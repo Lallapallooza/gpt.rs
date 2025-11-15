@@ -1,0 +1,39 @@
+[workspace]
+members = [
+    "crates/gpt-rs",
+    "crates/gpt-rs-cli",
+    "crates/gpt-rs-backend-c",
+    "crates/gpt-rs-backend-ref-cpu",
+    "crates/gpt-rs-backend-faer",
+    "crates/gpt-rs-backend-tests",
+    "crates/gpt-rs-macros",
+    "crates/gpt-rs-py",
+    "crates/gpt-rs-c-runtime",
+]
+default-members = [
+    "crates/gpt-rs",
+    "crates/gpt-rs-cli",
+    "crates/gpt-rs-backend-c",
+    "crates/gpt-rs-backend-ref-cpu",
+    "crates/gpt-rs-backend-faer",
+    "crates/gpt-rs-backend-tests",
+    "crates/gpt-rs-c-runtime",
+    "crates/gpt-rs-macros",
+    "crates/gpt-rs-py",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+authors = ["gpt.rs contributors"]
+
+[workspace.dependencies]
+anyhow = "1"
+bincode = "1"
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"

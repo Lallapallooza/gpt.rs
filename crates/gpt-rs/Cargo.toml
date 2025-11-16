@@ -1,0 +1,31 @@
+[package]
+name = "gpt-rs"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+parallel = ["dep:rayon"]
+simd = []
+profiler = []
+torch = ["gpt-rs-backend-tests/torch"]
+
+[dependencies]
+anyhow = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+rayon = { version = "1.10", optional = true }
+regex = "1"
+gpt-rs-macros = { path = "../gpt-rs-macros" }
+lru = "0.12"
+bincode = "1"
+smallvec = "1"
+half = "2.6"
+once_cell = "1"
+linkme = "0.3"
+
+[dev-dependencies]
+gpt-rs-backend-ref-cpu = { path = "../gpt-rs-backend-ref-cpu" }
+gpt-rs-backend-tests = { path = "../gpt-rs-backend-tests" }

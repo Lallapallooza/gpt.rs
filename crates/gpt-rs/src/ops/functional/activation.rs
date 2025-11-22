@@ -1,0 +1,109 @@
+//! Activation kernels implemented via portable graph capture.
+//!
+//! The routines here build backend programs for common nonlinearities such as softmax and GELU
+//! while keeping numerical stability tweaks (e.g., max subtraction) close to the graph capture.
+
+use anyhow::Result;
+use gpt_rs_macros::{capture_ptir, support_runtime_overload};
+
+use crate::backend::spec::PortableBackend;
+use crate::ops::functional::common::{ensure_rank_at_least, CaptureIntoDeviceTensor};
+use crate::ops::ptir;
+use crate::tensor::DeviceTensor;
+
+/// Applies ReLU: `max(x, 0)`.
+#[support_runtime_overload]
+pub fn relu<B: PortableBackend + 'static>(
+    _backend: &B,
+    x: &DeviceTensor<B>,
+) -> Result<DeviceTensor<B>> {
+    let _scope =
+        crate::profiling::functional_scope("gpt_rs::ops::functional::activation::relu", "max0");
+    capture_ptir!({ x }, |session| {
+        let zero = session.scalar(0.0).broadcast_like(&x);
+        Ok(x.maximum(&zero).id())
+    })?
+    .into_device_tensor(x.requires_grad_flag())
+}
+
+/// Applies ReLU6: `min(max(x, 0), 6)`.
+#[support_runtime_overload]
+pub fn relu6<B: PortableBackend + 'static>(
+    _backend: &B,
+    x: &DeviceTensor<B>,
+) -> Result<DeviceTensor<B>> {
+    let _scope = crate::profiling::functional_scope(
+        "gpt_rs::ops::functional::activation::relu6",
+        "clamp0_6",
+    );
+    capture_ptir!({ x }, |session| {
+        let zero = session.scalar(0.0).broadcast_like(&x);
+        let six = session.scalar(6.0).broadcast_like(&x);
+        Ok(x.maximum(&zero).minimum(&six).id())
+    })?
+    .into_device_tensor(x.requires_grad_flag())
+}
+
+struct SoftmaxLastDimPlan {
+    axis: usize,
+}
+
+fn validate_softmax_last_dim<B: PortableBackend + 'static>(
+    x: &DeviceTensor<B>,
+) -> Result<SoftmaxLastDimPlan> {
+    ensure_rank_at_least("softmax_last_dim input", x, 1)?;
+    Ok(SoftmaxLastDimPlan {
+        axis: x.shape().rank() - 1,
+    })
+}
+
+fn capture_softmax_last_dim<B: PortableBackend + 'static>(
+    plan: &SoftmaxLastDimPlan,
+    x: &DeviceTensor<B>,
+) -> Result<DeviceTensor<B>> {
+    capture_ptir!({ input = x }, |_session| {
+        let max = input.reduce_max([plan.axis], true);
+        let shifted = input - max.broadcast_like(&input);
+        let exp_values = shifted.exp();
+        let sum = exp_values.reduce_sum([plan.axis], true);
+        Ok((exp_values / sum.broadcast_like(&input)).id())
+    })?
+    .into_device_tensor(x.requires_grad_flag())
+}
+
+/// Computes a numerically stable softmax over the last dimension of `x`.
+///
+/// The graph is captured in four phases so callers can reason about the generated program:
+/// - subtract each row's maximum via `Reduce(Max)` to keep exponentials in range;
+/// - exponentiate the shifted tensor to obtain positive weights;
+/// - reduce with `Reduce(Sum)` to form per-row denominators and broadcast them back;
+/// - divide the exponentials by the broadcasted sums to produce normalized probabilities.
+///
+/// Reuses an existing [`GraphArena`] whenever one of the inputs already participates in a lazy graph.
+#[support_runtime_overload]
+pub fn softmax_last_dim<B: PortableBackend + 'static>(
+    _backend: &B,
+    x: &DeviceTensor<B>,
+) -> Result<DeviceTensor<B>> {
+    let plan = validate_softmax_last_dim(x)?;
+    capture_softmax_last_dim(&plan, x)
+}
+
+/// Applies the exact GELU activation used in GPT models.
+///
+/// The captured graph matches the analytical definition
+/// `0.5 * x * (1 + erf(x / sqrt(2)))`, combining scalar broadcasts with PTIR
+/// elementwise operators to remain backend portable.
+#[support_runtime_overload]
+pub fn gelu<B: PortableBackend + 'static>(
+    _backend: &B,
+    x: &DeviceTensor<B>,
+) -> Result<DeviceTensor<B>> {
+    ensure_rank_at_least("gelu input", x, 1)?;
+
+    capture_ptir!({ input = x }, |_session| {
+        let result = 0.5f32 * input * (1.0f32 + ptir::erf(input / ptir::sqrt(2.0f32)));
+        Ok(result.id())
+    })?
+    .into_device_tensor(x.requires_grad_flag())
+}

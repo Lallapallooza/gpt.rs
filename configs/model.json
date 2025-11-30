@@ -1,0 +1,9 @@
+{
+  "vocab_size": 78,
+  "context_length": 32,
+  "embed_dim": 32,
+  "num_layers": 2,
+  "num_heads": 4,
+  "mlp_ratio": 4,
+  "dropout": 0.0
+}

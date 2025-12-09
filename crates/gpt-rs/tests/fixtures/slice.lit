@@ -1,0 +1,24 @@
+EXPECTED:
+program @captured (spec_version = ptir.v0.4) {
+  func @captured {
+    params:
+      %0 : tensor<F32 x 4x4>
+    body:
+      %3 = Slice(SliceSpec { starts: [1, 1], sizes: [2, 2] })(%0) -> tensor<F32 x 2x2>
+    results:
+      %3 : tensor<F32 x 2x2>
+  }
+}
+INPUT:
+program @captured (spec_version = ptir.v0.4) {
+  func @captured {
+    params:
+      %0 : tensor<F32 x 4x4>
+    body:
+      %1 = Slice(SliceSpec { starts: [0, 0], sizes: [3, 3] })(%0) -> tensor<F32 x 3x3>
+      %2 = Slice(SliceSpec { starts: [1, 1], sizes: [2, 2] })(%1) -> tensor<F32 x 2x2>
+    results:
+      %2 : tensor<F32 x 2x2>
+  }
+}
+run_test

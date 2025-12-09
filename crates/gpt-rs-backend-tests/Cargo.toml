@@ -1,0 +1,18 @@
+[package]
+name = "gpt-rs-backend-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+torch = ["dep:tch"]
+
+[dependencies]
+anyhow = { workspace = true }
+gpt-rs = { path = "../gpt-rs" }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tch = { version = "0.13", optional = true, features = ["download-libtorch"] }
+libc = "0.2"

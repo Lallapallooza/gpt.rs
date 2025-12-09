@@ -1,0 +1,104 @@
+EXPECTED:
+program @captured (spec_version = ptir.v0.4) {
+  func @captured {
+    body:
+      %0 = Constant(TensorLiteral { spec: TensorSpec { dtype: F32, shape: Shape { dims: [] } }, bytes: [0, 0, 0, 0] }) -> tensor<F32 x []>
+      %1 = BroadcastTo(BroadcastToSpec { result_shape: Shape { dims: [Static(2)] } })(%0) -> tensor<F32 x 2>
+      %4 = ElementwiseBinary(Add)(%1, %1) -> tensor<F32 x 2>
+    results:
+      %4 : tensor<F32 x 2>
+  }
+}
+INPUT:
+program @captured (spec_version = ptir.v0.4) {
+  func @captured {
+    params:
+    body:
+      %0 = Constant(TensorLiteral { spec: TensorSpec { dtype: F32, shape: Shape { dims: [] } }, bytes: [0, 0, 0, 0] }) -> tensor<F32 x []>
+      %1 = BroadcastTo(BroadcastToSpec { result_shape: Shape { dims: [Static(2)] } })(%0) -> tensor<F32 x 2>
+      %2 = Constant(TensorLiteral { spec: TensorSpec { dtype: F32, shape: Shape { dims: [] } }, bytes: [0, 0, 0, 0] }) -> tensor<F32 x []>
+      %3 = BroadcastTo(BroadcastToSpec { result_shape: Shape { dims: [Static(2)] } })(%2) -> tensor<F32 x 2>
+      %4 = ElementwiseBinary(Add)(%1, %3) -> tensor<F32 x 2>
+    results:
+      %4 : tensor<F32 x 2>
+  }
+}
+run_test
+EXPECTED:
+program @captured (spec_version = ptir.v0.4) {
+  func @captured {
+    params:
+      %0 : tensor<F32 x 2x3>
+    body:
+      %1 = Transpose(TransposeSpec { perm: [1, 0] })(%0) -> tensor<F32 x 3x2>
+      %3 = ElementwiseBinary(Add)(%1, %1) -> tensor<F32 x 3x2>
+    results:
+      %3 : tensor<F32 x 3x2>
+  }
+}
+INPUT:
+program @captured (spec_version = ptir.v0.4) {
+  func @captured {
+    params:
+      %0 : tensor<F32 x 2x3>
+    body:
+      %1 = Transpose(TransposeSpec { perm: [1, 0] })(%0) -> tensor<F32 x 3x2>
+      %2 = Transpose(TransposeSpec { perm: [1, 0] })(%0) -> tensor<F32 x 3x2>
+      %3 = ElementwiseBinary(Add)(%1, %2) -> tensor<F32 x 3x2>
+    results:
+      %3 : tensor<F32 x 3x2>
+  }
+}
+run_test
+EXPECTED:
+program @captured (spec_version = ptir.v0.4) {
+  func @captured {
+    params:
+      %0 : tensor<F32 x 4>
+    body:
+      %1 = ElementwiseUnary(Rsqrt)(%0) -> tensor<F32 x 4>
+      %3 = ElementwiseBinary(Add)(%1, %1) -> tensor<F32 x 4>
+    results:
+      %3 : tensor<F32 x 4>
+  }
+}
+INPUT:
+program @captured (spec_version = ptir.v0.4) {
+  func @captured {
+    params:
+      %0 : tensor<F32 x 4>
+    body:
+      %1 = ElementwiseUnary(Rsqrt)(%0) -> tensor<F32 x 4>
+      %2 = ElementwiseUnary(Rsqrt)(%0) -> tensor<F32 x 4>
+      %3 = ElementwiseBinary(Add)(%1, %2) -> tensor<F32 x 4>
+    results:
+      %3 : tensor<F32 x 4>
+  }
+}
+run_test
+EXPECTED:
+program @captured (spec_version = ptir.v0.4) {
+  func @captured {
+    params:
+      %0 : tensor<F32 x 2>
+    body:
+      %1 = ElementwiseBinary(Add)(%0, %0) -> tensor<F32 x 2>
+      %3 = ElementwiseBinary(Mul)(%1, %1) -> tensor<F32 x 2>
+    results:
+      %3 : tensor<F32 x 2>
+  }
+}
+INPUT:
+program @captured (spec_version = ptir.v0.4) {
+  func @captured {
+    params:
+      %0 : tensor<F32 x 2>
+    body:
+      %1 = ElementwiseBinary(Add)(%0, %0) -> tensor<F32 x 2>
+      %2 = ElementwiseBinary(Add)(%0, %0) -> tensor<F32 x 2>
+      %3 = ElementwiseBinary(Mul)(%1, %2) -> tensor<F32 x 2>
+    results:
+      %3 : tensor<F32 x 2>
+  }
+}
+run_test

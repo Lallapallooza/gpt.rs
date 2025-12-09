@@ -1,0 +1,22 @@
+EXPECTED:
+program @captured (spec_version = ptir.v0.4) {
+  func @captured {
+    params:
+      %0 : tensor<F32 x 2x3>
+    results:
+      %0 : tensor<F32 x 2x3>
+  }
+}
+INPUT:
+program @captured (spec_version = ptir.v0.4) {
+  func @captured {
+    params:
+      %0 : tensor<F32 x 2x3>
+    body:
+      %1 = Transpose(TransposeSpec { perm: [1, 0] })(%0) -> tensor<F32 x 3x2>
+      %2 = Transpose(TransposeSpec { perm: [1, 0] })(%1) -> tensor<F32 x 2x3>
+    results:
+      %2 : tensor<F32 x 2x3>
+  }
+}
+run_test

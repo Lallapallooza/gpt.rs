@@ -1,0 +1,23 @@
+EXPECTED:
+program @captured (spec_version = ptir.v0.4) {
+  func @captured {
+    params:
+      %0 : tensor<F32 x 2>
+    results:
+      %0 : tensor<F32 x 2>
+  }
+}
+INPUT:
+program @captured (spec_version = ptir.v0.4) {
+  func @captured {
+    params:
+      %0 : tensor<F32 x 2>
+    body:
+      %1 = Constant(TensorLiteral { spec: TensorSpec { dtype: F32, shape: Shape { dims: [] } }, bytes: [0, 0, 0, 0] }) -> tensor<F32 x []>
+      %2 = BroadcastTo(BroadcastToSpec { result_shape: Shape { dims: [Static(2)] } })(%1) -> tensor<F32 x 2>
+      %3 = ElementwiseBinary(Add)(%0, %2) -> tensor<F32 x 2>
+    results:
+      %3 : tensor<F32 x 2>
+  }
+}
+run_test

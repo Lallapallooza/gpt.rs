@@ -1,0 +1,30 @@
+META:
+roles: Arg, Param
+stable_ids: 0, 1234
+EXPECTED:
+program @captured (spec_version = ptir.v0.4) {
+  func @captured {
+    params:
+      %0 : tensor<F32 x 6>
+      %5 : tensor<F32 x 6>
+    body:
+      %4 = ElementwiseBinary(Add)(%0, %5) -> tensor<F32 x 6>
+    results:
+      %4 : tensor<F32 x 6>
+  }
+}
+INPUT:
+program @captured (spec_version = ptir.v0.4) {
+  func @captured {
+    params:
+      %0 : tensor<F32 x 6>
+      %1 : tensor<F32 x 2x3>
+    body:
+      %2 = Transpose(TransposeSpec { perm: [1, 0] })(%1) -> tensor<F32 x 3x2>
+      %3 = Reshape(ReshapeSpec { new_shape: [Explicit(Static(6))] })(%2) -> tensor<F32 x 6>
+      %4 = ElementwiseBinary(Add)(%0, %3) -> tensor<F32 x 6>
+    results:
+      %4 : tensor<F32 x 6>
+  }
+}
+run_test

@@ -1,0 +1,15 @@
+[package]
+name = "gpt-rs-backend-ref-cpu"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+torch = ["gpt-rs-backend-tests/torch"]
+
+[dependencies]
+gpt-rs = { path = "../gpt-rs" }
+libm = "0.2"
+
+[dev-dependencies]
+gpt-rs-backend-tests = { path = "../gpt-rs-backend-tests" }

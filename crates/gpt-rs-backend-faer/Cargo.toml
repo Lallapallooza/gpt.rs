@@ -1,0 +1,16 @@
+[package]
+name = "gpt-rs-backend-faer"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+torch = ["gpt-rs-backend-tests/torch"]
+
+[dependencies]
+faer = "0.23"
+gpt-rs = { path = "../gpt-rs" }
+gpt-rs-backend-ref-cpu = { path = "../gpt-rs-backend-ref-cpu" }
+
+[dev-dependencies]
+gpt-rs-backend-tests = { path = "../gpt-rs-backend-tests" }

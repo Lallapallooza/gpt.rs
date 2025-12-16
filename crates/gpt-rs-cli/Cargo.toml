@@ -1,0 +1,17 @@
+[package]
+name = "gpt-rs-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+rand = { workspace = true }
+rand_chacha = "0.3"
+gpt-rs = { path = "../gpt-rs" }
+gpt-rs-backend-c = { path = "../gpt-rs-backend-c", optional = true, default-features = false }
+gpt-rs-backend-faer = { path = "../gpt-rs-backend-faer" }
+serde_json = { workspace = true }
+
+[features]
+conversion-c = ["dep:gpt-rs-backend-c", "gpt-rs-backend-c/conversion-c"]

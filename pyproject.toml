@@ -1,0 +1,63 @@
+[project]
+name = "gptrs-tools"
+version = "0.1.0"
+description = "Helper scripts for exporting and validating GPT-2 checkpoints for gpt.rs."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24,<3",
+    "torch>=2.3.0,<3",
+    "torchvision>=0.18,<1",
+    "transformers>=4.41,<5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.5",
+    "mypy>=1.8",
+    "pre-commit>=3.7",
+    "commitizen>=3.30",
+]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+src = ["scripts"]
+
+[tool.ruff.lint]
+extend-select = ["B", "C4", "I"]
+ignore = ["E203"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/export_gpt2.py" = ["T201"]
+"crates/gpt-rs-py/examples/*.py" = ["T201"]
+"crates/gpt-rs-py/test_install.py" = ["T201"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["scripts"]
+warn_unused_configs = true
+warn_unreachable = true
+namespace_packages = true
+exclude = ["crates/gpt-rs-py/"]
+
+[[tool.mypy.overrides]]
+module = ["torch.*", "transformers.*", "numpy.*", "gpt_rs.*", "pytest.*", "scipy.*"]
+ignore_missing_imports = true
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+version = "0.1.0"
+tag_format = "v$version"
+version_provider = "cargo"
+version_scheme = "semver"
+major_version_zero = true
+version_files = [
+    "Cargo.toml",
+    "crates/gpt-rs/Cargo.toml",
+    "crates/gpt-rs-cli/Cargo.toml",
+    "crates/gpt-rs-backend-ref-cpu/Cargo.toml",
+    "crates/gpt-rs-backend-faer/Cargo.toml",
+    "crates/gpt-rs-backend-tests/Cargo.toml",
+    "crates/gpt-rs-macros/Cargo.toml",
+]

@@ -1,0 +1,27 @@
+{
+  "defaults": {
+    "backend": "faer",
+    "torch_device": "cpu",
+    "seed": 0,
+    "rtol": 0.0001,
+    "atol": 0.0001,
+    "warmup": 1,
+    "iters": 5,
+    "threads": [1, 4],
+    "params": {
+      "batch": 1,
+      "image_size": 224,
+      "max_lines": 50
+    }
+  },
+  "runs": [
+    {
+      "model": "resnet34",
+      "workload": ["validate", "trace", "bench"]
+    },
+    {
+      "model": "mobilenet_v2",
+      "workload": ["validate", "trace", "bench"]
+    }
+  ]
+}

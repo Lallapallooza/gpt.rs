@@ -1,0 +1,28 @@
+[package]
+name = "gpt-rs-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "gpt_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+numpy = "0.22"
+gpt-rs = { path = "../gpt-rs" }
+gpt-rs-backend-ref-cpu = { path = "../gpt-rs-backend-ref-cpu" }
+gpt-rs-backend-faer = { path = "../gpt-rs-backend-faer", optional = true }
+gpt-rs-backend-c = { path = "../gpt-rs-backend-c", optional = true, default-features = false }
+thiserror.workspace = true
+anyhow.workspace = true
+serde_json = "1"
+
+[features]
+default = ["cpu"]
+cpu = []
+faer = ["gpt-rs-backend-faer"]
+conversion-c = ["dep:gpt-rs-backend-c", "gpt-rs-backend-c/conversion-c"]
+profiler = ["gpt-rs/profiler"]

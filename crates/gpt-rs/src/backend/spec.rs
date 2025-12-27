@@ -1214,14 +1214,6 @@ pub trait PortableBackend: Send + Sync {
         None
     }
 
-    /// Returns `true` when the backend can execute the given `custom_call` target.
-    ///
-    /// This is used by pattern registration helpers to only install rewrites that the backend
-    /// understands.
-    fn supports_custom_call(&self, _target: &str) -> bool {
-        false
-    }
-
     /// Materialises a tensor handle from host initialisation data.
     fn materialize(&self, init: TensorInit) -> BackendResult<Self::TensorHandle>;
 

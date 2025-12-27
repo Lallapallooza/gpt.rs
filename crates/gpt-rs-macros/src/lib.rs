@@ -378,6 +378,10 @@ enum ViewKind {
     Transpose,
     BroadcastTo,
     Slice,
+    Concat,
+    Take,
+    DynamicUpdateSlice,
+    ReduceWindow,
 }
 
 impl ViewKind {
@@ -398,6 +402,12 @@ impl ViewKind {
             ViewKind::Transpose => quote!(::gpt_rs::backend::pattern::TransposeOpView),
             ViewKind::BroadcastTo => quote!(::gpt_rs::backend::pattern::BroadcastOpView),
             ViewKind::Slice => quote!(::gpt_rs::backend::pattern::SliceOpView),
+            ViewKind::Concat => quote!(::gpt_rs::backend::pattern::ConcatOpView),
+            ViewKind::Take => quote!(::gpt_rs::backend::pattern::TakeOpView),
+            ViewKind::DynamicUpdateSlice => {
+                quote!(::gpt_rs::backend::pattern::DynamicUpdateSliceOpView)
+            }
+            ViewKind::ReduceWindow => quote!(::gpt_rs::backend::pattern::ReduceWindowOpView),
         }
     }
 
@@ -418,6 +428,10 @@ impl ViewKind {
             ViewKind::Transpose => "TransposeOpView",
             ViewKind::BroadcastTo => "BroadcastOpView",
             ViewKind::Slice => "SliceOpView",
+            ViewKind::Concat => "ConcatOpView",
+            ViewKind::Take => "TakeOpView",
+            ViewKind::DynamicUpdateSlice => "DynamicUpdateSliceOpView",
+            ViewKind::ReduceWindow => "ReduceWindowOpView",
         }
     }
 
@@ -440,6 +454,12 @@ impl ViewKind {
             ViewKind::Transpose => quote!(::gpt_rs::backend::pattern::filters::transpose),
             ViewKind::BroadcastTo => quote!(::gpt_rs::backend::pattern::filters::broadcast_to),
             ViewKind::Slice => quote!(::gpt_rs::backend::pattern::filters::slice),
+            ViewKind::Concat => quote!(::gpt_rs::backend::pattern::filters::concat),
+            ViewKind::Take => quote!(::gpt_rs::backend::pattern::filters::take),
+            ViewKind::DynamicUpdateSlice => {
+                quote!(::gpt_rs::backend::pattern::filters::dynamic_update_slice)
+            }
+            ViewKind::ReduceWindow => quote!(::gpt_rs::backend::pattern::filters::reduce_window),
         }
     }
 
@@ -449,6 +469,7 @@ impl ViewKind {
             ViewKind::DotGeneral => 1,
             ViewKind::ReduceMax | ViewKind::ReduceSum => 2,
             ViewKind::Slice => 3,
+            ViewKind::Concat | ViewKind::DynamicUpdateSlice | ViewKind::ReduceWindow => 3,
             ViewKind::Transpose | ViewKind::Reshape | ViewKind::BroadcastTo => 4,
             _ => 10,
         }
@@ -471,6 +492,10 @@ impl ViewKind {
             ViewKind::Transpose => "transpose",
             ViewKind::BroadcastTo => "broadcast_to",
             ViewKind::Slice => "slice",
+            ViewKind::Concat => "concat",
+            ViewKind::Take => "take",
+            ViewKind::DynamicUpdateSlice => "dynamic_update_slice",
+            ViewKind::ReduceWindow => "reduce_window",
         }
     }
 }
@@ -509,11 +534,69 @@ fn expr_mentions_known_tensor(expr: &Expr, known: &std::collections::HashSet<Str
     false
 }
 
+fn expr_tree_mentions_known_tensor(expr: &Expr, known: &std::collections::HashSet<String>) -> bool {
+    match strip_expr_wrappers(expr) {
+        Expr::Path(_) => expr_mentions_known_tensor(expr, known),
+        Expr::Binary(bin) => {
+            expr_tree_mentions_known_tensor(&bin.left, known)
+                || expr_tree_mentions_known_tensor(&bin.right, known)
+        }
+        Expr::MethodCall(call) => {
+            expr_tree_mentions_known_tensor(&call.receiver, known)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_tree_mentions_known_tensor(arg, known))
+        }
+        Expr::Call(call) => {
+            expr_tree_mentions_known_tensor(&call.func, known)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_tree_mentions_known_tensor(arg, known))
+        }
+        Expr::Reference(reference) => expr_tree_mentions_known_tensor(&reference.expr, known),
+        Expr::Unary(unary) => expr_tree_mentions_known_tensor(&unary.expr, known),
+        Expr::Cast(cast) => expr_tree_mentions_known_tensor(&cast.expr, known),
+        Expr::Field(field) => expr_tree_mentions_known_tensor(&field.base, known),
+        Expr::Index(index) => {
+            expr_tree_mentions_known_tensor(&index.expr, known)
+                || expr_tree_mentions_known_tensor(&index.index, known)
+        }
+        Expr::If(expr_if) => {
+            expr_tree_mentions_known_tensor(&expr_if.cond, known)
+                || expr_if.then_branch.stmts.iter().any(|stmt| match stmt {
+                    Stmt::Expr(expr, _) => expr_tree_mentions_known_tensor(expr, known),
+                    Stmt::Local(local) => local
+                        .init
+                        .as_ref()
+                        .is_some_and(|init| expr_tree_mentions_known_tensor(&init.expr, known)),
+                    Stmt::Item(_) | Stmt::Macro(_) => false,
+                })
+                || expr_if
+                    .else_branch
+                    .as_ref()
+                    .is_some_and(|(_, expr)| expr_tree_mentions_known_tensor(expr, known))
+        }
+        _ => false,
+    }
+}
+
 fn infer_view_kind(expr: &Expr, known: &std::collections::HashSet<String>) -> Option<ViewKind> {
     match strip_expr_wrappers(expr) {
+        Expr::Call(call) => {
+            let Expr::Path(path) = &*call.func else {
+                return None;
+            };
+            let name = path.path.segments.last()?.ident.to_string();
+            match name.as_str() {
+                "concat" | "try_concat" => Some(ViewKind::Concat),
+                _ => None,
+            }
+        }
         Expr::Binary(bin) => {
-            if !expr_mentions_known_tensor(&bin.left, known)
-                && !expr_mentions_known_tensor(&bin.right, known)
+            if !expr_tree_mentions_known_tensor(&bin.left, known)
+                && !expr_tree_mentions_known_tensor(&bin.right, known)
             {
                 return None;
             }
@@ -526,8 +609,7 @@ fn infer_view_kind(expr: &Expr, known: &std::collections::HashSet<String>) -> Op
             }
         }
         Expr::MethodCall(call) => {
-            let recv_ident = ident_from_expr(&call.receiver)?;
-            if !known.contains(&recv_ident.to_string()) {
+            if !expr_tree_mentions_known_tensor(&call.receiver, known) {
                 return None;
             }
             let name = call.method.to_string();
@@ -538,6 +620,11 @@ fn infer_view_kind(expr: &Expr, known: &std::collections::HashSet<String>) -> Op
                 "transpose" | "try_transpose" => Some(ViewKind::Transpose),
                 "broadcast_to" | "try_broadcast_to" => Some(ViewKind::BroadcastTo),
                 "slice" | "try_slice" => Some(ViewKind::Slice),
+                "take" | "try_take" => Some(ViewKind::Take),
+                "dynamic_update_slice" | "try_dynamic_update_slice" => {
+                    Some(ViewKind::DynamicUpdateSlice)
+                }
+                "reduce_window" | "try_reduce_window" => Some(ViewKind::ReduceWindow),
                 "maximum" | "try_maximum" => Some(ViewKind::Maximum),
                 "minimum" | "try_minimum" => Some(ViewKind::Minimum),
                 "reduce_sum" | "try_reduce_sum" => Some(ViewKind::ReduceSum),
@@ -996,7 +1083,89 @@ fn expand_ptir_pattern(attr: TokenStream, item: TokenStream) -> SynResult<TokenS
                 return;
             }
 
-            let Some(output) = output.downcast_ref::<::gpt_rs::backend::spec::ValueId>().copied() else {
+            let output = if let Some(output) = output
+                .downcast_ref::<::gpt_rs::backend::spec::ValueId>()
+                .copied()
+            {
+                output
+            } else if let Some(output) = output
+                .downcast_ref::<(
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                )>()
+                .map(|t| t.0)
+            {
+                output
+            } else if let Some(output) = output
+                .downcast_ref::<(
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                )>()
+                .map(|t| t.0)
+            {
+                output
+            } else if let Some(output) = output
+                .downcast_ref::<(
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                )>()
+                .map(|t| t.0)
+            {
+                output
+            } else if let Some(output) = output
+                .downcast_ref::<(
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                )>()
+                .map(|t| t.0)
+            {
+                output
+            } else if let Some(output) = output
+                .downcast_ref::<(
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                )>()
+                .map(|t| t.0)
+            {
+                output
+            } else if let Some(output) = output
+                .downcast_ref::<(
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                )>()
+                .map(|t| t.0)
+            {
+                output
+            } else if let Some(output) = output
+                .downcast_ref::<(
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                    ::gpt_rs::backend::spec::ValueId,
+                )>()
+                .map(|t| t.0)
+            {
+                output
+            } else {
                 return;
             };
             let Some(anchor) = binds.iter().rev().find(|b| b.name == #anchor_lit).map(|b| b.value) else {
@@ -1031,16 +1200,6 @@ fn expand_ptir_pattern(attr: TokenStream, item: TokenStream) -> SynResult<TokenS
         }
     };
 
-    let insert_ident = format_ident!(
-        "__{}_ptir_pattern_insert",
-        base_name,
-        span = fn_ident.span()
-    );
-    let auto_lower_ident = format_ident!(
-        "__{}AutoLowerToCustomCall",
-        view_name,
-        span = fn_ident.span()
-    );
     let def_ident = format_ident!(
         "__PTIR_PATTERN_DEF_{}",
         base_name.to_uppercase(),
@@ -1125,69 +1284,12 @@ fn expand_ptir_pattern(attr: TokenStream, item: TokenStream) -> SynResult<TokenS
     });
 
     let registry_def = quote! {
-        struct #auto_lower_ident;
-
-        impl ::gpt_rs::backend::pattern::OpRewritePattern<#view_ident> for #auto_lower_ident {
-            fn match_and_rewrite(
-                &self,
-                p: #view_ident,
-                rewriter: &mut ::gpt_rs::backend::rewriter::ProgramRewriter,
-            ) -> bool {
-                if !p.closure_report(rewriter).is_closed() {
-                    return false;
-                }
-
-                let output = p.output();
-                let Some(output_inst) = rewriter.inst_of(output) else {
-                    return false;
-                };
-                let Some(output_ty) = rewriter.type_of(output).cloned() else {
-                    return false;
-                };
-
-                let mut operands = Vec::with_capacity(p.input_count());
-                for idx in 0..p.input_count() {
-                    let Some(value) = p.input(idx as u32) else {
-                        return false;
-                    };
-                    operands.push(::gpt_rs::backend::spec::Operand::Value(value));
-                }
-
-                let op = ::gpt_rs::backend::spec::Operation::CustomCall(
-                    ::gpt_rs::backend::spec::CustomCallSpec {
-                        target: <#view_ident>::TARGET.to_string(),
-                        attrs: ::std::collections::BTreeMap::new(),
-                    },
-                );
-
-                let Ok((_new_inst, new_value)) =
-                    rewriter.insert_before(output_inst, op, operands, output_ty)
-                else {
-                    return false;
-                };
-
-                rewriter.replace_all_uses(output, new_value);
-                for result_id in &mut rewriter.func.result_ids {
-                    if *result_id == output {
-                        *result_id = new_value;
-                    }
-                }
-
-                true
-            }
-        }
-
-        fn #insert_ident(set: &mut ::gpt_rs::backend::pattern::PatternSet) {
-            set.insert_view::<#view_ident, _>(#auto_lower_ident);
-        }
-
         #[::gpt_rs::linkme::distributed_slice(::gpt_rs::backend::pattern::PATTERN_DEFS)]
         static #def_ident: ::gpt_rs::backend::pattern::PatternDef = ::gpt_rs::backend::pattern::PatternDef {
             target: <#view_ident>::TARGET,
             module_path: module_path!(),
             view_name: stringify!(#view_ident),
             fields: &[#(#pattern_field_entries),*],
-            insert: #insert_ident,
         };
     };
 

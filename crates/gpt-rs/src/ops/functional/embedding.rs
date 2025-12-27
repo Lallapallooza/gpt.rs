@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
-use gpt_rs_macros::{capture_ptir, support_runtime_overload};
+use gpt_rs_macros::{capture_ptir, ptir_pattern, support_runtime_overload};
 
 use crate::backend::spec::PortableBackend;
 use crate::ops::functional::common::{
@@ -55,57 +55,30 @@ fn validate_embedding_lookup<B: PortableBackend + 'static>(
     })
 }
 
-/// Captures the PTIR gather program and optional reshape for embedding lookup.
-fn capture_embedding_lookup<B: PortableBackend + 'static>(
-    plan: EmbeddingPlan,
-    weight: &DeviceTensor<B>,
-    indices: &DeviceTensor<B>,
-    graph: Option<Arc<GraphArena<B>>>,
-) -> Result<DeviceTensor<B>> {
-    let result = if let Some(graph) = graph {
-        // Use the provided graph arena for this operation
-        capture_ptir! {
-            graph = Arc::clone(&graph);
-            { weight, indices },
-            |_session| {
-                let indices_1d = if plan.squeeze_indices {
-                    indices.reshape(vec![plan.seq_len])
-                } else {
-                    indices
-                };
-                let gathered = weight.take(&indices_1d);
-                Ok(gathered.id())
-            }
-        }?
-    } else {
-        // Auto-resolve or create a new graph
-        capture_ptir! {
-            { weight, indices },
-            |_session| {
-                let indices_1d = if plan.squeeze_indices {
-                    indices.reshape(vec![plan.seq_len])
-                } else {
-                    indices
-                };
-                let gathered = weight.take(&indices_1d);
-                Ok(gathered.id())
-            }
-        }?
-    };
-
-    result.into_device_tensor(plan.requires_grad)
-}
-
 /// Fetches embedding vectors for integer indices by emitting a portable gather program.
 /// The helper mirrors the behaviour of `torch.nn.Embedding` while remaining backend agnostic.
 #[support_runtime_overload]
+#[ptir_pattern(target = "gpt_rs.embedding_lookup")]
 pub fn embedding_lookup<B: PortableBackend + 'static>(
     _backend: &B,
     weight: &DeviceTensor<B>,
     indices: &DeviceTensor<B>,
 ) -> Result<DeviceTensor<B>> {
     let plan = validate_embedding_lookup(weight, indices)?;
-    capture_embedding_lookup(plan, weight, indices, None)
+    let captured = capture_ptir! {
+        { weight, indices },
+        |_session| {
+            let indices_1d = if plan.squeeze_indices {
+                indices.reshape(vec![plan.seq_len])
+            } else {
+                indices
+            };
+            let gathered = weight.take(&indices_1d);
+            Ok(gathered.id())
+        }
+    }?;
+
+    captured.into_device_tensor(plan.requires_grad)
 }
 
 /// Fetches embedding vectors with explicit graph arena control for optimization.
@@ -121,6 +94,7 @@ pub fn embedding_lookup<B: PortableBackend + 'static>(
 ///     backend, pos_weights, pos_indices, token_emb.graph()
 /// )?;
 /// ```
+#[ptir_pattern(target = "gpt_rs.embedding_lookup_with_graph")]
 pub fn embedding_lookup_with_graph<B: PortableBackend + 'static>(
     _backend: &B,
     weight: &DeviceTensor<B>,
@@ -128,5 +102,34 @@ pub fn embedding_lookup_with_graph<B: PortableBackend + 'static>(
     graph: Option<Arc<GraphArena<B>>>,
 ) -> Result<DeviceTensor<B>> {
     let plan = validate_embedding_lookup(weight, indices)?;
-    capture_embedding_lookup(plan, weight, indices, graph)
+    let captured = if let Some(graph) = graph {
+        capture_ptir! {
+            graph = Arc::clone(&graph);
+            { weight, indices },
+            |_session| {
+                let indices_1d = if plan.squeeze_indices {
+                    indices.reshape(vec![plan.seq_len])
+                } else {
+                    indices
+                };
+                let gathered = weight.take(&indices_1d);
+                Ok(gathered.id())
+            }
+        }?
+    } else {
+        capture_ptir! {
+            { weight, indices },
+            |_session| {
+                let indices_1d = if plan.squeeze_indices {
+                    indices.reshape(vec![plan.seq_len])
+                } else {
+                    indices
+                };
+                let gathered = weight.take(&indices_1d);
+                Ok(gathered.id())
+            }
+        }?
+    };
+
+    captured.into_device_tensor(plan.requires_grad)
 }

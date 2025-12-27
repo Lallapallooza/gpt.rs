@@ -5,9 +5,9 @@
 //! autoregressive decoding.
 
 use anyhow::{ensure, Result};
-use gpt_rs_macros::{capture_ptir, support_runtime_overload};
+use gpt_rs_macros::{capture_ptir, ptir_pattern, support_runtime_overload};
 
-use crate::backend::spec::{DType, PortableBackend, ValueId};
+use crate::backend::spec::{DType, PortableBackend};
 use crate::nn::layers::attention::AttentionConfig;
 use crate::ops::functional::common::{
     ensure_axis_in_bounds, ensure_dims_match_except_axis, ensure_last_dim, ensure_rank,
@@ -16,7 +16,7 @@ use crate::ops::functional::common::{
 };
 use crate::ops::functional::runtime::CacheKeyArg;
 use crate::ops::graph::GraphArena;
-use crate::ops::ptir::{self, DotAttrs, DotDims, FunctionalSession};
+use crate::ops::ptir::{self, DotAttrs, DotDims};
 use crate::tensor::DeviceTensor;
 use std::sync::Arc;
 
@@ -177,18 +177,6 @@ pub struct DecodeAttentionComputation<B: PortableBackend + 'static> {
     pub cache: DecodeKvCache<B>,
 }
 
-struct CapturedAttention {
-    context: ValueId,
-    keys: ValueId,
-    values: ValueId,
-}
-
-struct CapturedDecodeAttention {
-    context: ValueId,
-    keys: ValueId,
-    values: ValueId,
-}
-
 struct AttentionPlan {
     seq_len: usize,
     cache_len: usize,
@@ -198,143 +186,6 @@ struct AttentionPlan {
 struct DecodeAttentionPlan {
     seq_len: usize,
     requires_grad: bool,
-}
-
-/// Emits the full scaled dot-product attention program inside a PTIR capture.
-///
-/// The helper follows the textbook GPT forward pass:
-/// 1. Slice the packed QKV projection into query/key/value blocks.
-/// 2. Reshape/transposes into `[heads, seq, head_dim]` layouts (including grouped-query logic).
-/// 3. Append cache entries when `existing_len > 0`, concatenating along the time axis.
-/// 4. Compute causal scores via dot-general, apply scaling+masking, and run the softmax.
-/// 5. Multiply by values to obtain the context tensor, reshape back to `[seq, embed_dim]`.
-///
-/// Tests:
-/// - `crates/gpt-rs/tests/functional_softmax.rs::attention_records_context_and_cache_outputs`
-///   inspects the captured PTIR nodes.
-/// - `crates/gpt-rs/tests/torch_parity.rs::functional_attention_matches_torch_reference`
-///   and backend parity suites verify numerical equality versus Torch.
-fn build_attention_capture<'ctx, 'gb, B, S>(
-    session: &S,
-    qkv: crate::ops::ptir::Tensor<'ctx, 'gb, B>,
-    cache_keys: Option<crate::ops::ptir::Tensor<'ctx, 'gb, B>>,
-    cache_values: Option<crate::ops::ptir::Tensor<'ctx, 'gb, B>>,
-    config: &AttentionConfig,
-    seq_len: usize,
-    existing_len: usize,
-) -> Result<CapturedAttention>
-where
-    B: PortableBackend + 'static,
-    S: FunctionalSession<'ctx, 'gb, B>,
-{
-    let total_len = existing_len + seq_len;
-    let embed_dim = config.embed_dim;
-    let num_query_heads = config.num_query_heads;
-    let num_kv_heads = config.num_key_value_heads;
-    let head_dim = config.head_dim;
-    let kv_head_dim = config.kv_head_dim;
-    let kv_group_size = config.kv_group_size();
-    let q_proj_dim = config.query_projection_dim();
-    let kv_proj_dim = config.key_value_projection_dim();
-
-    let q_slice = qkv.slice(vec![0, 0], vec![seq_len, q_proj_dim]);
-    let k_slice = qkv.slice(vec![0, q_proj_dim], vec![seq_len, kv_proj_dim]);
-    let v_slice = qkv.slice(
-        vec![0, q_proj_dim + kv_proj_dim],
-        vec![seq_len, kv_proj_dim],
-    );
-
-    // Reshape packed projections into `[heads, seq, head_dim]` views so the PTIR graph
-    // manipulates per-head tensors:
-    //   q_heads_new : [num_query_heads, seq_len, head_dim]
-    //   new_k_cache/new_v_cache : [num_kv_heads, seq_len, kv_head_dim]
-    let q_heads_new = q_slice
-        .reshape(vec![seq_len, num_query_heads, head_dim])
-        .transpose(vec![1, 0, 2]);
-
-    let new_k_cache = k_slice
-        .reshape(vec![seq_len, num_kv_heads, kv_head_dim])
-        .transpose(vec![1, 0, 2]);
-
-    let new_v_cache = v_slice
-        .reshape(vec![seq_len, num_kv_heads, kv_head_dim])
-        .transpose(vec![1, 0, 2]);
-
-    let k_cache = if let Some(existing) = cache_keys {
-        ptir::Tensor::concat(1, &[existing, new_k_cache])
-    } else {
-        new_k_cache
-    };
-
-    let v_cache = if let Some(existing) = cache_values {
-        ptir::Tensor::concat(1, &[existing, new_v_cache])
-    } else {
-        new_v_cache
-    };
-
-    let k_grouped = k_cache
-        .reshape(vec![num_kv_heads, 1, total_len, kv_head_dim])
-        .broadcast_to(vec![num_kv_heads, kv_group_size, total_len, kv_head_dim])
-        .reshape(vec![num_query_heads, total_len, kv_head_dim]);
-
-    let v_grouped = v_cache
-        .reshape(vec![num_kv_heads, 1, total_len, kv_head_dim])
-        .broadcast_to(vec![num_kv_heads, kv_group_size, total_len, kv_head_dim])
-        .reshape(vec![num_query_heads, total_len, kv_head_dim]);
-
-    // Compute scaled dot products between queries and grouped keys. DotGeneral contracts:
-    //   batch axes: head index
-    //   contracting axes: head_dim vs kv_head_dim
-    let scores = q_heads_new.dot_general(
-        &k_grouped,
-        &DotDims::new(crate::axes!(0), crate::axes!(2), crate::axes!(2)),
-        &DotAttrs::default(),
-    );
-
-    let scale_shape = vec![num_query_heads, seq_len, total_len];
-    let scale = scalar_broadcast(session, 1.0f32 / (head_dim as f32).sqrt(), &scale_shape);
-    let scaled_scores = scores * scale;
-
-    // Build a causal mask so query positions cannot attend to future tokens. For cached runs the
-    // query axis only spans the fresh tokens (length `seq_len`) while the key axis covers
-    // `total_len`; slice the full mask to avoid zero-padding queries.
-    let positions = session.iota(vec![total_len, total_len], 1, DType::Si32);
-    let query_pos = session.iota(vec![total_len, total_len], 0, DType::Si32);
-    let allowed = query_pos.greater_equal(&positions);
-    let mask_plane = vec![total_len, total_len];
-    let zero = scalar_broadcast(session, 0.0, &mask_plane);
-    let neg_large = scalar_broadcast(session, -1e9, &mask_plane);
-    let base_mask = ptir::Tensor::select(&allowed, &zero, &neg_large);
-    let sliced_mask = base_mask.slice(vec![existing_len, 0], vec![seq_len, total_len]);
-    let mask = sliced_mask.broadcast_to(vec![num_query_heads, seq_len, total_len]);
-
-    // Numerically stable softmax: add mask, subtract row-wise max, exponentiate, normalise.
-    // This mirrors the textbook “softmax(x - max(x)) / sum(exp(x - max(x)))” algorithm.
-    let masked_scores = scaled_scores + mask;
-    let max_scores = masked_scores.reduce_max(vec![2], true);
-    let stabilized =
-        masked_scores - max_scores.broadcast_to(vec![num_query_heads, seq_len, total_len]);
-
-    let exp_scores = stabilized.exp();
-    let sum_scores = exp_scores.reduce_sum(vec![2], true);
-    let softmax = exp_scores / sum_scores.broadcast_to(vec![num_query_heads, seq_len, total_len]);
-
-    // Weighted sum with values to produce the context tensor (attention output).
-    let context = softmax.dot_general(
-        &v_grouped,
-        &DotDims::new(crate::axes!(0), crate::axes!(2), crate::axes!(1)),
-        &DotAttrs::default(),
-    );
-
-    let context_out = context
-        .transpose(vec![1, 0, 2])
-        .reshape(vec![seq_len, embed_dim]);
-
-    Ok(CapturedAttention {
-        context: context_out.id(),
-        keys: k_cache.id(),
-        values: v_cache.id(),
-    })
 }
 
 fn validate_qkv_layout<B: PortableBackend + 'static>(
@@ -467,278 +318,6 @@ fn validate_decode_attention<B: PortableBackend + 'static>(
     })
 }
 
-fn capture_attention_forward<B: PortableBackend + 'static>(
-    plan: AttentionPlan,
-    backend: &B,
-    config: &AttentionConfig,
-    qkv: &DeviceTensor<B>,
-    cache: Option<&AttentionCache<B>>,
-) -> Result<AttentionComputation<B>> {
-    let graph =
-        resolve_graph_from_tensors(&[qkv]).unwrap_or_else(|| GraphArena::new(qkv.backend()));
-
-    let captured = capture_attention_graph(Arc::clone(&graph), qkv, cache, config, plan.cache_len)?;
-
-    let context_total = (Arc::clone(&graph), captured.context)
-        .into_device_tensor(false)?
-        .requires_grad(plan.requires_grad);
-    let combined_keys = (Arc::clone(&graph), captured.keys)
-        .into_device_tensor(false)?
-        .requires_grad(plan.requires_grad);
-    let combined_values = (graph, captured.values)
-        .into_device_tensor(false)?
-        .requires_grad(plan.requires_grad);
-
-    let existing_requires_grad = cache
-        .map(|c| c.keys().requires_grad_flag() || c.values().requires_grad_flag())
-        .unwrap_or(false);
-
-    let combined_keys = combined_keys.requires_grad(plan.requires_grad || existing_requires_grad);
-    let combined_values =
-        combined_values.requires_grad(plan.requires_grad || existing_requires_grad);
-
-    let present_keys = recent_window(backend, &combined_keys, 1, plan.cache_len, plan.seq_len)?;
-    let present_values = recent_window(backend, &combined_values, 1, plan.cache_len, plan.seq_len)?;
-
-    let present = AttentionCache::new(present_keys, present_values)?;
-    let combined = AttentionCache::new(combined_keys, combined_values)?;
-    let output = context_total;
-
-    Ok(AttentionComputation {
-        output,
-        present,
-        cache: combined,
-    })
-}
-
-fn capture_attention_graph<B: PortableBackend + 'static>(
-    graph: Arc<GraphArena<B>>,
-    qkv_new: &DeviceTensor<B>,
-    cache: Option<&AttentionCache<B>>,
-    config: &AttentionConfig,
-    existing_len: usize,
-) -> Result<CapturedAttention> {
-    let seq_len = qkv_new.shape().dims()[0];
-
-    let capture_result = if let Some(cache) = cache {
-        capture_ptir! {
-            graph = Arc::clone(&graph);
-            { qkv = qkv_new, cache_keys = cache.keys(), cache_values = cache.values() },
-            |session| {
-                let captured = build_attention_capture(
-                    &session,
-                    qkv,
-                    Some(cache_keys),
-                    Some(cache_values),
-                    config,
-                    seq_len,
-                    existing_len,
-                )?;
-                drop(session);
-                ctx.export(captured.keys);
-                ctx.export(captured.values);
-                Ok(captured)
-            }
-        }
-    } else {
-        capture_ptir! {
-            graph = Arc::clone(&graph);
-            { qkv = qkv_new },
-            |session| {
-                let captured = build_attention_capture(
-                    &session,
-                    qkv,
-                    None,
-                    None,
-                    config,
-                    seq_len,
-                    existing_len,
-                )?;
-                drop(session);
-                ctx.export(captured.keys);
-                ctx.export(captured.values);
-                Ok(captured)
-            }
-        }
-    };
-
-    let (_graph, captured) = capture_result?;
-    Ok(captured)
-}
-
-fn capture_decode_attention_graph<B: PortableBackend + 'static>(
-    graph: Arc<GraphArena<B>>,
-    qkv_new: &DeviceTensor<B>,
-    cache: &DecodeKvCache<B>,
-    update_starts: &DeviceTensor<B>,
-    query_start: &DeviceTensor<B>,
-    config: &AttentionConfig,
-) -> Result<CapturedDecodeAttention> {
-    let seq_len = qkv_new.shape().dims()[0];
-    let capacity = cache.capacity();
-    let num_query_heads = config.num_query_heads;
-    let num_kv_heads = config.num_key_value_heads;
-    let head_dim = config.head_dim;
-    let kv_head_dim = config.kv_head_dim;
-
-    let capture_result = capture_ptir! {
-        graph = Arc::clone(&graph);
-        {
-            qkv = qkv_new,
-            cache_keys = cache.keys(),
-            cache_values = cache.values(),
-            update_starts,
-            query_start,
-        },
-        |session| {
-            let captured = {
-                let embed_dim = config.embed_dim;
-                let kv_group_size = config.kv_group_size();
-                let q_proj_dim = config.query_projection_dim();
-                let kv_proj_dim = config.key_value_projection_dim();
-
-                let q_slice = qkv.slice(vec![0, 0], vec![seq_len, q_proj_dim]);
-                let k_slice = qkv.slice(vec![0, q_proj_dim], vec![seq_len, kv_proj_dim]);
-                let v_slice = qkv.slice(
-                    vec![0, q_proj_dim + kv_proj_dim],
-                    vec![seq_len, kv_proj_dim],
-                );
-
-                let q_heads_new = q_slice
-                    .reshape(vec![num_query_heads, seq_len, head_dim]);
-
-                let new_k_cache = k_slice
-                    .reshape(vec![num_kv_heads, seq_len, kv_head_dim]);
-
-                let new_v_cache = v_slice
-                    .reshape(vec![num_kv_heads, seq_len, kv_head_dim]);
-
-                let sizes = vec![num_kv_heads, seq_len, kv_head_dim];
-                let k_cache = cache_keys.dynamic_update_slice(
-                    &new_k_cache,
-                    &update_starts,
-                    sizes.clone(),
-                );
-                let v_cache =
-                    cache_values.dynamic_update_slice(&new_v_cache, &update_starts, sizes);
-
-                let k_grouped = k_cache
-                    .reshape(vec![num_kv_heads, 1, capacity, kv_head_dim])
-                    .broadcast_to(vec![num_kv_heads, kv_group_size, capacity, kv_head_dim])
-                    .reshape(vec![num_query_heads, capacity, kv_head_dim]);
-
-                let v_grouped = v_cache
-                    .reshape(vec![num_kv_heads, 1, capacity, kv_head_dim])
-                    .broadcast_to(vec![num_kv_heads, kv_group_size, capacity, kv_head_dim])
-                    .reshape(vec![num_query_heads, capacity, kv_head_dim]);
-
-                let scores = q_heads_new.dot_general(
-                    &k_grouped,
-                    &DotDims::new(crate::axes!(0), crate::axes!(2), crate::axes!(2)),
-                    &DotAttrs::default(),
-                );
-
-                let scale_shape = vec![num_query_heads, seq_len, capacity];
-                let scale = scalar_broadcast(
-                    &session,
-                    1.0f32 / (head_dim as f32).sqrt(),
-                    &scale_shape,
-                );
-                let scaled_scores = scores * scale;
-
-                let positions = session.iota(vec![capacity], 0, DType::Si32);
-                let query_pos = positions.dynamic_slice(&query_start, vec![1]);
-                let query_pos = query_pos.broadcast_to(vec![capacity]);
-                let allowed = query_pos.greater_equal(&positions);
-                let zero = scalar_broadcast(&session, 0.0, &[capacity]);
-                let neg_large = scalar_broadcast(&session, -1e9, &[capacity]);
-                let base_mask = ptir::Tensor::select(&allowed, &zero, &neg_large);
-                let mask_2d = base_mask.broadcast_to(vec![seq_len, capacity]);
-                let mask = mask_2d.broadcast_to(vec![num_query_heads, seq_len, capacity]);
-
-                let masked_scores = scaled_scores + mask;
-                let max_scores = masked_scores.reduce_max(vec![2], true);
-                let stabilized = masked_scores
-                    - max_scores.broadcast_to(vec![num_query_heads, seq_len, capacity]);
-
-                let exp_scores = stabilized.exp();
-                let sum_scores = exp_scores.reduce_sum(vec![2], true);
-                let softmax = exp_scores
-                    / sum_scores.broadcast_to(vec![num_query_heads, seq_len, capacity]);
-
-                let context = softmax.dot_general(
-                    &v_grouped,
-                    &DotDims::new(crate::axes!(0), crate::axes!(2), crate::axes!(1)),
-                    &DotAttrs::default(),
-                );
-
-                let context_out = context.reshape(vec![seq_len, embed_dim]);
-
-                CapturedDecodeAttention {
-                    context: context_out.id(),
-                    keys: k_cache.id(),
-                    values: v_cache.id(),
-                }
-            };
-
-            drop(session);
-            ctx.export(captured.keys);
-            ctx.export(captured.values);
-
-            Ok(captured)
-        }
-    };
-
-    let (_graph, captured) = capture_result?;
-    Ok(captured)
-}
-
-fn capture_decode_attention_forward<B: PortableBackend + 'static>(
-    plan: DecodeAttentionPlan,
-    _backend: &B,
-    config: &AttentionConfig,
-    qkv: &DeviceTensor<B>,
-    cache: &DecodeKvCache<B>,
-    update_starts: &DeviceTensor<B>,
-    query_start: &DeviceTensor<B>,
-) -> Result<DecodeAttentionComputation<B>> {
-    let graph =
-        resolve_graph_from_tensors(&[qkv]).unwrap_or_else(|| GraphArena::new(qkv.backend()));
-
-    let captured = capture_decode_attention_graph(
-        Arc::clone(&graph),
-        qkv,
-        cache,
-        update_starts,
-        query_start,
-        config,
-    )?;
-
-    let output = (Arc::clone(&graph), captured.context)
-        .into_device_tensor(false)?
-        .requires_grad(plan.requires_grad);
-    let combined_keys = (Arc::clone(&graph), captured.keys)
-        .into_device_tensor(false)?
-        .requires_grad(plan.requires_grad);
-    let combined_values = (graph, captured.values)
-        .into_device_tensor(false)?
-        .requires_grad(plan.requires_grad);
-
-    let existing_requires_grad =
-        cache.keys().requires_grad_flag() || cache.values().requires_grad_flag();
-    let combined_keys = combined_keys.requires_grad(plan.requires_grad || existing_requires_grad);
-    let combined_values =
-        combined_values.requires_grad(plan.requires_grad || existing_requires_grad);
-
-    let new_len = cache.len() + plan.seq_len;
-    let updated_cache = DecodeKvCache::new(combined_keys, combined_values, new_len)?;
-
-    Ok(DecodeAttentionComputation {
-        output,
-        cache: updated_cache,
-    })
-}
-
 /// Helper that returns the most recent `seq_len` elements from a cache-aware tensor slice.
 ///
 /// When `cache_len` is zero it simply clones the tensor; otherwise it slices along `axis`.
@@ -765,38 +344,245 @@ fn recent_window<B: PortableBackend + 'static>(
 /// - compute scaled dot products, apply the softmax with causal masking, and combine with values;
 /// - emit three outputs in a single backend program: context, new keys, and new values.
 #[support_runtime_overload]
+#[ptir_pattern(target = "gpt_rs.attention_f32")]
 pub fn attention<B: PortableBackend + 'static>(
     backend: &B,
     config: &AttentionConfig,
     qkv: &DeviceTensor<B>,
     cache: Option<&AttentionCache<B>>,
 ) -> Result<AttentionComputation<B>> {
-    portable_attention_forward_impl(backend, config, qkv, cache)
-}
-
-/// Captures the full forward attention program while handling optional cache stitching.
-///
-/// Internal flow:
-/// - validate projection and batch dimensions against the attention config;
-/// - if a cache is provided, splice zero-query rows and previous key/value blocks so the packed
-///   layout matches the expected `[seq, 3 * embed]` shape;
-/// - capture the scaled dot-product attention graph directly with the PTIR tensor DSL;
-/// - post-process the captured value identifiers into typed tensors and bundle them into an
-///   [`AttentionComputation`].
-fn portable_attention_forward_impl<B: PortableBackend + 'static>(
-    backend: &B,
-    config: &AttentionConfig,
-    qkv: &DeviceTensor<B>,
-    cache: Option<&AttentionCache<B>>,
-) -> Result<AttentionComputation<B>> {
     let plan = validate_attention(config, qkv, cache)?;
-    capture_attention_forward(plan, backend, config, qkv, cache)
+    let graph =
+        resolve_graph_from_tensors(&[qkv]).unwrap_or_else(|| GraphArena::new(qkv.backend()));
+
+    let total_len = plan.cache_len + plan.seq_len;
+    let embed_dim = config.embed_dim;
+    let num_query_heads = config.num_query_heads;
+    let num_kv_heads = config.num_key_value_heads;
+    let head_dim = config.head_dim;
+    let kv_head_dim = config.kv_head_dim;
+    let kv_group_size = config.kv_group_size();
+    let q_proj_dim = config.query_projection_dim();
+    let kv_proj_dim = config.key_value_projection_dim();
+
+    let (graph, (context_id, keys_id, values_id)) = if let Some(cache) = cache {
+        let captured = capture_ptir! {
+            graph = Arc::clone(&graph);
+            { qkv, cache_keys = cache.keys(), cache_values = cache.values() },
+            |session| {
+                let q_slice = qkv.slice(vec![0, 0], vec![plan.seq_len, q_proj_dim]);
+                let k_slice = qkv.slice(vec![0, q_proj_dim], vec![plan.seq_len, kv_proj_dim]);
+                let v_slice = qkv.slice(
+                    vec![0, q_proj_dim + kv_proj_dim],
+                    vec![plan.seq_len, kv_proj_dim],
+                );
+
+                let q_heads_new = q_slice
+                    .reshape(vec![plan.seq_len, num_query_heads, head_dim])
+                    .transpose(vec![1, 0, 2]);
+
+                let new_k_cache = k_slice
+                    .reshape(vec![plan.seq_len, num_kv_heads, kv_head_dim])
+                    .transpose(vec![1, 0, 2]);
+
+                let new_v_cache = v_slice
+                    .reshape(vec![plan.seq_len, num_kv_heads, kv_head_dim])
+                    .transpose(vec![1, 0, 2]);
+
+                let k_cache = ptir::Tensor::concat(1, &[cache_keys, new_k_cache]);
+                let v_cache = ptir::Tensor::concat(1, &[cache_values, new_v_cache]);
+
+                let k_grouped = k_cache
+                    .reshape(vec![num_kv_heads, 1, total_len, kv_head_dim])
+                    .broadcast_to(vec![num_kv_heads, kv_group_size, total_len, kv_head_dim])
+                    .reshape(vec![num_query_heads, total_len, kv_head_dim]);
+
+                let v_grouped = v_cache
+                    .reshape(vec![num_kv_heads, 1, total_len, kv_head_dim])
+                    .broadcast_to(vec![num_kv_heads, kv_group_size, total_len, kv_head_dim])
+                    .reshape(vec![num_query_heads, total_len, kv_head_dim]);
+
+                let scores = q_heads_new.dot_general(
+                    &k_grouped,
+                    &DotDims::new(crate::axes!(0), crate::axes!(2), crate::axes!(2)),
+                    &DotAttrs::default(),
+                );
+
+                let scale_shape = vec![num_query_heads, plan.seq_len, total_len];
+                let scale =
+                    scalar_broadcast(&session, 1.0f32 / (head_dim as f32).sqrt(), &scale_shape);
+                let scaled_scores = scores * scale;
+
+                let positions = session.iota(vec![total_len, total_len], 1, DType::Si32);
+                let query_pos = session.iota(vec![total_len, total_len], 0, DType::Si32);
+                let allowed = query_pos.greater_equal(&positions);
+                let mask_plane = vec![total_len, total_len];
+                let zero = scalar_broadcast(&session, 0.0, &mask_plane);
+                let neg_large = scalar_broadcast(&session, -1e9, &mask_plane);
+                let base_mask = ptir::Tensor::select(&allowed, &zero, &neg_large);
+                let sliced_mask =
+                    base_mask.slice(vec![plan.cache_len, 0], vec![plan.seq_len, total_len]);
+                let mask = sliced_mask.broadcast_to(vec![num_query_heads, plan.seq_len, total_len]);
+
+                let masked_scores = scaled_scores + mask;
+                let max_scores = masked_scores.reduce_max(vec![2], true);
+                let stabilized =
+                    masked_scores - max_scores.broadcast_to(vec![num_query_heads, plan.seq_len, total_len]);
+
+                let exp_scores = stabilized.exp();
+                let sum_scores = exp_scores.reduce_sum(vec![2], true);
+                let softmax =
+                    exp_scores / sum_scores.broadcast_to(vec![num_query_heads, plan.seq_len, total_len]);
+
+                let context = softmax.dot_general(
+                    &v_grouped,
+                    &DotDims::new(crate::axes!(0), crate::axes!(2), crate::axes!(1)),
+                    &DotAttrs::default(),
+                );
+
+                let context_out = context
+                    .transpose(vec![1, 0, 2])
+                    .reshape(vec![plan.seq_len, embed_dim]);
+
+                let context_id = context_out.id();
+                let keys_id = k_cache.id();
+                let values_id = v_cache.id();
+
+                drop(session);
+                ctx.export(keys_id);
+                ctx.export(values_id);
+
+                Ok((context_id, keys_id, values_id))
+            }
+        }?;
+        captured
+    } else {
+        let captured = capture_ptir! {
+            graph = Arc::clone(&graph);
+            { qkv },
+            |session| {
+                let q_slice = qkv.slice(vec![0, 0], vec![plan.seq_len, q_proj_dim]);
+                let k_slice = qkv.slice(vec![0, q_proj_dim], vec![plan.seq_len, kv_proj_dim]);
+                let v_slice = qkv.slice(
+                    vec![0, q_proj_dim + kv_proj_dim],
+                    vec![plan.seq_len, kv_proj_dim],
+                );
+
+                let q_heads_new = q_slice
+                    .reshape(vec![plan.seq_len, num_query_heads, head_dim])
+                    .transpose(vec![1, 0, 2]);
+
+                let new_k_cache = k_slice
+                    .reshape(vec![plan.seq_len, num_kv_heads, kv_head_dim])
+                    .transpose(vec![1, 0, 2]);
+
+                let new_v_cache = v_slice
+                    .reshape(vec![plan.seq_len, num_kv_heads, kv_head_dim])
+                    .transpose(vec![1, 0, 2]);
+
+                let k_grouped = new_k_cache
+                    .reshape(vec![num_kv_heads, 1, total_len, kv_head_dim])
+                    .broadcast_to(vec![num_kv_heads, kv_group_size, total_len, kv_head_dim])
+                    .reshape(vec![num_query_heads, total_len, kv_head_dim]);
+
+                let v_grouped = new_v_cache
+                    .reshape(vec![num_kv_heads, 1, total_len, kv_head_dim])
+                    .broadcast_to(vec![num_kv_heads, kv_group_size, total_len, kv_head_dim])
+                    .reshape(vec![num_query_heads, total_len, kv_head_dim]);
+
+                let scores = q_heads_new.dot_general(
+                    &k_grouped,
+                    &DotDims::new(crate::axes!(0), crate::axes!(2), crate::axes!(2)),
+                    &DotAttrs::default(),
+                );
+
+                let scale_shape = vec![num_query_heads, plan.seq_len, total_len];
+                let scale =
+                    scalar_broadcast(&session, 1.0f32 / (head_dim as f32).sqrt(), &scale_shape);
+                let scaled_scores = scores * scale;
+
+                let positions = session.iota(vec![total_len, total_len], 1, DType::Si32);
+                let query_pos = session.iota(vec![total_len, total_len], 0, DType::Si32);
+                let allowed = query_pos.greater_equal(&positions);
+                let mask_plane = vec![total_len, total_len];
+                let zero = scalar_broadcast(&session, 0.0, &mask_plane);
+                let neg_large = scalar_broadcast(&session, -1e9, &mask_plane);
+                let base_mask = ptir::Tensor::select(&allowed, &zero, &neg_large);
+                let sliced_mask =
+                    base_mask.slice(vec![plan.cache_len, 0], vec![plan.seq_len, total_len]);
+                let mask = sliced_mask.broadcast_to(vec![num_query_heads, plan.seq_len, total_len]);
+
+                let masked_scores = scaled_scores + mask;
+                let max_scores = masked_scores.reduce_max(vec![2], true);
+                let stabilized =
+                    masked_scores - max_scores.broadcast_to(vec![num_query_heads, plan.seq_len, total_len]);
+
+                let exp_scores = stabilized.exp();
+                let sum_scores = exp_scores.reduce_sum(vec![2], true);
+                let softmax =
+                    exp_scores / sum_scores.broadcast_to(vec![num_query_heads, plan.seq_len, total_len]);
+
+                let context = softmax.dot_general(
+                    &v_grouped,
+                    &DotDims::new(crate::axes!(0), crate::axes!(2), crate::axes!(1)),
+                    &DotAttrs::default(),
+                );
+
+                let context_out = context
+                    .transpose(vec![1, 0, 2])
+                    .reshape(vec![plan.seq_len, embed_dim]);
+
+                let context_id = context_out.id();
+                let keys_id = new_k_cache.id();
+                let values_id = new_v_cache.id();
+
+                drop(session);
+                ctx.export(keys_id);
+                ctx.export(values_id);
+
+                Ok((context_id, keys_id, values_id))
+            }
+        }?;
+        captured
+    };
+
+    let context_total = (Arc::clone(&graph), context_id)
+        .into_device_tensor(false)?
+        .requires_grad(plan.requires_grad);
+    let combined_keys = (Arc::clone(&graph), keys_id)
+        .into_device_tensor(false)?
+        .requires_grad(plan.requires_grad);
+    let combined_values = (graph, values_id)
+        .into_device_tensor(false)?
+        .requires_grad(plan.requires_grad);
+
+    let existing_requires_grad = cache
+        .map(|c| c.keys().requires_grad_flag() || c.values().requires_grad_flag())
+        .unwrap_or(false);
+
+    let combined_keys = combined_keys.requires_grad(plan.requires_grad || existing_requires_grad);
+    let combined_values =
+        combined_values.requires_grad(plan.requires_grad || existing_requires_grad);
+
+    let present_keys = recent_window(backend, &combined_keys, 1, plan.cache_len, plan.seq_len)?;
+    let present_values = recent_window(backend, &combined_values, 1, plan.cache_len, plan.seq_len)?;
+
+    let present = AttentionCache::new(present_keys, present_values)?;
+    let combined = AttentionCache::new(combined_keys, combined_values)?;
+    let output = context_total;
+
+    Ok(AttentionComputation {
+        output,
+        present,
+        cache: combined,
+    })
 }
 
 /// Concatenates tensors along the chosen axis, reusing shared validation helpers.
 ///
 /// Used by attention cache operations; emits `ptir::Tensor::concat` after matching dims on all
 /// other axes.
+#[ptir_pattern(target = "gpt_rs.concat_along_axis")]
 pub fn concat_along_axis<B: PortableBackend + 'static>(
     _backend: &B,
     lhs: &DeviceTensor<B>,
@@ -817,6 +603,7 @@ pub fn concat_along_axis<B: PortableBackend + 'static>(
 }
 
 /// Extracts a slice along a single axis while preserving other dimensions (cache utility).
+#[ptir_pattern(target = "gpt_rs.slice_along_axis")]
 pub fn slice_along_axis<B: PortableBackend + 'static>(
     _backend: &B,
     tensor: &DeviceTensor<B>,
@@ -846,6 +633,7 @@ pub fn slice_along_axis<B: PortableBackend + 'static>(
 ///
 /// This emits a `dynamic_update_slice` op and exports the result so callers can carry the updated
 /// tensor across decode steps without forcing additional materializations.
+#[ptir_pattern(target = "gpt_rs.dynamic_update_slice_into")]
 pub fn dynamic_update_slice_into<B: PortableBackend + 'static>(
     _backend: &B,
     base: &DeviceTensor<B>,
@@ -888,10 +676,8 @@ pub fn dynamic_update_slice_into<B: PortableBackend + 'static>(
     let sizes = update_dims.to_vec();
 
     capture_ptir!({ base, update, starts }, |session| {
-        let updated_id = {
-            let updated = base.dynamic_update_slice(&update, &starts, sizes.clone());
-            updated.id()
-        };
+        let updated = base.dynamic_update_slice(&update, &starts, sizes.clone());
+        let updated_id = updated.id();
         drop(session);
         ctx.export(updated_id);
         Ok(updated_id)
@@ -909,8 +695,9 @@ pub fn dynamic_update_slice_into<B: PortableBackend + 'static>(
 ///
 /// The current implementation supports `seq_len == 1` only.
 #[support_runtime_overload]
+#[ptir_pattern(target = "gpt_rs.attention_decode_cache_f32")]
 pub fn attention_decode_cache<B: PortableBackend + 'static>(
-    backend: &B,
+    _backend: &B,
     config: &AttentionConfig,
     qkv: &DeviceTensor<B>,
     cache: &DecodeKvCache<B>,
@@ -918,15 +705,133 @@ pub fn attention_decode_cache<B: PortableBackend + 'static>(
     query_start: &DeviceTensor<B>,
 ) -> Result<DecodeAttentionComputation<B>> {
     let plan = validate_decode_attention(config, qkv, cache, update_starts, query_start)?;
-    capture_decode_attention_forward(
-        plan,
-        backend,
-        config,
-        qkv,
-        cache,
-        update_starts,
-        query_start,
-    )
+    let graph =
+        resolve_graph_from_tensors(&[qkv]).unwrap_or_else(|| GraphArena::new(qkv.backend()));
+
+    let capacity = cache.capacity();
+    let num_query_heads = config.num_query_heads;
+    let num_kv_heads = config.num_key_value_heads;
+    let head_dim = config.head_dim;
+    let kv_head_dim = config.kv_head_dim;
+
+    let (graph, (context_id, keys_id, values_id)) = capture_ptir! {
+        graph = Arc::clone(&graph);
+        {
+            qkv,
+            cache_keys = cache.keys(),
+            cache_values = cache.values(),
+            update_starts,
+            query_start,
+        },
+        |session| {
+            let embed_dim = config.embed_dim;
+            let kv_group_size = config.kv_group_size();
+            let q_proj_dim = config.query_projection_dim();
+            let kv_proj_dim = config.key_value_projection_dim();
+
+            let q_slice = qkv.slice(vec![0, 0], vec![plan.seq_len, q_proj_dim]);
+            let k_slice = qkv.slice(vec![0, q_proj_dim], vec![plan.seq_len, kv_proj_dim]);
+            let v_slice = qkv.slice(
+                vec![0, q_proj_dim + kv_proj_dim],
+                vec![plan.seq_len, kv_proj_dim],
+            );
+
+            let q_heads_new = q_slice.reshape(vec![num_query_heads, plan.seq_len, head_dim]);
+
+            let new_k_cache = k_slice.reshape(vec![num_kv_heads, plan.seq_len, kv_head_dim]);
+
+            let new_v_cache = v_slice.reshape(vec![num_kv_heads, plan.seq_len, kv_head_dim]);
+
+            let sizes = vec![num_kv_heads, plan.seq_len, kv_head_dim];
+            let k_cache =
+                cache_keys.dynamic_update_slice(&new_k_cache, &update_starts, sizes.clone());
+            let v_cache =
+                cache_values.dynamic_update_slice(&new_v_cache, &update_starts, sizes);
+
+            let k_grouped = k_cache
+                .reshape(vec![num_kv_heads, 1, capacity, kv_head_dim])
+                .broadcast_to(vec![num_kv_heads, kv_group_size, capacity, kv_head_dim])
+                .reshape(vec![num_query_heads, capacity, kv_head_dim]);
+
+            let v_grouped = v_cache
+                .reshape(vec![num_kv_heads, 1, capacity, kv_head_dim])
+                .broadcast_to(vec![num_kv_heads, kv_group_size, capacity, kv_head_dim])
+                .reshape(vec![num_query_heads, capacity, kv_head_dim]);
+
+            let scores = q_heads_new.dot_general(
+                &k_grouped,
+                &DotDims::new(crate::axes!(0), crate::axes!(2), crate::axes!(2)),
+                &DotAttrs::default(),
+            );
+
+            let scale_shape = vec![num_query_heads, plan.seq_len, capacity];
+            let scale =
+                scalar_broadcast(&session, 1.0f32 / (head_dim as f32).sqrt(), &scale_shape);
+            let scaled_scores = scores * scale;
+
+            let positions = session.iota(vec![capacity], 0, DType::Si32);
+            let query_pos = positions.dynamic_slice(&query_start, vec![1]);
+            let query_pos = query_pos.broadcast_to(vec![capacity]);
+            let allowed = query_pos.greater_equal(&positions);
+            let zero = scalar_broadcast(&session, 0.0, &[capacity]);
+            let neg_large = scalar_broadcast(&session, -1e9, &[capacity]);
+            let base_mask = ptir::Tensor::select(&allowed, &zero, &neg_large);
+            let mask_2d = base_mask.broadcast_to(vec![plan.seq_len, capacity]);
+            let mask = mask_2d.broadcast_to(vec![num_query_heads, plan.seq_len, capacity]);
+
+            let masked_scores = scaled_scores + mask;
+            let max_scores = masked_scores.reduce_max(vec![2], true);
+            let stabilized = masked_scores
+                - max_scores.broadcast_to(vec![num_query_heads, plan.seq_len, capacity]);
+
+            let exp_scores = stabilized.exp();
+            let sum_scores = exp_scores.reduce_sum(vec![2], true);
+            let softmax =
+                exp_scores / sum_scores.broadcast_to(vec![num_query_heads, plan.seq_len, capacity]);
+
+            let context = softmax.dot_general(
+                &v_grouped,
+                &DotDims::new(crate::axes!(0), crate::axes!(2), crate::axes!(1)),
+                &DotAttrs::default(),
+            );
+
+            let context_out = context.reshape(vec![plan.seq_len, embed_dim]);
+
+            let context_id = context_out.id();
+            let keys_id = k_cache.id();
+            let values_id = v_cache.id();
+
+            drop(session);
+            ctx.export(keys_id);
+            ctx.export(values_id);
+
+            Ok((context_id, keys_id, values_id))
+        }
+    }?;
+
+    let output = (Arc::clone(&graph), context_id)
+        .into_device_tensor(false)?
+        .requires_grad(plan.requires_grad);
+    let combined_keys = (Arc::clone(&graph), keys_id)
+        .into_device_tensor(false)?
+        .requires_grad(plan.requires_grad);
+    let combined_values = (graph, values_id)
+        .into_device_tensor(false)?
+        .requires_grad(plan.requires_grad);
+
+    let existing_requires_grad =
+        cache.keys().requires_grad_flag() || cache.values().requires_grad_flag();
+    let combined_keys = combined_keys.requires_grad(plan.requires_grad || existing_requires_grad);
+    let combined_values =
+        combined_values.requires_grad(plan.requires_grad || existing_requires_grad);
+
+    let new_len = cache.len() + plan.seq_len;
+    let updated_cache = DecodeKvCache::new(combined_keys, combined_values, new_len)?;
+
+    Ok(DecodeAttentionComputation {
+        output,
+        cache: updated_cache,
+    })
 }
 
 impl CacheKeyArg for AttentionConfig {

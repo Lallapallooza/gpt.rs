@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use gpt_rs_macros::{capture_ptir, support_runtime_overload};
+use gpt_rs_macros::{capture_ptir, ptir_pattern, support_runtime_overload};
 
 use crate::backend::spec::PortableBackend;
 use crate::ops::functional::common::{
@@ -75,22 +75,34 @@ fn validate_layer_norm<B: PortableBackend + 'static>(
     })
 }
 
-/// Captures the PTIR program for layer norm given a validated plan.
+/// Applies layer normalization across the last tensor dimension.
 ///
-/// Mirrors the algorithm described in the public docs: sum/mean, variance computation, epsilon
-/// stabilisation, normalisation, then affine transform. The resulting outputs are exposed so
-/// downstream code can reuse the intermediates.
-fn capture_layer_norm<B: PortableBackend + 'static>(
-    plan: LayerNormPlan,
+/// The captured graph mirrors the textbook algorithm:
+/// - compute the per-sample mean by summing across the normalized axis and scaling by `1/N`;
+/// - subtract the mean to centre the activations and accumulate squared deviations;
+/// - compute variance, add `eps`, and take the reciprocal square root to obtain `1/std`;
+/// - multiply the centred activations by `1/std` to produce the normalized tensor;
+/// - broadcast the affine parameters (`gamma`, `beta`) and apply the final scaling and shift.
+/// Intermediate tensors (mean, inv_std, normalized) are returned alongside the final output so
+/// downstream consumers can reuse them without recomputing reductions.
+#[support_runtime_overload]
+#[ptir_pattern(target = "gpt_rs.layer_norm_f32")]
+pub fn layer_norm<B: PortableBackend + 'static>(
+    _backend: &B,
     x: &DeviceTensor<B>,
     gamma: &DeviceTensor<B>,
     beta: &DeviceTensor<B>,
     eps: f32,
 ) -> Result<LayerNormResult<B>> {
+    let plan = validate_layer_norm(x, gamma, beta)?;
     let (graph, (output_id, normalized_id, mean_id, inv_std_id)) = capture_ptir!({ x, gamma, beta }, |session| {
         // Mean reduction across the last dimension.
         let sum = x.reduce_sum(vec![plan.last_dim_axis], true);
-        let inv_count = scalar_broadcast(&session, 1.0f32 / plan.feature_dim as f32, &plan.reduce_shape);
+        let inv_count = scalar_broadcast(
+            &session,
+            1.0f32 / plan.feature_dim as f32,
+            &plan.reduce_shape,
+        );
         let mean = sum * inv_count;
         let mean_broadcast = mean.broadcast_to(plan.input_shape.clone());
 
@@ -124,26 +136,4 @@ fn capture_layer_norm<B: PortableBackend + 'static>(
         mean,
         inv_std,
     })
-}
-
-/// Applies layer normalization across the last tensor dimension.
-///
-/// The captured graph mirrors the textbook algorithm:
-/// - compute the per-sample mean by summing across the normalized axis and scaling by `1/N`;
-/// - subtract the mean to centre the activations and accumulate squared deviations;
-/// - compute variance, add `eps`, and take the reciprocal square root to obtain `1/std`;
-/// - multiply the centred activations by `1/std` to produce the normalized tensor;
-/// - broadcast the affine parameters (`gamma`, `beta`) and apply the final scaling and shift.
-/// Intermediate tensors (mean, inv_std, normalized) are returned alongside the final output so
-/// downstream consumers can reuse them without recomputing reductions.
-#[support_runtime_overload]
-pub fn layer_norm<B: PortableBackend + 'static>(
-    _backend: &B,
-    x: &DeviceTensor<B>,
-    gamma: &DeviceTensor<B>,
-    beta: &DeviceTensor<B>,
-    eps: f32,
-) -> Result<LayerNormResult<B>> {
-    let plan = validate_layer_norm(x, gamma, beta)?;
-    capture_layer_norm(plan, x, gamma, beta, eps)
 }

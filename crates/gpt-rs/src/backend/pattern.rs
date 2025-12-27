@@ -289,8 +289,24 @@ pub mod filters {
         matches!(op, Operation::Slice(_))
     }
 
+    pub fn concat(op: &Operation) -> bool {
+        matches!(op, Operation::Concat(_))
+    }
+
+    pub fn take(op: &Operation) -> bool {
+        matches!(op, Operation::Take)
+    }
+
+    pub fn dynamic_update_slice(op: &Operation) -> bool {
+        matches!(op, Operation::DynamicUpdateSlice(_))
+    }
+
     pub fn reduce(op: &Operation) -> bool {
         matches!(op, Operation::Reduce(_))
+    }
+
+    pub fn reduce_window(op: &Operation) -> bool {
+        matches!(op, Operation::ReduceWindow(_))
     }
 
     pub fn reduce_sum(op: &Operation) -> bool {

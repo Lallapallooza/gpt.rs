@@ -4,7 +4,7 @@
 //! higher-level conveniences like bias addition.
 
 use anyhow::Result;
-use gpt_rs_macros::{capture_ptir, support_runtime_overload};
+use gpt_rs_macros::{capture_ptir, ptir_pattern, support_runtime_overload};
 
 use crate::backend::spec::PortableBackend;
 use crate::ops::functional::common::{
@@ -38,29 +38,22 @@ fn validate_add_bias<B: PortableBackend + 'static>(
     })
 }
 
-/// Captures the broadcast + add PTIR nodes using the plan produced above.
-fn capture_add_bias<B: PortableBackend + 'static>(
-    plan: &AddBiasPlan,
-    x: &DeviceTensor<B>,
-    bias: &DeviceTensor<B>,
-) -> Result<DeviceTensor<B>> {
-    capture_ptir!({ x, bias }, |_session| {
-        let bias_broadcast = bias.broadcast_to(plan.output_shape.clone());
-        Ok((x + bias_broadcast).id())
-    })?
-    .into_device_tensor(plan.requires_grad)
-}
-
 /// Adds a bias vector to the last dimension of `x`, broadcasting as needed.
 /// Gradient tracking is preserved for both the activation tensor and the bias parameter.
 /// Steps: import operands, broadcast the bias across non-last axes, emit an elementwise add, and
 /// wrap the resulting value identifier into a lazy tensor.
 #[support_runtime_overload]
+#[ptir_pattern(target = "gpt_rs.add_bias")]
 pub fn add_bias<B: PortableBackend + 'static>(
     _backend: &B,
     x: &DeviceTensor<B>,
     bias: &DeviceTensor<B>,
 ) -> Result<DeviceTensor<B>> {
     let plan = validate_add_bias(x, bias)?;
-    capture_add_bias(&plan, x, bias)
+    capture_ptir!({ x, bias }, |_session| {
+        let bias_broadcast = bias.broadcast_to(plan.output_shape.clone());
+        let out = x + bias_broadcast;
+        Ok(out.id())
+    })?
+    .into_device_tensor(plan.requires_grad)
 }

@@ -4,7 +4,7 @@
 //! backend program.
 
 use anyhow::{ensure, Result};
-use gpt_rs_macros::{capture_ptir, support_runtime_overload};
+use gpt_rs_macros::{capture_ptir, ptir_pattern, support_runtime_overload};
 
 use crate::backend::spec::PortableBackend;
 use crate::ops::functional::common::{
@@ -56,15 +56,25 @@ fn validate_dropout<B: PortableBackend + 'static>(
     }))
 }
 
-/// Emits the PTIR program that implements inverted dropout.
-///
-/// The capture samples an RNG tensor, compares it to the drop probability, scales by `1/keep_prob`,
-/// and multiplies the mask with the input. Structural expectations live in
-/// `tests/functional_softmax.rs`, while numerical parity runs via the backend suites.
-fn capture_dropout<B: PortableBackend + 'static>(
-    plan: DropoutPlan,
+/// Applies inverted-dropout during training by sampling a Bernoulli mask on the backend.
+/// When evaluation mode is active or the keep probability is one, the original tensor is
+/// returned unchanged to avoid unnecessary graph nodes. In training mode the graph performs:
+/// - emit a uniform RNG node matching the activation shape;
+/// - compare against the drop probability to form a boolean mask;
+/// - turn the mask into a scaling tensor that divides by the keep probability;
+/// - multiply the input by the scaled mask so expectation stays constant.
+/// Coverage: `tests/functional_softmax.rs::dropout_emits_rng_mask_sequence` asserts the captured
+/// PTIR graph, while `tests/torch_parity.rs::functional_softmax_last_dim_matches_torch_reference`
+/// relies on the backend parity cases to exercise dropout indirectly once wired into training.
+#[support_runtime_overload]
+#[ptir_pattern(target = "gpt_rs.dropout_f32")]
+pub fn dropout<B: PortableBackend + 'static>(
+    _backend: &B,
     x: &DeviceTensor<B>,
+    p: f32,
+    training: bool,
 ) -> Result<DeviceTensor<B>> {
+    let plan = validate_dropout(x, p, training)?;
     match plan {
         DropoutPlan::NoOp => Ok(x.clone()),
         DropoutPlan::Apply(apply) => capture_ptir!({ input = x }, |session| {
@@ -80,29 +90,9 @@ fn capture_dropout<B: PortableBackend + 'static>(
             let zeros = scalar_broadcast(&session, 0.0, &apply.output_shape);
             let scaled_mask = ptir::Tensor::select(&mask, &scale_tensor, &zeros);
             // 4. Multiply the scaled mask by the input to produce inverted-dropout activations.
-            Ok((input * scaled_mask).id())
+            let output = input * scaled_mask;
+            Ok(output.id())
         })?
         .into_device_tensor(apply.requires_grad),
     }
-}
-
-/// Applies inverted-dropout during training by sampling a Bernoulli mask on the backend.
-/// When evaluation mode is active or the keep probability is one, the original tensor is
-/// returned unchanged to avoid unnecessary graph nodes. In training mode the graph performs:
-/// - emit a uniform RNG node matching the activation shape;
-/// - compare against the drop probability to form a boolean mask;
-/// - turn the mask into a scaling tensor that divides by the keep probability;
-/// - multiply the input by the scaled mask so expectation stays constant.
-/// Coverage: `tests/functional_softmax.rs::dropout_emits_rng_mask_sequence` asserts the captured
-/// PTIR graph, while `tests/torch_parity.rs::functional_softmax_last_dim_matches_torch_reference`
-/// relies on the backend parity cases to exercise dropout indirectly once wired into training.
-#[support_runtime_overload]
-pub fn dropout<B: PortableBackend + 'static>(
-    _backend: &B,
-    x: &DeviceTensor<B>,
-    p: f32,
-    training: bool,
-) -> Result<DeviceTensor<B>> {
-    let plan = validate_dropout(x, p, training)?;
-    capture_dropout(plan, x)
 }

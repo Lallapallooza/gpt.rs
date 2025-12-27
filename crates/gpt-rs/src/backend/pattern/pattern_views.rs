@@ -3,9 +3,10 @@ use crate::backend::{
     index::InstId,
     rewriter::ProgramRewriter,
     spec::{
-        BroadcastToSpec, CastSpec, CustomCallSpec, DotGeneralSpec, ElementwiseBinaryOp,
-        ElementwiseUnaryOp, ExtractPatchesSpec, Operand, Operation, ReduceKind, ReduceSpec,
-        ReshapeSpec, SliceSpec, TransposeSpec, ValueId, ValueType,
+        BroadcastToSpec, CastSpec, ConcatSpec, CustomCallSpec, DotGeneralSpec,
+        DynamicUpdateSliceSpec, ElementwiseBinaryOp, ElementwiseUnaryOp, ExtractPatchesSpec,
+        Operand, Operation, ReduceKind, ReduceSpec, ReduceWindowSpec, ReshapeSpec, SliceSpec,
+        TransposeSpec, ValueId, ValueType,
     },
 };
 
@@ -436,6 +437,144 @@ impl SliceOpView {
 
 impl OperationView for SliceOpView {
     const MATCHER: super::OperationMatcher = filters::slice;
+
+    fn extract(root: InstId, rewriter: &ProgramRewriter) -> Option<Self> {
+        Self::new(root, rewriter)
+    }
+}
+
+#[derive(Clone)]
+pub struct ConcatOpView {
+    pub root: InstId,
+    pub operands: Vec<Operand>,
+    pub result: ValueId,
+    pub result_type: ValueType,
+    pub spec: ConcatSpec,
+}
+
+impl ConcatOpView {
+    pub fn new(root: InstId, rewriter: &ProgramRewriter) -> Option<Self> {
+        let operands = rewriter.operands(root).to_vec();
+        let result = rewriter.value_of(root);
+        let result_type = rewriter.type_of(result)?.clone();
+        match rewriter.op(root) {
+            Operation::Concat(spec) => Some(Self {
+                root,
+                operands,
+                result,
+                result_type,
+                spec: spec.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl OperationView for ConcatOpView {
+    const MATCHER: super::OperationMatcher = filters::concat;
+
+    fn extract(root: InstId, rewriter: &ProgramRewriter) -> Option<Self> {
+        Self::new(root, rewriter)
+    }
+}
+
+#[derive(Clone)]
+pub struct TakeOpView {
+    pub root: InstId,
+    pub operands: Vec<Operand>,
+    pub result: ValueId,
+    pub result_type: ValueType,
+}
+
+impl TakeOpView {
+    pub fn new(root: InstId, rewriter: &ProgramRewriter) -> Option<Self> {
+        let operands = rewriter.operands(root).to_vec();
+        let result = rewriter.value_of(root);
+        let result_type = rewriter.type_of(result)?.clone();
+        match rewriter.op(root) {
+            Operation::Take => Some(Self {
+                root,
+                operands,
+                result,
+                result_type,
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl OperationView for TakeOpView {
+    const MATCHER: super::OperationMatcher = filters::take;
+
+    fn extract(root: InstId, rewriter: &ProgramRewriter) -> Option<Self> {
+        Self::new(root, rewriter)
+    }
+}
+
+#[derive(Clone)]
+pub struct DynamicUpdateSliceOpView {
+    pub root: InstId,
+    pub operands: Vec<Operand>,
+    pub result: ValueId,
+    pub result_type: ValueType,
+    pub spec: DynamicUpdateSliceSpec,
+}
+
+impl DynamicUpdateSliceOpView {
+    pub fn new(root: InstId, rewriter: &ProgramRewriter) -> Option<Self> {
+        let operands = rewriter.operands(root).to_vec();
+        let result = rewriter.value_of(root);
+        let result_type = rewriter.type_of(result)?.clone();
+        match rewriter.op(root) {
+            Operation::DynamicUpdateSlice(spec) => Some(Self {
+                root,
+                operands,
+                result,
+                result_type,
+                spec: spec.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl OperationView for DynamicUpdateSliceOpView {
+    const MATCHER: super::OperationMatcher = filters::dynamic_update_slice;
+
+    fn extract(root: InstId, rewriter: &ProgramRewriter) -> Option<Self> {
+        Self::new(root, rewriter)
+    }
+}
+
+#[derive(Clone)]
+pub struct ReduceWindowOpView {
+    pub root: InstId,
+    pub operands: Vec<Operand>,
+    pub result: ValueId,
+    pub result_type: ValueType,
+    pub spec: ReduceWindowSpec,
+}
+
+impl ReduceWindowOpView {
+    pub fn new(root: InstId, rewriter: &ProgramRewriter) -> Option<Self> {
+        let operands = rewriter.operands(root).to_vec();
+        let result = rewriter.value_of(root);
+        let result_type = rewriter.type_of(result)?.clone();
+        match rewriter.op(root) {
+            Operation::ReduceWindow(spec) => Some(Self {
+                root,
+                operands,
+                result,
+                result_type,
+                spec: spec.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl OperationView for ReduceWindowOpView {
+    const MATCHER: super::OperationMatcher = filters::reduce_window;
 
     fn extract(root: InstId, rewriter: &ProgramRewriter) -> Option<Self> {
         Self::new(root, rewriter)

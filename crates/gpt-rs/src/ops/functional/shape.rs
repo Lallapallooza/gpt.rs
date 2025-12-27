@@ -4,7 +4,7 @@
 //! code while keeping all work device-only (no host materialization).
 
 use anyhow::{bail, ensure, Result};
-use gpt_rs_macros::{capture_ptir, support_runtime_overload};
+use gpt_rs_macros::{capture_ptir, ptir_pattern, support_runtime_overload};
 
 use crate::backend::spec::PortableBackend;
 use crate::ops::functional::common::CaptureIntoDeviceTensor;
@@ -12,6 +12,7 @@ use crate::tensor::DeviceTensor;
 
 /// Reshapes a tensor while preserving element count.
 #[support_runtime_overload]
+#[ptir_pattern(target = "gpt_rs.reshape")]
 pub fn reshape<B: PortableBackend + 'static>(
     _backend: &B,
     x: &DeviceTensor<B>,
@@ -27,12 +28,16 @@ pub fn reshape<B: PortableBackend + 'static>(
         out_elems
     );
 
-    capture_ptir!({ x }, |_session| Ok(x.reshape(dims).id()))?
-        .into_device_tensor(x.requires_grad_flag())
+    capture_ptir!({ x }, |_session| {
+        let out = x.reshape(dims);
+        Ok(out.id())
+    })?
+    .into_device_tensor(x.requires_grad_flag())
 }
 
 /// Permutes tensor axes according to `perm`.
 #[support_runtime_overload]
+#[ptir_pattern(target = "gpt_rs.transpose")]
 pub fn transpose<B: PortableBackend + 'static>(
     _backend: &B,
     x: &DeviceTensor<B>,
@@ -54,6 +59,9 @@ pub fn transpose<B: PortableBackend + 'static>(
         seen[axis] = true;
     }
 
-    capture_ptir!({ x }, |_session| Ok(x.transpose(perm).id()))?
-        .into_device_tensor(x.requires_grad_flag())
+    capture_ptir!({ x }, |_session| {
+        let out = x.transpose(perm);
+        Ok(out.id())
+    })?
+    .into_device_tensor(x.requires_grad_flag())
 }

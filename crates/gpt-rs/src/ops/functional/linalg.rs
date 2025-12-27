@@ -4,7 +4,7 @@
 //! appropriate validation around shapes, dtypes, and backend ownership.
 
 use anyhow::{bail, Result};
-use gpt_rs_macros::{capture_ptir, support_runtime_overload};
+use gpt_rs_macros::{capture_ptir, ptir_pattern, support_runtime_overload};
 
 use crate::backend::spec::{PortableBackend, ValueId};
 use crate::ops::functional::common::{
@@ -99,24 +99,6 @@ fn validate_matmul<B: PortableBackend + 'static>(
     })
 }
 
-/// Captures the PTIR `dot_general` given a validated matmul plan.
-fn capture_matmul<B: PortableBackend + 'static>(
-    plan: MatmulPlan,
-    a: &DeviceTensor<B>,
-    b: &DeviceTensor<B>,
-) -> Result<DeviceTensor<B>> {
-    let tensor = capture_ptir!({ a, b }, |_session| -> anyhow::Result<ValueId> {
-        let result = a.dot_general(&b, &plan.dot_dims, &DotAttrs::default());
-        Ok::<ValueId, anyhow::Error>(result.id())
-    })?
-    .into_device_tensor(plan.requires_grad)?;
-
-    debug_assert_eq!(tensor.shape().dims(), plan.output_shape.as_slice());
-    debug_assert_eq!(tensor.dtype(), a.dtype());
-
-    Ok(tensor)
-}
-
 /// Performs matrix multiplication (or batched matmul) between `a` and `b`.
 /// Shape and dtype checks mirror the expectations of GPT projection layers while remaining
 /// portable across backends.
@@ -127,11 +109,21 @@ fn capture_matmul<B: PortableBackend + 'static>(
 /// - import operands into the active graph arena (or spawn a new one) and emit the dot product node;
 /// - wrap the resulting value identifier in a [`DeviceTensor`] carrying the inferred shape and dtype.
 #[support_runtime_overload]
+#[ptir_pattern(target = "gpt_rs.matmul")]
 pub fn matmul<B: PortableBackend + 'static>(
     _backend: &B,
     a: &DeviceTensor<B>,
     b: &DeviceTensor<B>,
 ) -> Result<DeviceTensor<B>> {
     let plan = validate_matmul(a, b)?;
-    capture_matmul(plan, a, b)
+    let tensor = capture_ptir!({ a, b }, |_session| -> anyhow::Result<ValueId> {
+        let result = a.dot_general(&b, &plan.dot_dims, &DotAttrs::default());
+        Ok::<ValueId, anyhow::Error>(result.id())
+    })?
+    .into_device_tensor(plan.requires_grad)?;
+
+    debug_assert_eq!(tensor.shape().dims(), plan.output_shape.as_slice());
+    debug_assert_eq!(tensor.dtype(), a.dtype());
+
+    Ok(tensor)
 }

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process;
 use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -43,6 +44,7 @@ struct TableRow {
 static TABLE_ROWS: OnceLock<Mutex<Vec<TableRow>>> = OnceLock::new();
 static TABLE_PRINTER: Once = Once::new();
 static TABLE_AGGREGATOR: OnceLock<TableAggregator> = OnceLock::new();
+static C_BACKEND_CACHE_CONFIG: Once = Once::new();
 
 fn table_rows() -> &'static Mutex<Vec<TableRow>> {
     TABLE_ROWS.get_or_init(|| Mutex::new(Vec::new()))
@@ -50,6 +52,28 @@ fn table_rows() -> &'static Mutex<Vec<TableRow>> {
 
 fn table_aggregator() -> &'static TableAggregator {
     TABLE_AGGREGATOR.get_or_init(TableAggregator::new)
+}
+
+fn configure_c_backend_cache_for_parity(backend_name: &str) {
+    if backend_name != "c" {
+        return;
+    }
+    if env::var_os("GPTRS_C_CACHE_DIR").is_some() {
+        return;
+    }
+    C_BACKEND_CACHE_CONFIG.call_once(|| {
+        let pid = process::id();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let cache_dir = env::temp_dir()
+            .join("gpt_rs_c_backend")
+            .join("torch_parity")
+            .join(format!("run-{pid}-{nonce}"));
+        let _ = fs::create_dir_all(&cache_dir);
+        env::set_var("GPTRS_C_CACHE_DIR", cache_dir);
+    });
 }
 
 fn register_table_printer() {
@@ -545,6 +569,7 @@ pub fn run_parity_test_with_modes<B: PortableBackend + 'static, F: Fn(&Arc<B>)>(
     f: F,
 ) {
     let backend_name = backend.backend_name().to_string();
+    configure_c_backend_cache_for_parity(&backend_name);
     let _context_guard = common::set_parity_context(&backend_name, test_name);
     let baseline = run_mode(&backend, BenchMode::Baseline, &f);
     match baseline {

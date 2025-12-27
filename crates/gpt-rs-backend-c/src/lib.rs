@@ -499,7 +499,7 @@ impl CBackend {
         converted: &ConvertedIr,
         entrypoint: &str,
     ) -> BackendResult<Arc<CompiledModule>> {
-        let fingerprint = cache_fingerprint(key);
+        let fingerprint = cache_fingerprint(key, converted);
         if let Some(found) = self
             .compiled
             .lock()
@@ -510,7 +510,7 @@ impl CBackend {
             return Ok(found);
         }
 
-        let cache_dir = std::env::temp_dir().join("gpt_rs_c_backend");
+        let cache_dir = c_cache_dir();
         std::fs::create_dir_all(&cache_dir)
             .map_err(|err| BackendError::execution(err.to_string()))?;
 
@@ -716,9 +716,17 @@ fn c_profile_enabled() -> bool {
     }
 }
 
-fn cache_fingerprint(key: &ConversionCacheKey) -> u64 {
+fn c_cache_dir() -> PathBuf {
+    match std::env::var("GPTRS_C_CACHE_DIR") {
+        Ok(value) if !value.trim().is_empty() => PathBuf::from(value.trim()),
+        _ => std::env::temp_dir().join("gpt_rs_c_backend"),
+    }
+}
+
+fn cache_fingerprint(key: &ConversionCacheKey, converted: &ConvertedIr) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hasher);
+    converted.module.hash(&mut hasher);
     hasher.finish()
 }
 

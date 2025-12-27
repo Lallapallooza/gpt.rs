@@ -1,5 +1,6 @@
 use super::ModelConfig;
 use crate::backend::spec::PortableBackend;
+use crate::module::{Module, ParamVisitor, ParamVisitorMut, TensorRole};
 use crate::nn::{
     AttentionConfig, CausalSelfAttention, CausalSelfAttentionGradients, CausalSelfAttentionState,
     Embedding, EmbeddingState, FeedForward, FeedForwardGradients, FeedForwardState, LayerNorm,
@@ -110,6 +111,24 @@ impl<B: PortableBackend + 'static> GptBlock<B> {
     ) -> Result<(GptBlockGradients, DeviceTensor<B>)> {
         let _ = (state, grad_output);
         bail!("GptBlock backward is not available on the portable backend yet")
+    }
+}
+
+impl<B: PortableBackend + 'static> Module<B> for GptBlock<B> {
+    fn visit_params(&self, v: &mut ParamVisitor<'_, B>) -> Result<()> {
+        v.scoped("attention", |v| self.attention.visit_params(v))?;
+        v.scoped("feed_forward", |v| self.feed_forward.visit_params(v))?;
+        v.scoped("ln_1", |v| self.ln_1.visit_params(v))?;
+        v.scoped("ln_2", |v| self.ln_2.visit_params(v))?;
+        Ok(())
+    }
+
+    fn visit_params_mut(&mut self, v: &mut ParamVisitorMut<'_, B>) -> Result<()> {
+        v.scoped("attention", |v| self.attention.visit_params_mut(v))?;
+        v.scoped("feed_forward", |v| self.feed_forward.visit_params_mut(v))?;
+        v.scoped("ln_1", |v| self.ln_1.visit_params_mut(v))?;
+        v.scoped("ln_2", |v| self.ln_2.visit_params_mut(v))?;
+        Ok(())
     }
 }
 pub struct Gpt<B: PortableBackend + 'static> {
@@ -312,6 +331,80 @@ impl<B: PortableBackend + 'static> Gpt<B> {
             let extras: Vec<String> = tensors.keys().cloned().collect();
             bail!("checkpoint contained unexpected tensors: {:?}", extras);
         }
+
+        Ok(Gpt {
+            backend,
+            functional,
+            config,
+            tok_embeddings,
+            pos_embeddings,
+            blocks,
+            final_ln,
+            lm_head,
+        })
+    }
+
+    pub fn build_from_params(
+        config: ModelConfig,
+        backend: Arc<B>,
+        mut get: impl FnMut(&str) -> Result<DeviceTensor<B>>,
+    ) -> Result<Self> {
+        let functional: FunctionalRegistryHandle<B> = build_registry(&config.functional_overrides);
+
+        let tok_embeddings_weight = get("tok_embeddings.weight")?;
+        let tok_embeddings = Embedding::new(Arc::clone(&backend), tok_embeddings_weight)?;
+        let pos_embeddings = get("pos_embeddings")?;
+
+        let mut blocks = Vec::with_capacity(config.num_layers);
+        for layer in 0..config.num_layers {
+            let prefix = format!("blocks.{}", layer);
+
+            let attn = CausalSelfAttention::new(
+                Arc::clone(&backend),
+                AttentionConfig::with_equal_heads(config.embed_dim, config.num_heads),
+                get(&format!("{}.attention.w_qkv", prefix))?,
+                get(&format!("{}.attention.w_out", prefix))?,
+                Some(get(&format!("{}.attention.b_qkv", prefix))?),
+                Some(get(&format!("{}.attention.b_out", prefix))?),
+            )?;
+
+            let ff = FeedForward::new(
+                Arc::clone(&backend),
+                get(&format!("{}.feed_forward.w_in", prefix))?,
+                get(&format!("{}.feed_forward.w_out", prefix))?,
+                Some(get(&format!("{}.feed_forward.b_in", prefix))?),
+                Some(get(&format!("{}.feed_forward.b_out", prefix))?),
+            )?;
+
+            let ln_1 = LayerNorm::new(
+                Arc::clone(&backend),
+                get(&format!("{}.ln_1.gamma", prefix))?,
+                get(&format!("{}.ln_1.beta", prefix))?,
+                1e-5,
+            )?;
+            let ln_2 = LayerNorm::new(
+                Arc::clone(&backend),
+                get(&format!("{}.ln_2.gamma", prefix))?,
+                get(&format!("{}.ln_2.beta", prefix))?,
+                1e-5,
+            )?;
+
+            blocks.push(GptBlock {
+                backend: Arc::clone(&backend),
+                attention: attn,
+                feed_forward: ff,
+                ln_1,
+                ln_2,
+            });
+        }
+
+        let final_ln = LayerNorm::new(
+            Arc::clone(&backend),
+            get("final_ln.gamma")?,
+            get("final_ln.beta")?,
+            1e-5,
+        )?;
+        let lm_head = get("lm_head")?;
 
         Ok(Gpt {
             backend,
@@ -870,6 +963,48 @@ impl<B: PortableBackend + 'static> Gpt<B> {
         f("final_ln.gamma", &mut self.final_ln.gamma)?;
         f("final_ln.beta", &mut self.final_ln.beta)?;
         f("lm_head", &mut self.lm_head)?;
+        Ok(())
+    }
+}
+
+impl<B: PortableBackend + 'static> Module<B> for Gpt<B> {
+    fn visit_params(&self, v: &mut ParamVisitor<'_, B>) -> Result<()> {
+        v.scoped("tok_embeddings", |v| self.tok_embeddings.visit_params(v))?;
+        v.param(
+            "pos_embeddings",
+            TensorRole::Parameter,
+            &self.pos_embeddings,
+        )?;
+        v.scoped("blocks", |v| {
+            for (i, block) in self.blocks.iter().enumerate() {
+                let idx = i.to_string();
+                v.scoped(&idx, |v| block.visit_params(v))?;
+            }
+            Ok(())
+        })?;
+        v.scoped("final_ln", |v| self.final_ln.visit_params(v))?;
+        v.param("lm_head", TensorRole::Parameter, &self.lm_head)?;
+        Ok(())
+    }
+
+    fn visit_params_mut(&mut self, v: &mut ParamVisitorMut<'_, B>) -> Result<()> {
+        v.scoped("tok_embeddings", |v| {
+            self.tok_embeddings.visit_params_mut(v)
+        })?;
+        v.param(
+            "pos_embeddings",
+            TensorRole::Parameter,
+            &mut self.pos_embeddings,
+        )?;
+        v.scoped("blocks", |v| {
+            for (i, block) in self.blocks.iter_mut().enumerate() {
+                let idx = i.to_string();
+                v.scoped(&idx, |v| block.visit_params_mut(v))?;
+            }
+            Ok(())
+        })?;
+        v.scoped("final_ln", |v| self.final_ln.visit_params_mut(v))?;
+        v.param("lm_head", TensorRole::Parameter, &mut self.lm_head)?;
         Ok(())
     }
 }

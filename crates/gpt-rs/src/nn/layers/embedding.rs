@@ -4,6 +4,7 @@
 //! wrappers for validating index tensors and capturing forward state.
 
 use crate::backend::spec::PortableBackend;
+use crate::module::{Module, ParamVisitor, ParamVisitorMut, TensorRole};
 use crate::ops::functional;
 use crate::tensor::{DType, DeviceTensor, Tensor};
 use anyhow::{bail, ensure, Result};
@@ -102,5 +103,15 @@ impl<B: PortableBackend> fmt::Debug for Embedding<B> {
         f.debug_struct("Embedding")
             .field("weight", &self.weight)
             .finish()
+    }
+}
+
+impl<B: PortableBackend + 'static> Module<B> for Embedding<B> {
+    fn visit_params(&self, v: &mut ParamVisitor<'_, B>) -> Result<()> {
+        v.param("weight", TensorRole::Parameter, &self.weight)
+    }
+
+    fn visit_params_mut(&mut self, v: &mut ParamVisitorMut<'_, B>) -> Result<()> {
+        v.param("weight", TensorRole::Parameter, &mut self.weight)
     }
 }

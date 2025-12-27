@@ -6,6 +6,7 @@ use gpt_rs_macros::capture_ptir;
 
 use super::conv::Conv2d;
 use crate::backend::spec::PortableBackend;
+use crate::module::{Module, ParamVisitor, ParamVisitorMut};
 use crate::nn::layers::Linear;
 use crate::ops::functional::common::CaptureIntoDeviceTensor;
 use crate::ops::functional::{max_pool2d, relu, reshape, transpose, Padding2d};
@@ -48,6 +49,26 @@ impl<B: PortableBackend + 'static> BasicBlock<B> {
         out = out.add(&identity)?;
         out = relu(self.backend.as_ref(), &out)?;
         Ok(out)
+    }
+}
+
+impl<B: PortableBackend + 'static> Module<B> for BasicBlock<B> {
+    fn visit_params(&self, v: &mut ParamVisitor<'_, B>) -> Result<()> {
+        v.scoped("conv1", |v| self.conv1.visit_params(v))?;
+        v.scoped("conv2", |v| self.conv2.visit_params(v))?;
+        if let Some(downsample) = &self.downsample {
+            v.scoped("downsample", |v| downsample.visit_params(v))?;
+        }
+        Ok(())
+    }
+
+    fn visit_params_mut(&mut self, v: &mut ParamVisitorMut<'_, B>) -> Result<()> {
+        v.scoped("conv1", |v| self.conv1.visit_params_mut(v))?;
+        v.scoped("conv2", |v| self.conv2.visit_params_mut(v))?;
+        if let Some(downsample) = &mut self.downsample {
+            v.scoped("downsample", |v| downsample.visit_params_mut(v))?;
+        }
+        Ok(())
     }
 }
 
@@ -348,5 +369,54 @@ impl<B: PortableBackend + 'static> ResNet34<B> {
         Ok(ResNet34::new(
             backend, conv1, layer1, layer2, layer3, layer4, fc,
         ))
+    }
+}
+
+impl<B: PortableBackend + 'static> Module<B> for ResNet34<B> {
+    fn visit_params(&self, v: &mut ParamVisitor<'_, B>) -> Result<()> {
+        v.scoped("conv1", |v| self.conv1.visit_params(v))?;
+
+        for (stage_idx, stage) in [&self.layer1, &self.layer2, &self.layer3, &self.layer4]
+            .into_iter()
+            .enumerate()
+        {
+            let stage_name = format!("layer{}", stage_idx + 1);
+            v.scoped(&stage_name, |v| {
+                for (block_idx, block) in stage.iter().enumerate() {
+                    let block_name = block_idx.to_string();
+                    v.scoped(&block_name, |v| block.visit_params(v))?;
+                }
+                Ok(())
+            })?;
+        }
+
+        v.scoped("fc", |v| self.fc.visit_params(v))?;
+        Ok(())
+    }
+
+    fn visit_params_mut(&mut self, v: &mut ParamVisitorMut<'_, B>) -> Result<()> {
+        v.scoped("conv1", |v| self.conv1.visit_params_mut(v))?;
+
+        for (stage_idx, stage) in [
+            &mut self.layer1,
+            &mut self.layer2,
+            &mut self.layer3,
+            &mut self.layer4,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let stage_name = format!("layer{}", stage_idx + 1);
+            v.scoped(&stage_name, |v| {
+                for (block_idx, block) in stage.iter_mut().enumerate() {
+                    let block_name = block_idx.to_string();
+                    v.scoped(&block_name, |v| block.visit_params_mut(v))?;
+                }
+                Ok(())
+            })?;
+        }
+
+        v.scoped("fc", |v| self.fc.visit_params_mut(v))?;
+        Ok(())
     }
 }

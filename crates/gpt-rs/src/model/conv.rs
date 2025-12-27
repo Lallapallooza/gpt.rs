@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::{ensure, Result};
 
 use crate::backend::spec::PortableBackend;
+use crate::module::{Module, ParamVisitor, ParamVisitorMut, TensorRole};
 use crate::ops::functional::{conv2d, Conv2dParams2d, Padding2d};
 use crate::tensor::DeviceTensor;
 
@@ -75,5 +76,23 @@ impl<B: PortableBackend + 'static> Conv2d<B> {
             self.bias.as_ref(),
             self.params,
         )
+    }
+}
+
+impl<B: PortableBackend + 'static> Module<B> for Conv2d<B> {
+    fn visit_params(&self, v: &mut ParamVisitor<'_, B>) -> Result<()> {
+        v.param("weight", TensorRole::Parameter, &self.weight)?;
+        if let Some(bias) = &self.bias {
+            v.param("bias", TensorRole::Parameter, bias)?;
+        }
+        Ok(())
+    }
+
+    fn visit_params_mut(&mut self, v: &mut ParamVisitorMut<'_, B>) -> Result<()> {
+        v.param("weight", TensorRole::Parameter, &mut self.weight)?;
+        if let Some(bias) = &mut self.bias {
+            v.param("bias", TensorRole::Parameter, bias)?;
+        }
+        Ok(())
     }
 }

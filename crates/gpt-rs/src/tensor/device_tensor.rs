@@ -12,18 +12,19 @@ use std::sync::{
 
 use crate::backend::spec::{PortableBackend, TensorInit, TensorSpec, ValueId};
 use crate::ops::graph::{CompiledGraph, GraphArena};
+use crate::params::{BaseParamId, ParamSource};
 
 type ArenaGroup<B> = (Arc<GraphArena<B>>, Vec<(usize, ValueId)>);
 
 static ARG_HANDLE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static PARAM_HANDLE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-fn next_arg_handle_id() -> u64 {
-    ARG_HANDLE_ID_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+fn next_arg_handle_id() -> u128 {
+    u128::from(ARG_HANDLE_ID_COUNTER.fetch_add(1, AtomicOrdering::Relaxed))
 }
 
-fn next_param_handle_id() -> u64 {
-    PARAM_HANDLE_ID_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+fn next_param_handle_id() -> u128 {
+    u128::from(PARAM_HANDLE_ID_COUNTER.fetch_add(1, AtomicOrdering::Relaxed))
 }
 
 /// Device-side tensor that wraps a backend handle and retains shape metadata.
@@ -209,6 +210,7 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     pub(crate) fn graph_value(&self) -> Option<(Arc<GraphArena<B>>, ValueId)> {
         match &*self.handle {
             LazyHandle::Input { .. } => None,
+            LazyHandle::Param { .. } => None,
             LazyHandle::Node { graph, value } => Some((Arc::clone(graph), *value)),
         }
     }
@@ -217,6 +219,19 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     pub fn materialize(&self) -> Result<B::TensorHandle> {
         match &*self.handle {
             LazyHandle::Input { tensor, .. } => Ok(tensor.clone()),
+            LazyHandle::Param {
+                base_id,
+                source,
+                cached,
+                ..
+            } => {
+                if let Some(handle) = cached.get() {
+                    return Ok(handle.clone());
+                }
+                let handle = source.load(*base_id)?;
+                let _ = cached.set(handle.clone());
+                Ok(handle)
+            }
             LazyHandle::Node { graph, value } => {
                 if let Some(handle) = graph.try_ready_handle(*value) {
                     return Ok(handle);
@@ -236,6 +251,20 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     pub fn freeze(&self) -> Result<Self> {
         match &*self.handle {
             LazyHandle::Input { .. } => Ok(self.clone()),
+            LazyHandle::Param { id, .. } => {
+                let handle = self.materialize()?;
+                Ok(DeviceTensor {
+                    backend: Arc::clone(&self.backend),
+                    shape: self.shape.clone(),
+                    dtype: self.dtype,
+                    handle: Arc::new(LazyHandle::Input {
+                        id: *id,
+                        role: InputRole::Param,
+                        tensor: handle,
+                    }),
+                    requires_grad: self.requires_grad,
+                })
+            }
             LazyHandle::Node { .. } => {
                 let handle = self.materialize()?;
                 Ok(DeviceTensor::from_handle(
@@ -259,6 +288,7 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                 role: InputRole::Param,
                 ..
             } => Ok(self.clone()),
+            LazyHandle::Param { .. } => Ok(self.clone()),
             _ => {
                 let handle = self.materialize()?;
                 Ok(DeviceTensor {
@@ -267,6 +297,60 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                     dtype: self.dtype,
                     handle: Arc::new(LazyHandle::Input {
                         id: next_param_handle_id(),
+                        role: InputRole::Param,
+                        tensor: handle,
+                    }),
+                    requires_grad: self.requires_grad,
+                })
+            }
+        }
+    }
+
+    /// Marks the tensor as a model parameter with an explicit stable identity.
+    ///
+    /// This is the preferred entrypoint for binding checkpoint parameter names to deterministic
+    /// ids, and for namespacing multiple co-resident model instances.
+    pub fn as_param_with_id(&self, stable_id: u128) -> Result<Self> {
+        match &*self.handle {
+            LazyHandle::Input {
+                role: InputRole::Param,
+                id,
+                ..
+            } if *id == stable_id => Ok(self.clone()),
+            LazyHandle::Param {
+                id,
+                base_id,
+                source,
+                cached,
+            } => {
+                if *id == stable_id {
+                    return Ok(self.clone());
+                }
+                let new_cached = once_cell::sync::OnceCell::new();
+                if let Some(handle) = cached.get() {
+                    let _ = new_cached.set(handle.clone());
+                }
+                Ok(DeviceTensor {
+                    backend: Arc::clone(&self.backend),
+                    shape: self.shape.clone(),
+                    dtype: self.dtype,
+                    handle: Arc::new(LazyHandle::Param {
+                        id: stable_id,
+                        base_id: *base_id,
+                        source: Arc::clone(source),
+                        cached: new_cached,
+                    }),
+                    requires_grad: self.requires_grad,
+                })
+            }
+            _ => {
+                let handle = self.materialize()?;
+                Ok(DeviceTensor {
+                    backend: Arc::clone(&self.backend),
+                    shape: self.shape.clone(),
+                    dtype: self.dtype,
+                    handle: Arc::new(LazyHandle::Input {
+                        id: stable_id,
                         role: InputRole::Param,
                         tensor: handle,
                     }),
@@ -290,6 +374,9 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
             match &*tensor.handle {
                 LazyHandle::Input { tensor: handle, .. } => {
                     results[idx] = Some(handle.clone());
+                }
+                LazyHandle::Param { .. } => {
+                    results[idx] = Some(tensor.materialize()?);
                 }
                 LazyHandle::Node { graph, value } => {
                     let key = Arc::as_ptr(graph) as usize;
@@ -321,6 +408,29 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
             backend_bridge::to_backend_dtype(self.dtype),
             backend_bridge::spec_shape_from_shape(&self.shape),
         )
+    }
+
+    pub fn lazy_param(
+        backend: Arc<B>,
+        shape: Shape,
+        dtype: DType,
+        stable_id: u128,
+        base_id: BaseParamId,
+        source: Arc<dyn ParamSource<B>>,
+        requires_grad: bool,
+    ) -> Self {
+        DeviceTensor {
+            backend,
+            shape,
+            dtype,
+            handle: Arc::new(LazyHandle::Param {
+                id: stable_id,
+                base_id,
+                source,
+                cached: once_cell::sync::OnceCell::new(),
+            }),
+            requires_grad,
+        }
     }
 }
 

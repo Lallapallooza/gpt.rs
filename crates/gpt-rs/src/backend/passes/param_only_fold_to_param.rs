@@ -173,7 +173,7 @@ impl<B: PortableBackend + 'static> FunctionPass<B> for ParamOnlyFoldToParamPass 
 
 struct StaticSubgraphDesc {
     leaf_param_ids: Vec<ValueId>,
-    leaf_param_stable_ids: Vec<u64>,
+    leaf_param_stable_ids: Vec<u128>,
     inst_set: HashSet<ValueId>,
     literal_hash: u64,
 }
@@ -317,7 +317,7 @@ fn describe_static_subgraph<B: PortableBackend + 'static>(
     let mut leaf_param_ids: Vec<ValueId> = leaf_set.into_iter().collect();
     leaf_param_ids.sort_by_key(|id| id.0);
 
-    let mut leaf_param_stable_ids: Vec<u64> = Vec::with_capacity(leaf_param_ids.len());
+    let mut leaf_param_stable_ids: Vec<u128> = Vec::with_capacity(leaf_param_ids.len());
     for id in &leaf_param_ids {
         let stable_id = cx
             .entry()
@@ -450,7 +450,7 @@ fn dag_hash_value<B: PortableBackend + 'static>(
             let role = cx.entry().role_of(value);
             hash = fnv1a_u64(hash, role.map(|r| r as u64).unwrap_or(0));
             let stable_id = cx.entry().stable_id_of(value).unwrap_or(0);
-            hash = fnv1a_u64(hash, stable_id);
+            hash = fnv1a_u128(hash, stable_id);
             if let Some(ty) = type_map.get(&value) {
                 if let Ok(bytes) = bincode::serialize(ty) {
                     hash = fnv1a_bytes(hash, &bytes);
@@ -500,16 +500,28 @@ fn dag_hash_value<B: PortableBackend + 'static>(
     rec(function, cx, def_map, type_map, value, &mut memo)
 }
 
-fn derived_param_id(backend_name: &str, dag_hash: u64, desc: &StaticSubgraphDesc) -> u64 {
-    let mut hash = fnv1a_init();
-    hash = fnv1a_bytes(hash, b"ptir:derived_param");
-    hash = fnv1a_bytes(hash, backend_name.as_bytes());
-    hash = fnv1a_u64(hash, dag_hash);
-    hash = fnv1a_u64(hash, desc.literal_hash);
+fn derived_param_id(backend_name: &str, dag_hash: u64, desc: &StaticSubgraphDesc) -> u128 {
+    let mut hash1 = fnv1a_init();
+    hash1 = fnv1a_bytes(hash1, b"ptir:derived_param:lo");
+    hash1 = fnv1a_bytes(hash1, backend_name.as_bytes());
+    hash1 = fnv1a_u64(hash1, dag_hash);
+    hash1 = fnv1a_u64(hash1, desc.literal_hash);
     for leaf in &desc.leaf_param_stable_ids {
-        hash = fnv1a_u64(hash, *leaf);
+        hash1 = fnv1a_u128(hash1, *leaf);
     }
-    hash | (1u64 << 63)
+
+    let mut hash2 = fnv1a_init();
+    hash2 = fnv1a_bytes(hash2, b"ptir:derived_param:hi");
+    hash2 = fnv1a_bytes(hash2, backend_name.as_bytes());
+    hash2 = fnv1a_u64(hash2, dag_hash.rotate_left(13));
+    hash2 = fnv1a_u64(hash2, desc.literal_hash.rotate_left(29));
+    for leaf in desc.leaf_param_stable_ids.iter().rev() {
+        hash2 = fnv1a_u128(hash2, *leaf);
+    }
+
+    let mut id = (u128::from(hash2) << 64) | u128::from(hash1);
+    id |= 1u128 << 127;
+    id
 }
 
 fn failure_cache_key(backend_name: &str, dag_hash: u64) -> u64 {
@@ -542,5 +554,9 @@ fn fnv1a_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
 }
 
 fn fnv1a_u64(hash: u64, value: u64) -> u64 {
+    fnv1a_bytes(hash, &value.to_le_bytes())
+}
+
+fn fnv1a_u128(hash: u64, value: u128) -> u64 {
     fnv1a_bytes(hash, &value.to_le_bytes())
 }

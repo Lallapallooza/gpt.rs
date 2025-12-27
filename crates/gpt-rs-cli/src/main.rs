@@ -3,13 +3,13 @@ use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use gpt_rs::backend::conversion::{self, ConversionOptions};
 use gpt_rs::backend::spec::Program;
 use gpt_rs::backend::text_ir::parse_program;
-use gpt_rs::checkpoint::CheckpointLoader;
 use gpt_rs::inference::generate::Generator;
 use gpt_rs::inference::sampler::Sampler;
 use gpt_rs::io::tensor_archive::TensorArchive;
 use gpt_rs::model::{Gpt, MobileNetV2, ResNet34};
 use gpt_rs::ops::trace::{self, FileTraceOptions, FileTraceSink, ProgramDumpFilter};
 use gpt_rs::profiling;
+use gpt_rs::runtime;
 use gpt_rs::tensor::{DeviceTensor, Shape, Tensor};
 use gpt_rs::tokenizer::{Tokenizer, TokenizerConfig};
 use gpt_rs::PortableBackend;
@@ -433,9 +433,12 @@ fn run_gpt<B: PortableBackend + 'static>(
     args: &RunGptArgs,
     profile: bool,
 ) -> Result<()> {
-    let loaded = CheckpointLoader::load(&args.checkpoint)
-        .with_context(|| format!("failed to load checkpoint {}", args.checkpoint.display()))?;
-    let model: Gpt<B> = loaded.into_model(Arc::clone(backend))?;
+    let model: Gpt<B> = runtime::load_gpt_checkpoint_with_namespace(
+        Arc::clone(backend),
+        &args.checkpoint,
+        runtime::next_namespace(),
+    )
+    .with_context(|| format!("failed to load checkpoint {}", args.checkpoint.display()))?;
     let tokenizer = load_tokenizer(&args.tokenizer)?;
 
     let prompt_tokens = tokenizer.encode(&args.prompt);
@@ -638,10 +641,12 @@ fn run_vision_resnet34<B: PortableBackend + 'static>(
     args: &RunVisionArgs,
     profile: bool,
 ) -> Result<()> {
-    let tensors = TensorArchive::load(&args.weights)
-        .with_context(|| format!("failed to read weights archive {}", args.weights.display()))?;
-    let model: ResNet34<B> = ResNet34::from_named_tensors(Arc::clone(backend), tensors)
-        .with_context(|| "failed to build ResNet34 from named tensors")?;
+    let model: ResNet34<B> = runtime::load_resnet34_weights_with_namespace(
+        Arc::clone(backend),
+        &args.weights,
+        runtime::next_namespace(),
+    )
+    .with_context(|| format!("failed to read weights archive {}", args.weights.display()))?;
 
     run_vision_model("resnet34", backend, &model, args, profile)
 }
@@ -651,10 +656,12 @@ fn run_vision_mobilenet_v2<B: PortableBackend + 'static>(
     args: &RunVisionArgs,
     profile: bool,
 ) -> Result<()> {
-    let tensors = TensorArchive::load(&args.weights)
-        .with_context(|| format!("failed to read weights archive {}", args.weights.display()))?;
-    let model: MobileNetV2<B> = MobileNetV2::from_named_tensors(Arc::clone(backend), tensors)
-        .with_context(|| "failed to build MobileNetV2 from named tensors")?;
+    let model: MobileNetV2<B> = runtime::load_mobilenet_v2_weights_with_namespace(
+        Arc::clone(backend),
+        &args.weights,
+        runtime::next_namespace(),
+    )
+    .with_context(|| format!("failed to read weights archive {}", args.weights.display()))?;
 
     run_vision_model("mobilenet_v2", backend, &model, args, profile)
 }
@@ -730,10 +737,12 @@ fn trace_vision_resnet34<B: PortableBackend + 'static>(
     args: &TraceVisionArgs,
     profile: bool,
 ) -> Result<()> {
-    let tensors = TensorArchive::load(&args.weights)
-        .with_context(|| format!("failed to read weights archive {}", args.weights.display()))?;
-    let model: ResNet34<B> = ResNet34::from_named_tensors(Arc::clone(backend), tensors)
-        .with_context(|| "failed to build ResNet34 from named tensors")?;
+    let model: ResNet34<B> = runtime::load_resnet34_weights_with_namespace(
+        Arc::clone(backend),
+        &args.weights,
+        runtime::next_namespace(),
+    )
+    .with_context(|| format!("failed to read weights archive {}", args.weights.display()))?;
 
     trace_vision_model("resnet34", backend, &model, args, profile)
 }
@@ -743,10 +752,12 @@ fn trace_vision_mobilenet_v2<B: PortableBackend + 'static>(
     args: &TraceVisionArgs,
     profile: bool,
 ) -> Result<()> {
-    let tensors = TensorArchive::load(&args.weights)
-        .with_context(|| format!("failed to read weights archive {}", args.weights.display()))?;
-    let model: MobileNetV2<B> = MobileNetV2::from_named_tensors(Arc::clone(backend), tensors)
-        .with_context(|| "failed to build MobileNetV2 from named tensors")?;
+    let model: MobileNetV2<B> = runtime::load_mobilenet_v2_weights_with_namespace(
+        Arc::clone(backend),
+        &args.weights,
+        runtime::next_namespace(),
+    )
+    .with_context(|| format!("failed to read weights archive {}", args.weights.display()))?;
 
     trace_vision_model("mobilenet_v2", backend, &model, args, profile)
 }

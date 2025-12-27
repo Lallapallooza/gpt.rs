@@ -11,13 +11,13 @@ pub struct EntryParam {
     pub id: ValueId,
     pub ty: ValueType,
     pub role: InputRole,
-    pub stable_id: Option<u64>,
+    pub stable_id: Option<u128>,
 }
 
 #[derive(Clone, Debug)]
 pub struct PlanInputs {
     pub roles: Vec<InputRole>,
-    pub stable_ids: Vec<Option<u64>>,
+    pub stable_ids: Vec<Option<u128>>,
 }
 
 pub struct EntrySignature<B> {
@@ -49,7 +49,7 @@ impl<B> EntrySignature<B> {
         self.param(value).map(|p| p.role)
     }
 
-    pub(crate) fn stable_id_of(&self, value: ValueId) -> Option<u64> {
+    pub(crate) fn stable_id_of(&self, value: ValueId) -> Option<u128> {
         self.param(value).and_then(|p| p.stable_id)
     }
 
@@ -67,7 +67,7 @@ impl<B> EntrySignature<B> {
         &mut self,
         function: &mut Function,
         role: InputRole,
-        stable_id: Option<u64>,
+        stable_id: Option<u128>,
         ty: ValueType,
     ) -> Result<ValueId> {
         if role == InputRole::Param {

@@ -5,6 +5,7 @@
 
 use super::linear::{Linear, LinearGradients, LinearState};
 use crate::backend::spec::PortableBackend;
+use crate::module::{Module, ParamVisitor, ParamVisitorMut, TensorRole};
 use crate::ops::functional;
 use crate::tensor::DeviceTensor;
 use anyhow::{bail, Result};
@@ -100,5 +101,31 @@ impl<B: PortableBackend + 'static> FeedForward<B> {
     /// Returns the backend handle that owns the block's parameters.
     pub fn backend(&self) -> Arc<B> {
         Arc::clone(&self.backend)
+    }
+}
+
+impl<B: PortableBackend + 'static> Module<B> for FeedForward<B> {
+    fn visit_params(&self, v: &mut ParamVisitor<'_, B>) -> Result<()> {
+        v.param("w_in", TensorRole::Parameter, &self.w_in.weight)?;
+        if let Some(bias) = &self.w_in.bias {
+            v.param("b_in", TensorRole::Parameter, bias)?;
+        }
+        v.param("w_out", TensorRole::Parameter, &self.w_out.weight)?;
+        if let Some(bias) = &self.w_out.bias {
+            v.param("b_out", TensorRole::Parameter, bias)?;
+        }
+        Ok(())
+    }
+
+    fn visit_params_mut(&mut self, v: &mut ParamVisitorMut<'_, B>) -> Result<()> {
+        v.param("w_in", TensorRole::Parameter, &mut self.w_in.weight)?;
+        if let Some(bias) = &mut self.w_in.bias {
+            v.param("b_in", TensorRole::Parameter, bias)?;
+        }
+        v.param("w_out", TensorRole::Parameter, &mut self.w_out.weight)?;
+        if let Some(bias) = &mut self.w_out.bias {
+            v.param("b_out", TensorRole::Parameter, bias)?;
+        }
+        Ok(())
     }
 }

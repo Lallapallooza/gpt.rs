@@ -1,5 +1,6 @@
 use super::linear::{Linear, LinearGradients, LinearState};
 use crate::backend::spec::PortableBackend;
+use crate::module::{Module, ParamVisitor, ParamVisitorMut, TensorRole};
 use crate::ops::functional::{self, AttentionCache, DecodeKvCache};
 use crate::tensor::DeviceTensor;
 use anyhow::{bail, ensure, Result};
@@ -329,5 +330,31 @@ impl<B: PortableBackend> fmt::Debug for CausalSelfAttention<B> {
         f.debug_struct("CausalSelfAttention")
             .field("config", &self.config)
             .finish()
+    }
+}
+
+impl<B: PortableBackend + 'static> Module<B> for CausalSelfAttention<B> {
+    fn visit_params(&self, v: &mut ParamVisitor<'_, B>) -> Result<()> {
+        v.param("w_qkv", TensorRole::Parameter, &self.proj_qkv.weight)?;
+        if let Some(bias) = &self.proj_qkv.bias {
+            v.param("b_qkv", TensorRole::Parameter, bias)?;
+        }
+        v.param("w_out", TensorRole::Parameter, &self.proj_out.weight)?;
+        if let Some(bias) = &self.proj_out.bias {
+            v.param("b_out", TensorRole::Parameter, bias)?;
+        }
+        Ok(())
+    }
+
+    fn visit_params_mut(&mut self, v: &mut ParamVisitorMut<'_, B>) -> Result<()> {
+        v.param("w_qkv", TensorRole::Parameter, &mut self.proj_qkv.weight)?;
+        if let Some(bias) = &mut self.proj_qkv.bias {
+            v.param("b_qkv", TensorRole::Parameter, bias)?;
+        }
+        v.param("w_out", TensorRole::Parameter, &mut self.proj_out.weight)?;
+        if let Some(bias) = &mut self.proj_out.bias {
+            v.param("b_out", TensorRole::Parameter, bias)?;
+        }
+        Ok(())
     }
 }

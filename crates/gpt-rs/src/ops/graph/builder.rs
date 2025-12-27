@@ -23,7 +23,7 @@ impl<'a, B: PortableBackend + 'static> GraphBuilder<'a, B> {
     /// Existing handles are reused so repeated captures share parameters.
     pub fn import(&mut self, tensor: &DeviceTensor<B>) -> Result<ValueId> {
         match &**tensor.lazy_handle() {
-            LazyHandle::Input { .. } => {
+            LazyHandle::Input { .. } | LazyHandle::Param { .. } => {
                 let role = tensor
                     .lazy_handle()
                     .role()

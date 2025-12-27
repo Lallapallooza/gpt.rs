@@ -455,7 +455,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
         let mut input_values: Vec<_> = inputs.into_iter().collect();
         input_values.sort_by_key(|value| value.0);
 
-        let mut bindings: Vec<(ValueId, TensorSpec, InputRole, Option<u64>)> =
+        let mut bindings: Vec<(ValueId, TensorSpec, InputRole, Option<u128>)> =
             Vec::with_capacity(input_values.len());
         for value in &input_values {
             if let Some(param) = inner
@@ -680,7 +680,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
                         .copied()
                         .ok_or_else(|| anyhow!("missing parameter mapping for {:?}", spec.value))?;
                     let stable_id = match role {
-                        InputRole::Arg => Some(param_id.0 as u64),
+                        InputRole::Arg => Some(u128::from(param_id.0)),
                         InputRole::Param => {
                             let record = inner
                                 .parameters

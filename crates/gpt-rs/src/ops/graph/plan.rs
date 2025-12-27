@@ -57,7 +57,7 @@ impl PlanKey {
 #[derive(Clone, Debug)]
 pub(super) struct InputSignature {
     pub(super) role: InputRole,
-    pub(super) stable_id: Option<u64>,
+    pub(super) stable_id: Option<u128>,
     pub(super) spec: TensorSpec,
 }
 
@@ -205,7 +205,7 @@ impl SignatureData {
 #[derive(Serialize)]
 struct SignatureInput {
     role: InputRole,
-    stable_id: Option<u64>,
+    stable_id: Option<u128>,
     spec: TensorSpec,
 }
 

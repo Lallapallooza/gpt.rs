@@ -11,15 +11,15 @@ use std::sync::Mutex;
 pub trait ParamResolver: Send + Sync {
     type Handle: Clone + Send + Sync + 'static;
 
-    fn get(&self, stable_id: u64) -> Option<Self::Handle>;
+    fn get(&self, stable_id: u128) -> Option<Self::Handle>;
 
-    fn set(&self, stable_id: u64, handle: Self::Handle);
+    fn set(&self, stable_id: u128, handle: Self::Handle);
 }
 
 /// Default in-memory implementation used when backends do not provide a resolver.
 #[derive(Debug, Default)]
 pub struct InMemoryParamResolver<H: Clone + Send + Sync + 'static> {
-    map: Mutex<HashMap<u64, H>>,
+    map: Mutex<HashMap<u128, H>>,
 }
 
 impl<H: Clone + Send + Sync + 'static> InMemoryParamResolver<H> {
@@ -33,7 +33,7 @@ impl<H: Clone + Send + Sync + 'static> InMemoryParamResolver<H> {
 impl<H: Clone + Send + Sync + 'static> ParamResolver for InMemoryParamResolver<H> {
     type Handle = H;
 
-    fn get(&self, stable_id: u64) -> Option<Self::Handle> {
+    fn get(&self, stable_id: u128) -> Option<Self::Handle> {
         self.map
             .lock()
             .expect("param resolver poisoned")
@@ -41,7 +41,7 @@ impl<H: Clone + Send + Sync + 'static> ParamResolver for InMemoryParamResolver<H
             .cloned()
     }
 
-    fn set(&self, stable_id: u64, handle: Self::Handle) {
+    fn set(&self, stable_id: u128, handle: Self::Handle) {
         self.map
             .lock()
             .expect("param resolver poisoned")

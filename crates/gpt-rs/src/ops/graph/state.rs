@@ -13,7 +13,7 @@ pub(super) struct GraphInner<B: PortableBackend + 'static> {
     pub(super) nodes: HashMap<ValueId, NodeRecord<B>>,
     pub(super) order: Vec<ValueId>,
     pub(super) parameters: Vec<ParameterRecord<B>>,
-    pub(super) parameter_lookup: HashMap<(InputRole, u64), ValueId>,
+    pub(super) parameter_lookup: HashMap<(InputRole, u128), ValueId>,
     pub(super) exports: HashSet<ValueId>,
     pub(super) version: u64,
 }
@@ -62,5 +62,5 @@ pub(super) struct ParameterRecord<B: PortableBackend + 'static> {
     pub(super) spec: TensorSpec,
     pub(super) handle: B::TensorHandle,
     pub(super) role: InputRole,
-    pub(super) stable_id: Option<u64>,
+    pub(super) stable_id: Option<u128>,
 }

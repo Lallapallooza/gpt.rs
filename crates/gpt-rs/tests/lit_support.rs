@@ -140,7 +140,7 @@ fn entry_signature_for_case<B: PortableBackend + 'static>(
     meta: &str,
 ) -> (EntrySignature<B>, InMemoryParamResolver<B::TensorHandle>) {
     let mut roles: Vec<InputRole> = Vec::new();
-    let mut stable_ids: Vec<Option<u64>> = Vec::new();
+    let mut stable_ids: Vec<Option<u128>> = Vec::new();
 
     for line in meta.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
         if let Some(rest) = line.strip_prefix("roles:") {
@@ -159,7 +159,7 @@ fn entry_signature_for_case<B: PortableBackend + 'static>(
             stable_ids = rest
                 .split(|ch: char| ch == ',' || ch.is_whitespace())
                 .filter(|v| !v.is_empty())
-                .map(|token| Some(token.parse::<u64>().expect("stable id")))
+                .map(|token| Some(token.parse::<u128>().expect("stable id")))
                 .collect();
             continue;
         }
@@ -180,7 +180,7 @@ fn entry_signature_for_case<B: PortableBackend + 'static>(
             .get(idx)
             .copied()
             .flatten()
-            .or(Some(param_id.0 as u64));
+            .or(Some(u128::from(param_id.0)));
 
         if role == InputRole::Param {
             let stable_id = stable_id.expect("param stable id");

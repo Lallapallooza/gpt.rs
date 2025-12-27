@@ -842,7 +842,7 @@ impl FaerPortableBackend {
 
 #[derive(Default)]
 struct FaerDerivedParamResolver {
-    entries: Mutex<HashMap<u64, CpuTensor>>,
+    entries: Mutex<HashMap<u128, CpuTensor>>,
 }
 
 impl FaerDerivedParamResolver {
@@ -856,7 +856,7 @@ impl FaerDerivedParamResolver {
 impl ParamResolver for FaerDerivedParamResolver {
     type Handle = CpuTensor;
 
-    fn get(&self, key: u64) -> Option<Self::Handle> {
+    fn get(&self, key: u128) -> Option<Self::Handle> {
         self.entries
             .lock()
             .expect("const cache poisoned")
@@ -864,7 +864,7 @@ impl ParamResolver for FaerDerivedParamResolver {
             .cloned()
     }
 
-    fn set(&self, key: u64, handle: Self::Handle) {
+    fn set(&self, key: u128, handle: Self::Handle) {
         self.entries
             .lock()
             .expect("const cache poisoned")

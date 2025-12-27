@@ -6,6 +6,7 @@ use gpt_rs_macros::capture_ptir;
 
 use super::conv::Conv2d;
 use crate::backend::spec::PortableBackend;
+use crate::module::{Module, ParamVisitor, ParamVisitorMut};
 use crate::nn::layers::Linear;
 use crate::ops::functional::common::CaptureIntoDeviceTensor;
 use crate::ops::functional::{relu6, reshape, transpose};
@@ -57,6 +58,26 @@ impl<B: PortableBackend + 'static> InvertedResidual<B> {
         }
 
         Ok(out)
+    }
+}
+
+impl<B: PortableBackend + 'static> Module<B> for InvertedResidual<B> {
+    fn visit_params(&self, v: &mut ParamVisitor<'_, B>) -> Result<()> {
+        if let Some(expand) = &self.expand {
+            v.scoped("expand", |v| expand.visit_params(v))?;
+        }
+        v.scoped("depthwise", |v| self.depthwise.visit_params(v))?;
+        v.scoped("project", |v| self.project.visit_params(v))?;
+        Ok(())
+    }
+
+    fn visit_params_mut(&mut self, v: &mut ParamVisitorMut<'_, B>) -> Result<()> {
+        if let Some(expand) = &mut self.expand {
+            v.scoped("expand", |v| expand.visit_params_mut(v))?;
+        }
+        v.scoped("depthwise", |v| self.depthwise.visit_params_mut(v))?;
+        v.scoped("project", |v| self.project.visit_params_mut(v))?;
+        Ok(())
     }
 }
 
@@ -339,5 +360,35 @@ impl<B: PortableBackend + 'static> MobileNetV2<B> {
         )?;
 
         Ok(MobileNetV2::new(backend, stem, blocks, head, classifier))
+    }
+}
+
+impl<B: PortableBackend + 'static> Module<B> for MobileNetV2<B> {
+    fn visit_params(&self, v: &mut ParamVisitor<'_, B>) -> Result<()> {
+        v.scoped("stem", |v| self.stem.visit_params(v))?;
+        v.scoped("blocks", |v| {
+            for (idx, block) in self.blocks.iter().enumerate() {
+                let name = idx.to_string();
+                v.scoped(&name, |v| block.visit_params(v))?;
+            }
+            Ok(())
+        })?;
+        v.scoped("head", |v| self.head.visit_params(v))?;
+        v.scoped("classifier", |v| self.classifier.visit_params(v))?;
+        Ok(())
+    }
+
+    fn visit_params_mut(&mut self, v: &mut ParamVisitorMut<'_, B>) -> Result<()> {
+        v.scoped("stem", |v| self.stem.visit_params_mut(v))?;
+        v.scoped("blocks", |v| {
+            for (idx, block) in self.blocks.iter_mut().enumerate() {
+                let name = idx.to_string();
+                v.scoped(&name, |v| block.visit_params_mut(v))?;
+            }
+            Ok(())
+        })?;
+        v.scoped("head", |v| self.head.visit_params_mut(v))?;
+        v.scoped("classifier", |v| self.classifier.visit_params_mut(v))?;
+        Ok(())
     }
 }

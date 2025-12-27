@@ -4,6 +4,7 @@
 //! `layer_norm`, returning convenient state objects for reuse.
 
 use crate::backend::spec::PortableBackend;
+use crate::module::{Module, ParamVisitor, ParamVisitorMut, TensorRole};
 use crate::ops::functional;
 use crate::tensor::{DeviceTensor, Shape, Tensor};
 use anyhow::{bail, Result};
@@ -117,5 +118,19 @@ impl<B: PortableBackend> fmt::Debug for LayerNorm<B> {
             .field("beta", &self.beta)
             .field("eps", &self.eps)
             .finish()
+    }
+}
+
+impl<B: PortableBackend + 'static> Module<B> for LayerNorm<B> {
+    fn visit_params(&self, v: &mut ParamVisitor<'_, B>) -> Result<()> {
+        v.param("gamma", TensorRole::Parameter, &self.gamma)?;
+        v.param("beta", TensorRole::Parameter, &self.beta)?;
+        Ok(())
+    }
+
+    fn visit_params_mut(&mut self, v: &mut ParamVisitorMut<'_, B>) -> Result<()> {
+        v.param("gamma", TensorRole::Parameter, &mut self.gamma)?;
+        v.param("beta", TensorRole::Parameter, &mut self.beta)?;
+        Ok(())
     }
 }

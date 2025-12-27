@@ -180,7 +180,7 @@ fn run_pass<B: PortableBackend + 'static, P: FunctionPass<B>>(
             id,
             ty,
             role: InputRole::Arg,
-            stable_id: Some(id.0 as u64),
+            stable_id: Some(u128::from(id.0)),
         })
         .collect::<Vec<_>>();
     let entry = EntrySignature::new(entry_params);

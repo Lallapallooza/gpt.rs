@@ -40,6 +40,7 @@ backend impl (faer, ref-cpu, ...)
 cargo build
 
 # run GPT-2 generation (checkpoint + tokenizer)
+# (see docs/gpt2_integration.md to export GPT-2 checkpoint/tokenizer)
 cargo run --release -p gpt-rs-cli -- run gpt --prompt "Hello" --max-tokens 64 \
   --checkpoint checkpoints/gpt2.bin --tokenizer configs/gpt2_tokenizer.json
 
@@ -70,12 +71,15 @@ See `docs/README.md` for a doc index, `docs/testing.md` for dumps/profiling deta
 ## Testing
 
 ```bash
-cargo test                                # workspace unit + integration tests
-cargo test -p gpt-rs-backend-faer --test backend_suite  # Torch parity (requires libtorch via tch)
+cargo test  # workspace unit + integration tests (no Torch)
+
+cargo test -p gpt-rs-backend-faer --test backend_suite  # backend smoke tests
+cargo test -p gpt-rs-backend-faer --features torch --test backend_suite -- --nocapture  # Torch parity + timings (libtorch via tch)
+cargo test -p gpt-rs --features torch --test torch_parity  # smaller parity set (ref-cpu backend)
 ```
 
 Torch parity tests live under `crates/gpt-rs-backend-tests/src/torch_parity/` and are wired into each backend via
-`define_backend_tests!`. See `docs/testing.md`.
+`define_backend_tests!` (behind the `torch` feature). See `docs/testing.md`.
 
 ## Status
 

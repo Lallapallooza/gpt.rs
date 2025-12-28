@@ -19,3 +19,4 @@ Doc policy:
 - `backend.md`: PTIR backend contract (ptir.v0.4). Treat as a spec.
 - `ops.md`: ops/capture/graph execution architecture (implementation-oriented).
 - `backend_optimizer.md`: PTIR rewrite/optimizer architecture (implementation-oriented).
+- `formats.md`: file formats (`GPTRSCHK` checkpoints, `GPTRSTEN` tensor archives).

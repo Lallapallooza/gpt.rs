@@ -230,6 +230,10 @@ uv run python scripts/eval.py --suite scripts/eval_suites/vision.json
 
 ### Dumps + profiling
 
+Notes:
+- `--profile` prints tables only when built with `-F gpt-rs/profiler` (otherwise gpt-rs-cli warns).
+- `--dump-dir` and `--dump-mode` work without the profiler feature.
+
 - Dump PTIR programs while validating a vision model (requires rebuilding the Python extension after
   enabling the new debug helpers):
   ```bash
@@ -257,6 +261,15 @@ uv run python scripts/eval.py --suite scripts/eval_suites/vision.json
 
 Legacy wrapper scripts have been removed; use `scripts/eval.py` directly with
 `--workload validate|trace|bench|run`.
+
+### Debugging knobs (env vars)
+
+- `GPTRS_EAGER=1`: force tensors created from captured nodes to materialize immediately (useful for debugging fusion).
+- `GPTRS_OPT_PRE_ITERS` / `GPTRS_OPT_POST_ITERS`: tune optimizer fixed-point iterations.
+- `GPTRS_PASS_STATS=1`: print per-pass optimizer stats to stdout.
+- C backend only:
+  - `GPTRS_PROFILE_BACKEND=1`: enable C backend profiling counters (requires building with C backend support).
+  - `GPTRS_C_CACHE_DIR=/path`: override the on-disk cache directory used by the C backend.
 
 ## 4) Model-agnostic CLI runner (gpt-rs-cli)
 

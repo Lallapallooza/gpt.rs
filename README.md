@@ -12,10 +12,12 @@ Warning: expect churn. APIs, formats, and model coverage change quickly.
 
 ## Demo
 
+Video: (TODO)
+
 ## Benchmarks (early)
 
 Single-thread CPU numbers from `scripts/eval.py --workload bench` on AMD Ryzen 9 9950X3D (Linux),
-commit `fc2d50b`, backend `c` vs Torch baselines:
+commit `f206c44`, backend `c` vs Torch baselines:
 
 | Workload | gpt.rs | torch | Speedup |
 | --- | ---: | ---: | ---: |

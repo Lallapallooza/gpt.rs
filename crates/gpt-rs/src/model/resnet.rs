@@ -12,6 +12,17 @@ use crate::ops::functional::common::CaptureIntoDeviceTensor;
 use crate::ops::functional::{max_pool2d, relu, reshape, transpose, Padding2d};
 use crate::tensor::{DeviceTensor, DeviceTensorOps, IntoDeviceTensor, Tensor};
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ResNet34Config {
+    pub num_classes: usize,
+}
+
+impl Default for ResNet34Config {
+    fn default() -> Self {
+        Self { num_classes: 1000 }
+    }
+}
+
 #[derive(Clone)]
 pub struct BasicBlock<B: PortableBackend + 'static> {
     backend: Arc<B>,

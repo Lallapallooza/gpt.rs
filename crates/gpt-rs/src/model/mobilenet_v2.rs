@@ -12,6 +12,17 @@ use crate::ops::functional::common::CaptureIntoDeviceTensor;
 use crate::ops::functional::{relu6, reshape, transpose};
 use crate::tensor::{DeviceTensor, DeviceTensorOps, IntoDeviceTensor, Tensor};
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MobileNetV2Config {
+    pub num_classes: usize,
+}
+
+impl Default for MobileNetV2Config {
+    fn default() -> Self {
+        Self { num_classes: 1000 }
+    }
+}
+
 #[derive(Clone)]
 pub struct InvertedResidual<B: PortableBackend + 'static> {
     backend: Arc<B>,

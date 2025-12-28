@@ -1,4 +1,3 @@
-use super::GptConfig;
 use crate::backend::spec::PortableBackend;
 use crate::module::{Module, ParamVisitor, ParamVisitorMut, TensorRole};
 use crate::nn::{
@@ -7,7 +6,8 @@ use crate::nn::{
     LayerNormGradients, LayerNormState,
 };
 use crate::ops::functional::{
-    self, build_registry, AttentionCache, DecodeKvCache, FunctionalRegistryHandle,
+    self, build_registry, AttentionCache, DecodeKvCache, FunctionalOverrides,
+    FunctionalRegistryHandle,
 };
 use crate::tensor::{DeviceTensor, DeviceTensorOps, Shape, Tensor};
 use anyhow::{anyhow, bail, ensure, Result};
@@ -15,6 +15,34 @@ use rand::Rng;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GptConfig {
+    pub vocab_size: usize,
+    pub context_length: usize,
+    pub embed_dim: usize,
+    pub num_layers: usize,
+    pub num_heads: usize,
+    pub mlp_ratio: usize,
+    pub dropout: f32,
+    #[serde(default)]
+    pub functional_overrides: FunctionalOverrides,
+}
+
+impl Default for GptConfig {
+    fn default() -> Self {
+        Self {
+            vocab_size: 50257,
+            context_length: 1024,
+            embed_dim: 768,
+            num_layers: 12,
+            num_heads: 12,
+            mlp_ratio: 4,
+            dropout: 0.0,
+            functional_overrides: FunctionalOverrides::default(),
+        }
+    }
+}
 
 pub struct GptBlock<B: PortableBackend + 'static> {
     pub backend: Arc<B>,

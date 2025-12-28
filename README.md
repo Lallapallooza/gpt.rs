@@ -1,12 +1,46 @@
 # gpt.rs
 
-Pure Rust experimentation toolkit for portable tensor programs (PTIR) and small model implementations.
+Rust-first experimentation toolkit for **portable tensor programs** (PTIR) and small model implementations.
 
-This workspace contains:
+Write models once, keep the math portable, and let backends compete on execution:
+- Layers call portable functionals (no open-coded kernels).
+- Functionals capture PTIR graphs and can be overridden at runtime.
+- Backends execute PTIR and can rewrite/fuse portable graphs into custom kernels.
+- Parameters have stable `u128` ids and can be streamed lazily from checkpoints.
 
-- `crates/gpt-rs`: core library (tensors, PTIR capture, layers, models, tokenizer, checkpoints).
-- `crates/gpt-rs-cli`: model runner CLI (`generate` / `forward` / `trace`) with PTIR dumping + profiling hooks.
-- `scripts/eval.py`: Torch-baselined validate/trace/bench runner for full models.
+## Highlights
+
+- **Capability-based runtime**: `runtime::load_model` returns a dynamic model handle; the CLI runs `generate` / `forward` / `trace` without hardcoding model kinds. See [`docs/runtime.md`](docs/runtime.md).
+- **Parameter streaming + stable ids**: checkpoint-backed `ParamSource` loads weights on demand; backends can memoize derived parameter formats by stable id. See [`docs/howto.md`](docs/howto.md) and [`docs/formats.md`](docs/formats.md).
+- **Backend rewrites**: pattern-driven PTIR rewrites via `#[ptir_pattern]` views and backend optimizer passes. See [`docs/backend_optimizer.md`](docs/backend_optimizer.md) (and `crates/gpt-rs-backend-c/src/optimizer/conv2d.rs` for a real example).
+- **Correctness tooling**: Torch parity at the kernel level and end-to-end model baselines via Python runners. See [`docs/testing.md`](docs/testing.md).
+- **Debuggability**: PTIR dumps (`--dump-dir`), profiling (`--profile` with `-F gpt-rs/profiler`), and eager debugging (`GPTRS_EAGER=1`).
+
+## Docs
+
+Start here:
+- [`docs/README.md`](docs/README.md) (doc index + policy)
+- [`docs/howto.md`](docs/howto.md) (add models/layers/functionals/backends)
+- [`docs/runtime.md`](docs/runtime.md) (loader, capability dispatch, overrides)
+- [`docs/testing.md`](docs/testing.md) (Torch parity + dumps/profiling + Python baselines)
+- [`docs/formats.md`](docs/formats.md) (checkpoint + tensor archive formats)
+
+Reference:
+- [`docs/backend.md`](docs/backend.md) (PTIR backend contract, ptir.v0.4)
+- [`docs/backend_optimizer.md`](docs/backend_optimizer.md) (optimizer pipeline + patterns)
+- [`docs/ops.md`](docs/ops.md) (PTIR capture/graphs/execution)
+- [`docs/frontend.md`](docs/frontend.md) (frontend layering + runtime overrides)
+
+Scripts:
+- [`scripts/README.md`](scripts/README.md) (Python utilities: export + eval)
+
+## Repository layout
+
+- `crates/gpt-rs`: core library (tensors, PTIR capture, layers, models, tokenizer, checkpoints, runtime).
+- `crates/gpt-rs-cli`: model runner CLI (`generate` / `forward` / `trace`) with dump/profile hooks.
+- `crates/gpt-rs-backend-*`: backend implementations (faer, ref-cpu, optional C backend).
+- `crates/gpt-rs-backend-tests`: backend suite + Torch parity harness (via `tch` / libtorch).
+- `scripts/`: Python baselines and exporters (`scripts/eval.py`, `scripts/export_gpt2.py`, ...).
 
 ## Architecture (high level)
 
@@ -29,9 +63,6 @@ backend::spec::PortableBackend (dot_general, reduce_window, gather, elementwise,
         v
 backend impl (faer, ref-cpu, ...)
 ```
-
-- Layers never “open code” kernels; they call portable functionals.
-- Functionals are pure math + PTIR capture; they can be swapped at runtime via the registry/overrides.
 
 ## Quick Start
 
@@ -69,11 +100,10 @@ uv run python scripts/eval.py --model mobilenet_v2 --workload trace --stop-on-fi
 uv run python scripts/eval.py --model gpt2 --workload bench --threads 1 4 --bench-tokens 1 64
 ```
 
-See `docs/README.md` for a doc index and `docs/testing.md` for dumps/profiling details.
-
 Notes:
 - Select a backend with `--backend` (or `GPTRS_BACKEND`, default: `faer`).
 - `--profile` prints tables only when built with `-F gpt-rs/profiler`.
+- Use `--dump-dir` / `--dump-mode` to capture PTIR programs (Rust CLI or Python runner).
 
 ## Testing
 

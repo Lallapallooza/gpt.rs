@@ -11,6 +11,8 @@ PTIR is designed to be optimization-friendly: LLM attention is expressed as a **
 
 Source of truth: `crates/gpt-rs/src/backend/spec.rs`. If this doc and the code disagree, fix the doc or fix the code.
 
+Backend implementation notes (how each backend executes PTIR): [backends/README.md](backends/README.md).
+
 ## Versioning
 
 - Serialized PTIR programs MUST set `spec_version = ptir.v0.4`.

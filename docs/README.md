@@ -17,6 +17,7 @@ Doc policy:
 - [code_map.md](code_map.md): where the functional/capture plumbing lives.
 
 ## Reference
+- [backends/README.md](backends/README.md): how each backend executes PTIR (ref-cpu, faer, c).
 - [backend.md](backend.md): PTIR backend contract (ptir.v0.4). Treat as a spec.
 - [ops.md](ops.md): ops/capture/graph execution architecture (implementation-oriented).
 - [backend_optimizer.md](backend_optimizer.md): PTIR rewrite/optimizer architecture (implementation-oriented).

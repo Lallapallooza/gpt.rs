@@ -26,6 +26,7 @@ Start here:
 - [docs/formats.md](docs/formats.md) (checkpoint + tensor archive formats)
 
 Reference:
+- [docs/backends/README.md](docs/backends/README.md) (how each backend works: ref-cpu, faer, c)
 - [docs/backend.md](docs/backend.md) (PTIR backend contract, ptir.v0.4)
 - [docs/backend_optimizer.md](docs/backend_optimizer.md) (optimizer pipeline + patterns)
 - [docs/ops.md](docs/ops.md) (PTIR capture/graphs/execution)

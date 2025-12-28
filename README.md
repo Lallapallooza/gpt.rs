@@ -12,8 +12,6 @@ Warning: expect churn. APIs, formats, and model coverage change quickly.
 
 ## Demo
 
-Video: (TODO)
-
 ## Benchmarks (early)
 
 Single-thread CPU numbers from `scripts/eval.py --workload bench` on AMD Ryzen 9 9950X3D (Linux),
@@ -73,30 +71,34 @@ Scripts:
 
 ## Roadmap (TODO)
 
-- Backends:
-  - triton backend
-  - nvgpu + cudnn backend
-  - xla backend
-  - iree backend
-- Training:
-  - training full implementation
-  - autograd
-  - distributed training support
-- Inference:
-  - quantized models full support
-  - paged attention
-  - speculative decoding
-- Tooling / interop:
-  - Chrome profiler integration for visualization
-  - full python interop: define/train models in python
-  - pytorch importer
-- Models:
-  - qwen
-  - llama
-  - deepseek
-  - gptoss
-  - diffusion models
-  - speech models
+Backends:
+- [ ] Triton backend
+- [ ] NVIDIA GPU (CUDA + cuDNN) backend
+- [ ] XLA backend
+- [ ] IREE backend
+
+Training:
+- [ ] Full training loop
+- [ ] Autograd
+- [ ] Distributed training
+
+Inference:
+- [ ] Quantized models (end-to-end)
+- [ ] Paged attention
+- [ ] Speculative decoding
+
+Tooling / interop:
+- [ ] Chrome trace export (profiler visualization)
+- [ ] Full Python interop (define/train models in Python)
+- [ ] PyTorch importer
+
+Models:
+- [ ] Qwen
+- [ ] Llama
+- [ ] DeepSeek
+- [ ] GPT-OSS
+- [ ] Diffusion models
+- [ ] Speech models
 
 ## Repository layout
 

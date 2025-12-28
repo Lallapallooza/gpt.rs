@@ -5,7 +5,7 @@ Pure Rust experimentation toolkit for portable tensor programs (PTIR) and small 
 This workspace contains:
 
 - `crates/gpt-rs`: core library (tensors, PTIR capture, layers, models, tokenizer, checkpoints).
-- `crates/gpt-rs-cli`: model runner CLI (`run` / `trace`) with PTIR dumping + profiling hooks.
+- `crates/gpt-rs-cli`: model runner CLI (`generate` / `forward` / `trace`) with PTIR dumping + profiling hooks.
 - `scripts/eval.py`: Torch-baselined validate/trace/bench runner for full models.
 
 ## Architecture (high level)
@@ -41,7 +41,7 @@ cargo build
 
 # run GPT-2 generation (checkpoint + tokenizer)
 # (see docs/gpt2_integration.md to export GPT-2 checkpoint/tokenizer)
-cargo run --release -p gpt-rs-cli -- run gpt --prompt "Hello" --max-tokens 64 \
+cargo run --release -p gpt-rs-cli -- generate --prompt "Hello" --max-tokens 64 \
   --checkpoint checkpoints/gpt2.bin --tokenizer configs/gpt2_tokenizer.json
 
 # export torchvision weights (gpt.rs checkpoint)
@@ -49,7 +49,7 @@ uv sync
 uv run python scripts/export_model_weights.py --model resnet34 --out checkpoints/resnet34.bin
 
 # run an image model (deterministic random input by default)
-cargo run --release -p gpt-rs-cli -- run resnet34 --checkpoint checkpoints/resnet34.bin
+cargo run --release -p gpt-rs-cli -- forward --checkpoint checkpoints/resnet34.bin
 ```
 
 ## Torch Baselines (Python)

@@ -265,11 +265,12 @@ with the same debugging hooks:
 
 - `--dump-dir` / `--dump-mode` to dump PTIR programs
 - `--profile` to print gpt-rs profiler tables
+- `--backend` (or `GPTRS_BACKEND`) to choose a backend (default: `faer`)
 
-### GPT run (generation)
+### Text generation (any causal LM)
 
 ```bash
-cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- run gpt \
+cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- generate \
   --prompt "Hi" \
   --max-tokens 128 \
   --temperature 0.8 \
@@ -281,7 +282,7 @@ cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- run gpt \
   --profile
 ```
 
-### Vision run (ResNet34 / MobileNetV2)
+### Forward pass (vision models today)
 
 First export weights from Torch into a gpt.rs checkpoint:
 
@@ -293,14 +294,13 @@ uv run python scripts/export_model_weights.py --model mobilenet_v2 --out checkpo
 Then run the model (generates a deterministic random input unless you pass `--input`):
 
 ```bash
-cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- run resnet34 --checkpoint checkpoints/resnet34.bin --profile
-cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- run mobilenet_v2 --checkpoint checkpoints/mobilenet_v2.bin --profile
+cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- forward --checkpoint checkpoints/resnet34.bin --profile
+cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- forward --checkpoint checkpoints/mobilenet_v2.bin --profile
 ```
 
 ### Vision trace (layer-by-layer dumps)
 
 ```bash
-cargo run --release -p gpt-rs-cli -- trace resnet34 \
-  --checkpoint checkpoints/resnet34.bin \
+cargo run --release -p gpt-rs-cli -- trace --checkpoint checkpoints/resnet34.bin \
   --out dumps/resnet34_trace.tensors
 ```

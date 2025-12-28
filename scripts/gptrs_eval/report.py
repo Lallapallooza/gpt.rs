@@ -4,7 +4,7 @@ import json
 from dataclasses import asdict
 from typing import Any, Sequence
 
-from .core import BenchResult, OutputFormat, TraceResult, ValidationResult
+from .core import BenchResult, OutputFormat, ValidationResult
 
 
 def _to_jsonable(obj: Any) -> Any:
@@ -27,25 +27,6 @@ def print_validation(res: ValidationResult) -> None:
     print(f"max_abs_diff={res.max_abs_diff:.6e} mean_abs_diff={res.mean_abs_diff:.6e}")
     if res.extra:
         print(f"extra={res.extra}")
-
-
-def print_trace(res: TraceResult, *, max_lines: int = 200) -> None:
-    print(f"model={res.model} allclose={res.ok}")
-    if res.missing_in_gptrs:
-        print(
-            f"missing_in_gpt_rs={res.missing_in_gptrs[:10]}"
-            f"{' ...' if len(res.missing_in_gptrs) > 10 else ''}"
-        )
-    lines = 0
-    for d in res.diffs:
-        if lines >= max_lines:
-            break
-        if not d.allclose or d.key == "logits":
-            print(
-                f"{d.key}: shape={d.shape} max_abs_diff={d.max_abs_diff:.6e} "
-                f"mean_abs_diff={d.mean_abs_diff:.6e} allclose={d.allclose}"
-            )
-            lines += 1
 
 
 def print_bench(results: Sequence[BenchResult], fmt: OutputFormat) -> None:

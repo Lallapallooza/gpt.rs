@@ -216,14 +216,12 @@ The canonical entrypoint is `scripts/eval.py`, which runs both gpt-rs and a
 Torch baseline for:
 
 - `validate`: compare logits
-- `trace`: compare intermediate activations (when the model adapter supports it)
 - `bench`: compare throughput/latency
 
 Examples:
 
 ```bash
 uv run python scripts/eval.py --model resnet34 --workload validate
-uv run python scripts/eval.py --model mobilenet_v2 --workload trace --stop-on-first-mismatch
 uv run python scripts/eval.py --model gpt2 --workload bench --threads 1 4 --bench-tokens 1 64
 uv run python scripts/eval.py --suite scripts/eval_suites/vision.json
 ```
@@ -260,7 +258,7 @@ Notes:
   ```
 
 Legacy wrapper scripts have been removed; use `scripts/eval.py` directly with
-`--workload validate|trace|bench|run`.
+`--workload validate|bench|run`.
 
 ### Debugging knobs (env vars)
 
@@ -309,11 +307,4 @@ Then run the model (generates a deterministic random input unless you pass `--in
 ```bash
 cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- forward --checkpoint checkpoints/resnet34.bin --profile
 cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- forward --checkpoint checkpoints/mobilenet_v2.bin --profile
-```
-
-### Vision trace (layer-by-layer dumps)
-
-```bash
-cargo run --release -p gpt-rs-cli -- trace --checkpoint checkpoints/resnet34.bin \
-  --out dumps/resnet34_trace.tensors
 ```

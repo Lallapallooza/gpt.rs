@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .core import BenchStats, TraceDiff, TraceResult, ValidationResult
+from .core import BenchStats, ValidationResult
 
 
 def validate_arrays(
@@ -19,73 +19,6 @@ def validate_arrays(
     mean_abs = float(diff.mean()) if diff.size else 0.0
     ok = bool(np.allclose(torch_np, gptrs_np, rtol=rtol, atol=atol))
     return ok, max_abs, mean_abs
-
-
-def compare_traces(
-    torch_trace: Dict[str, np.ndarray],
-    gptrs_trace: Dict[str, np.ndarray],
-    *,
-    rtol: float,
-    atol: float,
-    model: str,
-    max_lines: int = 200,
-    stop_on_first_mismatch: bool = False,
-) -> TraceResult:
-    ordered_keys = list(torch_trace.keys())
-    missing_in_gptrs = [k for k in ordered_keys if k not in gptrs_trace]
-    missing_in_torch = [k for k in gptrs_trace.keys() if k not in torch_trace]
-
-    diffs: List[TraceDiff] = []
-    ok = True
-    printed = 0
-
-    for key in ordered_keys:
-        if key not in gptrs_trace:
-            continue
-        torch_np = torch_trace[key]
-        gpt_np = gptrs_trace[key]
-        if torch_np.shape != gpt_np.shape:
-            ok = False
-            diffs.append(
-                TraceDiff(
-                    key=key,
-                    shape=tuple(torch_np.shape),
-                    max_abs_diff=float("inf"),
-                    mean_abs_diff=float("inf"),
-                    allclose=False,
-                )
-            )
-            if stop_on_first_mismatch:
-                break
-            continue
-
-        close, max_abs, mean_abs = validate_arrays(torch_np, gpt_np, rtol=rtol, atol=atol)
-        if not close:
-            ok = False
-        diffs.append(
-            TraceDiff(
-                key=key,
-                shape=tuple(torch_np.shape),
-                max_abs_diff=max_abs,
-                mean_abs_diff=mean_abs,
-                allclose=close,
-            )
-        )
-        if printed < max_lines and (not close or key == "logits"):
-            printed += 1
-        if stop_on_first_mismatch and not close:
-            break
-
-    if missing_in_gptrs:
-        ok = False
-
-    return TraceResult(
-        model=model,
-        ok=ok,
-        diffs=diffs,
-        missing_in_gptrs=missing_in_gptrs,
-        missing_in_torch=missing_in_torch,
-    )
 
 
 def time_many(

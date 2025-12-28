@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Unified validation/trace/bench runner for gpt.rs models.
+"""Unified validation/bench runner for gpt.rs models.
 
 Models are provided via small "case" adapters under `scripts/gptrs_eval/models/`.
 This script:
   - runs gpt-rs (default backend: faer) and Torch baselines
-  - can validate logits, compare traces, and benchmark performance
+  - can validate logits and benchmark performance
   - can run a suite (JSON/YAML) to define multiple runs/sweeps
 """
 
@@ -124,7 +124,7 @@ def _add_base_args(parser: argparse.ArgumentParser, *, include_hidden: bool) -> 
     parser.add_argument("--model", help="Model case to run")
     parser.add_argument(
         "--workload",
-        choices=["validate", "trace", "bench", "run", "all"],
+        choices=["validate", "bench", "run", "all"],
         default="all",
         help="What to run (default: all supported)",
     )
@@ -172,14 +172,6 @@ def _add_base_args(parser: argparse.ArgumentParser, *, include_hidden: bool) -> 
     )
     parser.add_argument("--json-out", type=Path, help="Write results JSON to this path")
 
-    # Trace controls (stored in cfg.params for cases that support trace)
-    parser.add_argument("--max-lines", type=int, default=200, help="Max trace lines to print")
-    parser.add_argument(
-        "--stop-on-first-mismatch",
-        action="store_true",
-        help="Stop after first mismatching activation (trace)",
-    )
-
     # Suite controls (pre-parse only)
     parser.add_argument("--suite", type=Path, help="JSON/YAML suite file")
     parser.add_argument("--list-models", action="store_true", help="List available model cases")
@@ -221,10 +213,6 @@ def _namespace_to_cfg_dict(args: argparse.Namespace) -> Tuple[Dict[str, Any], Li
         "iters": raw.pop("iters"),
         "params": {},
     }
-
-    # Trace knobs become params for cases that support trace.
-    cfg["params"]["max_lines"] = raw.pop("max_lines")
-    cfg["params"]["stop_on_first_mismatch"] = raw.pop("stop_on_first_mismatch")
 
     # Drop non-config keys.
     raw.pop("suite", None)
@@ -286,8 +274,6 @@ def _run_case(cfg_dict: Dict[str, Any], threads_list: List[int], workload: str) 
 
         if w == "validate":
             results.append(case.validate(cfg))
-        elif w == "trace":
-            results.append(case.trace(cfg))
         elif w == "run":
             results.append(case.run(cfg))
         else:
@@ -296,16 +282,14 @@ def _run_case(cfg_dict: Dict[str, Any], threads_list: List[int], workload: str) 
     return results
 
 
-def _print_results(results: List[Any], *, fmt: str, max_lines: int) -> None:
-    from gptrs_eval.core import BenchResult, CliRunResult, TraceResult, ValidationResult
-    from gptrs_eval.report import print_bench, print_trace, print_validation
+def _print_results(results: List[Any], *, fmt: str) -> None:
+    from gptrs_eval.core import BenchResult, CliRunResult, ValidationResult
+    from gptrs_eval.report import print_bench, print_validation
 
     bench: List[BenchResult] = []
     for r in results:
         if isinstance(r, ValidationResult):
             print_validation(r)
-        elif isinstance(r, TraceResult):
-            print_trace(r, max_lines=max_lines)
         elif isinstance(r, BenchResult):
             bench.append(r)
         elif isinstance(r, CliRunResult):
@@ -318,13 +302,11 @@ def _print_results(results: List[Any], *, fmt: str, max_lines: int) -> None:
 
 
 def _all_ok(results: List[Any]) -> bool:
-    from gptrs_eval.core import CliRunResult, TraceResult, ValidationResult
+    from gptrs_eval.core import CliRunResult, ValidationResult
 
     ok = True
     for r in results:
         if isinstance(r, ValidationResult) and not r.ok:
-            ok = False
-        if isinstance(r, TraceResult) and not r.ok:
             ok = False
         if isinstance(r, CliRunResult) and r.exit_code != 0:
             ok = False
@@ -387,7 +369,7 @@ def _run_suite(path: Path, *, fmt: str, json_out: Optional[Path]) -> int:
             json_out.write_text(out, encoding="utf-8")
         return 0 if _all_ok(results) else 1
 
-    _print_results(results, fmt=fmt, max_lines=200)
+    _print_results(results, fmt=fmt)
     if json_out:
         from gptrs_eval.report import dumps_json
 
@@ -436,7 +418,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.json_out.write_text(out, encoding="utf-8")
         return 0 if _all_ok(results) else 1
 
-    _print_results(results, fmt=str(args.format), max_lines=int(args.max_lines))
+    _print_results(results, fmt=str(args.format))
     if args.json_out:
         args.json_out.write_text(dumps_json(results), encoding="utf-8")
     return 0 if _all_ok(results) else 1

@@ -67,7 +67,6 @@ Raw tensor payloads:
 Tensor archives are used for:
 
 - CLI vision inputs (`gpt-rs-cli forward --input ... --input-key input`)
-- CLI trace output (`gpt-rs-cli trace --out ...`)
 - Optional CLI logits output (`gpt-rs-cli forward --out ...`)
 
 Layout:

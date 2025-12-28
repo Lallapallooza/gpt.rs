@@ -48,62 +48,32 @@ def test_backend():
         return False
 
 
-def test_tensor_ops():
-    """Test basic tensor operations."""
+def test_runtime_api():
+    """Test that runtime APIs exist and basic errors surface correctly."""
     try:
         import gpt_rs
-        import numpy as np
 
-        gpt_rs.set_backend("cpu")
+        assert hasattr(gpt_rs, "load_model")
+        assert hasattr(gpt_rs, "LoadedModel")
+        assert hasattr(gpt_rs, "Tokenizer")
 
-        # Create tensor
-        x = gpt_rs.Tensor.from_numpy(np.array([[1.0, 2.0]], dtype=np.float32))
-        print(f"✓ Created tensor with shape: {x.shape}")
-
-        # Softmax
-        out = gpt_rs.functional.softmax_last_dim(x)
-        result = out.numpy()
-        print(f"✓ Softmax output: {result}")
-
-        # Verify softmax sums to 1
-        if abs(result.sum() - 1.0) < 1e-5:
-            print("✓ Softmax verification passed")
-            return True
-        else:
-            print(f"✗ Softmax sum is {result.sum()}, expected 1.0")
+        # We don't ship checkpoints with the Python package; just validate error plumbing.
+        try:
+            _ = gpt_rs.load_model("this_file_should_not_exist.bin")
+            print("✗ Expected load_model() to fail for a missing file")
             return False
+        except Exception:
+            pass
 
-    except Exception as e:
-        print(f"✗ Tensor operations test failed: {e}")
-        import traceback
+        info = gpt_rs.version_info()
+        print(f"✓ version_info: {info}")
 
-        traceback.print_exc()
-        return False
-
-
-def test_nn_layer():
-    """Test NN layer."""
-    try:
-        import gpt_rs
-        import numpy as np
-
-        gpt_rs.set_backend("cpu")
-
-        # Create linear layer
-        np.random.seed(42)
-        weight = gpt_rs.Tensor.from_numpy(np.random.randn(2, 3).astype(np.float32))
-        bias = gpt_rs.Tensor.from_numpy(np.random.randn(3).astype(np.float32))
-        linear = gpt_rs.nn.Linear(weight, bias)
-
-        # Forward pass
-        x = gpt_rs.Tensor.from_numpy(np.random.randn(1, 2).astype(np.float32))
-        output = linear.forward(x)
-
-        print(f"✓ Linear layer forward pass: input {x.shape} -> output {output.shape}")
+        feats = gpt_rs.backend_features()
+        print(f"✓ backend_features: {feats}")
 
         return True
     except Exception as e:
-        print(f"✗ NN layer test failed: {e}")
+        print(f"✗ Runtime API test failed: {e}")
         import traceback
 
         traceback.print_exc()
@@ -120,8 +90,7 @@ def main():
     tests = [
         ("Import", test_import),
         ("Backend", test_backend),
-        ("Tensor Operations", test_tensor_ops),
-        ("NN Layer", test_nn_layer),
+        ("Runtime API", test_runtime_api),
     ]
 
     results = []

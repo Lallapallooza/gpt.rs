@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Tuple
 
-Workload = Literal["validate", "trace", "bench", "run", "all"]
+Workload = Literal["validate", "bench", "run", "all"]
 OutputFormat = Literal["table", "json", "csv"]
 
 
@@ -29,25 +29,6 @@ class ValidationResult:
     gptrs_shape: Tuple[int, ...]
     max_abs_diff: float
     mean_abs_diff: float
-    extra: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class TraceDiff:
-    key: str
-    shape: Tuple[int, ...]
-    max_abs_diff: float
-    mean_abs_diff: float
-    allclose: bool
-
-
-@dataclass(frozen=True)
-class TraceResult:
-    model: str
-    ok: bool
-    diffs: List[TraceDiff]
-    missing_in_gptrs: List[str]
-    missing_in_torch: List[str]
     extra: Dict[str, Any] = field(default_factory=dict)
 
 

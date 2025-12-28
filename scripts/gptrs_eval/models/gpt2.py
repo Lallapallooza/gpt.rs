@@ -72,7 +72,7 @@ class Gpt2Case:
             raise SystemExit(
                 "gpt_rs not installed. Install via:\n"
                 "  pip install maturin\n"
-                "  cd crates/gpt-rs-py && maturin develop --release --features faer --skip-install\n"
+                "  cd crates/gpt-rs-py && maturin develop --release --features faer\n"
             ) from err
 
         gpt = cast(Any, gpt_rs)
@@ -82,7 +82,7 @@ class Gpt2Case:
         checkpoint = Path(cfg.params["checkpoint"])
 
         tokenizer = gpt.Tokenizer.from_file(str(tokenizer_path))
-        model = gpt.model.Gpt.from_checkpoint(str(checkpoint))
+        model = gpt.load_model(str(checkpoint))
         return tokenizer, model
 
     def validate(self, cfg: RunConfig):

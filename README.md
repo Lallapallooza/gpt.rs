@@ -46,7 +46,7 @@ GPTRS_C_CACHE_DIR=./.cache/gpt_rs_c_backend uv run python scripts/eval.py \
 
 ## Highlights
 
-- **Capability-based runtime**: `runtime::load_model` returns a dynamic model handle; the CLI runs `generate` / `forward` / `trace` without hardcoding model kinds. See [docs/runtime.md](docs/runtime.md).
+- **Capability-based runtime**: `runtime::load_model` returns a dynamic model handle; the CLI runs `generate` / `forward` without hardcoding model kinds. See [docs/runtime.md](docs/runtime.md).
 - **Parameter streaming + stable ids**: checkpoint-backed `ParamSource` loads weights on demand; backends can memoize derived parameter formats by stable id. See [docs/howto.md](docs/howto.md) and [docs/formats.md](docs/formats.md).
 - **Backend rewrites**: pattern-driven PTIR rewrites via `#[ptir_pattern]` views and backend optimizer passes. See [docs/backend_optimizer.md](docs/backend_optimizer.md) (and [crates/gpt-rs-backend-c/src/optimizer/conv2d.rs](crates/gpt-rs-backend-c/src/optimizer/conv2d.rs) for a real example).
 - **Correctness tooling**: Torch parity at the kernel level and end-to-end model baselines via Python runners. See [docs/testing.md](docs/testing.md).
@@ -105,7 +105,7 @@ Models:
 ## Repository layout
 
 - `crates/gpt-rs`: core library (tensors, PTIR capture, layers, models, tokenizer, checkpoints, runtime).
-- `crates/gpt-rs-cli`: model runner CLI (`generate` / `forward` / `trace`) with dump/profile hooks.
+- `crates/gpt-rs-cli`: model runner CLI (`generate` / `forward`) with dump/profile hooks.
 - `crates/gpt-rs-backend-*`: backend implementations (faer, ref-cpu, optional C backend).
 - `crates/gpt-rs-backend-tests`: backend suite + Torch parity harness (via `tch` / libtorch).
 - `scripts/`: Python baselines and exporters (`scripts/eval.py`, `scripts/export_gpt2.py`, ...).
@@ -156,7 +156,7 @@ cargo run --release -p gpt-rs-cli -- forward --checkpoint checkpoints/resnet34.b
 
 ## Torch Baselines (Python)
 
-The canonical entrypoint is `scripts/eval.py` (validate / trace / bench) which runs both:
+The canonical entrypoint is `scripts/eval.py` (validate / bench) which runs both:
 
 ```bash
 uv sync
@@ -164,7 +164,6 @@ uv pip install maturin
 cd crates/gpt-rs-py && uv run maturin develop --release --features faer && cd ../..
 
 uv run python scripts/eval.py --model resnet34 --workload validate
-uv run python scripts/eval.py --model mobilenet_v2 --workload trace --stop-on-first-mismatch
 uv run python scripts/eval.py --model gpt2 --workload bench --threads 1 4 --bench-tokens 1 64
 ```
 

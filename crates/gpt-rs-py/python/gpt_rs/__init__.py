@@ -1,30 +1,17 @@
-"""
-gpt-rs: Pure Rust GPT-style transformer with Python bindings
+"""gpt-rs: Python bindings.
 
-A high-performance transformer library with PyTorch-like API.
-
-Quick Start:
-    >>> import gpt_rs
-    >>> import numpy as np
-    >>>
-    >>> # Create a tensor from NumPy
-    >>> arr = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
-    >>> tensor = gpt_rs.Tensor.from_numpy(arr)
+This package is intentionally small: it focuses on loading checkpoint-backed models and running
+inference (forward / generation), while keeping tensor/layer internals Rust-only.
 """
 
-from gpt_rs import (
-    functional,  # noqa: F401
-    gpt,  # noqa: F401
-    model,  # noqa: F401
-    nn,  # noqa: F401
-    vision,  # noqa: F401
-)
 from gpt_rs._native import (  # noqa: F401
-    Tensor,
+    LoadedModel,
     Tokenizer,
+    backend_features,
     clear_dump_dir,
     get_backend,
     list_backends,
+    load_model,
     profiling_pop_section,
     profiling_push_section,
     profiling_reset,
@@ -37,15 +24,23 @@ from gpt_rs._native import (  # noqa: F401
     profiling_trace_reset,
     set_backend,
     set_dump_dir,
+    supported_backends,
+    supported_model_kinds,
+    version_info,
 )
 
 __version__ = "0.1.0"
 __all__ = [
-    "Tensor",
+    "LoadedModel",
     "Tokenizer",
+    "load_model",
     "set_backend",
     "get_backend",
     "list_backends",
+    "supported_backends",
+    "supported_model_kinds",
+    "backend_features",
+    "version_info",
     "set_dump_dir",
     "clear_dump_dir",
     "profiling_reset",
@@ -58,9 +53,4 @@ __all__ = [
     "profiling_trace_disable",
     "profiling_trace_reset",
     "profiling_take_trace_json",
-    "functional",
-    "gpt",
-    "model",
-    "nn",
-    "vision",
 ]

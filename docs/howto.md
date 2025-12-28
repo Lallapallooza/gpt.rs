@@ -28,7 +28,6 @@ Checklist:
    - `forward(ModelInput)` returns `ModelOutput`.
    - If applicable, expose capabilities:
      - Causal LM generation: return `Some(self)` from `as_causal_lm()`.
-     - Vision tracing: implement `trace_vision(...) -> Ok(Some(trace))`.
 6. Register the model factory:
    - Today this is a list in `crates/gpt-rs/src/runtime/mod.rs` (`model_factories()`).
 7. Add a checkpoint exporter and baseline:

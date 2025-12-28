@@ -16,7 +16,7 @@ For the layering model and runtime functional overrides, see [frontend.md](front
 
 Core crates:
 - `crates/gpt-rs`: library (tensors, PTIR capture, layers, models, tokenizer, checkpoints).
-- `crates/gpt-rs-cli`: thin runner with `generate` / `forward` / `trace` and dump/profile flags.
+- `crates/gpt-rs-cli`: thin runner with `generate` / `forward` and dump/profile flags.
 - `crates/gpt-rs-backend-tests`: shared backend suite + Torch parity harness (via `tch` / libtorch).
 - `crates/gpt-rs-backend-faer`: optimized CPU backend (recommended default).
 - `crates/gpt-rs-backend-ref-cpu`: slow reference backend for debugging/spec bring-up.
@@ -30,7 +30,7 @@ Core modules (inside `crates/gpt-rs/src/`):
 - `backend`: PTIR backend contract + hook points (profiling/debug wrappers).
 - `nn`: parameterized layers composed from functionals.
 - `model`: concrete model assemblies (and any model-specific helpers).
-- `runtime`: model loading, model capability adapters (causal LM / vision tracing), and functional override plumbing.
+- `runtime`: model loading, model capability adapters (causal LM), and functional override plumbing.
 - `inference`: sampling + incremental generation (`Generator`).
 - `tokenizer`: encode/decode and tokenizer config.
 
@@ -45,4 +45,4 @@ Core modules (inside `crates/gpt-rs/src/`):
 ## Correctness and validation
 
 - Kernel-level correctness: backend suite + Torch parity (see [testing.md](testing.md)).
-- End-to-end model baselines: `scripts/eval.py` (validate / trace / bench) against Torch/HF.
+- End-to-end model baselines: `scripts/eval.py` (validate / bench) against Torch/HF.

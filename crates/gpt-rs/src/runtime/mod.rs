@@ -31,8 +31,6 @@ pub enum ModelOutput {
     Tensor(Tensor),
 }
 
-pub type VisionTrace<B> = Vec<(String, DeviceTensor<B>)>;
-
 pub trait LoadedModel<B: PortableBackend + 'static>: Send {
     fn kind(&self) -> &str;
 
@@ -40,10 +38,6 @@ pub trait LoadedModel<B: PortableBackend + 'static>: Send {
 
     fn as_causal_lm(&self) -> Option<&dyn CausalLanguageModel<B>> {
         None
-    }
-
-    fn trace_vision(&self, _input_nchw: &DeviceTensor<B>) -> Result<Option<VisionTrace<B>>> {
-        Ok(None)
     }
 }
 
@@ -72,12 +66,6 @@ impl<B: PortableBackend + 'static> LoadedModel<B> for ModelHandle<B> {
 
     fn as_causal_lm(&self) -> Option<&dyn CausalLanguageModel<B>> {
         self.inner.as_causal_lm().is_some().then_some(self)
-    }
-
-    fn trace_vision(&self, input_nchw: &DeviceTensor<B>) -> Result<Option<VisionTrace<B>>> {
-        with_registry(Arc::clone(&self.registry), || {
-            self.inner.trace_vision(input_nchw)
-        })
     }
 }
 
@@ -316,13 +304,6 @@ impl<B: PortableBackend + 'static> LoadedModel<B> for ResNet34<B> {
             other => bail!("ResNet34 does not accept input {:?}", other_kind(&other)),
         }
     }
-
-    fn trace_vision(
-        &self,
-        input_nchw: &DeviceTensor<B>,
-    ) -> Result<Option<Vec<(String, DeviceTensor<B>)>>> {
-        Ok(Some(self.forward_trace(input_nchw)?))
-    }
 }
 
 impl<B: PortableBackend + 'static> LoadedModel<B> for MobileNetV2<B> {
@@ -337,12 +318,5 @@ impl<B: PortableBackend + 'static> LoadedModel<B> for MobileNetV2<B> {
             )),
             other => bail!("MobileNetV2 does not accept input {:?}", other_kind(&other)),
         }
-    }
-
-    fn trace_vision(
-        &self,
-        input_nchw: &DeviceTensor<B>,
-    ) -> Result<Option<Vec<(String, DeviceTensor<B>)>>> {
-        Ok(Some(self.forward_trace(input_nchw)?))
     }
 }

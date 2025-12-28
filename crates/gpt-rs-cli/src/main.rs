@@ -89,9 +89,6 @@ enum Command {
     /// Run a model forward pass once (tokens or vision input).
     Forward(ForwardArgs),
 
-    /// Capture intermediate tensors for models that support tracing (vision today).
-    Trace(TraceArgs),
-
     /// Convert a PTIR program into a target IR module.
     Convert(ConvertArgs),
 
@@ -184,20 +181,6 @@ struct ForwardArgs {
     /// Optional output tensor archive path for logits ("logits" tensor).
     #[arg(long)]
     out: Option<PathBuf>,
-}
-
-#[derive(ClapArgs, Clone)]
-struct TraceArgs {
-    /// Model checkpoint (self-describing `GPTRSCHK`).
-    #[arg(long)]
-    checkpoint: PathBuf,
-
-    #[command(flatten)]
-    vision: VisionInputArgs,
-
-    /// Output tensor archive path (all traced tensors).
-    #[arg(long)]
-    out: PathBuf,
 }
 
 #[derive(ClapArgs, Clone)]
@@ -352,7 +335,6 @@ fn run_with_backend<B: PortableBackend + 'static>(
     match command {
         Command::Generate(args) => run_generate(&backend, &args, profile),
         Command::Forward(args) => run_forward(&backend, &args, profile),
-        Command::Trace(args) => run_trace(&backend, &args, profile),
         Command::Convert(_) => unreachable!(),
         Command::Patterns(_) => unreachable!(),
     }
@@ -692,57 +674,5 @@ fn run_forward<B: PortableBackend + 'static>(
             .with_context(|| format!("failed to write output archive {}", out.display()))?;
     }
 
-    Ok(())
-}
-
-fn run_trace<B: PortableBackend + 'static>(
-    backend: &Arc<B>,
-    args: &TraceArgs,
-    profile: bool,
-) -> Result<()> {
-    let model = runtime::load_model_with_namespace(
-        Arc::clone(backend),
-        &args.checkpoint,
-        runtime::next_namespace(),
-    )
-    .with_context(|| format!("failed to load checkpoint {}", args.checkpoint.display()))?;
-
-    println!("model={}", model.kind());
-    let input = load_vision_input_tensor(&args.vision)?;
-    let input_device = DeviceTensor::from_host(Arc::clone(backend), input)
-        .with_context(|| "failed to move input to device")?;
-
-    if profile {
-        profiling::reset();
-    }
-    let traced = model
-        .trace_vision(&input_device)?
-        .ok_or_else(|| anyhow!("model kind '{}' does not support tracing", model.kind()))?;
-
-    let mut names = Vec::with_capacity(traced.len());
-    let mut tensors = Vec::with_capacity(traced.len());
-    for (trace_name, tensor) in traced {
-        names.push(trace_name);
-        tensors.push(tensor);
-    }
-
-    let refs = tensors.iter().collect::<Vec<_>>();
-    let handles = DeviceTensor::materialize_many(&refs)
-        .with_context(|| "failed to materialize trace outputs")?;
-
-    let mut out = HashMap::new();
-    for ((trace_name, tensor), handle) in names
-        .into_iter()
-        .zip(tensors.iter())
-        .zip(handles.into_iter())
-    {
-        let literal = backend.to_literal(&handle)?;
-        let host = Tensor::from_literal(&literal)?.requires_grad(tensor.requires_grad_flag());
-        println!("trace {} shape={:?}", trace_name, host.shape().dims());
-        out.insert(trace_name, host);
-    }
-
-    TensorArchive::save(&args.out, &out)
-        .with_context(|| format!("failed to write trace archive {}", args.out.display()))?;
     Ok(())
 }

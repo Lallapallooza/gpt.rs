@@ -28,7 +28,6 @@ Models are exposed through a small dynamic trait:
 - `LoadedModel<B>`: `kind()`, `forward(ModelInput) -> ModelOutput`
 - Optional capabilities exposed via trait methods returning `Option<...>`:
   - `as_causal_lm() -> Option<&dyn CausalLanguageModel<B>>`
-  - `trace_vision(...) -> Option<VisionTrace<B>>`
 
 This is what makes the CLI generic: it asks the model for a capability (e.g. "causal LM") instead of
 switching on an enum of model kinds.
@@ -45,7 +44,6 @@ Most functionals are dispatched through a `FunctionalRegistry<B>` (portable base
 inner model with `ModelHandle<B>`. `ModelHandle` calls `ops::functional::with_registry(...)` around:
 
 - `LoadedModel::forward`
-- `LoadedModel::trace_vision`
 - `CausalLanguageModel` methods when the model is used as a causal LM
 
 This means:
@@ -77,9 +75,8 @@ weights, layouts) can be memoized by stable id without changing model code.
 
 - `generate`: requires `model.as_causal_lm()` and uses `CausalLanguageModel` (greedy/sampling + optional KV cache).
 - `forward`: calls `model.forward(...)` for either token inputs or vision inputs.
-- `trace`: requires `model.trace_vision(...)` (vision models today).
 
-See: `crates/gpt-rs-cli/src/main.rs` (`generate` / `forward` / `trace` subcommands).
+See: `crates/gpt-rs-cli/src/main.rs` (`generate` / `forward` subcommands).
 
 ## Adding a new model kind (runtime wiring)
 

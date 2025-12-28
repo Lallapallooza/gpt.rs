@@ -17,11 +17,17 @@
   "runs": [
     {
       "model": "resnet34",
-      "workload": ["validate", "trace", "bench"]
+      "workload": ["validate", "bench"],
+      "params": {
+        "checkpoint": "checkpoints/resnet34.bin"
+      }
     },
     {
       "model": "mobilenet_v2",
-      "workload": ["validate", "trace", "bench"]
+      "workload": ["validate", "bench"],
+      "params": {
+        "checkpoint": "checkpoints/mobilenet_v2.bin"
+      }
     }
   ]
 }

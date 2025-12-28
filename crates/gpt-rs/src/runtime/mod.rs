@@ -10,6 +10,7 @@ use crate::checkpoint::{CheckpointReader, CheckpointTensorEntry};
 use crate::inference::CausalLanguageModel;
 use crate::model::ModelConfig;
 use crate::model::{Gpt, GptConfig, MobileNetV2, ResNet34};
+use crate::ops::functional::{build_registry, with_registry, FunctionalOverrides};
 use crate::params::{param_key, BaseParamId, ModelNamespaceId, ParamSource};
 use crate::tensor::{DeviceTensor, Tensor};
 
@@ -43,6 +44,100 @@ pub trait LoadedModel<B: PortableBackend + 'static>: Send {
 
     fn trace_vision(&self, _input_nchw: &DeviceTensor<B>) -> Result<Option<VisionTrace<B>>> {
         Ok(None)
+    }
+}
+
+pub struct ModelHandle<B: PortableBackend + 'static> {
+    inner: Box<dyn LoadedModel<B>>,
+    registry: crate::ops::functional::FunctionalRegistryHandle<B>,
+}
+
+impl<B: PortableBackend + 'static> ModelHandle<B> {
+    pub fn new(
+        inner: Box<dyn LoadedModel<B>>,
+        registry: crate::ops::functional::FunctionalRegistryHandle<B>,
+    ) -> Self {
+        Self { inner, registry }
+    }
+}
+
+impl<B: PortableBackend + 'static> LoadedModel<B> for ModelHandle<B> {
+    fn kind(&self) -> &str {
+        self.inner.kind()
+    }
+
+    fn forward(&mut self, input: ModelInput<B>) -> Result<ModelOutput> {
+        with_registry(Arc::clone(&self.registry), || self.inner.forward(input))
+    }
+
+    fn as_causal_lm(&self) -> Option<&dyn CausalLanguageModel<B>> {
+        self.inner.as_causal_lm().is_some().then_some(self)
+    }
+
+    fn trace_vision(&self, input_nchw: &DeviceTensor<B>) -> Result<Option<VisionTrace<B>>> {
+        with_registry(Arc::clone(&self.registry), || {
+            self.inner.trace_vision(input_nchw)
+        })
+    }
+}
+
+impl<B: PortableBackend + 'static> CausalLanguageModel<B> for ModelHandle<B> {
+    fn context_length(&self) -> usize {
+        with_registry(Arc::clone(&self.registry), || {
+            self.inner
+                .as_causal_lm()
+                .expect("ModelHandle::context_length called on a non-causal model")
+                .context_length()
+        })
+    }
+
+    fn num_layers(&self) -> usize {
+        with_registry(Arc::clone(&self.registry), || {
+            self.inner
+                .as_causal_lm()
+                .expect("ModelHandle::num_layers called on a non-causal model")
+                .num_layers()
+        })
+    }
+
+    fn forward(&self, tokens: &[usize]) -> Result<Tensor> {
+        with_registry(Arc::clone(&self.registry), || {
+            self.inner
+                .as_causal_lm()
+                .expect("ModelHandle::forward called on a non-causal model")
+                .forward(tokens)
+        })
+    }
+
+    fn forward_with_decode_cache(
+        &self,
+        tokens: &[usize],
+        position_offset: usize,
+        caches: &mut [Option<crate::ops::functional::DecodeKvCache<B>>],
+    ) -> Result<Tensor> {
+        with_registry(Arc::clone(&self.registry), || {
+            self.inner
+                .as_causal_lm()
+                .expect("ModelHandle::forward_with_decode_cache called on a non-causal model")
+                .forward_with_decode_cache(tokens, position_offset, caches)
+        })
+    }
+
+    fn forward_with_decode_cache_with_capacity(
+        &self,
+        tokens: &[usize],
+        position_offset: usize,
+        caches: &mut [Option<crate::ops::functional::DecodeKvCache<B>>],
+        capacity: usize,
+    ) -> Result<Tensor> {
+        with_registry(Arc::clone(&self.registry), || {
+            self.inner
+                .as_causal_lm()
+                .expect(
+                    "ModelHandle::forward_with_decode_cache_with_capacity called on a non-causal model",
+                )
+                .forward_with_decode_cache_with_capacity(tokens, position_offset, caches, capacity)
+        })
     }
 }
 
@@ -84,6 +179,7 @@ pub fn load_model_with_namespace<B: PortableBackend + 'static>(
     let reader = CheckpointReader::open(&path)
         .with_context(|| format!("failed to open checkpoint {}", path.as_ref().display()))?;
     let config = reader.config().clone();
+    let registry = build_registry::<B>(&functional_overrides_from_config(&config)?);
 
     let mut specs: HashMap<String, CheckpointTensorEntry> =
         HashMap::with_capacity(reader.entries().len());
@@ -117,7 +213,8 @@ pub fn load_model_with_namespace<B: PortableBackend + 'static>(
     let kind = config.kind.as_str();
     let factory =
         model_factory::<B>(kind).ok_or_else(|| anyhow!("unsupported model kind '{kind}'"))?;
-    factory(backend, &config, &mut get)
+    let model = factory(backend, &config, &mut get)?;
+    Ok(Box::new(ModelHandle::new(model, registry)))
 }
 
 type BuildFn<B> = fn(
@@ -125,6 +222,25 @@ type BuildFn<B> = fn(
     &ModelConfig,
     &mut dyn FnMut(&str) -> Result<DeviceTensor<B>>,
 ) -> Result<Box<dyn LoadedModel<B>>>;
+
+fn functional_overrides_from_config(cfg: &ModelConfig) -> Result<FunctionalOverrides> {
+    if !cfg.runtime.functional_overrides.is_empty() {
+        return Ok(cfg.runtime.functional_overrides.clone());
+    }
+
+    if cfg.kind == "gpt" {
+        if let Some(overrides) = cfg.config.get("functional_overrides") {
+            if overrides.is_null() {
+                return Ok(FunctionalOverrides::default());
+            }
+            let overrides: FunctionalOverrides = serde_json::from_value(overrides.clone())
+                .with_context(|| "invalid gpt functional_overrides")?;
+            return Ok(overrides);
+        }
+    }
+
+    Ok(FunctionalOverrides::default())
+}
 
 fn build_gpt<B: PortableBackend + 'static>(
     backend: Arc<B>,

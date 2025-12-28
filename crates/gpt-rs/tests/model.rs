@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use gpt_rs::model::{Gpt, GptConfig};
-use gpt_rs::ops::functional::FunctionalOverrides;
 use gpt_rs::train::trainer::Trainer;
 use gpt_rs_backend_ref_cpu::CpuPortableBackend;
 use rand::rngs::StdRng;
@@ -23,7 +22,6 @@ fn gpt_forward_shape() {
         num_heads: 2,
         mlp_ratio: 2,
         dropout: 0.0,
-        functional_overrides: FunctionalOverrides::default(),
     };
     let model = Gpt::random(config, Arc::clone(&backend), &mut rng).unwrap();
     let tokens = vec![1, 2, 3, 4];
@@ -43,7 +41,6 @@ fn trainer_updates_lm_head() {
         num_heads: 1,
         mlp_ratio: 2,
         dropout: 0.0,
-        functional_overrides: FunctionalOverrides::default(),
     };
     let model = Gpt::random(config, Arc::clone(&backend), &mut rng).unwrap();
     let mut trainer = Trainer::new(model, 1e-2);

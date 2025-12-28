@@ -7,7 +7,6 @@ use gpt_rs::backend::spec::PortableBackend;
 use gpt_rs::checkpoint::{CheckpointLoader, CheckpointSaver};
 use gpt_rs::model::{Gpt, GptConfig};
 use gpt_rs::ops::functional;
-use gpt_rs::ops::functional::FunctionalOverrides;
 use gpt_rs::tensor::{DeviceTensor, Shape, Tensor};
 use gpt_rs::tokenizer::{Tokenizer, TokenizerConfig};
 use gpt_rs::train::trainer::Trainer;
@@ -38,7 +37,6 @@ pub fn gpt_forward_shape<B: PortableBackend + 'static>(backend: &Arc<B>) {
         num_heads: 2,
         mlp_ratio: 2,
         dropout: 0.0,
-        functional_overrides: FunctionalOverrides::default(),
     };
     let model = Gpt::random(config.clone(), Arc::clone(backend), &mut rng).unwrap();
     let tokens = vec![1, 2, 3, 4];
@@ -74,7 +72,6 @@ pub fn trainer_updates_lm_head<B: PortableBackend + 'static>(backend: &Arc<B>) {
         num_heads: 1,
         mlp_ratio: 2,
         dropout: 0.0,
-        functional_overrides: FunctionalOverrides::default(),
     };
     let model = Gpt::random(config, Arc::clone(backend), &mut rng).unwrap();
     let mut trainer = Trainer::new(model, 1e-2);
@@ -93,7 +90,6 @@ pub fn checkpoint_roundtrip<B: PortableBackend + 'static>(backend: &Arc<B>) {
         num_heads: 1,
         mlp_ratio: 2,
         dropout: 0.0,
-        functional_overrides: FunctionalOverrides::default(),
     };
     let model = Gpt::random(config, Arc::clone(backend), &mut rng).unwrap();
 

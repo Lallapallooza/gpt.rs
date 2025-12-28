@@ -5,10 +5,7 @@ use crate::nn::{
     Embedding, EmbeddingState, FeedForward, FeedForwardGradients, FeedForwardState, LayerNorm,
     LayerNormGradients, LayerNormState,
 };
-use crate::ops::functional::{
-    self, build_registry, AttentionCache, DecodeKvCache, FunctionalOverrides,
-    FunctionalRegistryHandle,
-};
+use crate::ops::functional::{self, AttentionCache, DecodeKvCache};
 use crate::tensor::{DeviceTensor, DeviceTensorOps, Shape, Tensor};
 use anyhow::{anyhow, bail, ensure, Result};
 use rand::Rng;
@@ -25,8 +22,6 @@ pub struct GptConfig {
     pub num_heads: usize,
     pub mlp_ratio: usize,
     pub dropout: f32,
-    #[serde(default)]
-    pub functional_overrides: FunctionalOverrides,
 }
 
 impl Default for GptConfig {
@@ -39,7 +34,6 @@ impl Default for GptConfig {
             num_heads: 12,
             mlp_ratio: 4,
             dropout: 0.0,
-            functional_overrides: FunctionalOverrides::default(),
         }
     }
 }
@@ -161,7 +155,6 @@ impl<B: PortableBackend + 'static> Module<B> for GptBlock<B> {
 }
 pub struct Gpt<B: PortableBackend + 'static> {
     pub backend: Arc<B>,
-    functional: FunctionalRegistryHandle<B>,
     pub config: GptConfig,
     pub tok_embeddings: Embedding<B>,
     pub pos_embeddings: DeviceTensor<B>,
@@ -181,7 +174,6 @@ pub struct GptForwardState<B: PortableBackend + 'static> {
 
 impl<B: PortableBackend + 'static> Gpt<B> {
     pub fn random(config: GptConfig, backend: Arc<B>, rng: &mut impl Rng) -> Result<Self> {
-        let functional: FunctionalRegistryHandle<B> = build_registry(&config.functional_overrides);
         let embed_dim = config.embed_dim;
         let hidden_dim = embed_dim * config.mlp_ratio;
         let weight_std = 0.02;
@@ -261,7 +253,6 @@ impl<B: PortableBackend + 'static> Gpt<B> {
 
         Ok(Gpt {
             backend,
-            functional,
             config,
             tok_embeddings,
             pos_embeddings,
@@ -292,7 +283,6 @@ impl<B: PortableBackend + 'static> Gpt<B> {
         )?;
 
         let mut blocks = Vec::with_capacity(config.num_layers);
-        let functional: FunctionalRegistryHandle<B> = build_registry(&config.functional_overrides);
         for layer in 0..config.num_layers {
             let prefix = format!("blocks.{}", layer);
             let attn = CausalSelfAttention::new(
@@ -362,7 +352,6 @@ impl<B: PortableBackend + 'static> Gpt<B> {
 
         Ok(Gpt {
             backend,
-            functional,
             config,
             tok_embeddings,
             pos_embeddings,
@@ -377,8 +366,6 @@ impl<B: PortableBackend + 'static> Gpt<B> {
         backend: Arc<B>,
         mut get: impl FnMut(&str) -> Result<DeviceTensor<B>>,
     ) -> Result<Self> {
-        let functional: FunctionalRegistryHandle<B> = build_registry(&config.functional_overrides);
-
         let tok_embeddings_weight = get("tok_embeddings.weight")?;
         let tok_embeddings = Embedding::new(Arc::clone(&backend), tok_embeddings_weight)?;
         let pos_embeddings = get("pos_embeddings")?;
@@ -436,7 +423,6 @@ impl<B: PortableBackend + 'static> Gpt<B> {
 
         Ok(Gpt {
             backend,
-            functional,
             config,
             tok_embeddings,
             pos_embeddings,
@@ -447,145 +433,133 @@ impl<B: PortableBackend + 'static> Gpt<B> {
     }
 
     pub fn forward_with_state(&self, tokens: &[usize]) -> Result<(Tensor, GptForwardState<B>)> {
-        crate::ops::functional::with_registry(self.functional.clone(), || {
-            self.validate_tokens(tokens)?;
+        self.validate_tokens(tokens)?;
 
-            let token_indices_host = Tensor::from_i32(
-                Shape::new([tokens.len()]),
-                tokens
-                    .iter()
-                    .map(|&idx| {
-                        i32::try_from(idx)
-                            .map_err(|_| anyhow!("token index {} exceeds i32::MAX", idx))
-                    })
-                    .collect::<Result<Vec<i32>>>()?,
-            )?;
-            let token_indices =
-                DeviceTensor::from_host(Arc::clone(&self.backend), token_indices_host)?;
-            let (token_embeddings, token_state) =
-                self.tok_embeddings.forward_with_state(&token_indices)?;
-            let positions: Vec<usize> = (0..tokens.len()).collect();
-            let position_indices_host = Tensor::from_i32(
-                Shape::new([positions.len()]),
-                positions.iter().map(|&idx| idx as i32).collect(),
-            )?;
-            let position_indices =
-                DeviceTensor::from_host(Arc::clone(&self.backend), position_indices_host)?;
-            let position_embeddings = functional::embedding_lookup_with_graph(
-                self.backend.as_ref(),
-                &self.pos_embeddings,
-                &position_indices,
-                token_embeddings.graph(),
-            )?;
+        let token_indices_host = Tensor::from_i32(
+            Shape::new([tokens.len()]),
+            tokens
+                .iter()
+                .map(|&idx| {
+                    i32::try_from(idx).map_err(|_| anyhow!("token index {} exceeds i32::MAX", idx))
+                })
+                .collect::<Result<Vec<i32>>>()?,
+        )?;
+        let token_indices = DeviceTensor::from_host(Arc::clone(&self.backend), token_indices_host)?;
+        let (token_embeddings, token_state) =
+            self.tok_embeddings.forward_with_state(&token_indices)?;
+        let positions: Vec<usize> = (0..tokens.len()).collect();
+        let position_indices_host = Tensor::from_i32(
+            Shape::new([positions.len()]),
+            positions.iter().map(|&idx| idx as i32).collect(),
+        )?;
+        let position_indices =
+            DeviceTensor::from_host(Arc::clone(&self.backend), position_indices_host)?;
+        let position_embeddings = functional::embedding_lookup_with_graph(
+            self.backend.as_ref(),
+            &self.pos_embeddings,
+            &position_indices,
+            token_embeddings.graph(),
+        )?;
 
-            let embedding_output = token_embeddings.add(&position_embeddings)?;
-            let mut hidden = embedding_output.clone();
-            let mut block_states = Vec::with_capacity(self.blocks.len());
-            for block in &self.blocks {
-                let (block_output, block_state) = block.forward_with_state(&hidden)?;
-                block_states.push(block_state);
-                hidden = block_output;
-            }
+        let embedding_output = token_embeddings.add(&position_embeddings)?;
+        let mut hidden = embedding_output.clone();
+        let mut block_states = Vec::with_capacity(self.blocks.len());
+        for block in &self.blocks {
+            let (block_output, block_state) = block.forward_with_state(&hidden)?;
+            block_states.push(block_state);
+            hidden = block_output;
+        }
 
-            let post_blocks = hidden.clone();
-            let (final_ln_output, final_ln_state) = self.final_ln.forward_with_state(&hidden)?;
-            let logits_device = final_ln_output.matmul(&self.lm_head)?;
-            let logits = logits_device.to_host()?;
+        let post_blocks = hidden.clone();
+        let (final_ln_output, final_ln_state) = self.final_ln.forward_with_state(&hidden)?;
+        let logits_device = final_ln_output.matmul(&self.lm_head)?;
+        let logits = logits_device.to_host()?;
 
-            let state = GptForwardState {
-                token_state,
-                embedding_output,
-                block_states,
-                post_blocks,
-                final_ln_output,
-                final_ln_state,
-            };
+        let state = GptForwardState {
+            token_state,
+            embedding_output,
+            block_states,
+            post_blocks,
+            final_ln_output,
+            final_ln_state,
+        };
 
-            Ok((logits, state))
-        })
+        Ok((logits, state))
     }
 
     pub fn forward_hidden(&self, tokens: &[usize]) -> Result<Tensor> {
-        crate::ops::functional::with_registry(self.functional.clone(), || {
-            self.validate_tokens(tokens)?;
+        self.validate_tokens(tokens)?;
 
-            let token_indices_host = Tensor::from_i32(
-                Shape::new([tokens.len()]),
-                tokens
-                    .iter()
-                    .map(|&idx| {
-                        i32::try_from(idx)
-                            .map_err(|_| anyhow!("token index {} exceeds i32::MAX", idx))
-                    })
-                    .collect::<Result<Vec<i32>>>()?,
-            )?;
-            let token_indices =
-                DeviceTensor::from_host(Arc::clone(&self.backend), token_indices_host)?;
-            let token_embeddings = self.tok_embeddings.forward(&token_indices)?;
-            let positions: Vec<usize> = (0..tokens.len()).collect();
-            let position_indices_host = Tensor::from_i32(
-                Shape::new([positions.len()]),
-                positions.iter().map(|&idx| idx as i32).collect(),
-            )?;
-            let position_indices =
-                DeviceTensor::from_host(Arc::clone(&self.backend), position_indices_host)?;
-            let position_embeddings = functional::embedding_lookup_with_graph(
-                self.backend.as_ref(),
-                &self.pos_embeddings,
-                &position_indices,
-                token_embeddings.graph(),
-            )?;
+        let token_indices_host = Tensor::from_i32(
+            Shape::new([tokens.len()]),
+            tokens
+                .iter()
+                .map(|&idx| {
+                    i32::try_from(idx).map_err(|_| anyhow!("token index {} exceeds i32::MAX", idx))
+                })
+                .collect::<Result<Vec<i32>>>()?,
+        )?;
+        let token_indices = DeviceTensor::from_host(Arc::clone(&self.backend), token_indices_host)?;
+        let token_embeddings = self.tok_embeddings.forward(&token_indices)?;
+        let positions: Vec<usize> = (0..tokens.len()).collect();
+        let position_indices_host = Tensor::from_i32(
+            Shape::new([positions.len()]),
+            positions.iter().map(|&idx| idx as i32).collect(),
+        )?;
+        let position_indices =
+            DeviceTensor::from_host(Arc::clone(&self.backend), position_indices_host)?;
+        let position_embeddings = functional::embedding_lookup_with_graph(
+            self.backend.as_ref(),
+            &self.pos_embeddings,
+            &position_indices,
+            token_embeddings.graph(),
+        )?;
 
-            let mut hidden = token_embeddings.add(&position_embeddings)?;
-            for block in &self.blocks {
-                hidden = block.forward(&hidden)?;
-            }
+        let mut hidden = token_embeddings.add(&position_embeddings)?;
+        for block in &self.blocks {
+            hidden = block.forward(&hidden)?;
+        }
 
-            let normalized = self.final_ln.forward(&hidden)?;
-            normalized.to_host()
-        })
+        let normalized = self.final_ln.forward(&hidden)?;
+        normalized.to_host()
     }
 
     pub fn forward(&self, tokens: &[usize]) -> Result<Tensor> {
-        crate::ops::functional::with_registry(self.functional.clone(), || {
-            self.validate_tokens(tokens)?;
+        self.validate_tokens(tokens)?;
 
-            let token_indices_host = Tensor::from_i32(
-                Shape::new([tokens.len()]),
-                tokens
-                    .iter()
-                    .map(|&idx| {
-                        i32::try_from(idx)
-                            .map_err(|_| anyhow!("token index {} exceeds i32::MAX", idx))
-                    })
-                    .collect::<Result<Vec<i32>>>()?,
-            )?;
-            let token_indices =
-                DeviceTensor::from_host(Arc::clone(&self.backend), token_indices_host)?;
-            let token_embeddings = self.tok_embeddings.forward(&token_indices)?;
-            let positions: Vec<usize> = (0..tokens.len()).collect();
-            let position_indices_host = Tensor::from_i32(
-                Shape::new([positions.len()]),
-                positions.iter().map(|&idx| idx as i32).collect(),
-            )?;
-            let position_indices =
-                DeviceTensor::from_host(Arc::clone(&self.backend), position_indices_host)?;
-            let position_embeddings = functional::embedding_lookup_with_graph(
-                self.backend.as_ref(),
-                &self.pos_embeddings,
-                &position_indices,
-                token_embeddings.graph(),
-            )?;
+        let token_indices_host = Tensor::from_i32(
+            Shape::new([tokens.len()]),
+            tokens
+                .iter()
+                .map(|&idx| {
+                    i32::try_from(idx).map_err(|_| anyhow!("token index {} exceeds i32::MAX", idx))
+                })
+                .collect::<Result<Vec<i32>>>()?,
+        )?;
+        let token_indices = DeviceTensor::from_host(Arc::clone(&self.backend), token_indices_host)?;
+        let token_embeddings = self.tok_embeddings.forward(&token_indices)?;
+        let positions: Vec<usize> = (0..tokens.len()).collect();
+        let position_indices_host = Tensor::from_i32(
+            Shape::new([positions.len()]),
+            positions.iter().map(|&idx| idx as i32).collect(),
+        )?;
+        let position_indices =
+            DeviceTensor::from_host(Arc::clone(&self.backend), position_indices_host)?;
+        let position_embeddings = functional::embedding_lookup_with_graph(
+            self.backend.as_ref(),
+            &self.pos_embeddings,
+            &position_indices,
+            token_embeddings.graph(),
+        )?;
 
-            let mut hidden = token_embeddings.add(&position_embeddings)?;
-            for block in &self.blocks {
-                hidden = block.forward(&hidden)?;
-            }
+        let mut hidden = token_embeddings.add(&position_embeddings)?;
+        for block in &self.blocks {
+            hidden = block.forward(&hidden)?;
+        }
 
-            let normalized = self.final_ln.forward(&hidden)?;
-            let logits = normalized.matmul(&self.lm_head)?;
-            logits.to_host()
-        })
+        let normalized = self.final_ln.forward(&hidden)?;
+        let logits = normalized.matmul(&self.lm_head)?;
+        logits.to_host()
     }
 
     pub fn forward_with_cache(
@@ -594,68 +568,64 @@ impl<B: PortableBackend + 'static> Gpt<B> {
         position_offset: usize,
         caches: &mut [Option<AttentionCache<B>>],
     ) -> Result<Tensor> {
-        crate::ops::functional::with_registry(self.functional.clone(), || {
-            self.validate_tokens_with_offset(tokens, position_offset)?;
-            ensure!(
-                caches.len() == self.blocks.len(),
-                "expected {} cache slots (one per layer), got {}",
-                self.blocks.len(),
-                caches.len()
-            );
+        self.validate_tokens_with_offset(tokens, position_offset)?;
+        ensure!(
+            caches.len() == self.blocks.len(),
+            "expected {} cache slots (one per layer), got {}",
+            self.blocks.len(),
+            caches.len()
+        );
 
-            let token_indices_host = Tensor::from_i32(
-                Shape::new([tokens.len()]),
-                tokens
-                    .iter()
-                    .map(|&idx| {
-                        i32::try_from(idx)
-                            .map_err(|_| anyhow!("token index {} exceeds i32::MAX", idx))
-                    })
-                    .collect::<Result<Vec<i32>>>()?,
-            )?;
-            let token_indices =
-                DeviceTensor::from_host(Arc::clone(&self.backend), token_indices_host)?;
-            let token_embeddings = self.tok_embeddings.forward(&token_indices)?;
-            let positions: Vec<usize> = (0..tokens.len()).map(|i| position_offset + i).collect();
-            let position_indices_host = Tensor::from_i32(
-                Shape::new([positions.len()]),
-                positions.iter().map(|&idx| idx as i32).collect(),
-            )?;
-            let position_indices =
-                DeviceTensor::from_host(Arc::clone(&self.backend), position_indices_host)?;
-            let position_embeddings = functional::embedding_lookup_with_graph(
-                self.backend.as_ref(),
-                &self.pos_embeddings,
-                &position_indices,
-                token_embeddings.graph(),
-            )?;
+        let token_indices_host = Tensor::from_i32(
+            Shape::new([tokens.len()]),
+            tokens
+                .iter()
+                .map(|&idx| {
+                    i32::try_from(idx).map_err(|_| anyhow!("token index {} exceeds i32::MAX", idx))
+                })
+                .collect::<Result<Vec<i32>>>()?,
+        )?;
+        let token_indices = DeviceTensor::from_host(Arc::clone(&self.backend), token_indices_host)?;
+        let token_embeddings = self.tok_embeddings.forward(&token_indices)?;
+        let positions: Vec<usize> = (0..tokens.len()).map(|i| position_offset + i).collect();
+        let position_indices_host = Tensor::from_i32(
+            Shape::new([positions.len()]),
+            positions.iter().map(|&idx| idx as i32).collect(),
+        )?;
+        let position_indices =
+            DeviceTensor::from_host(Arc::clone(&self.backend), position_indices_host)?;
+        let position_embeddings = functional::embedding_lookup_with_graph(
+            self.backend.as_ref(),
+            &self.pos_embeddings,
+            &position_indices,
+            token_embeddings.graph(),
+        )?;
 
-            let mut hidden = token_embeddings.add(&position_embeddings)?;
-            let mut new_caches: Vec<AttentionCache<B>> = Vec::with_capacity(self.blocks.len());
-            for (block, existing_cache) in self.blocks.iter().zip(caches.iter()) {
-                let (block_output, updated_cache) =
-                    block.forward_with_cache(&hidden, existing_cache.as_ref())?;
-                new_caches.push(updated_cache);
-                hidden = block_output;
-            }
+        let mut hidden = token_embeddings.add(&position_embeddings)?;
+        let mut new_caches: Vec<AttentionCache<B>> = Vec::with_capacity(self.blocks.len());
+        for (block, existing_cache) in self.blocks.iter().zip(caches.iter()) {
+            let (block_output, updated_cache) =
+                block.forward_with_cache(&hidden, existing_cache.as_ref())?;
+            new_caches.push(updated_cache);
+            hidden = block_output;
+        }
 
-            let normalized = self.final_ln.forward(&hidden)?;
-            let logits = normalized.matmul(&self.lm_head)?;
+        let normalized = self.final_ln.forward(&hidden)?;
+        let logits = normalized.matmul(&self.lm_head)?;
 
-            for (slot, new_cache) in caches.iter_mut().zip(new_caches.into_iter()) {
-                if let Some(old_cache) = slot.take() {
-                    if let Some((graph, value)) = old_cache.keys().graph_value() {
-                        graph.unexport(value);
-                    }
-                    if let Some((graph, value)) = old_cache.values().graph_value() {
-                        graph.unexport(value);
-                    }
+        for (slot, new_cache) in caches.iter_mut().zip(new_caches.into_iter()) {
+            if let Some(old_cache) = slot.take() {
+                if let Some((graph, value)) = old_cache.keys().graph_value() {
+                    graph.unexport(value);
                 }
-                *slot = Some(new_cache);
+                if let Some((graph, value)) = old_cache.values().graph_value() {
+                    graph.unexport(value);
+                }
             }
+            *slot = Some(new_cache);
+        }
 
-            logits.to_host()
-        })
+        logits.to_host()
     }
 
     pub fn forward_with_decode_cache(
@@ -684,170 +654,165 @@ impl<B: PortableBackend + 'static> Gpt<B> {
         caches: &mut [Option<DecodeKvCache<B>>],
         fixed_capacity: Option<usize>,
     ) -> Result<Tensor> {
-        crate::ops::functional::with_registry(self.functional.clone(), || {
-            self.validate_tokens_with_offset(tokens, position_offset)?;
-            ensure!(
-                caches.len() == self.blocks.len(),
-                "expected {} cache slots (one per layer), got {}",
-                self.blocks.len(),
-                caches.len()
-            );
+        self.validate_tokens_with_offset(tokens, position_offset)?;
+        ensure!(
+            caches.len() == self.blocks.len(),
+            "expected {} cache slots (one per layer), got {}",
+            self.blocks.len(),
+            caches.len()
+        );
 
-            let total = position_offset
-                .checked_add(tokens.len())
-                .ok_or_else(|| anyhow!("token position offset overflow"))?;
-            let required_capacity = match fixed_capacity {
-                Some(capacity) => {
-                    ensure!(capacity > 0, "decode cache capacity must be > 0");
-                    ensure!(
-                        capacity <= self.config.context_length,
-                        "decode cache capacity {} exceeds model context length {}",
-                        capacity,
-                        self.config.context_length
-                    );
-                    ensure!(
-                        capacity >= total,
-                        "decode cache capacity {} is too small for required sequence length {}",
-                        capacity,
-                        total
-                    );
-                    capacity
-                }
-                None => decode_cache_capacity(total, self.config.context_length),
-            };
+        let total = position_offset
+            .checked_add(tokens.len())
+            .ok_or_else(|| anyhow!("token position offset overflow"))?;
+        let required_capacity = match fixed_capacity {
+            Some(capacity) => {
+                ensure!(capacity > 0, "decode cache capacity must be > 0");
+                ensure!(
+                    capacity <= self.config.context_length,
+                    "decode cache capacity {} exceeds model context length {}",
+                    capacity,
+                    self.config.context_length
+                );
+                ensure!(
+                    capacity >= total,
+                    "decode cache capacity {} is too small for required sequence length {}",
+                    capacity,
+                    total
+                );
+                capacity
+            }
+            None => decode_cache_capacity(total, self.config.context_length),
+        };
 
-            let start_zeros_host = Tensor::from_i32(Shape::new([3]), vec![0, 0, 0])?;
-            let start_zeros = DeviceTensor::from_host(Arc::clone(&self.backend), start_zeros_host)?;
+        let start_zeros_host = Tensor::from_i32(Shape::new([3]), vec![0, 0, 0])?;
+        let start_zeros = DeviceTensor::from_host(Arc::clone(&self.backend), start_zeros_host)?;
 
-            // If we already have caches and the bucket grew, upsize all layers in one pass.
-            if caches
+        // If we already have caches and the bucket grew, upsize all layers in one pass.
+        if caches
+            .iter()
+            .filter_map(|c| c.as_ref().map(|cache| cache.capacity()))
+            .next()
+            .is_some_and(|cap| cap < required_capacity)
+        {
+            for slot in caches.iter_mut() {
+                let Some(old) = slot.as_ref() else {
+                    continue;
+                };
+
+                let old_dims = old.keys().shape().dims();
+                let shape = Shape::new([old_dims[0], required_capacity, old_dims[2]]);
+                let new_keys = DeviceTensor::zeros(Arc::clone(&self.backend), shape.clone())?;
+                let new_values = DeviceTensor::zeros(Arc::clone(&self.backend), shape)?;
+
+                let keys = functional::dynamic_update_slice_into(
+                    self.backend.as_ref(),
+                    &new_keys,
+                    old.keys(),
+                    &start_zeros,
+                )?;
+                let values = functional::dynamic_update_slice_into(
+                    self.backend.as_ref(),
+                    &new_values,
+                    old.values(),
+                    &start_zeros,
+                )?;
+                *slot = Some(DecodeKvCache::new(keys, values, old.len())?);
+            }
+        }
+
+        let token_indices_host = Tensor::from_i32(
+            Shape::new([tokens.len()]),
+            tokens
                 .iter()
-                .filter_map(|c| c.as_ref().map(|cache| cache.capacity()))
-                .next()
-                .is_some_and(|cap| cap < required_capacity)
-            {
-                for slot in caches.iter_mut() {
-                    let Some(old) = slot.as_ref() else {
-                        continue;
-                    };
+                .map(|&idx| {
+                    i32::try_from(idx).map_err(|_| anyhow!("token index {} exceeds i32::MAX", idx))
+                })
+                .collect::<Result<Vec<i32>>>()?,
+        )?;
+        let token_indices = DeviceTensor::from_host(Arc::clone(&self.backend), token_indices_host)?;
+        let token_embeddings = self.tok_embeddings.forward(&token_indices)?;
 
-                    let old_dims = old.keys().shape().dims();
-                    let shape = Shape::new([old_dims[0], required_capacity, old_dims[2]]);
-                    let new_keys = DeviceTensor::zeros(Arc::clone(&self.backend), shape.clone())?;
-                    let new_values = DeviceTensor::zeros(Arc::clone(&self.backend), shape)?;
+        let positions: Vec<usize> = (0..tokens.len()).map(|i| position_offset + i).collect();
+        let position_indices_host = Tensor::from_i32(
+            Shape::new([positions.len()]),
+            positions.iter().map(|&idx| idx as i32).collect(),
+        )?;
+        let position_indices =
+            DeviceTensor::from_host(Arc::clone(&self.backend), position_indices_host)?;
+        let position_embeddings = functional::embedding_lookup_with_graph(
+            self.backend.as_ref(),
+            &self.pos_embeddings,
+            &position_indices,
+            token_embeddings.graph(),
+        )?;
 
-                    let keys = functional::dynamic_update_slice_into(
-                        self.backend.as_ref(),
-                        &new_keys,
-                        old.keys(),
-                        &start_zeros,
-                    )?;
-                    let values = functional::dynamic_update_slice_into(
-                        self.backend.as_ref(),
-                        &new_values,
-                        old.values(),
-                        &start_zeros,
-                    )?;
-                    *slot = Some(DecodeKvCache::new(keys, values, old.len())?);
+        let mut hidden = token_embeddings.add(&position_embeddings)?;
+        let mut new_caches: Vec<DecodeKvCache<B>> = Vec::with_capacity(self.blocks.len());
+
+        let pos_i32 = i32::try_from(position_offset)
+            .map_err(|_| anyhow!("position offset {} exceeds i32::MAX", position_offset))?;
+        let update_starts_host = Tensor::from_i32(Shape::new([3]), vec![0, pos_i32, 0])?;
+        let update_starts = DeviceTensor::from_host(Arc::clone(&self.backend), update_starts_host)?;
+        let query_start_host = Tensor::from_i32(Shape::new([1]), vec![pos_i32])?;
+        let query_start = DeviceTensor::from_host(Arc::clone(&self.backend), query_start_host)?;
+
+        for (block, slot) in self.blocks.iter().zip(caches.iter()) {
+            if let Some(existing) = slot.as_ref() {
+                ensure!(
+                    existing.len() == position_offset,
+                    "decode cache length {} must match position offset {}",
+                    existing.len(),
+                    position_offset
+                );
+                let (block_output, updated_cache) = block.forward_with_decode_cache(
+                    &hidden,
+                    existing,
+                    &update_starts,
+                    &query_start,
+                )?;
+                new_caches.push(updated_cache);
+                hidden = block_output;
+            } else {
+                let (block_output, updated_cache) = block.forward_with_cache(&hidden, None)?;
+                let present_dims = updated_cache.keys().shape().dims();
+                let shape = Shape::new([present_dims[0], required_capacity, present_dims[2]]);
+                let keys_base = DeviceTensor::zeros(Arc::clone(&self.backend), shape.clone())?;
+                let values_base = DeviceTensor::zeros(Arc::clone(&self.backend), shape)?;
+
+                let keys = functional::dynamic_update_slice_into(
+                    self.backend.as_ref(),
+                    &keys_base,
+                    updated_cache.keys(),
+                    &start_zeros,
+                )?;
+                let values = functional::dynamic_update_slice_into(
+                    self.backend.as_ref(),
+                    &values_base,
+                    updated_cache.values(),
+                    &start_zeros,
+                )?;
+                new_caches.push(DecodeKvCache::new(keys, values, total)?);
+                hidden = block_output;
+            }
+        }
+
+        let normalized = self.final_ln.forward(&hidden)?;
+        let logits = normalized.matmul(&self.lm_head)?;
+
+        for (slot, new_cache) in caches.iter_mut().zip(new_caches.into_iter()) {
+            if let Some(old_cache) = slot.take() {
+                if let Some((graph, value)) = old_cache.keys().graph_value() {
+                    graph.unexport(value);
+                }
+                if let Some((graph, value)) = old_cache.values().graph_value() {
+                    graph.unexport(value);
                 }
             }
+            *slot = Some(new_cache);
+        }
 
-            let token_indices_host = Tensor::from_i32(
-                Shape::new([tokens.len()]),
-                tokens
-                    .iter()
-                    .map(|&idx| {
-                        i32::try_from(idx)
-                            .map_err(|_| anyhow!("token index {} exceeds i32::MAX", idx))
-                    })
-                    .collect::<Result<Vec<i32>>>()?,
-            )?;
-            let token_indices =
-                DeviceTensor::from_host(Arc::clone(&self.backend), token_indices_host)?;
-            let token_embeddings = self.tok_embeddings.forward(&token_indices)?;
-
-            let positions: Vec<usize> = (0..tokens.len()).map(|i| position_offset + i).collect();
-            let position_indices_host = Tensor::from_i32(
-                Shape::new([positions.len()]),
-                positions.iter().map(|&idx| idx as i32).collect(),
-            )?;
-            let position_indices =
-                DeviceTensor::from_host(Arc::clone(&self.backend), position_indices_host)?;
-            let position_embeddings = functional::embedding_lookup_with_graph(
-                self.backend.as_ref(),
-                &self.pos_embeddings,
-                &position_indices,
-                token_embeddings.graph(),
-            )?;
-
-            let mut hidden = token_embeddings.add(&position_embeddings)?;
-            let mut new_caches: Vec<DecodeKvCache<B>> = Vec::with_capacity(self.blocks.len());
-
-            let pos_i32 = i32::try_from(position_offset)
-                .map_err(|_| anyhow!("position offset {} exceeds i32::MAX", position_offset))?;
-            let update_starts_host = Tensor::from_i32(Shape::new([3]), vec![0, pos_i32, 0])?;
-            let update_starts =
-                DeviceTensor::from_host(Arc::clone(&self.backend), update_starts_host)?;
-            let query_start_host = Tensor::from_i32(Shape::new([1]), vec![pos_i32])?;
-            let query_start = DeviceTensor::from_host(Arc::clone(&self.backend), query_start_host)?;
-
-            for (block, slot) in self.blocks.iter().zip(caches.iter()) {
-                if let Some(existing) = slot.as_ref() {
-                    ensure!(
-                        existing.len() == position_offset,
-                        "decode cache length {} must match position offset {}",
-                        existing.len(),
-                        position_offset
-                    );
-                    let (block_output, updated_cache) = block.forward_with_decode_cache(
-                        &hidden,
-                        existing,
-                        &update_starts,
-                        &query_start,
-                    )?;
-                    new_caches.push(updated_cache);
-                    hidden = block_output;
-                } else {
-                    let (block_output, updated_cache) = block.forward_with_cache(&hidden, None)?;
-                    let present_dims = updated_cache.keys().shape().dims();
-                    let shape = Shape::new([present_dims[0], required_capacity, present_dims[2]]);
-                    let keys_base = DeviceTensor::zeros(Arc::clone(&self.backend), shape.clone())?;
-                    let values_base = DeviceTensor::zeros(Arc::clone(&self.backend), shape)?;
-
-                    let keys = functional::dynamic_update_slice_into(
-                        self.backend.as_ref(),
-                        &keys_base,
-                        updated_cache.keys(),
-                        &start_zeros,
-                    )?;
-                    let values = functional::dynamic_update_slice_into(
-                        self.backend.as_ref(),
-                        &values_base,
-                        updated_cache.values(),
-                        &start_zeros,
-                    )?;
-                    new_caches.push(DecodeKvCache::new(keys, values, total)?);
-                    hidden = block_output;
-                }
-            }
-
-            let normalized = self.final_ln.forward(&hidden)?;
-            let logits = normalized.matmul(&self.lm_head)?;
-
-            for (slot, new_cache) in caches.iter_mut().zip(new_caches.into_iter()) {
-                if let Some(old_cache) = slot.take() {
-                    if let Some((graph, value)) = old_cache.keys().graph_value() {
-                        graph.unexport(value);
-                    }
-                    if let Some((graph, value)) = old_cache.values().graph_value() {
-                        graph.unexport(value);
-                    }
-                }
-                *slot = Some(new_cache);
-            }
-
-            logits.to_host()
-        })
+        logits.to_host()
     }
 
     fn validate_tokens(&self, tokens: &[usize]) -> Result<()> {

@@ -33,7 +33,6 @@ fn decode_kv_cache_reuses_program_cache_in_lazy_mode() -> anyhow::Result<()> {
         num_heads: 4,
         mlp_ratio: 2,
         dropout: 0.0,
-        functional_overrides: Default::default(),
     };
     let model = Gpt::random(config, Arc::clone(&backend), &mut rng)?;
     let sampler = Sampler::new(0.0);

@@ -4,7 +4,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpt_rs::checkpoint::{CheckpointLoader, CheckpointSaver};
 use gpt_rs::model::{Gpt, GptConfig};
-use gpt_rs::ops::functional::FunctionalOverrides;
 use gpt_rs_backend_ref_cpu::CpuPortableBackend;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -26,7 +25,6 @@ fn checkpoint_roundtrip() {
         num_heads: 1,
         mlp_ratio: 2,
         dropout: 0.0,
-        functional_overrides: FunctionalOverrides::default(),
     };
     let model = Gpt::random(config, Arc::clone(&backend), &mut rng).unwrap();
 

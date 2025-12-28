@@ -1,10 +1,25 @@
+use crate::ops::functional::FunctionalOverrides;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelRuntimeConfig {
+    #[serde(default, skip_serializing_if = "FunctionalOverrides::is_empty")]
+    pub functional_overrides: FunctionalOverrides,
+}
+
+impl ModelRuntimeConfig {
+    fn is_empty(&self) -> bool {
+        self.functional_overrides.is_empty()
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelConfig {
     pub kind: String,
     #[serde(default)]
     pub config: serde_json::Value,
+    #[serde(default, skip_serializing_if = "ModelRuntimeConfig::is_empty")]
+    pub runtime: ModelRuntimeConfig,
 }
 
 impl ModelConfig {
@@ -12,6 +27,19 @@ impl ModelConfig {
         Self {
             kind: kind.into(),
             config,
+            runtime: ModelRuntimeConfig::default(),
+        }
+    }
+
+    pub fn new_with_runtime(
+        kind: impl Into<String>,
+        config: serde_json::Value,
+        runtime: ModelRuntimeConfig,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            config,
+            runtime,
         }
     }
 }
@@ -28,7 +56,14 @@ impl<'de> Deserialize<'de> for ModelConfig {
                 .get("config")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
-            return Ok(Self::new(kind.to_string(), config));
+            let runtime = match value.get("runtime") {
+                Some(runtime) if runtime.is_null() => ModelRuntimeConfig::default(),
+                Some(runtime) => {
+                    serde_json::from_value(runtime.clone()).map_err(D::Error::custom)?
+                }
+                None => ModelRuntimeConfig::default(),
+            };
+            return Ok(Self::new_with_runtime(kind.to_string(), config, runtime));
         }
 
         if let Ok(_legacy_gpt) = serde_json::from_value::<super::gpt::GptConfig>(value.clone()) {

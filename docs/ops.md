@@ -3,7 +3,7 @@
 This document describes the `gpt_rs::ops` layer: how portable functionals capture PTIR graphs, how graphs
 are cached/optimized, and how backends execute PTIR programs.
 
-If you are looking for the *spec*, see `docs/backend.md`.
+If you are looking for the *spec*, see [backend.md](backend.md).
 
 ## Where things live
 
@@ -51,7 +51,7 @@ The ops layer exposes hooks around PTIR execution via `crates/gpt-rs/src/ops/tra
 `gpt-rs-cli` wires this up via:
 - `--dump-dir <DIR>` and `--dump-mode all|compile`
 
-See `docs/testing.md` for CLI usage examples.
+See [testing.md](testing.md) for CLI usage examples.
 
 ## How to debug a bad kernel
 

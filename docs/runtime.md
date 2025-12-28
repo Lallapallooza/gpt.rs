@@ -87,4 +87,4 @@ After implementing your model and `LoadedModel<B>` impl, register it with the ru
 
 - `crates/gpt-rs/src/runtime/mod.rs`: `model_factories()` / `model_factory(kind)`
 
-For a full checklist (model + layer + functional + backend), see `docs/howto.md`.
+For a full checklist (model + layer + functional + backend), see [docs/howto.md](howto.md).

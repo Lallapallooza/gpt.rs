@@ -2,7 +2,7 @@
 
 This document describes the PTIR optimizer used by the graph arena before backend execution.
 
-It is intentionally implementation-oriented; the PTIR op semantics live in `docs/backend.md`.
+It is intentionally implementation-oriented; the PTIR op semantics live in [backend.md](backend.md).
 
 ## Where it lives
 
@@ -78,7 +78,7 @@ Checklist:
 2. Implement `OpRewritePattern<View>` and return `true` only when you actually mutate IR.
 3. Wire the pattern into a pass under `crates/gpt-rs/src/backend/passes/`.
 4. Register the pass in `crates/gpt-rs/src/backend/pipeline.rs` (or a backend-specific pipeline hook).
-5. Validate via Torch parity and/or dumped PTIR (see `docs/testing.md`).
+5. Validate via Torch parity and/or dumped PTIR (see [testing.md](testing.md)).
 
 ## Debugging optimizer behavior
 

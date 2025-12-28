@@ -66,7 +66,7 @@ Testing expectations:
 
 - Add capture/shape/error-message tests under `crates/gpt-rs/tests/` when changing validation rules.
 - Add numerical parity under `crates/gpt-rs-backend-tests/src/torch_parity/` when changing math.
-  (See `docs/testing.md`.)
+  (See [docs/testing.md](testing.md).)
 
 ## Override a functional (custom kernel without touching model code)
 
@@ -95,7 +95,8 @@ Steps:
 
 1. Create a new crate `crates/gpt-rs-backend-<name>`.
 2. Implement `PortableBackend` in your backend type.
-   - The contract is defined in `crates/gpt-rs/src/backend/spec.rs` (and summarized in `docs/backend.md`).
+   - The contract is defined in [crates/gpt-rs/src/backend/spec.rs](../crates/gpt-rs/src/backend/spec.rs)
+     (and summarized in [docs/backend.md](backend.md)).
 3. Optional but recommended:
    - `PortableBackend::pipeline()` to inject legalization/fusion passes.
    - `PortableBackend::param_resolver()` to cache derived param representations keyed by stable ids.

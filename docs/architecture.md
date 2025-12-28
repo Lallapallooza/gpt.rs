@@ -10,7 +10,7 @@ At a glance:
 - **Backends** (`gpt_rs::backend::spec::PortableBackend`) execute PTIR programs (faer, ref-cpu, ...).
 - **Runtime** (`gpt_rs::runtime::load_model`) loads a self-describing checkpoint into a dynamic model handle.
 
-For the layering model and runtime functional overrides, see `docs/frontend.md`.
+For the layering model and runtime functional overrides, see [frontend.md](frontend.md).
 
 ## Project layout
 
@@ -44,5 +44,5 @@ Core modules (inside `crates/gpt-rs/src/`):
 
 ## Correctness and validation
 
-- Kernel-level correctness: backend suite + Torch parity (see `docs/testing.md`).
+- Kernel-level correctness: backend suite + Torch parity (see [testing.md](testing.md)).
 - End-to-end model baselines: `scripts/eval.py` (validate / trace / bench) against Torch/HF.

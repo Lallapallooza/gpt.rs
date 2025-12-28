@@ -74,7 +74,7 @@ Backends implement the PTIR contract (`gpt_rs::backend::spec::PortableBackend`) 
 - `gpt-rs-backend-faer` (optimized CPU backend)
 - `gpt-rs-backend-ref-cpu` (reference interpreter)
 
-Backends can be wrapped with hooks for dumping/profiling/debugging (see `docs/testing.md`).
+Backends can be wrapped with hooks for dumping/profiling/debugging (see [testing.md](testing.md)).
 
 ## Typical call flow
 

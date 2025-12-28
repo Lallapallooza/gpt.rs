@@ -1,12 +1,48 @@
 # gpt.rs
 
-Rust-first experimentation toolkit for **portable tensor programs** (PTIR) and small model implementations.
+Rust-first **research project** for portable tensor programs (PTIR) and model runtimes.
 
-Write models once, keep the math portable, and let backends compete on execution:
+PTIR lets you keep model math portable while backends compete on execution:
 - Layers call portable functionals (no open-coded kernels).
 - Functionals capture PTIR graphs and can be overridden at runtime.
-- Backends execute PTIR and can rewrite/fuse portable graphs into custom kernels.
+- Backends execute PTIR and can rewrite/fuse graphs into custom kernels.
 - Parameters have stable `u128` ids and can be streamed lazily from checkpoints.
+
+Warning: expect churn. APIs, formats, and model coverage change quickly.
+
+## Demo
+
+Video: (TODO)
+
+## Benchmarks (early)
+
+Single-thread CPU numbers from `scripts/eval.py --workload bench` on AMD Ryzen 9 9950X3D (Linux),
+commit `fc2d50b`, backend `c` vs Torch baselines:
+
+| Workload | gpt.rs | torch | Speedup |
+| --- | ---: | ---: | ---: |
+| ResNet34 (batch=1, image=224) | 29.93 images/s | 28.20 images/s | 1.06x |
+| GPT-2 (generate 64 tokens) | 74.71 tokens/s | 46.16 tokens/s | 1.62x |
+
+Reproduce (C backend):
+```bash
+# Build the Python extension with the C backend enabled:
+uv sync
+uv pip install maturin
+uv --project "$(pwd)" --directory "$(pwd)/crates/gpt-rs-py" run \
+  maturin develop --release --features conversion-c
+
+# Export fresh v2 checkpoints:
+uv run python scripts/export_gpt2.py --model gpt2 --checkpoint-out checkpoints/gpt2.bin \
+  --config-out configs/gpt2_model.json --tokenizer-out configs/gpt2_tokenizer.json
+uv run python scripts/export_model_weights.py --model resnet34 --out checkpoints/resnet34.bin
+
+# Bench:
+GPTRS_C_CACHE_DIR=./.cache/gpt_rs_c_backend uv run python scripts/eval.py \
+  --model resnet34 --workload bench --backend c --threads 1 --warmup 1 --iters 2 --batch 1 --image-size 224
+GPTRS_C_CACHE_DIR=./.cache/gpt_rs_c_backend uv run python scripts/eval.py \
+  --model gpt2 --workload bench --backend c --threads 1 --warmup 1 --iters 2 --bench-tokens 64
+```
 
 ## Highlights
 
@@ -34,6 +70,33 @@ Reference:
 
 Scripts:
 - [scripts/README.md](scripts/README.md) (Python utilities: export + eval)
+
+## Roadmap (TODO)
+
+- Backends:
+  - triton backend
+  - nvgpu + cudnn backend
+  - xla backend
+  - iree backend
+- Training:
+  - training full implementation
+  - autograd
+  - distributed training support
+- Inference:
+  - quantized models full support
+  - paged attention
+  - speculative decoding
+- Tooling / interop:
+  - Chrome profiler integration for visualization
+  - full python interop: define/train models in python
+  - pytorch importer
+- Models:
+  - qwen
+  - llama
+  - deepseek
+  - gptoss
+  - diffusion models
+  - speech models
 
 ## Repository layout
 

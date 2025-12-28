@@ -75,17 +75,14 @@ enum DumpMode {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a model once (predict / generate).
-    Run {
-        #[command(subcommand)]
-        model: RunModel,
-    },
+    /// Causal text generation for models that implement `CausalLanguageModel`.
+    Generate(GenerateArgs),
 
-    /// Capture intermediate tensors for models that support tracing.
-    Trace {
-        #[command(subcommand)]
-        model: TraceModel,
-    },
+    /// Run a model forward pass once (tokens or vision input).
+    Forward(ForwardArgs),
+
+    /// Capture intermediate tensors for models that support tracing (vision today).
+    Trace(TraceArgs),
 
     /// Convert a PTIR program into a target IR module.
     Convert(ConvertArgs),
@@ -94,29 +91,8 @@ enum Command {
     Patterns(PatternsArgs),
 }
 
-#[derive(Subcommand)]
-enum RunModel {
-    /// GPT-style text generation from a gpt.rs checkpoint + tokenizer.
-    #[command(name = "gpt")]
-    Gpt(RunGptArgs),
-    /// ResNet34 forward pass from a gpt.rs checkpoint produced by the Python tools.
-    #[command(name = "resnet34")]
-    ResNet34(RunVisionArgs),
-    /// MobileNetV2 forward pass from a gpt.rs checkpoint produced by the Python tools.
-    #[command(name = "mobilenet_v2", alias = "mobilenet-v2")]
-    MobileNetV2(RunVisionArgs),
-}
-
-#[derive(Subcommand)]
-enum TraceModel {
-    #[command(name = "resnet34")]
-    ResNet34(TraceVisionArgs),
-    #[command(name = "mobilenet_v2", alias = "mobilenet-v2")]
-    MobileNetV2(TraceVisionArgs),
-}
-
 #[derive(ClapArgs, Clone)]
-struct RunGptArgs {
+struct GenerateArgs {
     #[arg(long, default_value = "checkpoints/gpt2.bin")]
     checkpoint: PathBuf,
 
@@ -158,12 +134,7 @@ struct RunGptArgs {
 }
 
 #[derive(ClapArgs, Clone)]
-struct RunVisionArgs {
-    /// Model checkpoint produced by the export tools.
-    #[arg(long)]
-    checkpoint: PathBuf,
-
-    /// Tensor archive containing a single input tensor (default key: "input").
+struct VisionInputArgs {
     #[arg(long)]
     input: Option<PathBuf>,
 
@@ -179,6 +150,28 @@ struct RunVisionArgs {
 
     #[arg(long, default_value_t = 224)]
     image_size: usize,
+}
+
+#[derive(ClapArgs, Clone)]
+struct ForwardArgs {
+    /// Model checkpoint (self-describing `GPTRSCHK`).
+    #[arg(long)]
+    checkpoint: PathBuf,
+
+    /// Tokenizer config to use with `--prompt`.
+    #[arg(long)]
+    tokenizer: Option<PathBuf>,
+
+    /// Text prompt (requires `--tokenizer`).
+    #[arg(long)]
+    prompt: Option<String>,
+
+    /// Comma-separated token ids, e.g. `--tokens 1,2,3`.
+    #[arg(long, value_delimiter = ',')]
+    tokens: Vec<usize>,
+
+    #[command(flatten)]
+    vision: VisionInputArgs,
 
     /// Optional output tensor archive path for logits ("logits" tensor).
     #[arg(long)]
@@ -186,27 +179,13 @@ struct RunVisionArgs {
 }
 
 #[derive(ClapArgs, Clone)]
-struct TraceVisionArgs {
-    /// Model checkpoint produced by the export tools.
+struct TraceArgs {
+    /// Model checkpoint (self-describing `GPTRSCHK`).
     #[arg(long)]
     checkpoint: PathBuf,
 
-    /// Tensor archive containing a single input tensor (default key: "input").
-    #[arg(long)]
-    input: Option<PathBuf>,
-
-    #[arg(long, default_value = "input")]
-    input_key: String,
-
-    /// Generate a deterministic random input when `--input` is not provided.
-    #[arg(long, default_value_t = 0)]
-    seed: u64,
-
-    #[arg(long, default_value_t = 1)]
-    batch: usize,
-
-    #[arg(long, default_value_t = 224)]
-    image_size: usize,
+    #[command(flatten)]
+    vision: VisionInputArgs,
 
     /// Output tensor archive path (all traced tensors).
     #[arg(long)]
@@ -248,7 +227,7 @@ fn load_tokenizer(path: impl AsRef<Path>) -> Result<Tokenizer> {
     Ok(Tokenizer::from_config(cfg))
 }
 
-fn load_input_tensor(args: &RunVisionArgs) -> Result<Tensor> {
+fn load_vision_input_tensor(args: &VisionInputArgs) -> Result<Tensor> {
     if let Some(path) = args.input.as_ref() {
         let tensors = TensorArchive::load(path)?;
         let input = tensors.get(&args.input_key).ok_or_else(|| {
@@ -276,19 +255,6 @@ fn load_input_tensor(args: &RunVisionArgs) -> Result<Tensor> {
         1.0,
         &mut rng,
     ))
-}
-
-fn load_input_tensor_trace(args: &TraceVisionArgs) -> Result<Tensor> {
-    let run_args = RunVisionArgs {
-        checkpoint: args.checkpoint.clone(),
-        input: args.input.clone(),
-        input_key: args.input_key.clone(),
-        seed: args.seed,
-        batch: args.batch,
-        image_size: args.image_size,
-        out: None,
-    };
-    load_input_tensor(&run_args)
 }
 
 fn main() -> Result<()> {
@@ -374,15 +340,9 @@ fn run_with_backend<B: PortableBackend + 'static>(
     profile: bool,
 ) -> Result<()> {
     match command {
-        Command::Run { model } => match model {
-            RunModel::Gpt(run) => run_gpt(&backend, &run, profile),
-            RunModel::ResNet34(run) => run_vision_resnet34(&backend, &run, profile),
-            RunModel::MobileNetV2(run) => run_vision_mobilenet_v2(&backend, &run, profile),
-        },
-        Command::Trace { model } => match model {
-            TraceModel::ResNet34(run) => trace_vision_resnet34(&backend, &run, profile),
-            TraceModel::MobileNetV2(run) => trace_vision_mobilenet_v2(&backend, &run, profile),
-        },
+        Command::Generate(args) => run_generate(&backend, &args, profile),
+        Command::Forward(args) => run_forward(&backend, &args, profile),
+        Command::Trace(args) => run_trace(&backend, &args, profile),
         Command::Convert(_) => unreachable!(),
         Command::Patterns(_) => unreachable!(),
     }
@@ -427,9 +387,9 @@ fn run_patterns(args: PatternsArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_gpt<B: PortableBackend + 'static>(
+fn run_generate<B: PortableBackend + 'static>(
     backend: &Arc<B>,
-    args: &RunGptArgs,
+    args: &GenerateArgs,
     profile: bool,
 ) -> Result<()> {
     let model = runtime::load_model_with_namespace(
@@ -438,11 +398,6 @@ fn run_gpt<B: PortableBackend + 'static>(
         runtime::next_namespace(),
     )
     .with_context(|| format!("failed to load checkpoint {}", args.checkpoint.display()))?;
-    ensure!(
-        model.kind() == "gpt",
-        "expected model kind 'gpt', got '{}'",
-        model.kind()
-    );
     let lm = model.as_causal_lm().ok_or_else(|| {
         anyhow!(
             "model kind '{}' does not support causal generation",
@@ -646,26 +601,9 @@ fn load_ptir_program(path: &Path) -> Result<Program> {
     }
 }
 
-fn run_vision_resnet34<B: PortableBackend + 'static>(
+fn run_forward<B: PortableBackend + 'static>(
     backend: &Arc<B>,
-    args: &RunVisionArgs,
-    profile: bool,
-) -> Result<()> {
-    run_vision_checkpoint("resnet34", backend, args, profile)
-}
-
-fn run_vision_mobilenet_v2<B: PortableBackend + 'static>(
-    backend: &Arc<B>,
-    args: &RunVisionArgs,
-    profile: bool,
-) -> Result<()> {
-    run_vision_checkpoint("mobilenet_v2", backend, args, profile)
-}
-
-fn run_vision_checkpoint<B: PortableBackend + 'static>(
-    expected_kind: &str,
-    backend: &Arc<B>,
-    args: &RunVisionArgs,
+    args: &ForwardArgs,
     profile: bool,
 ) -> Result<()> {
     let mut model = runtime::load_model_with_namespace(
@@ -674,51 +612,65 @@ fn run_vision_checkpoint<B: PortableBackend + 'static>(
         runtime::next_namespace(),
     )
     .with_context(|| format!("failed to load checkpoint {}", args.checkpoint.display()))?;
-    ensure!(
-        model.kind() == expected_kind,
-        "expected model kind '{}', got '{}'",
-        expected_kind,
-        model.kind()
-    );
-    run_vision_loaded_model(expected_kind, backend, model.as_mut(), args, profile)
-}
 
-fn run_vision_loaded_model<B: PortableBackend + 'static>(
-    name: &str,
-    backend: &Arc<B>,
-    model: &mut dyn runtime::LoadedModel<B>,
-    args: &RunVisionArgs,
-    profile: bool,
-) -> Result<()> {
-    let input = load_input_tensor(args)?;
-    let input_device = DeviceTensor::from_host(Arc::clone(backend), input)
-        .with_context(|| "failed to move input to device")?;
+    let is_text = args.prompt.is_some() || !args.tokens.is_empty();
+    if args.prompt.is_some() && !args.tokens.is_empty() {
+        bail!("use either --prompt or --tokens, not both");
+    }
+    if args.tokenizer.is_some() && args.prompt.is_none() {
+        bail!("--tokenizer is only valid together with --prompt");
+    }
+    if is_text && args.vision.input.is_some() {
+        bail!("cannot combine text input (--prompt/--tokens) with vision input (--input)");
+    }
+
+    let input = if let Some(prompt) = args.prompt.as_ref() {
+        let tokenizer_path = args
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| anyhow!("--prompt requires --tokenizer"))?;
+        let tokenizer = load_tokenizer(tokenizer_path)?;
+        let tokens = tokenizer.encode(prompt);
+        ensure!(
+            !tokens.is_empty(),
+            "prompt produced an empty token sequence"
+        );
+        runtime::ModelInput::Tokens(tokens)
+    } else if !args.tokens.is_empty() {
+        runtime::ModelInput::Tokens(args.tokens.clone())
+    } else {
+        let input = load_vision_input_tensor(&args.vision)?;
+        let input_device = DeviceTensor::from_host(Arc::clone(backend), input)
+            .with_context(|| "failed to move input to device")?;
+        runtime::ModelInput::Vision(input_device)
+    };
 
     if profile {
         profiling::reset();
     }
     let t0 = std::time::Instant::now();
-    let runtime::ModelOutput::Tensor(host) =
-        model.forward(runtime::ModelInput::Vision(input_device))?;
+    let runtime::ModelOutput::Tensor(host) = model.forward(input)?;
     let elapsed = t0.elapsed();
 
+    let model_kind = model.kind();
     let shape = host.shape().dims();
-    println!("model={} output_shape={:?}", name, shape);
+    println!("model={} output_shape={:?}", model_kind, shape);
 
-    if shape.len() == 2 && shape[0] > 0 {
-        let classes = shape[1];
-        if classes > 0 {
-            let row0 = &host.data()[0..classes];
-            let mut best = 0usize;
-            let mut best_val = f32::NEG_INFINITY;
-            for (i, &v) in row0.iter().enumerate() {
-                if v > best_val {
-                    best = i;
-                    best_val = v;
-                }
+    if shape.len() == 2 && shape[0] > 0 && shape[1] > 0 {
+        let rows = shape[0];
+        let cols = shape[1];
+        let row = if is_text { rows - 1 } else { 0 };
+        let start = row * cols;
+        let logits = &host.data()[start..start + cols];
+        let mut best = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for (i, &v) in logits.iter().enumerate() {
+            if v > best_val {
+                best = i;
+                best_val = v;
             }
-            println!("top1={} logit={:.6}", best, best_val);
         }
+        println!("top1={} logit={:.6}", best, best_val);
     }
 
     eprintln!("wall_s={:.3}", elapsed.as_secs_f64());
@@ -733,26 +685,9 @@ fn run_vision_loaded_model<B: PortableBackend + 'static>(
     Ok(())
 }
 
-fn trace_vision_resnet34<B: PortableBackend + 'static>(
+fn run_trace<B: PortableBackend + 'static>(
     backend: &Arc<B>,
-    args: &TraceVisionArgs,
-    profile: bool,
-) -> Result<()> {
-    trace_vision_checkpoint("resnet34", backend, args, profile)
-}
-
-fn trace_vision_mobilenet_v2<B: PortableBackend + 'static>(
-    backend: &Arc<B>,
-    args: &TraceVisionArgs,
-    profile: bool,
-) -> Result<()> {
-    trace_vision_checkpoint("mobilenet_v2", backend, args, profile)
-}
-
-fn trace_vision_checkpoint<B: PortableBackend + 'static>(
-    expected_kind: &str,
-    backend: &Arc<B>,
-    args: &TraceVisionArgs,
+    args: &TraceArgs,
     profile: bool,
 ) -> Result<()> {
     let model = runtime::load_model_with_namespace(
@@ -761,15 +696,9 @@ fn trace_vision_checkpoint<B: PortableBackend + 'static>(
         runtime::next_namespace(),
     )
     .with_context(|| format!("failed to load checkpoint {}", args.checkpoint.display()))?;
-    ensure!(
-        model.kind() == expected_kind,
-        "expected model kind '{}', got '{}'",
-        expected_kind,
-        model.kind()
-    );
 
-    println!("model={}", expected_kind);
-    let input = load_input_tensor_trace(args)?;
+    println!("model={}", model.kind());
+    let input = load_vision_input_tensor(&args.vision)?;
     let input_device = DeviceTensor::from_host(Arc::clone(backend), input)
         .with_context(|| "failed to move input to device")?;
 

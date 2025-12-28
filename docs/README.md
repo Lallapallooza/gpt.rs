@@ -8,6 +8,7 @@ Doc policy:
 
 ## Start here
 - `testing.md`: how correctness/perf is validated (backend suites, Torch parity, Python baselines).
+- `howto.md`: recipes for adding models/layers/functionals/backends (kept short and code-linked).
 
 ## Code orientation
 - `architecture.md`: crate/module layout and data flow.

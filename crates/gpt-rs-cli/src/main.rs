@@ -6,7 +6,6 @@ use gpt_rs::backend::text_ir::parse_program;
 use gpt_rs::inference::generate::Generator;
 use gpt_rs::inference::sampler::Sampler;
 use gpt_rs::io::tensor_archive::TensorArchive;
-use gpt_rs::model::{Gpt, MobileNetV2, ResNet34};
 use gpt_rs::ops::trace::{self, FileTraceOptions, FileTraceSink, ProgramDumpFilter};
 use gpt_rs::profiling;
 use gpt_rs::runtime;
@@ -100,10 +99,10 @@ enum RunModel {
     /// GPT-style text generation from a gpt.rs checkpoint + tokenizer.
     #[command(name = "gpt")]
     Gpt(RunGptArgs),
-    /// ResNet34 forward pass from a tensor archive produced by the Python tools.
+    /// ResNet34 forward pass from a gpt.rs checkpoint produced by the Python tools.
     #[command(name = "resnet34")]
     ResNet34(RunVisionArgs),
-    /// MobileNetV2 forward pass from a tensor archive produced by the Python tools.
+    /// MobileNetV2 forward pass from a gpt.rs checkpoint produced by the Python tools.
     #[command(name = "mobilenet_v2", alias = "mobilenet-v2")]
     MobileNetV2(RunVisionArgs),
 }
@@ -160,9 +159,9 @@ struct RunGptArgs {
 
 #[derive(ClapArgs, Clone)]
 struct RunVisionArgs {
-    /// Tensor archive containing named weights (see `scripts/export_model_weights.py`).
+    /// Model checkpoint produced by the export tools.
     #[arg(long)]
-    weights: PathBuf,
+    checkpoint: PathBuf,
 
     /// Tensor archive containing a single input tensor (default key: "input").
     #[arg(long)]
@@ -188,9 +187,9 @@ struct RunVisionArgs {
 
 #[derive(ClapArgs, Clone)]
 struct TraceVisionArgs {
-    /// Tensor archive containing named weights (see `scripts/export_model_weights.py`).
+    /// Model checkpoint produced by the export tools.
     #[arg(long)]
-    weights: PathBuf,
+    checkpoint: PathBuf,
 
     /// Tensor archive containing a single input tensor (default key: "input").
     #[arg(long)]
@@ -281,7 +280,7 @@ fn load_input_tensor(args: &RunVisionArgs) -> Result<Tensor> {
 
 fn load_input_tensor_trace(args: &TraceVisionArgs) -> Result<Tensor> {
     let run_args = RunVisionArgs {
-        weights: args.weights.clone(),
+        checkpoint: args.checkpoint.clone(),
         input: args.input.clone(),
         input_key: args.input_key.clone(),
         seed: args.seed,
@@ -433,12 +432,23 @@ fn run_gpt<B: PortableBackend + 'static>(
     args: &RunGptArgs,
     profile: bool,
 ) -> Result<()> {
-    let model: Gpt<B> = runtime::load_gpt_checkpoint_with_namespace(
+    let model = runtime::load_model_with_namespace(
         Arc::clone(backend),
         &args.checkpoint,
         runtime::next_namespace(),
     )
     .with_context(|| format!("failed to load checkpoint {}", args.checkpoint.display()))?;
+    ensure!(
+        model.kind() == "gpt",
+        "expected model kind 'gpt', got '{}'",
+        model.kind()
+    );
+    let lm = model.as_causal_lm().ok_or_else(|| {
+        anyhow!(
+            "model kind '{}' does not support causal generation",
+            model.kind()
+        )
+    })?;
     let tokenizer = load_tokenizer(&args.tokenizer)?;
 
     let prompt_tokens = tokenizer.encode(&args.prompt);
@@ -465,7 +475,7 @@ fn run_gpt<B: PortableBackend + 'static>(
         let t0 = std::time::Instant::now();
 
         let mut generator = Generator::new_with_kv_cache_capacity(
-            &model,
+            lm,
             &sampler,
             &prompt_tokens,
             args.kv_cache,
@@ -504,7 +514,7 @@ fn run_gpt<B: PortableBackend + 'static>(
     }
 
     let mut generator = Generator::new_with_kv_cache_capacity(
-        &model,
+        lm,
         &sampler,
         &prompt_tokens,
         args.kv_cache,
@@ -641,14 +651,7 @@ fn run_vision_resnet34<B: PortableBackend + 'static>(
     args: &RunVisionArgs,
     profile: bool,
 ) -> Result<()> {
-    let model: ResNet34<B> = runtime::load_resnet34_weights_with_namespace(
-        Arc::clone(backend),
-        &args.weights,
-        runtime::next_namespace(),
-    )
-    .with_context(|| format!("failed to read weights archive {}", args.weights.display()))?;
-
-    run_vision_model("resnet34", backend, &model, args, profile)
+    run_vision_checkpoint("resnet34", backend, args, profile)
 }
 
 fn run_vision_mobilenet_v2<B: PortableBackend + 'static>(
@@ -656,36 +659,34 @@ fn run_vision_mobilenet_v2<B: PortableBackend + 'static>(
     args: &RunVisionArgs,
     profile: bool,
 ) -> Result<()> {
-    let model: MobileNetV2<B> = runtime::load_mobilenet_v2_weights_with_namespace(
+    run_vision_checkpoint("mobilenet_v2", backend, args, profile)
+}
+
+fn run_vision_checkpoint<B: PortableBackend + 'static>(
+    expected_kind: &str,
+    backend: &Arc<B>,
+    args: &RunVisionArgs,
+    profile: bool,
+) -> Result<()> {
+    let mut model = runtime::load_model_with_namespace(
         Arc::clone(backend),
-        &args.weights,
+        &args.checkpoint,
         runtime::next_namespace(),
     )
-    .with_context(|| format!("failed to read weights archive {}", args.weights.display()))?;
-
-    run_vision_model("mobilenet_v2", backend, &model, args, profile)
+    .with_context(|| format!("failed to load checkpoint {}", args.checkpoint.display()))?;
+    ensure!(
+        model.kind() == expected_kind,
+        "expected model kind '{}', got '{}'",
+        expected_kind,
+        model.kind()
+    );
+    run_vision_loaded_model(expected_kind, backend, model.as_mut(), args, profile)
 }
 
-trait VisionForward<B: PortableBackend + 'static> {
-    fn forward(&self, input: &DeviceTensor<B>) -> Result<DeviceTensor<B>>;
-}
-
-impl<B: PortableBackend + 'static> VisionForward<B> for ResNet34<B> {
-    fn forward(&self, input: &DeviceTensor<B>) -> Result<DeviceTensor<B>> {
-        self.forward(input)
-    }
-}
-
-impl<B: PortableBackend + 'static> VisionForward<B> for MobileNetV2<B> {
-    fn forward(&self, input: &DeviceTensor<B>) -> Result<DeviceTensor<B>> {
-        self.forward(input)
-    }
-}
-
-fn run_vision_model<B: PortableBackend + 'static, M: VisionForward<B>>(
+fn run_vision_loaded_model<B: PortableBackend + 'static>(
     name: &str,
     backend: &Arc<B>,
-    model: &M,
+    model: &mut dyn runtime::LoadedModel<B>,
     args: &RunVisionArgs,
     profile: bool,
 ) -> Result<()> {
@@ -697,8 +698,8 @@ fn run_vision_model<B: PortableBackend + 'static, M: VisionForward<B>>(
         profiling::reset();
     }
     let t0 = std::time::Instant::now();
-    let logits = model.forward(&input_device)?;
-    let host = logits.to_host()?;
+    let runtime::ModelOutput::Tensor(host) =
+        model.forward(runtime::ModelInput::Vision(input_device))?;
     let elapsed = t0.elapsed();
 
     let shape = host.shape().dims();
@@ -737,14 +738,7 @@ fn trace_vision_resnet34<B: PortableBackend + 'static>(
     args: &TraceVisionArgs,
     profile: bool,
 ) -> Result<()> {
-    let model: ResNet34<B> = runtime::load_resnet34_weights_with_namespace(
-        Arc::clone(backend),
-        &args.weights,
-        runtime::next_namespace(),
-    )
-    .with_context(|| format!("failed to read weights archive {}", args.weights.display()))?;
-
-    trace_vision_model("resnet34", backend, &model, args, profile)
+    trace_vision_checkpoint("resnet34", backend, args, profile)
 }
 
 fn trace_vision_mobilenet_v2<B: PortableBackend + 'static>(
@@ -752,40 +746,29 @@ fn trace_vision_mobilenet_v2<B: PortableBackend + 'static>(
     args: &TraceVisionArgs,
     profile: bool,
 ) -> Result<()> {
-    let model: MobileNetV2<B> = runtime::load_mobilenet_v2_weights_with_namespace(
-        Arc::clone(backend),
-        &args.weights,
-        runtime::next_namespace(),
-    )
-    .with_context(|| format!("failed to read weights archive {}", args.weights.display()))?;
-
-    trace_vision_model("mobilenet_v2", backend, &model, args, profile)
+    trace_vision_checkpoint("mobilenet_v2", backend, args, profile)
 }
 
-trait VisionTrace<B: PortableBackend + 'static> {
-    fn forward_trace(&self, input: &DeviceTensor<B>) -> Result<Vec<(String, DeviceTensor<B>)>>;
-}
-
-impl<B: PortableBackend + 'static> VisionTrace<B> for ResNet34<B> {
-    fn forward_trace(&self, input: &DeviceTensor<B>) -> Result<Vec<(String, DeviceTensor<B>)>> {
-        self.forward_trace(input)
-    }
-}
-
-impl<B: PortableBackend + 'static> VisionTrace<B> for MobileNetV2<B> {
-    fn forward_trace(&self, input: &DeviceTensor<B>) -> Result<Vec<(String, DeviceTensor<B>)>> {
-        self.forward_trace(input)
-    }
-}
-
-fn trace_vision_model<B: PortableBackend + 'static, M: VisionTrace<B>>(
-    name: &str,
+fn trace_vision_checkpoint<B: PortableBackend + 'static>(
+    expected_kind: &str,
     backend: &Arc<B>,
-    model: &M,
     args: &TraceVisionArgs,
     profile: bool,
 ) -> Result<()> {
-    println!("model={}", name);
+    let model = runtime::load_model_with_namespace(
+        Arc::clone(backend),
+        &args.checkpoint,
+        runtime::next_namespace(),
+    )
+    .with_context(|| format!("failed to load checkpoint {}", args.checkpoint.display()))?;
+    ensure!(
+        model.kind() == expected_kind,
+        "expected model kind '{}', got '{}'",
+        expected_kind,
+        model.kind()
+    );
+
+    println!("model={}", expected_kind);
     let input = load_input_tensor_trace(args)?;
     let input_device = DeviceTensor::from_host(Arc::clone(backend), input)
         .with_context(|| "failed to move input to device")?;
@@ -793,7 +776,9 @@ fn trace_vision_model<B: PortableBackend + 'static, M: VisionTrace<B>>(
     if profile {
         profiling::reset();
     }
-    let traced = model.forward_trace(&input_device)?;
+    let traced = model
+        .trace_vision(&input_device)?
+        .ok_or_else(|| anyhow!("model kind '{}' does not support tracing", model.kind()))?;
 
     let mut names = Vec::with_capacity(traced.len());
     let mut tensors = Vec::with_capacity(traced.len());

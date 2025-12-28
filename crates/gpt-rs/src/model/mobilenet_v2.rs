@@ -211,6 +211,143 @@ impl<B: PortableBackend + 'static> MobileNetV2<B> {
         Arc::clone(&self.backend)
     }
 
+    pub fn build_from_params(
+        backend: Arc<B>,
+        mut get: impl FnMut(&str) -> Result<DeviceTensor<B>>,
+    ) -> Result<Self> {
+        let stem_weight = get("stem.weight")?;
+        let stem_bias = get("stem.bias")?;
+        let stem = Conv2d::new(
+            Arc::clone(&backend),
+            stem_weight,
+            Some(stem_bias),
+            [3, 3],
+            [2, 2],
+            [1, 1],
+            crate::ops::functional::Padding2d {
+                top: 1,
+                bottom: 1,
+                left: 1,
+                right: 1,
+            },
+        )?;
+
+        const SETTINGS: [(usize, usize, usize, usize); 7] = [
+            (1, 16, 1, 1),
+            (6, 24, 2, 2),
+            (6, 32, 3, 2),
+            (6, 64, 4, 2),
+            (6, 96, 3, 1),
+            (6, 160, 3, 2),
+            (6, 320, 1, 1),
+        ];
+
+        let mut blocks = Vec::new();
+        let mut input_channels = 32usize;
+        let mut block_idx = 0usize;
+
+        for (expand_ratio, out_channels, repeats, stage_stride) in SETTINGS {
+            for repeat_idx in 0..repeats {
+                let stride = if repeat_idx == 0 { stage_stride } else { 1 };
+                let _expanded = input_channels
+                    .checked_mul(expand_ratio)
+                    .ok_or_else(|| anyhow!("mobilenet expanded channel overflow"))?;
+
+                let expand = if expand_ratio != 1 {
+                    let w = get(&format!("blocks.{block_idx}.expand.weight"))?;
+                    let b = get(&format!("blocks.{block_idx}.expand.bias"))?;
+                    Some(Conv2d::new(
+                        Arc::clone(&backend),
+                        w,
+                        Some(b),
+                        [1, 1],
+                        [1, 1],
+                        [1, 1],
+                        crate::ops::functional::Padding2d::zero(),
+                    )?)
+                } else {
+                    None
+                };
+
+                let dw_weight = get(&format!("blocks.{block_idx}.depthwise.weight"))?;
+                let dw_bias = get(&format!("blocks.{block_idx}.depthwise.bias"))?;
+                let groups = dw_weight.shape().dims()[0];
+                let depthwise = Conv2d::new_grouped(
+                    Arc::clone(&backend),
+                    dw_weight,
+                    Some(dw_bias),
+                    [3, 3],
+                    [stride, stride],
+                    [1, 1],
+                    crate::ops::functional::Padding2d {
+                        top: 1,
+                        bottom: 1,
+                        left: 1,
+                        right: 1,
+                    },
+                    groups,
+                )?;
+
+                let proj_weight = get(&format!("blocks.{block_idx}.project.weight"))?;
+                let proj_bias = get(&format!("blocks.{block_idx}.project.bias"))?;
+                let project = Conv2d::new(
+                    Arc::clone(&backend),
+                    proj_weight,
+                    Some(proj_bias),
+                    [1, 1],
+                    [1, 1],
+                    [1, 1],
+                    crate::ops::functional::Padding2d::zero(),
+                )?;
+
+                let use_res_connect = stride == 1 && input_channels == out_channels;
+                blocks.push(InvertedResidual::new(
+                    Arc::clone(&backend),
+                    expand,
+                    depthwise,
+                    project,
+                    use_res_connect,
+                ));
+
+                input_channels = out_channels;
+                block_idx += 1;
+            }
+        }
+
+        let head_weight = get("head.weight")?;
+        let head_bias = get("head.bias")?;
+        let head = Conv2d::new(
+            Arc::clone(&backend),
+            head_weight,
+            Some(head_bias),
+            [1, 1],
+            [1, 1],
+            [1, 1],
+            crate::ops::functional::Padding2d::zero(),
+        )?;
+
+        let mut classifier_weight = get("classifier.weight")?;
+        let classifier_bias = get("classifier.bias")?;
+        let classifier_bias_len = classifier_bias.shape().dims()[0];
+        let classifier_weight_dims = classifier_weight.shape().dims();
+        if classifier_weight_dims.len() == 2 && classifier_weight_dims[0] == classifier_bias_len {
+            let stable_id = classifier_weight
+                .lazy_handle()
+                .id()
+                .ok_or_else(|| anyhow!("classifier.weight missing stable id"))?;
+            classifier_weight = transpose(backend.as_ref(), &classifier_weight, &[1, 0])?
+                .freeze()?
+                .as_param_with_id(stable_id)?;
+        }
+        let classifier = Linear::new(
+            Arc::clone(&backend),
+            classifier_weight,
+            Some(classifier_bias),
+        )?;
+
+        Ok(Self::new(backend, stem, blocks, head, classifier))
+    }
+
     pub fn from_named_tensors(
         backend: Arc<B>,
         mut tensors: HashMap<String, Tensor>,

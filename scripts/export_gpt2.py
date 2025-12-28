@@ -13,17 +13,15 @@ Requires 	orch and 	ransformers.
 
 import argparse
 import json
-import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple, cast
+from typing import Any, Dict, Iterable, List, Tuple, cast
 
 import numpy as np
 import torch
 from transformers import GPT2LMHeadModel, GPT2TokenizerFast
 
-MAGIC = b"GPTRSCHK"
-VERSION = 1
+from gptrs_eval.checkpoint import save as save_checkpoint
 
 
 @dataclass
@@ -190,29 +188,16 @@ def export_tokenizer(tokenizer: GPT2TokenizerFast, path: Path) -> None:
     path.write_text(json.dumps(data, indent=2))
 
 
-def write_checkpoint(path: Path, config: Dict[str, int], tensors: Iterable[ExportTensor]) -> None:
-    with path.open("wb") as f:
-        f.write(MAGIC)
-        f.write(struct.pack("<I", VERSION))
-        config_bytes = json.dumps(config).encode("utf-8")
-        f.write(struct.pack("<I", len(config_bytes)))
-        f.write(config_bytes)
-        tensors = list(tensors)
-        f.write(struct.pack("<I", len(tensors)))
-        for tensor in tensors:
-            name_bytes = tensor.name.encode("utf-8")
-            f.write(struct.pack("<I", len(name_bytes)))
-            f.write(name_bytes)
-            shape = list(tensor.array.shape)
-            f.write(struct.pack("<I", len(shape)))
-            for dim in shape:
-                f.write(struct.pack("<Q", dim))
-            dtype_tag = 0  # F32
-            f.write(struct.pack("<I", dtype_tag))
-            f.write(struct.pack("<B", 1 if tensor.requires_grad else 0))
-            data = tensor.array.astype(np.float32).flatten()
-            f.write(struct.pack("<Q", data.nbytes))
-            f.write(data.tobytes())
+def write_checkpoint(path: Path, config: Dict[str, Any], tensors: Iterable[ExportTensor]) -> None:
+    tensor_map: Dict[str, np.ndarray] = {t.name: t.array for t in tensors}
+    requires_grad = {t.name: bool(t.requires_grad) for t in tensors}
+    save_checkpoint(
+        path,
+        kind="gpt",
+        config=config,
+        tensors=tensor_map,
+        requires_grad=requires_grad,
+    )
 
 
 def main() -> None:

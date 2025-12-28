@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use gpt_rs::backend::spec::Program;
 use gpt_rs::inference::generate::Generator;
 use gpt_rs::inference::sampler::Sampler;
-use gpt_rs::model::{Gpt, ModelConfig};
+use gpt_rs::model::{Gpt, GptConfig};
 use gpt_rs::ops::trace::{self, ExecutionTraceSink, ProgramContext, ProgramStats};
 use gpt_rs_backend_ref_cpu::CpuPortableBackend;
 use rand::rngs::StdRng;
@@ -25,7 +25,7 @@ impl ExecutionTraceSink for ContextSink {
 fn decode_kv_cache_reuses_program_cache_in_lazy_mode() -> anyhow::Result<()> {
     let backend = Arc::new(CpuPortableBackend::default());
     let mut rng = StdRng::seed_from_u64(0);
-    let config = ModelConfig {
+    let config = GptConfig {
         vocab_size: 32,
         context_length: 32,
         embed_dim: 32,

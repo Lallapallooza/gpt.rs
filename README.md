@@ -44,12 +44,12 @@ cargo build
 cargo run --release -p gpt-rs-cli -- run gpt --prompt "Hello" --max-tokens 64 \
   --checkpoint checkpoints/gpt2.bin --tokenizer configs/gpt2_tokenizer.json
 
-# export torchvision weights (portable tensor archive)
+# export torchvision weights (gpt.rs checkpoint)
 uv sync
-uv run python scripts/export_model_weights.py --model resnet34 --out checkpoints/resnet34.tensors
+uv run python scripts/export_model_weights.py --model resnet34 --out checkpoints/resnet34.bin
 
 # run an image model (deterministic random input by default)
-cargo run --release -p gpt-rs-cli -- run resnet34 --weights checkpoints/resnet34.tensors
+cargo run --release -p gpt-rs-cli -- run resnet34 --checkpoint checkpoints/resnet34.bin
 ```
 
 ## Torch Baselines (Python)

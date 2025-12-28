@@ -1,6 +1,6 @@
 use crate::backend::spec::PortableBackend;
 use crate::inference::sampler::Sampler;
-use crate::model::Gpt;
+use crate::inference::CausalLanguageModel;
 use crate::ops::functional::DecodeKvCache;
 use crate::tensor::{Shape, Tensor};
 use anyhow::{ensure, Result};
@@ -35,7 +35,7 @@ impl Default for GenerateConfig {
 }
 
 pub struct Generator<'a, B: PortableBackend + 'static> {
-    model: &'a Gpt<B>,
+    model: &'a dyn CausalLanguageModel<B>,
     sampler: &'a Sampler,
     caches: Option<Vec<Option<DecodeKvCache<B>>>>,
     processed_len: usize,
@@ -47,7 +47,7 @@ pub struct Generator<'a, B: PortableBackend + 'static> {
 
 impl<'a, B: PortableBackend + 'static> Generator<'a, B> {
     pub fn new(
-        model: &'a Gpt<B>,
+        model: &'a dyn CausalLanguageModel<B>,
         sampler: &'a Sampler,
         prompt: &[usize],
         kv_cache: bool,
@@ -56,7 +56,7 @@ impl<'a, B: PortableBackend + 'static> Generator<'a, B> {
     }
 
     pub fn new_with_kv_cache_capacity(
-        model: &'a Gpt<B>,
+        model: &'a dyn CausalLanguageModel<B>,
         sampler: &'a Sampler,
         prompt: &[usize],
         kv_cache: bool,
@@ -64,11 +64,11 @@ impl<'a, B: PortableBackend + 'static> Generator<'a, B> {
     ) -> Result<Self> {
         ensure!(!prompt.is_empty(), "prompt must be non-empty");
 
-        let context_length = model.config.context_length;
+        let context_length = model.context_length();
         let tokens = prompt.to_vec();
         let window_start = tokens.len().saturating_sub(context_length);
 
-        let mut caches = kv_cache.then(|| vec![None; model.blocks.len()]);
+        let mut caches = kv_cache.then(|| vec![None; model.num_layers()]);
         let mut processed_len = 0usize;
 
         let context = &tokens[window_start..];
@@ -132,7 +132,7 @@ impl<'a, B: PortableBackend + 'static> Generator<'a, B> {
         let next = self.sampler.sample(&row_tensor);
         self.tokens.push(next);
 
-        let context_length = self.model.config.context_length;
+        let context_length = self.model.context_length();
         if self.tokens.len() - self.window_start > context_length {
             self.window_start = self.tokens.len().saturating_sub(context_length);
             if let Some(caches_vec) = self.caches.as_mut() {
@@ -167,7 +167,7 @@ impl<'a, B: PortableBackend + 'static> Generator<'a, B> {
 }
 
 pub fn generate_tokens<B: PortableBackend + 'static>(
-    model: &Gpt<B>,
+    model: &dyn CausalLanguageModel<B>,
     prompt: &[usize],
     sampler: &Sampler,
     cfg: GenerateConfig,

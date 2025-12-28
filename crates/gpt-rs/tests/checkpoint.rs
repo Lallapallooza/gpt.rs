@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpt_rs::checkpoint::{CheckpointLoader, CheckpointSaver};
-use gpt_rs::model::{Gpt, ModelConfig};
+use gpt_rs::model::{Gpt, GptConfig};
 use gpt_rs::ops::functional::FunctionalOverrides;
 use gpt_rs_backend_ref_cpu::CpuPortableBackend;
 use rand::rngs::StdRng;
@@ -18,7 +18,7 @@ fn cpu_backend() -> Arc<CpuPortableBackend> {
 fn checkpoint_roundtrip() {
     let backend = cpu_backend();
     let mut rng = StdRng::seed_from_u64(11);
-    let config = ModelConfig {
+    let config = GptConfig {
         vocab_size: 16,
         context_length: 8,
         embed_dim: 8,

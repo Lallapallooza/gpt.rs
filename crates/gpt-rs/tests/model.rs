@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use gpt_rs::model::{Gpt, ModelConfig};
+use gpt_rs::model::{Gpt, GptConfig};
 use gpt_rs::ops::functional::FunctionalOverrides;
 use gpt_rs::train::trainer::Trainer;
 use gpt_rs_backend_ref_cpu::CpuPortableBackend;
@@ -15,7 +15,7 @@ fn cpu_backend() -> Arc<CpuPortableBackend> {
 fn gpt_forward_shape() {
     let backend = cpu_backend();
     let mut rng = StdRng::seed_from_u64(42);
-    let config = ModelConfig {
+    let config = GptConfig {
         vocab_size: 32,
         context_length: 16,
         embed_dim: 8,
@@ -35,7 +35,7 @@ fn gpt_forward_shape() {
 fn trainer_updates_lm_head() {
     let backend = cpu_backend();
     let mut rng = StdRng::seed_from_u64(7);
-    let config = ModelConfig {
+    let config = GptConfig {
         vocab_size: 32,
         context_length: 8,
         embed_dim: 8,

@@ -240,6 +240,129 @@ impl<B: PortableBackend + 'static> ResNet34<B> {
         Arc::clone(&self.backend)
     }
 
+    pub fn build_from_params(
+        backend: Arc<B>,
+        mut get: impl FnMut(&str) -> Result<DeviceTensor<B>>,
+    ) -> Result<Self> {
+        let conv1_weight = get("conv1.weight")?;
+        let conv1_bias = get("conv1.bias")?;
+        let conv1 = Conv2d::new(
+            Arc::clone(&backend),
+            conv1_weight,
+            Some(conv1_bias),
+            [7, 7],
+            [2, 2],
+            [1, 1],
+            Padding2d {
+                top: 3,
+                bottom: 3,
+                left: 3,
+                right: 3,
+            },
+        )?;
+
+        const STAGES: [(usize, usize); 4] = [(64, 3), (128, 4), (256, 6), (512, 3)];
+
+        let mut in_channels = 64usize;
+        let mut layers: [Vec<BasicBlock<B>>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+
+        for (stage_idx, (out_channels, blocks)) in STAGES.iter().copied().enumerate() {
+            let stage_num = stage_idx + 1;
+            for block_idx in 0..blocks {
+                let stride = if stage_idx == 0 {
+                    1usize
+                } else if block_idx == 0 {
+                    2usize
+                } else {
+                    1usize
+                };
+
+                let conv1_key = format!("layer{stage_num}.{block_idx}.conv1");
+                let conv2_key = format!("layer{stage_num}.{block_idx}.conv2");
+
+                let block_conv1_weight = get(&format!("{conv1_key}.weight"))?;
+                let block_conv1_bias = get(&format!("{conv1_key}.bias"))?;
+                let conv1 = Conv2d::new(
+                    Arc::clone(&backend),
+                    block_conv1_weight,
+                    Some(block_conv1_bias),
+                    [3, 3],
+                    [stride, stride],
+                    [1, 1],
+                    Padding2d {
+                        top: 1,
+                        bottom: 1,
+                        left: 1,
+                        right: 1,
+                    },
+                )?;
+
+                let block_conv2_weight = get(&format!("{conv2_key}.weight"))?;
+                let block_conv2_bias = get(&format!("{conv2_key}.bias"))?;
+                let conv2 = Conv2d::new(
+                    Arc::clone(&backend),
+                    block_conv2_weight,
+                    Some(block_conv2_bias),
+                    [3, 3],
+                    [1, 1],
+                    [1, 1],
+                    Padding2d {
+                        top: 1,
+                        bottom: 1,
+                        left: 1,
+                        right: 1,
+                    },
+                )?;
+
+                let downsample = if block_idx == 0 && (stride != 1 || in_channels != out_channels) {
+                    let ds_key = format!("layer{stage_num}.{block_idx}.downsample");
+                    let ds_weight = get(&format!("{ds_key}.weight"))?;
+                    let ds_bias = get(&format!("{ds_key}.bias"))?;
+                    Some(Conv2d::new(
+                        Arc::clone(&backend),
+                        ds_weight,
+                        Some(ds_bias),
+                        [1, 1],
+                        [stride, stride],
+                        [1, 1],
+                        Padding2d::zero(),
+                    )?)
+                } else {
+                    None
+                };
+
+                layers[stage_idx].push(BasicBlock::new(
+                    Arc::clone(&backend),
+                    conv1,
+                    conv2,
+                    downsample,
+                ));
+
+                in_channels = out_channels;
+            }
+        }
+
+        let mut fc_weight = get("fc.weight")?;
+        let fc_bias = get("fc.bias")?;
+        let fc_bias_len = fc_bias.shape().dims()[0];
+        let fc_weight_dims = fc_weight.shape().dims();
+        if fc_weight_dims.len() == 2 && fc_weight_dims[0] == fc_bias_len {
+            let stable_id = fc_weight
+                .lazy_handle()
+                .id()
+                .ok_or_else(|| anyhow!("fc.weight missing stable id"))?;
+            fc_weight = transpose(backend.as_ref(), &fc_weight, &[1, 0])?
+                .freeze()?
+                .as_param_with_id(stable_id)?;
+        }
+        let fc = Linear::new(Arc::clone(&backend), fc_weight, Some(fc_bias))?;
+
+        let [layer1, layer2, layer3, layer4] = layers;
+        Ok(Self::new(
+            backend, conv1, layer1, layer2, layer3, layer4, fc,
+        ))
+    }
+
     pub fn from_named_tensors(
         backend: Arc<B>,
         mut tensors: HashMap<String, Tensor>,

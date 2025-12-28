@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpt_rs::backend::spec::PortableBackend;
 use gpt_rs::checkpoint::{CheckpointLoader, CheckpointSaver};
-use gpt_rs::model::{Gpt, ModelConfig};
+use gpt_rs::model::{Gpt, GptConfig};
 use gpt_rs::ops::functional;
 use gpt_rs::ops::functional::FunctionalOverrides;
 use gpt_rs::tensor::{DeviceTensor, Shape, Tensor};
@@ -30,7 +30,7 @@ pub fn matmul_matches_expected<B: PortableBackend + 'static>(backend: &Arc<B>) {
 
 pub fn gpt_forward_shape<B: PortableBackend + 'static>(backend: &Arc<B>) {
     let mut rng = StdRng::seed_from_u64(42);
-    let config = ModelConfig {
+    let config = GptConfig {
         vocab_size: 32,
         context_length: 16,
         embed_dim: 8,
@@ -66,7 +66,7 @@ pub fn tokenizer_roundtrip() {
 
 pub fn trainer_updates_lm_head<B: PortableBackend + 'static>(backend: &Arc<B>) {
     let mut rng = StdRng::seed_from_u64(7);
-    let config = ModelConfig {
+    let config = GptConfig {
         vocab_size: 32,
         context_length: 8,
         embed_dim: 8,
@@ -85,7 +85,7 @@ pub fn trainer_updates_lm_head<B: PortableBackend + 'static>(backend: &Arc<B>) {
 
 pub fn checkpoint_roundtrip<B: PortableBackend + 'static>(backend: &Arc<B>) {
     let mut rng = StdRng::seed_from_u64(11);
-    let config = ModelConfig {
+    let config = GptConfig {
         vocab_size: 16,
         context_length: 8,
         embed_dim: 8,

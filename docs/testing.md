@@ -283,24 +283,24 @@ cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- run gpt \
 
 ### Vision run (ResNet34 / MobileNetV2)
 
-First export weights from Torch into a portable tensor archive:
+First export weights from Torch into a gpt.rs checkpoint:
 
 ```bash
-uv run python scripts/export_model_weights.py --model resnet34 --out checkpoints/resnet34.tensors
-uv run python scripts/export_model_weights.py --model mobilenet_v2 --out checkpoints/mobilenet_v2.tensors
+uv run python scripts/export_model_weights.py --model resnet34 --out checkpoints/resnet34.bin
+uv run python scripts/export_model_weights.py --model mobilenet_v2 --out checkpoints/mobilenet_v2.bin
 ```
 
 Then run the model (generates a deterministic random input unless you pass `--input`):
 
 ```bash
-cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- run resnet34 --weights checkpoints/resnet34.tensors --profile
-cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- run mobilenet_v2 --weights checkpoints/mobilenet_v2.tensors --profile
+cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- run resnet34 --checkpoint checkpoints/resnet34.bin --profile
+cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- run mobilenet_v2 --checkpoint checkpoints/mobilenet_v2.bin --profile
 ```
 
 ### Vision trace (layer-by-layer dumps)
 
 ```bash
 cargo run --release -p gpt-rs-cli -- trace resnet34 \
-  --weights checkpoints/resnet34.tensors \
+  --checkpoint checkpoints/resnet34.bin \
   --out dumps/resnet34_trace.tensors
 ```

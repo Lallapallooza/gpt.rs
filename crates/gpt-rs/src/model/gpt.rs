@@ -1,4 +1,4 @@
-use super::ModelConfig;
+use super::GptConfig;
 use crate::backend::spec::PortableBackend;
 use crate::module::{Module, ParamVisitor, ParamVisitorMut, TensorRole};
 use crate::nn::{
@@ -134,7 +134,7 @@ impl<B: PortableBackend + 'static> Module<B> for GptBlock<B> {
 pub struct Gpt<B: PortableBackend + 'static> {
     pub backend: Arc<B>,
     functional: FunctionalRegistryHandle<B>,
-    pub config: ModelConfig,
+    pub config: GptConfig,
     pub tok_embeddings: Embedding<B>,
     pub pos_embeddings: DeviceTensor<B>,
     pub blocks: Vec<GptBlock<B>>,
@@ -152,7 +152,7 @@ pub struct GptForwardState<B: PortableBackend + 'static> {
 }
 
 impl<B: PortableBackend + 'static> Gpt<B> {
-    pub fn random(config: ModelConfig, backend: Arc<B>, rng: &mut impl Rng) -> Result<Self> {
+    pub fn random(config: GptConfig, backend: Arc<B>, rng: &mut impl Rng) -> Result<Self> {
         let functional: FunctionalRegistryHandle<B> = build_registry(&config.functional_overrides);
         let embed_dim = config.embed_dim;
         let hidden_dim = embed_dim * config.mlp_ratio;
@@ -244,7 +244,7 @@ impl<B: PortableBackend + 'static> Gpt<B> {
     }
 
     pub fn from_named_tensors(
-        config: ModelConfig,
+        config: GptConfig,
         backend: Arc<B>,
         mut tensors: HashMap<String, Tensor>,
     ) -> Result<Self> {
@@ -345,7 +345,7 @@ impl<B: PortableBackend + 'static> Gpt<B> {
     }
 
     pub fn build_from_params(
-        config: ModelConfig,
+        config: GptConfig,
         backend: Arc<B>,
         mut get: impl FnMut(&str) -> Result<DeviceTensor<B>>,
     ) -> Result<Self> {
@@ -1012,4 +1012,43 @@ impl<B: PortableBackend + 'static> Module<B> for Gpt<B> {
 fn decode_cache_capacity(required_len: usize, max_len: usize) -> usize {
     let bucket = required_len.next_power_of_two().max(1);
     bucket.min(max_len)
+}
+
+impl<B: PortableBackend + 'static> crate::inference::CausalLanguageModel<B> for Gpt<B> {
+    fn context_length(&self) -> usize {
+        self.config.context_length
+    }
+
+    fn num_layers(&self) -> usize {
+        self.blocks.len()
+    }
+
+    fn forward(&self, tokens: &[usize]) -> Result<Tensor> {
+        Gpt::forward(self, tokens)
+    }
+
+    fn forward_with_decode_cache(
+        &self,
+        tokens: &[usize],
+        position_offset: usize,
+        caches: &mut [Option<DecodeKvCache<B>>],
+    ) -> Result<Tensor> {
+        Gpt::forward_with_decode_cache(self, tokens, position_offset, caches)
+    }
+
+    fn forward_with_decode_cache_with_capacity(
+        &self,
+        tokens: &[usize],
+        position_offset: usize,
+        caches: &mut [Option<DecodeKvCache<B>>],
+        capacity: usize,
+    ) -> Result<Tensor> {
+        Gpt::forward_with_decode_cache_with_capacity(
+            self,
+            tokens,
+            position_offset,
+            caches,
+            capacity,
+        )
+    }
 }

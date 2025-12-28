@@ -25,8 +25,8 @@ frontend layering and functional overrides, see `docs/frontend.md`.
 - `ops`: PTIR capture (graph arena), functional kernels, tracing/dump sinks.
 - `nn`: parameterized layers composed from functionals (e.g. `Linear`, `LayerNorm`, attention blocks).
 - `model`: concrete model assemblies and weight loading helpers.
-- `checkpoint`: GPT checkpoint format + loader.
-- `io`: portable tensor archives (used by CV models and traces).
+- `checkpoint`: self-describing model checkpoint format + loader.
+- `io`: portable tensor archives (used for inputs/outputs/traces).
 - `inference`: sampling + incremental generation (`Generator`).
 - `tokenizer`: tokenizer config + encode/decode.
 - `train`: small training utilities (experimental; not the primary focus right now).

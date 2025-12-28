@@ -1,17 +1,15 @@
 use crate::backend::spec::PortableBackend;
-use crate::model::{Gpt, ModelConfig};
+use crate::model::{Gpt, GptConfig, ModelConfig};
 use crate::params::{base_param_id, BaseParamId};
 use crate::tensor::{DType, Shape, Tensor};
 use anyhow::{anyhow, bail, Result};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
 const MAGIC: &[u8; 8] = b"GPTRSCHK";
-const VERSION_V1: u32 = 1;
 const VERSION_V2: u32 = 2;
 
 #[derive(Clone, Debug)]
@@ -23,22 +21,6 @@ pub struct CheckpointTensorEntry {
     pub requires_grad: bool,
     pub offset: u64,
     pub len: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct CheckpointIndexV2 {
-    entries: Vec<CheckpointIndexEntryV2>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct CheckpointIndexEntryV2 {
-    name: String,
-    base_id: u128,
-    dims: Vec<u64>,
-    dtype_tag: u32,
-    requires_grad: bool,
-    offset: u64,
-    len: u64,
 }
 
 pub struct CheckpointReader {
@@ -62,77 +44,9 @@ impl CheckpointReader {
 
         let version = read_u32(&mut file)?;
         match version {
-            VERSION_V1 => Self::open_v1(file),
             VERSION_V2 => Self::open_v2(file),
             other => bail!("unsupported checkpoint version {}", other),
         }
-    }
-
-    fn open_v1(mut file: File) -> Result<Self> {
-        let config_len = read_u32(&mut file)? as usize;
-        let mut config_bytes = vec![0u8; config_len];
-        file.read_exact(&mut config_bytes)?;
-        let config: ModelConfig = serde_json::from_slice(&config_bytes)?;
-
-        let tensor_count = read_u32(&mut file)? as usize;
-        let mut entries = Vec::with_capacity(tensor_count);
-        let mut by_name = HashMap::with_capacity(tensor_count);
-        let mut by_base_id = HashMap::with_capacity(tensor_count);
-
-        for i in 0..tensor_count {
-            let name_len = read_u32(&mut file)? as usize;
-            let mut name_bytes = vec![0u8; name_len];
-            file.read_exact(&mut name_bytes)?;
-            let name = String::from_utf8(name_bytes)?;
-
-            let rank = read_u32(&mut file)? as usize;
-            let mut dims_u64 = Vec::with_capacity(rank);
-            for _ in 0..rank {
-                dims_u64.push(read_u64(&mut file)?);
-            }
-
-            let dtype_tag = read_u32(&mut file)?;
-            let dtype = DType::from_tag(dtype_tag)
-                .ok_or_else(|| anyhow!("unknown dtype tag {} in checkpoint", dtype_tag))?;
-            if dtype != DType::F32 {
-                bail!("only f32 tensors are currently supported");
-            }
-            let requires_grad = read_bool(&mut file)?;
-
-            let byte_len = read_u64(&mut file)?;
-            let offset = file.stream_position()?;
-
-            let skip = i64::try_from(byte_len)
-                .map_err(|_| anyhow!("tensor {} data length {} out of range", name, byte_len))?;
-            file.seek(SeekFrom::Current(skip))?;
-
-            let dims = dims_u64
-                .into_iter()
-                .map(|d| usize::try_from(d).map_err(|_| anyhow!("tensor {} dim overflow", name)))
-                .collect::<Result<Vec<_>>>()?;
-            let base_id = base_param_id(&name)?;
-
-            let entry = CheckpointTensorEntry {
-                name: name.clone(),
-                base_id,
-                dims,
-                dtype,
-                requires_grad,
-                offset,
-                len: byte_len,
-            };
-            by_name.insert(name, i);
-            by_base_id.insert(base_id, i);
-            entries.push(entry);
-        }
-
-        Ok(Self {
-            file,
-            config,
-            entries,
-            by_name,
-            by_base_id,
-        })
     }
 
     fn open_v2(mut file: File) -> Result<Self> {
@@ -144,32 +58,61 @@ impl CheckpointReader {
         let index_len = read_u32(&mut file)? as usize;
         let mut index_bytes = vec![0u8; index_len];
         file.read_exact(&mut index_bytes)?;
-        let index: CheckpointIndexV2 = bincode::deserialize(&index_bytes)?;
+        let mut index = Cursor::new(index_bytes);
+        let tensor_count = read_u32(&mut index)? as usize;
 
-        let mut entries = Vec::with_capacity(index.entries.len());
-        let mut by_name = HashMap::with_capacity(index.entries.len());
-        let mut by_base_id = HashMap::with_capacity(index.entries.len());
+        let mut entries = Vec::with_capacity(tensor_count);
+        let mut by_name = HashMap::with_capacity(tensor_count);
+        let mut by_base_id = HashMap::with_capacity(tensor_count);
 
-        for (i, e) in index.entries.into_iter().enumerate() {
-            let dtype = DType::from_tag(e.dtype_tag)
-                .ok_or_else(|| anyhow!("unknown dtype tag {} in checkpoint", e.dtype_tag))?;
-            let dims = e
-                .dims
+        for i in 0..tensor_count {
+            let name_len = read_u32(&mut index)? as usize;
+            let mut name_bytes = vec![0u8; name_len];
+            index.read_exact(&mut name_bytes)?;
+            let name = String::from_utf8(name_bytes)?;
+
+            let stored_base_id = BaseParamId(read_u128(&mut index)?);
+
+            let rank = read_u32(&mut index)? as usize;
+            let mut dims_u64 = Vec::with_capacity(rank);
+            for _ in 0..rank {
+                dims_u64.push(read_u64(&mut index)?);
+            }
+
+            let dtype_tag = read_u32(&mut index)?;
+            let dtype = DType::from_tag(dtype_tag)
+                .ok_or_else(|| anyhow!("unknown dtype tag {} in checkpoint", dtype_tag))?;
+            let requires_grad = read_bool(&mut index)?;
+
+            let offset = read_u64(&mut index)?;
+            let len = read_u64(&mut index)?;
+
+            let dims = dims_u64
                 .into_iter()
-                .map(|d| usize::try_from(d).map_err(|_| anyhow!("tensor {} dim overflow", e.name)))
+                .map(|d| usize::try_from(d).map_err(|_| anyhow!("tensor {} dim overflow", name)))
                 .collect::<Result<Vec<_>>>()?;
 
-            let base_id = BaseParamId(e.base_id);
+            let computed_base_id = base_param_id(&name)?;
+            if stored_base_id.0 != 0 && stored_base_id != computed_base_id {
+                bail!(
+                    "tensor {} base_id mismatch: expected {:?}, got {:?}",
+                    name,
+                    computed_base_id,
+                    stored_base_id
+                );
+            }
+            let base_id = computed_base_id;
+
             let entry = CheckpointTensorEntry {
-                name: e.name.clone(),
+                name: name.clone(),
                 base_id,
                 dims,
                 dtype,
-                requires_grad: e.requires_grad,
-                offset: e.offset,
-                len: e.len,
+                requires_grad,
+                offset,
+                len,
             };
-            by_name.insert(e.name, i);
+            by_name.insert(name, i);
             by_base_id.insert(base_id, i);
             entries.push(entry);
         }
@@ -266,7 +209,15 @@ pub struct LoadedCheckpoint {
 
 impl LoadedCheckpoint {
     pub fn into_model<B: PortableBackend>(self, backend: Arc<B>) -> Result<Gpt<B>> {
-        Gpt::from_named_tensors(self.config, backend, self.tensors)
+        if self.config.kind != "gpt" {
+            bail!(
+                "LoadedCheckpoint::into_model only supports kind='gpt', got '{}'",
+                self.config.kind
+            );
+        }
+        let config: GptConfig = serde_json::from_value(self.config.config)
+            .map_err(|err| anyhow!("invalid gpt config: {err}"))?;
+        Gpt::from_named_tensors(config, backend, self.tensors)
     }
 }
 
@@ -296,6 +247,12 @@ fn read_u64(reader: &mut impl Read) -> Result<u64> {
     let mut buf = [0u8; 8];
     reader.read_exact(&mut buf)?;
     Ok(u64::from_le_bytes(buf))
+}
+
+fn read_u128(reader: &mut impl Read) -> Result<u128> {
+    let mut buf = [0u8; 16];
+    reader.read_exact(&mut buf)?;
+    Ok(u128::from_le_bytes(buf))
 }
 
 fn read_bool(reader: &mut impl Read) -> Result<bool> {

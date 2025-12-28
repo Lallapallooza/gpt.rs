@@ -7,14 +7,14 @@ from typing import Dict
 
 import numpy as np
 
-from gptrs_eval.tensor_archive import save as save_tensor_archive
+from gptrs_eval.checkpoint import save as save_checkpoint
 from gptrs_eval.weights import build_mobilenet_v2_weights, build_resnet34_weights
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export Torch model weights for gpt-rs CLI.")
     parser.add_argument("--model", choices=["resnet34", "mobilenet_v2"], required=True)
-    parser.add_argument("--out", type=Path, required=True, help="Output tensor archive path.")
+    parser.add_argument("--out", type=Path, required=True, help="Output checkpoint path.")
     return parser.parse_args()
 
 
@@ -42,7 +42,7 @@ def main() -> int:
     else:
         tensors = export_mobilenet_v2()
 
-    save_tensor_archive(args.out, tensors)
+    save_checkpoint(args.out, kind=args.model, config={"num_classes": 1000}, tensors=tensors)
     print(f"wrote {len(tensors)} tensors -> {args.out}")
     return 0
 

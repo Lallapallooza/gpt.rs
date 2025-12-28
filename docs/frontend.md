@@ -1,150 +1,83 @@
 # Frontend Execution Model
 
-The frontend of `gpt.rs` is structured as a small set of layers that cooperate to
-produce portable forward passes (and keep the door open for future autograd):
+The gpt.rs "frontend" is the portion of the stack that *defines computation* without committing to a
+particular kernel implementation:
 
-- **Models** wire blocks together and define what is traced/returned.
-- **Layers** encapsulate model parameters, book‑keeping, and high-level control flow.
-  They expose ergonomic `forward` methods and are responsible for saving the
-  minimal state required for potential future gradient support.
-- **Functional implementations** provide side‑effect free math building blocks.  Each
-  functional breaks a composite operation (for example multi‑head attention or layer
-  normalisation) into elementary tensor primitives that are supplied by a backend.
-- **Backends** own the actual tensor kernels.  They implement the primitive operations
-  that the functionals request and can target different devices or optimised libraries.
+- **Models** (`gpt_rs::model::*`) compose layers into end-to-end networks.
+- **Layers** (`gpt_rs::nn::layers::*`) own parameters and control flow and expose ergonomic `forward` helpers.
+- **Functionals** (`gpt_rs::ops::functional::*`) implement portable math that captures PTIR graphs.
+- **Backends** (`gpt_rs::backend::spec::PortableBackend`) execute PTIR programs.
 
-This document explains how those pieces interact, how PTIR flows through the stack,
-and where runtime functional overrides hook in.
+The key idea is: layers do orchestration, functionals do portable math, and backends do execution.
 
-## Models: wiring blocks
+## Models
 
-Model types live in `crates/gpt-rs/src/model/**` and are responsible for composing layers
-into end-to-end networks.
+Models live in `crates/gpt-rs/src/model/` and are responsible for wiring submodules and deciding what the
+public outputs look like (logits, traces, etc).
 
-Examples:
+For runtime usage, `gpt_rs::runtime::load_model` loads a checkpoint into a `dyn LoadedModel<B>`, which
+exposes optional "capabilities" like `CausalLanguageModel` (generation) or vision tracing.
 
-- GPT uses transformer blocks (attention + MLP + layer norms) and exposes autoregressive
-  decoding helpers (kv-cache, `Generator`).
-- ResNet34 and MobileNetV2 compose conv/bn/activation/pool blocks and expose
-  `forward_trace` helpers to dump intermediate activations for Torch comparisons.
+## Layers
 
-## Layers: high-level orchestration
+Layers live in `crates/gpt-rs/src/nn/layers/` and typically contain:
 
-Layer types live in `crates/gpt-rs/src/nn/layers/**`.  Each layer holds an
-`Arc<B>` for some backend `B: PortableBackend` together with its learnable weights and exposes
-methods such as:
+- `Arc<B>` for some backend `B: PortableBackend`
+- parameter tensors (`DeviceTensor<B>`) and buffers
+- lightweight validation + orchestration logic
 
-- `forward(&self, input: &DeviceTensor<B>) -> Result<DeviceTensor<B>>`
-- `forward_with_state(&self, input: &DeviceTensor<B>) -> Result<(DeviceTensor<B>, State)>`
+Layers also implement the small `Module` trait (`crates/gpt-rs/src/module.rs`) so parameters can be
+enumerated/updated by stable name (this is what checkpoint tooling and future training utilities build on).
 
-The layer is responsible for:
+Autograd is not implemented yet; some layers expose `*_with_state` helpers that return the minimal forward
+state that a future backward pass would need.
 
-1. **Shape and configuration validation** – e.g. `CausalSelfAttention` asserts that the
-   embedding dimension is divisible by the head count before doing any work.
-2. **State capture for potential reverse mode** – only the minimal tensors required for future
-   gradient propagation are stored (`LinearState` keeps the original input, `CausalSelfAttentionState`
-   retains the cached projections and runtime cache entries for reuse, etc.).
-3. **Delegation to functionals** – heavy lifting (attention kernels, layer norm math,
-   etc.) is routed through the functional registry so that layers remain orchestration
-   only.  Layers never open-code GEMMs or reductions themselves; they always call the
-   backend through a functional façade.
+## Functionals (portable kernels)
 
-This separation keeps the public API expressive (layers look like standard deep-learning
-modules) while still allowing lower layers to swap out implementations.
+Functionals live in `crates/gpt-rs/src/ops/functional/`. They follow a consistent pattern:
 
-## Functional implementations: pure math + registry
+- validate inputs (dtype/shape/backend invariants)
+- capture PTIR graphs via `capture_ptir!` / `PtirSession`
+- return `DeviceTensor<B>` results (often lazily executed by the backend)
 
-Functionals live under `crates/gpt-rs/src/ops/functional/**` and are intentionally pure:
+Most public functionals are annotated with `#[support_runtime_overload]`, which wires them into the runtime
+registry/override system.
 
-- Each is a plain free function annotated with `#[support_runtime_overload]`. The macro
-  synthesises the context wrapper, registry entry, and default implementation wiring.
-- They return concrete tensors and caches without mutating global state (for example
-  `functional::attention` now yields both the present key/value chunk and the accumulated
-  `AttentionCache`).
-- They call only backend primitives such as `matmul`, `softmax_last_dim`, or PTIR
-  programs.  This means the same functional works with any backend that honours the
-  primitive contract.
+### `DeviceTensorOps`
 
-The arithmetic family (`add`, `sub`, `mul`, `div`, `maximum`, `minimum`, plus the unary
-`neg`/`abs` operations and `clamp` with optional bounds) validates shape and dtype equality up front and
-then lowers to `ElementwiseBinary`/`ElementwiseUnary` PTIR programs.  The shared `matmul`
-functional covers both rank-2 GEMM and rank-3 batched GEMM: it enforces matching contract
-dimensions, shared backends/dtypes, and emits a `dot_general` program that yields `[M, N]` or
-`[B, M, N]` results as appropriate.  Any backend that implements those primitives picks up
-the behaviour automatically.
+`DeviceTensorOps` is an extension trait implemented for `DeviceTensor<B>`. It provides method syntax like
+`a.matmul(&b)?` while still routing through the functional implementations (so layers stay backend-agnostic).
 
-### Device tensor extension methods
+## Runtime overrides (swapping implementations)
 
-`DeviceTensorOps` is implemented for `DeviceTensor<B>` and re-exported from `gpt_rs::tensor`.
-Import the trait to unlock zero-cost method syntax such as
-`tensor.add(&other)?.clamp(None, Some(&limit))`; calls still route through the functional
-definitions, so layers remain backend-agnostic.
+A `FunctionalRegistry<B>` selects an implementation per functional family (portable reference by default).
 
-A `FunctionalRegistry` keeps the available implementations per operation family. When a
-layer asks for attention, the registry selects the first implementation whose
-`supports(...)` predicate returns true. The code generated by
-`#[support_runtime_overload]` automatically registers the portable reference on demand,
-so layers simply call `functional::attention(backend, &config, &qkv, cache)` with an optional
-`AttentionCache`.
+There are two supported override routes:
 
-### Overriding functionals
-
-Users can inject custom kernels without editing layer code:
+1. **From checkpoint config**: `ModelConfig.runtime.functional_overrides` can request specific implementations
+   by name; `runtime::load_model` installs a registry configured by those overrides.
+2. **Programmatic**: callers can build a registry and install it for a scope:
 
 ```rust
-let registry = FunctionalRegistry::default();
-registry.register_attention(
-    AttentionImplementation::<Backend>::new("cuda_attention", cuda_attention_forward)
-        .with_supports(cuda_attention_supports),
-);
-```
-
-Registries are installed via the thread-local runtime stack:
-
-```rust
-let _guard = gpt_rs::ops::functional::runtime::push_registry(std::sync::Arc::new(registry));
+let registry = std::sync::Arc::new(gpt_rs::ops::functional::FunctionalRegistry::<B>::default());
+let _guard = gpt_rs::ops::functional::runtime::push_registry(registry);
 // run model forward here
 ```
 
-Alternatively, `FunctionalOverrides` can be loaded from configuration to select a named
-implementation at runtime.  This is how GPU integrations can reuse fused kernels (for
-instance, a single-call layer norm) while still falling back to the reference
-implementation for unsupported shapes.
+If you are adding a new overrideable functional family, keep the contract strict: validate shape/dtype in the
+portable path, and ensure custom implementations only use backend primitives (so correctness tooling still applies).
 
-As long as the custom functional restricts itself to backend primitives it inherits all
-of the automatic shape validation and state capture that the layer already performs.
+## Backends
 
-## Backends: primitive providers
+Backends implement the PTIR contract (`gpt_rs::backend::spec::PortableBackend`) and live in crates like:
 
-Backends execute the primitive PTIR op set that functionals lower into (e.g. `dot_general`,
-`reduce_window`, `extract_patches`, elementwise ops, gathers, reshapes).
+- `gpt-rs-backend-faer` (optimized CPU backend)
+- `gpt-rs-backend-ref-cpu` (reference interpreter)
 
-Only the PTIR-based contract (`gpt_rs::backend::spec::PortableBackend`) lives in the core crate;
-implementations live in sibling crates:
+Backends can be wrapped with hooks for dumping/profiling/debugging (see `docs/testing.md`).
 
-- `gpt-rs-backend-faer`: optimized CPU backend (recommended).
-- `gpt-rs-backend-ref-cpu`: slow reference interpreter for debugging/spec bring-up.
+## Typical call flow
 
-Because layers interact only with an `Arc<B>` for `B: PortableBackend`, swapping implementations is
-purely a matter of providing a different backend instance. Backends can also be wrapped with hooks
-for profiling/debugging (see `docs/testing.md`).
-
-## Putting it together
-
-A typical forward pass flows like this:
-
-1. Application code calls `CausalSelfAttention::forward(x)` (or
-   `CausalSelfAttention::forward_with_cache(x, cache)` during autoregressive decoding).
-2. The layer projects Q/K/V using backend primitives, then hands the result to
-   `functional::attention(backend, &config, &qkv, cache)`.
-3. The functional registry selects an implementation (default: reference) and runs it,
-   invoking multiple backend primitives (or a single fused kernel) to compute the
-   context tensor and cache (including an updated `AttentionCache` ready for reuse on
-   the next autoregressive step).
-4. The layer finishes its bookkeeping and returns the output alongside any state that downstream
-   consumers might reuse.
-
-This decomposition keeps the codebase welcoming to experimentation: layers read like the
-math in the paper, functionals isolate numerical recipes, and backends provide the knobs
-needed to target new hardware or fuse operations – all while preserving a correctness
-baseline via the reference CPU path.
+1. Layer calls a functional (e.g. attention, layer norm, conv2d).
+2. Functional captures PTIR (or hits a cached plan) and asks the backend to execute.
+3. Backend returns lazy handles; materialization happens only when needed.

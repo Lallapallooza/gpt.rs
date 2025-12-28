@@ -39,6 +39,9 @@ backend impl (faer, ref-cpu, ...)
 # build the workspace (requires Rust toolchain)
 cargo build
 
+# explore the CLI surface
+cargo run -p gpt-rs-cli -- --help
+
 # run GPT-2 generation (checkpoint + tokenizer)
 # export the checkpoint/tokenizer with: `uv run python scripts/export_gpt2.py --help`
 cargo run --release -p gpt-rs-cli -- generate --prompt "Hello" --max-tokens 64 \
@@ -67,6 +70,10 @@ uv run python scripts/eval.py --model gpt2 --workload bench --threads 1 4 --benc
 ```
 
 See `docs/README.md` for a doc index and `docs/testing.md` for dumps/profiling details.
+
+Notes:
+- Select a backend with `--backend` (or `GPTRS_BACKEND`, default: `faer`).
+- `--profile` prints tables only when built with `-F gpt-rs/profiler`.
 
 ## Testing
 

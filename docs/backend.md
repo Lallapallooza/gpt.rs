@@ -9,6 +9,8 @@ Normative keywords: MUST / SHOULD / MAY.
 
 PTIR is designed to be optimization-friendly: LLM attention is expressed as a **pattern** over core ops (no dedicated attention op).
 
+Source of truth: `crates/gpt-rs/src/backend/spec.rs`. If this doc and the code disagree, fix the doc or fix the code.
+
 ## Versioning
 
 - Serialized PTIR programs MUST set `spec_version = ptir.v0.4`.
@@ -54,7 +56,7 @@ Unless stated otherwise, tensors are interpreted as dense, contiguous, **row-maj
   - `Operand::Literal(TensorLiteral)` (an inline constant operand).
 
 Note: some backends (including the current reference CPU backend) only support tensor outputs
-and do not execute tuple-typed values yet.
+and may not execute tuple-typed values yet.
 
 ### Negative axes
 

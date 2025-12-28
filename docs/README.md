@@ -1,14 +1,20 @@
 # Documentation
 
-This directory contains current documentation for gpt.rs.
+This directory contains the docs we consider worth keeping up to date.
 
-## Guides (current)
-- `testing.md`: test structure (backend suites + Torch parity) and Python baselines.
+Doc policy:
+- If a doc stops matching the code, fix it immediately or delete it.
+- Prefer linking to `--help` output / source paths over copying long CLI/API listings.
 
-## Architecture / design (current)
-- `architecture.md`: crate/module layout and execution flow.
-- `frontend.md`: models/layers/functionals/backends split and runtime overrides.
-- `ops.md`: ops/graph/PTIR capture architecture.
-- `backend.md`: PTIR backend contract (ptir.v0.4).
-- `backend_optimizer.md`: PTIR rewrite system (patterns/driver/passes).
-- `code_map.md`: quick map of the functional layer and capture flow.
+## Start here
+- `testing.md`: how correctness/perf is validated (backend suites, Torch parity, Python baselines).
+
+## Code orientation
+- `architecture.md`: crate/module layout and data flow.
+- `frontend.md`: models/layers/functionals/backends + runtime overrides.
+- `code_map.md`: where the functional/capture plumbing lives.
+
+## Reference
+- `backend.md`: PTIR backend contract (ptir.v0.4). Treat as a spec.
+- `ops.md`: ops/capture/graph execution architecture (implementation-oriented).
+- `backend_optimizer.md`: PTIR rewrite/optimizer architecture (implementation-oriented).

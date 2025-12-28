@@ -46,6 +46,14 @@ struct Args {
 
     #[arg(
         long,
+        value_name = "NAME",
+        global = true,
+        help = "Backend to use (overrides $GPTRS_BACKEND)"
+    )]
+    backend: Option<String>,
+
+    #[arg(
+        long,
         value_name = "DIR",
         global = true,
         help = "Dump PTIR programs and metadata to the specified directory"
@@ -286,7 +294,9 @@ fn main() -> Result<()> {
         });
     }
 
-    let backend_env = env::var("GPTRS_BACKEND").unwrap_or_else(|_| "faer".to_string());
+    let backend_env = args
+        .backend
+        .unwrap_or_else(|| env::var("GPTRS_BACKEND").unwrap_or_else(|_| "faer".to_string()));
     let command = args.command;
 
     #[cfg(feature = "conversion-c")]

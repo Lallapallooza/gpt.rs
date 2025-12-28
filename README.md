@@ -40,7 +40,7 @@ backend impl (faer, ref-cpu, ...)
 cargo build
 
 # run GPT-2 generation (checkpoint + tokenizer)
-# (see docs/gpt2_integration.md to export GPT-2 checkpoint/tokenizer)
+# export the checkpoint/tokenizer with: `uv run python scripts/export_gpt2.py --help`
 cargo run --release -p gpt-rs-cli -- generate --prompt "Hello" --max-tokens 64 \
   --checkpoint checkpoints/gpt2.bin --tokenizer configs/gpt2_tokenizer.json
 
@@ -66,7 +66,7 @@ uv run python scripts/eval.py --model mobilenet_v2 --workload trace --stop-on-fi
 uv run python scripts/eval.py --model gpt2 --workload bench --threads 1 4 --bench-tokens 1 64
 ```
 
-See `docs/README.md` for a doc index, `docs/testing.md` for dumps/profiling details, and `docs/gpt2_integration.md` for GPT-2 export.
+See `docs/README.md` for a doc index and `docs/testing.md` for dumps/profiling details.
 
 ## Testing
 

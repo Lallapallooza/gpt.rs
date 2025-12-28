@@ -127,7 +127,7 @@ implementations live in sibling crates:
 
 Because layers interact only with an `Arc<B>` for `B: PortableBackend`, swapping implementations is
 purely a matter of providing a different backend instance. Backends can also be wrapped with hooks
-for profiling/debugging (see `docs/development.md`).
+for profiling/debugging (see `docs/testing.md`).
 
 ## Putting it together
 

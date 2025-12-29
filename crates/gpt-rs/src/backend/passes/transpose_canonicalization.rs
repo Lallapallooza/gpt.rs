@@ -43,7 +43,9 @@ impl OpRewritePattern<TransposeOpView> for EliminateIdentityTranspose {
                 *result_id = *src;
             }
         }
-        rewriter.erase_inst(view.root);
+        rewriter
+            .erase_inst(view.root)
+            .expect("transpose canonicalization erase should succeed");
         true
     }
 }
@@ -80,7 +82,9 @@ impl OpRewritePattern<TransposeOpView> for CollapseTransposeChain {
                     *result_id = base_value;
                 }
             }
-            rewriter.erase_inst(view.root);
+            rewriter
+                .erase_inst(view.root)
+                .expect("transpose canonicalization erase should succeed");
             return true;
         }
 
@@ -106,7 +110,9 @@ impl OpRewritePattern<TransposeOpView> for CollapseTransposeChain {
                 *result_id = new_value;
             }
         }
-        rewriter.erase_inst(view.root);
+        rewriter
+            .erase_inst(view.root)
+            .expect("transpose canonicalization erase should succeed");
         true
     }
 }

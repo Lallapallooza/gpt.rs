@@ -118,7 +118,7 @@ impl<'a, B: PortableBackend + 'static> Generator<'a, B> {
 
         let row_tensor =
             Tensor::from_vec(Shape::new([vocab]), std::mem::take(&mut self.logits_row))?;
-        let next = self.sampler.sample(&row_tensor);
+        let next = self.sampler.sample(&row_tensor)?;
         self.tokens.push(next);
         Ok(next)
     }
@@ -129,7 +129,7 @@ impl<'a, B: PortableBackend + 'static> Generator<'a, B> {
 
         let row_tensor =
             Tensor::from_vec(Shape::new([vocab]), std::mem::take(&mut self.logits_row))?;
-        let next = self.sampler.sample(&row_tensor);
+        let next = self.sampler.sample(&row_tensor)?;
         self.tokens.push(next);
 
         let context_length = self.model.context_length();

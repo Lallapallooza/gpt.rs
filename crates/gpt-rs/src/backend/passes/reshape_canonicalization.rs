@@ -51,7 +51,9 @@ impl OpRewritePattern<ReshapeOpView> for EliminateIdentityReshape {
                 *result_id = *source;
             }
         }
-        rewriter.erase_inst(view.root);
+        rewriter
+            .erase_inst(view.root)
+            .expect("reshape canonicalization erase should succeed");
         true
     }
 }
@@ -122,7 +124,9 @@ impl OpRewritePattern<ReshapeOpView> for CollapseReshapeChain {
                 *result_id = folded_value;
             }
         }
-        rewriter.erase_inst(view.root);
+        rewriter
+            .erase_inst(view.root)
+            .expect("reshape canonicalization erase should succeed");
         true
     }
 }

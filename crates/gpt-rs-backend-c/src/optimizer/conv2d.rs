@@ -289,7 +289,9 @@ impl OpRewritePattern<Conv2dPattern> for LowerCConv2dNhwcF32 {
 
         if let Some(old_inst) = rewriter.inst_of(output_value) {
             if rewriter.users_of(output_value).is_empty() {
-                rewriter.erase_inst(old_inst);
+                rewriter
+                    .erase_inst(old_inst)
+                    .expect("c optimizer erase should succeed");
             }
         }
 

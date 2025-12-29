@@ -112,28 +112,45 @@ impl Tensor {
         self.dtype
     }
 
+    /// Borrows the underlying `f32` payload, returning an error if the dtype differs.
+    pub fn try_data(&self) -> Result<&[f32]> {
+        match self.dtype {
+            DType::F32 => Ok(bytes_as_slice::<f32>(&self.data)),
+            other => bail!("tensor data is not stored as f32 (dtype={other:?})"),
+        }
+    }
+
     /// Borrows the underlying `f32` data slice, panicking if the dtype differs.
     pub fn data(&self) -> &[f32] {
+        self.try_data().expect("tensor data is not stored as f32")
+    }
+
+    /// Mutably borrows the underlying `f32` payload, returning an error if the dtype differs.
+    pub fn try_data_mut(&mut self) -> Result<&mut [f32]> {
         match self.dtype {
-            DType::F32 => bytes_as_slice::<f32>(&self.data),
-            _ => panic!("tensor data is not stored as f32"),
+            DType::F32 => Ok(bytes_as_slice_mut::<f32>(&mut self.data)),
+            other => bail!("tensor data is not stored as f32 (dtype={other:?})"),
         }
     }
 
     /// Mutably borrows the `f32` data slice, panicking if the dtype differs.
     pub fn data_mut(&mut self) -> &mut [f32] {
+        self.try_data_mut()
+            .expect("tensor data is not stored as mutable f32")
+    }
+
+    /// Borrows the underlying `i32` payload, returning an error if the dtype differs.
+    pub fn try_data_i32(&self) -> Result<&[i32]> {
         match self.dtype {
-            DType::F32 => bytes_as_slice_mut::<f32>(&mut self.data),
-            _ => panic!("tensor data is not stored as mutable f32"),
+            DType::I32 => Ok(bytes_as_slice::<i32>(&self.data)),
+            other => bail!("tensor data is not stored as i32 (dtype={other:?})"),
         }
     }
 
     /// Borrows the underlying `i32` data slice, panicking if the dtype differs.
     pub fn data_i32(&self) -> &[i32] {
-        match self.dtype {
-            DType::I32 => bytes_as_slice::<i32>(&self.data),
-            _ => panic!("tensor data is not stored as i32"),
-        }
+        self.try_data_i32()
+            .expect("tensor data is not stored as i32")
     }
 
     /// Applies a unary function in place over every scalar element.

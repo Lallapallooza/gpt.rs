@@ -133,6 +133,13 @@ pub struct PtirResults {
 /// etc.) that emit corresponding graph nodes. The `Copy` trait enables natural expression
 /// composition without explicit cloning.
 ///
+/// Many operations are provided in two forms:
+/// - `try_*` variants that return `Result` and surface validation/emission failures
+/// - convenience methods without the `try_` prefix that panic on error
+///
+/// Prefer the `try_*` APIs in library code and keep the panicking helpers for tests or trusted
+/// internal call sites.
+///
 /// # Lifetime Parameters
 ///
 /// - `'ctx`: Lifetime of the PTIR session/graph

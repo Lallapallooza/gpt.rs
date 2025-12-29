@@ -35,7 +35,9 @@ impl OpRewritePattern<BroadcastOpView> for EliminateIdentityBroadcast {
                 *result_id = *source;
             }
         }
-        rewriter.erase_inst(view.root);
+        rewriter
+            .erase_inst(view.root)
+            .expect("broadcast canonicalization erase should succeed");
         true
     }
 }
@@ -95,7 +97,9 @@ impl OpRewritePattern<BroadcastOpView> for CollapseBroadcastChain {
                 *result_id = combined_value;
             }
         }
-        rewriter.erase_inst(view.root);
+        rewriter
+            .erase_inst(view.root)
+            .expect("broadcast canonicalization erase should succeed");
         true
     }
 }

@@ -39,7 +39,9 @@ fn rewriter_replace_and_erase_instruction() {
     );
     assert_eq!(rewriter.version(InstId(1)), Some(1));
 
-    rewriter.erase_inst(InstId(0));
+    rewriter
+        .erase_inst(InstId(0))
+        .expect("erase should succeed");
     assert_eq!(rewriter.func.body.len(), 1);
     assert_eq!(rewriter.users_of(param_id), &[InstId(1)]);
     assert_eq!(rewriter.version(InstId(1)), Some(1));

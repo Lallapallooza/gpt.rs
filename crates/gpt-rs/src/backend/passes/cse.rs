@@ -97,7 +97,7 @@ fn replace_value(
         }
     }
     if let Some(inst) = rewriter.inst_of(from) {
-        rewriter.erase_inst(inst);
+        rewriter.erase_inst(inst).expect("CSE erase should succeed");
     }
     stats.changed = true;
     stats.rewrites_applied += 1;

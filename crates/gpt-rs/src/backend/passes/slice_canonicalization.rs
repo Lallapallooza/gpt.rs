@@ -116,7 +116,9 @@ impl OpRewritePattern<SliceOpView> for CollapseSliceChain {
                 *result_id = new_value;
             }
         }
-        rewriter.erase_inst(view.root);
+        rewriter
+            .erase_inst(view.root)
+            .expect("slice canonicalization erase should succeed");
         true
     }
 }

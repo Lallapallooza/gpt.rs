@@ -116,7 +116,7 @@ fn run_dce(rewriter: &mut ProgramRewriter) -> usize {
                 continue;
             }
             if rewriter.users_of(value).is_empty() {
-                rewriter.erase_inst(inst);
+                rewriter.erase_inst(inst).expect("DCE erase should succeed");
                 removed_in_pass += 1;
             }
         }

@@ -2,6 +2,15 @@ use crate::backend::{
     index::{DefId, FunctionIndexError, FunctionIndices, InstId},
     spec::{Function, Instruction, Operand, Operation, TensorLiteral, ValueId, ValueType},
 };
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ProgramRewriteError {
+    #[error("instruction id {0:?} must be valid")]
+    InvalidInstructionId(InstId),
+    #[error("attempting to erase instruction {inst:?} with {users} live uses")]
+    EraseWithLiveUses { inst: InstId, users: usize },
+}
 
 /// Mutable IR editor with stable instruction identifiers and SSA accounting.
 pub struct ProgramRewriter<'a> {
@@ -125,20 +134,22 @@ impl<'a> ProgramRewriter<'a> {
     }
 
     /// Erases the instruction identified by `inst`.
-    pub fn erase_inst(&mut self, inst: InstId) {
+    pub fn erase_inst(&mut self, inst: InstId) -> Result<(), ProgramRewriteError> {
         let value = self
             .indices
             .value_of(inst)
-            .expect("instruction must be in map");
-        if !self.indices.users_of(value).is_empty() {
-            panic!("attempting to erase instruction with live uses");
+            .ok_or(ProgramRewriteError::InvalidInstructionId(inst))?;
+        let users = self.indices.users_of(value).len();
+        if users > 0 {
+            return Err(ProgramRewriteError::EraseWithLiveUses { inst, users });
         }
         let pos = self
             .indices
             .position(inst)
-            .expect("instruction id must be valid");
+            .ok_or(ProgramRewriteError::InvalidInstructionId(inst))?;
         let instruction = self.func.body.remove(pos);
         self.indices.remove_instruction(inst, &instruction);
+        Ok(())
     }
 
     /// Inserts a new instruction before `at`, returning its identifiers.

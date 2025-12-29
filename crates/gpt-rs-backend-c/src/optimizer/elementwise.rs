@@ -319,7 +319,9 @@ impl FunctionPass<crate::CBackend> for CElementwiseFusionPass {
             }
             if let Some(old_inst) = rewriter.inst_of(root_value) {
                 if rewriter.users_of(root_value).is_empty() {
-                    rewriter.erase_inst(old_inst);
+                    rewriter
+                        .erase_inst(old_inst)
+                        .expect("c optimizer erase should succeed");
                 }
             }
 

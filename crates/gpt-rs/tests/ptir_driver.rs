@@ -48,7 +48,9 @@ impl Pattern for FoldStopGradient {
         };
         let produced = rewriter.value_of(root);
         rewriter.replace_all_uses(produced, *src);
-        rewriter.erase_inst(root);
+        rewriter
+            .erase_inst(root)
+            .expect("stop_gradient erase should succeed");
         true
     }
 }

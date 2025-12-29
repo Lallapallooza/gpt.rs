@@ -314,7 +314,9 @@ impl OpRewritePattern<Conv2dPattern> for LowerFaerConv2dNhwcF32 {
 
         if let Some(old_inst) = rewriter.inst_of(output_value) {
             if rewriter.users_of(output_value).is_empty() {
-                rewriter.erase_inst(old_inst);
+                rewriter
+                    .erase_inst(old_inst)
+                    .expect("faer optimizer erase should succeed");
             }
         }
 
@@ -548,7 +550,9 @@ impl OpRewritePattern<ExtractPatchesOpView> for LowerFaerDepthwiseConv2dNhwcF32 
 
         if let Some(old_inst) = rewriter.inst_of(output_value) {
             if rewriter.users_of(output_value).is_empty() {
-                rewriter.erase_inst(old_inst);
+                rewriter
+                    .erase_inst(old_inst)
+                    .expect("faer optimizer erase should succeed");
             }
         }
 

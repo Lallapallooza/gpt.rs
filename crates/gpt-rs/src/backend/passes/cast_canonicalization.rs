@@ -29,7 +29,9 @@ impl OpRewritePattern<CastOpView> for EliminateRedundantCast {
                 *result_id = *source;
             }
         }
-        rewriter.erase_inst(view.root);
+        rewriter
+            .erase_inst(view.root)
+            .expect("cast canonicalization erase should succeed");
         true
     }
 }

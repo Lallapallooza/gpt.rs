@@ -191,6 +191,8 @@ fn replace_with_value(
         }
     }
     if let Some(inst) = rewriter.inst_of(view.result) {
-        rewriter.erase_inst(inst);
+        rewriter
+            .erase_inst(inst)
+            .expect("elementwise simplification erase should succeed");
     }
 }

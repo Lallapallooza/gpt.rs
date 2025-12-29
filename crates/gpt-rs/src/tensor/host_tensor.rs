@@ -55,7 +55,7 @@ impl Tensor {
         Tensor {
             shape,
             dtype: DType::F32,
-            data: vec_into_bytes(vec![0.0; len]),
+            data: vec_into_bytes(vec![0.0f32; len]),
         }
     }
 
@@ -65,7 +65,7 @@ impl Tensor {
         Tensor {
             shape,
             dtype: DType::F32,
-            data: vec_into_bytes(vec![1.0; len]),
+            data: vec_into_bytes(vec![1.0f32; len]),
         }
     }
 

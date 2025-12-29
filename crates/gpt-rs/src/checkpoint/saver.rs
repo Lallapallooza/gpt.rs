@@ -2,7 +2,7 @@ use crate::backend::spec::PortableBackend;
 use crate::model::Gpt;
 use crate::model::ModelConfig;
 use crate::params::base_param_id;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -75,7 +75,9 @@ impl CheckpointSaver {
 
         let mut params: Vec<(String, Tensor)> = Vec::new();
         model.for_each_parameter(|name, tensor| {
-            let host = tensor.to_host()?;
+            let host = tensor
+                .to_host()
+                .with_context(|| format!("failed to export checkpoint tensor '{name}'"))?;
             params.push((name.to_string(), host));
             Ok(())
         })?;

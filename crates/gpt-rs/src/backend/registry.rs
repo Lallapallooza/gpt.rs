@@ -166,21 +166,35 @@ impl BackendRegistry {
     }
 
     fn register(&self, name: String, constructor: BackendConstructor) {
-        self.backends.write().unwrap().insert(name, constructor);
+        self.backends
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(name, constructor);
     }
 
     fn create(&self, name: &str) -> Option<Box<dyn ErasedBackend>> {
-        let registry = self.backends.read().unwrap();
+        let registry = self
+            .backends
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let constructor = registry.get(name)?;
         Some(constructor())
     }
 
     fn list_backends(&self) -> Vec<String> {
-        self.backends.read().unwrap().keys().cloned().collect()
+        self.backends
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .cloned()
+            .collect()
     }
 
     fn has_backend(&self, name: &str) -> bool {
-        self.backends.read().unwrap().contains_key(name)
+        self.backends
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(name)
     }
 }
 

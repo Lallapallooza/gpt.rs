@@ -39,7 +39,6 @@ impl PyTokenizer {
 
     #[getter]
     fn vocab_size(&self) -> usize {
-        // TODO: Add vocab_size() method to Tokenizer
-        0
+        self.inner.vocab_size()
     }
 }

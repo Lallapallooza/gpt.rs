@@ -159,6 +159,11 @@ impl Tokenizer {
         String::from_utf8(bytes).unwrap_or_default()
     }
 
+    /// Returns the size of the vocabulary backing this tokenizer.
+    pub fn vocab_size(&self) -> usize {
+        self.decoder.len()
+    }
+
     /// Applies the BPE merge loop to a byte-encoded token segment.
     ///
     /// Results are cached per input segment to amortize repeated work during long prompts.
@@ -169,7 +174,13 @@ impl Tokenizer {
             return String::new();
         }
 
-        if let Some(cached) = self.cache.lock().unwrap().get(token).cloned() {
+        if let Some(cached) = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(token)
+            .cloned()
+        {
             return cached;
         }
 
@@ -178,7 +189,7 @@ impl Tokenizer {
             let result = token.to_string();
             self.cache
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(token.to_string(), result.clone());
             return result;
         }
@@ -232,7 +243,7 @@ impl Tokenizer {
         let result = word.join(" ");
         self.cache
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(token.to_string(), result.clone());
         result
     }

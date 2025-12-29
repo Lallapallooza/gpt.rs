@@ -139,7 +139,9 @@ pub struct TraceGuard {
 impl Drop for TraceGuard {
     fn drop(&mut self) {
         if self.active {
-            let mut lock = GLOBAL_TRACE_SINK.write().expect("trace sink lock poisoned");
+            let mut lock = GLOBAL_TRACE_SINK
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             *lock = self.previous.take();
             self.active = false;
         }
@@ -148,7 +150,9 @@ impl Drop for TraceGuard {
 
 /// Installs a global execution trace sink, returning a guard that restores the previous sink.
 pub fn install_global_sink(sink: Arc<dyn ExecutionTraceSink>) -> TraceGuard {
-    let mut lock = GLOBAL_TRACE_SINK.write().expect("trace sink lock poisoned");
+    let mut lock = GLOBAL_TRACE_SINK
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let previous = lock.clone();
     *lock = Some(sink);
     TraceGuard {
@@ -161,7 +165,7 @@ pub fn install_global_sink(sink: Arc<dyn ExecutionTraceSink>) -> TraceGuard {
 pub fn current_sink() -> Option<Arc<dyn ExecutionTraceSink>> {
     GLOBAL_TRACE_SINK
         .read()
-        .expect("trace sink lock poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()
 }
 

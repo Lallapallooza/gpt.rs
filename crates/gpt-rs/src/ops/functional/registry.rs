@@ -209,11 +209,17 @@ impl<I: ?Sized> OpRegistry<I> {
     }
 
     fn register(&self, implementation: Arc<I>) {
-        self.implementations.lock().unwrap().push(implementation);
+        self.implementations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(implementation);
     }
 
     fn implementations(&self) -> Vec<Arc<I>> {
-        self.implementations.lock().unwrap().clone()
+        self.implementations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn select_by_name<B, E>(&self, name: &str) -> Option<Arc<I>>
@@ -350,18 +356,31 @@ impl<I: ?Sized> OpRegistry<I> {
     }
 
     fn lookup_benchmark_cache(&self, key: FunctionalCacheKey) -> Option<&'static str> {
-        let mut guard = self.benchmark_cache.lock().unwrap();
+        let mut guard = self
+            .benchmark_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.as_mut().and_then(|cache| cache.get(&key).copied())
     }
 
     fn remove_benchmark_entry(&self, key: FunctionalCacheKey) {
-        if let Some(cache) = self.benchmark_cache.lock().unwrap().as_mut() {
+        if let Some(cache) = self
+            .benchmark_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_mut()
+        {
             cache.pop(&key);
         }
     }
 
     fn update_benchmark_cache(&self, key: FunctionalCacheKey, name: &'static str) {
-        if let Some(cache) = self.benchmark_cache.lock().unwrap().as_mut() {
+        if let Some(cache) = self
+            .benchmark_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_mut()
+        {
             cache.put(key, name);
         }
     }
@@ -431,7 +450,10 @@ impl<B: PortableBackend + 'static> FunctionalRegistry<B> {
     {
         let registry = self.ensure_registry::<E>();
         {
-            let implementations = registry.implementations.lock().unwrap();
+            let implementations = registry
+                .implementations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if implementations
                 .iter()
                 .any(|candidate| E::name(candidate.as_ref()) == name)
@@ -467,7 +489,10 @@ impl<B: PortableBackend + 'static> FunctionalRegistry<B> {
         E: FunctionalRegistryEntry<B>,
     {
         let key = E::key();
-        let mut guard = self.registries.lock().unwrap();
+        let mut guard = self
+            .registries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let entry = guard.entry(key).or_insert_with(|| {
             let policy = self.overrides.policy(key);
             let registry: Arc<OpRegistry<E::Impl>> = Arc::new(OpRegistry::new(policy));

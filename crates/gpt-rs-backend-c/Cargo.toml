@@ -1,7 +1,10 @@
 [package]
 name = "gpt-rs-backend-c"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "C backend for executing gpt-rs portable tensor IR (PTIR)."
 
 [features]
 default = []
@@ -9,9 +12,9 @@ conversion-c = []
 torch = ["gpt-rs-backend-tests/torch"]
 
 [dependencies]
-gpt-rs = { path = "../gpt-rs" }
+gpt-rs = { path = "../gpt-rs", version = "0.1.0" }
 libloading = "0.8"
 bincode = { workspace = true }
 
 [dev-dependencies]
-gpt-rs-backend-tests = { path = "../gpt-rs-backend-tests" }
+gpt-rs-backend-tests = { path = "../gpt-rs-backend-tests", version = "0.1.0" }

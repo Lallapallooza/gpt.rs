@@ -1,7 +1,10 @@
 [package]
 name = "gpt-rs-backend-faer"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "faer-based CPU backend for gpt-rs portable tensor IR (PTIR)."
 
 [features]
 default = []
@@ -9,8 +12,8 @@ torch = ["gpt-rs-backend-tests/torch"]
 
 [dependencies]
 faer = "0.23"
-gpt-rs = { path = "../gpt-rs" }
-gpt-rs-backend-ref-cpu = { path = "../gpt-rs-backend-ref-cpu" }
+gpt-rs = { path = "../gpt-rs", version = "0.1.0" }
+gpt-rs-backend-ref-cpu = { path = "../gpt-rs-backend-ref-cpu", version = "0.1.0" }
 
 [dev-dependencies]
-gpt-rs-backend-tests = { path = "../gpt-rs-backend-tests" }
+gpt-rs-backend-tests = { path = "../gpt-rs-backend-tests", version = "0.1.0" }

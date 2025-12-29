@@ -39,6 +39,12 @@ pub unsafe extern "C" fn ptir_execute_json(
     if program.json.is_null() {
         return -1;
     }
+    if input_count > 0 && inputs.is_null() {
+        return -1;
+    }
+    if output_count > 0 && outputs.is_null() {
+        return -1;
+    }
 
     let json = unsafe { std::slice::from_raw_parts(program.json as *const u8, program.json_len) };
     let json_str = match std::str::from_utf8(json) {
@@ -90,11 +96,18 @@ pub unsafe extern "C" fn ptir_execute_json(
 }
 
 fn tensor_to_literal(tensor: &PtirTensor) -> Result<TensorLiteral, BackendError> {
-    if tensor.dims.is_null() || tensor.data.is_null() {
-        return Err(BackendError::execution("null tensor pointers"));
+    if tensor.data.is_null() {
+        return Err(BackendError::execution("null tensor data pointer"));
     }
     let rank = tensor.rank as usize;
-    let dims = unsafe { std::slice::from_raw_parts(tensor.dims, rank) };
+    let dims = if rank == 0 {
+        &[]
+    } else {
+        if tensor.dims.is_null() {
+            return Err(BackendError::execution("null tensor dims pointer"));
+        }
+        unsafe { std::slice::from_raw_parts(tensor.dims, rank) }
+    };
     let dtype = tag_to_dtype(tensor.dtype)
         .ok_or_else(|| BackendError::execution("unsupported dtype tag"))?;
     let elem_size = dtype_size(dtype)?;
@@ -119,11 +132,18 @@ fn tensor_to_literal(tensor: &PtirTensor) -> Result<TensorLiteral, BackendError>
 }
 
 fn write_literal(target: &mut PtirTensor, literal: &TensorLiteral) -> Result<(), BackendError> {
-    if target.dims.is_null() || target.data.is_null() {
-        return Err(BackendError::execution("null output tensor pointers"));
+    if target.data.is_null() {
+        return Err(BackendError::execution("null output tensor data pointer"));
     }
     let rank = target.rank as usize;
-    let dims = unsafe { std::slice::from_raw_parts(target.dims, rank) };
+    let dims = if rank == 0 {
+        &[]
+    } else {
+        if target.dims.is_null() {
+            return Err(BackendError::execution("null output tensor dims pointer"));
+        }
+        unsafe { std::slice::from_raw_parts(target.dims, rank) }
+    };
     if dims.len() != literal.spec.shape.rank() {
         return Err(BackendError::execution("output rank mismatch"));
     }

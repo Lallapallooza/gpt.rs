@@ -1,7 +1,10 @@
 [package]
 name = "gpt-rs"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Portable tensor IR, runtime, and reference models."
 
 [features]
 default = []
@@ -15,7 +18,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 regex = "1"
-gpt-rs-macros = { path = "../gpt-rs-macros" }
+gpt-rs-macros = { path = "../gpt-rs-macros", version = "0.1.0" }
 lru = "0.12"
 bincode = "1"
 smallvec = "1"
@@ -25,5 +28,5 @@ linkme = "0.3"
 blake3 = "1.5"
 
 [dev-dependencies]
-gpt-rs-backend-ref-cpu = { path = "../gpt-rs-backend-ref-cpu" }
-gpt-rs-backend-tests = { path = "../gpt-rs-backend-tests" }
+gpt-rs-backend-ref-cpu = { path = "../gpt-rs-backend-ref-cpu", version = "0.1.0" }
+gpt-rs-backend-tests = { path = "../gpt-rs-backend-tests", version = "0.1.0" }

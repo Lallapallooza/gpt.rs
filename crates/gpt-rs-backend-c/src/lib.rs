@@ -5,7 +5,7 @@ use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
@@ -124,6 +124,7 @@ pub fn register_conversion_targets() {
 pub struct CBackend {
     cache: ConversionCache,
     compiled: Mutex<HashMap<u64, Arc<CompiledModule>>>,
+    compile_gates: Mutex<HashMap<u64, Arc<Mutex<()>>>>,
     params: Arc<InMemoryParamResolver<CTensor>>,
 }
 
@@ -133,6 +134,7 @@ impl CBackend {
         Self {
             cache: ConversionCache::new(),
             compiled: Mutex::new(HashMap::new()),
+            compile_gates: Mutex::new(HashMap::new()),
             params: Arc::new(InMemoryParamResolver::new()),
         }
     }
@@ -510,6 +512,27 @@ impl CBackend {
             return Ok(found);
         }
 
+        let gate = {
+            let mut guard = self
+                .compile_gates
+                .lock()
+                .expect("compiled gate cache poisoned");
+            guard
+                .entry(fingerprint)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _gate_lock = gate.lock().expect("compiled gate poisoned");
+        if let Some(found) = self
+            .compiled
+            .lock()
+            .expect("compiled cache poisoned")
+            .get(&fingerprint)
+            .cloned()
+        {
+            return Ok(found);
+        }
+
         let cache_dir = c_cache_dir();
         std::fs::create_dir_all(&cache_dir)
             .map_err(|err| BackendError::execution(err.to_string()))?;
@@ -524,8 +547,19 @@ impl CBackend {
             compile_c(&src_path, &lib_path)?;
         }
 
-        let lib = unsafe { Library::new(&lib_path) }
-            .map_err(|err| BackendError::execution(err.to_string()))?;
+        let lib = match unsafe { Library::new(&lib_path) } {
+            Ok(lib) => lib,
+            Err(_err) => {
+                // A partially written shared library can happen if multiple threads compile the same
+                // fingerprint concurrently. Retry a single time after forcing a recompile.
+                let _ = std::fs::remove_file(&lib_path);
+                std::fs::write(&src_path, &converted.module)
+                    .map_err(|err| BackendError::execution(err.to_string()))?;
+                compile_c(&src_path, &lib_path)?;
+                unsafe { Library::new(&lib_path) }
+                    .map_err(|err| BackendError::execution(err.to_string()))?
+            }
+        };
         let entry = unsafe {
             lib.get::<CEntrypoint>(entrypoint.as_bytes())
                 .map(|symbol| *symbol)
@@ -741,6 +775,8 @@ fn lib_ext() -> &'static str {
 }
 
 fn compile_c(src: &Path, out: &Path) -> BackendResult<()> {
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     let mut cmd = Command::new(&compiler);
     if cfg!(target_os = "macos") {
@@ -761,7 +797,17 @@ fn compile_c(src: &Path, out: &Path) -> BackendResult<()> {
         cmd.arg("-fomit-frame-pointer");
     }
     cmd.arg("-DGPTRS_C_PROFILE");
-    cmd.arg("-o").arg(out).arg(src);
+    let pid = std::process::id();
+    let nonce = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_out = out.with_file_name(format!(
+        "{}.tmp.{}.{}",
+        out.file_name()
+            .ok_or_else(|| BackendError::execution("invalid output path"))?
+            .to_string_lossy(),
+        pid,
+        nonce
+    ));
+    cmd.arg("-o").arg(&tmp_out).arg(src);
 
     if !cfg!(target_os = "windows") {
         cmd.arg("-lm");
@@ -786,7 +832,18 @@ fn compile_c(src: &Path, out: &Path) -> BackendResult<()> {
             "C compiler failed: {stderr}"
         )));
     }
-    Ok(())
+    match std::fs::rename(&tmp_out, out) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            // If another thread finished compiling first, keep the existing library.
+            if out.exists() {
+                let _ = std::fs::remove_file(&tmp_out);
+                Ok(())
+            } else {
+                Err(BackendError::execution(err.to_string()))
+            }
+        }
+    }
 }
 
 fn runtime_library() -> Option<(PathBuf, String)> {

@@ -6,8 +6,8 @@
 use crate::backend::spec::PortableBackend;
 use crate::module::{Module, ParamVisitor, ParamVisitorMut, TensorRole};
 use crate::ops::functional;
-use crate::tensor::{DeviceTensor, Shape, Tensor};
-use anyhow::{bail, Result};
+use crate::tensor::DeviceTensor;
+use anyhow::Result;
 use std::fmt;
 use std::sync::Arc;
 
@@ -17,21 +17,6 @@ pub struct LayerNorm<B: PortableBackend + 'static> {
     pub gamma: DeviceTensor<B>,
     pub beta: DeviceTensor<B>,
     pub eps: f32,
-}
-
-/// State captured during [`LayerNorm::forward_with_state`].
-pub struct LayerNormState<B: PortableBackend + 'static> {
-    pub normalized: DeviceTensor<B>,
-    pub mean: DeviceTensor<B>,
-    pub inv_std: DeviceTensor<B>,
-    pub input_shape: Shape,
-}
-
-/// Placeholder gradient bundle until portable backward support arrives.
-pub struct LayerNormGradients {
-    pub gamma: Tensor,
-    pub beta: Tensor,
-    pub input: Tensor,
 }
 
 impl<B: PortableBackend + 'static> LayerNorm<B> {
@@ -58,40 +43,6 @@ impl<B: PortableBackend + 'static> LayerNorm<B> {
         let outputs =
             functional::layer_norm(self.backend.as_ref(), x, &self.gamma, &self.beta, self.eps)?;
         Ok(outputs.output)
-    }
-
-    /// Applies layer normalization and captures mean/variance buffers for reuse.
-    #[deny(clippy::disallowed_methods, clippy::disallowed_types)]
-    pub fn forward_with_state(
-        &self,
-        x: &DeviceTensor<B>,
-    ) -> Result<(DeviceTensor<B>, LayerNormState<B>)> {
-        let _prof_guard = crate::profiling::layer_scope("LayerNorm::forward_with_state");
-        let functional::LayerNormResult {
-            output,
-            normalized,
-            mean,
-            inv_std,
-        } = functional::layer_norm(self.backend.as_ref(), x, &self.gamma, &self.beta, self.eps)?;
-
-        Ok((
-            output,
-            LayerNormState {
-                normalized,
-                mean,
-                inv_std,
-                input_shape: x.shape().clone(),
-            },
-        ))
-    }
-
-    /// Placeholder backward entry point; returns an error until gradients are implemented.
-    pub fn backward(
-        &self,
-        _state: &LayerNormState<B>,
-        _grad_output: &DeviceTensor<B>,
-    ) -> Result<LayerNormGradients> {
-        bail!("layer norm backward is not available on the portable backend yet")
     }
 
     /// Returns the backend handle that owns the affine parameters.

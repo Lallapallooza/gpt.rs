@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use gpt_rs::backend::spec::PortableBackend;
 use gpt_rs::nn::layers::FeedForward;
+use gpt_rs::ops::functional;
 use gpt_rs::tensor::{DeviceTensor, Tensor};
 use tch::Tensor as TchTensor;
 
@@ -229,8 +230,9 @@ pub fn feed_forward_state_records_activation<B: PortableBackend + 'static>(backe
         .unwrap();
         let input_device =
             DeviceTensor::from_host(Arc::clone(backend), input_host.clone()).unwrap();
-        let (_output, state) = layer.forward_with_state(&input_device).unwrap();
-        state.activation.to_host().unwrap()
+        let hidden = layer.w_in.forward(&input_device).unwrap();
+        let activation = functional::gelu(backend.as_ref(), &hidden).unwrap();
+        activation.to_host().unwrap()
     });
 
     assert_close(&expected, activation_host.data());
@@ -295,8 +297,9 @@ pub fn feed_forward_state_records_activation_batch4_embed32_hidden128<
         .unwrap();
         let input_device =
             DeviceTensor::from_host(Arc::clone(backend), input_host.clone()).unwrap();
-        let (_output, state) = layer.forward_with_state(&input_device).unwrap();
-        state.activation.to_host().unwrap()
+        let hidden = layer.w_in.forward(&input_device).unwrap();
+        let activation = functional::gelu(backend.as_ref(), &hidden).unwrap();
+        activation.to_host().unwrap()
     });
 
     assert_close(&expected, activation_host.data());
@@ -344,8 +347,9 @@ pub fn feed_forward_state_records_activation_extreme_inputs<B: PortableBackend +
         .unwrap();
         let input_device =
             DeviceTensor::from_host(Arc::clone(backend), input_host.clone()).unwrap();
-        let (_output, state) = layer.forward_with_state(&input_device).unwrap();
-        state.activation.to_host().unwrap()
+        let hidden = layer.w_in.forward(&input_device).unwrap();
+        let activation = functional::gelu(backend.as_ref(), &hidden).unwrap();
+        activation.to_host().unwrap()
     });
 
     assert_close(&expected, activation_host.data());

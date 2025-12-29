@@ -1,9 +1,9 @@
-use super::linear::{Linear, LinearGradients, LinearState};
+use super::linear::Linear;
 use crate::backend::spec::PortableBackend;
 use crate::module::{Module, ParamVisitor, ParamVisitorMut, TensorRole};
 use crate::ops::functional::{self, AttentionCache, DecodeKvCache};
 use crate::tensor::DeviceTensor;
-use anyhow::{bail, ensure, Result};
+use anyhow::{ensure, Result};
 use std::fmt;
 use std::sync::Arc;
 
@@ -131,26 +131,6 @@ pub struct CausalSelfAttention<B: PortableBackend + 'static> {
     pub proj_out: Linear<B>,
 }
 
-/// Cached tensors captured during the forward pass for reuse or inspection.
-///
-/// Stores the original input, linear layer states, attention context, and both the freshly
-/// generated key/value chunk (`present_cache`) and the concatenated cache (`cache`).
-pub struct CausalSelfAttentionState<B: PortableBackend + 'static> {
-    pub input: DeviceTensor<B>,
-    pub proj_qkv: LinearState<B>,
-    pub attention_output: DeviceTensor<B>,
-    pub proj_out: LinearState<B>,
-    pub present_cache: AttentionCache<B>,
-    pub cache: AttentionCache<B>,
-}
-
-/// Placeholder for backward results once the portable path supports gradients.
-/// Mirrors the linear sublayer gradient structs so the API remains future-proof.
-pub struct CausalSelfAttentionGradients {
-    pub proj_qkv: LinearGradients,
-    pub proj_out: LinearGradients,
-}
-
 impl<B: PortableBackend + 'static> CausalSelfAttention<B> {
     /// Constructs the attention layer by uploading packed QKV and output projection weights.
     ///
@@ -193,27 +173,14 @@ impl<B: PortableBackend + 'static> CausalSelfAttention<B> {
         })
     }
 
-    /// Runs attention without returning intermediate state.
-    ///
-    /// Equivalent to [`forward_with_state`](Self::forward_with_state) but discards caches and
-    /// linear layer states.
+    /// Runs attention without returning KV caches.
     #[deny(clippy::disallowed_methods, clippy::disallowed_types)]
     pub fn forward(&self, x: &DeviceTensor<B>) -> Result<DeviceTensor<B>> {
-        let (output, _) =
-            self.forward_with_cache_internal(x, None, "CausalSelfAttention::forward")?;
-        Ok(output)
-    }
-
-    /// Runs attention and returns the captured [`CausalSelfAttentionState`].
-    ///
-    /// Useful when the caller plans to feed the saved caches or linear intermediates into a
-    /// future backward pass (once implemented).
-    #[deny(clippy::disallowed_methods, clippy::disallowed_types)]
-    pub fn forward_with_state(
-        &self,
-        x: &DeviceTensor<B>,
-    ) -> Result<(DeviceTensor<B>, CausalSelfAttentionState<B>)> {
-        self.forward_with_cache_internal(x, None, "CausalSelfAttention::forward_with_state")
+        let _prof_guard = crate::profiling::layer_scope("CausalSelfAttention::forward");
+        let qkv = self.proj_qkv.forward(x)?;
+        let functional::AttentionComputation { output, .. } =
+            functional::attention(self.backend.as_ref(), &self.config, &qkv, None)?;
+        self.proj_out.forward(&output)
     }
 
     /// Runs attention while accepting an optional existing cache.
@@ -225,8 +192,13 @@ impl<B: PortableBackend + 'static> CausalSelfAttention<B> {
         &self,
         x: &DeviceTensor<B>,
         cache: Option<&AttentionCache<B>>,
-    ) -> Result<(DeviceTensor<B>, CausalSelfAttentionState<B>)> {
-        self.forward_with_cache_internal(x, cache, "CausalSelfAttention::forward_with_cache")
+    ) -> Result<(DeviceTensor<B>, AttentionCache<B>)> {
+        let _prof_guard = crate::profiling::layer_scope("CausalSelfAttention::forward_with_cache");
+        let qkv = self.proj_qkv.forward(x)?;
+        let functional::AttentionComputation { output, cache, .. } =
+            functional::attention(self.backend.as_ref(), &self.config, &qkv, cache)?;
+        let output = self.proj_out.forward(&output)?;
+        Ok((output, cache))
     }
 
     /// Runs attention while updating a fixed-capacity decode KV cache.
@@ -260,52 +232,6 @@ impl<B: PortableBackend + 'static> CausalSelfAttention<B> {
 
         let output = self.proj_out.forward(&attention_context)?;
         Ok((output, updated_cache))
-    }
-
-    /// Shared implementation for the three forward variants.
-    ///
-    /// Captures profiling scopes, materialises packed QKV projections, feeds them into the
-    /// functional attention kernel, and finally runs the output projection while recording caches
-    /// for the caller.
-    #[deny(clippy::disallowed_methods, clippy::disallowed_types)]
-    fn forward_with_cache_internal(
-        &self,
-        x: &DeviceTensor<B>,
-        cache: Option<&AttentionCache<B>>,
-        scope: &'static str,
-    ) -> Result<(DeviceTensor<B>, CausalSelfAttentionState<B>)> {
-        let _prof_guard = crate::profiling::layer_scope(scope);
-        let (qkv, proj_qkv_state) = self.proj_qkv.forward_with_state(x)?;
-        let functional::AttentionComputation {
-            output: attention_context,
-            present: present_cache,
-            cache: updated_cache,
-        } = functional::attention(self.backend.as_ref(), &self.config, &qkv, cache)?;
-
-        let (output, proj_out_state) = self.proj_out.forward_with_state(&attention_context)?;
-
-        Ok((
-            output,
-            CausalSelfAttentionState {
-                input: x.clone(),
-                proj_qkv: proj_qkv_state,
-                attention_output: attention_context,
-                proj_out: proj_out_state,
-                present_cache,
-                cache: updated_cache,
-            },
-        ))
-    }
-
-    /// Placeholder for the backward pass; returns an error until gradients are implemented.
-    pub fn backward(
-        &self,
-        _state: &CausalSelfAttentionState<B>,
-        _grad_output: &DeviceTensor<B>,
-    ) -> Result<(CausalSelfAttentionGradients, DeviceTensor<B>)> {
-        bail!(
-            "CausalSelfAttention backward is not available until the portable linear path is implemented"
-        )
     }
 
     /// Returns the backend that owns the layer parameters.

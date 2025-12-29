@@ -10,34 +10,11 @@ pub use graph::{
 };
 pub use tensor::{tensor, TensorPlaceholder};
 
-use crate::backend::spec::{DType, PortableBackend};
-
-/// Session trait exposing the subset of PTIR helpers required by functional kernels.
-pub trait FunctionalSession<'ctx, 'gb, B: PortableBackend + 'static> {
-    fn scalar(&self, value: f32) -> Tensor<'ctx, 'gb, B>;
-    fn iota(&self, dims: Vec<usize>, axis: usize, dtype: DType) -> Tensor<'ctx, 'gb, B>;
-    fn rng_uniform(&self, dims: Vec<usize>, dtype: DType) -> Tensor<'ctx, 'gb, B>;
-}
-
-impl<'ctx, 'gb, B: PortableBackend + 'static> FunctionalSession<'ctx, 'gb, B>
-    for PtirSession<'ctx, 'gb, B>
-{
-    fn scalar(&self, value: f32) -> Tensor<'ctx, 'gb, B> {
-        PtirSession::scalar(self, value)
-    }
-
-    fn iota(&self, dims: Vec<usize>, axis: usize, dtype: DType) -> Tensor<'ctx, 'gb, B> {
-        PtirSession::iota(self, dims, axis, dtype)
-    }
-
-    fn rng_uniform(&self, dims: Vec<usize>, dtype: DType) -> Tensor<'ctx, 'gb, B> {
-        PtirSession::rng_uniform(self, dims, dtype)
-    }
-}
+use crate::backend::spec::PortableBackend;
 
 /// Broadcasts a scalar literal to the provided shape within the PTIR DSL.
 pub(crate) fn scalar_broadcast<'ctx, 'gb, B: PortableBackend + 'static>(
-    session: &impl FunctionalSession<'ctx, 'gb, B>,
+    session: &PtirSession<'ctx, 'gb, B>,
     value: f32,
     shape: &[usize],
 ) -> Tensor<'ctx, 'gb, B> {

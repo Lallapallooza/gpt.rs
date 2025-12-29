@@ -66,10 +66,6 @@ impl<'de> Deserialize<'de> for ModelConfig {
             return Ok(Self::new_with_runtime(kind.to_string(), config, runtime));
         }
 
-        if let Ok(_legacy_gpt) = serde_json::from_value::<super::gpt::GptConfig>(value.clone()) {
-            return Ok(Self::new("gpt".to_string(), value));
-        }
-
         Err(D::Error::custom("invalid ModelConfig"))
     }
 }

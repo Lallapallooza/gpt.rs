@@ -1,6 +1,6 @@
 //! Host-backed tensor used for literals, debugging, and interoperability.
 
-use super::{backend_bridge, dtype::DType, shape::Shape, storage::StorageElement};
+use super::{dtype::DType, shape::Shape, spec_utils, storage::StorageElement};
 use anyhow::{bail, ensure, Result};
 use rand::Rng;
 use std::mem::{size_of, ManuallyDrop};
@@ -236,8 +236,8 @@ impl Tensor {
     /// Wraps the tensor in a backend-neutral literal for graph initialization.
     pub fn to_literal(&self) -> TensorLiteral {
         let spec = TensorSpec::new(
-            backend_bridge::to_backend_dtype(self.dtype),
-            backend_bridge::spec_shape_from_shape(&self.shape),
+            spec_utils::backend_dtype(self.dtype),
+            spec_utils::backend_shape_from_shape(&self.shape),
         );
         TensorLiteral::new(spec, Arc::from(self.data.clone().into_boxed_slice()))
     }

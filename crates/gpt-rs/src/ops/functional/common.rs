@@ -9,12 +9,10 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, ensure, Result};
 use gpt_rs_macros::capture_ptir;
 
-use crate::backend::spec::{PortableBackend, TensorSpec, ValueId};
+use crate::backend::spec::{PortableBackend, ValueId};
 use crate::ops::graph::GraphArena;
 pub(crate) use crate::ops::ptir::scalar_broadcast;
-use crate::tensor::spec_utils::{
-    backend_dtype, backend_shape_from_shape, frontend_dtype, shape_from_spec,
-};
+use crate::tensor::spec_utils::{frontend_dtype, shape_from_spec};
 use crate::tensor::{DType as TensorDType, DeviceTensor};
 
 /// Extension trait exposing ergonomic math helpers on device tensors.
@@ -359,22 +357,6 @@ fn capture_clamp<B: PortableBackend + 'static>(
     };
 
     capture_result.into_device_tensor(requires_grad)
-}
-
-pub(crate) fn tensor_spec_from_device<B: PortableBackend + 'static>(
-    tensor: &DeviceTensor<B>,
-) -> TensorSpec {
-    TensorSpec::new(
-        backend_dtype(tensor.dtype()),
-        backend_shape_from_shape(tensor.shape()),
-    )
-}
-
-/// Returns the first available graph arena among the provided tensors, if any.
-pub(crate) fn resolve_graph_from_tensors<B: PortableBackend + 'static>(
-    tensors: &[&DeviceTensor<B>],
-) -> Option<Arc<GraphArena<B>>> {
-    tensors.iter().find_map(|tensor| tensor.graph())
 }
 
 pub trait CaptureIntoDeviceTensor<B: PortableBackend + 'static> {

@@ -216,17 +216,6 @@ fn functional_overrides_from_config(cfg: &ModelConfig) -> Result<FunctionalOverr
         return Ok(cfg.runtime.functional_overrides.clone());
     }
 
-    if cfg.kind == "gpt" {
-        if let Some(overrides) = cfg.config.get("functional_overrides") {
-            if overrides.is_null() {
-                return Ok(FunctionalOverrides::default());
-            }
-            let overrides: FunctionalOverrides = serde_json::from_value(overrides.clone())
-                .with_context(|| "invalid gpt functional_overrides")?;
-            return Ok(overrides);
-        }
-    }
-
     Ok(FunctionalOverrides::default())
 }
 
@@ -270,7 +259,6 @@ fn model_factories<B: PortableBackend + 'static>() -> &'static [(&'static str, B
         ("gpt", build_gpt::<B>),
         ("resnet34", build_resnet34::<B>),
         ("mobilenet_v2", build_mobilenet_v2::<B>),
-        ("mobilenet-v2", build_mobilenet_v2::<B>),
     ]
 }
 

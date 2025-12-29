@@ -64,11 +64,14 @@ pub use tensor_ops::*;
 pub fn tensor_spec_from_device<B: crate::backend::spec::PortableBackend + 'static>(
     tensor: &crate::tensor::DeviceTensor<B>,
 ) -> crate::backend::spec::TensorSpec {
-    common::tensor_spec_from_device(tensor)
+    crate::backend::spec::TensorSpec::new(
+        crate::tensor::spec_utils::backend_dtype(tensor.dtype()),
+        crate::tensor::spec_utils::backend_shape_from_shape(tensor.shape()),
+    )
 }
 
 pub fn resolve_graph_from_tensors<B: crate::backend::spec::PortableBackend + 'static>(
     tensors: &[&crate::tensor::DeviceTensor<B>],
 ) -> Option<std::sync::Arc<crate::ops::graph::GraphArena<B>>> {
-    common::resolve_graph_from_tensors(tensors)
+    tensors.iter().find_map(|tensor| tensor.graph())
 }

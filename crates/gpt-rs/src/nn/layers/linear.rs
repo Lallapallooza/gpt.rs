@@ -6,8 +6,8 @@
 use crate::backend::spec::PortableBackend;
 use crate::module::{Module, ParamVisitor, ParamVisitorMut, TensorRole};
 use crate::ops::functional;
-use crate::tensor::{DeviceTensor, DeviceTensorOps, Tensor};
-use anyhow::{bail, ensure, Result};
+use crate::tensor::{DeviceTensor, DeviceTensorOps};
+use anyhow::{ensure, Result};
 use std::fmt;
 use std::sync::Arc;
 /// Fully connected layer `y = x W + b` operating on device tensors.
@@ -15,18 +15,6 @@ pub struct Linear<B: PortableBackend + 'static> {
     backend: Arc<B>,
     pub weight: DeviceTensor<B>,
     pub bias: Option<DeviceTensor<B>>,
-}
-
-/// State captured during [`Linear::forward_with_state`].
-pub struct LinearState<B: PortableBackend + 'static> {
-    pub input: DeviceTensor<B>,
-}
-
-/// Placeholder gradients until the portable backend gains autograd support.
-pub struct LinearGradients {
-    pub weight: Tensor,
-    pub bias: Option<Tensor>,
-    pub input: Tensor,
 }
 
 impl<B: PortableBackend + 'static> Linear<B> {
@@ -88,31 +76,6 @@ impl<B: PortableBackend + 'static> Linear<B> {
                 .map(|b| b.requires_grad_flag())
                 .unwrap_or(false);
         Ok(output_device.requires_grad(requires_grad))
-    }
-
-    /// Runs the projection and returns the cloned input so potential backward passes can reuse it.
-    #[deny(clippy::disallowed_methods, clippy::disallowed_types)]
-    pub fn forward_with_state(
-        &self,
-        input: &DeviceTensor<B>,
-    ) -> Result<(DeviceTensor<B>, LinearState<B>)> {
-        let output = self.forward(input)?;
-        Ok((
-            output,
-            LinearState {
-                input: input.clone(),
-            },
-        ))
-    }
-
-    /// Placeholder backward pass; returns an error until gradients are implemented.
-    pub fn backward(
-        &self,
-        state: &LinearState<B>,
-        grad_output: &DeviceTensor<B>,
-    ) -> Result<LinearGradients> {
-        let _ = (state, grad_output);
-        bail!("linear backward is not available on the portable backend")
     }
 
     /// Returns the backend that owns the layer parameters.

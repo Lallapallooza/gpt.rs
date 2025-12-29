@@ -9,7 +9,6 @@ use gpt_rs::model::{Gpt, GptConfig};
 use gpt_rs::ops::functional;
 use gpt_rs::tensor::{DeviceTensor, Shape, Tensor};
 use gpt_rs::tokenizer::{Tokenizer, TokenizerConfig};
-use gpt_rs::train::trainer::Trainer;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
@@ -60,24 +59,6 @@ pub fn tokenizer_roundtrip() {
 
     assert_eq!(decoded, text);
     assert!(!tokens.is_empty());
-}
-
-pub fn trainer_updates_lm_head<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    let mut rng = StdRng::seed_from_u64(7);
-    let config = GptConfig {
-        vocab_size: 32,
-        context_length: 8,
-        embed_dim: 8,
-        num_layers: 1,
-        num_heads: 1,
-        mlp_ratio: 2,
-        dropout: 0.0,
-    };
-    let model = Gpt::random(config, Arc::clone(backend), &mut rng).unwrap();
-    let mut trainer = Trainer::new(model, 1e-2);
-    let tokens = vec![1, 2, 3, 4];
-    let result = trainer.train_step(&tokens, &[2, 3, 4, 5]);
-    assert!(result.is_err());
 }
 
 pub fn checkpoint_roundtrip<B: PortableBackend + 'static>(backend: &Arc<B>) {

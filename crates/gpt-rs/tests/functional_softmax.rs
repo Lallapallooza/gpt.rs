@@ -435,10 +435,12 @@ fn embedding_rejects_rank2_indices() {
     let weight = make_tensor(&backend, &[4, 8]);
     let indices = make_tensor_for_dtype(&backend, &[2, 1], DType::I32);
 
-    // Rank-2 indices are allowed for legacy compatibility; ensure they still work.
-    let result = functional::embedding_lookup(backend.as_ref(), &weight, &indices)
-        .expect("rank-2 embedding indices should succeed for compatibility");
-    assert_eq!(result.shape().dims(), &[2, 8]);
+    let err = functional::embedding_lookup(backend.as_ref(), &weight, &indices).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("embedding indices must have rank 1"),
+        "unexpected error: {err:?}"
+    );
 }
 
 fn make_tensor(backend: &Arc<RecordingBackend>, dims: &[usize]) -> DeviceTensor<RecordingBackend> {

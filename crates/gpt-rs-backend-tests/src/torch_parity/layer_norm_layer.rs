@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use gpt_rs::backend::spec::PortableBackend;
 use gpt_rs::nn::layers::LayerNorm;
+use gpt_rs::ops::functional;
 use gpt_rs::tensor::DeviceTensor;
 use tch::{Kind, Tensor as TchTensor};
 
@@ -92,7 +93,14 @@ fn run_layer_norm_state_case<B: PortableBackend + 'static>(
     let (normalized_host, mean_host, inv_std_host) = timed_gpt(|| {
         let layer = LayerNorm::new(Arc::clone(backend), gamma_host, beta_host, eps as f32).unwrap();
         let input_device = DeviceTensor::from_host(Arc::clone(backend), input_host).unwrap();
-        let (_output, state) = layer.forward_with_state(&input_device).unwrap();
+        let state = functional::layer_norm(
+            backend.as_ref(),
+            &input_device,
+            &layer.gamma,
+            &layer.beta,
+            layer.eps,
+        )
+        .unwrap();
         (
             state.normalized.to_host().unwrap(),
             state.mean.to_host().unwrap(),
@@ -176,7 +184,14 @@ pub fn layer_norm_forward_with_state_matches_moments<B: PortableBackend + 'stati
         .unwrap();
         let input_device =
             DeviceTensor::from_host(Arc::clone(backend), input_host.clone()).unwrap();
-        let (_output, state) = layer.forward_with_state(&input_device).unwrap();
+        let state = functional::layer_norm(
+            backend.as_ref(),
+            &input_device,
+            &layer.gamma,
+            &layer.beta,
+            layer.eps,
+        )
+        .unwrap();
         (
             state.normalized.to_host().unwrap(),
             state.mean.to_host().unwrap(),

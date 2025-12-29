@@ -4,9 +4,9 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use gpt_rs_macros::capture_ptir;
 
-use super::conv::Conv2d;
 use crate::backend::spec::PortableBackend;
 use crate::module::{Module, ParamVisitor, ParamVisitorMut};
+use crate::nn::layers::Conv2d;
 use crate::nn::layers::Linear;
 use crate::ops::functional::common::CaptureIntoDeviceTensor;
 use crate::ops::functional::{max_pool2d, relu, reshape, transpose, Padding2d};

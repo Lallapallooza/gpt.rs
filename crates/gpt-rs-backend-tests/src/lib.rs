@@ -23,12 +23,6 @@ macro_rules! define_backend_tests {
                 smoke::gpt_forward_shape(&backend);
             }
 
-            #[test]
-            fn smoke_trainer_updates_lm_head() {
-                let backend = ($backend_ctor)();
-                smoke::trainer_updates_lm_head(&backend);
-            }
-
             #[cfg(feature = "torch")]
             mod torch_parity_tests {
                 use super::*;
@@ -195,10 +189,9 @@ macro_rules! define_backend_tests {
             parity_test!(torch_embedding_supports_duplicate_indices, embedding_layer::embedding_supports_duplicate_indices);
             parity_test!(torch_embedding_forward_preserves_requires_grad, embedding_layer::embedding_forward_preserves_requires_grad);
             parity_test!(torch_embedding_matches_torch_vocab64_embed32_seq16_rank1, embedding_layer::embedding_matches_torch_vocab64_embed32_seq16_rank1);
-            parity_test!(torch_embedding_matches_torch_vocab64_embed32_seq16_rank2, embedding_layer::embedding_matches_torch_vocab64_embed32_seq16_rank2);
             parity_test!(torch_embedding_matches_torch_vocab32_embed8_seq5, embedding_layer::embedding_matches_torch_vocab32_embed8_seq5);
             parity_test!(torch_embedding_matches_torch_vocab32_embed128_seq8, embedding_layer::embedding_matches_torch_vocab32_embed128_seq8);
-            parity_test!(torch_embedding_rejects_indices_last_dim_not_one, embedding_layer::embedding_rejects_indices_last_dim_not_one);
+            parity_test!(torch_embedding_rejects_indices_rank2, embedding_layer::embedding_rejects_indices_rank2);
             parity_test!(torch_embedding_rejects_indices_rank3, embedding_layer::embedding_rejects_indices_rank3);
             parity_test!(torch_device_linear_initializes_from_host_and_device_weights, device_layers::linear_initializes_from_host_and_device_weights);
             parity_test!(torch_device_layer_norm_initializes_from_host_and_device_tensors, device_layers::layer_norm_initializes_from_host_and_device_tensors);

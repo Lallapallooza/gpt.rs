@@ -12,8 +12,9 @@ use crate::nn::layers::attention::AttentionConfig;
 use crate::ops::functional::common::{
     ensure_axis_in_bounds, ensure_dims_match_except_axis, ensure_last_dim, ensure_rank,
     ensure_same_backend, ensure_same_dtype, ensure_shape_matches, ensure_slice_within_bounds,
-    resolve_graph_from_tensors, scalar_broadcast, CaptureIntoDeviceTensor,
+    scalar_broadcast, CaptureIntoDeviceTensor,
 };
+use crate::ops::functional::resolve_graph_from_tensors;
 use crate::ops::functional::runtime::CacheKeyArg;
 use crate::ops::graph::GraphArena;
 use crate::ops::ptir::{self, DotAttrs, DotDims};

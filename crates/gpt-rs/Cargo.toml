@@ -5,8 +5,6 @@ edition = "2021"
 
 [features]
 default = []
-parallel = ["dep:rayon"]
-simd = []
 profiler = []
 torch = ["gpt-rs-backend-tests/torch"]
 
@@ -16,7 +14,6 @@ rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-rayon = { version = "1.10", optional = true }
 regex = "1"
 gpt-rs-macros = { path = "../gpt-rs-macros" }
 lru = "0.12"

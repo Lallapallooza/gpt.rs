@@ -1,10 +1,6 @@
 use crate::backend::spec::PortableBackend;
 use crate::module::{Module, ParamVisitor, ParamVisitorMut, TensorRole};
-use crate::nn::{
-    AttentionConfig, CausalSelfAttention, CausalSelfAttentionGradients, CausalSelfAttentionState,
-    Embedding, EmbeddingState, FeedForward, FeedForwardGradients, FeedForwardState, LayerNorm,
-    LayerNormGradients, LayerNormState,
-};
+use crate::nn::{AttentionConfig, CausalSelfAttention, Embedding, FeedForward, LayerNorm};
 use crate::ops::functional::{self, AttentionCache, DecodeKvCache};
 use crate::tensor::{DeviceTensor, DeviceTensorOps, Shape, Tensor};
 use anyhow::{anyhow, bail, ensure, Result};
@@ -46,21 +42,6 @@ pub struct GptBlock<B: PortableBackend + 'static> {
     pub ln_2: LayerNorm<B>,
 }
 
-pub struct GptBlockState<B: PortableBackend + 'static> {
-    pub input: DeviceTensor<B>,
-    pub ln1: LayerNormState<B>,
-    pub attn: CausalSelfAttentionState<B>,
-    pub ln2: LayerNormState<B>,
-    pub ff: FeedForwardState<B>,
-}
-
-pub struct GptBlockGradients {
-    pub attention: CausalSelfAttentionGradients,
-    pub feed_forward: FeedForwardGradients,
-    pub ln1: LayerNormGradients,
-    pub ln2: LayerNormGradients,
-}
-
 impl<B: PortableBackend + 'static> GptBlock<B> {
     pub fn forward(&self, x: &DeviceTensor<B>) -> Result<DeviceTensor<B>> {
         let normed = self.ln_1.forward(x)?;
@@ -77,12 +58,12 @@ impl<B: PortableBackend + 'static> GptBlock<B> {
         cache: Option<&AttentionCache<B>>,
     ) -> Result<(DeviceTensor<B>, AttentionCache<B>)> {
         let normed = self.ln_1.forward(x)?;
-        let (attn_output, attn_state) = self.attention.forward_with_cache(&normed, cache)?;
+        let (attn_output, updated_cache) = self.attention.forward_with_cache(&normed, cache)?;
         let residual = attn_output.add(x)?;
         let normed2 = self.ln_2.forward(&residual)?;
         let ff_output = self.feed_forward.forward(&normed2)?;
         let output = ff_output.add(&residual)?;
-        Ok((output, attn_state.cache))
+        Ok((output, updated_cache))
     }
 
     pub fn forward_with_decode_cache(
@@ -101,38 +82,6 @@ impl<B: PortableBackend + 'static> GptBlock<B> {
         let ff_output = self.feed_forward.forward(&normed2)?;
         let output = ff_output.add(&residual)?;
         Ok((output, updated_cache))
-    }
-
-    pub fn forward_with_state(
-        &self,
-        x: &DeviceTensor<B>,
-    ) -> Result<(DeviceTensor<B>, GptBlockState<B>)> {
-        let (normed, ln1_state) = self.ln_1.forward_with_state(x)?;
-        let (attn_output, attn_state) = self.attention.forward_with_state(&normed)?;
-        let residual = attn_output.add(x)?;
-        let (normed2, ln2_state) = self.ln_2.forward_with_state(&residual)?;
-        let (ff_output, ff_state) = self.feed_forward.forward_with_state(&normed2)?;
-        let output = ff_output.add(&residual)?;
-
-        Ok((
-            output,
-            GptBlockState {
-                input: x.clone(),
-                ln1: ln1_state,
-                attn: attn_state,
-                ln2: ln2_state,
-                ff: ff_state,
-            },
-        ))
-    }
-
-    pub fn backward(
-        &self,
-        state: &GptBlockState<B>,
-        grad_output: &DeviceTensor<B>,
-    ) -> Result<(GptBlockGradients, DeviceTensor<B>)> {
-        let _ = (state, grad_output);
-        bail!("GptBlock backward is not available on the portable backend yet")
     }
 }
 
@@ -161,15 +110,6 @@ pub struct Gpt<B: PortableBackend + 'static> {
     pub blocks: Vec<GptBlock<B>>,
     pub final_ln: LayerNorm<B>,
     pub lm_head: DeviceTensor<B>,
-}
-
-pub struct GptForwardState<B: PortableBackend + 'static> {
-    pub token_state: EmbeddingState<B>,
-    pub embedding_output: DeviceTensor<B>,
-    pub block_states: Vec<GptBlockState<B>>,
-    pub post_blocks: DeviceTensor<B>,
-    pub final_ln_output: DeviceTensor<B>,
-    pub final_ln_state: LayerNormState<B>,
 }
 
 impl<B: PortableBackend + 'static> Gpt<B> {
@@ -430,61 +370,6 @@ impl<B: PortableBackend + 'static> Gpt<B> {
             final_ln,
             lm_head,
         })
-    }
-
-    pub fn forward_with_state(&self, tokens: &[usize]) -> Result<(Tensor, GptForwardState<B>)> {
-        self.validate_tokens(tokens)?;
-
-        let token_indices_host = Tensor::from_i32(
-            Shape::new([tokens.len()]),
-            tokens
-                .iter()
-                .map(|&idx| {
-                    i32::try_from(idx).map_err(|_| anyhow!("token index {} exceeds i32::MAX", idx))
-                })
-                .collect::<Result<Vec<i32>>>()?,
-        )?;
-        let token_indices = DeviceTensor::from_host(Arc::clone(&self.backend), token_indices_host)?;
-        let (token_embeddings, token_state) =
-            self.tok_embeddings.forward_with_state(&token_indices)?;
-        let positions: Vec<usize> = (0..tokens.len()).collect();
-        let position_indices_host = Tensor::from_i32(
-            Shape::new([positions.len()]),
-            positions.iter().map(|&idx| idx as i32).collect(),
-        )?;
-        let position_indices =
-            DeviceTensor::from_host(Arc::clone(&self.backend), position_indices_host)?;
-        let position_embeddings = functional::embedding_lookup_with_graph(
-            self.backend.as_ref(),
-            &self.pos_embeddings,
-            &position_indices,
-            token_embeddings.graph(),
-        )?;
-
-        let embedding_output = token_embeddings.add(&position_embeddings)?;
-        let mut hidden = embedding_output.clone();
-        let mut block_states = Vec::with_capacity(self.blocks.len());
-        for block in &self.blocks {
-            let (block_output, block_state) = block.forward_with_state(&hidden)?;
-            block_states.push(block_state);
-            hidden = block_output;
-        }
-
-        let post_blocks = hidden.clone();
-        let (final_ln_output, final_ln_state) = self.final_ln.forward_with_state(&hidden)?;
-        let logits_device = final_ln_output.matmul(&self.lm_head)?;
-        let logits = logits_device.to_host()?;
-
-        let state = GptForwardState {
-            token_state,
-            embedding_output,
-            block_states,
-            post_blocks,
-            final_ln_output,
-            final_ln_state,
-        };
-
-        Ok((logits, state))
     }
 
     pub fn forward_hidden(&self, tokens: &[usize]) -> Result<Tensor> {

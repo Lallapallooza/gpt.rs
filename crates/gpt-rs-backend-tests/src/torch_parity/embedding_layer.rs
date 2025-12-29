@@ -22,7 +22,6 @@ fn run_embedding_case<B: PortableBackend + 'static>(
     embed_dim: usize,
     seq_len: usize,
     seed: u64,
-    rank2_indices: bool,
 ) {
     let mut rng = seeded_rng(seed);
     let weight_host = tensor_from_vec(&[vocab, embed_dim], random_vec(&mut rng, vocab * embed_dim));
@@ -36,13 +35,11 @@ fn run_embedding_case<B: PortableBackend + 'static>(
     let output_host = timed_gpt(|| {
         let weight_device =
             DeviceTensor::from_host(Arc::clone(backend), weight_host.clone()).unwrap();
-        let shape = if rank2_indices {
-            Shape::new([indices.len(), 1])
-        } else {
-            Shape::new([indices.len()])
-        };
-        let indices_tensor =
-            Tensor::from_i32(shape, indices.iter().map(|&idx| idx as i32).collect()).unwrap();
+        let indices_tensor = Tensor::from_i32(
+            Shape::new([indices.len()]),
+            indices.iter().map(|&idx| idx as i32).collect(),
+        )
+        .unwrap();
         let indices_device = DeviceTensor::from_host(Arc::clone(backend), indices_tensor).unwrap();
         let layer = Embedding::new(Arc::clone(backend), weight_device.clone()).unwrap();
         let output_device = layer.forward(&indices_device).unwrap();
@@ -70,7 +67,7 @@ pub fn embedding_matches_torch_basic<B: PortableBackend + 'static>(backend: &Arc
         let weight_device =
             DeviceTensor::from_host(Arc::clone(backend), weight_host.clone()).unwrap();
         let indices_tensor = Tensor::from_i32(
-            Shape::new([indices.len(), 1]),
+            Shape::new([indices.len()]),
             indices.iter().map(|&idx| idx as i32).collect(),
         )
         .unwrap();
@@ -100,7 +97,7 @@ pub fn embedding_supports_duplicate_indices<B: PortableBackend + 'static>(backen
         let weight_device =
             DeviceTensor::from_host(Arc::clone(backend), weight_host.clone()).unwrap();
         let indices_tensor = Tensor::from_i32(
-            Shape::new([indices.len(), 1]),
+            Shape::new([indices.len()]),
             indices.iter().map(|&idx| idx as i32).collect(),
         )
         .unwrap();
@@ -125,7 +122,7 @@ pub fn embedding_forward_preserves_requires_grad<B: PortableBackend + 'static>(b
         let layer = Embedding::new(Arc::clone(backend), device_weight.clone()).unwrap();
         let indices = [1usize, 3, 5];
         let indices_tensor = Tensor::from_i32(
-            Shape::new([indices.len(), 1]),
+            Shape::new([indices.len()]),
             indices.iter().map(|&idx| idx as i32).collect(),
         )
         .unwrap();
@@ -139,26 +136,20 @@ pub fn embedding_forward_preserves_requires_grad<B: PortableBackend + 'static>(b
 pub fn embedding_matches_torch_vocab64_embed32_seq16_rank1<B: PortableBackend + 'static>(
     backend: &Arc<B>,
 ) {
-    run_embedding_case(backend, 64, 32, 16, 0xB010, false);
-}
-
-pub fn embedding_matches_torch_vocab64_embed32_seq16_rank2<B: PortableBackend + 'static>(
-    backend: &Arc<B>,
-) {
-    run_embedding_case(backend, 64, 32, 16, 0xB011, true);
+    run_embedding_case(backend, 64, 32, 16, 0xB010);
 }
 
 pub fn embedding_matches_torch_vocab32_embed8_seq5<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    run_embedding_case(backend, 32, 8, 5, 0xB012, false);
+    run_embedding_case(backend, 32, 8, 5, 0xB012);
 }
 
 pub fn embedding_matches_torch_vocab32_embed128_seq8<B: PortableBackend + 'static>(
     backend: &Arc<B>,
 ) {
-    run_embedding_case(backend, 32, 128, 8, 0xB013, false);
+    run_embedding_case(backend, 32, 128, 8, 0xB013);
 }
 
-pub fn embedding_rejects_indices_last_dim_not_one<B: PortableBackend + 'static>(backend: &Arc<B>) {
+pub fn embedding_rejects_indices_rank2<B: PortableBackend + 'static>(backend: &Arc<B>) {
     let err = timed_gpt(|| {
         let weight = tensor_from_vec(&[8, 4], vec![0.0; 32]);
         let weight_device = DeviceTensor::from_host(Arc::clone(backend), weight).unwrap();
@@ -167,7 +158,9 @@ pub fn embedding_rejects_indices_last_dim_not_one<B: PortableBackend + 'static>(
         let layer = Embedding::new(Arc::clone(backend), weight_device).unwrap();
         layer.forward(&indices_device).unwrap_err()
     });
-    assert!(err.to_string().contains("last dimension"));
+    assert!(err
+        .to_string()
+        .contains("embedding indices must have rank 1"));
 }
 
 pub fn embedding_rejects_indices_rank3<B: PortableBackend + 'static>(backend: &Arc<B>) {

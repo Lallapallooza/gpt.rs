@@ -296,10 +296,6 @@ impl TensorArchive {
         writer.flush()?;
         Ok(())
     }
-
-    pub fn reader(path: impl AsRef<Path>) -> Result<TensorArchiveReader> {
-        TensorArchiveReader::open(path)
-    }
 }
 
 fn read_u32(reader: &mut impl Read) -> Result<u32> {

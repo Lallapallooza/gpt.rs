@@ -6,8 +6,8 @@
 use crate::backend::spec::PortableBackend;
 use crate::module::{Module, ParamVisitor, ParamVisitorMut, TensorRole};
 use crate::ops::functional;
-use crate::tensor::{DType, DeviceTensor, Tensor};
-use anyhow::{bail, ensure, Result};
+use crate::tensor::{DType, DeviceTensor};
+use anyhow::{ensure, Result};
 use std::fmt;
 use std::sync::Arc;
 
@@ -15,16 +15,6 @@ use std::sync::Arc;
 pub struct Embedding<B: PortableBackend + 'static> {
     backend: Arc<B>,
     pub weight: DeviceTensor<B>,
-}
-
-/// State bundle returned from [`Embedding::forward_with_state`].
-pub struct EmbeddingState<B: PortableBackend + 'static> {
-    pub indices: DeviceTensor<B>,
-}
-
-/// Placeholder for gradients once the portable backend adds backward support.
-pub struct EmbeddingGradients {
-    pub weight: Tensor,
 }
 
 impl<B: PortableBackend + 'static> Embedding<B> {
@@ -56,31 +46,6 @@ impl<B: PortableBackend + 'static> Embedding<B> {
         self.validate_indices(indices)?;
         let _prof_guard = crate::profiling::layer_scope("Embedding::forward");
         functional::embedding_lookup(self.backend.as_ref(), &self.weight, indices)
-    }
-
-    /// Runs the embedding lookup and returns the captured indices for potential reuse.
-    #[deny(clippy::disallowed_methods, clippy::disallowed_types)]
-    pub fn forward_with_state(
-        &self,
-        indices: &DeviceTensor<B>,
-    ) -> Result<(DeviceTensor<B>, EmbeddingState<B>)> {
-        self.validate_indices(indices)?;
-        let output = self.forward(indices)?;
-        Ok((
-            output,
-            EmbeddingState {
-                indices: indices.clone(),
-            },
-        ))
-    }
-
-    /// Placeholder for the backward pass; returns an error until gradients are implemented.
-    pub fn backward(
-        &self,
-        _state: &EmbeddingState<B>,
-        _grad_output: &DeviceTensor<B>,
-    ) -> Result<EmbeddingGradients> {
-        bail!("embedding backward is not available on the portable backend yet")
     }
 
     /// Returns the backend handle that owns the embedding weights.

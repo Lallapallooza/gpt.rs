@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use gpt_rs::backend::spec::PortableBackend;
 use gpt_rs::nn::layers::{AttentionConfig, CausalSelfAttention};
+use gpt_rs::ops::functional;
 use gpt_rs::tensor::{DeviceTensor, Tensor};
 use tch::{Kind, Tensor as TchTensor};
 
@@ -223,20 +224,20 @@ fn run_mha_prefill_decode_case<B: PortableBackend + 'static>(
             input_host.data()[0..prefill_len * embed_dim].to_vec(),
         );
         let prefill_device = DeviceTensor::from_host(Arc::clone(backend), prefill_input).unwrap();
-        let (_prefill_out, mut state) = layer.forward_with_cache(&prefill_device, None).unwrap();
+        let (_prefill_out, mut cache) = layer.forward_with_cache(&prefill_device, None).unwrap();
 
         for step in 0..decode_steps {
             let start = (prefill_len + step) * embed_dim;
             let end = start + embed_dim;
             let token = tensor_from_vec(&[1, embed_dim], input_host.data()[start..end].to_vec());
             let token_device = DeviceTensor::from_host(Arc::clone(backend), token).unwrap();
-            let (output, next_state) = layer
-                .forward_with_cache(&token_device, Some(&state.cache))
+            let (output, next_cache) = layer
+                .forward_with_cache(&token_device, Some(&cache))
                 .unwrap();
 
             let output_host = output.to_host().unwrap();
             assert_close(&expected[start..end], output_host.data());
-            state = next_state;
+            cache = next_cache;
         }
     });
 }
@@ -357,7 +358,7 @@ pub fn multi_head_attention_matches_torch_grouped<B: PortableBackend + 'static>(
         let output_host = output_device.to_host().unwrap();
 
         assert_eq!(
-            state.cache.keys().shape().dims(),
+            state.keys().shape().dims(),
             &[config.num_key_value_heads, seq_len, config.kv_head_dim]
         );
 
@@ -368,10 +369,9 @@ pub fn multi_head_attention_matches_torch_grouped<B: PortableBackend + 'static>(
         let last_token_device =
             DeviceTensor::from_host(Arc::clone(backend), last_token_host).unwrap();
         let (_, second_state) = layer
-            .forward_with_cache(&last_token_device, Some(&state.cache))
+            .forward_with_cache(&last_token_device, Some(&state))
             .unwrap();
-        assert_eq!(second_state.present_cache.len(), 1);
-        assert_eq!(second_state.cache.len(), seq_len + 1);
+        assert_eq!(second_state.len(), seq_len + 1);
 
         output_host
     });
@@ -477,8 +477,12 @@ pub fn multi_head_attention_state_records_context<B: PortableBackend + 'static>(
 
         let input_device =
             DeviceTensor::from_host(Arc::clone(backend), input_host.clone()).unwrap();
-        let (_output, state) = layer.forward_with_state(&input_device).unwrap();
-        state.attention_output.to_host().unwrap()
+        let qkv = layer.proj_qkv.forward(&input_device).unwrap();
+        let functional::AttentionComputation {
+            output: attention_context,
+            ..
+        } = functional::attention(backend.as_ref(), &config, &qkv, None).unwrap();
+        attention_context.to_host().unwrap()
     });
 
     assert_close(&expected, context_host.data());

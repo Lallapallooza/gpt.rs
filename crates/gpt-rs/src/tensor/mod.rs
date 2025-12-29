@@ -5,7 +5,6 @@
 //! [`DeviceTensorOps`] so helper traits live next to
 //! the tensor types consumers manipulate in forward passes.
 
-mod backend_bridge;
 mod device_tensor;
 pub mod dtype;
 mod host_tensor;

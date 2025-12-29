@@ -3,12 +3,12 @@
 //! Implements the common two-layer MLP with GELU activation and exposes state capturing hooks
 //! similar to the other portable NN layers.
 
-use super::linear::{Linear, LinearGradients, LinearState};
+use super::linear::Linear;
 use crate::backend::spec::PortableBackend;
 use crate::module::{Module, ParamVisitor, ParamVisitorMut, TensorRole};
 use crate::ops::functional;
 use crate::tensor::DeviceTensor;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::sync::Arc;
 
 /// Transformer feed-forward network `Linear -> GELU -> Linear`.
@@ -16,20 +16,6 @@ pub struct FeedForward<B: PortableBackend + 'static> {
     backend: Arc<B>,
     pub w_in: Linear<B>,
     pub w_out: Linear<B>,
-}
-
-/// State captured during [`FeedForward::forward_with_state`].
-pub struct FeedForwardState<B: PortableBackend + 'static> {
-    pub input: DeviceTensor<B>,
-    pub linear1: LinearState<B>,
-    pub activation: DeviceTensor<B>,
-    pub linear2: LinearState<B>,
-}
-
-/// Placeholder for gradients once the portable backend supports them.
-pub struct FeedForwardGradients {
-    pub w_in: LinearGradients,
-    pub w_out: LinearGradients,
 }
 
 impl<B: PortableBackend + 'static> FeedForward<B> {
@@ -65,37 +51,6 @@ impl<B: PortableBackend + 'static> FeedForward<B> {
         let hidden = self.w_in.forward(x)?;
         let activated = functional::gelu(self.backend.as_ref(), &hidden)?;
         self.w_out.forward(&activated)
-    }
-
-    /// Runs the block and returns the captured intermediates.
-    #[deny(clippy::disallowed_methods, clippy::disallowed_types)]
-    pub fn forward_with_state(
-        &self,
-        x: &DeviceTensor<B>,
-    ) -> Result<(DeviceTensor<B>, FeedForwardState<B>)> {
-        let _prof_guard = crate::profiling::layer_scope("FeedForward::forward_with_state");
-        let (hidden, linear1_state) = self.w_in.forward_with_state(x)?;
-        let activated = functional::gelu(self.backend.as_ref(), &hidden)?;
-        let (output, linear2_state) = self.w_out.forward_with_state(&activated)?;
-
-        Ok((
-            output,
-            FeedForwardState {
-                input: x.clone(),
-                linear1: linear1_state,
-                activation: activated,
-                linear2: linear2_state,
-            },
-        ))
-    }
-
-    /// Placeholder for the backward pass; returns an error until gradients are implemented.
-    pub fn backward(
-        &self,
-        _state: &FeedForwardState<B>,
-        _grad_output: &DeviceTensor<B>,
-    ) -> Result<(FeedForwardGradients, DeviceTensor<B>)> {
-        bail!("feed-forward backward is not available on the portable backend")
     }
 
     /// Returns the backend handle that owns the block's parameters.

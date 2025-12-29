@@ -121,10 +121,10 @@ impl Serialize for FunctionalPolicySetting {
     {
         match self {
             FunctionalPolicySetting::Force(name) => {
-                if name.contains('=') {
-                    serializer.serialize_str(&format!("force={}", name))
+                if name.is_empty() {
+                    serializer.serialize_str("")
                 } else {
-                    serializer.serialize_str(name)
+                    serializer.serialize_str(&format!("force={}", name))
                 }
             }
             FunctionalPolicySetting::Benchmark { cache_size } => {
@@ -178,8 +178,10 @@ fn parse_policy_string(raw: &str) -> Result<FunctionalPolicySetting> {
         return Ok(FunctionalPolicySetting::Benchmark { cache_size });
     }
 
-    // Legacy compatibility: treat bare string as force override.
-    Ok(FunctionalPolicySetting::Force(trimmed.to_string()))
+    Err(anyhow!(
+        "invalid functional policy setting '{}'; expected 'force=<impl>' or 'benchmark'",
+        trimmed
+    ))
 }
 
 struct OpRegistry<I: ?Sized> {

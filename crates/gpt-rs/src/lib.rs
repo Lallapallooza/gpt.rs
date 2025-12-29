@@ -18,8 +18,6 @@ mod env;
 pub mod profiling;
 pub mod runtime;
 pub mod tokenizer;
-pub mod train;
-pub mod vision;
 
 pub use backend::spec::PortableBackend;
 pub use tensor::{DType, Shape, Tensor};

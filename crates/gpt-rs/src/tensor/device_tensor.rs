@@ -1,7 +1,7 @@
 //! Device-side tensor wrapper that tracks backend handles and gradient metadata.
 
 use super::lazy_tensor::InputRole;
-use super::{backend_bridge, lazy_tensor::LazyHandle, shape::Shape, DType, Tensor};
+use super::{lazy_tensor::LazyHandle, shape::Shape, spec_utils, DType, Tensor};
 use anyhow::{anyhow, ensure, Result};
 use std::collections::HashMap;
 use std::fmt;
@@ -133,7 +133,7 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     pub fn zeros(backend: Arc<B>, shape: Shape) -> Result<Self> {
         let spec = TensorSpec::new(
             crate::backend::spec::DType::F32,
-            backend_bridge::spec_shape_from_shape(&shape),
+            spec_utils::backend_shape_from_shape(&shape),
         );
         let handle = backend.materialize(TensorInit::Zeroed(spec))?;
         Ok(DeviceTensor {
@@ -405,8 +405,8 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     /// Builds a backend `TensorSpec` matching this tensor.
     pub(crate) fn tensor_spec(&self) -> TensorSpec {
         TensorSpec::new(
-            backend_bridge::to_backend_dtype(self.dtype),
-            backend_bridge::spec_shape_from_shape(&self.shape),
+            spec_utils::backend_dtype(self.dtype),
+            spec_utils::backend_shape_from_shape(&self.shape),
         )
     }
 

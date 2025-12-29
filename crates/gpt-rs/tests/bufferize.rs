@@ -1525,34 +1525,6 @@ fn region_param_liveness_is_not_initialized_regression() {
 }
 
 #[test]
-#[ignore]
-fn region_param_liveness_expected_behavior_future_fix() {
-    let spec = tensor_spec_static(DType::F32, &[2, 2]);
-    let region = Region {
-        id: RegionId(0),
-        parameters: vec![ValueType::Tensor(spec.clone())],
-        body: vec![Instruction {
-            id: ValueId(10),
-            op: Operation::ElementwiseBinary(ElementwiseBinaryOp::Add),
-            operands: vec![Operand::Value(ValueId(0)), Operand::Value(ValueId(0))],
-            output: ValueType::Tensor(spec),
-        }],
-        results: vec![ValueType::Tensor(tensor_spec_static(DType::F32, &[2, 2]))],
-    };
-    let program = Program::new("main").with_regions(vec![region]);
-    let plan = plan_buffers_with(&program, &strict_opts()).expect("plan");
-    let region_plan = plan.region(RegionId(0)).expect("region plan");
-
-    assert_eq!(
-        region_plan
-            .buffer_for(ValueId(0))
-            .expect("param buffer")
-            .live_range,
-        LiveRange::new(0, 1)
-    );
-}
-
-#[test]
 fn region_results_inference_out_of_bounds_is_handled() {
     let spec = tensor_spec_static(DType::F32, &[2, 2]);
     let region = Region {

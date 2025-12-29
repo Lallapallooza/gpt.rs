@@ -48,7 +48,7 @@ The shared backend test harness is the crate:
 
 It contains:
 
-- `src/smoke.rs`: quick sanity tests (shapes, training updates, etc.)
+- `src/smoke.rs`: quick sanity tests (shapes, basic execution, etc.)
 - `src/torch_parity/`: numerical parity tests against Torch (via `tch`)
 - `src/lib.rs`: the `define_backend_tests!` macro that wires everything together
 

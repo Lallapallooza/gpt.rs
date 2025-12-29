@@ -12,7 +12,11 @@ Warning: expect churn. APIs, formats, and model coverage change quickly.
 
 ## Demo
 
-Video: (TODO)
+Video: 
+
+https://github.com/user-attachments/assets/4a99a79d-b98c-4b11-9f2d-64906b832ca7
+
+
 
 ## Benchmarks (early)
 

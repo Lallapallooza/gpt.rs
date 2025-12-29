@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Prepare GPT-2 tokenizer config
+        run: |
+          set -euo pipefail
+          vocab_url="https://huggingface.co/gpt2/resolve/main/vocab.json"
+          merges_url="https://huggingface.co/gpt2/resolve/main/merges.txt"
+          mkdir -p configs
+          curl -fsSL "$vocab_url" -o /tmp/gpt2_vocab.json
+          curl -fsSL "$merges_url" -o /tmp/gpt2_merges.txt
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          with open("/tmp/gpt2_vocab.json", "r", encoding="utf-8") as f:
+              vocab = json.load(f)
+
+          merges = []
+          with open("/tmp/gpt2_merges.txt", "r", encoding="utf-8") as f:
+              for line in f:
+                  line = line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  parts = line.split()
+                  if len(parts) == 2:
+                      merges.append([parts[0], parts[1]])
+
+          data = {"vocab": vocab, "merges": merges, "unk_token": "<|endoftext|>"}
+          out = Path("configs/gpt2_tokenizer.json")
+          out.write_text(json.dumps(data, indent=2), encoding="utf-8")
+          print(f"Wrote {out} with {len(vocab)} vocab items and {len(merges)} merges")
+          PY
+
+      - name: Run tests (workspace)
+        run: cargo test --workspace --exclude gpt-rs-py --exclude gpt-rs-backend-c

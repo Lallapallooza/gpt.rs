@@ -574,6 +574,30 @@ fn assign_slots(
     instructions: &[crate::backend::spec::Instruction],
     alias_info: &HashMap<BufferKey, (AliasKind, BufferKey)>,
 ) {
+    fn dtype_sort_key(dtype: DType) -> u32 {
+        match dtype {
+            DType::I1 => 0,
+            DType::Si4 => 1,
+            DType::Ui4 => 2,
+            DType::Si8 => 3,
+            DType::Ui8 => 4,
+            DType::Si16 => 5,
+            DType::Ui16 => 6,
+            DType::Si32 => 7,
+            DType::Ui32 => 8,
+            DType::Si64 => 9,
+            DType::Ui64 => 10,
+            DType::Fp8E4M3 => 11,
+            DType::Fp8E5M2 => 12,
+            DType::Bf16 => 13,
+            DType::F16 => 14,
+            DType::F32 => 15,
+            DType::F64 => 16,
+            DType::Cf32 => 17,
+            DType::Cf64 => 18,
+        }
+    }
+
     let const_ids: std::collections::HashSet<ValueId> = instructions
         .iter()
         .filter_map(|inst| match inst.op {
@@ -597,10 +621,17 @@ fn assign_slots(
         groups.entry(key).or_default().push(idx);
     }
 
+    let mut group_entries: Vec<_> = groups.into_iter().collect();
+    group_entries.sort_by(|((dtype_a, len_a), _), ((dtype_b, len_b), _)| {
+        dtype_sort_key(*dtype_a)
+            .cmp(&dtype_sort_key(*dtype_b))
+            .then_with(|| len_a.cmp(len_b))
+    });
+
     let mut slots: Vec<BufferSlot> = Vec::new();
     let mut slot_end: Vec<usize> = Vec::new();
 
-    for ((dtype, byte_len), indices) in groups {
+    for ((dtype, byte_len), indices) in group_entries {
         let mut sorted = indices;
         sorted.sort_by_key(|idx| plan.buffers[*idx].live_range.start);
         let mut local_slots: Vec<usize> = Vec::new();

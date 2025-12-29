@@ -7,6 +7,7 @@ use gpt_rs::inference::generate::Generator;
 use gpt_rs::inference::sampler::Sampler;
 use gpt_rs::io::tensor_archive::TensorArchive;
 use gpt_rs::ops::trace::{self, FileTraceOptions, FileTraceSink, ProgramDumpFilter};
+use gpt_rs::params::ModelNamespaceId;
 use gpt_rs::profiling;
 use gpt_rs::runtime;
 use gpt_rs::tensor::{DeviceTensor, Shape, Tensor};
@@ -23,6 +24,14 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+fn model_namespace_for_backend<B: PortableBackend + ?Sized>(backend: &B) -> ModelNamespaceId {
+    if backend.backend_name() == "c" {
+        ModelNamespaceId(0)
+    } else {
+        runtime::next_namespace()
+    }
+}
 
 fn install_dump_sink(path: &Path, dump_mode: DumpMode) -> Result<trace::TraceGuard> {
     let options = FileTraceOptions {
@@ -384,12 +393,10 @@ fn run_generate<B: PortableBackend + 'static>(
     args: &GenerateArgs,
     profile: bool,
 ) -> Result<()> {
-    let model = runtime::load_model_with_namespace(
-        Arc::clone(backend),
-        &args.checkpoint,
-        runtime::next_namespace(),
-    )
-    .with_context(|| format!("failed to load checkpoint {}", args.checkpoint.display()))?;
+    let namespace = model_namespace_for_backend(backend.as_ref());
+    let model =
+        runtime::load_model_with_namespace(Arc::clone(backend), &args.checkpoint, namespace)
+            .with_context(|| format!("failed to load checkpoint {}", args.checkpoint.display()))?;
     let lm = model.as_causal_lm().ok_or_else(|| {
         anyhow!(
             "model kind '{}' does not support causal generation",
@@ -598,12 +605,10 @@ fn run_forward<B: PortableBackend + 'static>(
     args: &ForwardArgs,
     profile: bool,
 ) -> Result<()> {
-    let mut model = runtime::load_model_with_namespace(
-        Arc::clone(backend),
-        &args.checkpoint,
-        runtime::next_namespace(),
-    )
-    .with_context(|| format!("failed to load checkpoint {}", args.checkpoint.display()))?;
+    let namespace = model_namespace_for_backend(backend.as_ref());
+    let mut model =
+        runtime::load_model_with_namespace(Arc::clone(backend), &args.checkpoint, namespace)
+            .with_context(|| format!("failed to load checkpoint {}", args.checkpoint.display()))?;
 
     let is_text = args.prompt.is_some() || !args.tokens.is_empty();
     if args.prompt.is_some() && !args.tokens.is_empty() {

@@ -189,6 +189,11 @@ struct DecodeAttentionPlan {
     requires_grad: bool,
 }
 
+fn decode_cache_capacity(required_len: usize, max_len: usize) -> usize {
+    let bucket = required_len.next_power_of_two().max(1);
+    bucket.min(max_len)
+}
+
 fn validate_qkv_layout<B: PortableBackend + 'static>(
     config: &AttentionConfig,
     qkv: &DeviceTensor<B>,
@@ -710,6 +715,7 @@ pub fn attention_decode_cache<B: PortableBackend + 'static>(
         resolve_graph_from_tensors(&[qkv]).unwrap_or_else(|| GraphArena::new(qkv.backend()));
 
     let capacity = cache.capacity();
+    let effective_capacity = decode_cache_capacity(cache.len() + plan.seq_len, capacity);
     let num_query_heads = config.num_query_heads;
     let num_kv_heads = config.num_key_value_heads;
     let head_dim = config.head_dim;
@@ -749,15 +755,18 @@ pub fn attention_decode_cache<B: PortableBackend + 'static>(
             let v_cache =
                 cache_values.dynamic_update_slice(&new_v_cache, &update_starts, sizes);
 
-            let k_grouped = k_cache
-                .reshape(vec![num_kv_heads, 1, capacity, kv_head_dim])
-                .broadcast_to(vec![num_kv_heads, kv_group_size, capacity, kv_head_dim])
-                .reshape(vec![num_query_heads, capacity, kv_head_dim]);
+            let k_cache_prefix = k_cache.slice(vec![0, 0, 0], vec![num_kv_heads, effective_capacity, kv_head_dim]);
+            let v_cache_prefix = v_cache.slice(vec![0, 0, 0], vec![num_kv_heads, effective_capacity, kv_head_dim]);
 
-            let v_grouped = v_cache
-                .reshape(vec![num_kv_heads, 1, capacity, kv_head_dim])
-                .broadcast_to(vec![num_kv_heads, kv_group_size, capacity, kv_head_dim])
-                .reshape(vec![num_query_heads, capacity, kv_head_dim]);
+            let k_grouped = k_cache_prefix
+                .reshape(vec![num_kv_heads, 1, effective_capacity, kv_head_dim])
+                .broadcast_to(vec![num_kv_heads, kv_group_size, effective_capacity, kv_head_dim])
+                .reshape(vec![num_query_heads, effective_capacity, kv_head_dim]);
+
+            let v_grouped = v_cache_prefix
+                .reshape(vec![num_kv_heads, 1, effective_capacity, kv_head_dim])
+                .broadcast_to(vec![num_kv_heads, kv_group_size, effective_capacity, kv_head_dim])
+                .reshape(vec![num_query_heads, effective_capacity, kv_head_dim]);
 
             let scores = q_heads_new.dot_general(
                 &k_grouped,
@@ -765,30 +774,31 @@ pub fn attention_decode_cache<B: PortableBackend + 'static>(
                 &DotAttrs::default(),
             );
 
-            let scale_shape = vec![num_query_heads, plan.seq_len, capacity];
+            let scale_shape = vec![num_query_heads, plan.seq_len, effective_capacity];
             let scale =
                 scalar_broadcast(&session, 1.0f32 / (head_dim as f32).sqrt(), &scale_shape);
             let scaled_scores = scores * scale;
 
-            let positions = session.iota(vec![capacity], 0, DType::Si32);
+            let positions = session.iota(vec![effective_capacity], 0, DType::Si32);
             let query_pos = positions.dynamic_slice(&query_start, vec![1]);
-            let query_pos = query_pos.broadcast_to(vec![capacity]);
+            let query_pos = query_pos.broadcast_to(vec![effective_capacity]);
             let allowed = query_pos.greater_equal(&positions);
-            let zero = scalar_broadcast(&session, 0.0, &[capacity]);
-            let neg_large = scalar_broadcast(&session, -1e9, &[capacity]);
+            let zero = scalar_broadcast(&session, 0.0, &[effective_capacity]);
+            let neg_large = scalar_broadcast(&session, -1e9, &[effective_capacity]);
             let base_mask = ptir::Tensor::select(&allowed, &zero, &neg_large);
-            let mask_2d = base_mask.broadcast_to(vec![plan.seq_len, capacity]);
-            let mask = mask_2d.broadcast_to(vec![num_query_heads, plan.seq_len, capacity]);
+            let mask_2d = base_mask.broadcast_to(vec![plan.seq_len, effective_capacity]);
+            let mask = mask_2d.broadcast_to(vec![num_query_heads, plan.seq_len, effective_capacity]);
 
             let masked_scores = scaled_scores + mask;
             let max_scores = masked_scores.reduce_max(vec![2], true);
             let stabilized = masked_scores
-                - max_scores.broadcast_to(vec![num_query_heads, plan.seq_len, capacity]);
+                - max_scores.broadcast_to(vec![num_query_heads, plan.seq_len, effective_capacity]);
 
             let exp_scores = stabilized.exp();
             let sum_scores = exp_scores.reduce_sum(vec![2], true);
             let softmax =
-                exp_scores / sum_scores.broadcast_to(vec![num_query_heads, plan.seq_len, capacity]);
+                exp_scores
+                    / sum_scores.broadcast_to(vec![num_query_heads, plan.seq_len, effective_capacity]);
 
             let context = softmax.dot_general(
                 &v_grouped,

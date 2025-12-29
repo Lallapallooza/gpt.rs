@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use gpt_rs::backend::conversion::{
     AliasKind, BufferKey, ConversionError, ConversionResult, FunctionBufferPlan,
@@ -182,35 +182,79 @@ pub(super) fn build_value_infos(
         }
     }
 
-    for (key, info) in value_infos.clone() {
-        if info.storage == ValueStorage::Alias {
-            let buffer = plan
-                .values
-                .get(&BufferKey {
-                    value: key.value,
-                    path: key.path.clone(),
-                })
-                .and_then(|index| plan.buffers.get(*index))
-                .ok_or_else(|| ConversionError::new("missing alias buffer spec"))?;
-            let alias_of = buffer
-                .alias_of
-                .clone()
-                .ok_or_else(|| ConversionError::new("alias buffer missing source"))?;
-            let alias_key = ValueKey::new(alias_of.value, alias_of.path);
-            let (alias_var, alias_len) = {
-                let alias_info = value_infos
-                    .get(&alias_key)
-                    .ok_or_else(|| ConversionError::new("alias source missing value info"))?;
-                (alias_info.var.clone(), alias_info.byte_len)
-            };
-            if let Some(entry) = value_infos.get_mut(&key) {
-                entry.var = alias_var;
-                entry.byte_len = alias_len;
-            }
+    let mut keys: Vec<ValueKey> = value_infos.keys().cloned().collect();
+    keys.sort_by(|a, b| match a.value.0.cmp(&b.value.0) {
+        std::cmp::Ordering::Equal => a.path.cmp(&b.path),
+        other => other,
+    });
+
+    let mut alias_memo: HashMap<ValueKey, (String, usize)> = HashMap::new();
+    let mut alias_visiting: HashSet<ValueKey> = HashSet::new();
+    for key in &keys {
+        let is_alias = value_infos
+            .get(key)
+            .map(|info| info.storage == ValueStorage::Alias)
+            .unwrap_or(false);
+        if !is_alias {
+            continue;
+        }
+        let (resolved_var, resolved_len) = resolve_alias_value_info(
+            key,
+            &value_infos,
+            plan,
+            &mut alias_memo,
+            &mut alias_visiting,
+        )?;
+        if let Some(entry) = value_infos.get_mut(key) {
+            entry.var = resolved_var;
+            entry.byte_len = resolved_len;
         }
     }
 
     Ok((value_infos, const_literals))
+}
+
+fn resolve_alias_value_info(
+    key: &ValueKey,
+    value_infos: &HashMap<ValueKey, ValueInfo>,
+    plan: &FunctionBufferPlan,
+    memo: &mut HashMap<ValueKey, (String, usize)>,
+    visiting: &mut HashSet<ValueKey>,
+) -> ConversionResult<(String, usize)> {
+    if let Some(found) = memo.get(key) {
+        return Ok(found.clone());
+    }
+    if !visiting.insert(key.clone()) {
+        return Err(ConversionError::new("alias buffer cycle detected"));
+    }
+
+    let info = value_infos
+        .get(key)
+        .ok_or_else(|| ConversionError::new("alias source missing value info"))?;
+    if info.storage != ValueStorage::Alias {
+        let resolved = (info.var.clone(), info.byte_len);
+        memo.insert(key.clone(), resolved.clone());
+        let _ = visiting.remove(key);
+        return Ok(resolved);
+    }
+
+    let buffer = plan
+        .values
+        .get(&BufferKey {
+            value: key.value,
+            path: key.path.clone(),
+        })
+        .and_then(|index| plan.buffers.get(*index))
+        .ok_or_else(|| ConversionError::new("missing alias buffer spec"))?;
+    let alias_of = buffer
+        .alias_of
+        .clone()
+        .ok_or_else(|| ConversionError::new("alias buffer missing source"))?;
+    let alias_key = ValueKey::new(alias_of.value, alias_of.path);
+    let resolved = resolve_alias_value_info(&alias_key, value_infos, plan, memo, visiting)?;
+    memo.insert(key.clone(), resolved.clone());
+    let _ = visiting.remove(key);
+    Ok(resolved)
 }
 pub(super) fn tensor_spec_of(ty: &ValueType) -> ConversionResult<TensorSpec> {
     match ty {

@@ -18,3 +18,4 @@ serde_json = { workspace = true }
 
 [features]
 conversion-c = ["dep:gpt-rs-backend-c", "gpt-rs-backend-c/conversion-c"]
+profiler = ["gpt-rs/profiler"]

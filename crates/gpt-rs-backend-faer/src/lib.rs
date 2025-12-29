@@ -974,12 +974,23 @@ impl PortableBackend for FaerPortableBackend {
 
             let instruction = &function.body[idx];
             let mut inputs = Vec::with_capacity(instruction.operands.len());
-            for operand in &instruction.operands {
+            for (operand_idx, operand) in instruction.operands.iter().enumerate() {
                 let tensor = match operand {
-                    Operand::Value(id) => values
-                        .get(id)
-                        .cloned()
-                        .ok_or_else(|| BackendError::execution("operand value missing"))?,
+                    Operand::Value(id) => {
+                        if matches!(&instruction.op, Operation::DynamicUpdateSlice(_))
+                            && operand_idx == 0
+                            && matches!(use_counts.get(id), Some(&1))
+                        {
+                            values
+                                .remove(id)
+                                .ok_or_else(|| BackendError::execution("operand value missing"))?
+                        } else {
+                            values
+                                .get(id)
+                                .cloned()
+                                .ok_or_else(|| BackendError::execution("operand value missing"))?
+                        }
+                    }
                     Operand::TupleElement { .. } => {
                         return Err(BackendError::execution("tuple operands not supported"))
                     }
@@ -988,18 +999,66 @@ impl PortableBackend for FaerPortableBackend {
                 inputs.push(tensor);
             }
 
-            let mut outputs = self.inner.execute_instruction(instruction, &inputs)?;
-            if outputs.len() != 1 {
-                return Err(BackendError::execution(
-                    "instructions must produce exactly one result",
-                ));
-            }
-            values.insert(
-                instruction.id,
-                outputs
-                    .pop()
-                    .expect("single output guaranteed by length check"),
-            );
+            let output = match &instruction.op {
+                Operation::DynamicUpdateSlice(spec) => {
+                    let output_spec = match &instruction.output {
+                        ValueType::Tensor(spec) => spec,
+                        ValueType::Tuple(_) => {
+                            return Err(BackendError::execution(
+                                "tuple outputs are not supported in faer backend",
+                            ))
+                        }
+                    };
+
+                    if inputs.len() != 3 {
+                        return Err(BackendError::execution(
+                            "dynamic_update_slice expects (base, update, starts)",
+                        ));
+                    }
+
+                    let mut inputs = inputs;
+                    let mut base = inputs.remove(0);
+                    let update = &inputs[0];
+                    let starts = &inputs[1];
+
+                    if dynamic_update_slice_inplace_fast(
+                        &mut base,
+                        update,
+                        starts,
+                        output_spec,
+                        spec,
+                    )? {
+                        base
+                    } else {
+                        let mut full_inputs = Vec::with_capacity(3);
+                        full_inputs.push(base);
+                        full_inputs.extend(inputs);
+                        let mut outputs =
+                            self.inner.execute_instruction(instruction, &full_inputs)?;
+                        if outputs.len() != 1 {
+                            return Err(BackendError::execution(
+                                "instructions must produce exactly one result",
+                            ));
+                        }
+                        outputs
+                            .pop()
+                            .expect("single output guaranteed by length check")
+                    }
+                }
+                _ => {
+                    let mut outputs = self.inner.execute_instruction(instruction, &inputs)?;
+                    if outputs.len() != 1 {
+                        return Err(BackendError::execution(
+                            "instructions must produce exactly one result",
+                        ));
+                    }
+                    outputs
+                        .pop()
+                        .expect("single output guaranteed by length check")
+                }
+            };
+
+            values.insert(instruction.id, output);
             idx += 1;
         }
 
@@ -1012,6 +1071,106 @@ impl PortableBackend for FaerPortableBackend {
             results.push(value);
         }
         Ok(results)
+    }
+}
+
+fn dynamic_update_slice_inplace_fast(
+    base: &mut CpuTensor,
+    update: &CpuTensor,
+    starts_tensor: &CpuTensor,
+    output: &TensorSpec,
+    spec: &gpt_rs::backend::spec::DynamicUpdateSliceSpec,
+) -> BackendResult<bool> {
+    let base_dims = static_dims(&base.spec.shape)?;
+    let update_dims = static_dims(&update.spec.shape)?;
+
+    if base_dims.len() != spec.sizes.len() {
+        return Ok(false);
+    }
+    if update_dims != spec.sizes {
+        return Ok(false);
+    }
+    if base.spec.dtype != update.spec.dtype {
+        return Ok(false);
+    }
+
+    let starts_vals = match &starts_tensor.data {
+        TensorData::Si32(values) => values.as_ref(),
+        _ => return Ok(false),
+    };
+    let starts_dims = static_dims(&starts_tensor.spec.shape)?;
+    if starts_dims.len() != 1 || starts_dims[0] != base_dims.len() {
+        return Ok(false);
+    }
+
+    let mut clamped_starts = Vec::with_capacity(base_dims.len());
+    for axis in 0..base_dims.len() {
+        let dim = base_dims[axis];
+        let size = spec.sizes[axis];
+        if size > dim {
+            return Ok(false);
+        }
+        let max_start = dim - size;
+        let mut start = starts_vals[axis] as isize;
+        if start < 0 {
+            start = 0;
+        }
+        let start = start as usize;
+        clamped_starts.push(if start > max_start { max_start } else { start });
+    }
+
+    if &base.spec != output {
+        return Ok(false);
+    }
+
+    if base_dims.len() != 3
+        || update_dims.len() != 3
+        || update_dims[0] != base_dims[0]
+        || update_dims[2] != base_dims[2]
+        || clamped_starts[0] != 0
+        || clamped_starts[2] != 0
+    {
+        return Ok(false);
+    }
+
+    let heads = base_dims[0];
+    let base_seq = base_dims[1];
+    let head_dim = base_dims[2];
+    let update_seq = update_dims[1];
+    let start_seq = clamped_starts[1];
+
+    match (&mut base.data, &update.data) {
+        (TensorData::F32(base_vals), TensorData::F32(update_vals)) => {
+            let base_slice = Arc::make_mut(base_vals);
+            let update_slice = update_vals.as_ref();
+            for head in 0..heads {
+                let dst_head_base = head * base_seq * head_dim;
+                let src_head_base = head * update_seq * head_dim;
+                for t in 0..update_seq {
+                    let dst_offset = dst_head_base + (start_seq + t) * head_dim;
+                    let src_offset = src_head_base + t * head_dim;
+                    base_slice[dst_offset..dst_offset + head_dim]
+                        .copy_from_slice(&update_slice[src_offset..src_offset + head_dim]);
+                }
+            }
+            Ok(true)
+        }
+        (TensorData::Si32(base_vals), TensorData::Si32(update_vals)) => {
+            let base_slice = Arc::make_mut(base_vals);
+            let update_slice = update_vals.as_ref();
+            for head in 0..heads {
+                let dst_head_base = head * base_seq * head_dim;
+                let src_head_base = head * update_seq * head_dim;
+                for t in 0..update_seq {
+                    let dst_offset = dst_head_base + (start_seq + t) * head_dim;
+                    let src_offset = src_head_base + t * head_dim;
+                    base_slice[dst_offset..dst_offset + head_dim]
+                        .copy_from_slice(&update_slice[src_offset..src_offset + head_dim]);
+                }
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
     }
 }
 

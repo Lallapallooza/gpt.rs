@@ -193,13 +193,15 @@ impl PortableBackend for CBackend {
         let options = ConversionOptions::default();
         let key = ConversionCacheKey::new(program, target.as_ref(), &options, None)
             .map_err(|err| BackendError::execution(err.to_string()))?;
-        let converted = self
-            .cache
-            .get_or_convert(key.clone(), || {
-                target.check(program, &options)?;
-                target.convert(program, &options)
-            })
-            .map_err(|err| BackendError::execution(err.to_string()))?;
+        let converted = {
+            let _convert_scope = gpt_rs::profiling::compile_scope("c_backend.convert");
+            self.cache
+                .get_or_convert(key.clone(), || {
+                    target.check(program, &options)?;
+                    target.convert(program, &options)
+                })
+                .map_err(|err| BackendError::execution(err.to_string()))?
+        };
 
         let entrypoint = converted
             .entrypoints
@@ -502,6 +504,14 @@ impl CBackend {
         entrypoint: &str,
     ) -> BackendResult<Arc<CompiledModule>> {
         let fingerprint = cache_fingerprint(key, converted);
+        if c_cache_debug_enabled() {
+            let key_hash = cache_key_hash(key);
+            let module_hash = fnv1a_hash(converted.module.as_bytes());
+            eprintln!(
+                "gpt-rs-backend-c: cache fingerprint={fingerprint:016x} key_hash={key_hash:016x} program_hash={program_hash:016x} module_hash={module_hash:016x} entrypoint={entrypoint}",
+                program_hash = key.program_hash,
+            );
+        }
         if let Some(found) = self
             .compiled
             .lock()
@@ -509,8 +519,11 @@ impl CBackend {
             .get(&fingerprint)
             .cloned()
         {
+            gpt_rs::profiling::cache_event("c_backend.module_hit_mem");
             return Ok(found);
         }
+
+        gpt_rs::profiling::cache_event("c_backend.module_miss_mem");
 
         let gate = {
             let mut guard = self
@@ -530,6 +543,7 @@ impl CBackend {
             .get(&fingerprint)
             .cloned()
         {
+            gpt_rs::profiling::cache_event("c_backend.module_hit_mem");
             return Ok(found);
         }
 
@@ -542,11 +556,16 @@ impl CBackend {
         let lib_path = cache_dir.join(format!("libgpt_rs_c_{fingerprint:016x}{ext}"));
 
         if !lib_path.exists() {
+            gpt_rs::profiling::cache_event("c_backend.module_miss_disk");
             std::fs::write(&src_path, &converted.module)
                 .map_err(|err| BackendError::execution(err.to_string()))?;
+            let _compile_scope = gpt_rs::profiling::compile_scope("c_backend.compile");
             compile_c(&src_path, &lib_path)?;
+        } else {
+            gpt_rs::profiling::cache_event("c_backend.module_hit_disk");
         }
 
+        let _load_scope = gpt_rs::profiling::compile_scope("c_backend.dlopen");
         let lib = match unsafe { Library::new(&lib_path) } {
             Ok(lib) => lib,
             Err(_err) => {
@@ -555,6 +574,7 @@ impl CBackend {
                 let _ = std::fs::remove_file(&lib_path);
                 std::fs::write(&src_path, &converted.module)
                     .map_err(|err| BackendError::execution(err.to_string()))?;
+                let _compile_scope = gpt_rs::profiling::compile_scope("c_backend.compile");
                 compile_c(&src_path, &lib_path)?;
                 unsafe { Library::new(&lib_path) }
                     .map_err(|err| BackendError::execution(err.to_string()))?
@@ -750,6 +770,13 @@ fn c_profile_enabled() -> bool {
     }
 }
 
+fn c_cache_debug_enabled() -> bool {
+    match std::env::var("GPTRS_C_CACHE_DEBUG") {
+        Ok(value) if !value.trim().is_empty() => parse_bool(&value),
+        _ => false,
+    }
+}
+
 fn c_cache_dir() -> PathBuf {
     match std::env::var("GPTRS_C_CACHE_DIR") {
         Ok(value) if !value.trim().is_empty() => PathBuf::from(value.trim()),
@@ -762,6 +789,24 @@ fn cache_fingerprint(key: &ConversionCacheKey, converted: &ConvertedIr) -> u64 {
     key.hash(&mut hasher);
     converted.module.hash(&mut hasher);
     hasher.finish()
+}
+
+fn cache_key_hash(key: &ConversionCacheKey) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn fnv1a_hash(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+
+    let mut hash = OFFSET;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 fn lib_ext() -> &'static str {

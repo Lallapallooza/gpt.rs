@@ -104,7 +104,10 @@ Models:
 
 Platforms:
 - [ ] Windows
-- [ ] MacOS
+- [ ] MacOS (partially works)
+
+Misc
+- [ ] WebUI
 
 ## Repository layout
 

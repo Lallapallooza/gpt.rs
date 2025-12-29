@@ -6,7 +6,6 @@ pub mod backend;
 pub mod checkpoint;
 pub mod inference;
 pub mod io;
-pub mod layout;
 pub mod model;
 pub mod module;
 pub mod nn;

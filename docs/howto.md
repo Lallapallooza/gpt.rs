@@ -130,5 +130,3 @@ Why this is low-friction:
 - Layout conversion is just `transpose(...)` in the same lazy graph, so backends can:
   - fuse/absorb transposes into kernels via optimizer passes, or
   - execute them as explicit ops when needed.
-- Backends can declare a preference via `PortableBackend::preferred_layout_4d()` (default: NHWC),
-  which makes it possible to standardize on a layout per backend while keeping model code simple.

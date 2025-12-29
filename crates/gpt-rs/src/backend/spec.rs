@@ -1188,13 +1188,6 @@ pub trait PortableBackend: Send + Sync {
     /// Returns a human-readable backend identifier (e.g., `"cpu"`, `"cuda"`).
     fn backend_name(&self) -> &str;
 
-    /// Returns the preferred layout for 4D activation tensors.
-    ///
-    /// The default matches the current portable convolution/pooling lowerings.
-    fn preferred_layout_4d(&self) -> crate::layout::Layout4D {
-        crate::layout::Layout4D::NHWC
-    }
-
     /// Returns optional backend hooks that extend the default optimizer pipeline.
     ///
     /// Backends should install legalization/fusion passes here without leaking backend-specific

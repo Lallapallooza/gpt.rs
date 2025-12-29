@@ -858,16 +858,6 @@ fn compile_c(src: &Path, out: &Path) -> BackendResult<()> {
         cmd.arg("-lm");
     }
 
-    if let Some((runtime_dir, runtime_name)) = runtime_library() {
-        cmd.arg("-L")
-            .arg(&runtime_dir)
-            .arg(format!("-l{runtime_name}"));
-        if !cfg!(target_os = "windows") {
-            let runtime_path = runtime_dir.display();
-            cmd.arg(format!("-Wl,-rpath,{runtime_path}"));
-        }
-    }
-
     let output = cmd
         .output()
         .map_err(|err| BackendError::execution(err.to_string()))?;
@@ -889,42 +879,4 @@ fn compile_c(src: &Path, out: &Path) -> BackendResult<()> {
             }
         }
     }
-}
-
-fn runtime_library() -> Option<(PathBuf, String)> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = manifest_dir.join("../../target");
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    let candidate = target_dir.join(profile).join(runtime_lib_filename());
-    if candidate.exists() {
-        let dir = candidate.parent()?.to_path_buf();
-        let name = lib_name_from_path(&candidate)?;
-        return Some((dir, name));
-    }
-
-    None
-}
-
-fn runtime_lib_filename() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "libgpt_rs_c_runtime.dylib"
-    } else if cfg!(target_os = "windows") {
-        "gpt_rs_c_runtime.dll"
-    } else {
-        "libgpt_rs_c_runtime.so"
-    }
-}
-
-fn lib_name_from_path(path: &Path) -> Option<String> {
-    let file = path.file_name()?.to_string_lossy();
-    let name = file
-        .trim_start_matches("lib")
-        .trim_end_matches(".so")
-        .trim_end_matches(".dylib")
-        .trim_end_matches(".dll");
-    Some(name.to_string())
 }

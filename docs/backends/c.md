@@ -76,8 +76,3 @@ The C backend is feature-gated in runners:
 
 - Compiler selection:
   - `CC=clang` (defaults to `cc`)
-
-Notes:
-- The backend optionally links against `gpt-rs-c-runtime` if the shared library is present under
-  `target/{debug|release}/` (see `runtime_library()` in
-  [../../crates/gpt-rs-backend-c/src/lib.rs](../../crates/gpt-rs-backend-c/src/lib.rs)).

@@ -42,80 +42,72 @@ pub trait DeviceTensorOps<B: PortableBackend + 'static>: Sized {
 impl<B: PortableBackend + 'static> DeviceTensorOps<B> for DeviceTensor<B> {
     fn add(&self, rhs: &Self) -> Result<Self> {
         ensure_same_backend("add", self, rhs)?;
-        let requires_grad = self.requires_grad_flag() || rhs.requires_grad_flag();
         capture_ptir!({ lhs = self, rhs }, |_session| {
             let result = lhs.try_add(&rhs)?;
             Ok(result.id())
         })?
-        .into_device_tensor(requires_grad)
+        .into_device_tensor()
     }
 
     fn sub(&self, rhs: &Self) -> Result<Self> {
         ensure_same_backend("sub", self, rhs)?;
-        let requires_grad = self.requires_grad_flag() || rhs.requires_grad_flag();
         capture_ptir!({ lhs = self, rhs }, |_session| {
             let result = lhs.try_sub(&rhs)?;
             Ok(result.id())
         })?
-        .into_device_tensor(requires_grad)
+        .into_device_tensor()
     }
 
     fn mul(&self, rhs: &Self) -> Result<Self> {
         ensure_same_backend("mul", self, rhs)?;
-        let requires_grad = self.requires_grad_flag() || rhs.requires_grad_flag();
         capture_ptir!({ lhs = self, rhs }, |_session| {
             let result = lhs.try_mul(&rhs)?;
             Ok(result.id())
         })?
-        .into_device_tensor(requires_grad)
+        .into_device_tensor()
     }
 
     fn div(&self, rhs: &Self) -> Result<Self> {
         ensure_same_backend("div", self, rhs)?;
-        let requires_grad = self.requires_grad_flag() || rhs.requires_grad_flag();
         capture_ptir!({ lhs = self, rhs }, |_session| {
             let result = lhs.try_div(&rhs)?;
             Ok(result.id())
         })?
-        .into_device_tensor(requires_grad)
+        .into_device_tensor()
     }
 
     fn maximum(&self, rhs: &Self) -> Result<Self> {
         ensure_same_backend("maximum", self, rhs)?;
-        let requires_grad = self.requires_grad_flag() || rhs.requires_grad_flag();
         capture_ptir!({ lhs = self, rhs }, |_session| {
             let result = lhs.try_maximum(&rhs)?;
             Ok(result.id())
         })?
-        .into_device_tensor(requires_grad)
+        .into_device_tensor()
     }
 
     fn minimum(&self, rhs: &Self) -> Result<Self> {
         ensure_same_backend("minimum", self, rhs)?;
-        let requires_grad = self.requires_grad_flag() || rhs.requires_grad_flag();
         capture_ptir!({ lhs = self, rhs }, |_session| {
             let result = lhs.try_minimum(&rhs)?;
             Ok(result.id())
         })?
-        .into_device_tensor(requires_grad)
+        .into_device_tensor()
     }
 
     fn neg(&self) -> Result<Self> {
-        let requires_grad = self.requires_grad_flag();
         capture_ptir!({ input = self }, |_session| {
             let result = input.try_neg()?;
             Ok(result.id())
         })?
-        .into_device_tensor(requires_grad)
+        .into_device_tensor()
     }
 
     fn abs(&self) -> Result<Self> {
-        let requires_grad = self.requires_grad_flag();
         capture_ptir!({ input = self }, |_session| {
             let result = input.try_abs()?;
             Ok(result.id())
         })?
-        .into_device_tensor(requires_grad)
+        .into_device_tensor()
     }
 
     fn clamp(&self, min: Option<&Self>, max: Option<&Self>) -> Result<Self> {
@@ -310,13 +302,6 @@ pub(crate) fn ensure_slice_within_bounds<B: PortableBackend + 'static>(
     Ok(())
 }
 
-/// Returns true when any tensor in the slice participates in autograd.
-pub(crate) fn tensors_require_grad<B: PortableBackend + 'static>(
-    tensors: &[&DeviceTensor<B>],
-) -> bool {
-    tensors.iter().any(|tensor| tensor.requires_grad_flag())
-}
-
 fn capture_clamp<B: PortableBackend + 'static>(
     x: &DeviceTensor<B>,
     min: Option<&DeviceTensor<B>>,
@@ -328,14 +313,6 @@ fn capture_clamp<B: PortableBackend + 'static>(
     if let Some(max_tensor) = max {
         ensure_same_backend("clamp", x, max_tensor)?;
     }
-
-    let requires_grad = x.requires_grad_flag()
-        || min
-            .map(|tensor| tensor.requires_grad_flag())
-            .unwrap_or(false)
-        || max
-            .map(|tensor| tensor.requires_grad_flag())
-            .unwrap_or(false);
 
     let capture_result = match (min, max) {
         (Some(min_tensor), Some(max_tensor)) => {
@@ -356,29 +333,29 @@ fn capture_clamp<B: PortableBackend + 'static>(
         (None, None) => capture_ptir!({ x }, |_session| Ok(x.id())),
     };
 
-    capture_result.into_device_tensor(requires_grad)
+    capture_result.into_device_tensor()
 }
 
 pub trait CaptureIntoDeviceTensor<B: PortableBackend + 'static> {
-    fn into_device_tensor(self, requires_grad: bool) -> Result<DeviceTensor<B>>;
+    fn into_device_tensor(self) -> Result<DeviceTensor<B>>;
 }
 
 impl<B: PortableBackend + 'static> CaptureIntoDeviceTensor<B> for (Arc<GraphArena<B>>, ValueId) {
-    fn into_device_tensor(self, requires_grad: bool) -> Result<DeviceTensor<B>> {
+    fn into_device_tensor(self) -> Result<DeviceTensor<B>> {
         let spec = self
             .0
             .tensor_spec_for(self.1)
             .ok_or_else(|| anyhow!("value {:?} missing tensor spec", self.1))?;
         let dtype = frontend_dtype(spec.dtype)?;
         let shape = shape_from_spec(&spec)?;
-        DeviceTensor::from_lazy(self.0, shape, dtype, self.1, requires_grad)
+        DeviceTensor::from_lazy(self.0, shape, dtype, self.1)
     }
 }
 
 impl<B: PortableBackend + 'static> CaptureIntoDeviceTensor<B>
     for Result<(Arc<GraphArena<B>>, ValueId)>
 {
-    fn into_device_tensor(self, requires_grad: bool) -> Result<DeviceTensor<B>> {
-        self.and_then(|capture| capture.into_device_tensor(requires_grad))
+    fn into_device_tensor(self) -> Result<DeviceTensor<B>> {
+        self.and_then(|capture| capture.into_device_tensor())
     }
 }

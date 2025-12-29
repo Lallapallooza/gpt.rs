@@ -19,7 +19,6 @@ struct IndexEntry {
     base_id: u128,
     dims: Vec<u64>,
     dtype_tag: u32,
-    requires_grad: bool,
     offset_rel: u64,
     len: u64,
 }
@@ -52,7 +51,7 @@ fn build_index_bytes(entries: &[IndexEntry], data_start: u64) -> Result<Vec<u8>>
         }
 
         push_u32(&mut out, entry.dtype_tag);
-        out.push(entry.requires_grad as u8);
+        out.push(0u8);
         let offset = data_start
             .checked_add(entry.offset_rel)
             .ok_or_else(|| anyhow::anyhow!("checkpoint offset overflow"))?;
@@ -103,7 +102,6 @@ impl CheckpointSaver {
                 base_id,
                 dims,
                 dtype_tag: dtype.tag(),
-                requires_grad: tensor.requires_grad_flag(),
                 offset_rel: running_offset,
                 len,
             });

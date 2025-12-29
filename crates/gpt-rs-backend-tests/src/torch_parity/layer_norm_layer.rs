@@ -204,25 +204,6 @@ pub fn layer_norm_forward_with_state_matches_moments<B: PortableBackend + 'stati
     assert_close(&inv_std_vec, inv_std_host.data());
 }
 
-pub fn layer_norm_forward_propagates_requires_grad<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    let mut rng = seeded_rng(0x1234);
-    let batch = 2;
-    let embed_dim = 3;
-
-    let input = tensor_from_vec(&[batch, embed_dim], random_vec(&mut rng, batch * embed_dim))
-        .requires_grad(true);
-    let gamma = tensor_from_vec(&[embed_dim], random_vec(&mut rng, embed_dim)).requires_grad(true);
-    let beta = tensor_from_vec(&[embed_dim], random_vec(&mut rng, embed_dim)).requires_grad(false);
-
-    timed_gpt(|| {
-        let layer = LayerNorm::new(Arc::clone(backend), gamma, beta, 1e-5).unwrap();
-        let input_device = DeviceTensor::from_host(Arc::clone(backend), input).unwrap();
-        let output = layer.forward(&input_device).unwrap();
-
-        assert!(output.requires_grad_flag());
-    });
-}
-
 pub fn layer_norm_matches_torch_embed_dim1<B: PortableBackend + 'static>(backend: &Arc<B>) {
     run_layer_norm_case(backend, 8, 1, 1e-5, 0xA11D, None);
 }

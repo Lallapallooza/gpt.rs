@@ -8,7 +8,7 @@ use gpt_rs_macros::{capture_ptir, ptir_pattern, support_runtime_overload};
 
 use crate::backend::spec::PortableBackend;
 use crate::ops::functional::common::{
-    ensure_dtype_equals, scalar_broadcast, tensors_require_grad, CaptureIntoDeviceTensor,
+    ensure_dtype_equals, scalar_broadcast, CaptureIntoDeviceTensor,
 };
 use crate::ops::ptir;
 use crate::tensor::{DType as TensorDType, DeviceTensor};
@@ -22,7 +22,6 @@ struct DropoutApplyPlan {
     output_shape: Vec<usize>,
     keep_prob: f32,
     drop_prob: f32,
-    requires_grad: bool,
 }
 
 /// Validates dropout inputs and derives reusable metadata.
@@ -52,7 +51,6 @@ fn validate_dropout<B: PortableBackend + 'static>(
         output_shape: x.shape().dims().to_vec(),
         keep_prob,
         drop_prob: p,
-        requires_grad: tensors_require_grad(&[x]),
     }))
 }
 
@@ -93,6 +91,6 @@ pub fn dropout<B: PortableBackend + 'static>(
             let output = input * scaled_mask;
             Ok(output.id())
         })?
-        .into_device_tensor(apply.requires_grad),
+        .into_device_tensor(),
     }
 }

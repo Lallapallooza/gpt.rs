@@ -65,7 +65,6 @@ impl<B: PortableBackend + 'static> AttentionCache<B> {
     }
 
     /// Returns the value tensor shaped as `[num_heads, seq_len, head_dim]`.
-    /// Like the key tensor, it preserves backend ownership and gradient tracking flags.
     pub fn values(&self) -> &DeviceTensor<B> {
         &self.values
     }
@@ -83,8 +82,8 @@ impl<B: PortableBackend + 'static> AttentionCache<B> {
     }
 
     /// Concatenates another cache along the sequence dimension, producing a new cache.
-    /// The resulting cache inherits the backend and gradient flags of the operands and validates
-    /// matching head counts and head dimensions before stitching storage together.
+    /// The resulting cache inherits the backend of the operands and validates matching head counts
+    /// and head dimensions before stitching storage together.
     pub fn concat(&self, other: &AttentionCache<B>) -> Result<AttentionCache<B>> {
         let backend = ensure_same_backend("attention cache concat", self.keys(), other.keys())?;
         ensure_same_backend(
@@ -181,12 +180,10 @@ pub struct DecodeAttentionComputation<B: PortableBackend + 'static> {
 struct AttentionPlan {
     seq_len: usize,
     cache_len: usize,
-    requires_grad: bool,
 }
 
 struct DecodeAttentionPlan {
     seq_len: usize,
-    requires_grad: bool,
 }
 
 fn decode_cache_capacity(required_len: usize, max_len: usize) -> usize {
@@ -289,11 +286,7 @@ fn validate_attention<B: PortableBackend + 'static>(
         None => 0,
     };
 
-    Ok(AttentionPlan {
-        seq_len,
-        cache_len,
-        requires_grad: qkv.requires_grad_flag(),
-    })
+    Ok(AttentionPlan { seq_len, cache_len })
 }
 
 fn validate_decode_attention<B: PortableBackend + 'static>(
@@ -318,10 +311,7 @@ fn validate_decode_attention<B: PortableBackend + 'static>(
     );
     validate_decode_starts(update_starts, query_start)?;
 
-    Ok(DecodeAttentionPlan {
-        seq_len,
-        requires_grad: qkv.requires_grad_flag(),
-    })
+    Ok(DecodeAttentionPlan { seq_len })
 }
 
 /// Helper that returns the most recent `seq_len` elements from a cache-aware tensor slice.
@@ -552,23 +542,9 @@ pub fn attention<B: PortableBackend + 'static>(
         captured
     };
 
-    let context_total = (Arc::clone(&graph), context_id)
-        .into_device_tensor(false)?
-        .requires_grad(plan.requires_grad);
-    let combined_keys = (Arc::clone(&graph), keys_id)
-        .into_device_tensor(false)?
-        .requires_grad(plan.requires_grad);
-    let combined_values = (graph, values_id)
-        .into_device_tensor(false)?
-        .requires_grad(plan.requires_grad);
-
-    let existing_requires_grad = cache
-        .map(|c| c.keys().requires_grad_flag() || c.values().requires_grad_flag())
-        .unwrap_or(false);
-
-    let combined_keys = combined_keys.requires_grad(plan.requires_grad || existing_requires_grad);
-    let combined_values =
-        combined_values.requires_grad(plan.requires_grad || existing_requires_grad);
+    let context_total = (Arc::clone(&graph), context_id).into_device_tensor()?;
+    let combined_keys = (Arc::clone(&graph), keys_id).into_device_tensor()?;
+    let combined_values = (graph, values_id).into_device_tensor()?;
 
     let present_keys = recent_window(backend, &combined_keys, 1, plan.cache_len, plan.seq_len)?;
     let present_values = recent_window(backend, &combined_values, 1, plan.cache_len, plan.seq_len)?;
@@ -600,12 +576,11 @@ pub fn concat_along_axis<B: PortableBackend + 'static>(
     ensure_axis_in_bounds("concat", lhs, axis)?;
     ensure_dims_match_except_axis("concat lhs", lhs, "rhs", rhs, axis)?;
 
-    let requires_grad = lhs.requires_grad_flag() || rhs.requires_grad_flag();
     capture_ptir!({ lhs, rhs }, |_session| {
         let concatenated = ptir::Tensor::concat(axis, &[lhs, rhs]);
         Ok(concatenated.id())
     })?
-    .into_device_tensor(requires_grad)
+    .into_device_tensor()
 }
 
 /// Extracts a slice along a single axis while preserving other dimensions (cache utility).
@@ -632,7 +607,7 @@ pub fn slice_along_axis<B: PortableBackend + 'static>(
         let sliced = tensor.slice(starts_clone.clone(), sizes_clone.clone());
         Ok(sliced.id())
     })?
-    .into_device_tensor(tensor.requires_grad_flag())
+    .into_device_tensor()
 }
 
 /// Helper that updates `base` with `update` using a dynamic start index tensor.
@@ -678,7 +653,6 @@ pub fn dynamic_update_slice_into<B: PortableBackend + 'static>(
         );
     }
 
-    let requires_grad = base.requires_grad_flag() || update.requires_grad_flag();
     let sizes = update_dims.to_vec();
 
     capture_ptir!({ base, update, starts }, |session| {
@@ -688,7 +662,7 @@ pub fn dynamic_update_slice_into<B: PortableBackend + 'static>(
         ctx.export(updated_id);
         Ok(updated_id)
     })?
-    .into_device_tensor(requires_grad)
+    .into_device_tensor()
 }
 
 /// Decode-only attention path that updates a fixed-capacity KV cache with `dynamic_update_slice`.
@@ -820,21 +794,9 @@ pub fn attention_decode_cache<B: PortableBackend + 'static>(
         }
     }?;
 
-    let output = (Arc::clone(&graph), context_id)
-        .into_device_tensor(false)?
-        .requires_grad(plan.requires_grad);
-    let combined_keys = (Arc::clone(&graph), keys_id)
-        .into_device_tensor(false)?
-        .requires_grad(plan.requires_grad);
-    let combined_values = (graph, values_id)
-        .into_device_tensor(false)?
-        .requires_grad(plan.requires_grad);
-
-    let existing_requires_grad =
-        cache.keys().requires_grad_flag() || cache.values().requires_grad_flag();
-    let combined_keys = combined_keys.requires_grad(plan.requires_grad || existing_requires_grad);
-    let combined_values =
-        combined_values.requires_grad(plan.requires_grad || existing_requires_grad);
+    let output = (Arc::clone(&graph), context_id).into_device_tensor()?;
+    let combined_keys = (Arc::clone(&graph), keys_id).into_device_tensor()?;
+    let combined_values = (graph, values_id).into_device_tensor()?;
 
     let new_len = cache.len() + plan.seq_len;
     let updated_cache = DecodeKvCache::new(combined_keys, combined_values, new_len)?;

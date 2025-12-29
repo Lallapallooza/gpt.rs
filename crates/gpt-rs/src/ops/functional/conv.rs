@@ -41,10 +41,6 @@ pub fn conv2d<B: PortableBackend + 'static>(
     let c_in_per_group = validated.c_in_per_group;
     let c_out_per_group = validated.c_out_per_group;
 
-    let requires_grad = x.requires_grad_flag()
-        || weight.requires_grad_flag()
-        || bias.map(|b| b.requires_grad_flag()).unwrap_or(false);
-
     let spec = ExtractPatchesSpec {
         window: vec![kernel_h, kernel_w],
         strides: vec![params.stride[0], params.stride[1]],
@@ -102,7 +98,7 @@ pub fn conv2d<B: PortableBackend + 'static>(
                 Ok(out.id())
             })?,
         }
-        .into_device_tensor(requires_grad)?;
+        .into_device_tensor()?;
 
         return Ok(result);
     }
@@ -187,7 +183,7 @@ pub fn conv2d<B: PortableBackend + 'static>(
             Ok(out.id())
         })?,
     }
-    .into_device_tensor(requires_grad)?;
+    .into_device_tensor()?;
 
     Ok(result)
 }

@@ -147,7 +147,6 @@ impl<B: PortableBackend + 'static> CacheKeyArg for DeviceTensor<B> {
     fn add_to_cache_key(&self, builder: &mut CacheKeyBuilder) {
         builder.combine_hash(self.shape().dims());
         builder.combine_hash(&self.dtype());
-        builder.combine_hash(&self.requires_grad_flag());
     }
 }
 

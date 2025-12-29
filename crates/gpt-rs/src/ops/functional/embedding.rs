@@ -15,10 +15,6 @@ use crate::ops::functional::common::{
 use crate::ops::graph::GraphArena;
 use crate::tensor::{DType as TensorDType, DeviceTensor};
 
-struct EmbeddingPlan {
-    requires_grad: bool,
-}
-
 /// Validates embedding tensors and records gather metadata/broadcasted shapes.
 ///
 /// Ensures the table is `[vocab, embed_dim]` and indices are rank-1 `[seq]` int32 tensors.
@@ -26,16 +22,14 @@ struct EmbeddingPlan {
 fn validate_embedding_lookup<B: PortableBackend + 'static>(
     weight: &DeviceTensor<B>,
     indices: &DeviceTensor<B>,
-) -> Result<EmbeddingPlan> {
+) -> Result<()> {
     ensure_rank("embedding weight", weight, 2)?;
     ensure_rank("embedding indices", indices, 1)?;
     ensure_dtype_equals("embedding indices", indices, TensorDType::I32)?;
 
     ensure_same_backend("embedding_lookup", weight, indices)?;
 
-    Ok(EmbeddingPlan {
-        requires_grad: weight.requires_grad_flag() || indices.requires_grad_flag(),
-    })
+    Ok(())
 }
 
 /// Fetches embedding vectors for integer indices by emitting a portable gather program.
@@ -47,7 +41,7 @@ pub fn embedding_lookup<B: PortableBackend + 'static>(
     weight: &DeviceTensor<B>,
     indices: &DeviceTensor<B>,
 ) -> Result<DeviceTensor<B>> {
-    let plan = validate_embedding_lookup(weight, indices)?;
+    validate_embedding_lookup(weight, indices)?;
     let captured = capture_ptir! {
         { weight, indices },
         |_session| {
@@ -56,7 +50,7 @@ pub fn embedding_lookup<B: PortableBackend + 'static>(
         }
     }?;
 
-    captured.into_device_tensor(plan.requires_grad)
+    captured.into_device_tensor()
 }
 
 /// Fetches embedding vectors with explicit graph arena control for optimization.
@@ -79,7 +73,7 @@ pub fn embedding_lookup_with_graph<B: PortableBackend + 'static>(
     indices: &DeviceTensor<B>,
     graph: Option<Arc<GraphArena<B>>>,
 ) -> Result<DeviceTensor<B>> {
-    let plan = validate_embedding_lookup(weight, indices)?;
+    validate_embedding_lookup(weight, indices)?;
     let captured = if let Some(graph) = graph {
         capture_ptir! {
             graph = Arc::clone(&graph);
@@ -99,5 +93,5 @@ pub fn embedding_lookup_with_graph<B: PortableBackend + 'static>(
         }?
     };
 
-    captured.into_device_tensor(plan.requires_grad)
+    captured.into_device_tensor()
 }

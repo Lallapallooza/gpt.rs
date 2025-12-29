@@ -32,7 +32,7 @@ pub fn reshape<B: PortableBackend + 'static>(
         let out = x.reshape(dims);
         Ok(out.id())
     })?
-    .into_device_tensor(x.requires_grad_flag())
+    .into_device_tensor()
 }
 
 /// Permutes tensor axes according to `perm`.
@@ -63,5 +63,5 @@ pub fn transpose<B: PortableBackend + 'static>(
         let out = x.transpose(perm);
         Ok(out.id())
     })?
-    .into_device_tensor(x.requires_grad_flag())
+    .into_device_tensor()
 }

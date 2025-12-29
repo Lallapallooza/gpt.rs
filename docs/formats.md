@@ -48,12 +48,13 @@ repeat tensor_count times:
   rank[u32]
   dims[rank * u64]
   dtype_tag[u32]
-  requires_grad[u8]
+  reserved[u8]
   offset_abs[u64]
   byte_len[u64]
 ```
 
 The Rust loader computes `BaseParamId` from the name (and validates `stored_base_id` if it is non-zero).
+`reserved` is a legacy byte that is ignored by current readers; writers emit `0`.
 
 ### `data_bytes`
 
@@ -89,7 +90,7 @@ repeat tensor_count times:
   rank[u32]
   dims[rank * u64]
   dtype_tag[u32]
-  requires_grad[u8]
+  reserved[u8]
   offset_abs[u64]
   byte_len[u64]
 ```

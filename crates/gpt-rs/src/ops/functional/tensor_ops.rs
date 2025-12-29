@@ -15,7 +15,6 @@ use crate::tensor::DeviceTensor;
 
 struct AddBiasPlan {
     output_shape: Vec<usize>,
-    requires_grad: bool,
 }
 
 /// Validates bias addition operands and captures broadcast metadata.
@@ -34,12 +33,10 @@ fn validate_add_bias<B: PortableBackend + 'static>(
     ensure_same_backend("add_bias", x, bias)?;
     Ok(AddBiasPlan {
         output_shape: x.shape().dims().to_vec(),
-        requires_grad: x.requires_grad_flag() || bias.requires_grad_flag(),
     })
 }
 
 /// Adds a bias vector to the last dimension of `x`, broadcasting as needed.
-/// Gradient tracking is preserved for both the activation tensor and the bias parameter.
 /// Steps: import operands, broadcast the bias across non-last axes, emit an elementwise add, and
 /// wrap the resulting value identifier into a lazy tensor.
 #[support_runtime_overload]
@@ -55,5 +52,5 @@ pub fn add_bias<B: PortableBackend + 'static>(
         let out = x + bias_broadcast;
         Ok(out.id())
     })?
-    .into_device_tensor(plan.requires_grad)
+    .into_device_tensor()
 }

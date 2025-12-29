@@ -18,7 +18,6 @@ pub struct CheckpointTensorEntry {
     pub base_id: BaseParamId,
     pub dims: Vec<usize>,
     pub dtype: DType,
-    pub requires_grad: bool,
     pub offset: u64,
     pub len: u64,
 }
@@ -82,7 +81,7 @@ impl CheckpointReader {
             let dtype_tag = read_u32(&mut index)?;
             let dtype = DType::from_tag(dtype_tag)
                 .ok_or_else(|| anyhow!("unknown dtype tag {} in checkpoint", dtype_tag))?;
-            let requires_grad = read_bool(&mut index)?;
+            let _reserved = read_bool(&mut index)?;
 
             let offset = read_u64(&mut index)?;
             let len = read_u64(&mut index)?;
@@ -108,7 +107,6 @@ impl CheckpointReader {
                 base_id,
                 dims,
                 dtype,
-                requires_grad,
                 offset,
                 len,
             };
@@ -198,7 +196,7 @@ impl CheckpointReader {
             }
         };
 
-        Ok(tensor.requires_grad(entry.requires_grad))
+        Ok(tensor)
     }
 }
 

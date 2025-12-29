@@ -187,7 +187,6 @@ pub fn load_model_with_namespace<B: PortableBackend + 'static>(
             key.0,
             spec.base_id,
             Arc::clone(&source_for_params),
-            spec.requires_grad,
         ))
     };
 

@@ -160,7 +160,6 @@ macro_rules! define_backend_tests {
             parity_test!(torch_attention_prefill4_decode3_grouped_kv2_matches_full_concat, attention::attention_prefill4_decode3_grouped_kv2_matches_full_concat);
             parity_test!(torch_linear_matches_torch_with_bias, linear::linear_matches_torch_with_bias);
             parity_test!(torch_linear_matches_torch_without_bias, linear::linear_matches_torch_without_bias);
-            parity_test!(torch_linear_forward_propagates_requires_grad, linear::linear_forward_propagates_requires_grad);
             parity_test!(torch_linear_matches_torch_batch1_in5_out3_bias, linear::linear_matches_torch_batch1_in5_out3_bias);
             parity_test!(torch_linear_matches_torch_batch64_in64_out64_bias, linear::linear_matches_torch_batch64_in64_out64_bias);
             parity_test!(torch_linear_matches_torch_batch7_in13_out17_bias, linear::linear_matches_torch_batch7_in13_out17_bias);
@@ -177,7 +176,6 @@ macro_rules! define_backend_tests {
             parity_test!(torch_feed_forward_state_records_activation_extreme_inputs, feed_forward_layer::feed_forward_state_records_activation_extreme_inputs);
             parity_test!(torch_layer_norm_matches_torch_basic, layer_norm_layer::layer_norm_matches_torch_basic);
             parity_test!(torch_layer_norm_forward_with_state_matches_moments, layer_norm_layer::layer_norm_forward_with_state_matches_moments);
-            parity_test!(torch_layer_norm_forward_propagates_requires_grad, layer_norm_layer::layer_norm_forward_propagates_requires_grad);
             parity_test!(torch_layer_norm_matches_torch_embed_dim1, layer_norm_layer::layer_norm_matches_torch_embed_dim1);
             parity_test!(torch_layer_norm_matches_torch_prime_embed, layer_norm_layer::layer_norm_matches_torch_prime_embed);
             parity_test!(torch_layer_norm_matches_torch_large_embed, layer_norm_layer::layer_norm_matches_torch_large_embed);
@@ -187,7 +185,6 @@ macro_rules! define_backend_tests {
             parity_test!(torch_layer_norm_state_constant_input_matches_moments, layer_norm_layer::layer_norm_state_constant_input_matches_moments);
             parity_test!(torch_embedding_matches_torch_basic, embedding_layer::embedding_matches_torch_basic);
             parity_test!(torch_embedding_supports_duplicate_indices, embedding_layer::embedding_supports_duplicate_indices);
-            parity_test!(torch_embedding_forward_preserves_requires_grad, embedding_layer::embedding_forward_preserves_requires_grad);
             parity_test!(torch_embedding_matches_torch_vocab64_embed32_seq16_rank1, embedding_layer::embedding_matches_torch_vocab64_embed32_seq16_rank1);
             parity_test!(torch_embedding_matches_torch_vocab32_embed8_seq5, embedding_layer::embedding_matches_torch_vocab32_embed8_seq5);
             parity_test!(torch_embedding_matches_torch_vocab32_embed128_seq8, embedding_layer::embedding_matches_torch_vocab32_embed128_seq8);

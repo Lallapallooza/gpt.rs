@@ -13,7 +13,6 @@ pub struct TensorArchiveEntry {
     pub name: String,
     pub dims: Vec<usize>,
     pub dtype: DType,
-    pub requires_grad: bool,
     pub offset: u64,
     pub len: u64,
 }
@@ -67,7 +66,7 @@ impl TensorArchiveReader {
             let dtype_tag = read_u32(&mut index)?;
             let dtype = DType::from_tag(dtype_tag)
                 .ok_or_else(|| anyhow!("unknown dtype tag {} in tensor archive", dtype_tag))?;
-            let requires_grad = read_bool(&mut index)?;
+            let _reserved = read_bool(&mut index)?;
 
             let offset = read_u64(&mut index)?;
             let len = read_u64(&mut index)?;
@@ -81,7 +80,6 @@ impl TensorArchiveReader {
                 name: name.clone(),
                 dims,
                 dtype,
-                requires_grad,
                 offset,
                 len,
             };
@@ -158,7 +156,7 @@ impl TensorArchiveReader {
             }
         };
 
-        Ok(tensor.requires_grad(entry.requires_grad))
+        Ok(tensor)
     }
 }
 
@@ -168,7 +166,6 @@ struct IndexEntry {
     name: String,
     dims: Vec<u64>,
     dtype_tag: u32,
-    requires_grad: bool,
     offset_rel: u64,
     len: u64,
 }
@@ -194,7 +191,7 @@ fn build_index_bytes(entries: &[IndexEntry], data_start: u64) -> Result<Vec<u8>>
             push_u64(&mut out, *dim);
         }
         push_u32(&mut out, entry.dtype_tag);
-        out.push(entry.requires_grad as u8);
+        out.push(0u8);
         let offset = data_start
             .checked_add(entry.offset_rel)
             .ok_or_else(|| anyhow!("tensor archive offset overflow"))?;
@@ -241,7 +238,6 @@ impl TensorArchive {
                 name: (*name).clone(),
                 dims,
                 dtype_tag: dtype.tag(),
-                requires_grad: tensor.requires_grad_flag(),
                 offset_rel: running_offset,
                 len,
             });

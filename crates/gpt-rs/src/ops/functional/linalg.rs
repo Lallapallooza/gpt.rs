@@ -16,7 +16,6 @@ use crate::tensor::DeviceTensor;
 struct MatmulPlan {
     dot_dims: DotDims,
     output_shape: Vec<usize>,
-    requires_grad: bool,
 }
 
 /// Validates shapes/dtypes for 2D and batched 3D matmul and derives the PTIR dot-general spec.
@@ -95,7 +94,6 @@ fn validate_matmul<B: PortableBackend + 'static>(
     Ok(MatmulPlan {
         dot_dims,
         output_shape: result_dims,
-        requires_grad: a.requires_grad_flag() || b.requires_grad_flag(),
     })
 }
 
@@ -120,7 +118,7 @@ pub fn matmul<B: PortableBackend + 'static>(
         let result = a.dot_general(&b, &plan.dot_dims, &DotAttrs::default());
         Ok::<ValueId, anyhow::Error>(result.id())
     })?
-    .into_device_tensor(plan.requires_grad)?;
+    .into_device_tensor()?;
 
     debug_assert_eq!(tensor.shape().dims(), plan.output_shape.as_slice());
     debug_assert_eq!(tensor.dtype(), a.dtype());

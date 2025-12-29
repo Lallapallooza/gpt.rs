@@ -110,29 +110,6 @@ pub fn embedding_supports_duplicate_indices<B: PortableBackend + 'static>(backen
     assert_close(&expected, output_host.data());
 }
 
-pub fn embedding_forward_preserves_requires_grad<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    let mut rng = seeded_rng(0xC0DE);
-    let vocab = 12;
-    let embed_dim = 4;
-
-    timed_gpt(|| {
-        let weight = tensor_from_vec(&[vocab, embed_dim], random_vec(&mut rng, vocab * embed_dim))
-            .requires_grad(true);
-        let device_weight = DeviceTensor::from_host(Arc::clone(backend), weight).unwrap();
-        let layer = Embedding::new(Arc::clone(backend), device_weight.clone()).unwrap();
-        let indices = [1usize, 3, 5];
-        let indices_tensor = Tensor::from_i32(
-            Shape::new([indices.len()]),
-            indices.iter().map(|&idx| idx as i32).collect(),
-        )
-        .unwrap();
-        let indices_device = DeviceTensor::from_host(Arc::clone(backend), indices_tensor).unwrap();
-        let output = layer.forward(&indices_device).unwrap();
-
-        assert!(output.requires_grad_flag());
-    });
-}
-
 pub fn embedding_matches_torch_vocab64_embed32_seq16_rank1<B: PortableBackend + 'static>(
     backend: &Arc<B>,
 ) {

@@ -46,7 +46,7 @@ pub fn max_pool2d<B: PortableBackend + 'static>(
         let out = x.reduce_window(spec);
         Ok(out.id())
     })?
-    .into_device_tensor(x.requires_grad_flag())
+    .into_device_tensor()
 }
 
 #[support_runtime_overload]
@@ -86,5 +86,5 @@ pub fn max_pool2d_nhwc<B: PortableBackend + 'static>(
         let out = x.reduce_window(spec);
         Ok(out.id())
     })?
-    .into_device_tensor(x.requires_grad_flag())
+    .into_device_tensor()
 }

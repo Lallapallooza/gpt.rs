@@ -1,7 +1,6 @@
 //! Normalization primitives including layer norm expressed through portable graphs.
 //!
-//! Results expose intermediate statistics so future gradient implementations can reuse them without
-//! recomputing reductions.
+//! Results expose intermediate statistics for reuse and debugging without recomputing reductions.
 
 use std::sync::Arc;
 
@@ -16,8 +15,6 @@ use crate::ops::functional::common::{
 use crate::tensor::{DType as TensorDType, DeviceTensor};
 
 /// Outputs produced by [`layer_norm`], including cached intermediates.
-/// Holding onto these tensors allows future gradient code to reuse mean and variance without
-/// recomputing reductions.
 pub struct LayerNormResult<B: PortableBackend + 'static> {
     pub output: DeviceTensor<B>,
     pub normalized: DeviceTensor<B>,
@@ -30,7 +27,6 @@ struct LayerNormPlan {
     feature_dim: usize,
     reduce_shape: Vec<usize>,
     input_shape: Vec<usize>,
-    requires_grad: bool,
 }
 
 /// Validates layer-norm tensors and prepares broadcast metadata reused during capture.
@@ -69,9 +65,6 @@ fn validate_layer_norm<B: PortableBackend + 'static>(
         feature_dim,
         reduce_shape,
         input_shape: x.shape().dims().to_vec(),
-        requires_grad: x.requires_grad_flag()
-            || gamma.requires_grad_flag()
-            || beta.requires_grad_flag(),
     })
 }
 
@@ -125,10 +118,10 @@ pub fn layer_norm<B: PortableBackend + 'static>(
         Ok((output.id(), normalized.id(), mean.id(), inv_std.id()))
     })?;
 
-    let output = (Arc::clone(&graph), output_id).into_device_tensor(plan.requires_grad)?;
-    let normalized = (Arc::clone(&graph), normalized_id).into_device_tensor(plan.requires_grad)?;
-    let mean = (Arc::clone(&graph), mean_id).into_device_tensor(plan.requires_grad)?;
-    let inv_std = (graph, inv_std_id).into_device_tensor(plan.requires_grad)?;
+    let output = (Arc::clone(&graph), output_id).into_device_tensor()?;
+    let normalized = (Arc::clone(&graph), normalized_id).into_device_tensor()?;
+    let mean = (Arc::clone(&graph), mean_id).into_device_tensor()?;
+    let inv_std = (graph, inv_std_id).into_device_tensor()?;
 
     Ok(LayerNormResult {
         output,

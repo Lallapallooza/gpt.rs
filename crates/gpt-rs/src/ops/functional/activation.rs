@@ -25,7 +25,7 @@ pub fn relu<B: PortableBackend + 'static>(
         let out = x.maximum(&zero);
         Ok(out.id())
     })?
-    .into_device_tensor(x.requires_grad_flag())
+    .into_device_tensor()
 }
 
 /// Applies ReLU6: `min(max(x, 0), 6)`.
@@ -46,7 +46,7 @@ pub fn relu6<B: PortableBackend + 'static>(
         let out = max0.minimum(&six);
         Ok(out.id())
     })?
-    .into_device_tensor(x.requires_grad_flag())
+    .into_device_tensor()
 }
 
 struct SoftmaxLastDimPlan {
@@ -85,7 +85,7 @@ pub fn softmax_last_dim<B: PortableBackend + 'static>(
         let sum = exp_values.reduce_sum([plan.axis], true);
         Ok((exp_values / sum.broadcast_like(&input)).id())
     })?
-    .into_device_tensor(x.requires_grad_flag())
+    .into_device_tensor()
 }
 
 /// Applies the exact GELU activation used in GPT models.
@@ -109,5 +109,5 @@ pub fn gelu<B: PortableBackend + 'static>(
         let out = half * one_plus;
         Ok(out.id())
     })?
-    .into_device_tensor(x.requires_grad_flag())
+    .into_device_tensor()
 }

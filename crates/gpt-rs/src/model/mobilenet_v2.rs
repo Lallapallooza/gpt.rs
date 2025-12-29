@@ -150,7 +150,7 @@ impl<B: PortableBackend + 'static> MobileNetV2<B> {
             let sum_hw = sum_h.reduce_sum(vec![2], true);
             Ok(sum_hw.div_scalar(denom).id())
         })?
-        .into_device_tensor(x.requires_grad_flag())?;
+        .into_device_tensor()?;
 
         let n = x.shape().dims()[0];
         let c = x.shape().dims()[3];

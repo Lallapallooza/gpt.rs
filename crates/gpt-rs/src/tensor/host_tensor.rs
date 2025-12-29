@@ -14,8 +14,6 @@ pub struct Tensor {
     shape: Shape,
     dtype: DType,
     data: Vec<u8>,
-    grad: Option<Vec<u8>>,
-    requires_grad: bool,
 }
 
 impl Tensor {
@@ -32,8 +30,6 @@ impl Tensor {
             shape,
             dtype: DType::F32,
             data: vec_into_bytes(data),
-            grad: None,
-            requires_grad: false,
         })
     }
 
@@ -50,8 +46,6 @@ impl Tensor {
             shape,
             dtype: DType::I32,
             data: vec_into_bytes(data),
-            grad: None,
-            requires_grad: false,
         })
     }
 
@@ -62,8 +56,6 @@ impl Tensor {
             shape,
             dtype: DType::F32,
             data: vec_into_bytes(vec![0.0; len]),
-            grad: None,
-            requires_grad: false,
         }
     }
 
@@ -74,8 +66,6 @@ impl Tensor {
             shape,
             dtype: DType::F32,
             data: vec_into_bytes(vec![1.0; len]),
-            grad: None,
-            requires_grad: false,
         }
     }
 
@@ -99,8 +89,6 @@ impl Tensor {
             shape,
             dtype: DType::F32,
             data: vec_into_bytes(values),
-            grad: None,
-            requires_grad: false,
         }
     }
 
@@ -145,47 +133,6 @@ impl Tensor {
         match self.dtype {
             DType::I32 => bytes_as_slice::<i32>(&self.data),
             _ => panic!("tensor data is not stored as i32"),
-        }
-    }
-
-    /// Toggles gradient tracking and allocates a gradient buffer when necessary.
-    pub fn requires_grad(mut self, flag: bool) -> Self {
-        self.requires_grad = flag;
-        if flag {
-            match self.dtype {
-                DType::F32 => {
-                    if self.grad.is_none() {
-                        self.grad = Some(vec_into_bytes(vec![0.0; self.len()]));
-                    }
-                }
-                _ => {
-                    self.grad = None;
-                }
-            }
-        } else {
-            self.grad = None;
-        }
-        self
-    }
-
-    /// Returns the current gradient tracking flag.
-    pub fn requires_grad_flag(&self) -> bool {
-        self.requires_grad
-    }
-
-    /// Borrows the gradient buffer as `f32` values when gradients are available.
-    pub fn grad(&self) -> Option<&[f32]> {
-        match (self.dtype, self.grad.as_ref()) {
-            (DType::F32, Some(bytes)) => Some(bytes_as_slice::<f32>(bytes)),
-            _ => None,
-        }
-    }
-
-    /// Mutably borrows the gradient buffer as `f32` values.
-    pub fn grad_mut(&mut self) -> Option<&mut [f32]> {
-        match (self.dtype, self.grad.as_mut()) {
-            (DType::F32, Some(bytes)) => Some(bytes_as_slice_mut::<f32>(bytes)),
-            _ => None,
         }
     }
 
@@ -274,8 +221,6 @@ impl Tensor {
             shape: Shape::new(dims),
             dtype,
             data: literal.bytes.as_ref().to_vec(),
-            grad: None,
-            requires_grad: false,
         })
     }
 }

@@ -74,8 +74,7 @@ fn naive_matmul<B: PortableBackend + 'static>(
         }
     }
 
-    let requires_grad = ctx.a.requires_grad_flag() || ctx.b.requires_grad_flag();
-    let tensor = Tensor::from_vec(Shape::new([m, n]), out)?.requires_grad(requires_grad);
+    let tensor = Tensor::from_vec(Shape::new([m, n]), out)?;
     DeviceTensor::from_host(ctx.a.backend(), tensor)
 }
 

@@ -234,7 +234,7 @@ Output: `T[shape]`
 Semantics:
 
 - Forward value is identical to `x`.
-- Autograd (when implemented) MUST treat this as a gradient barrier.
+- Autodiff (when implemented) MUST treat this as a derivative barrier.
 - Backends that do not implement autograd MAY treat it as a pure no-op.
 
 ### Reductions and argmax

@@ -20,7 +20,7 @@ fn mul_mul_add_pattern<B: gpt_rs::backend::spec::PortableBackend + 'static>(
         let add = mul2 + mul1;
         Ok(add.id())
     })?
-    .into_device_tensor(false)
+    .into_device_tensor()
 }
 
 fn rewriter_from_program(src: &str) -> ProgramRewriter<'static> {

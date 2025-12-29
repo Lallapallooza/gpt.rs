@@ -67,15 +67,7 @@ impl<B: PortableBackend + 'static> Linear<B> {
         if let Some(bias) = &self.bias {
             output_device = functional::add_bias(self.backend.as_ref(), &output_device, bias)?;
         }
-
-        let requires_grad = input.requires_grad_flag()
-            || self.weight.requires_grad_flag()
-            || self
-                .bias
-                .as_ref()
-                .map(|b| b.requires_grad_flag())
-                .unwrap_or(false);
-        Ok(output_device.requires_grad(requires_grad))
+        Ok(output_device)
     }
 
     /// Returns the backend that owns the layer parameters.

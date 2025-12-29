@@ -132,8 +132,7 @@ impl<B: PortableBackend + 'static> Gpt<B> {
 
         let tok_embeddings_weight = DeviceTensor::from_host(
             Arc::clone(&backend),
-            Tensor::randn(Shape::new([config.vocab_size, embed_dim]), weight_std, rng)
-                .requires_grad(true),
+            Tensor::randn(Shape::new([config.vocab_size, embed_dim]), weight_std, rng),
         )?;
         let tok_embeddings = Embedding::new(Arc::clone(&backend), tok_embeddings_weight)?;
         let pos_embeddings = DeviceTensor::from_host(
@@ -142,8 +141,7 @@ impl<B: PortableBackend + 'static> Gpt<B> {
                 Shape::new([config.context_length, embed_dim]),
                 weight_std,
                 rng,
-            )
-            .requires_grad(true),
+            ),
         )?;
 
         let mut blocks = Vec::with_capacity(config.num_layers);
@@ -151,34 +149,30 @@ impl<B: PortableBackend + 'static> Gpt<B> {
             let attn = CausalSelfAttention::new(
                 Arc::clone(&backend),
                 AttentionConfig::with_equal_heads(embed_dim, config.num_heads),
-                Tensor::randn(Shape::new([embed_dim, 3 * embed_dim]), weight_std, rng)
-                    .requires_grad(true),
-                Tensor::randn(Shape::new([embed_dim, embed_dim]), weight_std, rng)
-                    .requires_grad(true),
-                Some(Tensor::zeros(Shape::new([3 * embed_dim])).requires_grad(true)),
-                Some(Tensor::zeros(Shape::new([embed_dim])).requires_grad(true)),
+                Tensor::randn(Shape::new([embed_dim, 3 * embed_dim]), weight_std, rng),
+                Tensor::randn(Shape::new([embed_dim, embed_dim]), weight_std, rng),
+                Some(Tensor::zeros(Shape::new([3 * embed_dim]))),
+                Some(Tensor::zeros(Shape::new([embed_dim]))),
             )?;
 
             let ff = FeedForward::new(
                 Arc::clone(&backend),
-                Tensor::randn(Shape::new([embed_dim, hidden_dim]), weight_std, rng)
-                    .requires_grad(true),
-                Tensor::randn(Shape::new([hidden_dim, embed_dim]), weight_std, rng)
-                    .requires_grad(true),
-                Some(Tensor::zeros(Shape::new([hidden_dim])).requires_grad(true)),
-                Some(Tensor::zeros(Shape::new([embed_dim])).requires_grad(true)),
+                Tensor::randn(Shape::new([embed_dim, hidden_dim]), weight_std, rng),
+                Tensor::randn(Shape::new([hidden_dim, embed_dim]), weight_std, rng),
+                Some(Tensor::zeros(Shape::new([hidden_dim]))),
+                Some(Tensor::zeros(Shape::new([embed_dim]))),
             )?;
 
             let ln_1 = LayerNorm::new(
                 Arc::clone(&backend),
-                Tensor::ones(Shape::new([embed_dim])).requires_grad(true),
-                Tensor::zeros(Shape::new([embed_dim])).requires_grad(true),
+                Tensor::ones(Shape::new([embed_dim])),
+                Tensor::zeros(Shape::new([embed_dim])),
                 1e-5,
             )?;
             let ln_2 = LayerNorm::new(
                 Arc::clone(&backend),
-                Tensor::ones(Shape::new([embed_dim])).requires_grad(true),
-                Tensor::zeros(Shape::new([embed_dim])).requires_grad(true),
+                Tensor::ones(Shape::new([embed_dim])),
+                Tensor::zeros(Shape::new([embed_dim])),
                 1e-5,
             )?;
 
@@ -193,14 +187,13 @@ impl<B: PortableBackend + 'static> Gpt<B> {
 
         let final_ln = LayerNorm::new(
             Arc::clone(&backend),
-            Tensor::ones(Shape::new([embed_dim])).requires_grad(true),
-            Tensor::zeros(Shape::new([embed_dim])).requires_grad(true),
+            Tensor::ones(Shape::new([embed_dim])),
+            Tensor::zeros(Shape::new([embed_dim])),
             1e-5,
         )?;
         let lm_head = DeviceTensor::from_host(
             Arc::clone(&backend),
-            Tensor::randn(Shape::new([embed_dim, config.vocab_size]), weight_std, rng)
-                .requires_grad(true),
+            Tensor::randn(Shape::new([embed_dim, config.vocab_size]), weight_std, rng),
         )?;
 
         Ok(Gpt {

@@ -1,4 +1,4 @@
-//! Device-side tensor wrapper that tracks backend handles and gradient metadata.
+//! Device-side tensor wrapper that tracks backend handles and shape metadata.
 
 use super::lazy_tensor::InputRole;
 use super::{lazy_tensor::LazyHandle, shape::Shape, spec_utils, DType, Tensor};
@@ -33,7 +33,6 @@ pub struct DeviceTensor<B: PortableBackend + 'static> {
     shape: Shape,
     dtype: DType,
     handle: Arc<LazyHandle<B>>,
-    requires_grad: bool,
 }
 
 impl<B: PortableBackend + 'static> Clone for DeviceTensor<B> {
@@ -43,7 +42,6 @@ impl<B: PortableBackend + 'static> Clone for DeviceTensor<B> {
             shape: self.shape.clone(),
             dtype: self.dtype,
             handle: self.handle.clone(),
-            requires_grad: self.requires_grad,
         }
     }
 }
@@ -59,7 +57,6 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     pub fn from_host(backend: Arc<B>, tensor: Tensor) -> Result<Self> {
         let shape = tensor.shape().clone();
         let dtype = tensor.dtype();
-        let requires_grad = tensor.requires_grad_flag();
         let literal = tensor.to_literal();
         let handle = backend.materialize(TensorInit::Literal(literal))?;
         Ok(DeviceTensor {
@@ -71,7 +68,6 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                 role: InputRole::Arg,
                 tensor: handle,
             }),
-            requires_grad,
         })
     }
 
@@ -91,7 +87,6 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                 role: InputRole::Arg,
                 tensor: handle,
             }),
-            requires_grad: false,
         }
     }
 
@@ -101,7 +96,6 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
         shape: Shape,
         dtype: DType,
         value: ValueId,
-        requires_grad: bool,
     ) -> Result<Self> {
         let backend = graph.backend();
 
@@ -116,7 +110,6 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                     role: InputRole::Arg,
                     tensor: handle,
                 }),
-                requires_grad,
             })
         } else {
             Ok(DeviceTensor {
@@ -124,7 +117,6 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                 shape,
                 dtype,
                 handle: Arc::new(LazyHandle::Node { graph, value }),
-                requires_grad,
             })
         }
     }
@@ -145,7 +137,6 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                 role: InputRole::Arg,
                 tensor: handle,
             }),
-            requires_grad: false,
         })
     }
 
@@ -153,7 +144,7 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     pub fn to_host(&self) -> Result<Tensor> {
         let handle = self.materialize()?;
         let literal = self.backend.to_literal(&handle)?;
-        Tensor::from_literal(&literal).map(|tensor| tensor.requires_grad(self.requires_grad))
+        Tensor::from_literal(&literal)
     }
 
     /// Returns the backend instance that owns the tensor.
@@ -183,17 +174,6 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     /// Returns the scalar dtype of the device tensor.
     pub fn dtype(&self) -> DType {
         self.dtype
-    }
-
-    /// Sets the gradient tracking flag on the device tensor.
-    pub fn requires_grad(mut self, flag: bool) -> Self {
-        self.requires_grad = flag;
-        self
-    }
-
-    /// Reads the gradient tracking flag.
-    pub fn requires_grad_flag(&self) -> bool {
-        self.requires_grad
     }
 
     /// Returns the raw lazy handle reference for graph wiring.
@@ -262,7 +242,6 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                         role: InputRole::Param,
                         tensor: handle,
                     }),
-                    requires_grad: self.requires_grad,
                 })
             }
             LazyHandle::Node { .. } => {
@@ -272,8 +251,7 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                     self.shape.clone(),
                     self.dtype,
                     handle,
-                )
-                .requires_grad(self.requires_grad))
+                ))
             }
         }
     }
@@ -300,7 +278,6 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                         role: InputRole::Param,
                         tensor: handle,
                     }),
-                    requires_grad: self.requires_grad,
                 })
             }
         }
@@ -340,7 +317,6 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                         source: Arc::clone(source),
                         cached: new_cached,
                     }),
-                    requires_grad: self.requires_grad,
                 })
             }
             _ => {
@@ -354,7 +330,6 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                         role: InputRole::Param,
                         tensor: handle,
                     }),
-                    requires_grad: self.requires_grad,
                 })
             }
         }
@@ -417,7 +392,6 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
         stable_id: u128,
         base_id: BaseParamId,
         source: Arc<dyn ParamSource<B>>,
-        requires_grad: bool,
     ) -> Self {
         DeviceTensor {
             backend,
@@ -429,7 +403,6 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                 source,
                 cached: once_cell::sync::OnceCell::new(),
             }),
-            requires_grad,
         }
     }
 }
@@ -440,7 +413,6 @@ impl<B: PortableBackend> fmt::Debug for DeviceTensor<B> {
             .field("backend", &self.backend.backend_name())
             .field("shape", &self.shape.dims())
             .field("dtype", &self.dtype)
-            .field("requires_grad", &self.requires_grad)
             .finish()
     }
 }

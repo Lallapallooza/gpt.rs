@@ -142,22 +142,6 @@ pub fn linear_matches_torch_without_bias<B: PortableBackend + 'static>(backend: 
     assert_close(&expected, output_host.data());
 }
 
-pub fn linear_forward_propagates_requires_grad<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    let mut rng = seeded_rng(7);
-
-    let input = tensor_from_vec(&[1, 2], random_vec(&mut rng, 2)).requires_grad(true);
-    let weight = tensor_from_vec(&[2, 2], random_vec(&mut rng, 4)).requires_grad(true);
-    let bias = tensor_from_vec(&[2], random_vec(&mut rng, 2)).requires_grad(true);
-
-    timed_gpt(|| {
-        let layer = Linear::new(Arc::clone(backend), weight, Some(bias)).unwrap();
-        let input_device = DeviceTensor::from_host(Arc::clone(backend), input.clone()).unwrap();
-        let output = layer.forward(&input_device).unwrap();
-
-        assert!(output.requires_grad_flag());
-    });
-}
-
 pub fn linear_matches_torch_batch1_in5_out3_bias<B: PortableBackend + 'static>(backend: &Arc<B>) {
     run_linear_case(backend, 1, 5, 3, 0xCE552, true);
 }

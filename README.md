@@ -17,8 +17,7 @@ https://github.com/user-attachments/assets/4a99a79d-b98c-4b11-9f2d-64906b832ca7
 
 ## Benchmarks (early)
 
-Single-thread CPU numbers from `scripts/eval.py --workload bench` on AMD Ryzen 9 9950X3D (Linux),
-commit `f206c44`, backend `c` vs Torch baselines:
+Single-thread CPU numbers from `scripts/eval.py --workload bench --backend c` on AMD Ryzen 9 9950X3D (Linux):
 
 | Workload | gpt.rs | torch | Speedup |
 | --- | ---: | ---: | ---: |

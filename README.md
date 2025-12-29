@@ -103,6 +103,10 @@ Models:
 - [ ] Diffusion models
 - [ ] Speech models
 
+Platforms:
+- [ ] Windows
+- [ ] MacOS
+
 ## Repository layout
 
 - `crates/gpt-rs`: core library (tensors, PTIR capture, layers, models, tokenizer, checkpoints, runtime).
@@ -193,3 +197,7 @@ portable PTIR kernels and Torch baselines for correctness.
 
 The functional layer exposes portable math (elementwise ops, matmul, normalization, attention, conv/pool) via the
 `DeviceTensorOps` extension trait while still delegating to backend PTIR execution.
+
+## License
+
+Apache License 2.0. See `LICENSE`.

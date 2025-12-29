@@ -7,7 +7,7 @@ name = "gpt-rs"
 version = "0.1.0"
 description = "Pure Rust GPT-style transformer with Python bindings"
 authors = [{name = "gpt.rs contributors"}]
-license = {text = "MIT OR Apache-2.0"}
+license = {text = "Apache-2.0"}
 requires-python = ">=3.9"
 classifiers = [
     "Programming Language :: Rust",

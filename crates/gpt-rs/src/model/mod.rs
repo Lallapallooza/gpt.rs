@@ -1,6 +1,7 @@
 pub mod config;
 pub mod gpt;
 pub mod mobilenet_v2;
+pub mod registry;
 pub mod resnet;
 
 pub use config::ModelConfig;

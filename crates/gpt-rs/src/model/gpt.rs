@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
 
+pub const KIND: &str = "gpt";
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GptConfig {
     pub vocab_size: usize,
@@ -32,6 +34,16 @@ impl Default for GptConfig {
             dropout: 0.0,
         }
     }
+}
+
+pub(crate) fn build_from_model_config<B: PortableBackend + 'static>(
+    backend: Arc<B>,
+    cfg: &super::ModelConfig,
+    get: &mut dyn FnMut(&str) -> Result<DeviceTensor<B>>,
+) -> Result<Box<dyn crate::runtime::LoadedModel<B>>> {
+    let model_cfg: GptConfig = serde_json::from_value(cfg.config.clone())
+        .map_err(|err| anyhow!("invalid gpt config: {err}"))?;
+    Ok(Box::new(Gpt::build_from_params(model_cfg, backend, get)?))
 }
 
 pub struct GptBlock<B: PortableBackend + 'static> {
@@ -928,5 +940,29 @@ impl<B: PortableBackend + 'static> crate::inference::CausalLanguageModel<B> for 
             caches,
             capacity,
         )
+    }
+}
+
+impl<B: PortableBackend + 'static> crate::runtime::LoadedModel<B> for Gpt<B> {
+    fn kind(&self) -> &str {
+        KIND
+    }
+
+    fn forward(
+        &mut self,
+        input: crate::runtime::ModelInput<B>,
+    ) -> Result<crate::runtime::ModelOutput> {
+        match input {
+            crate::runtime::ModelInput::Tokens(tokens) => Ok(crate::runtime::ModelOutput::Tensor(
+                Gpt::forward(self, &tokens)?,
+            )),
+            crate::runtime::ModelInput::Vision(_) => {
+                bail!("model '{KIND}' expects token input, got vision input")
+            }
+        }
+    }
+
+    fn as_causal_lm(&self) -> Option<&dyn crate::inference::CausalLanguageModel<B>> {
+        Some(self)
     }
 }

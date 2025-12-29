@@ -3,13 +3,13 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 
 use crate::backend::spec::{PortableBackend, TensorInit};
 use crate::checkpoint::{CheckpointReader, CheckpointTensorEntry};
 use crate::inference::CausalLanguageModel;
+use crate::model::registry as model_registry;
 use crate::model::ModelConfig;
-use crate::model::{Gpt, GptConfig, MobileNetV2, ResNet34};
 use crate::ops::functional::{build_registry, with_registry, FunctionalOverrides};
 use crate::params::{param_key, BaseParamId, ModelNamespaceId, ParamSource};
 use crate::tensor::{DeviceTensor, Tensor};
@@ -129,13 +129,6 @@ impl<B: PortableBackend + 'static> CausalLanguageModel<B> for ModelHandle<B> {
     }
 }
 
-fn other_kind<B: PortableBackend + 'static>(input: &ModelInput<B>) -> &'static str {
-    match input {
-        ModelInput::Tokens(_) => "tokens",
-        ModelInput::Vision(_) => "vision",
-    }
-}
-
 struct CheckpointParamSource<B: PortableBackend + 'static> {
     backend: Arc<B>,
     reader: Mutex<CheckpointReader>,
@@ -199,112 +192,15 @@ pub fn load_model_with_namespace<B: PortableBackend + 'static>(
     };
 
     let kind = config.kind.as_str();
-    let factory =
-        model_factory::<B>(kind).ok_or_else(|| anyhow!("unsupported model kind '{kind}'"))?;
-    let model = factory(backend, &config, &mut get)?;
+    let factory = model_registry::model_factory::<B>(kind)
+        .ok_or_else(|| anyhow!("unsupported model kind '{kind}'"))?;
+    let model = (factory)(backend, &config, &mut get)?;
     Ok(Box::new(ModelHandle::new(model, registry)))
 }
-
-type BuildFn<B> = fn(
-    Arc<B>,
-    &ModelConfig,
-    &mut dyn FnMut(&str) -> Result<DeviceTensor<B>>,
-) -> Result<Box<dyn LoadedModel<B>>>;
-
 fn functional_overrides_from_config(cfg: &ModelConfig) -> Result<FunctionalOverrides> {
     if !cfg.runtime.functional_overrides.is_empty() {
         return Ok(cfg.runtime.functional_overrides.clone());
     }
 
     Ok(FunctionalOverrides::default())
-}
-
-fn build_gpt<B: PortableBackend + 'static>(
-    backend: Arc<B>,
-    cfg: &ModelConfig,
-    get: &mut dyn FnMut(&str) -> Result<DeviceTensor<B>>,
-) -> Result<Box<dyn LoadedModel<B>>> {
-    let model_cfg: GptConfig =
-        serde_json::from_value(cfg.config.clone()).with_context(|| "invalid gpt config")?;
-    Ok(Box::new(Gpt::build_from_params(model_cfg, backend, get)?))
-}
-
-fn build_resnet34<B: PortableBackend + 'static>(
-    backend: Arc<B>,
-    _cfg: &ModelConfig,
-    get: &mut dyn FnMut(&str) -> Result<DeviceTensor<B>>,
-) -> Result<Box<dyn LoadedModel<B>>> {
-    Ok(Box::new(ResNet34::build_from_params(backend, get)?))
-}
-
-fn build_mobilenet_v2<B: PortableBackend + 'static>(
-    backend: Arc<B>,
-    _cfg: &ModelConfig,
-    get: &mut dyn FnMut(&str) -> Result<DeviceTensor<B>>,
-) -> Result<Box<dyn LoadedModel<B>>> {
-    Ok(Box::new(MobileNetV2::build_from_params(backend, get)?))
-}
-
-fn model_factory<B: PortableBackend + 'static>(kind: &str) -> Option<BuildFn<B>> {
-    for (k, build) in model_factories::<B>() {
-        if *k == kind {
-            return Some(*build);
-        }
-    }
-    None
-}
-
-fn model_factories<B: PortableBackend + 'static>() -> &'static [(&'static str, BuildFn<B>)] {
-    &[
-        ("gpt", build_gpt::<B>),
-        ("resnet34", build_resnet34::<B>),
-        ("mobilenet_v2", build_mobilenet_v2::<B>),
-    ]
-}
-
-impl<B: PortableBackend + 'static> LoadedModel<B> for Gpt<B> {
-    fn kind(&self) -> &str {
-        "gpt"
-    }
-
-    fn forward(&mut self, input: ModelInput<B>) -> Result<ModelOutput> {
-        match input {
-            ModelInput::Tokens(tokens) => Ok(ModelOutput::Tensor(Gpt::forward(self, &tokens)?)),
-            other => bail!("GPT does not accept input {:?}", other_kind(&other)),
-        }
-    }
-
-    fn as_causal_lm(&self) -> Option<&dyn CausalLanguageModel<B>> {
-        Some(self)
-    }
-}
-
-impl<B: PortableBackend + 'static> LoadedModel<B> for ResNet34<B> {
-    fn kind(&self) -> &str {
-        "resnet34"
-    }
-
-    fn forward(&mut self, input: ModelInput<B>) -> Result<ModelOutput> {
-        match input {
-            ModelInput::Vision(input) => Ok(ModelOutput::Tensor(
-                ResNet34::forward(self, &input)?.to_host()?,
-            )),
-            other => bail!("ResNet34 does not accept input {:?}", other_kind(&other)),
-        }
-    }
-}
-
-impl<B: PortableBackend + 'static> LoadedModel<B> for MobileNetV2<B> {
-    fn kind(&self) -> &str {
-        "mobilenet_v2"
-    }
-
-    fn forward(&mut self, input: ModelInput<B>) -> Result<ModelOutput> {
-        match input {
-            ModelInput::Vision(input) => Ok(ModelOutput::Tensor(
-                MobileNetV2::forward(self, &input)?.to_host()?,
-            )),
-            other => bail!("MobileNetV2 does not accept input {:?}", other_kind(&other)),
-        }
-    }
 }

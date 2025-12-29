@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use gpt_rs_macros::capture_ptir;
 
 use crate::backend::spec::PortableBackend;
@@ -12,6 +12,8 @@ use crate::ops::functional::common::CaptureIntoDeviceTensor;
 use crate::ops::functional::{relu6, reshape, transpose};
 use crate::tensor::{DeviceTensor, DeviceTensorOps, IntoDeviceTensor, Tensor};
 
+pub const KIND: &str = "mobilenet_v2";
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MobileNetV2Config {
     pub num_classes: usize,
@@ -21,6 +23,14 @@ impl Default for MobileNetV2Config {
     fn default() -> Self {
         Self { num_classes: 1000 }
     }
+}
+
+pub(crate) fn build_from_model_config<B: PortableBackend + 'static>(
+    backend: Arc<B>,
+    _cfg: &super::ModelConfig,
+    get: &mut dyn FnMut(&str) -> Result<DeviceTensor<B>>,
+) -> Result<Box<dyn crate::runtime::LoadedModel<B>>> {
+    Ok(Box::new(MobileNetV2::build_from_params(backend, get)?))
 }
 
 #[derive(Clone)]
@@ -469,5 +479,25 @@ impl<B: PortableBackend + 'static> Module<B> for MobileNetV2<B> {
         v.scoped("head", |v| self.head.visit_params_mut(v))?;
         v.scoped("classifier", |v| self.classifier.visit_params_mut(v))?;
         Ok(())
+    }
+}
+
+impl<B: PortableBackend + 'static> crate::runtime::LoadedModel<B> for MobileNetV2<B> {
+    fn kind(&self) -> &str {
+        KIND
+    }
+
+    fn forward(
+        &mut self,
+        input: crate::runtime::ModelInput<B>,
+    ) -> Result<crate::runtime::ModelOutput> {
+        match input {
+            crate::runtime::ModelInput::Vision(input) => Ok(crate::runtime::ModelOutput::Tensor(
+                MobileNetV2::forward(self, &input)?.to_host()?,
+            )),
+            crate::runtime::ModelInput::Tokens(_) => {
+                bail!("model '{KIND}' expects vision input, got token input")
+            }
+        }
     }
 }

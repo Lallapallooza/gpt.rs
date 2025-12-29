@@ -172,5 +172,7 @@ pub fn embedding_rejects_indices_rank3<B: PortableBackend + 'static>(backend: &A
         let layer = Embedding::new(Arc::clone(backend), weight_device).unwrap();
         layer.forward(&indices_device).unwrap_err()
     });
-    assert!(err.to_string().contains("embedding indices must be rank 1"));
+    assert!(err
+        .to_string()
+        .contains("embedding indices must have rank 1"));
 }

@@ -110,6 +110,12 @@ Torch parity (smoke + parity):
 cargo test -p gpt-rs-backend-faer --features torch --test backend_suite
 ```
 
+Run Torch parity across the workspace (default members) from the repo root:
+
+```bash
+cargo test --features torch
+```
+
 Run a single parity test by name filter:
 
 ```bash

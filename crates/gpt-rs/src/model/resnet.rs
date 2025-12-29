@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use gpt_rs_macros::capture_ptir;
 
 use crate::backend::spec::PortableBackend;
@@ -12,6 +12,8 @@ use crate::ops::functional::common::CaptureIntoDeviceTensor;
 use crate::ops::functional::{max_pool2d, relu, reshape, transpose, Padding2d};
 use crate::tensor::{DeviceTensor, DeviceTensorOps, IntoDeviceTensor, Tensor};
 
+pub const KIND: &str = "resnet34";
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ResNet34Config {
     pub num_classes: usize,
@@ -21,6 +23,14 @@ impl Default for ResNet34Config {
     fn default() -> Self {
         Self { num_classes: 1000 }
     }
+}
+
+pub(crate) fn build_from_model_config<B: PortableBackend + 'static>(
+    backend: Arc<B>,
+    _cfg: &super::ModelConfig,
+    get: &mut dyn FnMut(&str) -> Result<DeviceTensor<B>>,
+) -> Result<Box<dyn crate::runtime::LoadedModel<B>>> {
+    Ok(Box::new(ResNet34::build_from_params(backend, get)?))
 }
 
 #[derive(Clone)]
@@ -471,5 +481,25 @@ impl<B: PortableBackend + 'static> Module<B> for ResNet34<B> {
 
         v.scoped("fc", |v| self.fc.visit_params_mut(v))?;
         Ok(())
+    }
+}
+
+impl<B: PortableBackend + 'static> crate::runtime::LoadedModel<B> for ResNet34<B> {
+    fn kind(&self) -> &str {
+        KIND
+    }
+
+    fn forward(
+        &mut self,
+        input: crate::runtime::ModelInput<B>,
+    ) -> Result<crate::runtime::ModelOutput> {
+        match input {
+            crate::runtime::ModelInput::Vision(input) => Ok(crate::runtime::ModelOutput::Tensor(
+                ResNet34::forward(self, &input)?.to_host()?,
+            )),
+            crate::runtime::ModelInput::Tokens(_) => {
+                bail!("model '{KIND}' expects vision input, got token input")
+            }
+        }
     }
 }

@@ -292,15 +292,8 @@ pub fn register_c_backend() {
     register_portable_backend("c", CBackend::new);
 }
 
-#[cfg(not(target_family = "wasm"))]
-#[used]
-#[link_section = ".init_array"]
-static REGISTER_C_BACKEND: extern "C" fn() = {
-    extern "C" fn register() {
-        register_c_backend();
-    }
-    register
-};
+#[gpt_rs::linkme::distributed_slice(gpt_rs::backend::registry::BACKEND_REGISTRARS)]
+static REGISTER_C_BACKEND: fn() = register_c_backend;
 
 fn c_legality_spec() -> LegalitySpec {
     LegalitySpec::default()

@@ -19,12 +19,5 @@ pub fn register_cpu_backend() {
 }
 
 // Auto-register on library load
-#[cfg(not(target_family = "wasm"))]
-#[used]
-#[link_section = ".init_array"]
-static REGISTER_CPU_BACKEND: extern "C" fn() = {
-    extern "C" fn register() {
-        register_cpu_backend();
-    }
-    register
-};
+#[gpt_rs::linkme::distributed_slice(gpt_rs::backend::registry::BACKEND_REGISTRARS)]
+static REGISTER_CPU_BACKEND: fn() = register_cpu_backend;

@@ -2919,12 +2919,5 @@ pub fn register_faer_backend() {
 }
 
 // Auto-register on library load
-#[cfg(not(target_family = "wasm"))]
-#[used]
-#[link_section = ".init_array"]
-static REGISTER_FAER_BACKEND: extern "C" fn() = {
-    extern "C" fn register() {
-        register_faer_backend();
-    }
-    register
-};
+#[gpt_rs::linkme::distributed_slice(gpt_rs::backend::registry::BACKEND_REGISTRARS)]
+static REGISTER_FAER_BACKEND: fn() = register_faer_backend;

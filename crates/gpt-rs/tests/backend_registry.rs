@@ -1,9 +1,10 @@
 use gpt_rs::backend::registry::{create_backend, has_backend, list_backends};
+use gpt_rs_backend_ref_cpu::CpuPortableBackend;
 
 #[test]
 fn test_backend_registry() {
-    // Ensure backends are registered (auto-registration via .init_array)
-    gpt_rs_backend_ref_cpu::register_cpu_backend();
+    // Ensure the backend crate is linked so its registrar lands in the slice.
+    let _ = CpuPortableBackend::new();
 
     // List backends
     let backends = list_backends();

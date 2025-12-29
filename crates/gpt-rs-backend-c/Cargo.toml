@@ -15,6 +15,7 @@ torch = ["gpt-rs-backend-tests/torch"]
 gpt-rs = { path = "../gpt-rs", version = "0.1.0" }
 libloading = "0.8"
 bincode = { workspace = true }
+linkme = "0.3"
 
 [dev-dependencies]
 gpt-rs-backend-tests = { path = "../gpt-rs-backend-tests", version = "0.1.0" }

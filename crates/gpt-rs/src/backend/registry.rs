@@ -7,7 +7,10 @@
 use super::spec::{BackendError, BackendResult, PortableBackend, TensorInit, TensorLiteral};
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Once, RwLock};
+
+#[linkme::distributed_slice]
+pub static BACKEND_REGISTRARS: [fn()] = [..];
 
 /// Type-erased backend handle that can be downcast to concrete backend types.
 pub type BackendHandle = Box<dyn Any + Send + Sync>;
@@ -205,6 +208,15 @@ fn global_registry() -> &'static BackendRegistry {
     GLOBAL_REGISTRY.get_or_init(BackendRegistry::new)
 }
 
+fn ensure_backends_registered() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        for registrar in BACKEND_REGISTRARS {
+            registrar();
+        }
+    });
+}
+
 /// Register a backend by name with a constructor function.
 ///
 /// The constructor will be called each time the backend is requested via `create_backend()`.
@@ -243,16 +255,19 @@ where
 ///
 /// Returns `None` if no backend with the given name has been registered.
 pub fn create_backend(name: &str) -> Option<Box<dyn ErasedBackend>> {
+    ensure_backends_registered();
     global_registry().create(name)
 }
 
 /// List all registered backend names.
 pub fn list_backends() -> Vec<String> {
+    ensure_backends_registered();
     global_registry().list_backends()
 }
 
 /// Check if a backend with the given name is registered.
 pub fn has_backend(name: &str) -> bool {
+    ensure_backends_registered();
     global_registry().has_backend(name)
 }
 

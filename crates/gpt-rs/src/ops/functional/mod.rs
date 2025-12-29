@@ -46,6 +46,7 @@ pub mod runtime;
 pub mod shape;
 pub mod stochastic;
 pub mod tensor_ops;
+pub mod utils;
 
 pub use activation::*;
 pub use attention::*;
@@ -60,18 +61,4 @@ pub use runtime::*;
 pub use shape::*;
 pub use stochastic::*;
 pub use tensor_ops::*;
-
-pub fn tensor_spec_from_device<B: crate::backend::spec::PortableBackend + 'static>(
-    tensor: &crate::tensor::DeviceTensor<B>,
-) -> crate::backend::spec::TensorSpec {
-    crate::backend::spec::TensorSpec::new(
-        crate::tensor::spec_utils::backend_dtype(tensor.dtype()),
-        crate::tensor::spec_utils::backend_shape_from_shape(tensor.shape()),
-    )
-}
-
-pub fn resolve_graph_from_tensors<B: crate::backend::spec::PortableBackend + 'static>(
-    tensors: &[&crate::tensor::DeviceTensor<B>],
-) -> Option<std::sync::Arc<crate::ops::graph::GraphArena<B>>> {
-    tensors.iter().find_map(|tensor| tensor.graph())
-}
+pub use utils::{resolve_graph_from_tensors, tensor_spec_from_device};

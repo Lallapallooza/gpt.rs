@@ -29,8 +29,8 @@ Layers live in `crates/gpt-rs/src/nn/layers/` and typically contain:
 Layers also implement the small `Module` trait (`crates/gpt-rs/src/module.rs`) so parameters can be
 enumerated/updated by stable name (this is what checkpoint tooling and future training utilities build on).
 
-Autograd is not implemented yet; some layers expose `*_with_state` helpers that return the minimal forward
-state that a future backward pass would need.
+Automatic differentiation is not implemented yet; some layers expose `*_with_state` helpers that return
+the minimal forward state that a future derivative pass would need.
 
 ## Functionals (portable kernels)
 

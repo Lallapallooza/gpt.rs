@@ -22,3 +22,4 @@ Doc policy:
 - [ops.md](ops.md): ops/capture/graph execution architecture (implementation-oriented).
 - [backend_optimizer.md](backend_optimizer.md): PTIR rewrite/optimizer architecture (implementation-oriented).
 - [formats.md](formats.md): file formats (`GPTRSCHK` checkpoints, `GPTRSTEN` tensor archives).
+- [development.md](development.md): env vars and local development notes.

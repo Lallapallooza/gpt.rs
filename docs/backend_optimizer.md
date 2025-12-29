@@ -41,7 +41,7 @@ Tuning/debug knobs:
 
 - `GPTRS_OPT_PRE_ITERS`: fixed-point iterations for the "pre" loop (default: 2).
 - `GPTRS_OPT_POST_ITERS`: fixed-point iterations for the "post" loop (default: 4).
-- `GPTRS_PASS_STATS=1`: print per-pass stats to stdout.
+- `GPTRS_PASS_STATS=1`: emit per-pass optimizer stats to the trace sink (for example into `passes.jsonl` when using `--dump-dir`).
 
 ## Pattern system
 

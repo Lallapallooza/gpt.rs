@@ -98,9 +98,23 @@ pub struct ProgramStats {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", content = "data")]
 pub enum PassEventKind {
-    PassStart { name: String },
-    PassEnd { name: String, status: PassStatus },
-    RewriteApplied { pass: String, description: String },
+    PassStart {
+        name: String,
+    },
+    PassEnd {
+        name: String,
+        status: PassStatus,
+    },
+    RewriteApplied {
+        pass: String,
+        description: String,
+    },
+    OptimizerPassStats {
+        run_id: Option<usize>,
+        function: String,
+        pass: String,
+        stats: OptimizerPassStats,
+    },
 }
 
 /// Result of running a pass.
@@ -117,6 +131,16 @@ pub struct PassEvent {
     pub timestamp: SystemTime,
     pub trace_id: Option<u64>,
     pub kind: PassEventKind,
+}
+
+/// Optimizer statistics collected for a single pass run.
+#[derive(Debug, Clone, Serialize)]
+pub struct OptimizerPassStats {
+    pub changed: bool,
+    pub iterations: usize,
+    pub rewrites_applied: usize,
+    pub erased_insts: usize,
+    pub body_len: usize,
 }
 
 /// Receives callbacks around PTIR program execution and pass activity.

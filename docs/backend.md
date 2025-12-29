@@ -235,7 +235,7 @@ Semantics:
 
 - Forward value is identical to `x`.
 - Autodiff (when implemented) MUST treat this as a derivative barrier.
-- Backends that do not implement autograd MAY treat it as a pure no-op.
+- Backends that do not implement autodiff MAY treat it as a pure no-op.
 
 ### Reductions and argmax
 

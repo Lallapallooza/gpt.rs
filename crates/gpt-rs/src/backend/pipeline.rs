@@ -2,6 +2,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+use std::time::SystemTime;
 
 use crate::backend::optimizer::{FunctionPass, OptimizeContext, Optimizer, PassResult};
 use crate::backend::passes::{
@@ -10,6 +11,7 @@ use crate::backend::passes::{
     ReshapeCanonicalizationPass, SliceCanonicalizationPass, TransposeCanonicalizationPass,
 };
 use crate::backend::spec::{Function, PortableBackend};
+use crate::ops::trace::{emit_pass_event, OptimizerPassStats, PassEvent, PassEventKind};
 
 pub enum Step<B: PortableBackend + 'static> {
     Pass(Arc<dyn FunctionPass<B>>),
@@ -72,22 +74,20 @@ impl<B: PortableBackend + 'static> PipelineOptimizer<B> {
     pub fn new(backend_pipeline: Option<Arc<dyn BackendPipeline<B>>>) -> Self {
         let mut builder = PipelineBuilder::new();
 
-        let pre_iters = std::env::var("GPTRS_OPT_PRE_ITERS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2);
-        let post_iters = std::env::var("GPTRS_OPT_POST_ITERS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4);
+        let pre_iters = crate::env::optimizer_pre_iters();
+        let post_iters = crate::env::optimizer_post_iters();
 
-        builder.fixed_point(pre_iters, |p| {
+        fn canonicalize<B: PortableBackend + 'static>(p: &mut PipelineBuilder<B>) {
             p.pass(Arc::new(BroadcastCanonicalizationPass::default()));
             p.pass(Arc::new(ReshapeCanonicalizationPass::default()));
             p.pass(Arc::new(TransposeCanonicalizationPass::default()));
             p.pass(Arc::new(SliceCanonicalizationPass::default()));
             p.pass(Arc::new(CastCanonicalizationPass::default()));
             p.pass(Arc::new(ElementwiseSimplificationPass::default()));
+        }
+
+        builder.fixed_point(pre_iters, |p| {
+            canonicalize(p);
         });
 
         if let Some(pipeline) = backend_pipeline.as_ref() {
@@ -102,12 +102,7 @@ impl<B: PortableBackend + 'static> PipelineOptimizer<B> {
         }
 
         builder.fixed_point(post_iters, |p| {
-            p.pass(Arc::new(BroadcastCanonicalizationPass::default()));
-            p.pass(Arc::new(ReshapeCanonicalizationPass::default()));
-            p.pass(Arc::new(TransposeCanonicalizationPass::default()));
-            p.pass(Arc::new(SliceCanonicalizationPass::default()));
-            p.pass(Arc::new(CastCanonicalizationPass::default()));
-            p.pass(Arc::new(ElementwiseSimplificationPass::default()));
+            canonicalize(p);
             p.pass(Arc::new(CommonSubexpressionEliminationPass));
             p.pass(Arc::new(DeadCodeEliminationPass));
         });
@@ -118,7 +113,7 @@ impl<B: PortableBackend + 'static> PipelineOptimizer<B> {
 
         Self {
             steps: builder.finish(),
-            log_stats: std::env::var("GPTRS_PASS_STATS").is_ok(),
+            log_stats: crate::env::pass_stats_enabled(),
             run_counter: AtomicUsize::new(0),
         }
     }
@@ -162,7 +157,7 @@ fn run_steps<B: PortableBackend + 'static>(
                 changed_any |= stats.changed;
                 *totals = totals.merge(stats);
                 if log_stats {
-                    log_pass_stats(pass.name(), function, run_id, stats);
+                    emit_optimizer_pass_stats(pass.name(), function, run_id, stats);
                 }
             }
             Step::FixedPoint { max_iters, steps } => {
@@ -186,18 +181,26 @@ fn run_steps<B: PortableBackend + 'static>(
     changed_any
 }
 
-fn log_pass_stats(name: &str, function: &Function, run_id: Option<usize>, stats: PassResult) {
-    let func_len = function.body.len();
-    let rid = run_id.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
-    println!(
-        "[optimizer] run={} func={} pass={} changed={} rewrites={} erased={} iters={} body_len={}",
-        rid,
-        function.name,
-        name,
-        stats.changed,
-        stats.rewrites_applied,
-        stats.erased_insts,
-        stats.iterations,
-        func_len
-    );
+fn emit_optimizer_pass_stats(
+    name: &str,
+    function: &Function,
+    run_id: Option<usize>,
+    stats: PassResult,
+) {
+    emit_pass_event(PassEvent {
+        timestamp: SystemTime::now(),
+        trace_id: None,
+        kind: PassEventKind::OptimizerPassStats {
+            run_id,
+            function: function.name.clone(),
+            pass: name.to_string(),
+            stats: OptimizerPassStats {
+                changed: stats.changed,
+                iterations: stats.iterations,
+                rewrites_applied: stats.rewrites_applied,
+                erased_insts: stats.erased_insts,
+                body_len: function.body.len(),
+            },
+        },
+    });
 }

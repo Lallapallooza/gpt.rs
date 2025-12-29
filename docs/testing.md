@@ -270,7 +270,7 @@ Legacy wrapper scripts have been removed; use `scripts/eval.py` directly with
 
 - `GPTRS_EAGER=1`: force tensors created from captured nodes to materialize immediately (useful for debugging fusion).
 - `GPTRS_OPT_PRE_ITERS` / `GPTRS_OPT_POST_ITERS`: tune optimizer fixed-point iterations.
-- `GPTRS_PASS_STATS=1`: print per-pass optimizer stats to stdout.
+- `GPTRS_PASS_STATS=1`: emit per-pass optimizer stats to the trace sink (for example into `passes.jsonl` when using `--dump-dir`).
 - C backend only:
   - `GPTRS_PROFILE_BACKEND=1`: enable C backend profiling counters (requires building with C backend support).
   - `GPTRS_C_CACHE_DIR=/path`: override the on-disk cache directory used by the C backend.

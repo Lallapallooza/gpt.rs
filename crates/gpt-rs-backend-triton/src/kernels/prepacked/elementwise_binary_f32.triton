@@ -1,4 +1,44 @@
-// gpt_rs.kernel: elementwise_binary_f32
-// gpt_rs.symbol: gpt_rs_triton_ewise_binary_f32
-// args: lhs_ptr(*fp32), rhs_ptr(*fp32), out_ptr(*fp32), n(u32), op(u32)
-// op mapping: 0=add,1=sub,2=mul,3=div,4=max,5=min
+# gpt_rs.kernel: elementwise_binary_f32
+# gpt_rs.symbol: gpt_rs_triton_ewise_binary_f32
+# gpt_rs.signature: lhs_ptr=*fp32,rhs_ptr=*fp32,out_ptr=*fp32,n=i32,op=i32
+# gpt_rs.param_abi: *fp32,*fp32,*fp32,u32,u32,*opaque
+# gpt_rs.constexpr: BLOCK_SIZE=256
+# gpt_rs.num_warps: 8
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def gpt_rs_triton_ewise_binary_f32(
+    lhs_ptr,
+    rhs_ptr,
+    out_ptr,
+    n,
+    op,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n
+
+    lhs = tl.load(lhs_ptr + offs, mask=mask, other=0.0)
+    rhs = tl.load(rhs_ptr + offs, mask=mask, other=0.0)
+
+    add = lhs + rhs
+    sub = lhs - rhs
+    mul = lhs * rhs
+    div = lhs / rhs
+    mx = tl.maximum(lhs, rhs)
+    mn = tl.minimum(lhs, rhs)
+
+    out = tl.where(
+        op == 0,
+        add,
+        tl.where(
+            op == 1,
+            sub,
+            tl.where(op == 2, mul, tl.where(op == 3, div, tl.where(op == 4, mx, mn))),
+        ),
+    )
+    tl.store(out_ptr + offs, out, mask=mask)

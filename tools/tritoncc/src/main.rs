@@ -304,10 +304,14 @@ fn run_inspect(raw_args: Vec<String>) -> Result<(), String> {
 fn detect_kernel_kind(source: &str) -> KernelKind {
     for line in source.lines() {
         let trimmed = line.trim();
-        if trimmed == "// gpt_rs.kernel: elementwise_binary_f32" {
+        if trimmed == "// gpt_rs.kernel: elementwise_binary_f32"
+            || trimmed == "# gpt_rs.kernel: elementwise_binary_f32"
+        {
             return KernelKind::ElementwiseBinaryF32;
         }
-        if trimmed == "// gpt_rs.kernel: elementwise_unary_f32" {
+        if trimmed == "// gpt_rs.kernel: elementwise_unary_f32"
+            || trimmed == "# gpt_rs.kernel: elementwise_unary_f32"
+        {
             return KernelKind::ElementwiseUnaryF32;
         }
     }

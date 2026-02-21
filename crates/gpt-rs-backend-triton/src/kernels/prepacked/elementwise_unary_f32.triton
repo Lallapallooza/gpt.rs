@@ -1,4 +1,22 @@
-// gpt_rs.kernel: elementwise_unary_f32
-// gpt_rs.symbol: gpt_rs_triton_ewise_unary_f32
-// args: in_ptr(*fp32), out_ptr(*fp32), n(u32), op(u32)
-// op mapping: 0=neg,1=abs
+# gpt_rs.kernel: elementwise_unary_f32
+# gpt_rs.symbol: gpt_rs_triton_ewise_unary_f32
+# gpt_rs.signature: in_ptr=*fp32,out_ptr=*fp32,n=i32,op=i32
+# gpt_rs.param_abi: *fp32,*fp32,u32,u32,*opaque
+# gpt_rs.constexpr: BLOCK_SIZE=256
+# gpt_rs.num_warps: 8
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def gpt_rs_triton_ewise_unary_f32(in_ptr, out_ptr, n, op, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n
+
+    x = tl.load(in_ptr + offs, mask=mask, other=0.0)
+    neg = -x
+    absv = tl.abs(x)
+    out = tl.where(op == 0, neg, absv)
+    tl.store(out_ptr + offs, out, mask=mask)

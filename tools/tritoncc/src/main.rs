@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 struct KernelMeta {
     schema_version: u32,
@@ -21,6 +22,24 @@ enum KernelKind {
     ElementwiseBinaryF32,
     ElementwiseUnaryF32,
     Placeholder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompileBackend {
+    Python,
+    Builtin,
+}
+
+impl CompileBackend {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "python" | "py" => Ok(Self::Python),
+            "builtin" | "bootstrap" => Ok(Self::Builtin),
+            other => Err(format!(
+                "unknown compile backend '{other}', expected one of: python, builtin"
+            )),
+        }
+    }
 }
 
 fn main() {
@@ -57,6 +76,7 @@ fn run_compile(raw_args: Vec<String>) -> Result<(), String> {
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut meta: Option<PathBuf> = None;
+    let mut backend: Option<String> = None;
 
     let mut i = 0usize;
     while i < raw_args.len() {
@@ -77,6 +97,10 @@ fn run_compile(raw_args: Vec<String>) -> Result<(), String> {
                 i += 1;
                 meta = raw_args.get(i).map(PathBuf::from);
             }
+            "--backend" => {
+                i += 1;
+                backend = raw_args.get(i).cloned();
+            }
             flag => return Err(format!("unknown compile flag '{flag}'")),
         }
         i += 1;
@@ -86,8 +110,99 @@ fn run_compile(raw_args: Vec<String>) -> Result<(), String> {
     let input = input.ok_or_else(|| "missing required --in".to_string())?;
     let output = output.ok_or_else(|| "missing required --out".to_string())?;
     let meta = meta.ok_or_else(|| "missing required --meta".to_string())?;
+    let backend = resolve_compile_backend(backend)?;
 
-    let source = fs::read_to_string(&input)
+    match backend {
+        CompileBackend::Python => run_python_compile(&arch, &input, &output, &meta),
+        CompileBackend::Builtin => run_builtin_compile(&arch, &input, &output, &meta),
+    }
+}
+
+fn resolve_compile_backend(backend_flag: Option<String>) -> Result<CompileBackend, String> {
+    if let Some(value) = backend_flag {
+        return CompileBackend::parse(&value);
+    }
+    if let Ok(value) = env::var("TRITONCC_BACKEND") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return CompileBackend::parse(trimmed);
+        }
+    }
+    CompileBackend::parse("python")
+}
+
+fn run_python_compile(arch: &str, input: &Path, output: &Path, meta: &Path) -> Result<(), String> {
+    let script = triton_python_script()?;
+    let output_result = Command::new("uv")
+        .arg("run")
+        .arg("python")
+        .arg(&script)
+        .arg("--arch")
+        .arg(arch)
+        .arg("--in")
+        .arg(input)
+        .arg("--out")
+        .arg(output)
+        .arg("--meta")
+        .arg(meta)
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to invoke python backend via uv for script {}: {err}",
+                script.display()
+            )
+        })?;
+
+    if !output_result.status.success() {
+        let stdout = String::from_utf8_lossy(&output_result.stdout);
+        let stderr = String::from_utf8_lossy(&output_result.stderr);
+        return Err(format!(
+            "python backend compilation failed (status={}): stdout='{}' stderr='{}'",
+            output_result.status,
+            stdout.trim(),
+            stderr.trim()
+        ));
+    }
+
+    if !output_result.stdout.is_empty() {
+        print!("{}", String::from_utf8_lossy(&output_result.stdout));
+    }
+    if !output_result.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output_result.stderr));
+    }
+    Ok(())
+}
+
+fn triton_python_script() -> Result<PathBuf, String> {
+    if let Ok(value) = env::var("TRITONCC_PY_SCRIPT") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            let path = PathBuf::from(trimmed);
+            if path.exists() {
+                return Ok(path);
+            }
+            return Err(format!(
+                "TRITONCC_PY_SCRIPT points to a missing file: {}",
+                path.display()
+            ));
+        }
+    }
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("compile_with_triton.py");
+    if path.exists() {
+        Ok(path)
+    } else {
+        Err(format!(
+            "python compile script not found at {}",
+            path.display()
+        ))
+    }
+}
+
+fn run_builtin_compile(arch: &str, input: &Path, output: &Path, meta: &Path) -> Result<(), String> {
+    let source = fs::read_to_string(input)
         .map_err(|e| format!("failed to read input {}: {e}", input.display()))?;
 
     let kernel_kind = detect_kernel_kind(&source);
@@ -98,22 +213,24 @@ fn run_compile(raw_args: Vec<String>) -> Result<(), String> {
         .collect::<Vec<_>>()
         .join("\n");
     let ptx = match kernel_kind {
-        KernelKind::ElementwiseBinaryF32 => emit_elementwise_binary_ptx(&arch),
-        KernelKind::ElementwiseUnaryF32 => emit_elementwise_unary_ptx(&arch),
-        KernelKind::Placeholder => emit_placeholder_ptx(&arch, input.display().to_string(), source_preview),
+        KernelKind::ElementwiseBinaryF32 => emit_elementwise_binary_ptx(arch),
+        KernelKind::ElementwiseUnaryF32 => emit_elementwise_unary_ptx(arch),
+        KernelKind::Placeholder => {
+            emit_placeholder_ptx(arch, input.display().to_string(), source_preview)
+        }
     };
 
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create output dir {}: {e}", parent.display()))?;
     }
-    fs::write(&output, ptx)
+    fs::write(output, ptx)
         .map_err(|e| format!("failed to write output {}: {e}", output.display()))?;
 
     let kernel_symbol = match kernel_kind {
         KernelKind::ElementwiseBinaryF32 => "gpt_rs_triton_ewise_binary_f32".to_string(),
         KernelKind::ElementwiseUnaryF32 => "gpt_rs_triton_ewise_unary_f32".to_string(),
-        KernelKind::Placeholder => derive_symbol_name(&input),
+        KernelKind::Placeholder => derive_symbol_name(input),
     };
     let param_abi = match kernel_kind {
         KernelKind::ElementwiseBinaryF32 => {
@@ -133,7 +250,11 @@ fn run_compile(raw_args: Vec<String>) -> Result<(), String> {
                 "u32".to_string(),
             ]
         }
-        KernelKind::Placeholder => vec!["*fp32".to_string(), "*fp32".to_string(), "i32".to_string()],
+        KernelKind::Placeholder => vec![
+            "*fp32".to_string(),
+            "*fp32".to_string(),
+            "i32".to_string(),
+        ],
     };
     let note = match kernel_kind {
         KernelKind::ElementwiseBinaryF32 => "elementwise binary PTX emitted by tritoncc",
@@ -144,7 +265,7 @@ fn run_compile(raw_args: Vec<String>) -> Result<(), String> {
         schema_version: 1,
         tool: "tritoncc",
         tool_version: "0.1.0",
-        arch,
+        arch: arch.to_string(),
         input: input.display().to_string(),
         output: output.display().to_string(),
         kernel_symbol,
@@ -158,7 +279,7 @@ fn run_compile(raw_args: Vec<String>) -> Result<(), String> {
         fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create metadata dir {}: {e}", parent.display()))?;
     }
-    fs::write(&meta, encode_meta_json(&meta_doc))
+    fs::write(meta, encode_meta_json(&meta_doc))
         .map_err(|e| format!("failed to write metadata {}: {e}", meta.display()))?;
 
     println!("compiled {} -> {}", input.display(), output.display());
@@ -171,8 +292,8 @@ fn run_inspect(raw_args: Vec<String>) -> Result<(), String> {
         return Err("inspect requires input path".to_string());
     }
     let input = PathBuf::from(&raw_args[0]);
-    let source = fs::read_to_string(&input)
-        .map_err(|e| format!("failed to read input {}: {e}", input.display()))?;
+    let source =
+        fs::read_to_string(&input).map_err(|e| format!("failed to read input {}: {e}", input.display()))?;
     println!("input={}", input.display());
     println!("bytes={}", source.len());
     println!("lines={}", source.lines().count());
@@ -419,7 +540,10 @@ fn json_escape(input: &str) -> String {
 fn print_help() {
     println!("tritoncc 0.1.0");
     println!("Usage:");
-    println!("  tritoncc compile --arch <sm_xx> --in <kernel.triton> --out <kernel.ptx> --meta <kernel.meta.json>");
+    println!("  tritoncc compile --arch <sm_xx> --in <kernel.triton> --out <kernel.ptx> --meta <kernel.meta.json> [--backend <python|builtin>]");
     println!("  tritoncc inspect <kernel.triton>");
     println!("  tritoncc version");
+    println!("Env:");
+    println!("  TRITONCC_BACKEND=python|builtin (default: python)");
+    println!("  TRITONCC_PY_SCRIPT=/path/to/compile_with_triton.py");
 }

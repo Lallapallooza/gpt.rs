@@ -215,12 +215,16 @@ impl TritonExecutor {
         let mut out_ptr = out.buffer.device_ptr();
         let mut n = count_u32;
         let mut op_u32 = opcode;
+        // Python Triton-compiled kernels currently expose one trailing opaque
+        // pointer parameter; built-in kernels ignore this extra argument.
+        let mut opaque_ptr = 0u64;
         let mut params = [
             (&mut lhs_ptr as *mut u64).cast::<c_void>(),
             (&mut rhs_ptr as *mut u64).cast::<c_void>(),
             (&mut out_ptr as *mut u64).cast::<c_void>(),
             (&mut n as *mut u32).cast::<c_void>(),
             (&mut op_u32 as *mut u32).cast::<c_void>(),
+            (&mut opaque_ptr as *mut u64).cast::<c_void>(),
         ];
         driver.launch_kernel(
             &loaded.function,
@@ -274,11 +278,15 @@ impl TritonExecutor {
         let mut out_ptr = out.buffer.device_ptr();
         let mut n = count_u32;
         let mut op_u32 = opcode;
+        // Python Triton-compiled kernels currently expose one trailing opaque
+        // pointer parameter; built-in kernels ignore this extra argument.
+        let mut opaque_ptr = 0u64;
         let mut params = [
             (&mut in_ptr as *mut u64).cast::<c_void>(),
             (&mut out_ptr as *mut u64).cast::<c_void>(),
             (&mut n as *mut u32).cast::<c_void>(),
             (&mut op_u32 as *mut u32).cast::<c_void>(),
+            (&mut opaque_ptr as *mut u64).cast::<c_void>(),
         ];
         driver.launch_kernel(
             &loaded.function,

@@ -33,6 +33,11 @@ type CuMemcpyDtoHV2Fn = unsafe extern "C" fn(
     src_device: CUdeviceptr,
     byte_count: usize,
 ) -> CUresult;
+type CuMemcpyDtoDV2Fn = unsafe extern "C" fn(
+    dst_device: CUdeviceptr,
+    src_device: CUdeviceptr,
+    byte_count: usize,
+) -> CUresult;
 type CuMemsetD8V2Fn =
     unsafe extern "C" fn(dst_device: CUdeviceptr, value: u8, count: usize) -> CUresult;
 type CuModuleLoadDataExFn = unsafe extern "C" fn(
@@ -69,6 +74,7 @@ struct DriverFns {
     cu_mem_free_v2: CuMemFreeV2Fn,
     cu_memcpy_hto_d_v2: CuMemcpyHtoDV2Fn,
     cu_memcpy_dto_h_v2: CuMemcpyDtoHV2Fn,
+    cu_memcpy_dto_d_v2: CuMemcpyDtoDV2Fn,
     cu_memset_d8_v2: CuMemsetD8V2Fn,
     cu_module_load_data_ex: CuModuleLoadDataExFn,
     cu_module_unload: CuModuleUnloadFn,
@@ -183,6 +189,7 @@ impl CudaDriver {
             cu_mem_free_v2: load_symbol(&lib, b"cuMemFree_v2\0")?,
             cu_memcpy_hto_d_v2: load_symbol(&lib, b"cuMemcpyHtoD_v2\0")?,
             cu_memcpy_dto_h_v2: load_symbol(&lib, b"cuMemcpyDtoH_v2\0")?,
+            cu_memcpy_dto_d_v2: load_symbol(&lib, b"cuMemcpyDtoD_v2\0")?,
             cu_memset_d8_v2: load_symbol(&lib, b"cuMemsetD8_v2\0")?,
             cu_module_load_data_ex: load_symbol(&lib, b"cuModuleLoadDataEx\0")?,
             cu_module_unload: load_symbol(&lib, b"cuModuleUnload\0")?,
@@ -259,6 +266,26 @@ impl CudaDriver {
             }
         }
         Ok(out)
+    }
+
+    pub fn copy_device_to_device(
+        &self,
+        dst: CUdeviceptr,
+        src: CUdeviceptr,
+        bytes: usize,
+    ) -> BackendResult<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        self.ensure_current()?;
+        // SAFETY: src/dst pointers are valid CUDA allocations and byte range is provided by caller.
+        unsafe {
+            check_cuda(
+                (self.fns.cu_memcpy_dto_d_v2)(dst, src, bytes),
+                "cuMemcpyDtoD_v2",
+            )?;
+        }
+        Ok(())
     }
 
     fn alloc(self: &Arc<Self>, bytes: usize) -> BackendResult<Arc<DeviceBuffer>> {

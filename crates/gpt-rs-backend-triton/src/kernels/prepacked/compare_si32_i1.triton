@@ -1,0 +1,34 @@
+# gpt_rs.kernel: compare_si32_i1
+# gpt_rs.symbol: gpt_rs_triton_compare_si32_i1
+# gpt_rs.signature: lhs_ptr=*i32,rhs_ptr=*i32,out_ptr=*i8,n=i32,op=i32
+# gpt_rs.param_abi: *i32,*i32,*i8,u32,u32,*opaque
+# gpt_rs.constexpr: BLOCK_SIZE=256
+# gpt_rs.num_warps: 8
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def gpt_rs_triton_compare_si32_i1(lhs_ptr, rhs_ptr, out_ptr, n, op, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n
+
+    lhs = tl.load(lhs_ptr + offs, mask=mask, other=0)
+    rhs = tl.load(rhs_ptr + offs, mask=mask, other=0)
+
+    lt = lhs < rhs
+    le = lhs <= rhs
+    eq = lhs == rhs
+    ge = lhs >= rhs
+    gt = lhs > rhs
+    ne = lhs != rhs
+
+    pred = tl.where(
+        op == 0,
+        lt,
+        tl.where(op == 1, le, tl.where(op == 2, eq, tl.where(op == 3, ge, tl.where(op == 4, gt, ne)))),
+    )
+    out = pred.to(tl.int8)
+    tl.store(out_ptr + offs, out, mask=mask)

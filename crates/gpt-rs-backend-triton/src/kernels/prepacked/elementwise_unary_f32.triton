@@ -18,5 +18,43 @@ def gpt_rs_triton_ewise_unary_f32(in_ptr, out_ptr, n, op, BLOCK_SIZE: tl.constex
     x = tl.load(in_ptr + offs, mask=mask, other=0.0)
     neg = -x
     absv = tl.abs(x)
-    out = tl.where(op == 0, neg, absv)
+    expv = tl.exp(x)
+    logv = tl.log(x)
+
+    # tanh(x) via exp identity to keep compatibility with Triton versions
+    # where tl.math.tanh is unavailable.
+    ex2 = tl.exp(2.0 * x)
+    tanhv = (ex2 - 1.0) / (ex2 + 1.0)
+
+    # erf approximation (Abramowitz-Stegun 7.1.26).
+    sign = tl.where(x < 0.0, -1.0, 1.0)
+    ax = tl.abs(x)
+    t = 1.0 / (1.0 + 0.3275911 * ax)
+    poly = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t
+    erfv = sign * (1.0 - poly * tl.exp(-(ax * ax)))
+
+    rsqrtv = 1.0 / tl.sqrt(x)
+    recipv = 1.0 / x
+
+    out = tl.where(
+        op == 0,
+        neg,
+        tl.where(
+            op == 1,
+            absv,
+            tl.where(
+                op == 2,
+                expv,
+                tl.where(
+                    op == 3,
+                    logv,
+                    tl.where(
+                        op == 4,
+                        tanhv,
+                        tl.where(op == 5, erfv, tl.where(op == 6, rsqrtv, recipv)),
+                    ),
+                ),
+            ),
+        ),
+    )
     tl.store(out_ptr + offs, out, mask=mask)

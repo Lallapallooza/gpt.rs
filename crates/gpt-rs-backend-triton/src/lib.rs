@@ -140,7 +140,7 @@ impl ConversionTarget for TritonConversionTarget {
     }
 
     fn version(&self) -> u64 {
-        2
+        3
     }
 
     fn file_extension(&self) -> &str {
@@ -208,12 +208,24 @@ fn triton_legality_spec() -> LegalitySpec {
             OperationKind::Constant,
             OperationKind::StopGradient,
             OperationKind::Reshape,
+            OperationKind::Transpose,
             OperationKind::ElementwiseUnary,
             OperationKind::ElementwiseBinary,
             OperationKind::DotGeneral,
             OperationKind::Reduce,
+            OperationKind::BroadcastTo,
+            OperationKind::Slice,
+            OperationKind::Concat,
+            OperationKind::Iota,
+            OperationKind::Compare,
+            OperationKind::Select,
+            OperationKind::Take,
+            OperationKind::DynamicSlice,
+            OperationKind::DynamicUpdateSlice,
+            OperationKind::ExtractPatches,
+            OperationKind::ReduceWindow,
         ])
-        .allow_dtypes([DType::F32])
+        .allow_dtypes([DType::F32, DType::Si32, DType::I1])
         .with_dynamic_dims(false)
 }
 

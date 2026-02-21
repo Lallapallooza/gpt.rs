@@ -1,0 +1,52 @@
+# gpt_rs.kernel: dynamic_update_slice_f32_rank4
+# gpt_rs.symbol: gpt_rs_triton_dynamic_update_slice_f32_rank4
+# gpt_rs.signature: update_ptr=*fp32,out_ptr=*fp32,n=i32,ud0=i32,ud1=i32,ud2=i32,ud3=i32,os0=i32,os1=i32,os2=i32,os3=i32,st0=i32,st1=i32,st2=i32,st3=i32
+# gpt_rs.param_abi: *fp32,*fp32,u32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,*opaque
+# gpt_rs.constexpr: BLOCK_SIZE=256
+# gpt_rs.num_warps: 8
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def gpt_rs_triton_dynamic_update_slice_f32_rank4(
+    update_ptr,
+    out_ptr,
+    n,
+    ud0,
+    ud1,
+    ud2,
+    ud3,
+    os0,
+    os1,
+    os2,
+    os3,
+    st0,
+    st1,
+    st2,
+    st3,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = idx < n
+
+    plane23 = ud2 * ud3
+    plane123 = ud1 * plane23
+
+    u0 = idx // plane123
+    rem0 = idx - u0 * plane123
+    u1 = rem0 // plane23
+    rem1 = rem0 - u1 * plane23
+    u2 = rem1 // ud3
+    u3 = rem1 - u2 * ud3
+
+    o0 = u0 + st0
+    o1 = u1 + st1
+    o2 = u2 + st2
+    o3 = u3 + st3
+
+    out_off = o0 * os0 + o1 * os1 + o2 * os2 + o3 * os3
+    values = tl.load(update_ptr + idx, mask=mask, other=0.0)
+    tl.store(out_ptr + out_off, values, mask=mask)

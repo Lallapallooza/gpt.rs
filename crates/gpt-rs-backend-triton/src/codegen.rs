@@ -1,11 +1,16 @@
 use gpt_rs::backend::conversion::{ConversionError, ConversionResult};
 use gpt_rs::backend::spec::{
-    DType, ElementwiseUnaryOp, Function, Operand, Operation, Program, ReduceKind, ValueType,
+    DType, ElementwiseUnaryOp, Function, Operand, Operation, Program, ReduceKind, TensorSpec,
+    ValueType,
 };
 
 use crate::artifact::TritonArtifact;
 use crate::kernels::{
-    elementwise_binary_kernel_spec, elementwise_unary_kernel_spec, prepacked_kernel_sources,
+    broadcast_kernel_spec, broadcast_si32_kernel_spec, compare_si32_i1_kernel_spec,
+    concat_kernel_spec, dynamic_update_slice_f32_kernel_spec, elementwise_binary_kernel_spec,
+    elementwise_unary_kernel_spec, extract_patches_nhwc_kernel_spec, iota_si32_kernel_spec,
+    prepacked_kernel_sources, reduce_max_last_axis_kernel_spec, reduce_window_max_nhwc_kernel_spec,
+    select_i1_f32_kernel_spec, slice_kernel_spec, take_f32_i32_kernel_spec, transpose_kernel_spec,
 };
 
 pub fn lower_program_to_artifact(
@@ -17,26 +22,27 @@ pub fn lower_program_to_artifact(
     let _ = prepacked_kernel_sources();
 
     let function = entry_function(program)?;
-
-    let mut has_elementwise_binary = false;
-    let mut has_elementwise_unary = false;
     for instruction in &function.body {
         validate_instruction(function, instruction)?;
-        if matches!(instruction.op, Operation::ElementwiseUnary(_)) {
-            has_elementwise_unary = true;
-        }
-        if matches!(instruction.op, Operation::ElementwiseBinary(_)) {
-            has_elementwise_binary = true;
-        }
     }
 
-    let mut kernels = Vec::new();
-    if has_elementwise_unary {
-        kernels.push(elementwise_unary_kernel_spec());
-    }
-    if has_elementwise_binary {
-        kernels.push(elementwise_binary_kernel_spec());
-    }
+    let kernels = vec![
+        elementwise_unary_kernel_spec(),
+        elementwise_binary_kernel_spec(),
+        broadcast_kernel_spec(),
+        broadcast_si32_kernel_spec(),
+        slice_kernel_spec(),
+        transpose_kernel_spec(),
+        concat_kernel_spec(),
+        reduce_max_last_axis_kernel_spec(),
+        iota_si32_kernel_spec(),
+        compare_si32_i1_kernel_spec(),
+        select_i1_f32_kernel_spec(),
+        take_f32_i32_kernel_spec(),
+        dynamic_update_slice_f32_kernel_spec(),
+        extract_patches_nhwc_kernel_spec(),
+        reduce_window_max_nhwc_kernel_spec(),
+    ];
 
     Ok(TritonArtifact::new(
         entrypoint_symbol.to_string(),
@@ -51,9 +57,9 @@ fn validate_instruction(
 ) -> ConversionResult<()> {
     match &instruction.op {
         Operation::Constant(literal) => {
-            if literal.spec.dtype != DType::F32 {
+            if !matches!(literal.spec.dtype, DType::F32 | DType::Si32 | DType::I1) {
                 return Err(ConversionError::new(format!(
-                    "triton constant lowering supports F32 only, got {:?}",
+                    "triton constant lowering supports F32/Si32/I1 only, got {:?}",
                     literal.spec.dtype
                 )));
             }
@@ -61,111 +67,323 @@ fn validate_instruction(
             Ok(())
         }
         Operation::StopGradient | Operation::Reshape(_) => {
-            let _ = operand_value_id(instruction.operands.first(), "alias source")?;
+            let _ = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.first(),
+                "alias source",
+            )?;
             ensure_tensor_output(&instruction.output)?;
             Ok(())
         }
         Operation::ElementwiseUnary(op) => {
-            let input_id = operand_value_id(instruction.operands.first(), "elementwise unary")?;
-            let input_spec = operand_tensor_spec(function, input_id).ok_or_else(|| {
-                ConversionError::new("failed to resolve elementwise unary input spec")
-            })?;
+            let input_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.first(),
+                "elementwise unary input",
+            )?;
             let out_spec = ensure_tensor_output(&instruction.output)?;
-            if input_spec.dtype != DType::F32 || out_spec.dtype != DType::F32 {
+            if input_spec != out_spec || input_spec.dtype != DType::F32 {
                 return Err(ConversionError::new(
-                    "triton elementwise unary lowering supports F32 only",
-                ));
-            }
-            if input_spec != out_spec {
-                return Err(ConversionError::new(
-                    "triton elementwise unary lowering requires equal tensor specs for input/out",
+                    "triton elementwise unary lowering requires matching F32 input/output specs",
                 ));
             }
             match op {
-                ElementwiseUnaryOp::Neg | ElementwiseUnaryOp::Abs => Ok(()),
-                _ => Err(ConversionError::new(format!(
-                    "triton elementwise unary lowering does not support op {:?}",
-                    op
-                ))),
+                ElementwiseUnaryOp::Neg
+                | ElementwiseUnaryOp::Abs
+                | ElementwiseUnaryOp::Exp
+                | ElementwiseUnaryOp::Log
+                | ElementwiseUnaryOp::Tanh
+                | ElementwiseUnaryOp::Erf
+                | ElementwiseUnaryOp::Rsqrt
+                | ElementwiseUnaryOp::Reciprocal => Ok(()),
             }
         }
         Operation::ElementwiseBinary(_) => {
-            let lhs_id = operand_value_id(instruction.operands.first(), "elementwise lhs")?;
-            let rhs_id = operand_value_id(instruction.operands.get(1), "elementwise rhs")?;
-            let lhs_spec = operand_tensor_spec(function, lhs_id)
-                .ok_or_else(|| ConversionError::new("failed to resolve elementwise lhs spec"))?;
-            let rhs_spec = operand_tensor_spec(function, rhs_id)
-                .ok_or_else(|| ConversionError::new("failed to resolve elementwise rhs spec"))?;
+            let lhs_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.first(),
+                "elementwise lhs",
+            )?;
+            let rhs_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.get(1),
+                "elementwise rhs",
+            )?;
             let out_spec = ensure_tensor_output(&instruction.output)?;
-            if lhs_spec.dtype != DType::F32
-                || rhs_spec.dtype != DType::F32
-                || out_spec.dtype != DType::F32
-            {
+            if lhs_spec != out_spec || rhs_spec != out_spec || out_spec.dtype != DType::F32 {
                 return Err(ConversionError::new(
-                    "triton elementwise lowering supports F32 only",
-                ));
-            }
-            if lhs_spec != out_spec || rhs_spec != out_spec {
-                return Err(ConversionError::new(
-                    "triton elementwise lowering requires equal tensor specs for lhs/rhs/out",
+                    "triton elementwise lowering requires equal F32 lhs/rhs/out specs",
                 ));
             }
             Ok(())
         }
-        Operation::DotGeneral(spec) => {
-            let lhs_id = operand_value_id(instruction.operands.first(), "dot lhs")?;
-            let rhs_id = operand_value_id(instruction.operands.get(1), "dot rhs")?;
-            let lhs_spec = operand_tensor_spec(function, lhs_id)
-                .ok_or_else(|| ConversionError::new("failed to resolve dot lhs spec"))?;
-            let rhs_spec = operand_tensor_spec(function, rhs_id)
-                .ok_or_else(|| ConversionError::new("failed to resolve dot rhs spec"))?;
+        Operation::DotGeneral(_) => {
+            let lhs_spec =
+                operand_tensor_spec_for_operand(function, instruction.operands.first(), "dot lhs")?;
+            let rhs_spec =
+                operand_tensor_spec_for_operand(function, instruction.operands.get(1), "dot rhs")?;
             let out_spec = ensure_tensor_output(&instruction.output)?;
-
             if lhs_spec.dtype != DType::F32
                 || rhs_spec.dtype != DType::F32
                 || out_spec.dtype != DType::F32
             {
                 return Err(ConversionError::new(
-                    "triton dot lowering supports F32 only",
-                ));
-            }
-            let supports_rank2 = spec.batch_lhs.is_empty()
-                && spec.batch_rhs.is_empty()
-                && spec.contract_lhs.as_slice() == [1]
-                && spec.contract_rhs.as_slice() == [0]
-                && lhs_spec.shape.rank() == 2
-                && rhs_spec.shape.rank() == 2
-                && out_spec.shape.rank() == 2;
-
-            let supports_batched_rank3 = spec.batch_lhs.as_slice() == [0]
-                && spec.batch_rhs.as_slice() == [0]
-                && spec.contract_lhs.as_slice() == [2]
-                && spec.contract_rhs.as_slice() == [1]
-                && lhs_spec.shape.rank() == 3
-                && rhs_spec.shape.rank() == 3
-                && out_spec.shape.rank() == 3;
-
-            if !(supports_rank2 || supports_batched_rank3) {
-                return Err(ConversionError::new(
-                    "triton dot lowering supports rank-2 MxK·KxN and rank-3 batched BxMxK · BxKxN",
+                    "triton dot lowering currently supports F32 only",
                 ));
             }
             Ok(())
         }
         Operation::Reduce(spec) => {
-            let input_id = operand_value_id(instruction.operands.first(), "reduce input")?;
-            let input_spec = operand_tensor_spec(function, input_id)
-                .ok_or_else(|| ConversionError::new("failed to resolve reduce input spec"))?;
+            let input_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.first(),
+                "reduce input",
+            )?;
             let out_spec = ensure_tensor_output(&instruction.output)?;
-
-            if spec.kind != ReduceKind::Sum {
+            if !matches!(spec.kind, ReduceKind::Sum | ReduceKind::Max) {
                 return Err(ConversionError::new(
-                    "triton reduce lowering supports sum only",
+                    "triton reduce lowering supports sum/max only",
                 ));
             }
             if input_spec.dtype != DType::F32 || out_spec.dtype != DType::F32 {
                 return Err(ConversionError::new(
-                    "triton reduce lowering supports F32 only",
+                    "triton reduce lowering currently supports F32 only",
+                ));
+            }
+            Ok(())
+        }
+        Operation::BroadcastTo(_) => {
+            let input_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.first(),
+                "broadcast input",
+            )?;
+            let out_spec = ensure_tensor_output(&instruction.output)?;
+            if input_spec.dtype != out_spec.dtype {
+                return Err(ConversionError::new(
+                    "triton broadcast lowering requires matching input/output dtype",
+                ));
+            }
+            if !matches!(out_spec.dtype, DType::F32 | DType::Si32) {
+                return Err(ConversionError::new(
+                    "triton broadcast lowering supports F32/Si32 only",
+                ));
+            }
+            Ok(())
+        }
+        Operation::Slice(_) => {
+            let input_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.first(),
+                "slice input",
+            )?;
+            let out_spec = ensure_tensor_output(&instruction.output)?;
+            if input_spec.dtype != out_spec.dtype {
+                return Err(ConversionError::new(
+                    "triton slice lowering requires matching input/output dtype",
+                ));
+            }
+            if !matches!(out_spec.dtype, DType::F32 | DType::Si32) {
+                return Err(ConversionError::new(
+                    "triton slice lowering supports F32/Si32 only",
+                ));
+            }
+            Ok(())
+        }
+        Operation::Transpose(_) => {
+            let input_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.first(),
+                "transpose input",
+            )?;
+            let out_spec = ensure_tensor_output(&instruction.output)?;
+            if input_spec.dtype != DType::F32 || out_spec.dtype != DType::F32 {
+                return Err(ConversionError::new(
+                    "triton transpose lowering currently supports F32 only",
+                ));
+            }
+            Ok(())
+        }
+        Operation::Concat(_) => {
+            let out_spec = ensure_tensor_output(&instruction.output)?;
+            if out_spec.dtype != DType::F32 {
+                return Err(ConversionError::new(
+                    "triton concat lowering currently supports F32 only",
+                ));
+            }
+            for operand in &instruction.operands {
+                let spec =
+                    operand_tensor_spec_for_operand(function, Some(operand), "concat input")?;
+                if spec.dtype != DType::F32 {
+                    return Err(ConversionError::new(
+                        "triton concat lowering currently supports F32 inputs only",
+                    ));
+                }
+            }
+            Ok(())
+        }
+        Operation::Iota(spec) => {
+            let out_spec = ensure_tensor_output(&instruction.output)?;
+            if spec.dtype != DType::Si32 || out_spec.dtype != DType::Si32 {
+                return Err(ConversionError::new(
+                    "triton iota lowering currently supports Si32 only",
+                ));
+            }
+            Ok(())
+        }
+        Operation::Compare(_) => {
+            let lhs_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.first(),
+                "compare lhs",
+            )?;
+            let rhs_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.get(1),
+                "compare rhs",
+            )?;
+            let out_spec = ensure_tensor_output(&instruction.output)?;
+            if lhs_spec.dtype != DType::Si32
+                || rhs_spec.dtype != DType::Si32
+                || out_spec.dtype != DType::I1
+            {
+                return Err(ConversionError::new(
+                    "triton compare lowering currently supports Si32 -> I1 only",
+                ));
+            }
+            Ok(())
+        }
+        Operation::Select => {
+            let pred_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.first(),
+                "select predicate",
+            )?;
+            let when_true_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.get(1),
+                "select true",
+            )?;
+            let when_false_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.get(2),
+                "select false",
+            )?;
+            let out_spec = ensure_tensor_output(&instruction.output)?;
+            if pred_spec.dtype != DType::I1
+                || when_true_spec.dtype != DType::F32
+                || when_false_spec.dtype != DType::F32
+                || out_spec.dtype != DType::F32
+            {
+                return Err(ConversionError::new(
+                    "triton select lowering currently supports I1 predicate with F32 branches",
+                ));
+            }
+            Ok(())
+        }
+        Operation::Take => {
+            let params_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.first(),
+                "take params",
+            )?;
+            let indices_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.get(1),
+                "take indices",
+            )?;
+            let out_spec = ensure_tensor_output(&instruction.output)?;
+            if params_spec.dtype != DType::F32
+                || indices_spec.dtype != DType::Si32
+                || out_spec.dtype != DType::F32
+            {
+                return Err(ConversionError::new(
+                    "triton take lowering currently supports F32 params and Si32 indices",
+                ));
+            }
+            Ok(())
+        }
+        Operation::DynamicSlice(_) => {
+            let value_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.first(),
+                "dynamic_slice value",
+            )?;
+            let starts_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.get(1),
+                "dynamic_slice starts",
+            )?;
+            let out_spec = ensure_tensor_output(&instruction.output)?;
+            if starts_spec.dtype != DType::Si32 || value_spec.dtype != out_spec.dtype {
+                return Err(ConversionError::new(
+                    "triton dynamic_slice lowering requires Si32 starts and matching value/output dtype",
+                ));
+            }
+            if !matches!(out_spec.dtype, DType::F32 | DType::Si32) {
+                return Err(ConversionError::new(
+                    "triton dynamic_slice lowering supports F32/Si32 outputs only",
+                ));
+            }
+            Ok(())
+        }
+        Operation::DynamicUpdateSlice(_) => {
+            let base_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.first(),
+                "dynamic_update_slice base",
+            )?;
+            let update_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.get(1),
+                "dynamic_update_slice update",
+            )?;
+            let starts_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.get(2),
+                "dynamic_update_slice starts",
+            )?;
+            let out_spec = ensure_tensor_output(&instruction.output)?;
+            if base_spec.dtype != DType::F32
+                || update_spec.dtype != DType::F32
+                || starts_spec.dtype != DType::Si32
+                || out_spec.dtype != DType::F32
+            {
+                return Err(ConversionError::new(
+                    "triton dynamic_update_slice lowering currently supports F32 base/update with Si32 starts",
+                ));
+            }
+            Ok(())
+        }
+        Operation::ExtractPatches(_) => {
+            let input_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.first(),
+                "extract_patches input",
+            )?;
+            let out_spec = ensure_tensor_output(&instruction.output)?;
+            if input_spec.dtype != DType::F32 || out_spec.dtype != DType::F32 {
+                return Err(ConversionError::new(
+                    "triton extract_patches lowering currently supports F32 only",
+                ));
+            }
+            Ok(())
+        }
+        Operation::ReduceWindow(spec) => {
+            let input_spec = operand_tensor_spec_for_operand(
+                function,
+                instruction.operands.first(),
+                "reduce_window input",
+            )?;
+            let out_spec = ensure_tensor_output(&instruction.output)?;
+            if spec.reduce != ReduceKind::Max {
+                return Err(ConversionError::new(
+                    "triton reduce_window lowering currently supports max only",
+                ));
+            }
+            if input_spec.dtype != DType::F32 || out_spec.dtype != DType::F32 {
+                return Err(ConversionError::new(
+                    "triton reduce_window lowering currently supports F32 only",
                 ));
             }
             Ok(())
@@ -185,7 +403,7 @@ fn entry_function(program: &Program) -> ConversionResult<&Function> {
         .ok_or_else(|| ConversionError::new("entry function not found"))
 }
 
-fn ensure_tensor_output(output: &ValueType) -> ConversionResult<gpt_rs::backend::spec::TensorSpec> {
+fn ensure_tensor_output(output: &ValueType) -> ConversionResult<TensorSpec> {
     match output {
         ValueType::Tensor(spec) => Ok(spec.clone()),
         ValueType::Tuple(_) => Err(ConversionError::new(
@@ -194,23 +412,27 @@ fn ensure_tensor_output(output: &ValueType) -> ConversionResult<gpt_rs::backend:
     }
 }
 
-fn operand_value_id(operand: Option<&Operand>, what: &str) -> ConversionResult<u32> {
+fn operand_tensor_spec_for_operand(
+    function: &Function,
+    operand: Option<&Operand>,
+    what: &str,
+) -> ConversionResult<TensorSpec> {
     match operand {
-        Some(Operand::Value(id)) => Ok(id.0),
+        Some(Operand::Value(id)) => operand_tensor_spec(function, id.0).ok_or_else(|| {
+            ConversionError::new(format!(
+                "failed to resolve operand tensor spec for {what} value {}",
+                id.0
+            ))
+        }),
+        Some(Operand::Literal(literal)) => Ok(literal.spec.clone()),
         Some(Operand::TupleElement { .. }) => Err(ConversionError::new(format!(
-            "{what} uses tuple element operands, unsupported in triton lowering"
-        ))),
-        Some(Operand::Literal(_)) => Err(ConversionError::new(format!(
-            "{what} uses inline literal operands, unsupported in triton lowering"
+            "{what} uses tuple element operand, unsupported in triton lowering"
         ))),
         None => Err(ConversionError::new(format!("missing operand for {what}"))),
     }
 }
 
-fn operand_tensor_spec(
-    function: &Function,
-    value_id: u32,
-) -> Option<gpt_rs::backend::spec::TensorSpec> {
+fn operand_tensor_spec(function: &Function, value_id: u32) -> Option<TensorSpec> {
     if let Some((idx, _)) = function
         .parameter_ids
         .iter()

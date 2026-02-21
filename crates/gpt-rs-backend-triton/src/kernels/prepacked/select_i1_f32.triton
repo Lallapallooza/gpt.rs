@@ -1,0 +1,30 @@
+# gpt_rs.kernel: select_i1_f32
+# gpt_rs.symbol: gpt_rs_triton_select_i1_f32
+# gpt_rs.signature: pred_ptr=*i8,true_ptr=*fp32,false_ptr=*fp32,out_ptr=*fp32,n=i32
+# gpt_rs.param_abi: *i8,*fp32,*fp32,*fp32,u32,*opaque
+# gpt_rs.constexpr: BLOCK_SIZE=256
+# gpt_rs.num_warps: 8
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def gpt_rs_triton_select_i1_f32(
+    pred_ptr,
+    true_ptr,
+    false_ptr,
+    out_ptr,
+    n,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n
+
+    pred = tl.load(pred_ptr + offs, mask=mask, other=0).to(tl.int8)
+    tv = tl.load(true_ptr + offs, mask=mask, other=0.0)
+    fv = tl.load(false_ptr + offs, mask=mask, other=0.0)
+
+    out = tl.where(pred != 0, tv, fv)
+    tl.store(out_ptr + offs, out, mask=mask)

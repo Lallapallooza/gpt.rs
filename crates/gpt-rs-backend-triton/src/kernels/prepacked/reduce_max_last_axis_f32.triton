@@ -1,0 +1,37 @@
+# gpt_rs.kernel: reduce_max_last_axis_f32
+# gpt_rs.symbol: gpt_rs_triton_reduce_max_last_axis_f32
+# gpt_rs.signature: in_ptr=*fp32,out_ptr=*fp32,rows=i32,cols=i32
+# gpt_rs.param_abi: *fp32,*fp32,i32,i32,*opaque
+# gpt_rs.constexpr: BLOCK_SIZE=256
+# gpt_rs.num_warps: 8
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def gpt_rs_triton_reduce_max_last_axis_f32(
+    in_ptr,
+    out_ptr,
+    rows,
+    cols,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= rows:
+        return
+
+    offs = tl.arange(0, BLOCK_SIZE)
+    max_vals = tl.full([BLOCK_SIZE], -float("inf"), tl.float32)
+
+    col = 0
+    base = pid * cols
+    while col < cols:
+        idx = col + offs
+        mask = idx < cols
+        values = tl.load(in_ptr + base + idx, mask=mask, other=-float("inf"))
+        max_vals = tl.maximum(max_vals, values)
+        col += BLOCK_SIZE
+
+    row_max = tl.max(max_vals, axis=0)
+    tl.store(out_ptr + pid, row_max)

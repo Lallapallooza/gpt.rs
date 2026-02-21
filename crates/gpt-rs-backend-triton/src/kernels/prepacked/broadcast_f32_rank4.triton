@@ -1,0 +1,48 @@
+# gpt_rs.kernel: broadcast_f32_rank4
+# gpt_rs.symbol: gpt_rs_triton_broadcast_f32_rank4
+# gpt_rs.signature: in_ptr=*fp32,out_ptr=*fp32,n=i32,od0=i32,od1=i32,od2=i32,od3=i32,is0=i32,is1=i32,is2=i32,is3=i32
+# gpt_rs.param_abi: *fp32,*fp32,u32,i32,i32,i32,i32,i32,i32,i32,i32,*opaque
+# gpt_rs.constexpr: BLOCK_SIZE=256
+# gpt_rs.num_warps: 8
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def gpt_rs_triton_broadcast_f32_rank4(
+    in_ptr,
+    out_ptr,
+    n,
+    od0,
+    od1,
+    od2,
+    od3,
+    is0,
+    is1,
+    is2,
+    is3,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = idx < n
+
+    plane23 = od2 * od3
+    plane123 = od1 * plane23
+
+    o0 = idx // plane123
+    rem0 = idx - o0 * plane123
+    o1 = rem0 // plane23
+    rem1 = rem0 - o1 * plane23
+    o2 = rem1 // od3
+    o3 = rem1 - o2 * od3
+
+    i0 = tl.where(is0 == 0, 0, o0)
+    i1 = tl.where(is1 == 0, 0, o1)
+    i2 = tl.where(is2 == 0, 0, o2)
+    i3 = tl.where(is3 == 0, 0, o3)
+
+    in_off = i0 * is0 + i1 * is1 + i2 * is2 + i3 * is3
+    values = tl.load(in_ptr + in_off, mask=mask, other=0.0)
+    tl.store(out_ptr + idx, values, mask=mask)

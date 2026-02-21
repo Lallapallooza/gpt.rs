@@ -1,0 +1,61 @@
+# gpt_rs.kernel: concat_f32_rank4
+# gpt_rs.symbol: gpt_rs_triton_concat_f32_rank4
+# gpt_rs.signature: lhs_ptr=*fp32,rhs_ptr=*fp32,out_ptr=*fp32,n=i32,od0=i32,od1=i32,od2=i32,od3=i32,axis=i32,split=i32,ls0=i32,ls1=i32,ls2=i32,ls3=i32,rs0=i32,rs1=i32,rs2=i32,rs3=i32
+# gpt_rs.param_abi: *fp32,*fp32,*fp32,u32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,*opaque
+# gpt_rs.constexpr: BLOCK_SIZE=256
+# gpt_rs.num_warps: 8
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def gpt_rs_triton_concat_f32_rank4(
+    lhs_ptr,
+    rhs_ptr,
+    out_ptr,
+    n,
+    od0,
+    od1,
+    od2,
+    od3,
+    axis,
+    split,
+    ls0,
+    ls1,
+    ls2,
+    ls3,
+    rs0,
+    rs1,
+    rs2,
+    rs3,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = idx < n
+
+    plane23 = od2 * od3
+    plane123 = od1 * plane23
+
+    c0 = idx // plane123
+    rem0 = idx - c0 * plane123
+    c1 = rem0 // plane23
+    rem1 = rem0 - c1 * plane23
+    c2 = rem1 // od3
+    c3 = rem1 - c2 * od3
+
+    axis_coord = tl.where(axis == 0, c0, tl.where(axis == 1, c1, tl.where(axis == 2, c2, c3)))
+    from_lhs = axis_coord < split
+
+    lhs_off = c0 * ls0 + c1 * ls1 + c2 * ls2 + c3 * ls3
+    r0 = tl.where(axis == 0, axis_coord - split, c0)
+    r1 = tl.where(axis == 1, axis_coord - split, c1)
+    r2 = tl.where(axis == 2, axis_coord - split, c2)
+    r3 = tl.where(axis == 3, axis_coord - split, c3)
+    rhs_off = r0 * rs0 + r1 * rs1 + r2 * rs2 + r3 * rs3
+
+    lhs_val = tl.load(lhs_ptr + lhs_off, mask=mask & from_lhs, other=0.0)
+    rhs_val = tl.load(rhs_ptr + rhs_off, mask=mask & (~from_lhs), other=0.0)
+    out = tl.where(from_lhs, lhs_val, rhs_val)
+    tl.store(out_ptr + idx, out, mask=mask)

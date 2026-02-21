@@ -1,0 +1,38 @@
+# gpt_rs.kernel: iota_si32_rank4
+# gpt_rs.symbol: gpt_rs_triton_iota_si32_rank4
+# gpt_rs.signature: out_ptr=*i32,n=i32,od0=i32,od1=i32,od2=i32,od3=i32,axis=i32
+# gpt_rs.param_abi: *i32,u32,i32,i32,i32,i32,i32,*opaque
+# gpt_rs.constexpr: BLOCK_SIZE=256
+# gpt_rs.num_warps: 8
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def gpt_rs_triton_iota_si32_rank4(
+    out_ptr,
+    n,
+    od0,
+    od1,
+    od2,
+    od3,
+    axis,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = idx < n
+
+    plane23 = od2 * od3
+    plane123 = od1 * plane23
+
+    c0 = idx // plane123
+    rem0 = idx - c0 * plane123
+    c1 = rem0 // plane23
+    rem1 = rem0 - c1 * plane23
+    c2 = rem1 // od3
+    c3 = rem1 - c2 * od3
+
+    value = tl.where(axis == 0, c0, tl.where(axis == 1, c1, tl.where(axis == 2, c2, c3)))
+    tl.store(out_ptr + idx, value.to(tl.int32), mask=mask)

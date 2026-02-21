@@ -3,15 +3,22 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use gpt_rs::backend::spec::{
-    BackendError, BackendResult, DType, Dimension, ElementwiseBinaryOp, ElementwiseUnaryOp,
-    Operand, Operation, ReduceKind, TensorLiteral, TensorSpec, ValueId, ValueType,
+    BackendError, BackendResult, ComparisonOp, DType, Dimension, ElementwiseBinaryOp,
+    ElementwiseUnaryOp, Operand, Operation, ReduceKind, TensorLiteral, TensorSpec, ValueId,
+    ValueType,
 };
 use libloading::Library;
 
 use crate::artifact::TritonArtifact;
 use crate::compiler::KernelCompiler;
 use crate::device::{self, CudaDriver, CudaFunction, DeviceBuffer};
-use crate::kernels::{KernelKind, KernelSpec, EWISE_BINARY_KERNEL_ID, EWISE_UNARY_KERNEL_ID};
+use crate::kernels::{
+    KernelKind, KernelSpec, BROADCAST_KERNEL_ID, BROADCAST_SI32_KERNEL_ID,
+    COMPARE_SI32_I1_KERNEL_ID, CONCAT_KERNEL_ID, DYNAMIC_UPDATE_SLICE_F32_KERNEL_ID,
+    EWISE_BINARY_KERNEL_ID, EWISE_UNARY_KERNEL_ID, EXTRACT_PATCHES_NHWC_KERNEL_ID,
+    IOTA_SI32_KERNEL_ID, REDUCE_MAX_LAST_AXIS_KERNEL_ID, REDUCE_WINDOW_MAX_NHWC_KERNEL_ID,
+    SELECT_I1_F32_KERNEL_ID, SLICE_KERNEL_ID, TAKE_F32_I32_KERNEL_ID, TRANSPOSE_KERNEL_ID,
+};
 use crate::tensor::TritonTensor;
 
 pub struct TritonExecutor {
@@ -124,6 +131,106 @@ impl TritonExecutor {
                 })?;
                 self.execute_elementwise_unary(driver, kernel, *op, &input, &out_spec)
             }
+            Operation::BroadcastTo(_) => {
+                let input =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
+                let out_spec = output_tensor_spec(&instruction.output)?;
+                self.execute_broadcast(driver, kernels, &input, &out_spec)
+            }
+            Operation::Slice(spec) => {
+                let input =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
+                let out_spec = output_tensor_spec(&instruction.output)?;
+                self.execute_slice(driver, kernels, &input, spec, &out_spec)
+            }
+            Operation::DynamicSlice(spec) => {
+                let input =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
+                let starts =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.get(1))?;
+                let out_spec = output_tensor_spec(&instruction.output)?;
+                self.execute_dynamic_slice(driver, kernels, &input, &starts, spec, &out_spec)
+            }
+            Operation::Transpose(spec) => {
+                let input =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
+                let out_spec = output_tensor_spec(&instruction.output)?;
+                self.execute_transpose(driver, kernels, &input, spec, &out_spec)
+            }
+            Operation::Concat(spec) => {
+                if instruction.operands.len() != 2 {
+                    return Err(BackendError::execution(
+                        "triton concat runtime currently supports exactly two operands",
+                    ));
+                }
+                let lhs =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
+                let rhs =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.get(1))?;
+                let out_spec = output_tensor_spec(&instruction.output)?;
+                self.execute_concat(driver, kernels, &lhs, &rhs, spec, &out_spec)
+            }
+            Operation::Iota(spec) => {
+                let out_spec = output_tensor_spec(&instruction.output)?;
+                let kernel = kernels.get(IOTA_SI32_KERNEL_ID).ok_or_else(|| {
+                    BackendError::execution("missing iota kernel in triton artifact")
+                })?;
+                self.execute_iota(driver, kernel, spec, &out_spec)
+            }
+            Operation::Compare(spec) => {
+                let lhs =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
+                let rhs =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.get(1))?;
+                let out_spec = output_tensor_spec(&instruction.output)?;
+                let kernel = kernels.get(COMPARE_SI32_I1_KERNEL_ID).ok_or_else(|| {
+                    BackendError::execution("missing compare kernel in triton artifact")
+                })?;
+                self.execute_compare(driver, kernel, spec.op, &lhs, &rhs, &out_spec)
+            }
+            Operation::Select => {
+                let pred =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
+                let when_true =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.get(1))?;
+                let when_false =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.get(2))?;
+                let out_spec = output_tensor_spec(&instruction.output)?;
+                let kernel = kernels.get(SELECT_I1_F32_KERNEL_ID).ok_or_else(|| {
+                    BackendError::execution("missing select kernel in triton artifact")
+                })?;
+                self.execute_select(driver, kernel, &pred, &when_true, &when_false, &out_spec)
+            }
+            Operation::Take => {
+                let params =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
+                let indices =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.get(1))?;
+                let out_spec = output_tensor_spec(&instruction.output)?;
+                let kernel = kernels.get(TAKE_F32_I32_KERNEL_ID).ok_or_else(|| {
+                    BackendError::execution("missing take kernel in triton artifact")
+                })?;
+                self.execute_take(driver, kernel, &params, &indices, &out_spec)
+            }
+            Operation::DynamicUpdateSlice(_spec) => {
+                let base =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
+                let update =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.get(1))?;
+                let starts =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.get(2))?;
+                let out_spec = output_tensor_spec(&instruction.output)?;
+                let kernel = kernels
+                    .get(DYNAMIC_UPDATE_SLICE_F32_KERNEL_ID)
+                    .ok_or_else(|| {
+                        BackendError::execution(
+                            "missing dynamic_update_slice kernel in triton artifact",
+                        )
+                    })?;
+                self.execute_dynamic_update_slice(
+                    driver, kernel, &base, &update, &starts, &out_spec,
+                )
+            }
             Operation::DotGeneral(spec) => {
                 let lhs =
                     self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
@@ -142,7 +249,27 @@ impl TritonExecutor {
                 let input =
                     self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                self.execute_reduce_sum_last_axis(driver, &input.spec, &out_spec, spec, &input)
+                self.execute_reduce(driver, kernels, &input.spec, &out_spec, spec, &input)
+            }
+            Operation::ExtractPatches(spec) => {
+                let input =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
+                let out_spec = output_tensor_spec(&instruction.output)?;
+                let kernel = kernels.get(EXTRACT_PATCHES_NHWC_KERNEL_ID).ok_or_else(|| {
+                    BackendError::execution("missing extract_patches kernel in triton artifact")
+                })?;
+                self.execute_extract_patches(driver, kernel, &input, spec, &out_spec)
+            }
+            Operation::ReduceWindow(spec) => {
+                let input =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
+                let out_spec = output_tensor_spec(&instruction.output)?;
+                let kernel = kernels
+                    .get(REDUCE_WINDOW_MAX_NHWC_KERNEL_ID)
+                    .ok_or_else(|| {
+                        BackendError::execution("missing reduce_window kernel in triton artifact")
+                    })?;
+                self.execute_reduce_window(driver, kernel, &input, spec, &out_spec)
             }
             other => Err(BackendError::execution(format!(
                 "triton runtime does not support instruction op: {:?}",
@@ -299,6 +426,1051 @@ impl TritonExecutor {
         Ok(out)
     }
 
+    fn execute_broadcast(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernels: &HashMap<&str, &KernelSpec>,
+        input: &TritonTensor,
+        out_spec: &TensorSpec,
+    ) -> BackendResult<TritonTensor> {
+        if input.spec.dtype != out_spec.dtype {
+            return Err(BackendError::execution(
+                "broadcast input/output dtype mismatch",
+            ));
+        }
+        if !matches!(out_spec.dtype, DType::F32 | DType::Si32) {
+            return Err(BackendError::execution(format!(
+                "broadcast runtime supports F32/Si32 only, got {:?}",
+                out_spec.dtype
+            )));
+        }
+
+        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let element_count = static_element_count(&out_spec.shape)?;
+        if element_count == 0 {
+            return Ok(out);
+        }
+
+        let kernel_id = match out_spec.dtype {
+            DType::F32 => BROADCAST_KERNEL_ID,
+            DType::Si32 => BROADCAST_SI32_KERNEL_ID,
+            _ => {
+                return Err(BackendError::execution(format!(
+                    "unsupported broadcast dtype {:?}",
+                    out_spec.dtype
+                )))
+            }
+        };
+        let kernel = kernels.get(kernel_id).ok_or_else(|| {
+            BackendError::execution(format!("missing broadcast kernel {kernel_id} in artifact"))
+        })?;
+        let expected_kind = match out_spec.dtype {
+            DType::F32 => KernelKind::BroadcastF32Rank4,
+            DType::Si32 => KernelKind::BroadcastSi32Rank4,
+            _ => unreachable!(),
+        };
+        if kernel.kind != expected_kind {
+            return Err(BackendError::execution(format!(
+                "unexpected broadcast kernel kind: {:?}",
+                kernel.kind
+            )));
+        }
+
+        let (out_dims, in_strides) = broadcast_rank4_layout(&input.spec.shape, &out_spec.shape)?;
+        let loaded = self.load_kernel(driver, kernel)?;
+
+        let mut in_ptr = input.buffer.device_ptr();
+        let mut out_ptr = out.buffer.device_ptr();
+        let mut n = usize_to_u32(element_count, "broadcast element count")?;
+        let mut od0 = out_dims[0];
+        let mut od1 = out_dims[1];
+        let mut od2 = out_dims[2];
+        let mut od3 = out_dims[3];
+        let mut is0 = in_strides[0];
+        let mut is1 = in_strides[1];
+        let mut is2 = in_strides[2];
+        let mut is3 = in_strides[3];
+        let mut opaque_ptr = 0u64;
+        let mut params = [
+            (&mut in_ptr as *mut u64).cast::<c_void>(),
+            (&mut out_ptr as *mut u64).cast::<c_void>(),
+            (&mut n as *mut u32).cast::<c_void>(),
+            (&mut od0 as *mut i32).cast::<c_void>(),
+            (&mut od1 as *mut i32).cast::<c_void>(),
+            (&mut od2 as *mut i32).cast::<c_void>(),
+            (&mut od3 as *mut i32).cast::<c_void>(),
+            (&mut is0 as *mut i32).cast::<c_void>(),
+            (&mut is1 as *mut i32).cast::<c_void>(),
+            (&mut is2 as *mut i32).cast::<c_void>(),
+            (&mut is3 as *mut i32).cast::<c_void>(),
+            (&mut opaque_ptr as *mut u64).cast::<c_void>(),
+        ];
+        launch_1d(driver, &loaded.function, n, 256, &mut params)?;
+        Ok(out)
+    }
+
+    fn execute_slice(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernels: &HashMap<&str, &KernelSpec>,
+        input: &TritonTensor,
+        spec: &gpt_rs::backend::spec::SliceSpec,
+        out_spec: &TensorSpec,
+    ) -> BackendResult<TritonTensor> {
+        if input.spec.dtype != out_spec.dtype {
+            return Err(BackendError::execution("slice input/output dtype mismatch"));
+        }
+        if spec.starts.len() != spec.sizes.len() {
+            return Err(BackendError::execution(
+                "slice starts and sizes length mismatch",
+            ));
+        }
+
+        match out_spec.dtype {
+            DType::F32 => self.execute_slice_f32(driver, kernels, input, &spec.starts, out_spec),
+            DType::Si32 => {
+                // Minimal i32 slice support for attention decode path (rank-1).
+                let in_dims = static_dims(&input.spec.shape)?;
+                let out_dims = static_dims(&out_spec.shape)?;
+                if in_dims.len() != 1 || out_dims.len() != 1 || spec.starts.len() != 1 {
+                    return Err(BackendError::execution(
+                        "slice Si32 path currently supports rank-1 only",
+                    ));
+                }
+                let start = spec.starts[0];
+                let len = out_dims[0];
+                if match start.checked_add(len) {
+                    Some(end) => end > in_dims[0],
+                    None => true,
+                } {
+                    return Err(BackendError::execution("slice Si32 bounds check failed"));
+                }
+                let out =
+                    TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+                let offset_bytes = start
+                    .checked_mul(4)
+                    .ok_or_else(|| BackendError::execution("slice Si32 offset overflow"))?;
+                let src_ptr = input
+                    .buffer
+                    .device_ptr()
+                    .checked_add(u64::try_from(offset_bytes).map_err(|_| {
+                        BackendError::execution("slice Si32 offset conversion overflow")
+                    })?)
+                    .ok_or_else(|| BackendError::execution("slice Si32 pointer overflow"))?;
+                driver.copy_device_to_device(out.buffer.device_ptr(), src_ptr, len * 4)?;
+                Ok(out)
+            }
+            _ => Err(BackendError::execution(format!(
+                "slice runtime supports F32/Si32 only, got {:?}",
+                out_spec.dtype
+            ))),
+        }
+    }
+
+    fn execute_slice_f32(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernels: &HashMap<&str, &KernelSpec>,
+        input: &TritonTensor,
+        starts: &[usize],
+        out_spec: &TensorSpec,
+    ) -> BackendResult<TritonTensor> {
+        let kernel = kernels
+            .get(SLICE_KERNEL_ID)
+            .ok_or_else(|| BackendError::execution("missing slice kernel in triton artifact"))?;
+        if !matches!(kernel.kind, KernelKind::SliceF32Rank4) {
+            return Err(BackendError::execution(format!(
+                "unexpected slice kernel kind: {:?}",
+                kernel.kind
+            )));
+        }
+        let (out_dims, in_strides, starts4) =
+            slice_rank4_layout(&input.spec.shape, &out_spec.shape, starts)?;
+
+        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let element_count = static_element_count(&out_spec.shape)?;
+        if element_count == 0 {
+            return Ok(out);
+        }
+        let loaded = self.load_kernel(driver, kernel)?;
+
+        let mut in_ptr = input.buffer.device_ptr();
+        let mut out_ptr = out.buffer.device_ptr();
+        let mut n = usize_to_u32(element_count, "slice element count")?;
+        let mut od0 = out_dims[0];
+        let mut od1 = out_dims[1];
+        let mut od2 = out_dims[2];
+        let mut od3 = out_dims[3];
+        let mut is0 = in_strides[0];
+        let mut is1 = in_strides[1];
+        let mut is2 = in_strides[2];
+        let mut is3 = in_strides[3];
+        let mut st0 = starts4[0];
+        let mut st1 = starts4[1];
+        let mut st2 = starts4[2];
+        let mut st3 = starts4[3];
+        let mut opaque_ptr = 0u64;
+        let mut params = [
+            (&mut in_ptr as *mut u64).cast::<c_void>(),
+            (&mut out_ptr as *mut u64).cast::<c_void>(),
+            (&mut n as *mut u32).cast::<c_void>(),
+            (&mut od0 as *mut i32).cast::<c_void>(),
+            (&mut od1 as *mut i32).cast::<c_void>(),
+            (&mut od2 as *mut i32).cast::<c_void>(),
+            (&mut od3 as *mut i32).cast::<c_void>(),
+            (&mut is0 as *mut i32).cast::<c_void>(),
+            (&mut is1 as *mut i32).cast::<c_void>(),
+            (&mut is2 as *mut i32).cast::<c_void>(),
+            (&mut is3 as *mut i32).cast::<c_void>(),
+            (&mut st0 as *mut i32).cast::<c_void>(),
+            (&mut st1 as *mut i32).cast::<c_void>(),
+            (&mut st2 as *mut i32).cast::<c_void>(),
+            (&mut st3 as *mut i32).cast::<c_void>(),
+            (&mut opaque_ptr as *mut u64).cast::<c_void>(),
+        ];
+        launch_1d(driver, &loaded.function, n, 256, &mut params)?;
+        Ok(out)
+    }
+
+    fn execute_dynamic_slice(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernels: &HashMap<&str, &KernelSpec>,
+        input: &TritonTensor,
+        starts: &TritonTensor,
+        spec: &gpt_rs::backend::spec::DynamicSliceSpec,
+        out_spec: &TensorSpec,
+    ) -> BackendResult<TritonTensor> {
+        if starts.spec.dtype != DType::Si32 {
+            return Err(BackendError::execution("dynamic_slice starts must be Si32"));
+        }
+        let rank = input.spec.shape.rank();
+        if spec.sizes.len() != rank {
+            return Err(BackendError::execution(
+                "dynamic_slice sizes length must match input rank",
+            ));
+        }
+        let starts_values = read_i32_tensor(starts)?;
+        if starts_values.len() != rank {
+            return Err(BackendError::execution(
+                "dynamic_slice starts length must match input rank",
+            ));
+        }
+        let mut static_starts = Vec::with_capacity(rank);
+        for value in starts_values {
+            if value < 0 {
+                return Err(BackendError::execution(
+                    "dynamic_slice starts must be non-negative",
+                ));
+            }
+            static_starts.push(value as usize);
+        }
+
+        match out_spec.dtype {
+            DType::F32 => self.execute_slice_f32(driver, kernels, input, &static_starts, out_spec),
+            DType::Si32 => {
+                // Rank-1 Si32 dynamic slice is required by decode attention query position path.
+                let in_dims = static_dims(&input.spec.shape)?;
+                if in_dims.len() != 1 || static_starts.len() != 1 || spec.sizes.len() != 1 {
+                    return Err(BackendError::execution(
+                        "dynamic_slice Si32 path currently supports rank-1 only",
+                    ));
+                }
+                let start = static_starts[0];
+                let len = spec.sizes[0];
+                if match start.checked_add(len) {
+                    Some(end) => end > in_dims[0],
+                    None => true,
+                } {
+                    return Err(BackendError::execution(
+                        "dynamic_slice Si32 bounds check failed",
+                    ));
+                }
+                let out =
+                    TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+                let offset_bytes = start
+                    .checked_mul(4)
+                    .ok_or_else(|| BackendError::execution("dynamic_slice Si32 offset overflow"))?;
+                let src_ptr = input
+                    .buffer
+                    .device_ptr()
+                    .checked_add(u64::try_from(offset_bytes).map_err(|_| {
+                        BackendError::execution("dynamic_slice Si32 offset conversion overflow")
+                    })?)
+                    .ok_or_else(|| {
+                        BackendError::execution("dynamic_slice Si32 pointer overflow")
+                    })?;
+                driver.copy_device_to_device(out.buffer.device_ptr(), src_ptr, len * 4)?;
+                Ok(out)
+            }
+            _ => Err(BackendError::execution(format!(
+                "dynamic_slice unsupported dtype {:?}",
+                out_spec.dtype
+            ))),
+        }
+    }
+
+    fn execute_transpose(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernels: &HashMap<&str, &KernelSpec>,
+        input: &TritonTensor,
+        spec: &gpt_rs::backend::spec::TransposeSpec,
+        out_spec: &TensorSpec,
+    ) -> BackendResult<TritonTensor> {
+        if input.spec.dtype != DType::F32 || out_spec.dtype != DType::F32 {
+            return Err(BackendError::execution(
+                "transpose runtime currently supports F32 only",
+            ));
+        }
+        let kernel = kernels.get(TRANSPOSE_KERNEL_ID).ok_or_else(|| {
+            BackendError::execution("missing transpose kernel in triton artifact")
+        })?;
+        if !matches!(kernel.kind, KernelKind::TransposeF32Rank5) {
+            return Err(BackendError::execution(format!(
+                "unexpected transpose kernel kind: {:?}",
+                kernel.kind
+            )));
+        }
+        let (out_dims, in_strides) =
+            transpose_rank5_layout(&input.spec.shape, &out_spec.shape, &spec.perm)?;
+        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let element_count = static_element_count(&out_spec.shape)?;
+        if element_count == 0 {
+            return Ok(out);
+        }
+        let loaded = self.load_kernel(driver, kernel)?;
+
+        let mut in_ptr = input.buffer.device_ptr();
+        let mut out_ptr = out.buffer.device_ptr();
+        let mut n = usize_to_u32(element_count, "transpose element count")?;
+        let mut od0 = out_dims[0];
+        let mut od1 = out_dims[1];
+        let mut od2 = out_dims[2];
+        let mut od3 = out_dims[3];
+        let mut od4 = out_dims[4];
+        let mut is0 = in_strides[0];
+        let mut is1 = in_strides[1];
+        let mut is2 = in_strides[2];
+        let mut is3 = in_strides[3];
+        let mut is4 = in_strides[4];
+        let mut opaque_ptr = 0u64;
+        let mut params = [
+            (&mut in_ptr as *mut u64).cast::<c_void>(),
+            (&mut out_ptr as *mut u64).cast::<c_void>(),
+            (&mut n as *mut u32).cast::<c_void>(),
+            (&mut od0 as *mut i32).cast::<c_void>(),
+            (&mut od1 as *mut i32).cast::<c_void>(),
+            (&mut od2 as *mut i32).cast::<c_void>(),
+            (&mut od3 as *mut i32).cast::<c_void>(),
+            (&mut od4 as *mut i32).cast::<c_void>(),
+            (&mut is0 as *mut i32).cast::<c_void>(),
+            (&mut is1 as *mut i32).cast::<c_void>(),
+            (&mut is2 as *mut i32).cast::<c_void>(),
+            (&mut is3 as *mut i32).cast::<c_void>(),
+            (&mut is4 as *mut i32).cast::<c_void>(),
+            (&mut opaque_ptr as *mut u64).cast::<c_void>(),
+        ];
+        launch_1d(driver, &loaded.function, n, 256, &mut params)?;
+        Ok(out)
+    }
+
+    fn execute_concat(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernels: &HashMap<&str, &KernelSpec>,
+        lhs: &TritonTensor,
+        rhs: &TritonTensor,
+        spec: &gpt_rs::backend::spec::ConcatSpec,
+        out_spec: &TensorSpec,
+    ) -> BackendResult<TritonTensor> {
+        if lhs.spec.dtype != DType::F32
+            || rhs.spec.dtype != DType::F32
+            || out_spec.dtype != DType::F32
+        {
+            return Err(BackendError::execution(
+                "concat runtime currently supports F32 only",
+            ));
+        }
+        let kernel = kernels
+            .get(CONCAT_KERNEL_ID)
+            .ok_or_else(|| BackendError::execution("missing concat kernel in triton artifact"))?;
+        if !matches!(kernel.kind, KernelKind::ConcatF32Rank4) {
+            return Err(BackendError::execution(format!(
+                "unexpected concat kernel kind: {:?}",
+                kernel.kind
+            )));
+        }
+        let (out_dims, lhs_strides, rhs_strides, axis, split) =
+            concat_rank4_layout(&lhs.spec.shape, &rhs.spec.shape, &out_spec.shape, spec.axis)?;
+        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let element_count = static_element_count(&out_spec.shape)?;
+        if element_count == 0 {
+            return Ok(out);
+        }
+        let loaded = self.load_kernel(driver, kernel)?;
+
+        let mut lhs_ptr = lhs.buffer.device_ptr();
+        let mut rhs_ptr = rhs.buffer.device_ptr();
+        let mut out_ptr = out.buffer.device_ptr();
+        let mut n = usize_to_u32(element_count, "concat element count")?;
+        let mut od0 = out_dims[0];
+        let mut od1 = out_dims[1];
+        let mut od2 = out_dims[2];
+        let mut od3 = out_dims[3];
+        let mut axis_i32 = axis;
+        let mut split_i32 = split;
+        let mut ls0 = lhs_strides[0];
+        let mut ls1 = lhs_strides[1];
+        let mut ls2 = lhs_strides[2];
+        let mut ls3 = lhs_strides[3];
+        let mut rs0 = rhs_strides[0];
+        let mut rs1 = rhs_strides[1];
+        let mut rs2 = rhs_strides[2];
+        let mut rs3 = rhs_strides[3];
+        let mut opaque_ptr = 0u64;
+        let mut params = [
+            (&mut lhs_ptr as *mut u64).cast::<c_void>(),
+            (&mut rhs_ptr as *mut u64).cast::<c_void>(),
+            (&mut out_ptr as *mut u64).cast::<c_void>(),
+            (&mut n as *mut u32).cast::<c_void>(),
+            (&mut od0 as *mut i32).cast::<c_void>(),
+            (&mut od1 as *mut i32).cast::<c_void>(),
+            (&mut od2 as *mut i32).cast::<c_void>(),
+            (&mut od3 as *mut i32).cast::<c_void>(),
+            (&mut axis_i32 as *mut i32).cast::<c_void>(),
+            (&mut split_i32 as *mut i32).cast::<c_void>(),
+            (&mut ls0 as *mut i32).cast::<c_void>(),
+            (&mut ls1 as *mut i32).cast::<c_void>(),
+            (&mut ls2 as *mut i32).cast::<c_void>(),
+            (&mut ls3 as *mut i32).cast::<c_void>(),
+            (&mut rs0 as *mut i32).cast::<c_void>(),
+            (&mut rs1 as *mut i32).cast::<c_void>(),
+            (&mut rs2 as *mut i32).cast::<c_void>(),
+            (&mut rs3 as *mut i32).cast::<c_void>(),
+            (&mut opaque_ptr as *mut u64).cast::<c_void>(),
+        ];
+        launch_1d(driver, &loaded.function, n, 256, &mut params)?;
+        Ok(out)
+    }
+
+    fn execute_iota(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernel: &KernelSpec,
+        spec: &gpt_rs::backend::spec::IotaSpec,
+        out_spec: &TensorSpec,
+    ) -> BackendResult<TritonTensor> {
+        if out_spec.dtype != DType::Si32 {
+            return Err(BackendError::execution(
+                "iota runtime currently supports Si32 output only",
+            ));
+        }
+        if !matches!(kernel.kind, KernelKind::IotaSi32Rank4) {
+            return Err(BackendError::execution(format!(
+                "unexpected iota kernel kind: {:?}",
+                kernel.kind
+            )));
+        }
+        let out_dims = static_dims(&out_spec.shape)?;
+        if spec.axis >= out_dims.len() {
+            return Err(BackendError::execution("iota axis out of bounds"));
+        }
+        if out_dims.len() > 4 {
+            return Err(BackendError::execution(
+                "iota runtime supports rank <= 4 only",
+            ));
+        }
+        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let element_count = static_element_count(&out_spec.shape)?;
+        if element_count == 0 {
+            return Ok(out);
+        }
+        let loaded = self.load_kernel(driver, kernel)?;
+        let (od0, od1, od2, od3) = align_dims4(&out_dims)?;
+        let aligned_axis = (4 - out_dims.len())
+            .checked_add(spec.axis)
+            .ok_or_else(|| BackendError::execution("iota axis alignment overflow"))?;
+        let axis = usize_to_i32(aligned_axis, "iota axis")?;
+
+        let mut out_ptr = out.buffer.device_ptr();
+        let mut n = usize_to_u32(element_count, "iota element count")?;
+        let mut od0 = od0;
+        let mut od1 = od1;
+        let mut od2 = od2;
+        let mut od3 = od3;
+        let mut axis_i32 = axis;
+        let mut opaque_ptr = 0u64;
+        let mut params = [
+            (&mut out_ptr as *mut u64).cast::<c_void>(),
+            (&mut n as *mut u32).cast::<c_void>(),
+            (&mut od0 as *mut i32).cast::<c_void>(),
+            (&mut od1 as *mut i32).cast::<c_void>(),
+            (&mut od2 as *mut i32).cast::<c_void>(),
+            (&mut od3 as *mut i32).cast::<c_void>(),
+            (&mut axis_i32 as *mut i32).cast::<c_void>(),
+            (&mut opaque_ptr as *mut u64).cast::<c_void>(),
+        ];
+        launch_1d(driver, &loaded.function, n, 256, &mut params)?;
+        Ok(out)
+    }
+
+    fn execute_compare(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernel: &KernelSpec,
+        op: ComparisonOp,
+        lhs: &TritonTensor,
+        rhs: &TritonTensor,
+        out_spec: &TensorSpec,
+    ) -> BackendResult<TritonTensor> {
+        if lhs.spec != rhs.spec {
+            return Err(BackendError::execution("compare operand spec mismatch"));
+        }
+        if lhs.spec.dtype != DType::Si32 || out_spec.dtype != DType::I1 {
+            return Err(BackendError::execution(
+                "compare runtime currently supports Si32 -> I1 only",
+            ));
+        }
+        if !matches!(kernel.kind, KernelKind::CompareSi32I1) {
+            return Err(BackendError::execution(format!(
+                "unexpected compare kernel kind: {:?}",
+                kernel.kind
+            )));
+        }
+        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let element_count = static_element_count(&out_spec.shape)?;
+        if element_count == 0 {
+            return Ok(out);
+        }
+        let loaded = self.load_kernel(driver, kernel)?;
+        let opcode = compare_opcode(op);
+        let mut lhs_ptr = lhs.buffer.device_ptr();
+        let mut rhs_ptr = rhs.buffer.device_ptr();
+        let mut out_ptr = out.buffer.device_ptr();
+        let mut n = usize_to_u32(element_count, "compare element count")?;
+        let mut op_u32 = opcode;
+        let mut opaque_ptr = 0u64;
+        let mut params = [
+            (&mut lhs_ptr as *mut u64).cast::<c_void>(),
+            (&mut rhs_ptr as *mut u64).cast::<c_void>(),
+            (&mut out_ptr as *mut u64).cast::<c_void>(),
+            (&mut n as *mut u32).cast::<c_void>(),
+            (&mut op_u32 as *mut u32).cast::<c_void>(),
+            (&mut opaque_ptr as *mut u64).cast::<c_void>(),
+        ];
+        launch_1d(driver, &loaded.function, n, 256, &mut params)?;
+        Ok(out)
+    }
+
+    fn execute_select(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernel: &KernelSpec,
+        predicate: &TritonTensor,
+        when_true: &TritonTensor,
+        when_false: &TritonTensor,
+        out_spec: &TensorSpec,
+    ) -> BackendResult<TritonTensor> {
+        if predicate.spec.dtype != DType::I1 {
+            return Err(BackendError::execution("select predicate must be I1"));
+        }
+        if when_true.spec != when_false.spec || when_true.spec != *out_spec {
+            return Err(BackendError::execution(
+                "select branch/output spec mismatch",
+            ));
+        }
+        if out_spec.dtype != DType::F32 {
+            return Err(BackendError::execution(
+                "select runtime currently supports F32 branches only",
+            ));
+        }
+        if !matches!(kernel.kind, KernelKind::SelectI1F32) {
+            return Err(BackendError::execution(format!(
+                "unexpected select kernel kind: {:?}",
+                kernel.kind
+            )));
+        }
+        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let element_count = static_element_count(&out_spec.shape)?;
+        if element_count == 0 {
+            return Ok(out);
+        }
+        let loaded = self.load_kernel(driver, kernel)?;
+        let mut pred_ptr = predicate.buffer.device_ptr();
+        let mut true_ptr = when_true.buffer.device_ptr();
+        let mut false_ptr = when_false.buffer.device_ptr();
+        let mut out_ptr = out.buffer.device_ptr();
+        let mut n = usize_to_u32(element_count, "select element count")?;
+        let mut opaque_ptr = 0u64;
+        let mut params = [
+            (&mut pred_ptr as *mut u64).cast::<c_void>(),
+            (&mut true_ptr as *mut u64).cast::<c_void>(),
+            (&mut false_ptr as *mut u64).cast::<c_void>(),
+            (&mut out_ptr as *mut u64).cast::<c_void>(),
+            (&mut n as *mut u32).cast::<c_void>(),
+            (&mut opaque_ptr as *mut u64).cast::<c_void>(),
+        ];
+        launch_1d(driver, &loaded.function, n, 256, &mut params)?;
+        Ok(out)
+    }
+
+    fn execute_take(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernel: &KernelSpec,
+        params: &TritonTensor,
+        indices: &TritonTensor,
+        out_spec: &TensorSpec,
+    ) -> BackendResult<TritonTensor> {
+        if params.spec.dtype != DType::F32
+            || indices.spec.dtype != DType::Si32
+            || out_spec.dtype != DType::F32
+        {
+            return Err(BackendError::execution(
+                "take runtime expects F32 params, Si32 indices, F32 output",
+            ));
+        }
+        if !matches!(kernel.kind, KernelKind::TakeF32I32) {
+            return Err(BackendError::execution(format!(
+                "unexpected take kernel kind: {:?}",
+                kernel.kind
+            )));
+        }
+        let params_dims = static_dims(&params.spec.shape)?;
+        if params_dims.len() != 2 {
+            return Err(BackendError::execution(
+                "take runtime currently supports rank-2 params only",
+            ));
+        }
+        let index_count = static_element_count(&indices.spec.shape)?;
+        let embed_dim = params_dims[1];
+        let vocab = params_dims[0];
+        let expected_out = index_count
+            .checked_mul(embed_dim)
+            .ok_or_else(|| BackendError::execution("take output element count overflow"))?;
+        let out_count = static_element_count(&out_spec.shape)?;
+        if expected_out != out_count {
+            return Err(BackendError::execution(format!(
+                "take output shape mismatch: expected {} elements, got {}",
+                expected_out, out_count
+            )));
+        }
+
+        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        if out_count == 0 {
+            return Ok(out);
+        }
+        let loaded = self.load_kernel(driver, kernel)?;
+        let mut weight_ptr = params.buffer.device_ptr();
+        let mut indices_ptr = indices.buffer.device_ptr();
+        let mut out_ptr = out.buffer.device_ptr();
+        let mut n = usize_to_u32(out_count, "take element count")?;
+        let mut embed = usize_to_i32(embed_dim, "take embed_dim")?;
+        let mut vocab = usize_to_i32(vocab, "take vocab")?;
+        let mut opaque_ptr = 0u64;
+        let mut params_arr = [
+            (&mut weight_ptr as *mut u64).cast::<c_void>(),
+            (&mut indices_ptr as *mut u64).cast::<c_void>(),
+            (&mut out_ptr as *mut u64).cast::<c_void>(),
+            (&mut n as *mut u32).cast::<c_void>(),
+            (&mut embed as *mut i32).cast::<c_void>(),
+            (&mut vocab as *mut i32).cast::<c_void>(),
+            (&mut opaque_ptr as *mut u64).cast::<c_void>(),
+        ];
+        launch_1d(driver, &loaded.function, n, 256, &mut params_arr)?;
+        Ok(out)
+    }
+
+    fn execute_dynamic_update_slice(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernel: &KernelSpec,
+        base: &TritonTensor,
+        update: &TritonTensor,
+        starts: &TritonTensor,
+        out_spec: &TensorSpec,
+    ) -> BackendResult<TritonTensor> {
+        if base.spec.dtype != DType::F32
+            || update.spec.dtype != DType::F32
+            || starts.spec.dtype != DType::Si32
+            || out_spec.dtype != DType::F32
+        {
+            return Err(BackendError::execution(
+                "dynamic_update_slice runtime currently supports F32 base/update with Si32 starts",
+            ));
+        }
+        if !matches!(kernel.kind, KernelKind::DynamicUpdateSliceF32Rank4) {
+            return Err(BackendError::execution(format!(
+                "unexpected dynamic_update_slice kernel kind: {:?}",
+                kernel.kind
+            )));
+        }
+        let base_dims = static_dims(&base.spec.shape)?;
+        let update_dims = static_dims(&update.spec.shape)?;
+        if base_dims.len() > 4 {
+            return Err(BackendError::execution(
+                "dynamic_update_slice runtime supports rank <= 4 only",
+            ));
+        }
+        let starts_values = read_i32_tensor(starts)?;
+        if starts_values.len() != base_dims.len() {
+            return Err(BackendError::execution(
+                "dynamic_update_slice starts length mismatch",
+            ));
+        }
+        let mut starts_usize = Vec::with_capacity(starts_values.len());
+        for value in starts_values {
+            if value < 0 {
+                return Err(BackendError::execution(
+                    "dynamic_update_slice starts must be non-negative",
+                ));
+            }
+            starts_usize.push(value as usize);
+        }
+        for axis in 0..base_dims.len() {
+            let end = starts_usize[axis]
+                .checked_add(update_dims[axis])
+                .ok_or_else(|| BackendError::execution("dynamic_update_slice bounds overflow"))?;
+            if end > base_dims[axis] {
+                return Err(BackendError::execution(
+                    "dynamic_update_slice update exceeds base bounds",
+                ));
+            }
+        }
+
+        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        driver.copy_device_to_device(
+            out.buffer.device_ptr(),
+            base.buffer.device_ptr(),
+            byte_len(out_spec)?,
+        )?;
+        let update_elems = static_element_count(&update.spec.shape)?;
+        if update_elems == 0 {
+            return Ok(out);
+        }
+        let loaded = self.load_kernel(driver, kernel)?;
+        let (update_dims4, out_strides4, starts4) =
+            dynamic_update_rank4_layout(&update_dims, &base_dims, &starts_usize)?;
+
+        let mut update_ptr = update.buffer.device_ptr();
+        let mut out_ptr = out.buffer.device_ptr();
+        let mut n = usize_to_u32(update_elems, "dynamic_update_slice update elements")?;
+        let mut ud0 = update_dims4[0];
+        let mut ud1 = update_dims4[1];
+        let mut ud2 = update_dims4[2];
+        let mut ud3 = update_dims4[3];
+        let mut os0 = out_strides4[0];
+        let mut os1 = out_strides4[1];
+        let mut os2 = out_strides4[2];
+        let mut os3 = out_strides4[3];
+        let mut st0 = starts4[0];
+        let mut st1 = starts4[1];
+        let mut st2 = starts4[2];
+        let mut st3 = starts4[3];
+        let mut opaque_ptr = 0u64;
+        let mut params = [
+            (&mut update_ptr as *mut u64).cast::<c_void>(),
+            (&mut out_ptr as *mut u64).cast::<c_void>(),
+            (&mut n as *mut u32).cast::<c_void>(),
+            (&mut ud0 as *mut i32).cast::<c_void>(),
+            (&mut ud1 as *mut i32).cast::<c_void>(),
+            (&mut ud2 as *mut i32).cast::<c_void>(),
+            (&mut ud3 as *mut i32).cast::<c_void>(),
+            (&mut os0 as *mut i32).cast::<c_void>(),
+            (&mut os1 as *mut i32).cast::<c_void>(),
+            (&mut os2 as *mut i32).cast::<c_void>(),
+            (&mut os3 as *mut i32).cast::<c_void>(),
+            (&mut st0 as *mut i32).cast::<c_void>(),
+            (&mut st1 as *mut i32).cast::<c_void>(),
+            (&mut st2 as *mut i32).cast::<c_void>(),
+            (&mut st3 as *mut i32).cast::<c_void>(),
+            (&mut opaque_ptr as *mut u64).cast::<c_void>(),
+        ];
+        launch_1d(driver, &loaded.function, n, 256, &mut params)?;
+        Ok(out)
+    }
+
+    fn execute_reduce(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernels: &HashMap<&str, &KernelSpec>,
+        input_spec: &TensorSpec,
+        out_spec: &TensorSpec,
+        spec: &gpt_rs::backend::spec::ReduceSpec,
+        input: &TritonTensor,
+    ) -> BackendResult<TritonTensor> {
+        match spec.kind {
+            ReduceKind::Sum => {
+                self.execute_reduce_sum_last_axis(driver, input_spec, out_spec, spec, input)
+            }
+            ReduceKind::Max => {
+                let kernel = kernels.get(REDUCE_MAX_LAST_AXIS_KERNEL_ID).ok_or_else(|| {
+                    BackendError::execution(
+                        "missing reduce_max_last_axis kernel in triton artifact",
+                    )
+                })?;
+                self.execute_reduce_max_last_axis(driver, kernel, input_spec, out_spec, spec, input)
+            }
+            other => Err(BackendError::execution(format!(
+                "reduce runtime unsupported kind {:?}",
+                other
+            ))),
+        }
+    }
+
+    fn execute_reduce_max_last_axis(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernel: &KernelSpec,
+        input_spec: &TensorSpec,
+        out_spec: &TensorSpec,
+        spec: &gpt_rs::backend::spec::ReduceSpec,
+        input: &TritonTensor,
+    ) -> BackendResult<TritonTensor> {
+        if !matches!(kernel.kind, KernelKind::ReduceMaxLastAxisF32) {
+            return Err(BackendError::execution(format!(
+                "unexpected reduce_max kernel kind: {:?}",
+                kernel.kind
+            )));
+        }
+        if input.spec != *input_spec {
+            return Err(BackendError::execution("reduce_max tensor/spec mismatch"));
+        }
+        if input_spec.dtype != DType::F32 || out_spec.dtype != DType::F32 {
+            return Err(BackendError::execution(
+                "reduce_max currently supports F32 only",
+            ));
+        }
+        let input_dims = static_dims(&input_spec.shape)?;
+        if input_dims.is_empty() {
+            return Err(BackendError::execution(
+                "reduce_max does not support scalar inputs",
+            ));
+        }
+        let last_axis = input_dims.len() - 1;
+        if spec.axes.as_slice() != [last_axis] {
+            return Err(BackendError::execution(
+                "reduce_max supports reducing the last axis only",
+            ));
+        }
+        let rows = input_dims[..last_axis]
+            .iter()
+            .try_fold(1usize, |acc, dim| acc.checked_mul(*dim))
+            .ok_or_else(|| BackendError::execution("reduce_max row dimension overflow"))?;
+        let cols = input_dims[last_axis];
+        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        if rows == 0 || cols == 0 {
+            return Ok(out);
+        }
+        let loaded = self.load_kernel(driver, kernel)?;
+        let mut in_ptr = input.buffer.device_ptr();
+        let mut out_ptr = out.buffer.device_ptr();
+        let mut rows_i32 = usize_to_i32(rows, "reduce_max rows")?;
+        let mut cols_i32 = usize_to_i32(cols, "reduce_max cols")?;
+        let mut opaque_ptr = 0u64;
+        let mut params = [
+            (&mut in_ptr as *mut u64).cast::<c_void>(),
+            (&mut out_ptr as *mut u64).cast::<c_void>(),
+            (&mut rows_i32 as *mut i32).cast::<c_void>(),
+            (&mut cols_i32 as *mut i32).cast::<c_void>(),
+            (&mut opaque_ptr as *mut u64).cast::<c_void>(),
+        ];
+        let rows_u32 = usize_to_u32(rows, "reduce_max rows")?;
+        driver.launch_kernel(
+            &loaded.function,
+            (rows_u32, 1, 1),
+            (256, 1, 1),
+            0,
+            &mut params,
+        )?;
+        Ok(out)
+    }
+
+    fn execute_extract_patches(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernel: &KernelSpec,
+        input: &TritonTensor,
+        spec: &gpt_rs::backend::spec::ExtractPatchesSpec,
+        out_spec: &TensorSpec,
+    ) -> BackendResult<TritonTensor> {
+        if !matches!(kernel.kind, KernelKind::ExtractPatchesNhwcF32) {
+            return Err(BackendError::execution(format!(
+                "unexpected extract_patches kernel kind: {:?}",
+                kernel.kind
+            )));
+        }
+        if input.spec.dtype != DType::F32 || out_spec.dtype != DType::F32 {
+            return Err(BackendError::execution(
+                "extract_patches runtime currently supports F32 only",
+            ));
+        }
+        let in_dims = static_dims(&input.spec.shape)?;
+        let out_dims = static_dims(&out_spec.shape)?;
+        if in_dims.len() != 4 || out_dims.len() != 4 {
+            return Err(BackendError::execution(
+                "extract_patches runtime expects rank-4 NHWC input/output",
+            ));
+        }
+        if spec.window.len() != 2
+            || spec.strides.len() != 2
+            || spec.dilation.len() != 2
+            || spec.padding.len() != 2
+        {
+            return Err(BackendError::execution(
+                "extract_patches runtime currently supports 2D window only",
+            ));
+        }
+        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let elem_count = static_element_count(&out_spec.shape)?;
+        if elem_count == 0 {
+            return Ok(out);
+        }
+        let patch_dim = out_dims[3];
+        let loaded = self.load_kernel(driver, kernel)?;
+
+        let mut in_ptr = input.buffer.device_ptr();
+        let mut out_ptr = out.buffer.device_ptr();
+        let mut n = usize_to_u32(elem_count, "extract_patches element count")?;
+        let mut in_h = usize_to_i32(in_dims[1], "extract_patches in_h")?;
+        let mut in_w = usize_to_i32(in_dims[2], "extract_patches in_w")?;
+        let mut in_c = usize_to_i32(in_dims[3], "extract_patches in_c")?;
+        let mut out_h = usize_to_i32(out_dims[1], "extract_patches out_h")?;
+        let mut out_w = usize_to_i32(out_dims[2], "extract_patches out_w")?;
+        let mut k_h = usize_to_i32(spec.window[0], "extract_patches k_h")?;
+        let mut k_w = usize_to_i32(spec.window[1], "extract_patches k_w")?;
+        let mut s_h = usize_to_i32(spec.strides[0], "extract_patches s_h")?;
+        let mut s_w = usize_to_i32(spec.strides[1], "extract_patches s_w")?;
+        let mut d_h = usize_to_i32(spec.dilation[0], "extract_patches d_h")?;
+        let mut d_w = usize_to_i32(spec.dilation[1], "extract_patches d_w")?;
+        let mut pad_top = usize_to_i32(spec.padding[0].0, "extract_patches pad_top")?;
+        let mut pad_left = usize_to_i32(spec.padding[1].0, "extract_patches pad_left")?;
+        let mut patch_dim_i32 = usize_to_i32(patch_dim, "extract_patches patch_dim")?;
+        let mut opaque_ptr = 0u64;
+        let mut params = [
+            (&mut in_ptr as *mut u64).cast::<c_void>(),
+            (&mut out_ptr as *mut u64).cast::<c_void>(),
+            (&mut n as *mut u32).cast::<c_void>(),
+            (&mut in_h as *mut i32).cast::<c_void>(),
+            (&mut in_w as *mut i32).cast::<c_void>(),
+            (&mut in_c as *mut i32).cast::<c_void>(),
+            (&mut out_h as *mut i32).cast::<c_void>(),
+            (&mut out_w as *mut i32).cast::<c_void>(),
+            (&mut k_h as *mut i32).cast::<c_void>(),
+            (&mut k_w as *mut i32).cast::<c_void>(),
+            (&mut s_h as *mut i32).cast::<c_void>(),
+            (&mut s_w as *mut i32).cast::<c_void>(),
+            (&mut d_h as *mut i32).cast::<c_void>(),
+            (&mut d_w as *mut i32).cast::<c_void>(),
+            (&mut pad_top as *mut i32).cast::<c_void>(),
+            (&mut pad_left as *mut i32).cast::<c_void>(),
+            (&mut patch_dim_i32 as *mut i32).cast::<c_void>(),
+            (&mut opaque_ptr as *mut u64).cast::<c_void>(),
+        ];
+        launch_1d(driver, &loaded.function, n, 256, &mut params)?;
+        Ok(out)
+    }
+
+    fn execute_reduce_window(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernel: &KernelSpec,
+        input: &TritonTensor,
+        spec: &gpt_rs::backend::spec::ReduceWindowSpec,
+        out_spec: &TensorSpec,
+    ) -> BackendResult<TritonTensor> {
+        if !matches!(kernel.kind, KernelKind::ReduceWindowMaxNhwcF32) {
+            return Err(BackendError::execution(format!(
+                "unexpected reduce_window kernel kind: {:?}",
+                kernel.kind
+            )));
+        }
+        if spec.reduce != ReduceKind::Max {
+            return Err(BackendError::execution(
+                "reduce_window runtime currently supports max only",
+            ));
+        }
+        if input.spec.dtype != DType::F32 || out_spec.dtype != DType::F32 {
+            return Err(BackendError::execution(
+                "reduce_window runtime currently supports F32 only",
+            ));
+        }
+        let in_dims = static_dims(&input.spec.shape)?;
+        let out_dims = static_dims(&out_spec.shape)?;
+        if in_dims.len() != 4 || out_dims.len() != 4 {
+            return Err(BackendError::execution(
+                "reduce_window runtime expects rank-4 NHWC input/output",
+            ));
+        }
+        if spec.window_dims.len() != 4
+            || spec.strides.len() != 4
+            || spec.padding.len() != 4
+            || spec.base_dilation.len() != 4
+            || spec.window_dilation.len() != 4
+        {
+            return Err(BackendError::execution(
+                "reduce_window runtime currently supports rank-4 specs only",
+            ));
+        }
+        if spec.window_dims[0] != 1 || spec.window_dims[3] != 1 {
+            return Err(BackendError::execution(
+                "reduce_window runtime expects NHWC window with N/C window = 1",
+            ));
+        }
+        if spec.base_dilation != vec![1, 1, 1, 1] {
+            return Err(BackendError::execution(
+                "reduce_window runtime currently supports base_dilation=[1,1,1,1] only",
+            ));
+        }
+
+        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let elem_count = static_element_count(&out_spec.shape)?;
+        if elem_count == 0 {
+            return Ok(out);
+        }
+        let loaded = self.load_kernel(driver, kernel)?;
+
+        let mut in_ptr = input.buffer.device_ptr();
+        let mut out_ptr = out.buffer.device_ptr();
+        let mut n = usize_to_u32(elem_count, "reduce_window element count")?;
+        let mut in_h = usize_to_i32(in_dims[1], "reduce_window in_h")?;
+        let mut in_w = usize_to_i32(in_dims[2], "reduce_window in_w")?;
+        let mut in_c = usize_to_i32(in_dims[3], "reduce_window in_c")?;
+        let mut out_h = usize_to_i32(out_dims[1], "reduce_window out_h")?;
+        let mut out_w = usize_to_i32(out_dims[2], "reduce_window out_w")?;
+        let mut k_h = usize_to_i32(spec.window_dims[1], "reduce_window k_h")?;
+        let mut k_w = usize_to_i32(spec.window_dims[2], "reduce_window k_w")?;
+        let mut s_h = usize_to_i32(spec.strides[1], "reduce_window s_h")?;
+        let mut s_w = usize_to_i32(spec.strides[2], "reduce_window s_w")?;
+        let mut d_h = usize_to_i32(spec.window_dilation[1], "reduce_window d_h")?;
+        let mut d_w = usize_to_i32(spec.window_dilation[2], "reduce_window d_w")?;
+        let mut pad_top = usize_to_i32(spec.padding[1].0, "reduce_window pad_top")?;
+        let mut pad_left = usize_to_i32(spec.padding[2].0, "reduce_window pad_left")?;
+        let mut opaque_ptr = 0u64;
+        let mut params = [
+            (&mut in_ptr as *mut u64).cast::<c_void>(),
+            (&mut out_ptr as *mut u64).cast::<c_void>(),
+            (&mut n as *mut u32).cast::<c_void>(),
+            (&mut in_h as *mut i32).cast::<c_void>(),
+            (&mut in_w as *mut i32).cast::<c_void>(),
+            (&mut in_c as *mut i32).cast::<c_void>(),
+            (&mut out_h as *mut i32).cast::<c_void>(),
+            (&mut out_w as *mut i32).cast::<c_void>(),
+            (&mut k_h as *mut i32).cast::<c_void>(),
+            (&mut k_w as *mut i32).cast::<c_void>(),
+            (&mut s_h as *mut i32).cast::<c_void>(),
+            (&mut s_w as *mut i32).cast::<c_void>(),
+            (&mut d_h as *mut i32).cast::<c_void>(),
+            (&mut d_w as *mut i32).cast::<c_void>(),
+            (&mut pad_top as *mut i32).cast::<c_void>(),
+            (&mut pad_left as *mut i32).cast::<c_void>(),
+            (&mut opaque_ptr as *mut u64).cast::<c_void>(),
+        ];
+        launch_1d(driver, &loaded.function, n, 128, &mut params)?;
+        Ok(out)
+    }
+
     fn execute_dot_general(
         &self,
         driver: &Arc<CudaDriver>,
@@ -447,8 +1619,98 @@ impl TritonExecutor {
             return Ok(out);
         }
 
+        // Batched rank-3 matrix multiplication: [B,M,K] · [B,N,K] => [B,M,N].
+        if spec.batch_lhs.as_slice() == [0]
+            && spec.batch_rhs.as_slice() == [0]
+            && spec.contract_lhs.as_slice() == [2]
+            && spec.contract_rhs.as_slice() == [2]
+        {
+            if lhs_dims.len() != 3 || rhs_dims.len() != 3 || out_dims.len() != 3 {
+                return Err(BackendError::execution(
+                    "dot_general batched path expects rank-3 tensors",
+                ));
+            }
+
+            let batches = lhs_dims[0];
+            let m = lhs_dims[1];
+            let k = lhs_dims[2];
+            let rhs_batches = rhs_dims[0];
+            let n = rhs_dims[1];
+            let k_rhs = rhs_dims[2];
+
+            if batches != rhs_batches
+                || out_dims[0] != batches
+                || out_dims[1] != m
+                || out_dims[2] != n
+                || k != k_rhs
+            {
+                return Err(BackendError::execution(
+                    "dot_general shape mismatch for batched matrix multiplication [B,M,K] · [B,N,K]",
+                ));
+            }
+
+            let out =
+                TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+            let lhs_stride = m
+                .checked_mul(k)
+                .ok_or_else(|| BackendError::execution("batched lhs stride overflow"))?;
+            let rhs_stride = n
+                .checked_mul(k)
+                .ok_or_else(|| BackendError::execution("batched rhs stride overflow"))?;
+            let out_stride = m
+                .checked_mul(n)
+                .ok_or_else(|| BackendError::execution("batched out stride overflow"))?;
+
+            let elem_size = 4u64; // f32
+            for batch in 0..batches {
+                let lhs_elem = batch
+                    .checked_mul(lhs_stride)
+                    .ok_or_else(|| BackendError::execution("batched lhs offset overflow"))?;
+                let rhs_elem = batch
+                    .checked_mul(rhs_stride)
+                    .ok_or_else(|| BackendError::execution("batched rhs offset overflow"))?;
+                let out_elem = batch
+                    .checked_mul(out_stride)
+                    .ok_or_else(|| BackendError::execution("batched out offset overflow"))?;
+
+                let lhs_ptr = lhs
+                    .buffer
+                    .device_ptr()
+                    .checked_add(
+                        u64::try_from(lhs_elem)
+                            .map_err(|_| BackendError::execution("lhs offset conversion overflow"))?
+                            .checked_mul(elem_size)
+                            .ok_or_else(|| BackendError::execution("lhs byte offset overflow"))?,
+                    )
+                    .ok_or_else(|| BackendError::execution("lhs pointer overflow"))?;
+                let rhs_ptr = rhs
+                    .buffer
+                    .device_ptr()
+                    .checked_add(
+                        u64::try_from(rhs_elem)
+                            .map_err(|_| BackendError::execution("rhs offset conversion overflow"))?
+                            .checked_mul(elem_size)
+                            .ok_or_else(|| BackendError::execution("rhs byte offset overflow"))?,
+                    )
+                    .ok_or_else(|| BackendError::execution("rhs pointer overflow"))?;
+                let out_ptr = out
+                    .buffer
+                    .device_ptr()
+                    .checked_add(
+                        u64::try_from(out_elem)
+                            .map_err(|_| BackendError::execution("out offset conversion overflow"))?
+                            .checked_mul(elem_size)
+                            .ok_or_else(|| BackendError::execution("out byte offset overflow"))?,
+                    )
+                    .ok_or_else(|| BackendError::execution("out pointer overflow"))?;
+
+                cublas.sgemm_row_major_raw_rhs_transposed(lhs_ptr, rhs_ptr, out_ptr, m, n, k)?;
+            }
+            return Ok(out);
+        }
+
         Err(BackendError::execution(
-            "dot_general runtime supports rank-2 MxK·KxN and rank-3 batched BxMxK·BxKxN only",
+            "dot_general runtime supports rank-2 MxK·KxN and selected rank-3 batched variants",
         ))
     }
 
@@ -640,6 +1902,328 @@ fn static_element_count(shape: &gpt_rs::backend::spec::Shape) -> BackendResult<u
     Ok(count)
 }
 
+fn usize_to_u32(value: usize, what: &str) -> BackendResult<u32> {
+    u32::try_from(value).map_err(|_| BackendError::execution(format!("{what} exceeds u32 range")))
+}
+
+fn usize_to_i32(value: usize, what: &str) -> BackendResult<i32> {
+    i32::try_from(value).map_err(|_| BackendError::execution(format!("{what} exceeds i32 range")))
+}
+
+fn contiguous_strides(dims: &[usize]) -> BackendResult<Vec<usize>> {
+    let mut strides = vec![0usize; dims.len()];
+    let mut stride = 1usize;
+    for axis in (0..dims.len()).rev() {
+        strides[axis] = stride;
+        stride = stride
+            .checked_mul(dims[axis])
+            .ok_or_else(|| BackendError::execution("stride overflow"))?;
+    }
+    Ok(strides)
+}
+
+fn align_dims4(dims: &[usize]) -> BackendResult<(i32, i32, i32, i32)> {
+    if dims.len() > 4 {
+        return Err(BackendError::execution(format!(
+            "rank {} exceeds rank-4 support",
+            dims.len()
+        )));
+    }
+    let mut aligned = [1usize; 4];
+    let offset = 4 - dims.len();
+    for (idx, value) in dims.iter().enumerate() {
+        aligned[offset + idx] = *value;
+    }
+    Ok((
+        usize_to_i32(aligned[0], "dim0")?,
+        usize_to_i32(aligned[1], "dim1")?,
+        usize_to_i32(aligned[2], "dim2")?,
+        usize_to_i32(aligned[3], "dim3")?,
+    ))
+}
+
+fn broadcast_rank4_layout(
+    in_shape: &gpt_rs::backend::spec::Shape,
+    out_shape: &gpt_rs::backend::spec::Shape,
+) -> BackendResult<([i32; 4], [i32; 4])> {
+    let in_dims = static_dims(in_shape)?;
+    let out_dims = static_dims(out_shape)?;
+    if out_dims.len() > 4 || in_dims.len() > 4 {
+        return Err(BackendError::execution(
+            "broadcast runtime supports rank <= 4 only",
+        ));
+    }
+    if out_dims.len() < in_dims.len() {
+        return Err(BackendError::execution(
+            "broadcast result rank must be >= input rank",
+        ));
+    }
+
+    let mut out4 = [1usize; 4];
+    let mut in4 = [1usize; 4];
+    for (idx, dim) in out_dims.iter().enumerate() {
+        out4[4 - out_dims.len() + idx] = *dim;
+    }
+    for (idx, dim) in in_dims.iter().enumerate() {
+        in4[4 - in_dims.len() + idx] = *dim;
+    }
+
+    let base_strides = contiguous_strides(&in4)?;
+    let mut in_strides = [0i32; 4];
+    let mut out_i32 = [0i32; 4];
+    for axis in 0..4 {
+        let in_dim = in4[axis];
+        let out_dim = out4[axis];
+        if !(in_dim == out_dim || in_dim == 1) {
+            return Err(BackendError::execution(format!(
+                "broadcast dim mismatch at axis {axis}: input={in_dim}, output={out_dim}"
+            )));
+        }
+        let stride = if in_dim == 1 && out_dim > 1 {
+            0usize
+        } else {
+            base_strides[axis]
+        };
+        in_strides[axis] = usize_to_i32(stride, "broadcast input stride")?;
+        out_i32[axis] = usize_to_i32(out_dim, "broadcast output dim")?;
+    }
+
+    Ok((out_i32, in_strides))
+}
+
+fn slice_rank4_layout(
+    in_shape: &gpt_rs::backend::spec::Shape,
+    out_shape: &gpt_rs::backend::spec::Shape,
+    starts: &[usize],
+) -> BackendResult<([i32; 4], [i32; 4], [i32; 4])> {
+    let in_dims = static_dims(in_shape)?;
+    let out_dims = static_dims(out_shape)?;
+    if in_dims.len() > 4 || out_dims.len() > 4 {
+        return Err(BackendError::execution(
+            "slice runtime supports rank <= 4 only",
+        ));
+    }
+    if in_dims.len() != out_dims.len() || starts.len() != in_dims.len() {
+        return Err(BackendError::execution("slice starts/sizes rank mismatch"));
+    }
+    for axis in 0..in_dims.len() {
+        if match starts[axis].checked_add(out_dims[axis]) {
+            Some(end) => end > in_dims[axis],
+            None => true,
+        } {
+            return Err(BackendError::execution(format!(
+                "slice out of bounds at axis {axis}"
+            )));
+        }
+    }
+
+    let mut in4 = [1usize; 4];
+    let mut out4 = [1usize; 4];
+    let mut starts4 = [0usize; 4];
+    let offset = 4 - in_dims.len();
+    in4[offset..(offset + in_dims.len())].copy_from_slice(&in_dims);
+    out4[offset..(offset + out_dims.len())].copy_from_slice(&out_dims);
+    starts4[offset..(offset + starts.len())].copy_from_slice(starts);
+    let strides = contiguous_strides(&in4)?;
+    let mut out_i32 = [0i32; 4];
+    let mut strides_i32 = [0i32; 4];
+    let mut starts_i32 = [0i32; 4];
+    for axis in 0..4 {
+        out_i32[axis] = usize_to_i32(out4[axis], "slice output dim")?;
+        strides_i32[axis] = usize_to_i32(strides[axis], "slice input stride")?;
+        starts_i32[axis] = usize_to_i32(starts4[axis], "slice start")?;
+    }
+    Ok((out_i32, strides_i32, starts_i32))
+}
+
+fn transpose_rank5_layout(
+    in_shape: &gpt_rs::backend::spec::Shape,
+    out_shape: &gpt_rs::backend::spec::Shape,
+    perm: &[usize],
+) -> BackendResult<([i32; 5], [i32; 5])> {
+    let in_dims = static_dims(in_shape)?;
+    let out_dims = static_dims(out_shape)?;
+    if in_dims.len() > 5 || out_dims.len() > 5 {
+        return Err(BackendError::execution(
+            "transpose runtime supports rank <= 5 only",
+        ));
+    }
+    if in_dims.len() != out_dims.len() || perm.len() != in_dims.len() {
+        return Err(BackendError::execution(
+            "transpose rank/permutation mismatch",
+        ));
+    }
+    let input_strides = contiguous_strides(&in_dims)?;
+    let mut mapped_strides = vec![0usize; perm.len()];
+    let mut seen = vec![false; perm.len()];
+    for (axis, src_axis) in perm.iter().enumerate() {
+        if *src_axis >= perm.len() || seen[*src_axis] {
+            return Err(BackendError::execution(
+                "transpose permutation must be a valid unique permutation",
+            ));
+        }
+        seen[*src_axis] = true;
+        mapped_strides[axis] = input_strides[*src_axis];
+    }
+
+    let mut out5 = [1usize; 5];
+    let mut strides5 = [0usize; 5];
+    let offset = 5 - out_dims.len();
+    out5[offset..(offset + out_dims.len())].copy_from_slice(&out_dims);
+    strides5[offset..(offset + out_dims.len())].copy_from_slice(&mapped_strides);
+
+    let mut out_i32 = [0i32; 5];
+    let mut strides_i32 = [0i32; 5];
+    for axis in 0..5 {
+        out_i32[axis] = usize_to_i32(out5[axis], "transpose output dim")?;
+        strides_i32[axis] = usize_to_i32(strides5[axis], "transpose input stride")?;
+    }
+    Ok((out_i32, strides_i32))
+}
+
+fn normalize_axis(axis: isize, rank: usize) -> BackendResult<usize> {
+    let rank_isize =
+        isize::try_from(rank).map_err(|_| BackendError::execution("rank exceeds isize"))?;
+    let normalized = if axis < 0 { rank_isize + axis } else { axis };
+    if normalized < 0 || normalized >= rank_isize {
+        return Err(BackendError::execution(format!(
+            "axis {axis} out of bounds for rank {rank}"
+        )));
+    }
+    usize::try_from(normalized).map_err(|_| BackendError::execution("axis conversion overflow"))
+}
+
+type ConcatRank4Layout = ([i32; 4], [i32; 4], [i32; 4], i32, i32);
+
+fn concat_rank4_layout(
+    lhs_shape: &gpt_rs::backend::spec::Shape,
+    rhs_shape: &gpt_rs::backend::spec::Shape,
+    out_shape: &gpt_rs::backend::spec::Shape,
+    axis: isize,
+) -> BackendResult<ConcatRank4Layout> {
+    let lhs_dims = static_dims(lhs_shape)?;
+    let rhs_dims = static_dims(rhs_shape)?;
+    let out_dims = static_dims(out_shape)?;
+    if lhs_dims.len() > 4 || rhs_dims.len() > 4 || out_dims.len() > 4 {
+        return Err(BackendError::execution(
+            "concat runtime supports rank <= 4 only",
+        ));
+    }
+    if lhs_dims.len() != rhs_dims.len() || lhs_dims.len() != out_dims.len() {
+        return Err(BackendError::execution("concat rank mismatch"));
+    }
+    let axis = normalize_axis(axis, lhs_dims.len())?;
+    for idx in 0..lhs_dims.len() {
+        if idx == axis {
+            if match lhs_dims[idx].checked_add(rhs_dims[idx]) {
+                Some(sum) => sum != out_dims[idx],
+                None => true,
+            } {
+                return Err(BackendError::execution(
+                    "concat output axis dimension mismatch",
+                ));
+            }
+        } else if lhs_dims[idx] != rhs_dims[idx] || lhs_dims[idx] != out_dims[idx] {
+            return Err(BackendError::execution(format!(
+                "concat non-axis dimension mismatch at axis {idx}"
+            )));
+        }
+    }
+
+    let lhs_strides = contiguous_strides(&lhs_dims)?;
+    let rhs_strides = contiguous_strides(&rhs_dims)?;
+
+    let mut out4 = [1usize; 4];
+    let mut lhs4 = [0usize; 4];
+    let mut rhs4 = [0usize; 4];
+    let offset = 4 - out_dims.len();
+    out4[offset..(offset + out_dims.len())].copy_from_slice(&out_dims);
+    lhs4[offset..(offset + out_dims.len())].copy_from_slice(&lhs_strides);
+    rhs4[offset..(offset + out_dims.len())].copy_from_slice(&rhs_strides);
+
+    let mut out_i32 = [0i32; 4];
+    let mut lhs_i32 = [0i32; 4];
+    let mut rhs_i32 = [0i32; 4];
+    for idx in 0..4 {
+        out_i32[idx] = usize_to_i32(out4[idx], "concat output dim")?;
+        lhs_i32[idx] = usize_to_i32(lhs4[idx], "concat lhs stride")?;
+        rhs_i32[idx] = usize_to_i32(rhs4[idx], "concat rhs stride")?;
+    }
+
+    let axis_i32 = usize_to_i32(offset + axis, "concat axis")?;
+    let split_i32 = usize_to_i32(lhs_dims[axis], "concat split")?;
+    Ok((out_i32, lhs_i32, rhs_i32, axis_i32, split_i32))
+}
+
+fn dynamic_update_rank4_layout(
+    update_dims: &[usize],
+    out_dims: &[usize],
+    starts: &[usize],
+) -> BackendResult<([i32; 4], [i32; 4], [i32; 4])> {
+    if update_dims.len() > 4 || out_dims.len() > 4 {
+        return Err(BackendError::execution(
+            "dynamic_update_slice runtime supports rank <= 4 only",
+        ));
+    }
+    if update_dims.len() != out_dims.len() || starts.len() != out_dims.len() {
+        return Err(BackendError::execution(
+            "dynamic_update_slice rank mismatch",
+        ));
+    }
+    let out_strides = contiguous_strides(out_dims)?;
+
+    let mut update4 = [1usize; 4];
+    let mut out_strides4 = [0usize; 4];
+    let mut starts4 = [0usize; 4];
+    let offset = 4 - out_dims.len();
+    update4[offset..(offset + out_dims.len())].copy_from_slice(update_dims);
+    out_strides4[offset..(offset + out_dims.len())].copy_from_slice(&out_strides);
+    starts4[offset..(offset + out_dims.len())].copy_from_slice(starts);
+
+    let mut update_i32 = [0i32; 4];
+    let mut out_strides_i32 = [0i32; 4];
+    let mut starts_i32 = [0i32; 4];
+    for idx in 0..4 {
+        update_i32[idx] = usize_to_i32(update4[idx], "dynamic_update update dim")?;
+        out_strides_i32[idx] = usize_to_i32(out_strides4[idx], "dynamic_update output stride")?;
+        starts_i32[idx] = usize_to_i32(starts4[idx], "dynamic_update start")?;
+    }
+    Ok((update_i32, out_strides_i32, starts_i32))
+}
+
+fn launch_1d(
+    driver: &Arc<CudaDriver>,
+    function: &CudaFunction,
+    n: u32,
+    block_x: u32,
+    params: &mut [*mut c_void],
+) -> BackendResult<()> {
+    if n == 0 {
+        return Ok(());
+    }
+    let grid_x = n.div_ceil(block_x);
+    driver.launch_kernel(function, (grid_x, 1, 1), (block_x, 1, 1), 0, params)
+}
+
+fn read_i32_tensor(tensor: &TritonTensor) -> BackendResult<Vec<i32>> {
+    if tensor.spec.dtype != DType::Si32 {
+        return Err(BackendError::execution(
+            "read_i32_tensor requires Si32 tensor",
+        ));
+    }
+    let bytes = tensor.buffer.read_to_vec()?;
+    if bytes.len() % 4 != 0 {
+        return Err(BackendError::execution(
+            "Si32 tensor byte length is not divisible by 4",
+        ));
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        out.push(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(out)
+}
+
 fn binary_opcode(op: ElementwiseBinaryOp) -> u32 {
     match op {
         ElementwiseBinaryOp::Add => 0,
@@ -655,10 +2239,23 @@ fn unary_opcode(op: ElementwiseUnaryOp) -> BackendResult<u32> {
     match op {
         ElementwiseUnaryOp::Neg => Ok(0),
         ElementwiseUnaryOp::Abs => Ok(1),
-        _ => Err(BackendError::execution(format!(
-            "elementwise unary runtime does not support op {:?}",
-            op
-        ))),
+        ElementwiseUnaryOp::Exp => Ok(2),
+        ElementwiseUnaryOp::Log => Ok(3),
+        ElementwiseUnaryOp::Tanh => Ok(4),
+        ElementwiseUnaryOp::Erf => Ok(5),
+        ElementwiseUnaryOp::Rsqrt => Ok(6),
+        ElementwiseUnaryOp::Reciprocal => Ok(7),
+    }
+}
+
+fn compare_opcode(op: ComparisonOp) -> u32 {
+    match op {
+        ComparisonOp::Less => 0,
+        ComparisonOp::LessEqual => 1,
+        ComparisonOp::Equal => 2,
+        ComparisonOp::GreaterEqual => 3,
+        ComparisonOp::Greater => 4,
+        ComparisonOp::NotEqual => 5,
     }
 }
 
@@ -682,6 +2279,7 @@ type CublasHandle = *mut c_void;
 
 const CUBLAS_STATUS_SUCCESS: CublasStatus = 0;
 const CUBLAS_OP_N: i32 = 0;
+const CUBLAS_OP_T: i32 = 1;
 
 type CublasCreateFn = unsafe extern "C" fn(handle: *mut CublasHandle) -> CublasStatus;
 type CublasDestroyFn = unsafe extern "C" fn(handle: CublasHandle) -> CublasStatus;
@@ -802,6 +2400,54 @@ impl CublasContext {
                     &alpha as *const f32,
                     rhs_ptr as usize as *const f32,
                     n_i32,
+                    lhs_ptr as usize as *const f32,
+                    k_i32,
+                    &beta as *const f32,
+                    out_ptr as usize as *mut f32,
+                    n_i32,
+                ),
+                "cublasSgemm_v2",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn sgemm_row_major_raw_rhs_transposed(
+        &self,
+        lhs_ptr: u64,
+        rhs_ptr: u64,
+        out_ptr: u64,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> BackendResult<()> {
+        let m_i32 = i32::try_from(m)
+            .map_err(|_| BackendError::execution("matrix dimension m exceeds i32"))?;
+        let n_i32 = i32::try_from(n)
+            .map_err(|_| BackendError::execution("matrix dimension n exceeds i32"))?;
+        let k_i32 = i32::try_from(k)
+            .map_err(|_| BackendError::execution("matrix dimension k exceeds i32"))?;
+
+        self.driver.ensure_current()?;
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        // Row-major C = A(MxK) * B^T where rhs pointer is row-major B(NxK).
+        // Equivalent column-major equation:
+        // C^T (N x M) = B(N x K) * A^T(K x M)
+        // with B represented by rhs_ptr as column-major KxN and transposed in cuBLAS.
+        // SAFETY: pointers are valid CUDA device pointers sized for m,n,k.
+        unsafe {
+            check_cublas(
+                (self.fns.sgemm)(
+                    self.handle as CublasHandle,
+                    CUBLAS_OP_T,
+                    CUBLAS_OP_N,
+                    n_i32,
+                    m_i32,
+                    k_i32,
+                    &alpha as *const f32,
+                    rhs_ptr as usize as *const f32,
+                    k_i32,
                     lhs_ptr as usize as *const f32,
                     k_i32,
                     &beta as *const f32,

@@ -1,0 +1,35 @@
+# gpt_rs.kernel: take_f32_i32
+# gpt_rs.symbol: gpt_rs_triton_take_f32_i32
+# gpt_rs.signature: weight_ptr=*fp32,indices_ptr=*i32,out_ptr=*fp32,n=i32,embed_dim=i32,vocab=i32
+# gpt_rs.param_abi: *fp32,*i32,*fp32,u32,i32,i32,*opaque
+# gpt_rs.constexpr: BLOCK_SIZE=256
+# gpt_rs.num_warps: 8
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def gpt_rs_triton_take_f32_i32(
+    weight_ptr,
+    indices_ptr,
+    out_ptr,
+    n,
+    embed_dim,
+    vocab,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n
+
+    token = offs // embed_dim
+    channel = offs - token * embed_dim
+
+    row = tl.load(indices_ptr + token, mask=mask, other=0)
+    valid = (row >= 0) & (row < vocab)
+
+    safe_row = tl.maximum(row, 0)
+    weight_off = safe_row * embed_dim + channel
+    values = tl.load(weight_ptr + weight_off, mask=mask & valid, other=0.0)
+    tl.store(out_ptr + offs, values, mask=mask)

@@ -1,0 +1,58 @@
+# gpt_rs.kernel: extract_patches_nhwc_f32
+# gpt_rs.symbol: gpt_rs_triton_extract_patches_nhwc_f32
+# gpt_rs.signature: in_ptr=*fp32,out_ptr=*fp32,n=i32,in_h=i32,in_w=i32,in_c=i32,out_h=i32,out_w=i32,k_h=i32,k_w=i32,s_h=i32,s_w=i32,d_h=i32,d_w=i32,pad_top=i32,pad_left=i32,patch_dim=i32
+# gpt_rs.param_abi: *fp32,*fp32,u32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,*opaque
+# gpt_rs.constexpr: BLOCK_SIZE=256
+# gpt_rs.num_warps: 8
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def gpt_rs_triton_extract_patches_nhwc_f32(
+    in_ptr,
+    out_ptr,
+    n,
+    in_h,
+    in_w,
+    in_c,
+    out_h,
+    out_w,
+    k_h,
+    k_w,
+    s_h,
+    s_w,
+    d_h,
+    d_w,
+    pad_top,
+    pad_left,
+    patch_dim,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = idx < n
+
+    p = idx % patch_dim
+    tmp = idx // patch_dim
+    ow = tmp % out_w
+    tmp = tmp // out_w
+    oh = tmp % out_h
+    n_idx = tmp // out_h
+
+    c = p % in_c
+    p2 = p // in_c
+    kw = p2 % k_w
+    kh = p2 // k_w
+
+    in_y = oh * s_h + kh * d_h - pad_top
+    in_x = ow * s_w + kw * d_w - pad_left
+
+    valid = (in_y >= 0) & (in_y < in_h) & (in_x >= 0) & (in_x < in_w)
+    safe_y = tl.maximum(in_y, 0)
+    safe_x = tl.maximum(in_x, 0)
+
+    in_off = ((n_idx * in_h + safe_y) * in_w + safe_x) * in_c + c
+    values = tl.load(in_ptr + in_off, mask=mask & valid, other=0.0)
+    tl.store(out_ptr + idx, values, mask=mask)

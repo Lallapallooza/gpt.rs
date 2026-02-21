@@ -1,0 +1,4 @@
+// gpt_rs.kernel: elementwise_binary_f32
+// gpt_rs.symbol: gpt_rs_triton_ewise_binary_f32
+// args: lhs_ptr(*fp32), rhs_ptr(*fp32), out_ptr(*fp32), n(u32), op(u32)
+// op mapping: 0=add,1=sub,2=mul,3=div,4=max,5=min

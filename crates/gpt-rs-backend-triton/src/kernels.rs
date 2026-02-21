@@ -4,6 +4,13 @@ pub const EWISE_BINARY_KERNEL_ID: &str = "gpt_rs.triton.kernel.elementwise_binar
 pub const EWISE_BINARY_SYMBOL: &str = "gpt_rs_triton_ewise_binary_f32";
 pub const EWISE_UNARY_KERNEL_ID: &str = "gpt_rs.triton.kernel.elementwise_unary_f32.v1";
 pub const EWISE_UNARY_SYMBOL: &str = "gpt_rs_triton_ewise_unary_f32";
+pub const PREPACKED_EWISE_BINARY_KERNEL: &str =
+    include_str!("kernels/prepacked/elementwise_binary_f32.triton");
+pub const PREPACKED_EWISE_UNARY_KERNEL: &str =
+    include_str!("kernels/prepacked/elementwise_unary_f32.triton");
+pub const PREPACKED_MATMUL_KERNEL: &str = include_str!("kernels/prepacked/matmul_f32.triton");
+pub const PREPACKED_REDUCE_SUM_LAST_AXIS_KERNEL: &str =
+    include_str!("kernels/prepacked/reduce_sum_last_axis_f32.triton");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KernelSpec {
@@ -38,19 +45,18 @@ pub fn elementwise_unary_kernel_spec() -> KernelSpec {
 }
 
 pub fn elementwise_binary_triton_source() -> String {
-    r#"// gpt_rs.kernel: elementwise_binary_f32
-// gpt_rs.symbol: gpt_rs_triton_ewise_binary_f32
-// args: lhs_ptr(*fp32), rhs_ptr(*fp32), out_ptr(*fp32), n(u32), op(u32)
-// op mapping: 0=add,1=sub,2=mul,3=div,4=max,5=min
-"#
-    .to_string()
+    PREPACKED_EWISE_BINARY_KERNEL.to_string()
 }
 
 pub fn elementwise_unary_triton_source() -> String {
-    r#"// gpt_rs.kernel: elementwise_unary_f32
-// gpt_rs.symbol: gpt_rs_triton_ewise_unary_f32
-// args: in_ptr(*fp32), out_ptr(*fp32), n(u32), op(u32)
-// op mapping: 0=neg,1=abs
-"#
-    .to_string()
+    PREPACKED_EWISE_UNARY_KERNEL.to_string()
+}
+
+pub fn prepacked_kernel_sources() -> &'static [&'static str] {
+    &[
+        PREPACKED_EWISE_BINARY_KERNEL,
+        PREPACKED_EWISE_UNARY_KERNEL,
+        PREPACKED_MATMUL_KERNEL,
+        PREPACKED_REDUCE_SUM_LAST_AXIS_KERNEL,
+    ]
 }

@@ -154,6 +154,14 @@ def detect_kernel_kind(source: str) -> str:
     raise CompileError("unsupported kernel marker in input source; expected one of: " + markers)
 
 
+def ptx_version_for_arch(arch: int) -> int:
+    if arch >= 90:
+        return 80
+    if arch >= 80:
+        return 76
+    return 72
+
+
 def compile_kernel(
     kind: str, arch: int, block_size: int
 ) -> tuple[str, str, dict[str, object], KernelSpec]:
@@ -161,7 +169,12 @@ def compile_kernel(
     fn = KERNEL_FNS[kind]
     source = ASTSource(fn, signature=spec.signature, constexprs={"BLOCK_SIZE": block_size})
     target = GPUTarget("cuda", arch, 32)
-    compiled = triton.compile(source, target=target, options={"num_warps": spec.num_warps})
+    ptx_version = ptx_version_for_arch(arch)
+    compiled = triton.compile(
+        source,
+        target=target,
+        options={"num_warps": spec.num_warps, "ptx_version": ptx_version},
+    )
 
     ptx_blob = compiled.asm.get("ptx")
     if ptx_blob is None:
@@ -172,7 +185,16 @@ def compile_kernel(
         ptx = ptx_blob
 
     kernel_symbol = compiled.name
-    return ptx, kernel_symbol, {"num_warps": spec.num_warps, "block_size": block_size}, spec
+    return (
+        ptx,
+        kernel_symbol,
+        {
+            "num_warps": spec.num_warps,
+            "block_size": block_size,
+            "ptx_version": ptx_version,
+        },
+        spec,
+    )
 
 
 def write_outputs(
@@ -200,6 +222,7 @@ def write_outputs(
         "param_abi": spec.param_abi,
         "shared_mem_bytes": 0,
         "num_warps": options["num_warps"],
+        "ptx_version": options["ptx_version"],
         "note": f"compiled via Python Triton marker backend ({spec.symbol})",
     }
     meta_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")

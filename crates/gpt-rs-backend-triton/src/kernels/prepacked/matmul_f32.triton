@@ -1,0 +1,3 @@
+// gpt_rs.kernel: matmul_f32
+// gpt_rs.symbol: gpt_rs_triton_matmul_f32
+// reserved prepacked kernel asset for future native triton lowering.

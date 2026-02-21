@@ -4,12 +4,18 @@ use gpt_rs::backend::spec::{
 };
 
 use crate::artifact::TritonArtifact;
-use crate::kernels::{elementwise_binary_kernel_spec, elementwise_unary_kernel_spec};
+use crate::kernels::{
+    elementwise_binary_kernel_spec, elementwise_unary_kernel_spec, prepacked_kernel_sources,
+};
 
 pub fn lower_program_to_artifact(
     program: &Program,
     entrypoint_symbol: &str,
 ) -> ConversionResult<TritonArtifact> {
+    // Touch all prepacked assets so they are included and validated by the
+    // compiler even before every kernel family is hooked into runtime dispatch.
+    let _ = prepacked_kernel_sources();
+
     let function = entry_function(program)?;
 
     let mut has_elementwise_binary = false;
@@ -123,13 +129,25 @@ fn validate_instruction(
                     "triton dot lowering supports F32 only",
                 ));
             }
-            if !spec.batch_lhs.is_empty()
-                || !spec.batch_rhs.is_empty()
-                || spec.contract_lhs.as_slice() != [1]
-                || spec.contract_rhs.as_slice() != [0]
-            {
+            let supports_rank2 = spec.batch_lhs.is_empty()
+                && spec.batch_rhs.is_empty()
+                && spec.contract_lhs.as_slice() == [1]
+                && spec.contract_rhs.as_slice() == [0]
+                && lhs_spec.shape.rank() == 2
+                && rhs_spec.shape.rank() == 2
+                && out_spec.shape.rank() == 2;
+
+            let supports_batched_rank3 = spec.batch_lhs.as_slice() == [0]
+                && spec.batch_rhs.as_slice() == [0]
+                && spec.contract_lhs.as_slice() == [2]
+                && spec.contract_rhs.as_slice() == [1]
+                && lhs_spec.shape.rank() == 3
+                && rhs_spec.shape.rank() == 3
+                && out_spec.shape.rank() == 3;
+
+            if !(supports_rank2 || supports_batched_rank3) {
                 return Err(ConversionError::new(
-                    "triton dot lowering supports rank-2 MxK · KxN only",
+                    "triton dot lowering supports rank-2 MxK·KxN and rank-3 batched BxMxK · BxKxN",
                 ));
             }
             Ok(())

@@ -323,39 +323,133 @@ impl TritonExecutor {
                 "dot_general runtime currently supports F32 only",
             ));
         }
-        if !spec.batch_lhs.is_empty()
-            || !spec.batch_rhs.is_empty()
-            || spec.contract_lhs.as_slice() != [1]
-            || spec.contract_rhs.as_slice() != [0]
-        {
-            return Err(BackendError::execution(
-                "dot_general runtime supports rank-2 MxK · KxN only",
-            ));
-        }
 
         let lhs_dims = static_dims(&lhs_spec.shape)?;
         let rhs_dims = static_dims(&rhs_spec.shape)?;
         let out_dims = static_dims(&out_spec.shape)?;
-        if lhs_dims.len() != 2 || rhs_dims.len() != 2 || out_dims.len() != 2 {
-            return Err(BackendError::execution(
-                "dot_general runtime supports rank-2 tensors only",
-            ));
-        }
-
-        let m = lhs_dims[0];
-        let k = lhs_dims[1];
-        let k_rhs = rhs_dims[0];
-        let n = rhs_dims[1];
-        if k != k_rhs || out_dims[0] != m || out_dims[1] != n {
-            return Err(BackendError::execution(
-                "dot_general shape mismatch for matrix multiplication",
-            ));
-        }
-
-        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
         let cublas = self.cublas(driver)?;
-        cublas.sgemm_row_major(&lhs.buffer, &rhs.buffer, &out.buffer, m, n, k)?;
-        Ok(out)
+
+        // Rank-2 matrix multiplication: [M,K] · [K,N] => [M,N].
+        if spec.batch_lhs.is_empty()
+            && spec.batch_rhs.is_empty()
+            && spec.contract_lhs.as_slice() == [1]
+            && spec.contract_rhs.as_slice() == [0]
+        {
+            if lhs_dims.len() != 2 || rhs_dims.len() != 2 || out_dims.len() != 2 {
+                return Err(BackendError::execution(
+                    "dot_general rank-2 path expects rank-2 tensors",
+                ));
+            }
+
+            let m = lhs_dims[0];
+            let k = lhs_dims[1];
+            let k_rhs = rhs_dims[0];
+            let n = rhs_dims[1];
+            if k != k_rhs || out_dims[0] != m || out_dims[1] != n {
+                return Err(BackendError::execution(
+                    "dot_general shape mismatch for matrix multiplication",
+                ));
+            }
+
+            let out =
+                TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+            cublas.sgemm_row_major(&lhs.buffer, &rhs.buffer, &out.buffer, m, n, k)?;
+            return Ok(out);
+        }
+
+        // Batched rank-3 matrix multiplication: [B,M,K] · [B,K,N] => [B,M,N].
+        if spec.batch_lhs.as_slice() == [0]
+            && spec.batch_rhs.as_slice() == [0]
+            && spec.contract_lhs.as_slice() == [2]
+            && spec.contract_rhs.as_slice() == [1]
+        {
+            if lhs_dims.len() != 3 || rhs_dims.len() != 3 || out_dims.len() != 3 {
+                return Err(BackendError::execution(
+                    "dot_general batched path expects rank-3 tensors",
+                ));
+            }
+
+            let batches = lhs_dims[0];
+            let m = lhs_dims[1];
+            let k = lhs_dims[2];
+            let rhs_batches = rhs_dims[0];
+            let k_rhs = rhs_dims[1];
+            let n = rhs_dims[2];
+
+            if batches != rhs_batches
+                || out_dims[0] != batches
+                || out_dims[1] != m
+                || out_dims[2] != n
+                || k != k_rhs
+            {
+                return Err(BackendError::execution(
+                    "dot_general shape mismatch for batched matrix multiplication",
+                ));
+            }
+
+            let out =
+                TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+            let lhs_stride = m
+                .checked_mul(k)
+                .ok_or_else(|| BackendError::execution("batched lhs stride overflow"))?;
+            let rhs_stride = k
+                .checked_mul(n)
+                .ok_or_else(|| BackendError::execution("batched rhs stride overflow"))?;
+            let out_stride = m
+                .checked_mul(n)
+                .ok_or_else(|| BackendError::execution("batched out stride overflow"))?;
+
+            let elem_size = 4u64; // f32
+            for batch in 0..batches {
+                let lhs_elem = batch
+                    .checked_mul(lhs_stride)
+                    .ok_or_else(|| BackendError::execution("batched lhs offset overflow"))?;
+                let rhs_elem = batch
+                    .checked_mul(rhs_stride)
+                    .ok_or_else(|| BackendError::execution("batched rhs offset overflow"))?;
+                let out_elem = batch
+                    .checked_mul(out_stride)
+                    .ok_or_else(|| BackendError::execution("batched out offset overflow"))?;
+
+                let lhs_ptr = lhs
+                    .buffer
+                    .device_ptr()
+                    .checked_add(
+                        u64::try_from(lhs_elem)
+                            .map_err(|_| BackendError::execution("lhs offset conversion overflow"))?
+                            .checked_mul(elem_size)
+                            .ok_or_else(|| BackendError::execution("lhs byte offset overflow"))?,
+                    )
+                    .ok_or_else(|| BackendError::execution("lhs pointer overflow"))?;
+                let rhs_ptr = rhs
+                    .buffer
+                    .device_ptr()
+                    .checked_add(
+                        u64::try_from(rhs_elem)
+                            .map_err(|_| BackendError::execution("rhs offset conversion overflow"))?
+                            .checked_mul(elem_size)
+                            .ok_or_else(|| BackendError::execution("rhs byte offset overflow"))?,
+                    )
+                    .ok_or_else(|| BackendError::execution("rhs pointer overflow"))?;
+                let out_ptr = out
+                    .buffer
+                    .device_ptr()
+                    .checked_add(
+                        u64::try_from(out_elem)
+                            .map_err(|_| BackendError::execution("out offset conversion overflow"))?
+                            .checked_mul(elem_size)
+                            .ok_or_else(|| BackendError::execution("out byte offset overflow"))?,
+                    )
+                    .ok_or_else(|| BackendError::execution("out pointer overflow"))?;
+
+                cublas.sgemm_row_major_raw(lhs_ptr, rhs_ptr, out_ptr, m, n, k)?;
+            }
+            return Ok(out);
+        }
+
+        Err(BackendError::execution(
+            "dot_general runtime supports rank-2 MxK·KxN and rank-3 batched BxMxK·BxKxN only",
+        ))
     }
 
     fn execute_reduce_sum_last_axis(
@@ -665,6 +759,25 @@ impl CublasContext {
         n: usize,
         k: usize,
     ) -> BackendResult<()> {
+        self.sgemm_row_major_raw(
+            lhs.device_ptr(),
+            rhs.device_ptr(),
+            out.device_ptr(),
+            m,
+            n,
+            k,
+        )
+    }
+
+    fn sgemm_row_major_raw(
+        &self,
+        lhs_ptr: u64,
+        rhs_ptr: u64,
+        out_ptr: u64,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> BackendResult<()> {
         let m_i32 = i32::try_from(m)
             .map_err(|_| BackendError::execution("matrix dimension m exceeds i32"))?;
         let n_i32 = i32::try_from(n)
@@ -687,12 +800,12 @@ impl CublasContext {
                     m_i32,
                     k_i32,
                     &alpha as *const f32,
-                    rhs.device_ptr() as usize as *const f32,
+                    rhs_ptr as usize as *const f32,
                     n_i32,
-                    lhs.device_ptr() as usize as *const f32,
+                    lhs_ptr as usize as *const f32,
                     k_i32,
                     &beta as *const f32,
-                    out.device_ptr() as usize as *mut f32,
+                    out_ptr as usize as *mut f32,
                     n_i32,
                 ),
                 "cublasSgemm_v2",

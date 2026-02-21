@@ -1,0 +1,4 @@
+// gpt_rs.kernel: elementwise_unary_f32
+// gpt_rs.symbol: gpt_rs_triton_ewise_unary_f32
+// args: in_ptr(*fp32), out_ptr(*fp32), n(u32), op(u32)
+// op mapping: 0=neg,1=abs

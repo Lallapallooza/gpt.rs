@@ -30,7 +30,10 @@ impl KernelCompiler {
     }
 
     pub fn compile(&self, kernel: &KernelSpec) -> BackendResult<Arc<CompiledKernel>> {
-        let fingerprint = kernel_fingerprint(kernel);
+        let compiler = tritoncc_binary();
+        let arch = triton_arch();
+        let backend = tritoncc_backend();
+        let fingerprint = kernel_fingerprint(kernel, &arch, &compiler, &backend);
 
         if let Some(found) = self
             .compiled
@@ -69,13 +72,13 @@ impl KernelCompiler {
             .map_err(|err| BackendError::execution(err.to_string()))?;
 
         let source_path = cache_dir.join(format!("kernel_{fingerprint:016x}.triton"));
-        let ptx_path = cache_dir.join(format!("kernel_{fingerprint:016x}.ptx"));
-        let meta_path = cache_dir.join(format!("kernel_{fingerprint:016x}.meta.json"));
+        let ptx_path = cache_dir.join(format!("kernel_{fingerprint:016x}_{arch}.ptx"));
+        let meta_path = cache_dir.join(format!("kernel_{fingerprint:016x}_{arch}.meta.json"));
 
         if !ptx_path.exists() || !meta_path.exists() {
             std::fs::write(&source_path, &kernel.source)
                 .map_err(|err| BackendError::execution(err.to_string()))?;
-            run_tritoncc_compile(&source_path, &ptx_path, &meta_path)?;
+            run_tritoncc_compile(&compiler, &arch, &source_path, &ptx_path, &meta_path)?;
         }
 
         let ptx = std::fs::read_to_string(&ptx_path)
@@ -103,11 +106,14 @@ struct TritonCcMeta {
     kernel_symbol: String,
 }
 
-fn run_tritoncc_compile(source: &Path, ptx: &Path, meta: &Path) -> BackendResult<()> {
-    let compiler = tritoncc_binary();
-    let arch = triton_arch();
-
-    let output = Command::new(&compiler)
+fn run_tritoncc_compile(
+    compiler: &str,
+    arch: &str,
+    source: &Path,
+    ptx: &Path,
+    meta: &Path,
+) -> BackendResult<()> {
+    let output = Command::new(compiler)
         .arg("compile")
         .arg("--arch")
         .arg(arch)
@@ -154,10 +160,17 @@ fn tritoncc_binary() -> String {
         }
     }
 
-    // Preferred path in this repository.
-    let local = Path::new("tools/tritoncc/target/debug/tritoncc");
-    if local.exists() {
-        return local.display().to_string();
+    let candidates = [
+        PathBuf::from("tools/tritoncc/target/debug/tritoncc"),
+        PathBuf::from("tools/tritoncc/target/release/tritoncc"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/tritoncc/target/debug/tritoncc"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/tritoncc/target/release/tritoncc"),
+    ];
+
+    for candidate in candidates {
+        if candidate.exists() {
+            return candidate.display().to_string();
+        }
     }
 
     "tritoncc".to_string()
@@ -173,11 +186,22 @@ fn triton_arch() -> String {
     "sm_80".to_string()
 }
 
-fn kernel_fingerprint(kernel: &KernelSpec) -> u64 {
+fn tritoncc_backend() -> String {
+    std::env::var("TRITONCC_BACKEND")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "python".to_string())
+}
+
+fn kernel_fingerprint(kernel: &KernelSpec, arch: &str, compiler: &str, backend: &str) -> u64 {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(kernel.id.as_bytes());
     bytes.extend_from_slice(kernel.symbol.as_bytes());
     bytes.extend_from_slice(kernel.source.as_bytes());
+    bytes.extend_from_slice(arch.as_bytes());
+    bytes.extend_from_slice(compiler.as_bytes());
+    bytes.extend_from_slice(backend.as_bytes());
     fnv1a(&bytes)
 }
 

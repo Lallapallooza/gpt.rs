@@ -48,7 +48,7 @@ struct RmsNormPlan {
 /// Enforces dtype alignment (currently f32), rank expectations, and gamma/beta shapes, then records
 /// the reduction axes and broadcast shapes. Structural coverage lives in
 /// `tests/functional_softmax.rs::layer_norm_captures_reduction_chain`, and numerical parity runs in
-/// `crates/gpt-rs/tests/torch_parity.rs` plus backend suites.
+/// the backend parity suites under `crates/gpt-rs-backend-tests/src/torch_parity/`.
 fn validate_layer_norm<B: PortableBackend + 'static>(
     x: &DeviceTensor<B>,
     gamma: &DeviceTensor<B>,

@@ -1,7 +1,6 @@
 pub mod arithmetic;
 pub mod attention;
 pub mod common;
-pub mod device_layers;
 pub mod embedding_layer;
 pub mod feed_forward_layer;
 pub mod functional_ops;

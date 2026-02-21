@@ -62,8 +62,9 @@ fn validate_dropout<B: PortableBackend + 'static>(
 /// - turn the mask into a scaling tensor that divides by the keep probability;
 /// - multiply the input by the scaled mask so expectation stays constant.
 /// Coverage: `tests/functional_softmax.rs::dropout_emits_rng_mask_sequence` asserts the captured
-/// PTIR graph, while `tests/torch_parity.rs::functional_softmax_last_dim_matches_torch_reference`
-/// relies on the backend parity cases to exercise dropout indirectly once wired into training.
+/// PTIR graph, while backend parity suites under
+/// `crates/gpt-rs-backend-tests/src/torch_parity/` exercise numeric behavior indirectly once wired
+/// into training.
 #[support_runtime_overload]
 #[ptir_pattern(target = "gpt_rs.dropout_f32")]
 pub fn dropout<B: PortableBackend + 'static>(

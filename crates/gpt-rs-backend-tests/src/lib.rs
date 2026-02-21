@@ -1,3 +1,4 @@
+pub mod api_invariants;
 pub mod smoke;
 #[cfg(feature = "torch")]
 pub mod torch_parity;
@@ -9,7 +10,7 @@ macro_rules! define_backend_tests {
         mod $module {
             use std::sync::Arc;
 
-            use $crate::smoke;
+            use $crate::{api_invariants, smoke};
 
             #[test]
             fn smoke_matmul_matches_expected() {
@@ -23,14 +24,44 @@ macro_rules! define_backend_tests {
                 smoke::gpt_forward_shape(&backend);
             }
 
+            #[test]
+            fn api_linear_initializes_from_host_and_device_weights() {
+                let backend = ($backend_ctor)();
+                api_invariants::linear_initializes_from_host_and_device_weights(&backend);
+            }
+
+            #[test]
+            fn api_layer_norm_initializes_from_host_and_device_tensors() {
+                let backend = ($backend_ctor)();
+                api_invariants::layer_norm_initializes_from_host_and_device_tensors(&backend);
+            }
+
+            #[test]
+            fn api_embedding_initializes_from_device_tensor() {
+                let backend = ($backend_ctor)();
+                api_invariants::embedding_initializes_from_device_tensor(&backend);
+            }
+
+            #[test]
+            fn api_feed_forward_accepts_mixed_tensor_inputs() {
+                let backend = ($backend_ctor)();
+                api_invariants::feed_forward_accepts_mixed_tensor_inputs(&backend);
+            }
+
+            #[test]
+            fn api_multi_head_attention_accepts_device_parameters() {
+                let backend = ($backend_ctor)();
+                api_invariants::multi_head_attention_accepts_device_parameters(&backend);
+            }
+
             #[cfg(feature = "torch")]
             mod torch_parity_tests {
                 use super::*;
 
                 use $crate::torch_parity::{
-                    arithmetic, attention, device_layers, embedding_layer, feed_forward_layer,
-                    functional_ops, harness, layer_norm_layer, linear, matmul,
-                    multi_head_attention_layer, rms_norm_layer, vision_ops,
+                    arithmetic, attention, embedding_layer, feed_forward_layer, functional_ops,
+                    harness, layer_norm_layer, linear, matmul, multi_head_attention_layer,
+                    rms_norm_layer, vision_ops,
                 };
 
                 macro_rules! run_parity {
@@ -197,11 +228,6 @@ macro_rules! define_backend_tests {
             parity_test!(torch_embedding_matches_torch_vocab32_embed128_seq8, embedding_layer::embedding_matches_torch_vocab32_embed128_seq8);
             parity_test!(torch_embedding_rejects_indices_rank2, embedding_layer::embedding_rejects_indices_rank2);
             parity_test!(torch_embedding_rejects_indices_rank3, embedding_layer::embedding_rejects_indices_rank3);
-            parity_test!(torch_device_linear_initializes_from_host_and_device_weights, device_layers::linear_initializes_from_host_and_device_weights);
-            parity_test!(torch_device_layer_norm_initializes_from_host_and_device_tensors, device_layers::layer_norm_initializes_from_host_and_device_tensors);
-            parity_test!(torch_device_embedding_initializes_from_device_tensor, device_layers::embedding_initializes_from_device_tensor);
-            parity_test!(torch_device_feed_forward_accepts_mixed_tensor_inputs, device_layers::feed_forward_accepts_mixed_tensor_inputs);
-            parity_test!(torch_device_multi_head_attention_accepts_device_parameters, device_layers::multi_head_attention_accepts_device_parameters);
             parity_test!(torch_multi_head_attention_matches_torch_with_bias, multi_head_attention_layer::multi_head_attention_matches_torch_with_bias);
             parity_test!(torch_multi_head_attention_matches_torch_grouped, multi_head_attention_layer::multi_head_attention_matches_torch_grouped);
             parity_test!(torch_multi_head_attention_matches_torch_without_bias, multi_head_attention_layer::multi_head_attention_matches_torch_without_bias);

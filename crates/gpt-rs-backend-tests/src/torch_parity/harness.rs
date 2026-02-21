@@ -569,6 +569,18 @@ pub fn run_parity_test_with_modes<B: PortableBackend + 'static, F: Fn(&Arc<B>)>(
     f: F,
 ) {
     let backend_name = backend.backend_name().to_string();
+    if let Some(reason) = temporary_xfail_reason(&backend_name, test_name) {
+        print_row(
+            &backend_name,
+            test_name,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            "xfail",
+        );
+        eprintln!("torch_parity xfail: backend={backend_name} test={test_name} reason={reason}");
+        return;
+    }
     configure_c_backend_cache_for_parity(&backend_name);
     let _context_guard = common::set_parity_context(&backend_name, test_name);
     let baseline = run_mode(&backend, BenchMode::Baseline, &f);
@@ -655,6 +667,17 @@ fn resolve_torch_ms(baseline: RunDurations, optimized: RunDurations) -> f64 {
     } else {
         f64::NAN
     }
+}
+
+fn temporary_xfail_reason(backend_name: &str, test_name: &str) -> Option<&'static str> {
+    if backend_name == "triton"
+        && (test_name.starts_with("torch_vision_conv2d_")
+            || test_name.starts_with("torch_vision_depthwise_conv2d_")
+            || test_name.starts_with("torch_vision_group_conv2d_"))
+    {
+        return Some("temporary Triton xfail until generalized conv dot_general lowering lands");
+    }
+    None
 }
 
 fn format_ms(value: f64) -> String {

@@ -1,3 +1,6 @@
+mod device;
+mod tensor;
+
 use std::sync::Arc;
 
 use gpt_rs::backend::param_resolver::ParamResolver;
@@ -5,6 +8,7 @@ use gpt_rs::backend::spec::{
     BackendResult, Instruction, PortableBackend, Program, TensorInit, TensorLiteral,
 };
 use gpt_rs_backend_ref_cpu::{CpuPortableBackend, CpuTensor};
+pub use tensor::TritonTensor;
 
 /// Bootstrap Triton backend.
 ///
@@ -21,6 +25,14 @@ impl TritonBackend {
         Self {
             inner: CpuPortableBackend::new(),
         }
+    }
+
+    /// Returns whether a CUDA driver appears available in the host runtime.
+    ///
+    /// This probe is intentionally lightweight for bootstrap bring-up and does
+    /// not establish contexts/streams yet.
+    pub fn is_available() -> bool {
+        device::CudaRuntime::global_is_available()
     }
 }
 

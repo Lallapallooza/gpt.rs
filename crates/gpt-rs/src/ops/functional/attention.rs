@@ -352,7 +352,6 @@ pub fn attention<B: PortableBackend + 'static>(
         resolve_graph_from_tensors(&[qkv]).unwrap_or_else(|| GraphArena::new(qkv.backend()));
 
     let total_len = plan.cache_len + plan.seq_len;
-    let embed_dim = config.embed_dim;
     let num_query_heads = config.num_query_heads;
     let num_kv_heads = config.num_key_value_heads;
     let head_dim = config.head_dim;
@@ -438,7 +437,7 @@ pub fn attention<B: PortableBackend + 'static>(
 
                 let context_out = context
                     .transpose(vec![1, 0, 2])
-                    .reshape(vec![plan.seq_len, embed_dim]);
+                    .reshape(vec![plan.seq_len, q_proj_dim]);
 
                 let context_id = context_out.id();
                 let keys_id = k_cache.id();
@@ -526,7 +525,7 @@ pub fn attention<B: PortableBackend + 'static>(
 
                 let context_out = context
                     .transpose(vec![1, 0, 2])
-                    .reshape(vec![plan.seq_len, embed_dim]);
+                    .reshape(vec![plan.seq_len, q_proj_dim]);
 
                 let context_id = context_out.id();
                 let keys_id = new_k_cache.id();
@@ -705,7 +704,6 @@ pub fn attention_decode_cache<B: PortableBackend + 'static>(
             query_start,
         },
         |session| {
-            let embed_dim = config.embed_dim;
             let kv_group_size = config.kv_group_size();
             let q_proj_dim = config.query_projection_dim();
             let kv_proj_dim = config.key_value_projection_dim();
@@ -780,7 +778,7 @@ pub fn attention_decode_cache<B: PortableBackend + 'static>(
                 &DotAttrs::default(),
             );
 
-            let context_out = context.reshape(vec![plan.seq_len, embed_dim]);
+            let context_out = context.reshape(vec![plan.seq_len, q_proj_dim]);
 
             let context_id = context_out.id();
             let keys_id = k_cache.id();

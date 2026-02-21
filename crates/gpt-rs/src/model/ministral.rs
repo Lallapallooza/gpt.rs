@@ -17,6 +17,10 @@ pub struct MinistralConfig {
     pub num_layers: usize,
     pub num_heads: usize,
     pub num_kv_heads: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_dim: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_head_dim: Option<usize>,
     pub mlp_hidden_dim: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
@@ -34,12 +38,56 @@ impl Default for MinistralConfig {
             num_layers: 8,
             num_heads: 8,
             num_kv_heads: 8,
+            head_dim: None,
+            kv_head_dim: None,
             mlp_hidden_dim: 2048,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000.0,
             rotary_dim: 64,
             rope_scaling: RopeScaling::None,
         }
+    }
+}
+
+impl MinistralConfig {
+    fn attention_config(&self) -> Result<AttentionConfig> {
+        ensure!(self.embed_dim > 0, "embed_dim must be > 0");
+        ensure!(self.num_heads > 0, "num_heads must be > 0");
+        ensure!(self.num_kv_heads > 0, "num_kv_heads must be > 0");
+        ensure!(
+            self.num_heads.is_multiple_of(self.num_kv_heads),
+            "query heads must be divisible by kv heads"
+        );
+
+        let head_dim = match self.head_dim {
+            Some(dim) => {
+                ensure!(dim > 0, "head_dim must be > 0");
+                dim
+            }
+            None => {
+                ensure!(
+                    self.embed_dim.is_multiple_of(self.num_heads),
+                    "embed_dim {} must be divisible by num_heads {} when head_dim is not provided",
+                    self.embed_dim,
+                    self.num_heads
+                );
+                self.embed_dim / self.num_heads
+            }
+        };
+
+        let kv_head_dim = self.kv_head_dim.unwrap_or(head_dim);
+        ensure!(
+            kv_head_dim == head_dim,
+            "portable attention requires head_dim ({head_dim}) == kv_head_dim ({kv_head_dim})"
+        );
+
+        Ok(AttentionConfig::with_projection_dims(
+            self.embed_dim,
+            self.num_heads,
+            self.num_kv_heads,
+            head_dim,
+            kv_head_dim,
+        ))
     }
 }
 
@@ -182,17 +230,9 @@ impl<B: PortableBackend + 'static> Ministral<B> {
     }
 
     pub fn random(config: MinistralConfig, backend: Arc<B>, rng: &mut impl Rng) -> Result<Self> {
+        let attention_config = config.attention_config()?;
         ensure!(
-            config.embed_dim.is_multiple_of(config.num_heads),
-            "embed dim must divide query heads"
-        );
-        ensure!(
-            config.num_heads.is_multiple_of(config.num_kv_heads),
-            "query heads must be divisible by kv heads"
-        );
-        ensure!(
-            config.rotary_dim.is_multiple_of(2)
-                && config.rotary_dim <= config.embed_dim / config.num_heads,
+            config.rotary_dim.is_multiple_of(2) && config.rotary_dim <= attention_config.head_dim,
             "rotary_dim must be even and <= head_dim"
         );
 
@@ -211,18 +251,14 @@ impl<B: PortableBackend + 'static> Ministral<B> {
         for _ in 0..config.num_layers {
             let attn = CausalSelfAttention::new(
                 Arc::clone(&backend),
-                AttentionConfig::with_kv(config.embed_dim, config.num_heads, config.num_kv_heads),
+                attention_config.clone(),
                 Tensor::randn(
-                    Shape::new([
-                        config.embed_dim,
-                        config.embed_dim
-                            + 2 * (config.num_kv_heads * (config.embed_dim / config.num_heads)),
-                    ]),
+                    Shape::new([config.embed_dim, attention_config.total_projection_dim()]),
                     weight_std,
                     rng,
                 ),
                 Tensor::randn(
-                    Shape::new([config.embed_dim, config.embed_dim]),
+                    Shape::new([attention_config.query_projection_dim(), config.embed_dim]),
                     weight_std,
                     rng,
                 ),
@@ -301,6 +337,11 @@ impl<B: PortableBackend + 'static> Ministral<B> {
         backend: Arc<B>,
         get: &mut dyn FnMut(&str) -> Result<DeviceTensor<B>>,
     ) -> Result<Self> {
+        let attention_config = config.attention_config()?;
+        ensure!(
+            config.rotary_dim.is_multiple_of(2) && config.rotary_dim <= attention_config.head_dim,
+            "rotary_dim must be even and <= head_dim"
+        );
         let tok_embeddings = Embedding::new(Arc::clone(&backend), get("tok_embeddings.weight")?)?;
 
         let mut blocks = Vec::with_capacity(config.num_layers);
@@ -308,7 +349,7 @@ impl<B: PortableBackend + 'static> Ministral<B> {
             let prefix = format!("blocks.{}", layer);
             let attn = CausalSelfAttention::new(
                 Arc::clone(&backend),
-                AttentionConfig::with_kv(config.embed_dim, config.num_heads, config.num_kv_heads),
+                attention_config.clone(),
                 get(&format!("{}.attention.w_qkv", prefix))?,
                 get(&format!("{}.attention.w_out", prefix))?,
                 Option::<DeviceTensor<B>>::None,

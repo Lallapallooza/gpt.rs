@@ -129,7 +129,7 @@ class MinistralCase:
         return gpt.load_model(str(checkpoint))
 
     def _build_hf(self, cfg: RunConfig) -> Tuple[Any, Any]:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
         torch_model_id = str(cfg.params.get("torch_model", _DEFAULT_MODEL_ID))
         trust_remote_code = bool(cfg.params.get("trust_remote_code", False))
@@ -139,10 +139,20 @@ class MinistralCase:
         if torch_dtype != "auto":
             model_kwargs["torch_dtype"] = torch_dtype
 
-        torch_model = cast(
-            Any,
-            AutoModelForCausalLM.from_pretrained(torch_model_id, **model_kwargs),
-        )
+        config = AutoConfig.from_pretrained(torch_model_id, trust_remote_code=trust_remote_code)
+        model_type = str(getattr(config, "model_type", "")).lower()
+        if model_type == "mistral3":
+            from transformers import Mistral3ForConditionalGeneration
+
+            torch_model = cast(
+                Any,
+                Mistral3ForConditionalGeneration.from_pretrained(torch_model_id, **model_kwargs),
+            )
+        else:
+            torch_model = cast(
+                Any,
+                AutoModelForCausalLM.from_pretrained(torch_model_id, **model_kwargs),
+            )
         torch_model.eval()
         torch_model.to(cfg.torch_device)
 
@@ -170,7 +180,7 @@ class MinistralCase:
             input_ids = torch.tensor(tokens, dtype=torch.long, device=cfg.torch_device).unsqueeze(0)
             with torch.no_grad():
                 out = torch_model(input_ids=input_ids)
-            return out.logits[0, -1].detach().cpu().numpy().astype(np.float32, copy=False)
+            return out.logits[0, -1].float().detach().cpu().numpy().astype(np.float32, copy=False)
 
         hf_toks = list(prompt_tokens)
         rs_toks = list(prompt_tokens)

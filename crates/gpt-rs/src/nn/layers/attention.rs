@@ -57,8 +57,37 @@ impl AttentionConfig {
 
     /// Creates a grouped-query configuration where key/value heads use the provided dimension.
     ///
+    /// This constructor does not require `embed_dim / num_query_heads == head_dim`, which allows
+    /// architectures that use wider query projections than residual width.
+    pub fn with_projection_dims(
+        embed_dim: usize,
+        num_query_heads: usize,
+        num_key_value_heads: usize,
+        head_dim: usize,
+        kv_head_dim: usize,
+    ) -> Self {
+        assert!(embed_dim > 0, "embed dim must be positive");
+        assert!(num_query_heads > 0, "query heads must be positive");
+        assert!(num_key_value_heads > 0, "key/value heads must be positive");
+        assert!(
+            num_query_heads.is_multiple_of(num_key_value_heads),
+            "query heads must be divisible by key/value heads"
+        );
+        assert!(head_dim > 0, "head_dim must be positive");
+        assert!(kv_head_dim > 0, "kv_head_dim must be positive");
+        AttentionConfig {
+            embed_dim,
+            num_query_heads,
+            num_key_value_heads,
+            head_dim,
+            kv_head_dim,
+        }
+    }
+
+    /// Creates a grouped-query configuration where key/value heads use the provided dimension.
+    ///
     /// The portable path currently requires `kv_head_dim == head_dim`, so an assertion guards
-    /// against unsupported layouts.
+    /// against unsupported layouts for this convenience constructor.
     pub fn with_custom_kv_dim(
         embed_dim: usize,
         num_query_heads: usize,
@@ -78,13 +107,13 @@ impl AttentionConfig {
             head_dim == kv_head_dim,
             "portable attention requires query and key head dimensions to match"
         );
-        AttentionConfig {
+        Self::with_projection_dims(
             embed_dim,
             num_query_heads,
             num_key_value_heads,
             head_dim,
             kv_head_dim,
-        }
+        )
     }
 
     /// Returns the number of query heads configured for the layer.

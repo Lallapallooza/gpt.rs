@@ -345,7 +345,7 @@ fn attention_cache_outputs_use_seq_len_only() {
 
     assert_eq!(
         attention.output.shape().dims(),
-        &[seq_len, config.embed_dim],
+        &[seq_len, config.query_projection_dim()],
         "output should cover only new tokens"
     );
     assert_eq!(
@@ -400,7 +400,7 @@ fn attention_decode_cache_emits_dynamic_slice_ops() {
 
     assert_eq!(
         attention.output.shape().dims(),
-        &[seq_len, config.embed_dim],
+        &[seq_len, config.query_projection_dim()],
         "decode attention output stays shape-stable"
     );
     assert_eq!(
@@ -427,6 +427,63 @@ fn attention_decode_cache_emits_dynamic_slice_ops() {
             .any(|inst| matches!(inst.op, Operation::DynamicSlice(_))),
         "decode attention should derive the causal mask via DynamicSlice"
     );
+}
+
+#[test]
+fn attention_allows_wider_query_projection_than_embed_dim() {
+    let backend = Arc::new(RecordingBackend::default());
+    let config = AttentionConfig::with_projection_dims(12, 4, 2, 8, 8);
+    let seq_len = 3usize;
+    let qkv = make_tensor(&backend, &[seq_len, config.total_projection_dim()]);
+
+    let attention = functional::attention(backend.as_ref(), &config, &qkv, None)
+        .expect("attention capture succeeds for asymmetric projection dims");
+    assert_eq!(
+        attention.output.shape().dims(),
+        &[seq_len, config.query_projection_dim()],
+        "attention output width must match query projection dim"
+    );
+    flush_tensor(&attention.output);
+}
+
+#[test]
+fn attention_decode_cache_allows_wider_query_projection_than_embed_dim() {
+    let backend = Arc::new(RecordingBackend::default());
+    let config = AttentionConfig::with_projection_dims(12, 4, 2, 8, 8);
+    let seq_len = 1usize;
+    let capacity = 8usize;
+    let qkv = make_tensor(&backend, &[seq_len, config.total_projection_dim()]);
+    let cache_keys = make_tensor_for_dtype(
+        &backend,
+        &[config.num_key_value_heads, capacity, config.kv_head_dim],
+        DType::F32,
+    );
+    let cache_values = make_tensor_for_dtype(
+        &backend,
+        &[config.num_key_value_heads, capacity, config.kv_head_dim],
+        DType::F32,
+    );
+    let cache =
+        functional::DecodeKvCache::new(cache_keys, cache_values, 0).expect("cache validated");
+    let update_starts = make_tensor_for_dtype(&backend, &[3], DType::I32);
+    let query_start = make_tensor_for_dtype(&backend, &[1], DType::I32);
+
+    let attention = functional::attention_decode_cache(
+        backend.as_ref(),
+        &config,
+        &qkv,
+        &cache,
+        &update_starts,
+        &query_start,
+    )
+    .expect("decode attention capture succeeds for asymmetric projection dims");
+    assert_eq!(
+        attention.output.shape().dims(),
+        &[seq_len, config.query_projection_dim()],
+        "decode attention output width must match query projection dim"
+    );
+    assert_eq!(attention.cache.len(), 1, "decode cache length increments");
+    flush_tensor(&attention.output);
 }
 
 #[test]

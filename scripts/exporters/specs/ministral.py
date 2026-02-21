@@ -83,6 +83,26 @@ def _rope_scaling_from_hf(cfg: Any) -> Dict[str, Any]:
     raise ValueError(f"unsupported rope scaling type for Ministral exporter: {rope_type!r}")
 
 
+def _rope_theta_from_hf(cfg: Any) -> float:
+    theta = getattr(cfg, "rope_theta", None)
+    if theta is not None:
+        return float(theta)
+
+    rope_parameters = getattr(cfg, "rope_parameters", None)
+    if isinstance(rope_parameters, dict):
+        rope_theta = rope_parameters.get("rope_theta")
+        if rope_theta is not None:
+            return float(rope_theta)
+
+    rope_scaling = getattr(cfg, "rope_scaling", None)
+    if isinstance(rope_scaling, dict):
+        rope_theta = rope_scaling.get("rope_theta")
+        if rope_theta is not None:
+            return float(rope_theta)
+
+    return 10_000.0
+
+
 def _rotary_dim_from_hf(cfg: Any) -> int:
     hidden_size = int(cfg.hidden_size)
     num_heads = int(cfg.num_attention_heads)
@@ -112,49 +132,94 @@ def _context_length_from_hf(cfg: Any) -> int:
     return 2048
 
 
+def _text_config(cfg: Any) -> Any:
+    text_cfg = getattr(cfg, "text_config", None)
+    if text_cfg is not None:
+        return text_cfg
+    return cfg
+
+
+def _text_state_prefix(state: Mapping[str, Any]) -> str:
+    candidates = ("model.language_model", "model", "language_model")
+    for prefix in candidates:
+        probe = f"{prefix}.layers.0.self_attn.q_proj.weight"
+        if probe in state:
+            return prefix
+    known = ", ".join(sorted(k for k in state.keys() if ".layers." in k)[:8])
+    raise KeyError(
+        "unable to locate text transformer prefix in state dict; "
+        f"checked {candidates}, sample layer keys: {known}"
+    )
+
+
 def _collect_checkpoint(model: Any) -> Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
     import torch
 
     cfg = model.config
+    text_cfg = _text_config(cfg)
     state = model.state_dict()
+    text_prefix = _text_state_prefix(state)
 
-    embed_dim = int(cfg.hidden_size)
-    num_layers = int(cfg.num_hidden_layers)
-    num_heads = int(cfg.num_attention_heads)
-    num_kv_heads = int(getattr(cfg, "num_key_value_heads", num_heads))
-    mlp_hidden_dim = int(cfg.intermediate_size)
-    vocab_size = int(cfg.vocab_size)
-    context_length = _context_length_from_hf(cfg)
+    embed_dim = int(text_cfg.hidden_size)
+    num_layers = int(text_cfg.num_hidden_layers)
+    num_heads = int(text_cfg.num_attention_heads)
+    num_kv_heads_cfg = int(getattr(text_cfg, "num_key_value_heads", num_heads))
+    mlp_hidden_dim = int(text_cfg.intermediate_size)
+    vocab_size = int(text_cfg.vocab_size)
+    context_length = _context_length_from_hf(text_cfg)
 
     if embed_dim % num_heads != 0:
         raise ValueError(
             "invalid attention dimensions: "
             f"hidden_size={embed_dim} is not divisible by num_heads={num_heads}"
         )
-    if num_heads % num_kv_heads != 0:
+    if num_heads % num_kv_heads_cfg != 0:
         raise ValueError(
             "invalid grouped-query attention dimensions: "
-            f"num_heads={num_heads} is not divisible by num_kv_heads={num_kv_heads}"
+            f"num_heads={num_heads} is not divisible by num_kv_heads={num_kv_heads_cfg}"
         )
 
-    head_dim = embed_dim // num_heads
-    kv_dim = num_kv_heads * head_dim
-    qkv_dim = embed_dim + kv_dim + kv_dim
+    q_proj0 = _state_tensor(state, f"{text_prefix}.layers.0.self_attn.q_proj.weight").t()
+    k_proj0 = _state_tensor(state, f"{text_prefix}.layers.0.self_attn.k_proj.weight").t()
+    q_proj_dim = int(q_proj0.shape[1])
+    if q_proj_dim % num_heads != 0:
+        raise ValueError(
+            "invalid query projection width: "
+            f"q_proj_dim={q_proj_dim} is not divisible by num_heads={num_heads}"
+        )
+    head_dim = q_proj_dim // num_heads
+    kv_dim = int(k_proj0.shape[1])
+    if kv_dim % head_dim != 0:
+        raise ValueError(
+            f"invalid key projection width: kv_dim={kv_dim} is not divisible by head_dim={head_dim}"
+        )
+    num_kv_heads = kv_dim // head_dim
+    qkv_dim = q_proj_dim + kv_dim + kv_dim
 
     tensors: Dict[str, np.ndarray] = {}
     add_tensor = tensors.__setitem__
 
     add_tensor(
         "tok_embeddings.weight",
-        _to_numpy_f32(_state_tensor(state, "model.embed_tokens.weight")),
+        _to_numpy_f32(_state_tensor(state, f"{text_prefix}.embed_tokens.weight")),
     )
 
     for i in range(num_layers):
-        prefix = f"model.layers.{i}"
+        prefix = f"{text_prefix}.layers.{i}"
 
         q_proj = _state_tensor(state, f"{prefix}.self_attn.q_proj.weight").t()
         k_proj = _state_tensor(state, f"{prefix}.self_attn.k_proj.weight").t()
         v_proj = _state_tensor(state, f"{prefix}.self_attn.v_proj.weight").t()
+        if int(q_proj.shape[1]) != q_proj_dim:
+            raise ValueError(
+                f"inconsistent query projection width at layer {i}: "
+                f"expected {q_proj_dim}, got {int(q_proj.shape[1])}"
+            )
+        if int(k_proj.shape[1]) != kv_dim or int(v_proj.shape[1]) != kv_dim:
+            raise ValueError(
+                "inconsistent kv projection width at layer "
+                f"{i}: expected {kv_dim}, got k={int(k_proj.shape[1])}, v={int(v_proj.shape[1])}"
+            )
         packed_qkv = torch.cat((q_proj, k_proj, v_proj), dim=1)
         if tuple(packed_qkv.shape) != (embed_dim, qkv_dim):
             raise ValueError(
@@ -188,10 +253,12 @@ def _collect_checkpoint(model: Any) -> Tuple[Dict[str, Any], Dict[str, np.ndarra
             _to_numpy_f32(_state_tensor(state, f"{prefix}.post_attention_layernorm.weight")),
         )
 
-    add_tensor("final_norm.gamma", _to_numpy_f32(_state_tensor(state, "model.norm.weight")))
+    add_tensor(
+        "final_norm.gamma", _to_numpy_f32(_state_tensor(state, f"{text_prefix}.norm.weight"))
+    )
     lm_head_weight = state.get("lm_head.weight")
     if lm_head_weight is None:
-        lm_head_weight = _state_tensor(state, "model.embed_tokens.weight")
+        lm_head_weight = _state_tensor(state, f"{text_prefix}.embed_tokens.weight")
     add_tensor("lm_head", _to_numpy_f32(lm_head_weight.t()))
 
     model_config = {
@@ -201,11 +268,13 @@ def _collect_checkpoint(model: Any) -> Tuple[Dict[str, Any], Dict[str, np.ndarra
         "num_layers": num_layers,
         "num_heads": num_heads,
         "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
+        "kv_head_dim": head_dim,
         "mlp_hidden_dim": mlp_hidden_dim,
-        "rms_norm_eps": float(getattr(cfg, "rms_norm_eps", 1e-5)),
-        "rope_theta": float(getattr(cfg, "rope_theta", 10_000.0)),
-        "rotary_dim": _rotary_dim_from_hf(cfg),
-        "rope_scaling": _rope_scaling_from_hf(cfg),
+        "rms_norm_eps": float(getattr(text_cfg, "rms_norm_eps", 1e-5)),
+        "rope_theta": _rope_theta_from_hf(text_cfg),
+        "rotary_dim": _rotary_dim_from_hf(text_cfg),
+        "rope_scaling": _rope_scaling_from_hf(text_cfg),
     }
     return model_config, tensors
 
@@ -216,14 +285,21 @@ def _load_model_and_tokenizer(
     torch_dtype_name: str,
     trust_remote_code: bool,
 ) -> Tuple[Any, Any]:
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     kwargs: Dict[str, Any] = {"trust_remote_code": trust_remote_code}
     dtype = _resolve_torch_dtype(torch_dtype_name)
     if dtype != "auto":
         kwargs["torch_dtype"] = dtype
 
-    model = cast(Any, AutoModelForCausalLM.from_pretrained(model_id, **kwargs))
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+    model_type = str(getattr(config, "model_type", "")).lower()
+    if model_type == "mistral3":
+        from transformers import Mistral3ForConditionalGeneration
+
+        model = cast(Any, Mistral3ForConditionalGeneration.from_pretrained(model_id, **kwargs))
+    else:
+        model = cast(Any, AutoModelForCausalLM.from_pretrained(model_id, **kwargs))
     model.eval()
     model.to(device)
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)

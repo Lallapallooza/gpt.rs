@@ -229,6 +229,9 @@ Examples:
 ```bash
 uv run python scripts/eval.py --model resnet34 --workload validate
 uv run python scripts/eval.py --model gpt2 --workload bench --threads 1 4 --bench-tokens 1 64
+uv run python scripts/eval.py --model ministral_3_3b_instruct_2512 --workload validate \
+  --checkpoint checkpoints/ministral_3_3b_instruct_2512.bin \
+  --torch-model mistralai/Ministral-3-3B-Instruct-2512
 uv run python scripts/eval.py --suite scripts/eval_suites/vision.json
 ```
 
@@ -265,6 +268,10 @@ Notes:
 
 Legacy wrapper scripts have been removed; use `scripts/eval.py` directly with
 `--workload validate|bench|run`.
+
+For Ministral text runs, `scripts/eval.py --model ministral_3_3b_instruct_2512 --workload run`
+uses the Hugging Face tokenizer (not `gpt_rs.Tokenizer.from_file`) and can decode generated output
+without converting to the GPT-2 tokenizer format.
 
 ### Debugging knobs (env vars)
 
@@ -304,6 +311,10 @@ cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- generate \
 First export weights from Torch into a gpt.rs checkpoint:
 
 ```bash
+uv run python scripts/export.py export --exporter ministral_3_3b_instruct_2512 \
+  --checkpoint-out checkpoints/ministral_3_3b_instruct_2512.bin \
+  --config-out configs/ministral_3_3b_instruct_2512_model.json \
+  --tokenizer-out configs/ministral_3_3b_instruct_2512_tokenizer.json
 uv run python scripts/export.py export --exporter resnet34 --checkpoint-out checkpoints/resnet34.bin
 uv run python scripts/export.py export --exporter mobilenet_v2 --checkpoint-out checkpoints/mobilenet_v2.bin
 ```

@@ -27,7 +27,7 @@ data_bytes[...]
 
 JSON object matching `crates/gpt-rs/src/model/config.rs::ModelConfig`:
 
-- `kind`: string (e.g. `"gpt"`, `"resnet34"`)
+- `kind`: string (e.g. `"gpt"`, `"ministral"`, `"resnet34"`)
 - `config`: model-specific JSON payload
 - `runtime` (optional): runtime-only knobs (e.g. functional overrides)
 

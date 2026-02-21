@@ -365,6 +365,7 @@ pub fn load_model(checkpoint: String, backend: Option<String>) -> PyResult<PyLoa
 pub fn supported_model_kinds() -> PyResult<Vec<String>> {
     Ok(vec![
         "gpt".to_string(),
+        "ministral".to_string(),
         "resnet34".to_string(),
         "mobilenet_v2".to_string(),
     ])

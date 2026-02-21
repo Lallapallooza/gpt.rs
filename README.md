@@ -36,6 +36,10 @@ uv --project "$(pwd)" --directory "$(pwd)/crates/gpt-rs-py" run \
 uv run python scripts/export.py export --exporter gpt2 \
   --checkpoint-out checkpoints/gpt2.bin \
   --config-out configs/gpt2_model.json --tokenizer-out configs/gpt2_tokenizer.json
+uv run python scripts/export.py export --exporter ministral_3_3b_instruct_2512 \
+  --checkpoint-out checkpoints/ministral_3_3b_instruct_2512.bin \
+  --config-out configs/ministral_3_3b_instruct_2512_model.json \
+  --tokenizer-out configs/ministral_3_3b_instruct_2512_tokenizer.json
 uv run python scripts/export.py export --exporter resnet34 --checkpoint-out checkpoints/resnet34.bin
 uv run python scripts/export.py export --exporter mobilenet_v2 --checkpoint-out checkpoints/mobilenet_v2.bin
 
@@ -155,6 +159,17 @@ cargo run -p gpt-rs-cli -- --help
 cargo run --release -p gpt-rs-cli -- generate --prompt "Hello" --max-tokens 64 \
   --checkpoint checkpoints/gpt2.bin --tokenizer configs/gpt2_tokenizer.json
 
+# export Ministral artifacts (checkpoint + config + HF tokenizer json)
+uv run python scripts/export.py export --exporter ministral_3_3b_instruct_2512 \
+  --checkpoint-out checkpoints/ministral_3_3b_instruct_2512.bin \
+  --config-out configs/ministral_3_3b_instruct_2512_model.json \
+  --tokenizer-out configs/ministral_3_3b_instruct_2512_tokenizer.json
+
+# validate Ministral checkpoint against Torch
+uv run python scripts/eval.py --model ministral_3_3b_instruct_2512 --workload validate \
+  --checkpoint checkpoints/ministral_3_3b_instruct_2512.bin \
+  --torch-model mistralai/Ministral-3-3B-Instruct-2512
+
 # export torchvision weights (gpt.rs checkpoint)
 uv sync
 uv run python scripts/export.py export --exporter resnet34 --checkpoint-out checkpoints/resnet34.bin
@@ -175,6 +190,9 @@ cd crates/gpt-rs-py && uv run maturin develop --release --features faer && cd ..
 
 uv run python scripts/eval.py --model resnet34 --workload validate
 uv run python scripts/eval.py --model gpt2 --workload bench --threads 1 4 --bench-tokens 1 64
+uv run python scripts/eval.py --model ministral_3_3b_instruct_2512 --workload validate \
+  --checkpoint checkpoints/ministral_3_3b_instruct_2512.bin \
+  --torch-model mistralai/Ministral-3-3B-Instruct-2512
 ```
 
 Notes:
@@ -197,8 +215,9 @@ Torch parity tests live under `crates/gpt-rs-backend-tests/src/torch_parity/` an
 
 ## Status
 
-Forward inference for GPT-2 generation and image classification models (ResNet34, MobileNetV2) is implemented, with
-portable PTIR kernels and Torch baselines for correctness.
+Forward inference for causal LMs (`gpt`, `ministral`) and image classification models
+(`resnet34`, `mobilenet_v2`) is implemented, with portable PTIR kernels and Torch baselines
+for correctness.
 
 The functional layer exposes portable math (elementwise ops, matmul, normalization, attention, conv/pool) via the
 `DeviceTensorOps` extension trait while still delegating to backend PTIR execution.

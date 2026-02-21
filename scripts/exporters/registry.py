@@ -21,9 +21,11 @@ def _load_default_exporters() -> None:
     if _LOADED:
         return
     from .specs.gpt2 import GPT2Exporter
+    from .specs.ministral import MinistralExporter
     from .specs.vision import build_vision_exporters
 
     register_exporter(GPT2Exporter())
+    register_exporter(MinistralExporter())
     for exporter in build_vision_exporters():
         register_exporter(exporter)
     _LOADED = True

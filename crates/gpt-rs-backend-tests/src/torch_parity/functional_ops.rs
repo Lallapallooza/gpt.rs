@@ -77,6 +77,29 @@ fn silu_case<B: PortableBackend + 'static>(backend: &Arc<B>, shape: &[usize], da
     assert_close(&expected, &actual);
 }
 
+fn swiglu_case<B: PortableBackend + 'static>(
+    backend: &Arc<B>,
+    shape: &[usize],
+    gate_data: &[f32],
+    up_data: &[f32],
+) {
+    let expected = timed_torch(|| {
+        let gate_t = tch_tensor_from_vec(shape, gate_data);
+        let up_t = tch_tensor_from_vec(shape, up_data);
+        let expected_tensor = gate_t.silu() * up_t;
+        tensor_to_vec(&expected_tensor)
+    });
+
+    let actual = timed_gpt(|| {
+        let gate = device_tensor_from_data(backend, shape, gate_data);
+        let up = device_tensor_from_data(backend, shape, up_data);
+        let result = functional::swiglu(backend.as_ref(), &gate, &up).unwrap();
+        to_host_vec(&result)
+    });
+
+    assert_close(&expected, &actual);
+}
+
 fn add_bias_case<B: PortableBackend + 'static>(
     backend: &Arc<B>,
     shape: &[usize],
@@ -281,6 +304,31 @@ pub fn silu_extreme_inputs_match_torch<B: PortableBackend + 'static>(backend: &A
     let len: usize = shape.iter().product();
     let data = random_vec_range(&mut rng, len, -40.0, 40.0);
     silu_case(backend, &shape, &data);
+}
+
+pub fn swiglu_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    let mut rng = seeded_rng(0x5200_u64);
+    let shape = [5usize, 19usize];
+    let len: usize = shape.iter().product();
+    let gate_data = random_vec_range(&mut rng, len, -10.0, 10.0);
+    let up_data = random_vec(&mut rng, len);
+    swiglu_case(backend, &shape, &gate_data, &up_data);
+}
+
+pub fn swiglu_rejects_shape_mismatch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    let err = timed_gpt(|| {
+        let gate = device_tensor_from_data(backend, &[2, 8], &[0.0; 16]);
+        let up = device_tensor_from_data(backend, &[2, 7], &[0.0; 14]);
+        match functional::swiglu(backend.as_ref(), &gate, &up) {
+            Ok(_) => panic!("swiglu should reject shape mismatch"),
+            Err(err) => err,
+        }
+    });
+    assert!(
+        err.to_string().contains("shape"),
+        "error should mention shape mismatch, got: {}",
+        err
+    );
 }
 
 pub fn add_bias_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {

@@ -60,8 +60,8 @@ macro_rules! define_backend_tests {
 
                 use $crate::torch_parity::{
                     arithmetic, attention, embedding_layer, feed_forward_layer, functional_ops,
-                    harness, layer_norm_layer, linear, matmul, multi_head_attention_layer,
-                    rms_norm_layer, vision_ops,
+                    gated_feed_forward_layer, harness, layer_norm_layer, linear, matmul,
+                    multi_head_attention_layer, rms_norm_layer, vision_ops,
                 };
 
                 macro_rules! run_parity {
@@ -125,6 +125,8 @@ macro_rules! define_backend_tests {
             parity_test!(torch_functional_gelu_matches_torch, functional_ops::gelu_matches_torch);
             parity_test!(torch_functional_silu_matches_torch, functional_ops::silu_matches_torch);
             parity_test!(torch_functional_silu_extreme_inputs_match_torch, functional_ops::silu_extreme_inputs_match_torch);
+            parity_test!(torch_functional_swiglu_matches_torch, functional_ops::swiglu_matches_torch);
+            parity_test!(torch_functional_swiglu_rejects_shape_mismatch, functional_ops::swiglu_rejects_shape_mismatch);
             parity_test!(torch_functional_gelu_matches_torch_1d_256, functional_ops::gelu_matches_torch_1d_256);
             parity_test!(torch_functional_gelu_matches_torch_2d_4x16, functional_ops::gelu_matches_torch_2d_4x16);
             parity_test!(torch_functional_gelu_matches_torch_3d_2x3x8, functional_ops::gelu_matches_torch_3d_2x3x8);
@@ -209,6 +211,10 @@ macro_rules! define_backend_tests {
             parity_test!(torch_feed_forward_matches_torch_batch7_embed13_hidden31_no_bias, feed_forward_layer::feed_forward_matches_torch_batch7_embed13_hidden31_no_bias);
             parity_test!(torch_feed_forward_state_records_activation_batch4_embed32_hidden128, feed_forward_layer::feed_forward_state_records_activation_batch4_embed32_hidden128);
             parity_test!(torch_feed_forward_state_records_activation_extreme_inputs, feed_forward_layer::feed_forward_state_records_activation_extreme_inputs);
+            parity_test!(torch_gated_feed_forward_matches_torch_with_bias, gated_feed_forward_layer::gated_feed_forward_matches_torch_with_bias);
+            parity_test!(torch_gated_feed_forward_matches_torch_without_bias, gated_feed_forward_layer::gated_feed_forward_matches_torch_without_bias);
+            parity_test!(torch_gated_feed_forward_matches_torch_batch4_embed64_hidden256_bias, gated_feed_forward_layer::gated_feed_forward_matches_torch_batch4_embed64_hidden256_bias);
+            parity_test!(torch_gated_feed_forward_state_records_swiglu_hidden, gated_feed_forward_layer::gated_feed_forward_state_records_swiglu_hidden);
             parity_test!(torch_layer_norm_matches_torch_basic, layer_norm_layer::layer_norm_matches_torch_basic);
             parity_test!(torch_layer_norm_forward_with_state_matches_moments, layer_norm_layer::layer_norm_forward_with_state_matches_moments);
             parity_test!(torch_layer_norm_matches_torch_embed_dim1, layer_norm_layer::layer_norm_matches_torch_embed_dim1);

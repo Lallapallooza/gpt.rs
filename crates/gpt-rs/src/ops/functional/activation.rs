@@ -7,7 +7,10 @@ use anyhow::Result;
 use gpt_rs_macros::{capture_ptir, ptir_pattern, support_runtime_overload};
 
 use crate::backend::spec::PortableBackend;
-use crate::ops::functional::common::{ensure_rank_at_least, CaptureIntoDeviceTensor};
+use crate::ops::functional::common::{
+    ensure_rank_at_least, ensure_same_backend, ensure_same_dtype, ensure_shape_matches,
+    CaptureIntoDeviceTensor,
+};
 use crate::ops::ptir;
 use crate::tensor::DeviceTensor;
 
@@ -129,6 +132,33 @@ pub fn silu<B: PortableBackend + 'static>(
         let exp = neg.exp();
         let denom = 1.0f32 + exp;
         let out = input / denom;
+        Ok(out.id())
+    })?
+    .into_device_tensor()
+}
+
+/// Applies SwiGLU gating: `silu(gate) * up`.
+///
+/// This helper is the activation core used by gated MLP blocks in Mistral/Ministral-like models.
+/// Both inputs must have identical shape/dtype/backend placement.
+#[support_runtime_overload]
+#[ptir_pattern(target = "gpt_rs.swiglu_f32")]
+pub fn swiglu<B: PortableBackend + 'static>(
+    _backend: &B,
+    gate: &DeviceTensor<B>,
+    up: &DeviceTensor<B>,
+) -> Result<DeviceTensor<B>> {
+    ensure_same_backend("swiglu", gate, up)?;
+    ensure_same_dtype("swiglu gate", gate, "up", up)?;
+    ensure_shape_matches("swiglu gate", gate, "up", up)?;
+    ensure_rank_at_least("swiglu gate", gate, 1)?;
+
+    capture_ptir!({ gate, up }, |_session| {
+        let neg = gate * -1.0f32;
+        let exp = neg.exp();
+        let denom = 1.0f32 + exp;
+        let silu_gate = gate / denom;
+        let out = silu_gate * up;
         Ok(out.id())
     })?
     .into_device_tensor()

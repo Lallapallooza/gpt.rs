@@ -4,6 +4,7 @@ pub mod common;
 pub mod embedding_layer;
 pub mod feed_forward_layer;
 pub mod functional_ops;
+pub mod gated_feed_forward_layer;
 pub mod harness;
 pub mod layer_norm_layer;
 pub mod linear;

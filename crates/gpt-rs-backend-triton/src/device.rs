@@ -1,4 +1,4 @@
-use std::ffi::c_void;
+use std::ffi::{c_void, CString};
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
@@ -9,6 +9,9 @@ type CUresult = i32;
 type CUdevice = i32;
 type CUcontext = *mut c_void;
 type CUdeviceptr = u64;
+type CUmodule = *mut c_void;
+type CUfunction = *mut c_void;
+type CUstream = *mut c_void;
 
 const CUDA_SUCCESS: CUresult = 0;
 
@@ -32,6 +35,29 @@ type CuMemcpyDtoHV2Fn = unsafe extern "C" fn(
 ) -> CUresult;
 type CuMemsetD8V2Fn =
     unsafe extern "C" fn(dst_device: CUdeviceptr, value: u8, count: usize) -> CUresult;
+type CuModuleLoadDataExFn = unsafe extern "C" fn(
+    module: *mut CUmodule,
+    image: *const c_void,
+    num_options: u32,
+    options: *mut u32,
+    option_values: *mut *mut c_void,
+) -> CUresult;
+type CuModuleUnloadFn = unsafe extern "C" fn(module: CUmodule) -> CUresult;
+type CuModuleGetFunctionFn =
+    unsafe extern "C" fn(hfunc: *mut CUfunction, hmod: CUmodule, name: *const i8) -> CUresult;
+type CuLaunchKernelFn = unsafe extern "C" fn(
+    f: CUfunction,
+    grid_dim_x: u32,
+    grid_dim_y: u32,
+    grid_dim_z: u32,
+    block_dim_x: u32,
+    block_dim_y: u32,
+    block_dim_z: u32,
+    shared_mem_bytes: u32,
+    h_stream: CUstream,
+    kernel_params: *mut *mut c_void,
+    extra: *mut *mut c_void,
+) -> CUresult;
 
 struct DriverFns {
     cu_init: CuInitFn,
@@ -44,6 +70,10 @@ struct DriverFns {
     cu_memcpy_hto_d_v2: CuMemcpyHtoDV2Fn,
     cu_memcpy_dto_h_v2: CuMemcpyDtoHV2Fn,
     cu_memset_d8_v2: CuMemsetD8V2Fn,
+    cu_module_load_data_ex: CuModuleLoadDataExFn,
+    cu_module_unload: CuModuleUnloadFn,
+    cu_module_get_function: CuModuleGetFunctionFn,
+    cu_launch_kernel: CuLaunchKernelFn,
 }
 
 pub struct CudaDriver {
@@ -86,12 +116,38 @@ impl DeviceBuffer {
     pub fn read_to_vec(&self) -> BackendResult<Vec<u8>> {
         self.driver.download(self.ptr, self.bytes)
     }
+
+    pub fn device_ptr(&self) -> u64 {
+        self.ptr
+    }
 }
 
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
         // SAFETY: Device pointer was allocated by this driver and is released once on drop.
         let _ = unsafe { (self.driver.fns.cu_mem_free_v2)(self.ptr) };
+    }
+}
+
+#[derive(Clone)]
+pub struct CudaFunction {
+    #[allow(dead_code)]
+    module: Arc<CudaModule>,
+    func: usize,
+}
+
+pub struct CudaModule {
+    driver: Arc<CudaDriver>,
+    module: usize,
+}
+
+impl Drop for CudaModule {
+    fn drop(&mut self) {
+        if self.module != 0 {
+            // SAFETY: Module belongs to this driver and is unloaded once.
+            let _ = unsafe { (self.driver.fns.cu_module_unload)(self.module_ptr()) };
+            self.module = 0;
+        }
     }
 }
 
@@ -128,6 +184,10 @@ impl CudaDriver {
             cu_memcpy_hto_d_v2: load_symbol(&lib, b"cuMemcpyHtoD_v2\0")?,
             cu_memcpy_dto_h_v2: load_symbol(&lib, b"cuMemcpyDtoH_v2\0")?,
             cu_memset_d8_v2: load_symbol(&lib, b"cuMemsetD8_v2\0")?,
+            cu_module_load_data_ex: load_symbol(&lib, b"cuModuleLoadDataEx\0")?,
+            cu_module_unload: load_symbol(&lib, b"cuModuleUnload\0")?,
+            cu_module_get_function: load_symbol(&lib, b"cuModuleGetFunction\0")?,
+            cu_launch_kernel: load_symbol(&lib, b"cuLaunchKernel\0")?,
         };
 
         // SAFETY: Calls are made with valid pointers and follow CUDA driver API contract.
@@ -218,7 +278,89 @@ impl CudaDriver {
         }))
     }
 
-    fn ensure_current(&self) -> BackendResult<()> {
+    pub fn load_ptx_module(self: &Arc<Self>, ptx: &str) -> BackendResult<Arc<CudaModule>> {
+        self.ensure_current()?;
+        let c_ptx = CString::new(ptx)
+            .map_err(|_| BackendError::execution("ptx source contains NUL byte"))?;
+        let mut module: CUmodule = std::ptr::null_mut();
+        // SAFETY: pointer arguments are valid for cuModuleLoadDataEx.
+        unsafe {
+            check_cuda(
+                (self.fns.cu_module_load_data_ex)(
+                    &mut module as *mut CUmodule,
+                    c_ptx.as_ptr() as *const c_void,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                "cuModuleLoadDataEx",
+            )?;
+        }
+        Ok(Arc::new(CudaModule {
+            driver: Arc::clone(self),
+            module: module as usize,
+        }))
+    }
+
+    pub fn get_function(
+        &self,
+        module: &Arc<CudaModule>,
+        symbol: &str,
+    ) -> BackendResult<CudaFunction> {
+        self.ensure_current()?;
+        let c_symbol = CString::new(symbol)
+            .map_err(|_| BackendError::execution("kernel symbol contains NUL byte"))?;
+        let mut function: CUfunction = std::ptr::null_mut();
+        // SAFETY: module and output pointers are valid.
+        unsafe {
+            check_cuda(
+                (self.fns.cu_module_get_function)(
+                    &mut function as *mut CUfunction,
+                    module.module_ptr(),
+                    c_symbol.as_ptr(),
+                ),
+                "cuModuleGetFunction",
+            )?;
+        }
+
+        Ok(CudaFunction {
+            module: Arc::clone(module),
+            func: function as usize,
+        })
+    }
+
+    pub fn launch_kernel(
+        &self,
+        function: &CudaFunction,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shared_mem_bytes: u32,
+        params: &mut [*mut c_void],
+    ) -> BackendResult<()> {
+        self.ensure_current()?;
+        // SAFETY: function and parameter pointers are valid for kernel launch.
+        unsafe {
+            check_cuda(
+                (self.fns.cu_launch_kernel)(
+                    function.func_ptr(),
+                    grid.0,
+                    grid.1,
+                    grid.2,
+                    block.0,
+                    block.1,
+                    block.2,
+                    shared_mem_bytes,
+                    std::ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                ),
+                "cuLaunchKernel",
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn ensure_current(&self) -> BackendResult<()> {
         // SAFETY: Context was created by this driver and remains valid until drop.
         unsafe {
             check_cuda(
@@ -230,6 +372,18 @@ impl CudaDriver {
 
     fn ctx_ptr(&self) -> CUcontext {
         self.ctx as CUcontext
+    }
+}
+
+impl CudaFunction {
+    fn func_ptr(&self) -> CUfunction {
+        self.func as CUfunction
+    }
+}
+
+impl CudaModule {
+    fn module_ptr(&self) -> CUmodule {
+        self.module as CUmodule
     }
 }
 

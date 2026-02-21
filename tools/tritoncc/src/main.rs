@@ -16,6 +16,12 @@ struct KernelMeta {
     note: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KernelKind {
+    ElementwiseBinaryF32,
+    Placeholder,
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err}");
@@ -83,28 +89,17 @@ fn run_compile(raw_args: Vec<String>) -> Result<(), String> {
     let source = fs::read_to_string(&input)
         .map_err(|e| format!("failed to read input {}: {e}", input.display()))?;
 
+    let kernel_kind = detect_kernel_kind(&source);
     let source_preview = source
         .lines()
         .take(12)
         .map(|line| format!("// {line}"))
         .collect::<Vec<_>>()
         .join("\n");
-
-    let ptx = format!(
-        r#"// tritoncc placeholder PTX artifact
-// This artifact is non-executable and exists to lock CLI/metadata contracts.
-// arch: {arch}
-// input: {input}
-.version 8.0
-.target sm_80
-.address_size 64
-// source preview:
-{source_preview}
-"#,
-        arch = arch,
-        input = input.display(),
-        source_preview = source_preview
-    );
+    let ptx = match kernel_kind {
+        KernelKind::ElementwiseBinaryF32 => emit_elementwise_binary_ptx(&arch),
+        KernelKind::Placeholder => emit_placeholder_ptx(&arch, input.display().to_string(), source_preview),
+    };
 
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)
@@ -113,7 +108,26 @@ fn run_compile(raw_args: Vec<String>) -> Result<(), String> {
     fs::write(&output, ptx)
         .map_err(|e| format!("failed to write output {}: {e}", output.display()))?;
 
-    let kernel_symbol = derive_symbol_name(&input);
+    let kernel_symbol = match kernel_kind {
+        KernelKind::ElementwiseBinaryF32 => "gpt_rs_triton_ewise_binary_f32".to_string(),
+        KernelKind::Placeholder => derive_symbol_name(&input),
+    };
+    let param_abi = match kernel_kind {
+        KernelKind::ElementwiseBinaryF32 => {
+            vec![
+                "*fp32".to_string(),
+                "*fp32".to_string(),
+                "*fp32".to_string(),
+                "u32".to_string(),
+                "u32".to_string(),
+            ]
+        }
+        KernelKind::Placeholder => vec!["*fp32".to_string(), "*fp32".to_string(), "i32".to_string()],
+    };
+    let note = match kernel_kind {
+        KernelKind::ElementwiseBinaryF32 => "elementwise binary PTX emitted by tritoncc",
+        KernelKind::Placeholder => "placeholder metadata emitted by bootstrap tritoncc",
+    };
     let meta_doc = KernelMeta {
         schema_version: 1,
         tool: "tritoncc",
@@ -122,10 +136,10 @@ fn run_compile(raw_args: Vec<String>) -> Result<(), String> {
         input: input.display().to_string(),
         output: output.display().to_string(),
         kernel_symbol,
-        param_abi: vec!["*fp32".to_string(), "*fp32".to_string(), "i32".to_string()],
+        param_abi,
         shared_mem_bytes: 0,
         num_warps: 4,
-        note: "placeholder metadata emitted by bootstrap tritoncc",
+        note,
     };
 
     if let Some(parent) = meta.parent() {
@@ -152,6 +166,115 @@ fn run_inspect(raw_args: Vec<String>) -> Result<(), String> {
     println!("lines={}", source.lines().count());
     println!("symbol={}", derive_symbol_name(&input));
     Ok(())
+}
+
+fn detect_kernel_kind(source: &str) -> KernelKind {
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed == "// gpt_rs.kernel: elementwise_binary_f32" {
+            return KernelKind::ElementwiseBinaryF32;
+        }
+    }
+    KernelKind::Placeholder
+}
+
+fn emit_placeholder_ptx(arch: &str, input: String, source_preview: String) -> String {
+    format!(
+        r#"// tritoncc placeholder PTX artifact
+// This artifact is non-executable and exists to lock CLI/metadata contracts.
+// arch: {arch}
+// input: {input}
+.version 8.0
+.target {arch}
+.address_size 64
+// source preview:
+{source_preview}
+"#
+    )
+}
+
+fn emit_elementwise_binary_ptx(arch: &str) -> String {
+    format!(
+        r#".version 7.0
+.target {arch}
+.address_size 64
+
+.visible .entry gpt_rs_triton_ewise_binary_f32(
+    .param .u64 lhs_ptr,
+    .param .u64 rhs_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n,
+    .param .u32 op
+)
+{{
+    .reg .pred %p<7>;
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<14>;
+    .reg .f32 %f<6>;
+
+    ld.param.u64 %rd1, [lhs_ptr];
+    ld.param.u64 %rd2, [rhs_ptr];
+    ld.param.u64 %rd3, [out_ptr];
+    ld.param.u32 %r1, [n];
+    ld.param.u32 %r2, [op];
+
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %tid.x;
+    mad.lo.s32 %r6, %r3, %r4, %r5;
+    setp.ge.u32 %p1, %r6, %r1;
+    @%p1 bra L_DONE;
+
+    mul.wide.u32 %rd4, %r6, 4;
+    add.s64 %rd5, %rd1, %rd4;
+    add.s64 %rd6, %rd2, %rd4;
+    add.s64 %rd7, %rd3, %rd4;
+    ld.global.f32 %f1, [%rd5];
+    ld.global.f32 %f2, [%rd6];
+
+    setp.eq.u32 %p2, %r2, 0;
+    @%p2 bra L_ADD;
+    setp.eq.u32 %p3, %r2, 1;
+    @%p3 bra L_SUB;
+    setp.eq.u32 %p4, %r2, 2;
+    @%p4 bra L_MUL;
+    setp.eq.u32 %p5, %r2, 3;
+    @%p5 bra L_DIV;
+    setp.eq.u32 %p6, %r2, 4;
+    @%p6 bra L_MAX;
+    bra L_MIN;
+
+L_ADD:
+    add.f32 %f3, %f1, %f2;
+    bra L_STORE;
+
+L_SUB:
+    sub.f32 %f3, %f1, %f2;
+    bra L_STORE;
+
+L_MUL:
+    mul.f32 %f3, %f1, %f2;
+    bra L_STORE;
+
+L_DIV:
+    div.full.f32 %f3, %f1, %f2;
+    bra L_STORE;
+
+L_MAX:
+    max.f32 %f3, %f1, %f2;
+    bra L_STORE;
+
+L_MIN:
+    min.f32 %f3, %f1, %f2;
+
+L_STORE:
+    st.global.f32 [%rd7], %f3;
+
+L_DONE:
+    ret;
+}}
+"#
+    )
 }
 
 fn derive_symbol_name(input: &PathBuf) -> String {

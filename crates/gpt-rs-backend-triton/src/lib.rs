@@ -1,4 +1,10 @@
+mod bundle;
+mod codegen;
+mod compiler;
 mod device;
+mod kernels;
+mod optimizer;
+mod runtime;
 mod tensor;
 
 use std::sync::Arc;
@@ -10,11 +16,11 @@ use gpt_rs::backend::conversion::{
     ConvertedIr, LegalitySpec, OperationKind,
 };
 use gpt_rs::backend::param_resolver::{InMemoryParamResolver, ParamResolver};
+use gpt_rs::backend::pipeline::BackendPipeline;
 use gpt_rs::backend::spec::{
     BackendError, BackendResult, DType, Instruction, PortableBackend, Program, TensorInit,
     TensorLiteral, TensorSpec,
 };
-use serde::Serialize;
 
 pub use tensor::TritonTensor;
 
@@ -24,6 +30,7 @@ pub use tensor::TritonTensor;
 pub struct TritonBackend {
     params: Arc<InMemoryParamResolver<TritonTensor>>,
     conversion_cache: ConversionCache,
+    executor: runtime::TritonExecutor,
 }
 
 impl TritonBackend {
@@ -32,6 +39,7 @@ impl TritonBackend {
         Self {
             params: Arc::new(InMemoryParamResolver::new()),
             conversion_cache: ConversionCache::new(),
+            executor: runtime::TritonExecutor::new(),
         }
     }
 
@@ -51,6 +59,10 @@ impl PortableBackend for TritonBackend {
 
     fn backend_name(&self) -> &str {
         "triton"
+    }
+
+    fn pipeline(&self) -> Option<Arc<dyn BackendPipeline<Self>>> {
+        Some(Arc::new(optimizer::TritonPipeline))
     }
 
     fn param_resolver(&self) -> Option<Arc<dyn ParamResolver<Handle = Self::TensorHandle>>> {
@@ -84,7 +96,7 @@ impl PortableBackend for TritonBackend {
     ) -> BackendResult<Vec<Self::TensorHandle>> {
         let _ = (instruction, inputs);
         Err(BackendError::execution(
-            "triton backend does not implement instruction execution yet; CPU fallback is forbidden",
+            "triton backend instruction path is not implemented; use run_program",
         ))
     }
 
@@ -99,7 +111,7 @@ impl PortableBackend for TritonBackend {
         let options = ConversionOptions::default();
         let key = ConversionCacheKey::new(program, target.as_ref(), &options, None)
             .map_err(|err| BackendError::execution(err.to_string()))?;
-        let _converted = self
+        let converted = self
             .conversion_cache
             .get_or_convert(key, || {
                 target.check(program, &options)?;
@@ -107,10 +119,9 @@ impl PortableBackend for TritonBackend {
             })
             .map_err(|err| BackendError::execution(err.to_string()))?;
 
-        let _ = entry_inputs;
-        Err(BackendError::execution(
-            "triton backend native runtime execution is not implemented yet; CPU fallback is forbidden",
-        ))
+        let bundle: bundle::TritonBundle = serde_json::from_str(&converted.module)
+            .map_err(|err| BackendError::execution(err.to_string()))?;
+        self.executor.execute_bundle(&bundle, entry_inputs)
     }
 }
 
@@ -129,7 +140,7 @@ impl ConversionTarget for TritonConversionTarget {
     }
 
     fn version(&self) -> u64 {
-        1
+        2
     }
 
     fn file_extension(&self) -> &str {
@@ -163,32 +174,22 @@ impl ConversionTarget for TritonConversionTarget {
     fn convert(
         &self,
         program: &Program,
-        _options: &ConversionOptions,
+        options: &ConversionOptions,
     ) -> ConversionResult<ConvertedIr> {
-        self.check(program, &ConversionOptions::default())?;
+        self.check(program, options)?;
+        let optimized = optimizer::optimize_program_for_triton(program)?;
 
-        let entrypoint = default_entrypoint_name(program)?;
-        let buffer_plan = plan_buffers_with(
-            program,
-            &BufferizeOptions {
-                require_static_shapes: true,
-                require_known_dtypes: true,
-            },
-        )
-        .map_err(|err| ConversionError::new(err.to_string()))?;
-
-        let module = TritonConvertedModule {
-            bundle_version: 1,
-            entrypoint: entrypoint.clone(),
-            note: "bootstrap conversion output; kernel lowering pending in later milestones"
-                .to_string(),
-            function_count: program.functions.len(),
-            region_count: program.regions.len(),
-            bufferized_function_count: buffer_plan.functions.len(),
-            bufferized_region_count: buffer_plan.regions.len(),
+        let buffer_opts = BufferizeOptions {
+            require_static_shapes: true,
+            require_known_dtypes: true,
         };
+        plan_buffers_with(&optimized, &buffer_opts)
+            .map_err(|err| ConversionError::new(err.to_string()))?;
 
-        let encoded = serde_json::to_string_pretty(&module)
+        let entrypoint = default_entrypoint_name(&optimized)?;
+        let bundle = codegen::lower_program_to_bundle(&optimized, &entrypoint)?;
+
+        let encoded = serde_json::to_string_pretty(&bundle)
             .map_err(|err| ConversionError::new(err.to_string()))?;
 
         Ok(ConvertedIr {
@@ -201,59 +202,17 @@ impl ConversionTarget for TritonConversionTarget {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct TritonConvertedModule {
-    bundle_version: u32,
-    entrypoint: String,
-    note: String,
-    function_count: usize,
-    region_count: usize,
-    bufferized_function_count: usize,
-    bufferized_region_count: usize,
-}
-
 fn triton_legality_spec() -> LegalitySpec {
     LegalitySpec::default()
         .allow_ops([
             OperationKind::Constant,
-            OperationKind::ElementwiseUnary,
-            OperationKind::ElementwiseBinary,
             OperationKind::StopGradient,
-            OperationKind::Cast,
-            OperationKind::Compare,
-            OperationKind::Select,
-            OperationKind::ArgMax,
             OperationKind::Reshape,
-            OperationKind::Transpose,
-            OperationKind::BroadcastTo,
-            OperationKind::Slice,
-            OperationKind::Concat,
-            OperationKind::Pad,
-            OperationKind::Tile,
-            OperationKind::Iota,
-            OperationKind::Reduce,
-            OperationKind::Take,
-            OperationKind::Gather,
-            OperationKind::ScatterAdd,
-            OperationKind::DynamicSlice,
-            OperationKind::DynamicUpdateSlice,
-            OperationKind::ScatterReduce,
-            OperationKind::Cond,
-            OperationKind::While,
-            OperationKind::Scan,
-            OperationKind::ExtractPatches,
+            OperationKind::ElementwiseBinary,
             OperationKind::DotGeneral,
-            OperationKind::ReduceWindow,
-            OperationKind::RngUniform,
-            OperationKind::RngNormal,
-            OperationKind::TopK,
-            OperationKind::SegmentReduce,
-            OperationKind::Quantize,
-            OperationKind::Dequantize,
-            OperationKind::Requantize,
-            OperationKind::CustomCall,
+            OperationKind::Reduce,
         ])
-        .allow_dtypes([DType::F32, DType::Si32, DType::I1])
+        .allow_dtypes([DType::F32])
         .with_dynamic_dims(false)
 }
 

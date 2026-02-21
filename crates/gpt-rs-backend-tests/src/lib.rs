@@ -61,7 +61,7 @@ macro_rules! define_backend_tests {
                 use $crate::torch_parity::{
                     arithmetic, attention, embedding_layer, feed_forward_layer, functional_ops,
                     gated_feed_forward_layer, harness, layer_norm_layer, linear, matmul,
-                    multi_head_attention_layer, rms_norm_layer, vision_ops,
+                    multi_head_attention_layer, rms_norm_layer, rotary_ops, vision_ops,
                 };
 
                 macro_rules! run_parity {
@@ -127,6 +127,10 @@ macro_rules! define_backend_tests {
             parity_test!(torch_functional_silu_extreme_inputs_match_torch, functional_ops::silu_extreme_inputs_match_torch);
             parity_test!(torch_functional_swiglu_matches_torch, functional_ops::swiglu_matches_torch);
             parity_test!(torch_functional_swiglu_rejects_shape_mismatch, functional_ops::swiglu_rejects_shape_mismatch);
+            parity_test!(torch_rotary_apply_matches_torch_full_rotary, rotary_ops::rope_apply_matches_torch_full_rotary);
+            parity_test!(torch_rotary_apply_matches_torch_partial_rotary, rotary_ops::rope_apply_matches_torch_partial_rotary);
+            parity_test!(torch_rotary_apply_rejects_sequence_mismatch, rotary_ops::rope_apply_rejects_sequence_mismatch);
+            parity_test!(torch_rotary_cache_yarn_scaling_matches_formula, rotary_ops::rope_cache_yarn_scaling_matches_formula);
             parity_test!(torch_functional_gelu_matches_torch_1d_256, functional_ops::gelu_matches_torch_1d_256);
             parity_test!(torch_functional_gelu_matches_torch_2d_4x16, functional_ops::gelu_matches_torch_2d_4x16);
             parity_test!(torch_functional_gelu_matches_torch_3d_2x3x8, functional_ops::gelu_matches_torch_3d_2x3x8);

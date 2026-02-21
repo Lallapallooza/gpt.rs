@@ -3,13 +3,21 @@ from __future__ import annotations
 import argparse
 import time
 from pathlib import Path
-from typing import Any, List, Tuple, cast
+from typing import Any, Dict, List, Tuple, cast
 
 import numpy as np
 
 from ..core import BenchResult, CliRunResult, RunConfig
 from ..gptrs_py import debug_context
 from ..runner import bench_stats, time_many, validation_result
+
+
+def _as_path(value: Any, fallback: Path) -> Path:
+    if value is None:
+        return fallback
+    if isinstance(value, Path):
+        return value
+    return Path(str(value))
 
 
 class Gpt2Case:
@@ -19,8 +27,20 @@ class Gpt2Case:
         return ["validate", "bench", "run"]
 
     def add_cli_args(self, parser: argparse.ArgumentParser) -> None:
-        parser.add_argument("--prompt", default="Hello", help="Prompt text.")
-        parser.add_argument("--torch-model", default="gpt2", help="HF model id for torch baseline.")
+        from ..registry import get_case_default_params
+
+        defaults: Dict[str, Any] = get_case_default_params(self.name)
+        prompt_default = str(defaults.get("prompt", "Hello"))
+        torch_model_default = str(defaults.get("torch_model", "gpt2"))
+        checkpoint_default = _as_path(defaults.get("checkpoint"), Path("checkpoints/gpt2.bin"))
+        tokenizer_default = _as_path(defaults.get("tokenizer"), Path("configs/gpt2_tokenizer.json"))
+
+        parser.add_argument("--prompt", default=prompt_default, help="Prompt text.")
+        parser.add_argument(
+            "--torch-model",
+            default=torch_model_default,
+            help="HF model id for torch baseline.",
+        )
         parser.add_argument(
             "--temperature",
             type=float,
@@ -36,13 +56,13 @@ class Gpt2Case:
         parser.add_argument(
             "--checkpoint",
             type=Path,
-            default=Path("checkpoints/gpt2.bin"),
+            default=checkpoint_default,
             help="Checkpoint path.",
         )
         parser.add_argument(
             "--tokenizer",
             type=Path,
-            default=Path("configs/gpt2_tokenizer.json"),
+            default=tokenizer_default,
             help="Tokenizer JSON.",
         )
         parser.add_argument(

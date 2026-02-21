@@ -304,8 +304,8 @@ cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- generate \
 First export weights from Torch into a gpt.rs checkpoint:
 
 ```bash
-uv run python scripts/export_model_weights.py --model resnet34 --out checkpoints/resnet34.bin
-uv run python scripts/export_model_weights.py --model mobilenet_v2 --out checkpoints/mobilenet_v2.bin
+uv run python scripts/export.py export --exporter resnet34 --checkpoint-out checkpoints/resnet34.bin
+uv run python scripts/export.py export --exporter mobilenet_v2 --checkpoint-out checkpoints/mobilenet_v2.bin
 ```
 
 Then run the model (generates a deterministic random input unless you pass `--input`):

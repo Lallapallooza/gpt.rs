@@ -707,7 +707,7 @@ fn inject_binds_into_capture(
         let bind_name = bind_name_for(ident, kind, &mut base_counts, &mut counts);
         let bind_lit = syn::LitStr::new(&bind_name, ident.span());
         let orig_expr = (*init.expr).clone();
-        init.expr = Box::new(parse_quote! { (#orig_expr).ptir_bind(#bind_lit) });
+        *init.expr = parse_quote! { (#orig_expr).ptir_bind(#bind_lit) };
 
         known_tensors.insert(ident.to_string());
         binds.push(BindInfo {
@@ -1416,10 +1416,10 @@ fn expand_capture_ptir(input: TokenStream) -> SynResult<TokenStream> {
 
     for (index, binding) in bindings.iter().enumerate() {
         let ref_ident = format_ident!("__capture_operand_{}", index);
-        let expr = binding.expr.clone().map_or_else(
-            || Expr::Path(expr_path_from_ident(&binding.name)),
-            |expr| expr,
-        );
+        let expr = binding
+            .expr
+            .clone()
+            .unwrap_or_else(|| Expr::Path(expr_path_from_ident(&binding.name)));
         ref_inits.push(quote! {
             let #ref_ident = #expr;
         });

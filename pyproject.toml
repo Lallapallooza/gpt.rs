@@ -29,7 +29,6 @@ extend-select = ["B", "C4", "I"]
 ignore = ["E203"]
 
 [tool.ruff.lint.per-file-ignores]
-"scripts/export_gpt2.py" = ["T201"]
 "crates/gpt-rs-py/examples/*.py" = ["T201"]
 "crates/gpt-rs-py/test_install.py" = ["T201"]
 

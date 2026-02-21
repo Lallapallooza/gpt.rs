@@ -31,7 +31,7 @@ Checklist:
 6. Register the model factory:
    - Today this is a list in `crates/gpt-rs/src/runtime/mod.rs` (`model_factories()`).
 7. Add a checkpoint exporter and baseline:
-   - For Torch models, extend `scripts/export_model_weights.py` and `scripts/gptrs_eval/models/`.
+   - For Torch models, add/update a spec under `scripts/exporters/specs/` and wire eval metadata.
    - Ensure `scripts/eval.py --model <kind> --workload validate` can run end-to-end.
 
 ## Write a layer

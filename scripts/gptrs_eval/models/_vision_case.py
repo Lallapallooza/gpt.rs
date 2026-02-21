@@ -23,6 +23,21 @@ class VisionCaseBase:
     def supported_workloads(self) -> list[str]:
         return ["validate", "bench", "run"]
 
+    def _default_checkpoint(self) -> Any:
+        from pathlib import Path
+
+        from ..registry import get_case_default_params
+
+        defaults = get_case_default_params(self.name)
+        value = defaults.get("checkpoint")
+        if value is not None:
+            if isinstance(value, Path):
+                return value
+            return Path(str(value))
+        if self.checkpoint_default is not None:
+            return self.checkpoint_default
+        return Path(f"checkpoints/{self.name}.bin")
+
     def add_cli_args(self, parser: argparse.ArgumentParser) -> None:
         from pathlib import Path
 
@@ -33,11 +48,7 @@ class VisionCaseBase:
             default=224,
             help="Input image size H=W (default: 224)",
         )
-        default_ckpt = (
-            self.checkpoint_default
-            if self.checkpoint_default is not None
-            else Path(f"checkpoints/{self.name}.bin")
-        )
+        default_ckpt = self._default_checkpoint()
         parser.add_argument(
             "--checkpoint",
             type=Path,

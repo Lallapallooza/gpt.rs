@@ -33,9 +33,11 @@ uv --project "$(pwd)" --directory "$(pwd)/crates/gpt-rs-py" run \
   maturin develop --release --features conversion-c
 
 # Export fresh v2 checkpoints:
-uv run python scripts/export_gpt2.py --model gpt2 --checkpoint-out checkpoints/gpt2.bin \
+uv run python scripts/export.py export --exporter gpt2 \
+  --checkpoint-out checkpoints/gpt2.bin \
   --config-out configs/gpt2_model.json --tokenizer-out configs/gpt2_tokenizer.json
-uv run python scripts/export_model_weights.py --model resnet34 --out checkpoints/resnet34.bin
+uv run python scripts/export.py export --exporter resnet34 --checkpoint-out checkpoints/resnet34.bin
+uv run python scripts/export.py export --exporter mobilenet_v2 --checkpoint-out checkpoints/mobilenet_v2.bin
 
 # Bench:
 GPTRS_C_CACHE_DIR=./.cache/gpt_rs_c_backend uv run python scripts/eval.py \
@@ -115,7 +117,7 @@ Misc
 - `crates/gpt-rs-cli`: model runner CLI (`generate` / `forward`) with dump/profile hooks.
 - `crates/gpt-rs-backend-*`: backend implementations (faer, ref-cpu, optional C backend).
 - `crates/gpt-rs-backend-tests`: backend suite + Torch parity harness (via `tch` / libtorch).
-- `scripts/`: Python baselines and exporters (`scripts/eval.py`, `scripts/export_gpt2.py`, ...).
+- `scripts/`: Python baselines and exporters (`scripts/eval.py`, `scripts/export.py`).
 
 ## Architecture (high level)
 
@@ -149,13 +151,14 @@ cargo build
 cargo run -p gpt-rs-cli -- --help
 
 # run GPT-2 generation (checkpoint + tokenizer)
-# export the checkpoint/tokenizer with: `uv run python scripts/export_gpt2.py --help`
+# export the checkpoint/tokenizer with: `uv run python scripts/export.py export --exporter gpt2 --help`
 cargo run --release -p gpt-rs-cli -- generate --prompt "Hello" --max-tokens 64 \
   --checkpoint checkpoints/gpt2.bin --tokenizer configs/gpt2_tokenizer.json
 
 # export torchvision weights (gpt.rs checkpoint)
 uv sync
-uv run python scripts/export_model_weights.py --model resnet34 --out checkpoints/resnet34.bin
+uv run python scripts/export.py export --exporter resnet34 --checkpoint-out checkpoints/resnet34.bin
+uv run python scripts/export.py export --exporter mobilenet_v2 --checkpoint-out checkpoints/mobilenet_v2.bin
 
 # run an image model (deterministic random input by default)
 cargo run --release -p gpt-rs-cli -- forward --checkpoint checkpoints/resnet34.bin

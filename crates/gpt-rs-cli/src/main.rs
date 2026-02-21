@@ -273,6 +273,8 @@ fn main() -> Result<()> {
 
     #[cfg(feature = "conversion-c")]
     gpt_rs_backend_c::register_conversion_targets();
+    #[cfg(feature = "backend-triton")]
+    gpt_rs_backend_triton::register_conversion_targets();
 
     if args.profile {
         profiling::reset();
@@ -297,11 +299,14 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| env::var("GPTRS_BACKEND").unwrap_or_else(|_| "faer".to_string()));
     let command = args.command;
 
-    let mut supported = vec!["faer"];
-    #[cfg(feature = "backend-triton")]
-    supported.push("triton");
-    #[cfg(feature = "conversion-c")]
-    supported.push("c");
+    #[cfg(all(feature = "backend-triton", feature = "conversion-c"))]
+    let supported = ["faer", "triton", "c"];
+    #[cfg(all(feature = "backend-triton", not(feature = "conversion-c")))]
+    let supported = ["faer", "triton"];
+    #[cfg(all(not(feature = "backend-triton"), feature = "conversion-c"))]
+    let supported = ["faer", "c"];
+    #[cfg(all(not(feature = "backend-triton"), not(feature = "conversion-c")))]
+    let supported = ["faer"];
 
     match backend_env.trim() {
         "faer" => {

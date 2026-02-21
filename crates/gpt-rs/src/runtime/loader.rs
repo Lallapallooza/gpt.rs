@@ -307,13 +307,26 @@ fn source_cache_config(
         return SourceCacheConfig::default();
     }
 
-    let budget_bytes = effective_device_budget_bytes(entries, cfg);
+    let budget_bytes = effective_cache_budget_bytes(entries, cfg);
     let small_param_persist_threshold = cfg.small_param_persist_threshold;
     let enabled = budget_bytes.is_some() || small_param_persist_threshold.is_some();
     SourceCacheConfig {
         enabled,
         budget_bytes,
         small_param_persist_threshold,
+    }
+}
+
+fn effective_cache_budget_bytes(
+    entries: &[CheckpointTensorEntry],
+    cfg: &WeightStreamingConfig,
+) -> Option<u64> {
+    let device_budget = effective_device_budget_bytes(entries, cfg);
+    match (device_budget, cfg.host_budget_bytes) {
+        (Some(device), Some(host)) => Some(device.min(host)),
+        (Some(device), None) => Some(device),
+        (None, Some(host)) => Some(host),
+        (None, None) => None,
     }
 }
 
@@ -343,6 +356,23 @@ mod tests {
             device_budget_bytes,
             device_weights_percent,
             host_budget_bytes: None,
+            prefetch_layers: None,
+            small_param_persist_threshold,
+        }
+    }
+
+    fn weight_cfg_with_host_budget(
+        enabled: bool,
+        device_budget_bytes: Option<u64>,
+        device_weights_percent: Option<f32>,
+        host_budget_bytes: Option<u64>,
+        small_param_persist_threshold: Option<u64>,
+    ) -> WeightStreamingConfig {
+        WeightStreamingConfig {
+            enabled,
+            device_budget_bytes,
+            device_weights_percent,
+            host_budget_bytes,
             prefetch_layers: None,
             small_param_persist_threshold,
         }
@@ -395,6 +425,20 @@ mod tests {
         let cfg_tighter_percent = weight_cfg(true, Some(40), Some(0.5), None);
         let source_cfg_tighter_percent = source_cache_config(&entries, &cfg_tighter_percent);
         assert_eq!(source_cfg_tighter_percent.budget_bytes, Some(30));
+    }
+
+    #[test]
+    fn source_cache_budget_honors_host_budget_limit() {
+        let entries = vec![entry("a", 1, 30), entry("b", 2, 20), entry("c", 3, 10)];
+        let cfg = weight_cfg_with_host_budget(true, Some(40), Some(0.8), Some(25), None);
+        let source_cfg = source_cache_config(&entries, &cfg);
+        assert!(source_cfg.enabled);
+        assert_eq!(source_cfg.budget_bytes, Some(25));
+
+        let host_only = weight_cfg_with_host_budget(true, None, None, Some(18), None);
+        let host_only_cfg = source_cache_config(&entries, &host_only);
+        assert!(host_only_cfg.enabled);
+        assert_eq!(host_only_cfg.budget_bytes, Some(18));
     }
 
     #[test]

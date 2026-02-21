@@ -1,0 +1,26 @@
+{
+  "defaults": {
+    "backend": "faer",
+    "seed": 0,
+    "rtol": 0.001,
+    "atol": 0.001,
+    "warmup": 1,
+    "iters": 1,
+    "threads": [1],
+    "params": {
+      "prompt": "Hello",
+      "torch_model": "mistralai/Ministral-3-3B-Instruct-2512",
+      "checkpoint": "checkpoints/ministral_3_3b_instruct_2512.bin",
+      "generate_tokens": 0,
+      "max_prompt_tokens": 64,
+      "trust_remote_code": false,
+      "torch_dtype": "auto"
+    }
+  },
+  "runs": [
+    {
+      "model": "ministral_3_3b_instruct_2512",
+      "workload": ["validate"]
+    }
+  ]
+}

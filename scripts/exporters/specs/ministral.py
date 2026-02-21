@@ -9,7 +9,13 @@ import numpy as np
 
 from gptrs_eval.checkpoint import save as save_checkpoint
 
-from ..types import ArtifactDefaults, ExporterInfo, ExportRequest, ExportResult
+from ..types import (
+    ArtifactDefaults,
+    EvalCaseRegistration,
+    ExporterInfo,
+    ExportRequest,
+    ExportResult,
+)
 
 _DEFAULT_MODEL_ID = "mistralai/Ministral-3-3B-Instruct-2512"
 _DEFAULT_CHECKPOINT = Path("checkpoints/ministral_3_3b_instruct_2512.bin")
@@ -253,6 +259,20 @@ class MinistralExporter:
             checkpoint=_DEFAULT_CHECKPOINT,
             config=_DEFAULT_CONFIG,
             tokenizer=_DEFAULT_TOKENIZER,
+        ),
+        eval_case=EvalCaseRegistration(
+            model_name="ministral_3_3b_instruct_2512",
+            module="gptrs_eval.models.ministral",
+            cls="MinistralCase",
+            default_params={
+                "checkpoint": _DEFAULT_CHECKPOINT,
+                "torch_model": _DEFAULT_MODEL_ID,
+                "prompt": "Hello",
+                "generate_tokens": 0,
+                "max_prompt_tokens": 64,
+                "trust_remote_code": False,
+                "torch_dtype": "auto",
+            },
         ),
     )
 

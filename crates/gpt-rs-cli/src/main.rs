@@ -299,14 +299,7 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| env::var("GPTRS_BACKEND").unwrap_or_else(|_| "faer".to_string()));
     let command = args.command;
 
-    #[cfg(all(feature = "backend-triton", feature = "conversion-c"))]
-    let supported = ["faer", "triton", "c"];
-    #[cfg(all(feature = "backend-triton", not(feature = "conversion-c")))]
-    let supported = ["faer", "triton"];
-    #[cfg(all(not(feature = "backend-triton"), feature = "conversion-c"))]
-    let supported = ["faer", "c"];
-    #[cfg(all(not(feature = "backend-triton"), not(feature = "conversion-c")))]
-    let supported = ["faer"];
+    let supported = supported_backends();
 
     match backend_env.trim() {
         "faer" => {
@@ -359,6 +352,17 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn supported_backends() -> Vec<&'static str> {
+    [
+        Some("faer"),
+        cfg!(feature = "backend-triton").then_some("triton"),
+        cfg!(feature = "conversion-c").then_some("c"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 fn run_with_backend<B: PortableBackend + 'static>(

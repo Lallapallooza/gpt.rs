@@ -34,6 +34,10 @@ pub fn model_factories<B: PortableBackend + 'static>() -> &'static [ModelFactory
             build: super::gpt::build_from_model_config::<B>,
         },
         ModelFactory {
+            kind: super::ministral::KIND,
+            build: super::ministral::build_from_model_config::<B>,
+        },
+        ModelFactory {
             kind: super::resnet::KIND,
             build: super::resnet::build_from_model_config::<B>,
         },

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -21,11 +21,12 @@ struct CheckpointParamSource<B: PortableBackend + 'static> {
     state: Mutex<CheckpointParamState<B>>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct SourceCacheConfig {
     enabled: bool,
     budget_bytes: Option<u64>,
     small_param_persist_threshold: Option<u64>,
+    prefetch_base_ids: HashSet<BaseParamId>,
 }
 
 #[derive(Clone)]
@@ -64,14 +65,11 @@ impl<H: Clone> ParamHandleCache<H> {
     }
 
     fn insert(&mut self, base_id: BaseParamId, bytes: u64, handle: H) {
-        if !self.cfg.enabled || !self.should_cache(bytes) {
+        if !self.cfg.enabled || !self.should_cache(base_id, bytes) {
             return;
         }
 
-        let pinned = self
-            .cfg
-            .small_param_persist_threshold
-            .is_some_and(|threshold| bytes <= threshold);
+        let pinned = self.is_pinned(base_id, bytes);
 
         let touch_tick = self.next_tick();
         if let Some(existing) = self.entries.get_mut(&base_id) {
@@ -114,14 +112,24 @@ impl<H: Clone> ParamHandleCache<H> {
         );
     }
 
-    fn should_cache(&self, bytes: u64) -> bool {
-        match (
-            self.cfg.small_param_persist_threshold,
-            self.cfg.budget_bytes,
-        ) {
-            (Some(threshold), None) => bytes <= threshold,
-            _ => true,
+    fn should_cache(&self, base_id: BaseParamId, bytes: u64) -> bool {
+        if self.cfg.prefetch_base_ids.contains(&base_id) {
+            return true;
         }
+        if self.cfg.budget_bytes.is_some() {
+            return true;
+        }
+        self.cfg
+            .small_param_persist_threshold
+            .is_some_and(|threshold| bytes <= threshold)
+    }
+
+    fn is_pinned(&self, base_id: BaseParamId, bytes: u64) -> bool {
+        self.cfg.prefetch_base_ids.contains(&base_id)
+            || self
+                .cfg
+                .small_param_persist_threshold
+                .is_some_and(|threshold| bytes <= threshold)
     }
 
     fn evict_one_unpinned(&mut self) -> bool {
@@ -160,21 +168,60 @@ struct CheckpointParamState<B: PortableBackend + 'static> {
 }
 
 impl<B: PortableBackend + 'static> CheckpointParamSource<B> {
-    fn new(backend: Arc<B>, reader: CheckpointReader, cache_cfg: SourceCacheConfig) -> Self {
+    fn new(
+        backend: Arc<B>,
+        reader: CheckpointReader,
+        cache_cfg: SourceCacheConfig,
+    ) -> Result<Self> {
         let mut entry_bytes: HashMap<BaseParamId, u64> =
             HashMap::with_capacity(reader.entries().len());
         for entry in reader.entries() {
             entry_bytes.insert(entry.base_id, entry.len);
         }
-        Self {
+        let mut state = CheckpointParamState {
+            reader,
+            entry_bytes,
+            cache: ParamHandleCache::new(cache_cfg),
+        };
+        prefetch_source_cache(&backend, &mut state)?;
+        Ok(Self {
             backend,
-            state: Mutex::new(CheckpointParamState {
-                reader,
-                entry_bytes,
-                cache: ParamHandleCache::new(cache_cfg),
-            }),
-        }
+            state: Mutex::new(state),
+        })
     }
+}
+
+fn prefetch_source_cache<B: PortableBackend + 'static>(
+    backend: &Arc<B>,
+    state: &mut CheckpointParamState<B>,
+) -> Result<()> {
+    if !state.cache.cfg.enabled || state.cache.cfg.prefetch_base_ids.is_empty() {
+        return Ok(());
+    }
+
+    let prefetched_ids: Vec<BaseParamId> = state
+        .reader
+        .entries()
+        .iter()
+        .filter_map(|entry| {
+            state
+                .cache
+                .cfg
+                .prefetch_base_ids
+                .contains(&entry.base_id)
+                .then_some(entry.base_id)
+        })
+        .collect();
+    for base_id in prefetched_ids {
+        if state.cache.get(base_id).is_some() {
+            continue;
+        }
+        let tensor = state.reader.get_by_base_id(base_id)?;
+        let bytes = state.entry_bytes.get(&base_id).copied().unwrap_or(0);
+        let handle = backend.materialize(TensorInit::Literal(tensor.to_literal()))?;
+        state.cache.insert(base_id, bytes, handle);
+    }
+    Ok(())
 }
 
 impl<B: PortableBackend + 'static> ParamSource<B> for CheckpointParamSource<B> {
@@ -230,7 +277,7 @@ pub fn load_model_with_namespace<B: PortableBackend + 'static>(
         Arc::clone(&backend),
         reader,
         source_cache_cfg,
-    ));
+    )?);
 
     let backend_for_params = Arc::clone(&backend);
     let source_for_params = Arc::clone(&source);
@@ -309,12 +356,42 @@ fn source_cache_config(
 
     let budget_bytes = effective_cache_budget_bytes(entries, cfg);
     let small_param_persist_threshold = cfg.small_param_persist_threshold;
-    let enabled = budget_bytes.is_some() || small_param_persist_threshold.is_some();
+    let prefetch_base_ids = prefetch_block_base_ids(entries, cfg.prefetch_layers);
+    let enabled = budget_bytes.is_some()
+        || small_param_persist_threshold.is_some()
+        || !prefetch_base_ids.is_empty();
     SourceCacheConfig {
         enabled,
         budget_bytes,
         small_param_persist_threshold,
+        prefetch_base_ids,
     }
+}
+
+fn prefetch_block_base_ids(
+    entries: &[CheckpointTensorEntry],
+    prefetch_layers: Option<usize>,
+) -> HashSet<BaseParamId> {
+    let Some(layer_limit) = prefetch_layers else {
+        return HashSet::new();
+    };
+    if layer_limit == 0 {
+        return HashSet::new();
+    }
+    entries
+        .iter()
+        .filter_map(|entry| {
+            block_layer_index(&entry.name)
+                .filter(|layer| *layer < layer_limit)
+                .map(|_| entry.base_id)
+        })
+        .collect()
+}
+
+fn block_layer_index(name: &str) -> Option<usize> {
+    let rest = name.strip_prefix("blocks.")?;
+    let (layer_index, _) = rest.split_once('.')?;
+    layer_index.parse::<usize>().ok()
 }
 
 fn effective_cache_budget_bytes(

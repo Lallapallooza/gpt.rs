@@ -354,3 +354,29 @@ fn budget_and_host_cap_change_streaming_reload_behavior() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn prefetch_layers_reduce_streaming_first_forward_materialization() -> Result<()> {
+    let no_prefetch_streaming = WeightStreamingConfig {
+        enabled: true,
+        ..WeightStreamingConfig::default()
+    };
+    let (no_prefetch_first, no_prefetch_second) = run_case(no_prefetch_streaming)?;
+
+    let prefetch_streaming = WeightStreamingConfig {
+        enabled: true,
+        prefetch_layers: Some(1),
+        ..WeightStreamingConfig::default()
+    };
+    let (prefetch_first, prefetch_second) = run_case(prefetch_streaming)?;
+
+    ensure!(
+        prefetch_first < no_prefetch_first,
+        "expected prefetch_layers to reduce first-forward materialization calls (prefetch={prefetch_first}, baseline={no_prefetch_first})"
+    );
+    ensure!(
+        prefetch_second <= no_prefetch_second,
+        "expected prefetch_layers to not increase second-forward materialization calls (prefetch={prefetch_second}, baseline={no_prefetch_second})"
+    );
+    Ok(())
+}

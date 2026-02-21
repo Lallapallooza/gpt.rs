@@ -56,10 +56,7 @@ impl<'a, B: PortableBackend + 'static> GraphBuilder<'a, B> {
                 Ok(value)
             }
             LazyHandle::Param {
-                base_id,
-                source,
-                cache_enabled,
-                ..
+                base_id, source, ..
             } => {
                 let stable_id = tensor
                     .lazy_handle()
@@ -73,13 +70,6 @@ impl<'a, B: PortableBackend + 'static> GraphBuilder<'a, B> {
 
                 let value = self.allocate_value();
                 let spec = tensor.tensor_spec();
-                let handle = if *cache_enabled {
-                    let handle = tensor.materialize()?;
-                    self.arena.param_resolver.set(stable_id, handle.clone());
-                    Some(handle)
-                } else {
-                    None
-                };
                 self.inner.param_sources.insert(
                     stable_id,
                     ParamSourceRecord {
@@ -90,7 +80,7 @@ impl<'a, B: PortableBackend + 'static> GraphBuilder<'a, B> {
                 self.inner.parameters.push(ParameterRecord {
                     value,
                     spec,
-                    handle,
+                    handle: None,
                     role: InputRole::Param,
                     stable_id: Some(stable_id),
                 });

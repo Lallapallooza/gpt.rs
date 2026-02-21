@@ -50,7 +50,6 @@ fn tensor_from_data(
 fn streamed_param(
     backend: &Arc<CpuPortableBackend>,
     source: Arc<CountingParamSource>,
-    cache_enabled: bool,
 ) -> DeviceTensor<CpuPortableBackend> {
     DeviceTensor::lazy_param(
         Arc::clone(backend),
@@ -59,7 +58,6 @@ fn streamed_param(
         0xABCD,
         BaseParamId(0x1234),
         source,
-        cache_enabled,
     )
 }
 
@@ -71,7 +69,7 @@ fn streamed_param_without_cache_loads_from_source_every_time() -> Result<()> {
         Tensor::from_vec(Shape::new([2, 2]), vec![1.0, 2.0, 3.0, 4.0])?,
     ));
 
-    let param = streamed_param(&backend, Arc::clone(&source), false);
+    let param = streamed_param(&backend, Arc::clone(&source));
     assert_eq!(source.loads(), 0);
 
     let _ = param.materialize()?;
@@ -79,26 +77,6 @@ fn streamed_param_without_cache_loads_from_source_every_time() -> Result<()> {
 
     let _ = param.materialize()?;
     assert_eq!(source.loads(), 2);
-
-    Ok(())
-}
-
-#[test]
-fn streamed_param_with_cache_materializes_once() -> Result<()> {
-    let backend = Arc::new(CpuPortableBackend::new());
-    let source = Arc::new(CountingParamSource::new(
-        Arc::clone(&backend),
-        Tensor::from_vec(Shape::new([2, 2]), vec![5.0, 6.0, 7.0, 8.0])?,
-    ));
-
-    let param = streamed_param(&backend, Arc::clone(&source), true);
-    assert_eq!(source.loads(), 0);
-
-    let _ = param.materialize()?;
-    assert_eq!(source.loads(), 1);
-
-    let _ = param.materialize()?;
-    assert_eq!(source.loads(), 1);
 
     Ok(())
 }
@@ -112,7 +90,7 @@ fn compiled_graph_reloads_streamed_param_for_new_runtime_inputs() -> Result<()> 
     ));
 
     let input = tensor_from_data(&backend, [2, 2], &[1.0, 2.0, 3.0, 4.0])?;
-    let param = streamed_param(&backend, Arc::clone(&source), false);
+    let param = streamed_param(&backend, Arc::clone(&source));
     let out = input.add(&param)?;
     let compiled = out.compile()?;
 

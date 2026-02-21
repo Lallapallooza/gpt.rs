@@ -256,13 +256,7 @@ pub fn load_model_with_namespace<B: PortableBackend + 'static>(
         .with_context(|| format!("failed to open checkpoint {}", path.as_ref().display()))?;
     let config = reader.config().clone();
     let weight_streaming = &config.runtime.weight_streaming;
-    if let Some(percent) = weight_streaming.device_weights_percent {
-        ensure!(
-            (0.0..=1.0).contains(&percent),
-            "runtime.weight_streaming.device_weights_percent must be in [0.0, 1.0], got {}",
-            percent
-        );
-    }
+    validate_weight_streaming_config(weight_streaming)?;
     let streaming_enabled = weight_streaming_enabled(weight_streaming);
     let source_cache_cfg = source_cache_config(reader.entries(), weight_streaming);
     let registry = build_registry::<B>(&functional_overrides_from_config(&config)?);
@@ -286,15 +280,24 @@ pub fn load_model_with_namespace<B: PortableBackend + 'static>(
             .get(name)
             .ok_or_else(|| anyhow!("missing tensor '{}' in checkpoint", name))?;
         let key = param_key(namespace, spec.base_id);
-        let cache_enabled = !streaming_enabled;
+        let shape = crate::tensor::Shape::new(spec.dims.clone());
+        if !streaming_enabled {
+            let handle = source_for_params.load(spec.base_id)?;
+            return DeviceTensor::from_handle(
+                Arc::clone(&backend_for_params),
+                shape,
+                spec.dtype,
+                handle,
+            )
+            .as_param_with_id(key.0);
+        }
         Ok(DeviceTensor::lazy_param(
             Arc::clone(&backend_for_params),
-            crate::tensor::Shape::new(spec.dims.clone()),
+            shape,
             spec.dtype,
             key.0,
             spec.base_id,
             Arc::clone(&source_for_params),
-            cache_enabled,
         ))
     };
 
@@ -315,11 +318,26 @@ fn functional_overrides_from_config(cfg: &ModelConfig) -> Result<FunctionalOverr
 
 fn weight_streaming_enabled(cfg: &WeightStreamingConfig) -> bool {
     cfg.enabled
-        || cfg.device_budget_bytes.is_some()
+}
+
+fn validate_weight_streaming_config(cfg: &WeightStreamingConfig) -> Result<()> {
+    let has_streaming_knob = cfg.device_budget_bytes.is_some()
         || cfg.device_weights_percent.is_some()
-        || cfg.host_budget_bytes.is_some()
+        || cfg.cache_budget_cap_bytes.is_some()
         || cfg.prefetch_layers.is_some()
-        || cfg.small_param_persist_threshold.is_some()
+        || cfg.small_param_persist_threshold.is_some();
+    ensure!(
+        cfg.enabled || !has_streaming_knob,
+        "runtime.weight_streaming.enabled=false but streaming knobs are set; set runtime.weight_streaming.enabled=true or clear streaming knobs"
+    );
+    if let Some(percent) = cfg.device_weights_percent {
+        ensure!(
+            (0.0..=1.0).contains(&percent),
+            "runtime.weight_streaming.device_weights_percent must be in [0.0, 1.0], got {}",
+            percent
+        );
+    }
+    Ok(())
 }
 
 fn effective_device_budget_bytes(
@@ -399,7 +417,7 @@ fn effective_cache_budget_bytes(
     cfg: &WeightStreamingConfig,
 ) -> Option<u64> {
     let device_budget = effective_device_budget_bytes(entries, cfg);
-    match (device_budget, cfg.host_budget_bytes) {
+    match (device_budget, cfg.cache_budget_cap_bytes) {
         (Some(device), Some(host)) => Some(device.min(host)),
         (Some(device), None) => Some(device),
         (None, Some(host)) => Some(host),

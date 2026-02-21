@@ -10,7 +10,7 @@ pub struct WeightStreamingConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_weights_percent: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_budget_bytes: Option<u64>,
+    pub cache_budget_cap_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefetch_layers: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -22,7 +22,7 @@ impl WeightStreamingConfig {
         !self.enabled
             && self.device_budget_bytes.is_none()
             && self.device_weights_percent.is_none()
-            && self.host_budget_bytes.is_none()
+            && self.cache_budget_cap_bytes.is_none()
             && self.prefetch_layers.is_none()
             && self.small_param_persist_threshold.is_none()
     }

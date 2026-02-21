@@ -200,22 +200,8 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
         match &*self.handle {
             LazyHandle::Input { tensor, .. } => Ok(tensor.clone()),
             LazyHandle::Param {
-                base_id,
-                source,
-                cache_enabled,
-                cached,
-                ..
-            } => {
-                if *cache_enabled {
-                    if let Some(handle) = cached.get() {
-                        return Ok(handle.clone());
-                    }
-                    let handle = source.load(*base_id)?;
-                    let _ = cached.set(handle.clone());
-                    return Ok(handle);
-                }
-                Ok(source.load(*base_id)?)
-            }
+                base_id, source, ..
+            } => Ok(source.load(*base_id)?),
             LazyHandle::Node { graph, value } => {
                 if let Some(handle) = graph.try_ready_handle(*value) {
                     return Ok(handle);
@@ -302,15 +288,9 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                 id,
                 base_id,
                 source,
-                cache_enabled,
-                cached,
             } => {
                 if *id == stable_id {
                     return Ok(self.clone());
-                }
-                let new_cached = once_cell::sync::OnceCell::new();
-                if let Some(handle) = cached.get() {
-                    let _ = new_cached.set(handle.clone());
                 }
                 Ok(DeviceTensor {
                     backend: Arc::clone(&self.backend),
@@ -320,8 +300,6 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                         id: stable_id,
                         base_id: *base_id,
                         source: Arc::clone(source),
-                        cache_enabled: *cache_enabled,
-                        cached: new_cached,
                     }),
                 })
             }
@@ -398,7 +376,6 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
         stable_id: u128,
         base_id: BaseParamId,
         source: Arc<dyn ParamSource<B>>,
-        cache_enabled: bool,
     ) -> Self {
         DeviceTensor {
             backend,
@@ -408,8 +385,6 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                 id: stable_id,
                 base_id,
                 source,
-                cache_enabled,
-                cached: once_cell::sync::OnceCell::new(),
             }),
         }
     }

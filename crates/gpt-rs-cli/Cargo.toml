@@ -14,8 +14,10 @@ rand_chacha = "0.3"
 gpt-rs = { path = "../gpt-rs", version = "0.1.0" }
 gpt-rs-backend-c = { path = "../gpt-rs-backend-c", version = "0.1.0", optional = true, default-features = false }
 gpt-rs-backend-faer = { path = "../gpt-rs-backend-faer", version = "0.1.0" }
+gpt-rs-backend-triton = { path = "../gpt-rs-backend-triton", version = "0.1.0", optional = true }
 serde_json = { workspace = true }
 
 [features]
 conversion-c = ["dep:gpt-rs-backend-c", "gpt-rs-backend-c/conversion-c"]
+backend-triton = ["dep:gpt-rs-backend-triton"]
 profiler = ["gpt-rs/profiler"]

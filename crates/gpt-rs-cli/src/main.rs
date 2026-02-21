@@ -16,6 +16,8 @@ use gpt_rs::PortableBackend;
 #[cfg(feature = "conversion-c")]
 use gpt_rs_backend_c::CBackend;
 use gpt_rs_backend_faer::FaerCpuBackend;
+#[cfg(feature = "backend-triton")]
+use gpt_rs_backend_triton::TritonBackend;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use std::collections::HashMap;
@@ -295,10 +297,11 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| env::var("GPTRS_BACKEND").unwrap_or_else(|_| "faer".to_string()));
     let command = args.command;
 
+    let mut supported = vec!["faer"];
+    #[cfg(feature = "backend-triton")]
+    supported.push("triton");
     #[cfg(feature = "conversion-c")]
-    let supported = ["faer", "c"];
-    #[cfg(not(feature = "conversion-c"))]
-    let supported = ["faer"];
+    supported.push("c");
 
     match backend_env.trim() {
         "faer" => {
@@ -315,6 +318,19 @@ fn main() -> Result<()> {
             {
                 bail!(
                     "GPTRS_BACKEND='c' requires building gpt-rs-cli with --features conversion-c"
+                );
+            }
+        }
+        "triton" => {
+            #[cfg(feature = "backend-triton")]
+            {
+                let backend = Arc::new(TritonBackend::new());
+                run_with_backend(backend, command, args.profile)?;
+            }
+            #[cfg(not(feature = "backend-triton"))]
+            {
+                bail!(
+                    "GPTRS_BACKEND='triton' requires building gpt-rs-cli with --features backend-triton"
                 );
             }
         }

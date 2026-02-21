@@ -74,6 +74,9 @@ type FaerBackend = gpt_rs_backend_faer::FaerPortableBackend;
 #[cfg(feature = "conversion-c")]
 type CBackend = gpt_rs_backend_c::CBackend;
 
+#[cfg(feature = "triton")]
+type TritonBackend = gpt_rs_backend_triton::TritonBackend;
+
 enum PyLoadedModelInner {
     Cpu {
         backend: Arc<CpuBackend>,
@@ -89,6 +92,11 @@ enum PyLoadedModelInner {
         backend: Arc<CBackend>,
         model: Box<dyn gpt_rs::runtime::LoadedModel<CBackend>>,
     },
+    #[cfg(feature = "triton")]
+    Triton {
+        backend: Arc<TritonBackend>,
+        model: Box<dyn gpt_rs::runtime::LoadedModel<TritonBackend>>,
+    },
 }
 
 impl PyLoadedModelInner {
@@ -99,6 +107,8 @@ impl PyLoadedModelInner {
             Self::Faer { model, .. } => model.kind(),
             #[cfg(feature = "conversion-c")]
             Self::C { model, .. } => model.kind(),
+            #[cfg(feature = "triton")]
+            Self::Triton { model, .. } => model.kind(),
         }
     }
 }
@@ -131,6 +141,8 @@ impl PyLoadedModel {
             PyLoadedModelInner::Faer { model, .. } => model.forward(ModelInput::Tokens(tokens)),
             #[cfg(feature = "conversion-c")]
             PyLoadedModelInner::C { model, .. } => model.forward(ModelInput::Tokens(tokens)),
+            #[cfg(feature = "triton")]
+            PyLoadedModelInner::Triton { model, .. } => model.forward(ModelInput::Tokens(tokens)),
         });
         let out = out.map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
         match out {
@@ -161,6 +173,13 @@ impl PyLoadedModel {
                     Err(e) => Err(e),
                 }
             }
+            #[cfg(feature = "triton")]
+            PyLoadedModelInner::Triton { model, .. } => {
+                match model.forward(ModelInput::Tokens(tokens)) {
+                    Ok(ModelOutput::Tensor(t)) => Ok(t),
+                    Err(e) => Err(e),
+                }
+            }
         });
         let logits = logits.map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
         let row = last_logits_row(&logits)?;
@@ -183,6 +202,8 @@ impl PyLoadedModel {
             PyLoadedModelInner::Faer { model, .. } => model.debug_token_activations(&tokens),
             #[cfg(feature = "conversion-c")]
             PyLoadedModelInner::C { model, .. } => model.debug_token_activations(&tokens),
+            #[cfg(feature = "triton")]
+            PyLoadedModelInner::Triton { model, .. } => model.debug_token_activations(&tokens),
         });
         let activations = activations.map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
 
@@ -303,6 +324,35 @@ impl PyLoadedModel {
                         .map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))
                 }
             }
+            #[cfg(feature = "triton")]
+            PyLoadedModelInner::Triton { model, .. } => {
+                let lm = model
+                    .as_causal_lm()
+                    .ok_or_else(|| PyValueError::new_err("model is not a causal language model"))?;
+                if let Some(capacity) = kv_cache_capacity {
+                    let mut gen = Generator::new_with_kv_cache_capacity(
+                        lm,
+                        &sampler,
+                        &prompt_tokens,
+                        cfg.kv_cache,
+                        Some(capacity),
+                    )
+                    .map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
+                    for step in 0..cfg.max_new_tokens {
+                        if step + 1 == cfg.max_new_tokens {
+                            gen.step_final()
+                                .map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
+                        } else {
+                            gen.step()
+                                .map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
+                        }
+                    }
+                    Ok(gen.into_tokens())
+                } else {
+                    gpt_rs::inference::generate::generate_tokens(lm, &prompt_tokens, &sampler, cfg)
+                        .map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))
+                }
+            }
         }?;
 
         Ok(result)
@@ -326,6 +376,11 @@ impl PyLoadedModel {
             }
             #[cfg(feature = "conversion-c")]
             PyLoadedModelInner::C { backend, model } => {
+                let input = numpy_to_device_tensor(backend, input_nchw, 4, "vision")?;
+                py.allow_threads(|| model.forward(ModelInput::Vision(input)))
+            }
+            #[cfg(feature = "triton")]
+            PyLoadedModelInner::Triton { backend, model } => {
                 let input = numpy_to_device_tensor(backend, input_nchw, 4, "vision")?;
                 py.allow_threads(|| model.forward(ModelInput::Vision(input)))
             }
@@ -385,6 +440,17 @@ pub fn load_model(checkpoint: String, backend: Option<String>) -> PyResult<PyLoa
         });
     }
 
+    #[cfg(feature = "triton")]
+    if let Some(backend) = registry::get_typed_backend::<TritonBackend>(erased.as_ref()) {
+        let model = gpt_rs::runtime::load_model(Arc::clone(&backend), &path)
+            .with_context(|| format!("failed to load checkpoint {path}"))
+            .map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
+        return Ok(PyLoadedModel {
+            backend_name,
+            inner: PyLoadedModelInner::Triton { backend, model },
+        });
+    }
+
     Err(PyRuntimeError::new_err(format!(
         "unsupported backend '{backend_name}' for runtime.load_model (missing feature build?)",
     )))
@@ -411,6 +477,7 @@ pub fn backend_features<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
     d.set_item("cpu", true)?;
     d.set_item("faer", cfg!(feature = "faer"))?;
     d.set_item("conversion_c", cfg!(feature = "conversion-c"))?;
+    d.set_item("triton", cfg!(feature = "triton"))?;
     Ok(d)
 }
 

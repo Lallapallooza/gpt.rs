@@ -16,6 +16,9 @@ fn ensure_backends_registered() {
 
     #[cfg(feature = "conversion-c")]
     gpt_rs_backend_c::register_c_backend();
+
+    #[cfg(feature = "triton")]
+    gpt_rs_backend_triton::register_triton_backend();
 }
 
 /// Get the default backend name

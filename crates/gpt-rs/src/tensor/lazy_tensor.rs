@@ -26,6 +26,7 @@ pub(crate) enum LazyHandle<B: PortableBackend + 'static> {
         id: u128,
         base_id: BaseParamId,
         source: Arc<dyn ParamSource<B>>,
+        cache_enabled: bool,
         cached: OnceCell<B::TensorHandle>,
     },
     /// Lazily-evaluated graph node that will be flushed into a concrete handle on demand.

@@ -1,15 +1,44 @@
 use crate::ops::functional::FunctionalOverrides;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WeightStreamingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_budget_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_weights_percent: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_budget_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefetch_layers: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub small_param_persist_threshold: Option<u64>,
+}
+
+impl WeightStreamingConfig {
+    fn is_disabled(&self) -> bool {
+        !self.enabled
+            && self.device_budget_bytes.is_none()
+            && self.device_weights_percent.is_none()
+            && self.host_budget_bytes.is_none()
+            && self.prefetch_layers.is_none()
+            && self.small_param_persist_threshold.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelRuntimeConfig {
     #[serde(default, skip_serializing_if = "FunctionalOverrides::is_empty")]
     pub functional_overrides: FunctionalOverrides,
+    #[serde(default, skip_serializing_if = "WeightStreamingConfig::is_disabled")]
+    pub weight_streaming: WeightStreamingConfig,
 }
 
 impl ModelRuntimeConfig {
     fn is_empty(&self) -> bool {
-        self.functional_overrides.is_empty()
+        self.functional_overrides.is_empty() && self.weight_streaming.is_disabled()
     }
 }
 

@@ -202,15 +202,19 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
             LazyHandle::Param {
                 base_id,
                 source,
+                cache_enabled,
                 cached,
                 ..
             } => {
-                if let Some(handle) = cached.get() {
-                    return Ok(handle.clone());
+                if *cache_enabled {
+                    if let Some(handle) = cached.get() {
+                        return Ok(handle.clone());
+                    }
+                    let handle = source.load(*base_id)?;
+                    let _ = cached.set(handle.clone());
+                    return Ok(handle);
                 }
-                let handle = source.load(*base_id)?;
-                let _ = cached.set(handle.clone());
-                Ok(handle)
+                Ok(source.load(*base_id)?)
             }
             LazyHandle::Node { graph, value } => {
                 if let Some(handle) = graph.try_ready_handle(*value) {
@@ -298,6 +302,7 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                 id,
                 base_id,
                 source,
+                cache_enabled,
                 cached,
             } => {
                 if *id == stable_id {
@@ -315,6 +320,7 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                         id: stable_id,
                         base_id: *base_id,
                         source: Arc::clone(source),
+                        cache_enabled: *cache_enabled,
                         cached: new_cached,
                     }),
                 })
@@ -392,6 +398,7 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
         stable_id: u128,
         base_id: BaseParamId,
         source: Arc<dyn ParamSource<B>>,
+        cache_enabled: bool,
     ) -> Self {
         DeviceTensor {
             backend,
@@ -401,6 +408,7 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                 id: stable_id,
                 base_id,
                 source,
+                cache_enabled,
                 cached: once_cell::sync::OnceCell::new(),
             }),
         }

@@ -10,7 +10,7 @@ use crate::backend::text_ir::{PtirSnippet, SnippetBindings, SnippetResult};
 use crate::tensor::{DeviceTensor, InputRole, LazyHandle};
 
 use super::arena::GraphArena;
-use super::state::{GraphInner, NodeRecord, NodeState, ParameterRecord};
+use super::state::{GraphInner, NodeRecord, NodeState, ParamSourceRecord, ParameterRecord};
 
 /// Context passed to graph capture closures for importing tensors and emitting nodes.
 pub struct GraphBuilder<'a, B: PortableBackend + 'static> {
@@ -23,7 +23,7 @@ impl<'a, B: PortableBackend + 'static> GraphBuilder<'a, B> {
     /// Existing handles are reused so repeated captures share parameters.
     pub fn import(&mut self, tensor: &DeviceTensor<B>) -> Result<ValueId> {
         match &**tensor.lazy_handle() {
-            LazyHandle::Input { .. } | LazyHandle::Param { .. } => {
+            LazyHandle::Input { .. } => {
                 let role = tensor
                     .lazy_handle()
                     .role()
@@ -47,8 +47,51 @@ impl<'a, B: PortableBackend + 'static> GraphBuilder<'a, B> {
                 self.inner.parameters.push(ParameterRecord {
                     value,
                     spec,
-                    handle,
+                    handle: Some(handle),
                     role,
+                    stable_id: Some(stable_id),
+                });
+                self.inner.parameter_lookup.insert(key, value);
+                self.inner.bump_version();
+                Ok(value)
+            }
+            LazyHandle::Param {
+                base_id,
+                source,
+                cache_enabled,
+                ..
+            } => {
+                let stable_id = tensor
+                    .lazy_handle()
+                    .id()
+                    .ok_or_else(|| anyhow!("param handle missing stable id"))?;
+                let key = (InputRole::Param, stable_id);
+
+                if let Some(existing) = self.inner.parameter_lookup.get(&key) {
+                    return Ok(*existing);
+                }
+
+                let value = self.allocate_value();
+                let spec = tensor.tensor_spec();
+                let handle = if *cache_enabled {
+                    let handle = tensor.materialize()?;
+                    self.arena.param_resolver.set(stable_id, handle.clone());
+                    Some(handle)
+                } else {
+                    None
+                };
+                self.inner.param_sources.insert(
+                    stable_id,
+                    ParamSourceRecord {
+                        base_id: *base_id,
+                        source: Arc::clone(source),
+                    },
+                );
+                self.inner.parameters.push(ParameterRecord {
+                    value,
+                    spec,
+                    handle,
+                    role: InputRole::Param,
                     stable_id: Some(stable_id),
                 });
                 self.inner.parameter_lookup.insert(key, value);
@@ -65,7 +108,7 @@ impl<'a, B: PortableBackend + 'static> GraphBuilder<'a, B> {
                     self.inner.parameters.push(ParameterRecord {
                         value: value_id,
                         spec,
-                        handle,
+                        handle: Some(handle),
                         role: InputRole::Arg,
                         stable_id: None,
                     });

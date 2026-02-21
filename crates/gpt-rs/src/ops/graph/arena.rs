@@ -68,7 +68,7 @@ use super::plan::{
     insert_cached_program, CachedPlan, InputSignature, ParameterSpec, PlanCache, PlanKey, PlanNode,
     DEFAULT_PLAN_CACHE_CAPACITY,
 };
-use super::state::{GraphInner, NodeState};
+use super::state::{GraphInner, NodeState, ParameterRecord};
 
 /// Central storage for lazy tensor graphs built on top of a single backend instance.
 pub struct GraphArena<B: PortableBackend + 'static> {
@@ -218,7 +218,95 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
             .parameters
             .iter()
             .find(|param| param.value == value)
-            .map(|param| param.handle.clone())
+            .and_then(|param| self.resolve_parameter_handle(&inner, param).ok())
+    }
+
+    fn resolve_param_handle_by_stable_id(
+        &self,
+        inner: &GraphInner<B>,
+        stable_id: u128,
+    ) -> Result<B::TensorHandle> {
+        if let Some(handle) = self.param_resolver.get(stable_id) {
+            return Ok(handle);
+        }
+
+        if let Some(param) = inner
+            .parameters
+            .iter()
+            .find(|record| record.role == InputRole::Param && record.stable_id == Some(stable_id))
+        {
+            return self.resolve_parameter_handle(inner, param);
+        }
+
+        if let Some(source) = inner.param_sources.get(&stable_id) {
+            return source.source.load(source.base_id);
+        }
+
+        Err(anyhow!(
+            "missing param {:?} in resolver/source for backend {}",
+            stable_id,
+            self.backend.backend_name()
+        ))
+    }
+
+    fn resolve_parameter_handle(
+        &self,
+        inner: &GraphInner<B>,
+        param: &ParameterRecord<B>,
+    ) -> Result<B::TensorHandle> {
+        match param.role {
+            InputRole::Arg => param
+                .handle
+                .clone()
+                .ok_or_else(|| anyhow!("arg value {:?} missing materialized handle", param.value)),
+            InputRole::Param => {
+                let stable_id = param
+                    .stable_id
+                    .ok_or_else(|| anyhow!("param value {:?} missing stable id", param.value))?;
+                if let Some(handle) = self.param_resolver.get(stable_id) {
+                    return Ok(handle);
+                }
+                if let Some(handle) = param.handle.clone() {
+                    self.param_resolver.set(stable_id, handle.clone());
+                    return Ok(handle);
+                }
+                if let Some(source) = inner.param_sources.get(&stable_id) {
+                    return source.source.load(source.base_id);
+                }
+                Err(anyhow!(
+                    "missing param source for stable id {:?} on backend {}",
+                    stable_id,
+                    self.backend.backend_name()
+                ))
+            }
+        }
+    }
+
+    fn collect_target_handles(
+        &self,
+        inner: &GraphInner<B>,
+        targets: &[ValueId],
+    ) -> Result<Vec<B::TensorHandle>> {
+        let mut handles = Vec::with_capacity(targets.len());
+        for value in targets {
+            if let Some(node) = inner.nodes.get(value) {
+                match &node.state {
+                    NodeState::Ready(handle) => handles.push(handle.clone()),
+                    NodeState::Pending => {
+                        return Err(anyhow!("value {:?} pending after program execution", value));
+                    }
+                }
+            } else if let Some(param) = inner
+                .parameters
+                .iter()
+                .find(|record| record.value == *value)
+            {
+                handles.push(self.resolve_parameter_handle(inner, param)?);
+            } else {
+                return Err(anyhow!("value {:?} not registered", value));
+            }
+        }
+        Ok(handles)
     }
 
     /// Captures a sequence of graph edits, exposing a [`GraphBuilder`] to the caller.
@@ -400,7 +488,8 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
                 .iter()
                 .find(|record| record.value == *value)
             {
-                ready_handles.push(Some(param.handle.clone()));
+                let handle = self.resolve_parameter_handle(&inner, param)?;
+                ready_handles.push(Some(handle));
             } else {
                 return Err(anyhow!("value {:?} not registered in graph", value));
             }
@@ -692,7 +781,9 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
                             let stable_id = record.stable_id.ok_or_else(|| {
                                 anyhow!("param input {:?} missing stable id", spec.value)
                             })?;
-                            self.param_resolver.set(stable_id, record.handle.clone());
+                            if let Some(handle) = record.handle.clone() {
+                                self.param_resolver.set(stable_id, handle);
+                            }
                             Some(stable_id)
                         }
                     };
@@ -813,7 +904,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
                         }
                     }
 
-                    gather_handles_for_targets(&inner, targets)?
+                    self.collect_target_handles(&inner, targets)?
                 };
 
                 if let Some(ref sink) = trace_sink {
@@ -892,7 +983,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
                             .iter_mut()
                             .find(|record| record.value == value)
                         {
-                            param.handle = handle.clone();
+                            param.handle = Some(handle.clone());
                         } else {
                             let node = inner
                                 .nodes
@@ -908,7 +999,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
                     if let Some(param) =
                         inner.parameters.iter().find(|record| record.value == value)
                     {
-                        handles.push(param.handle.clone());
+                        handles.push(self.resolve_parameter_handle(&inner, param)?);
                         arg_index += 1;
                         continue;
                     }
@@ -931,13 +1022,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
                 InputRole::Param => {
                     let stable_id =
                         stable_id.ok_or_else(|| anyhow!("param input missing stable id"))?;
-                    let handle = self.param_resolver.get(stable_id).ok_or_else(|| {
-                        anyhow!(
-                            "missing param {:?} in resolver for backend {}",
-                            stable_id,
-                            self.backend.backend_name()
-                        )
-                    })?;
+                    let handle = self.resolve_param_handle_by_stable_id(&inner, stable_id)?;
                     handles.push(handle);
                 }
             }
@@ -954,32 +1039,6 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
         drop(inner);
         Ok(handles)
     }
-}
-
-fn gather_handles_for_targets<B: PortableBackend + 'static>(
-    inner: &GraphInner<B>,
-    targets: &[ValueId],
-) -> Result<Vec<B::TensorHandle>> {
-    let mut handles = Vec::with_capacity(targets.len());
-    for value in targets {
-        if let Some(node) = inner.nodes.get(value) {
-            match &node.state {
-                NodeState::Ready(handle) => handles.push(handle.clone()),
-                NodeState::Pending => {
-                    return Err(anyhow!("value {:?} pending after program execution", value));
-                }
-            }
-        } else if let Some(param) = inner
-            .parameters
-            .iter()
-            .find(|record| record.value == *value)
-        {
-            handles.push(param.handle.clone());
-        } else {
-            return Err(anyhow!("value {:?} not registered", value));
-        }
-    }
-    Ok(handles)
 }
 
 #[derive(Debug)]
@@ -1087,7 +1146,7 @@ impl<B: PortableBackend + 'static> CompiledGraph<B> {
                     .iter()
                     .find(|record| record.value == *value)
                 {
-                    ready.push(param.handle.clone());
+                    ready.push(self.arena.resolve_parameter_handle(&inner, param)?);
                 } else {
                     bail!("value {:?} not registered in graph", value);
                 }

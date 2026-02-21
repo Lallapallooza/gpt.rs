@@ -2,8 +2,10 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::backend::spec::{Operand, Operation, PortableBackend, TensorSpec, ValueId};
+use crate::params::{BaseParamId, ParamSource};
 use crate::tensor::InputRole;
 
 /// Mutable graph storage protected by a mutex inside [`GraphArena`](super::arena::GraphArena).
@@ -14,6 +16,7 @@ pub(super) struct GraphInner<B: PortableBackend + 'static> {
     pub(super) order: Vec<ValueId>,
     pub(super) parameters: Vec<ParameterRecord<B>>,
     pub(super) parameter_lookup: HashMap<(InputRole, u128), ValueId>,
+    pub(super) param_sources: HashMap<u128, ParamSourceRecord<B>>,
     pub(super) exports: HashSet<ValueId>,
     pub(super) version: u64,
 }
@@ -27,6 +30,7 @@ impl<B: PortableBackend + 'static> GraphInner<B> {
             order: Vec::new(),
             parameters: Vec::new(),
             parameter_lookup: HashMap::new(),
+            param_sources: HashMap::new(),
             exports: HashSet::new(),
             version: 0,
         }
@@ -60,7 +64,13 @@ pub(super) enum NodeState<B: PortableBackend + 'static> {
 pub(super) struct ParameterRecord<B: PortableBackend + 'static> {
     pub(super) value: ValueId,
     pub(super) spec: TensorSpec,
-    pub(super) handle: B::TensorHandle,
+    pub(super) handle: Option<B::TensorHandle>,
     pub(super) role: InputRole,
     pub(super) stable_id: Option<u128>,
+}
+
+/// Runtime source binding used to lazily load parameter handles on resolver misses.
+pub(super) struct ParamSourceRecord<B: PortableBackend + 'static> {
+    pub(super) base_id: BaseParamId,
+    pub(super) source: Arc<dyn ParamSource<B>>,
 }

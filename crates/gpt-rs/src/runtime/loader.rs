@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 
 use crate::backend::spec::{PortableBackend, TensorInit};
 use crate::checkpoint::{CheckpointReader, CheckpointTensorEntry};
@@ -46,6 +46,20 @@ pub fn load_model_with_namespace<B: PortableBackend + 'static>(
     let reader = CheckpointReader::open(&path)
         .with_context(|| format!("failed to open checkpoint {}", path.as_ref().display()))?;
     let config = reader.config().clone();
+    let weight_streaming = &config.runtime.weight_streaming;
+    if let Some(percent) = weight_streaming.device_weights_percent {
+        ensure!(
+            (0.0..=1.0).contains(&percent),
+            "runtime.weight_streaming.device_weights_percent must be in [0.0, 1.0], got {}",
+            percent
+        );
+    }
+    let weight_streaming_enabled = weight_streaming.enabled
+        || weight_streaming.device_budget_bytes.is_some()
+        || weight_streaming.device_weights_percent.is_some()
+        || weight_streaming.host_budget_bytes.is_some()
+        || weight_streaming.prefetch_layers.is_some()
+        || weight_streaming.small_param_persist_threshold.is_some();
     let registry = build_registry::<B>(&functional_overrides_from_config(&config)?);
 
     let mut specs: HashMap<String, CheckpointTensorEntry> =
@@ -73,6 +87,7 @@ pub fn load_model_with_namespace<B: PortableBackend + 'static>(
             key.0,
             spec.base_id,
             Arc::clone(&source_for_params),
+            !weight_streaming_enabled,
         ))
     };
 

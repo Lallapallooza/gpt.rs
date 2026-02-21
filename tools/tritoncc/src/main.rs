@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 struct KernelMeta {
     schema_version: u32,
@@ -19,6 +19,7 @@ struct KernelMeta {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KernelKind {
     ElementwiseBinaryF32,
+    ElementwiseUnaryF32,
     Placeholder,
 }
 
@@ -98,6 +99,7 @@ fn run_compile(raw_args: Vec<String>) -> Result<(), String> {
         .join("\n");
     let ptx = match kernel_kind {
         KernelKind::ElementwiseBinaryF32 => emit_elementwise_binary_ptx(&arch),
+        KernelKind::ElementwiseUnaryF32 => emit_elementwise_unary_ptx(&arch),
         KernelKind::Placeholder => emit_placeholder_ptx(&arch, input.display().to_string(), source_preview),
     };
 
@@ -110,6 +112,7 @@ fn run_compile(raw_args: Vec<String>) -> Result<(), String> {
 
     let kernel_symbol = match kernel_kind {
         KernelKind::ElementwiseBinaryF32 => "gpt_rs_triton_ewise_binary_f32".to_string(),
+        KernelKind::ElementwiseUnaryF32 => "gpt_rs_triton_ewise_unary_f32".to_string(),
         KernelKind::Placeholder => derive_symbol_name(&input),
     };
     let param_abi = match kernel_kind {
@@ -122,10 +125,19 @@ fn run_compile(raw_args: Vec<String>) -> Result<(), String> {
                 "u32".to_string(),
             ]
         }
+        KernelKind::ElementwiseUnaryF32 => {
+            vec![
+                "*fp32".to_string(),
+                "*fp32".to_string(),
+                "u32".to_string(),
+                "u32".to_string(),
+            ]
+        }
         KernelKind::Placeholder => vec!["*fp32".to_string(), "*fp32".to_string(), "i32".to_string()],
     };
     let note = match kernel_kind {
         KernelKind::ElementwiseBinaryF32 => "elementwise binary PTX emitted by tritoncc",
+        KernelKind::ElementwiseUnaryF32 => "elementwise unary PTX emitted by tritoncc",
         KernelKind::Placeholder => "placeholder metadata emitted by bootstrap tritoncc",
     };
     let meta_doc = KernelMeta {
@@ -173,6 +185,9 @@ fn detect_kernel_kind(source: &str) -> KernelKind {
         let trimmed = line.trim();
         if trimmed == "// gpt_rs.kernel: elementwise_binary_f32" {
             return KernelKind::ElementwiseBinaryF32;
+        }
+        if trimmed == "// gpt_rs.kernel: elementwise_unary_f32" {
+            return KernelKind::ElementwiseUnaryF32;
         }
     }
     KernelKind::Placeholder
@@ -277,7 +292,63 @@ L_DONE:
     )
 }
 
-fn derive_symbol_name(input: &PathBuf) -> String {
+fn emit_elementwise_unary_ptx(arch: &str) -> String {
+    format!(
+        r#".version 7.0
+.target {arch}
+.address_size 64
+
+.visible .entry gpt_rs_triton_ewise_unary_f32(
+    .param .u64 in_ptr,
+    .param .u64 out_ptr,
+    .param .u32 n,
+    .param .u32 op
+)
+{{
+    .reg .pred %p<4>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<4>;
+
+    ld.param.u64 %rd1, [in_ptr];
+    ld.param.u64 %rd2, [out_ptr];
+    ld.param.u32 %r1, [n];
+    ld.param.u32 %r2, [op];
+
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %tid.x;
+    mad.lo.s32 %r6, %r3, %r4, %r5;
+    setp.ge.u32 %p1, %r6, %r1;
+    @%p1 bra L_DONE;
+
+    mul.wide.u32 %rd3, %r6, 4;
+    add.s64 %rd4, %rd1, %rd3;
+    add.s64 %rd5, %rd2, %rd3;
+    ld.global.f32 %f1, [%rd4];
+
+    setp.eq.u32 %p2, %r2, 0;
+    @%p2 bra L_NEG;
+    bra L_ABS;
+
+L_NEG:
+    neg.f32 %f2, %f1;
+    bra L_STORE;
+
+L_ABS:
+    abs.f32 %f2, %f1;
+
+L_STORE:
+    st.global.f32 [%rd5], %f2;
+
+L_DONE:
+    ret;
+}}
+"#
+    )
+}
+
+fn derive_symbol_name(input: &Path) -> String {
     let stem = input
         .file_stem()
         .and_then(|s| s.to_str())

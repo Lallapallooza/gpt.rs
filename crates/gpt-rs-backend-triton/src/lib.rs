@@ -208,6 +208,7 @@ fn triton_legality_spec() -> LegalitySpec {
             OperationKind::Constant,
             OperationKind::StopGradient,
             OperationKind::Reshape,
+            OperationKind::ElementwiseUnary,
             OperationKind::ElementwiseBinary,
             OperationKind::DotGeneral,
             OperationKind::Reduce,

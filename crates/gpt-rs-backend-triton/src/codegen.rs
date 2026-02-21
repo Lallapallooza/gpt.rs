@@ -1,8 +1,10 @@
 use gpt_rs::backend::conversion::{ConversionError, ConversionResult};
-use gpt_rs::backend::spec::{DType, Function, Operand, Operation, Program, ReduceKind, ValueType};
+use gpt_rs::backend::spec::{
+    DType, ElementwiseUnaryOp, Function, Operand, Operation, Program, ReduceKind, ValueType,
+};
 
 use crate::artifact::TritonArtifact;
-use crate::kernels::elementwise_binary_kernel_spec;
+use crate::kernels::{elementwise_binary_kernel_spec, elementwise_unary_kernel_spec};
 
 pub fn lower_program_to_artifact(
     program: &Program,
@@ -11,14 +13,21 @@ pub fn lower_program_to_artifact(
     let function = entry_function(program)?;
 
     let mut has_elementwise_binary = false;
+    let mut has_elementwise_unary = false;
     for instruction in &function.body {
         validate_instruction(function, instruction)?;
+        if matches!(instruction.op, Operation::ElementwiseUnary(_)) {
+            has_elementwise_unary = true;
+        }
         if matches!(instruction.op, Operation::ElementwiseBinary(_)) {
             has_elementwise_binary = true;
         }
     }
 
     let mut kernels = Vec::new();
+    if has_elementwise_unary {
+        kernels.push(elementwise_unary_kernel_spec());
+    }
     if has_elementwise_binary {
         kernels.push(elementwise_binary_kernel_spec());
     }
@@ -49,6 +58,30 @@ fn validate_instruction(
             let _ = operand_value_id(instruction.operands.first(), "alias source")?;
             ensure_tensor_output(&instruction.output)?;
             Ok(())
+        }
+        Operation::ElementwiseUnary(op) => {
+            let input_id = operand_value_id(instruction.operands.first(), "elementwise unary")?;
+            let input_spec = operand_tensor_spec(function, input_id).ok_or_else(|| {
+                ConversionError::new("failed to resolve elementwise unary input spec")
+            })?;
+            let out_spec = ensure_tensor_output(&instruction.output)?;
+            if input_spec.dtype != DType::F32 || out_spec.dtype != DType::F32 {
+                return Err(ConversionError::new(
+                    "triton elementwise unary lowering supports F32 only",
+                ));
+            }
+            if input_spec != out_spec {
+                return Err(ConversionError::new(
+                    "triton elementwise unary lowering requires equal tensor specs for input/out",
+                ));
+            }
+            match op {
+                ElementwiseUnaryOp::Neg | ElementwiseUnaryOp::Abs => Ok(()),
+                _ => Err(ConversionError::new(format!(
+                    "triton elementwise unary lowering does not support op {:?}",
+                    op
+                ))),
+            }
         }
         Operation::ElementwiseBinary(_) => {
             let lhs_id = operand_value_id(instruction.operands.first(), "elementwise lhs")?;

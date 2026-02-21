@@ -3,15 +3,15 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use gpt_rs::backend::spec::{
-    BackendError, BackendResult, DType, Dimension, ElementwiseBinaryOp, Operand, Operation,
-    ReduceKind, TensorLiteral, TensorSpec, ValueId, ValueType,
+    BackendError, BackendResult, DType, Dimension, ElementwiseBinaryOp, ElementwiseUnaryOp,
+    Operand, Operation, ReduceKind, TensorLiteral, TensorSpec, ValueId, ValueType,
 };
 use libloading::Library;
 
 use crate::artifact::TritonArtifact;
 use crate::compiler::KernelCompiler;
 use crate::device::{self, CudaDriver, CudaFunction, DeviceBuffer};
-use crate::kernels::{KernelKind, KernelSpec, EWISE_BINARY_KERNEL_ID};
+use crate::kernels::{KernelKind, KernelSpec, EWISE_BINARY_KERNEL_ID, EWISE_UNARY_KERNEL_ID};
 use crate::tensor::TritonTensor;
 
 pub struct TritonExecutor {
@@ -115,6 +115,15 @@ impl TritonExecutor {
                 })?;
                 self.execute_elementwise_binary(driver, kernel, *op, &lhs, &rhs, &out_spec)
             }
+            Operation::ElementwiseUnary(op) => {
+                let input =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
+                let out_spec = output_tensor_spec(&instruction.output)?;
+                let kernel = kernels.get(EWISE_UNARY_KERNEL_ID).ok_or_else(|| {
+                    BackendError::execution("missing elementwise unary kernel in triton artifact")
+                })?;
+                self.execute_elementwise_unary(driver, kernel, *op, &input, &out_spec)
+            }
             Operation::DotGeneral(spec) => {
                 let lhs =
                     self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
@@ -209,6 +218,64 @@ impl TritonExecutor {
         let mut params = [
             (&mut lhs_ptr as *mut u64).cast::<c_void>(),
             (&mut rhs_ptr as *mut u64).cast::<c_void>(),
+            (&mut out_ptr as *mut u64).cast::<c_void>(),
+            (&mut n as *mut u32).cast::<c_void>(),
+            (&mut op_u32 as *mut u32).cast::<c_void>(),
+        ];
+        driver.launch_kernel(
+            &loaded.function,
+            (grid_x, 1, 1),
+            (block_x, 1, 1),
+            0,
+            &mut params,
+        )?;
+
+        Ok(out)
+    }
+
+    fn execute_elementwise_unary(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernel: &KernelSpec,
+        op: ElementwiseUnaryOp,
+        input: &TritonTensor,
+        spec: &TensorSpec,
+    ) -> BackendResult<TritonTensor> {
+        if input.spec != *spec {
+            return Err(BackendError::execution(
+                "elementwise unary operand/spec mismatch in triton runtime",
+            ));
+        }
+        if spec.dtype != DType::F32 {
+            return Err(BackendError::execution(format!(
+                "elementwise unary runtime currently supports F32 only, got {:?}",
+                spec.dtype
+            )));
+        }
+        if !matches!(kernel.kind, KernelKind::ElementwiseUnaryF32) {
+            return Err(BackendError::execution(format!(
+                "unexpected kernel kind for elementwise unary: {:?}",
+                kernel.kind
+            )));
+        }
+
+        let element_count = static_element_count(&spec.shape)?;
+        let out = TritonTensor::new(spec.clone(), driver.alloc_zeroed(byte_len(spec)?)?);
+
+        let loaded = self.load_kernel(driver, kernel)?;
+        let opcode = unary_opcode(op)?;
+        let count_u32 = u32::try_from(element_count).map_err(|_| {
+            BackendError::execution("elementwise unary tensor too large for u32 launch size")
+        })?;
+        let block_x = 256u32;
+        let grid_x = count_u32.div_ceil(block_x);
+
+        let mut in_ptr = input.buffer.device_ptr();
+        let mut out_ptr = out.buffer.device_ptr();
+        let mut n = count_u32;
+        let mut op_u32 = opcode;
+        let mut params = [
+            (&mut in_ptr as *mut u64).cast::<c_void>(),
             (&mut out_ptr as *mut u64).cast::<c_void>(),
             (&mut n as *mut u32).cast::<c_void>(),
             (&mut op_u32 as *mut u32).cast::<c_void>(),
@@ -479,6 +546,17 @@ fn binary_opcode(op: ElementwiseBinaryOp) -> u32 {
         ElementwiseBinaryOp::Div => 3,
         ElementwiseBinaryOp::Maximum => 4,
         ElementwiseBinaryOp::Minimum => 5,
+    }
+}
+
+fn unary_opcode(op: ElementwiseUnaryOp) -> BackendResult<u32> {
+    match op {
+        ElementwiseUnaryOp::Neg => Ok(0),
+        ElementwiseUnaryOp::Abs => Ok(1),
+        _ => Err(BackendError::execution(format!(
+            "elementwise unary runtime does not support op {:?}",
+            op
+        ))),
     }
 }
 

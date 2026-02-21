@@ -12,6 +12,7 @@ type CUdeviceptr = u64;
 type CUmodule = *mut c_void;
 type CUfunction = *mut c_void;
 type CUstream = *mut c_void;
+type CUevent = *mut c_void;
 
 const CUDA_SUCCESS: CUresult = 0;
 
@@ -63,6 +64,12 @@ type CuLaunchKernelFn = unsafe extern "C" fn(
     kernel_params: *mut *mut c_void,
     extra: *mut *mut c_void,
 ) -> CUresult;
+type CuEventCreateFn = unsafe extern "C" fn(event: *mut CUevent, flags: u32) -> CUresult;
+type CuEventDestroyV2Fn = unsafe extern "C" fn(event: CUevent) -> CUresult;
+type CuEventRecordFn = unsafe extern "C" fn(event: CUevent, stream: CUstream) -> CUresult;
+type CuEventSynchronizeFn = unsafe extern "C" fn(event: CUevent) -> CUresult;
+type CuEventElapsedTimeFn =
+    unsafe extern "C" fn(ms: *mut f32, start: CUevent, end: CUevent) -> CUresult;
 
 struct DriverFns {
     cu_init: CuInitFn,
@@ -80,6 +87,11 @@ struct DriverFns {
     cu_module_unload: CuModuleUnloadFn,
     cu_module_get_function: CuModuleGetFunctionFn,
     cu_launch_kernel: CuLaunchKernelFn,
+    cu_event_create: CuEventCreateFn,
+    cu_event_destroy_v2: CuEventDestroyV2Fn,
+    cu_event_record: CuEventRecordFn,
+    cu_event_synchronize: CuEventSynchronizeFn,
+    cu_event_elapsed_time: CuEventElapsedTimeFn,
 }
 
 pub struct CudaDriver {
@@ -195,6 +207,14 @@ impl CudaDriver {
             cu_module_unload: load_symbol(&lib, b"cuModuleUnload\0")?,
             cu_module_get_function: load_symbol(&lib, b"cuModuleGetFunction\0")?,
             cu_launch_kernel: load_symbol(&lib, b"cuLaunchKernel\0")?,
+            cu_event_create: load_symbol(&lib, b"cuEventCreate\0")?,
+            cu_event_destroy_v2: load_symbol_any(
+                &lib,
+                &[b"cuEventDestroy_v2\0", b"cuEventDestroy\0"],
+            )?,
+            cu_event_record: load_symbol(&lib, b"cuEventRecord\0")?,
+            cu_event_synchronize: load_symbol(&lib, b"cuEventSynchronize\0")?,
+            cu_event_elapsed_time: load_symbol(&lib, b"cuEventElapsedTime\0")?,
         };
 
         // SAFETY: Calls are made with valid pointers and follow CUDA driver API contract.
@@ -387,6 +407,80 @@ impl CudaDriver {
         Ok(())
     }
 
+    pub fn time_with_events<F>(&self, op_name: &str, op: F) -> BackendResult<f32>
+    where
+        F: FnOnce() -> BackendResult<()>,
+    {
+        const CU_EVENT_DEFAULT: u32 = 0;
+
+        self.ensure_current()?;
+        let mut start: CUevent = std::ptr::null_mut();
+        let mut end: CUevent = std::ptr::null_mut();
+
+        // SAFETY: start/end are valid out-pointers for CUDA event creation.
+        unsafe {
+            check_cuda(
+                (self.fns.cu_event_create)(&mut start as *mut CUevent, CU_EVENT_DEFAULT),
+                "cuEventCreate(start)",
+            )?;
+            check_cuda(
+                (self.fns.cu_event_create)(&mut end as *mut CUevent, CU_EVENT_DEFAULT),
+                "cuEventCreate(end)",
+            )?;
+        }
+
+        let start_guard = CudaEventGuard {
+            driver: self,
+            event: start,
+        };
+        let end_guard = CudaEventGuard {
+            driver: self,
+            event: end,
+        };
+
+        // SAFETY: Events are valid handles, and null stream means default stream.
+        unsafe {
+            check_cuda(
+                (self.fns.cu_event_record)(start_guard.event, std::ptr::null_mut()),
+                "cuEventRecord(start)",
+            )?;
+        }
+
+        op()?;
+
+        // SAFETY: Event record/sync operations use valid event handles.
+        unsafe {
+            check_cuda(
+                (self.fns.cu_event_record)(end_guard.event, std::ptr::null_mut()),
+                "cuEventRecord(end)",
+            )?;
+            check_cuda(
+                (self.fns.cu_event_synchronize)(end_guard.event),
+                "cuEventSynchronize(end)",
+            )?;
+        }
+
+        let mut elapsed_ms = 0.0f32;
+        // SAFETY: elapsed output pointer and event handles are valid.
+        unsafe {
+            check_cuda(
+                (self.fns.cu_event_elapsed_time)(
+                    &mut elapsed_ms as *mut f32,
+                    start_guard.event,
+                    end_guard.event,
+                ),
+                "cuEventElapsedTime",
+            )?;
+        }
+        if !elapsed_ms.is_finite() || elapsed_ms < 0.0 {
+            return Err(BackendError::execution(format!(
+                "invalid CUDA event elapsed time for {op_name}: {elapsed_ms}"
+            )));
+        }
+
+        Ok(elapsed_ms)
+    }
+
     pub fn ensure_current(&self) -> BackendResult<()> {
         // SAFETY: Context was created by this driver and remains valid until drop.
         unsafe {
@@ -399,6 +493,22 @@ impl CudaDriver {
 
     fn ctx_ptr(&self) -> CUcontext {
         self.ctx as CUcontext
+    }
+}
+
+struct CudaEventGuard<'a> {
+    driver: &'a CudaDriver,
+    event: CUevent,
+}
+
+impl Drop for CudaEventGuard<'_> {
+    fn drop(&mut self) {
+        if self.event.is_null() {
+            return;
+        }
+        // SAFETY: Event was created by this driver and is destroyed once here.
+        let _ = unsafe { (self.driver.fns.cu_event_destroy_v2)(self.event) };
+        self.event = std::ptr::null_mut();
     }
 }
 
@@ -438,6 +548,28 @@ fn load_symbol<T: Copy>(lib: &Library, name: &'static [u8]) -> BackendResult<T> 
         ))
     })?;
     Ok(*sym)
+}
+
+fn load_symbol_any<T: Copy>(lib: &Library, names: &[&'static [u8]]) -> BackendResult<T> {
+    for name in names {
+        // SAFETY: Caller provides expected symbol type from CUDA driver API.
+        if let Ok(sym) = unsafe { lib.get::<T>(name) } {
+            return Ok(*sym);
+        }
+    }
+
+    let tried = names
+        .iter()
+        .map(|name| {
+            String::from_utf8_lossy(name)
+                .trim_end_matches('\0')
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(BackendError::execution(format!(
+        "failed to resolve any CUDA symbol variant: {tried}"
+    )))
 }
 
 fn check_cuda(code: CUresult, op: &str) -> BackendResult<()> {

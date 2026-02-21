@@ -97,6 +97,9 @@ enum Command {
     /// Causal text generation for models that implement `CausalLanguageModel`.
     Generate(GenerateArgs),
 
+    /// Dedicated benchmark modes for causal generation.
+    Benchmark(BenchmarkArgs),
+
     /// Run a model forward pass once (tokens or vision input).
     Forward(ForwardArgs),
 
@@ -147,6 +150,70 @@ struct GenerateArgs {
         help = "Exclude the first N generated tokens from timing/profiling (warmup)"
     )]
     warmup_tokens: usize,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum BenchmarkMode {
+    #[value(name = "prefill")]
+    Prefill,
+    #[value(name = "first-token")]
+    FirstToken,
+    #[value(name = "decode-steady")]
+    DecodeSteady,
+}
+
+#[derive(ClapArgs, Clone)]
+struct BenchmarkArgs {
+    #[arg(long, default_value = "checkpoints/gpt2.bin")]
+    checkpoint: PathBuf,
+
+    #[arg(long, default_value = "configs/gpt2_tokenizer.json")]
+    tokenizer: PathBuf,
+
+    #[arg(long, default_value = "Hello")]
+    prompt: String,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value = "decode-steady",
+        help = "Benchmark mode: prefill | first-token | decode-steady"
+    )]
+    mode: BenchmarkMode,
+
+    #[arg(
+        long,
+        default_value_t = 129,
+        help = "Number of generated tokens for decode-steady mode"
+    )]
+    max_tokens: usize,
+
+    #[arg(
+        long,
+        default_value_t = 1,
+        value_name = "N",
+        help = "Warmup tokens excluded from decode-steady timing"
+    )]
+    warmup_tokens: usize,
+
+    #[arg(long, default_value_t = 0.8)]
+    temperature: f32,
+
+    #[arg(long, default_value_t = false)]
+    greedy: bool,
+
+    #[arg(long)]
+    top_k: Option<usize>,
+
+    #[arg(long, default_value_t = true)]
+    kv_cache: bool,
+
+    #[arg(
+        long,
+        value_name = "TOKENS",
+        help = "Fixed KV-cache capacity for decode (disables power-of-two growth buckets)"
+    )]
+    kv_cache_capacity: Option<usize>,
 }
 
 #[derive(ClapArgs, Clone)]
@@ -298,19 +365,17 @@ fn main() -> Result<()> {
         .backend
         .unwrap_or_else(|| env::var("GPTRS_BACKEND").unwrap_or_else(|_| "faer".to_string()));
     let command = args.command;
-
     let supported = supported_backends();
-
-    match backend_env.trim() {
+    let profile_consumed = match backend_env.trim() {
         "faer" => {
             let backend = Arc::new(FaerCpuBackend::create());
-            run_with_backend(backend, command, args.profile)?;
+            run_with_backend(backend, command, args.profile)?
         }
         "c" => {
             #[cfg(feature = "conversion-c")]
             {
                 let backend = Arc::new(CBackend::new());
-                run_with_backend(backend, command, args.profile)?;
+                run_with_backend(backend, command, args.profile)?
             }
             #[cfg(not(feature = "conversion-c"))]
             {
@@ -322,8 +387,9 @@ fn main() -> Result<()> {
         "triton" => {
             #[cfg(feature = "backend-triton")]
             {
+                gpt_rs_backend_triton::set_gpu_event_timing(args.profile);
                 let backend = Arc::new(TritonBackend::new());
-                run_with_backend(backend, command, args.profile)?;
+                run_with_backend(backend, command, args.profile)?
             }
             #[cfg(not(feature = "backend-triton"))]
             {
@@ -339,9 +405,9 @@ fn main() -> Result<()> {
                 supported.join(", ")
             );
         }
-    }
+    };
 
-    if args.profile {
+    if args.profile && !profile_consumed {
         if let Some(report) = profiling::take_formatted_tables() {
             eprintln!("{}", report);
         } else {
@@ -369,10 +435,17 @@ fn run_with_backend<B: PortableBackend + 'static>(
     backend: Arc<B>,
     command: Command,
     profile: bool,
-) -> Result<()> {
+) -> Result<bool> {
     match command {
-        Command::Generate(args) => run_generate(&backend, &args, profile),
-        Command::Forward(args) => run_forward(&backend, &args, profile),
+        Command::Generate(args) => {
+            run_generate(&backend, &args, profile)?;
+            Ok(false)
+        }
+        Command::Benchmark(args) => run_benchmark(&backend, &args, profile),
+        Command::Forward(args) => {
+            run_forward(&backend, &args, profile)?;
+            Ok(false)
+        }
         Command::Convert(_) => unreachable!(),
         Command::Patterns(_) => unreachable!(),
     }
@@ -554,6 +627,223 @@ fn run_generate<B: PortableBackend + 'static>(
     );
 
     Ok(())
+}
+
+fn run_benchmark<B: PortableBackend + 'static>(
+    backend: &Arc<B>,
+    args: &BenchmarkArgs,
+    profile: bool,
+) -> Result<bool> {
+    let namespace = model_namespace_for_backend(backend.as_ref());
+    let model =
+        runtime::load_model_with_namespace(Arc::clone(backend), &args.checkpoint, namespace)
+            .with_context(|| format!("failed to load checkpoint {}", args.checkpoint.display()))?;
+    let lm = model.as_causal_lm().ok_or_else(|| {
+        anyhow!(
+            "model kind '{}' does not support causal generation",
+            model.kind()
+        )
+    })?;
+    let tokenizer = load_tokenizer(&args.tokenizer)?;
+    let prompt_tokens = tokenizer.encode(&args.prompt);
+    ensure!(
+        !prompt_tokens.is_empty(),
+        "prompt produced an empty token sequence"
+    );
+
+    let mut sampler = Sampler::new(args.temperature);
+    if args.greedy {
+        sampler.temperature = 0.0;
+    }
+    if let Some(k) = args.top_k {
+        sampler.top_k = Some(k.max(1));
+    }
+
+    match args.mode {
+        BenchmarkMode::Prefill => {
+            if profile {
+                profiling::reset();
+            }
+            let elapsed = {
+                let _scope = profile.then(|| profiling::backend_scope("benchmark.prefill_total"));
+                let t0 = std::time::Instant::now();
+                let _generator = Generator::new_with_kv_cache_capacity(
+                    lm,
+                    &sampler,
+                    &prompt_tokens,
+                    args.kv_cache,
+                    args.kv_cache_capacity,
+                )?;
+                t0.elapsed()
+            };
+            eprintln!(
+                "Benchmark prefill latency: prompt_tokens={} elapsed={:.2?}",
+                prompt_tokens.len(),
+                elapsed
+            );
+
+            if profile {
+                emit_profile_with_attribution(elapsed, 1.0, "prefill")?;
+                return Ok(true);
+            }
+            Ok(false)
+        }
+        BenchmarkMode::FirstToken => {
+            if profile {
+                profiling::reset();
+            }
+            let (token, elapsed) = {
+                let _scope =
+                    profile.then(|| profiling::backend_scope("benchmark.first_token_total"));
+                let t0 = std::time::Instant::now();
+                let mut generator = Generator::new_with_kv_cache_capacity(
+                    lm,
+                    &sampler,
+                    &prompt_tokens,
+                    args.kv_cache,
+                    args.kv_cache_capacity,
+                )?;
+                let token = generator.step_final()?;
+                (token, t0.elapsed())
+            };
+            eprintln!(
+                "Benchmark first-token latency: prompt_tokens={} token={} elapsed={:.2?} ({:.2} tokens/sec)",
+                prompt_tokens.len(),
+                token,
+                elapsed,
+                1.0f64 / elapsed.as_secs_f64().max(1e-9)
+            );
+
+            if profile {
+                emit_profile_with_attribution(elapsed, 1.0, "first-token")?;
+                return Ok(true);
+            }
+            Ok(false)
+        }
+        BenchmarkMode::DecodeSteady => {
+            ensure!(
+                args.max_tokens > 0,
+                "--max-tokens must be > 0 for decode-steady benchmark"
+            );
+            let warmup = args.warmup_tokens.min(args.max_tokens);
+            let measured_steps = args.max_tokens.saturating_sub(warmup);
+            ensure!(
+                measured_steps > 0,
+                "decode-steady requires at least one measured token; got max_tokens={} warmup_tokens={}",
+                args.max_tokens,
+                args.warmup_tokens
+            );
+
+            let mut generator = Generator::new_with_kv_cache_capacity(
+                lm,
+                &sampler,
+                &prompt_tokens,
+                args.kv_cache,
+                args.kv_cache_capacity,
+            )?;
+
+            for _ in 0..warmup {
+                generator.step()?;
+            }
+
+            if profile {
+                profiling::reset();
+            }
+            let elapsed = {
+                let _scope =
+                    profile.then(|| profiling::backend_scope("benchmark.decode_steady_total"));
+                let t0 = std::time::Instant::now();
+                for step in 0..measured_steps {
+                    if step + 1 == measured_steps {
+                        generator.step_final()?;
+                    } else {
+                        generator.step()?;
+                    }
+                }
+                t0.elapsed()
+            };
+            let tps = (measured_steps as f64) / elapsed.as_secs_f64().max(1e-9);
+            eprintln!(
+                "Benchmark decode-steady: measured_tokens={} warmup_tokens={} elapsed={:.2?} ({:.2} tokens/sec)",
+                measured_steps,
+                warmup,
+                elapsed,
+                tps
+            );
+
+            if profile {
+                emit_profile_with_attribution(elapsed, measured_steps as f64, "decode-steady")?;
+                return Ok(true);
+            }
+            Ok(false)
+        }
+    }
+}
+
+fn emit_profile_with_attribution(
+    elapsed: std::time::Duration,
+    measured_units: f64,
+    label: &str,
+) -> Result<()> {
+    if let Some((formatted, report_json)) = profiling::take_formatted_tables_and_report_json(false)
+    {
+        if let Some(component_ms) = measured_component_ms_from_report_json(&report_json) {
+            let wall_ms = elapsed.as_secs_f64() * 1_000.0;
+            let coverage = if wall_ms > 0.0 {
+                (component_ms / wall_ms) * 100.0
+            } else {
+                0.0
+            };
+            let clamped = coverage.clamp(0.0, 100.0);
+            let per_unit_ms = if measured_units > 0.0 {
+                wall_ms / measured_units
+            } else {
+                wall_ms
+            };
+            eprintln!(
+                "Attribution ({label}): {:.1}% measured ({:.3} ms profiled / {:.3} ms wall, {:.3} ms/unit)",
+                clamped, component_ms, wall_ms, per_unit_ms
+            );
+            if clamped < 90.0 {
+                eprintln!(
+                    "Attribution warning: measured coverage is below 90% (current {:.1}%).",
+                    clamped
+                );
+            }
+        } else {
+            eprintln!("Attribution ({label}): unavailable (failed to parse profiler report).");
+        }
+        eprintln!("{formatted}");
+    } else {
+        eprintln!(
+            "profiling enabled but no report available; rebuild gpt-rs with profiler support"
+        );
+    }
+    Ok(())
+}
+
+fn measured_component_ms_from_report_json(report_json: &str) -> Option<f64> {
+    let parsed: serde_json::Value = serde_json::from_str(report_json).ok()?;
+    let sections = parsed.get("sections")?.as_array()?;
+    let mut total = 0.0f64;
+
+    for section in sections {
+        let tables = section.get("tables")?;
+        for key in [
+            "layers",
+            "functionals",
+            "backend",
+            "compilation",
+            "compile_passes",
+        ] {
+            if let Some(rows) = tables.get(key).and_then(|v| v.as_array()) {
+                for row in rows {
+                    total += row.get("excl_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                }
+            }
+        }
+    }
+    Some(total)
 }
 
 fn run_conversion(args: ConvertArgs) -> Result<()> {

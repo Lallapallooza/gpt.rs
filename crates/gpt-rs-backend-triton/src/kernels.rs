@@ -14,6 +14,8 @@ pub const TRANSPOSE_KERNEL_ID: &str = "gpt_rs.triton.kernel.transpose_f32_rank5.
 pub const TRANSPOSE_SYMBOL: &str = "gpt_rs_triton_transpose_f32_rank5";
 pub const CONCAT_KERNEL_ID: &str = "gpt_rs.triton.kernel.concat_f32_rank4.v1";
 pub const CONCAT_SYMBOL: &str = "gpt_rs_triton_concat_f32_rank4";
+pub const REDUCE_SUM_LAST_AXIS_KERNEL_ID: &str = "gpt_rs.triton.kernel.reduce_sum_last_axis_f32.v1";
+pub const REDUCE_SUM_LAST_AXIS_SYMBOL: &str = "gpt_rs_triton_reduce_sum_last_axis_f32";
 pub const REDUCE_MAX_LAST_AXIS_KERNEL_ID: &str = "gpt_rs.triton.kernel.reduce_max_last_axis_f32.v1";
 pub const REDUCE_MAX_LAST_AXIS_SYMBOL: &str = "gpt_rs_triton_reduce_max_last_axis_f32";
 pub const IOTA_SI32_KERNEL_ID: &str = "gpt_rs.triton.kernel.iota_si32_rank4.v1";
@@ -81,6 +83,7 @@ pub enum KernelKind {
     SliceF32Rank4,
     TransposeF32Rank5,
     ConcatF32Rank4,
+    ReduceSumLastAxisF32,
     ReduceMaxLastAxisF32,
     IotaSi32Rank4,
     CompareSi32I1,
@@ -151,6 +154,15 @@ pub fn concat_kernel_spec() -> KernelSpec {
         kind: KernelKind::ConcatF32Rank4,
         source: PREPACKED_CONCAT_KERNEL.to_string(),
         symbol: CONCAT_SYMBOL.to_string(),
+    }
+}
+
+pub fn reduce_sum_last_axis_kernel_spec() -> KernelSpec {
+    KernelSpec {
+        id: REDUCE_SUM_LAST_AXIS_KERNEL_ID.to_string(),
+        kind: KernelKind::ReduceSumLastAxisF32,
+        source: PREPACKED_REDUCE_SUM_LAST_AXIS_KERNEL.to_string(),
+        symbol: REDUCE_SUM_LAST_AXIS_SYMBOL.to_string(),
     }
 }
 

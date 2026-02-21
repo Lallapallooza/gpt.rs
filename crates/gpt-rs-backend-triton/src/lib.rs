@@ -240,6 +240,10 @@ pub fn register_triton_backend() {
     gpt_rs::backend::registry::register_portable_backend("triton", TritonBackend::new);
 }
 
+pub fn set_gpu_event_timing(enabled: bool) {
+    runtime::set_gpu_event_timing_enabled(enabled);
+}
+
 #[gpt_rs::linkme::distributed_slice(gpt_rs::backend::registry::BACKEND_REGISTRARS)]
 static REGISTER_TRITON_BACKEND: fn() = register_triton_backend;
 

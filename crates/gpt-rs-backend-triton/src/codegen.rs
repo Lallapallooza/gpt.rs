@@ -9,8 +9,9 @@ use crate::kernels::{
     broadcast_kernel_spec, broadcast_si32_kernel_spec, compare_si32_i1_kernel_spec,
     concat_kernel_spec, dynamic_update_slice_f32_kernel_spec, elementwise_binary_kernel_spec,
     elementwise_unary_kernel_spec, extract_patches_nhwc_kernel_spec, iota_si32_kernel_spec,
-    prepacked_kernel_sources, reduce_max_last_axis_kernel_spec, reduce_window_max_nhwc_kernel_spec,
-    select_i1_f32_kernel_spec, slice_kernel_spec, take_f32_i32_kernel_spec, transpose_kernel_spec,
+    prepacked_kernel_sources, reduce_max_last_axis_kernel_spec, reduce_sum_last_axis_kernel_spec,
+    reduce_window_max_nhwc_kernel_spec, select_i1_f32_kernel_spec, slice_kernel_spec,
+    take_f32_i32_kernel_spec, transpose_kernel_spec,
 };
 
 pub fn lower_program_to_artifact(
@@ -34,6 +35,7 @@ pub fn lower_program_to_artifact(
         slice_kernel_spec(),
         transpose_kernel_spec(),
         concat_kernel_spec(),
+        reduce_sum_last_axis_kernel_spec(),
         reduce_max_last_axis_kernel_spec(),
         iota_si32_kernel_spec(),
         compare_si32_i1_kernel_spec(),

@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use gpt_rs::backend::spec::{
@@ -17,16 +19,27 @@ use crate::kernels::{
     KernelKind, KernelSpec, BROADCAST_KERNEL_ID, BROADCAST_SI32_KERNEL_ID,
     COMPARE_SI32_I1_KERNEL_ID, CONCAT_KERNEL_ID, DYNAMIC_UPDATE_SLICE_F32_KERNEL_ID,
     EWISE_BINARY_KERNEL_ID, EWISE_UNARY_KERNEL_ID, EXTRACT_PATCHES_NHWC_KERNEL_ID,
-    IOTA_SI32_KERNEL_ID, REDUCE_MAX_LAST_AXIS_KERNEL_ID, REDUCE_WINDOW_MAX_NHWC_KERNEL_ID,
-    SELECT_I1_F32_KERNEL_ID, SLICE_KERNEL_ID, TAKE_F32_I32_KERNEL_ID, TRANSPOSE_KERNEL_ID,
+    IOTA_SI32_KERNEL_ID, REDUCE_MAX_LAST_AXIS_KERNEL_ID, REDUCE_SUM_LAST_AXIS_KERNEL_ID,
+    REDUCE_WINDOW_MAX_NHWC_KERNEL_ID, SELECT_I1_F32_KERNEL_ID, SLICE_KERNEL_ID,
+    TAKE_F32_I32_KERNEL_ID, TRANSPOSE_KERNEL_ID,
 };
 use crate::tensor::TritonTensor;
+
+thread_local! {
+    static EXECUTION_KERNEL_STACK: RefCell<Vec<HashMap<String, Arc<LoadedKernel>>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+static GPU_EVENT_TIMING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_gpu_event_timing_enabled(enabled: bool) {
+    GPU_EVENT_TIMING_ENABLED.store(enabled, Ordering::Relaxed);
+}
 
 pub struct TritonExecutor {
     compiler: KernelCompiler,
     loaded_kernels: Mutex<HashMap<u64, Arc<LoadedKernel>>>,
     cublas: OnceLock<Result<Arc<CublasContext>, String>>,
-    reduce_ones_cache: Mutex<HashMap<usize, Arc<DeviceBuffer>>>,
 }
 
 impl TritonExecutor {
@@ -35,7 +48,6 @@ impl TritonExecutor {
             compiler: KernelCompiler::new(),
             loaded_kernels: Mutex::new(HashMap::new()),
             cublas: OnceLock::new(),
-            reduce_ones_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -65,6 +77,8 @@ impl TritonExecutor {
             .iter()
             .map(|spec| (spec.id.as_str(), spec))
             .collect::<HashMap<_, _>>();
+        let preloaded = self.preload_execution_kernels(&driver, &artifact.kernels)?;
+        let _execution_kernel_guard = ExecutionKernelGuard::push(preloaded);
 
         let mut values: HashMap<ValueId, TritonTensor> = HashMap::new();
         for (value_id, input) in function.parameter_ids.iter().zip(entry_inputs.iter()) {
@@ -87,6 +101,19 @@ impl TritonExecutor {
             results.push(value);
         }
         Ok(results)
+    }
+
+    fn preload_execution_kernels(
+        &self,
+        driver: &Arc<CudaDriver>,
+        specs: &[KernelSpec],
+    ) -> BackendResult<HashMap<String, Arc<LoadedKernel>>> {
+        let mut out = HashMap::with_capacity(specs.len());
+        for spec in specs {
+            let loaded = self.load_kernel(driver, spec)?;
+            out.insert(spec.id.clone(), loaded);
+        }
+        Ok(out)
     }
 
     fn execute_instruction(
@@ -1187,7 +1214,12 @@ impl TritonExecutor {
     ) -> BackendResult<TritonTensor> {
         match spec.kind {
             ReduceKind::Sum => {
-                self.execute_reduce_sum_last_axis(driver, input_spec, out_spec, spec, input)
+                let kernel = kernels.get(REDUCE_SUM_LAST_AXIS_KERNEL_ID).ok_or_else(|| {
+                    BackendError::execution(
+                        "missing reduce_sum_last_axis kernel in triton artifact",
+                    )
+                })?;
+                self.execute_reduce_sum_last_axis(driver, kernel, input_spec, out_spec, spec, input)
             }
             ReduceKind::Max => {
                 let kernel = kernels.get(REDUCE_MAX_LAST_AXIS_KERNEL_ID).ok_or_else(|| {
@@ -1262,7 +1294,7 @@ impl TritonExecutor {
             (&mut opaque_ptr as *mut u64).cast::<c_void>(),
         ];
         let rows_u32 = usize_to_u32(rows, "reduce_max rows")?;
-        launch_1d(driver, &loaded, rows_u32, 256, &mut params)?;
+        launch_program_grid(driver, &loaded, rows_u32, 256, rows_u32, &mut params)?;
         Ok(out)
     }
 
@@ -1549,52 +1581,16 @@ impl TritonExecutor {
             let out_stride = m
                 .checked_mul(n)
                 .ok_or_else(|| BackendError::execution("batched out stride overflow"))?;
-
-            let elem_size = 4u64; // f32
-            for batch in 0..batches {
-                let lhs_elem = batch
-                    .checked_mul(lhs_stride)
-                    .ok_or_else(|| BackendError::execution("batched lhs offset overflow"))?;
-                let rhs_elem = batch
-                    .checked_mul(rhs_stride)
-                    .ok_or_else(|| BackendError::execution("batched rhs offset overflow"))?;
-                let out_elem = batch
-                    .checked_mul(out_stride)
-                    .ok_or_else(|| BackendError::execution("batched out offset overflow"))?;
-
-                let lhs_ptr = lhs
-                    .buffer
-                    .device_ptr()
-                    .checked_add(
-                        u64::try_from(lhs_elem)
-                            .map_err(|_| BackendError::execution("lhs offset conversion overflow"))?
-                            .checked_mul(elem_size)
-                            .ok_or_else(|| BackendError::execution("lhs byte offset overflow"))?,
-                    )
-                    .ok_or_else(|| BackendError::execution("lhs pointer overflow"))?;
-                let rhs_ptr = rhs
-                    .buffer
-                    .device_ptr()
-                    .checked_add(
-                        u64::try_from(rhs_elem)
-                            .map_err(|_| BackendError::execution("rhs offset conversion overflow"))?
-                            .checked_mul(elem_size)
-                            .ok_or_else(|| BackendError::execution("rhs byte offset overflow"))?,
-                    )
-                    .ok_or_else(|| BackendError::execution("rhs pointer overflow"))?;
-                let out_ptr = out
-                    .buffer
-                    .device_ptr()
-                    .checked_add(
-                        u64::try_from(out_elem)
-                            .map_err(|_| BackendError::execution("out offset conversion overflow"))?
-                            .checked_mul(elem_size)
-                            .ok_or_else(|| BackendError::execution("out byte offset overflow"))?,
-                    )
-                    .ok_or_else(|| BackendError::execution("out pointer overflow"))?;
-
-                cublas.sgemm_row_major_raw(lhs_ptr, rhs_ptr, out_ptr, m, n, k)?;
-            }
+            let cfg = StridedBatchedGemmConfig {
+                m,
+                n,
+                k,
+                lhs_stride,
+                rhs_stride,
+                out_stride,
+                batches,
+            };
+            cublas.sgemm_row_major_strided_batched(&lhs.buffer, &rhs.buffer, &out.buffer, cfg)?;
             return Ok(out);
         }
 
@@ -1639,52 +1635,21 @@ impl TritonExecutor {
             let out_stride = m
                 .checked_mul(n)
                 .ok_or_else(|| BackendError::execution("batched out stride overflow"))?;
-
-            let elem_size = 4u64; // f32
-            for batch in 0..batches {
-                let lhs_elem = batch
-                    .checked_mul(lhs_stride)
-                    .ok_or_else(|| BackendError::execution("batched lhs offset overflow"))?;
-                let rhs_elem = batch
-                    .checked_mul(rhs_stride)
-                    .ok_or_else(|| BackendError::execution("batched rhs offset overflow"))?;
-                let out_elem = batch
-                    .checked_mul(out_stride)
-                    .ok_or_else(|| BackendError::execution("batched out offset overflow"))?;
-
-                let lhs_ptr = lhs
-                    .buffer
-                    .device_ptr()
-                    .checked_add(
-                        u64::try_from(lhs_elem)
-                            .map_err(|_| BackendError::execution("lhs offset conversion overflow"))?
-                            .checked_mul(elem_size)
-                            .ok_or_else(|| BackendError::execution("lhs byte offset overflow"))?,
-                    )
-                    .ok_or_else(|| BackendError::execution("lhs pointer overflow"))?;
-                let rhs_ptr = rhs
-                    .buffer
-                    .device_ptr()
-                    .checked_add(
-                        u64::try_from(rhs_elem)
-                            .map_err(|_| BackendError::execution("rhs offset conversion overflow"))?
-                            .checked_mul(elem_size)
-                            .ok_or_else(|| BackendError::execution("rhs byte offset overflow"))?,
-                    )
-                    .ok_or_else(|| BackendError::execution("rhs pointer overflow"))?;
-                let out_ptr = out
-                    .buffer
-                    .device_ptr()
-                    .checked_add(
-                        u64::try_from(out_elem)
-                            .map_err(|_| BackendError::execution("out offset conversion overflow"))?
-                            .checked_mul(elem_size)
-                            .ok_or_else(|| BackendError::execution("out byte offset overflow"))?,
-                    )
-                    .ok_or_else(|| BackendError::execution("out pointer overflow"))?;
-
-                cublas.sgemm_row_major_raw_rhs_transposed(lhs_ptr, rhs_ptr, out_ptr, m, n, k)?;
-            }
+            let cfg = StridedBatchedGemmConfig {
+                m,
+                n,
+                k,
+                lhs_stride,
+                rhs_stride,
+                out_stride,
+                batches,
+            };
+            cublas.sgemm_row_major_strided_batched_rhs_transposed(
+                &lhs.buffer,
+                &rhs.buffer,
+                &out.buffer,
+                cfg,
+            )?;
             return Ok(out);
         }
 
@@ -1696,6 +1661,7 @@ impl TritonExecutor {
     fn execute_reduce_sum_last_axis(
         &self,
         driver: &Arc<CudaDriver>,
+        kernel: &KernelSpec,
         input_spec: &TensorSpec,
         out_spec: &TensorSpec,
         spec: &gpt_rs::backend::spec::ReduceSpec,
@@ -1713,6 +1679,12 @@ impl TritonExecutor {
             return Err(BackendError::execution(
                 "reduce runtime currently supports sum only",
             ));
+        }
+        if !matches!(kernel.kind, KernelKind::ReduceSumLastAxisF32) {
+            return Err(BackendError::execution(format!(
+                "unexpected reduce_sum kernel kind: {:?}",
+                kernel.kind
+            )));
         }
 
         let input_dims = static_dims(&input_spec.shape)?;
@@ -1735,9 +1707,24 @@ impl TritonExecutor {
         let cols = input_dims[last_axis];
 
         let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
-        let ones = self.reduce_ones(driver, cols)?;
-        let cublas = self.cublas(driver)?;
-        cublas.sgemm_row_major(&input.buffer, &ones, &out.buffer, rows, 1, cols)?;
+        if rows == 0 || cols == 0 {
+            return Ok(out);
+        }
+        let loaded = self.load_kernel(driver, kernel)?;
+        let mut in_ptr = input.buffer.device_ptr();
+        let mut out_ptr = out.buffer.device_ptr();
+        let mut rows_i32 = usize_to_i32(rows, "reduce_sum rows")?;
+        let mut cols_i32 = usize_to_i32(cols, "reduce_sum cols")?;
+        let mut opaque_ptr = 0u64;
+        let mut params = [
+            (&mut in_ptr as *mut u64).cast::<c_void>(),
+            (&mut out_ptr as *mut u64).cast::<c_void>(),
+            (&mut rows_i32 as *mut i32).cast::<c_void>(),
+            (&mut cols_i32 as *mut i32).cast::<c_void>(),
+            (&mut opaque_ptr as *mut u64).cast::<c_void>(),
+        ];
+        let rows_u32 = usize_to_u32(rows, "reduce_sum rows")?;
+        launch_program_grid(driver, &loaded, rows_u32, 256, rows_u32, &mut params)?;
         Ok(out)
     }
 
@@ -1746,6 +1733,15 @@ impl TritonExecutor {
         driver: &Arc<CudaDriver>,
         spec: &KernelSpec,
     ) -> BackendResult<Arc<LoadedKernel>> {
+        if let Some(found) = EXECUTION_KERNEL_STACK.with(|stack| {
+            stack
+                .borrow()
+                .last()
+                .and_then(|kernels| kernels.get(spec.id.as_str()).cloned())
+        }) {
+            return Ok(found);
+        }
+
         let compiled = self.compiler.compile(spec)?;
         if let Some(found) = self
             .loaded_kernels
@@ -1791,31 +1787,6 @@ impl TritonExecutor {
             ))),
         }
     }
-
-    fn reduce_ones(
-        &self,
-        driver: &Arc<CudaDriver>,
-        cols: usize,
-    ) -> BackendResult<Arc<DeviceBuffer>> {
-        if let Some(found) = self
-            .reduce_ones_cache
-            .lock()
-            .expect("reduce ones cache poisoned")
-            .get(&cols)
-            .cloned()
-        {
-            return Ok(found);
-        }
-
-        let ones = vec![1.0f32; cols];
-        let bytes = f32_to_bytes(&ones);
-        let buffer = driver.alloc_and_upload(&bytes)?;
-        self.reduce_ones_cache
-            .lock()
-            .expect("reduce ones cache poisoned")
-            .insert(cols, Arc::clone(&buffer));
-        Ok(buffer)
-    }
 }
 
 struct LoadedKernel {
@@ -1823,6 +1794,23 @@ struct LoadedKernel {
     fingerprint: u64,
     function: CudaFunction,
     profile_signature: Option<u32>,
+}
+
+struct ExecutionKernelGuard;
+
+impl ExecutionKernelGuard {
+    fn push(kernels: HashMap<String, Arc<LoadedKernel>>) -> Self {
+        EXECUTION_KERNEL_STACK.with(|stack| stack.borrow_mut().push(kernels));
+        Self
+    }
+}
+
+impl Drop for ExecutionKernelGuard {
+    fn drop(&mut self) {
+        EXECUTION_KERNEL_STACK.with(|stack| {
+            let _ = stack.borrow_mut().pop();
+        });
+    }
 }
 
 fn literal_to_tensor(
@@ -2187,18 +2175,43 @@ fn launch_1d(
     if n == 0 {
         return Ok(());
     }
+    let grid_x = n.div_ceil(block_x);
+    launch_program_grid(driver, kernel, grid_x, block_x, n, params)
+}
+
+fn launch_program_grid(
+    driver: &Arc<CudaDriver>,
+    kernel: &LoadedKernel,
+    grid_x: u32,
+    block_x: u32,
+    work_elements: u32,
+    params: &mut [*mut c_void],
+) -> BackendResult<()> {
+    if grid_x == 0 {
+        return Ok(());
+    }
     let _scope = profiling::backend_scope_with_meta("backend.triton.kernel", || {
         let meta = kernel
             .profile_signature
             .map(ScopeMeta::signature)
             .unwrap_or_default();
         meta.with_work(WorkStats {
-            elements: u64::from(n),
+            elements: u64::from(work_elements),
             ..WorkStats::default()
         })
     });
-    let grid_x = n.div_ceil(block_x);
-    driver.launch_kernel(&kernel.function, (grid_x, 1, 1), (block_x, 1, 1), 0, params)
+    if triton_gpu_event_timing_enabled() {
+        let _elapsed_ms = driver.time_with_events("backend.triton.kernel", || {
+            driver.launch_kernel(&kernel.function, (grid_x, 1, 1), (block_x, 1, 1), 0, params)
+        })?;
+        Ok(())
+    } else {
+        driver.launch_kernel(&kernel.function, (grid_x, 1, 1), (block_x, 1, 1), 0, params)
+    }
+}
+
+fn triton_gpu_event_timing_enabled() -> bool {
+    GPU_EVENT_TIMING_ENABLED.load(Ordering::Relaxed)
 }
 
 fn read_i32_tensor(tensor: &TritonTensor) -> BackendResult<Vec<i32>> {
@@ -2255,14 +2268,6 @@ fn compare_opcode(op: ComparisonOp) -> u32 {
     }
 }
 
-fn f32_to_bytes(values: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
-    for value in values {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    bytes
-}
-
 fn cublas_profile_scope(
     transposed_rhs: bool,
     m: usize,
@@ -2289,11 +2294,55 @@ fn cublas_profile_scope(
     })
 }
 
+fn cublas_strided_batched_profile_scope(
+    transposed_rhs: bool,
+    m: usize,
+    n: usize,
+    k: usize,
+    batches: usize,
+) -> profiling::ScopeGuard {
+    let signature = format!(
+        "sgemm_strided_batched.b{batches}.m{m}.n{n}.k{k}.rhs_t{}",
+        u8::from(transposed_rhs)
+    );
+    profiling::backend_scope_with_meta("backend.triton.cublas_sgemm_strided_batched", || {
+        let meta = profiling::signature_id(&signature)
+            .map(ScopeMeta::signature)
+            .unwrap_or_default();
+        let m_u64 = m as u64;
+        let n_u64 = n as u64;
+        let k_u64 = k as u64;
+        let b_u64 = batches as u64;
+        let work = WorkStats {
+            elements: b_u64.saturating_mul(m_u64.saturating_mul(n_u64)),
+            flops: b_u64.saturating_mul(
+                m_u64
+                    .saturating_mul(n_u64)
+                    .saturating_mul(k_u64)
+                    .saturating_mul(2),
+            ),
+            ..WorkStats::default()
+        };
+        meta.with_work(work)
+    })
+}
+
 struct DotGeneralArgs<'a> {
     spec: &'a gpt_rs::backend::spec::DotGeneralSpec,
     lhs_spec: &'a TensorSpec,
     rhs_spec: &'a TensorSpec,
     out_spec: &'a TensorSpec,
+}
+
+#[derive(Copy, Clone)]
+struct StridedBatchedGemmConfig {
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs_stride: usize,
+    rhs_stride: usize,
+    out_stride: usize,
+    batches: usize,
 }
 
 type CublasStatus = i32;
@@ -2321,11 +2370,32 @@ type CublasSgemmFn = unsafe extern "C" fn(
     c: *mut f32,
     ldc: i32,
 ) -> CublasStatus;
+type CublasSgemmStridedBatchedFn = unsafe extern "C" fn(
+    handle: CublasHandle,
+    transa: i32,
+    transb: i32,
+    m: i32,
+    n: i32,
+    k: i32,
+    alpha: *const f32,
+    a: *const f32,
+    lda: i32,
+    stride_a: i64,
+    b: *const f32,
+    ldb: i32,
+    stride_b: i64,
+    beta: *const f32,
+    c: *mut f32,
+    ldc: i32,
+    stride_c: i64,
+    batch_count: i32,
+) -> CublasStatus;
 
 struct CublasFns {
     create: CublasCreateFn,
     destroy: CublasDestroyFn,
     sgemm: CublasSgemmFn,
+    sgemm_strided_batched: CublasSgemmStridedBatchedFn,
 }
 
 struct CublasContext {
@@ -2344,12 +2414,25 @@ impl Drop for CublasContext {
 }
 
 impl CublasContext {
+    fn run_cublas_timed<F>(&self, op_name: &str, op: F) -> BackendResult<()>
+    where
+        F: FnOnce() -> BackendResult<()>,
+    {
+        if triton_gpu_event_timing_enabled() {
+            let _elapsed_ms = self.driver.time_with_events(op_name, op)?;
+            Ok(())
+        } else {
+            op()
+        }
+    }
+
     fn new(driver: Arc<CudaDriver>) -> BackendResult<Self> {
         let lib = load_cublas_library()?;
         let fns = CublasFns {
             create: load_cublas_symbol(&lib, b"cublasCreate_v2\0")?,
             destroy: load_cublas_symbol(&lib, b"cublasDestroy_v2\0")?,
             sgemm: load_cublas_symbol(&lib, b"cublasSgemm_v2\0")?,
+            sgemm_strided_batched: load_cublas_symbol(&lib, b"cublasSgemmStridedBatched\0")?,
         };
 
         driver.ensure_current()?;
@@ -2389,6 +2472,36 @@ impl CublasContext {
         )
     }
 
+    fn sgemm_row_major_strided_batched(
+        &self,
+        lhs: &DeviceBuffer,
+        rhs: &DeviceBuffer,
+        out: &DeviceBuffer,
+        cfg: StridedBatchedGemmConfig,
+    ) -> BackendResult<()> {
+        self.sgemm_row_major_strided_batched_raw(
+            lhs.device_ptr(),
+            rhs.device_ptr(),
+            out.device_ptr(),
+            cfg,
+        )
+    }
+
+    fn sgemm_row_major_strided_batched_rhs_transposed(
+        &self,
+        lhs: &DeviceBuffer,
+        rhs: &DeviceBuffer,
+        out: &DeviceBuffer,
+        cfg: StridedBatchedGemmConfig,
+    ) -> BackendResult<()> {
+        self.sgemm_row_major_strided_batched_raw_rhs_transposed(
+            lhs.device_ptr(),
+            rhs.device_ptr(),
+            out.device_ptr(),
+            cfg,
+        )
+    }
+
     fn sgemm_row_major_raw(
         &self,
         lhs_ptr: u64,
@@ -2410,77 +2523,170 @@ impl CublasContext {
         let alpha = 1.0f32;
         let beta = 0.0f32;
         // Row-major C = A * B using column-major GEMM: C^T = B^T * A^T.
-        // SAFETY: pointers are valid CUDA device pointers for buffers sized according to m,n,k.
-        unsafe {
-            check_cublas(
-                (self.fns.sgemm)(
-                    self.handle as CublasHandle,
-                    CUBLAS_OP_N,
-                    CUBLAS_OP_N,
-                    n_i32,
-                    m_i32,
-                    k_i32,
-                    &alpha as *const f32,
-                    rhs_ptr as usize as *const f32,
-                    n_i32,
-                    lhs_ptr as usize as *const f32,
-                    k_i32,
-                    &beta as *const f32,
-                    out_ptr as usize as *mut f32,
-                    n_i32,
-                ),
-                "cublasSgemm_v2",
-            )?;
-        }
+        self.run_cublas_timed("cublasSgemm_v2", || {
+            // SAFETY: pointers are valid CUDA device pointers for buffers sized according to m,n,k.
+            unsafe {
+                check_cublas(
+                    (self.fns.sgemm)(
+                        self.handle as CublasHandle,
+                        CUBLAS_OP_N,
+                        CUBLAS_OP_N,
+                        n_i32,
+                        m_i32,
+                        k_i32,
+                        &alpha as *const f32,
+                        rhs_ptr as usize as *const f32,
+                        n_i32,
+                        lhs_ptr as usize as *const f32,
+                        k_i32,
+                        &beta as *const f32,
+                        out_ptr as usize as *mut f32,
+                        n_i32,
+                    ),
+                    "cublasSgemm_v2",
+                )?;
+            }
+            Ok(())
+        })?;
         Ok(())
     }
 
-    fn sgemm_row_major_raw_rhs_transposed(
+    fn sgemm_row_major_strided_batched_raw(
         &self,
         lhs_ptr: u64,
         rhs_ptr: u64,
         out_ptr: u64,
-        m: usize,
-        n: usize,
-        k: usize,
+        cfg: StridedBatchedGemmConfig,
     ) -> BackendResult<()> {
-        let _scope = cublas_profile_scope(true, m, n, k);
+        let StridedBatchedGemmConfig {
+            m,
+            n,
+            k,
+            lhs_stride,
+            rhs_stride,
+            out_stride,
+            batches,
+        } = cfg;
+        let _scope = cublas_strided_batched_profile_scope(false, m, n, k, batches);
         let m_i32 = i32::try_from(m)
             .map_err(|_| BackendError::execution("matrix dimension m exceeds i32"))?;
         let n_i32 = i32::try_from(n)
             .map_err(|_| BackendError::execution("matrix dimension n exceeds i32"))?;
         let k_i32 = i32::try_from(k)
             .map_err(|_| BackendError::execution("matrix dimension k exceeds i32"))?;
+        let batch_i32 = i32::try_from(batches)
+            .map_err(|_| BackendError::execution("batch count exceeds i32"))?;
+        let lhs_stride_i64 = i64::try_from(lhs_stride)
+            .map_err(|_| BackendError::execution("lhs stride exceeds i64"))?;
+        let rhs_stride_i64 = i64::try_from(rhs_stride)
+            .map_err(|_| BackendError::execution("rhs stride exceeds i64"))?;
+        let out_stride_i64 = i64::try_from(out_stride)
+            .map_err(|_| BackendError::execution("out stride exceeds i64"))?;
 
         self.driver.ensure_current()?;
         let alpha = 1.0f32;
         let beta = 0.0f32;
-        // Row-major C = A(MxK) * B^T where rhs pointer is row-major B(NxK).
-        // Equivalent column-major equation:
-        // C^T (N x M) = B(N x K) * A^T(K x M)
-        // with B represented by rhs_ptr as column-major KxN and transposed in cuBLAS.
-        // SAFETY: pointers are valid CUDA device pointers sized for m,n,k.
-        unsafe {
-            check_cublas(
-                (self.fns.sgemm)(
-                    self.handle as CublasHandle,
-                    CUBLAS_OP_T,
-                    CUBLAS_OP_N,
-                    n_i32,
-                    m_i32,
-                    k_i32,
-                    &alpha as *const f32,
-                    rhs_ptr as usize as *const f32,
-                    k_i32,
-                    lhs_ptr as usize as *const f32,
-                    k_i32,
-                    &beta as *const f32,
-                    out_ptr as usize as *mut f32,
-                    n_i32,
-                ),
-                "cublasSgemm_v2",
-            )?;
-        }
+        // Row-major C = A * B using column-major GEMM: C^T = B^T * A^T.
+        // Batch-strided variant follows the same transform.
+        self.run_cublas_timed("cublasSgemmStridedBatched", || {
+            // SAFETY: pointers/strides are valid CUDA device arguments sized for the batched GEMM.
+            unsafe {
+                check_cublas(
+                    (self.fns.sgemm_strided_batched)(
+                        self.handle as CublasHandle,
+                        CUBLAS_OP_N,
+                        CUBLAS_OP_N,
+                        n_i32,
+                        m_i32,
+                        k_i32,
+                        &alpha as *const f32,
+                        rhs_ptr as usize as *const f32,
+                        n_i32,
+                        rhs_stride_i64,
+                        lhs_ptr as usize as *const f32,
+                        k_i32,
+                        lhs_stride_i64,
+                        &beta as *const f32,
+                        out_ptr as usize as *mut f32,
+                        n_i32,
+                        out_stride_i64,
+                        batch_i32,
+                    ),
+                    "cublasSgemmStridedBatched",
+                )?;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn sgemm_row_major_strided_batched_raw_rhs_transposed(
+        &self,
+        lhs_ptr: u64,
+        rhs_ptr: u64,
+        out_ptr: u64,
+        cfg: StridedBatchedGemmConfig,
+    ) -> BackendResult<()> {
+        let StridedBatchedGemmConfig {
+            m,
+            n,
+            k,
+            lhs_stride,
+            rhs_stride,
+            out_stride,
+            batches,
+        } = cfg;
+        let _scope = cublas_strided_batched_profile_scope(true, m, n, k, batches);
+        let m_i32 = i32::try_from(m)
+            .map_err(|_| BackendError::execution("matrix dimension m exceeds i32"))?;
+        let n_i32 = i32::try_from(n)
+            .map_err(|_| BackendError::execution("matrix dimension n exceeds i32"))?;
+        let k_i32 = i32::try_from(k)
+            .map_err(|_| BackendError::execution("matrix dimension k exceeds i32"))?;
+        let batch_i32 = i32::try_from(batches)
+            .map_err(|_| BackendError::execution("batch count exceeds i32"))?;
+        let lhs_stride_i64 = i64::try_from(lhs_stride)
+            .map_err(|_| BackendError::execution("lhs stride exceeds i64"))?;
+        let rhs_stride_i64 = i64::try_from(rhs_stride)
+            .map_err(|_| BackendError::execution("rhs stride exceeds i64"))?;
+        let out_stride_i64 = i64::try_from(out_stride)
+            .map_err(|_| BackendError::execution("out stride exceeds i64"))?;
+
+        self.driver.ensure_current()?;
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        // Row-major C = A(MxK) * B^T where rhs pointer stores row-major B(NxK).
+        // Column-major equivalent per batch:
+        // C^T(NxM) = B(NxK) * A^T(KxM), with cuBLAS transa=Transpose for rhs operand.
+        self.run_cublas_timed("cublasSgemmStridedBatched", || {
+            // SAFETY: pointers/strides are valid CUDA device arguments sized for the batched GEMM.
+            unsafe {
+                check_cublas(
+                    (self.fns.sgemm_strided_batched)(
+                        self.handle as CublasHandle,
+                        CUBLAS_OP_T,
+                        CUBLAS_OP_N,
+                        n_i32,
+                        m_i32,
+                        k_i32,
+                        &alpha as *const f32,
+                        rhs_ptr as usize as *const f32,
+                        k_i32,
+                        rhs_stride_i64,
+                        lhs_ptr as usize as *const f32,
+                        k_i32,
+                        lhs_stride_i64,
+                        &beta as *const f32,
+                        out_ptr as usize as *mut f32,
+                        n_i32,
+                        out_stride_i64,
+                        batch_i32,
+                    ),
+                    "cublasSgemmStridedBatched",
+                )?;
+            }
+            Ok(())
+        })?;
         Ok(())
     }
 }

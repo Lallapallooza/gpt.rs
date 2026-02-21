@@ -1,4 +1,4 @@
-mod bundle;
+mod artifact;
 mod codegen;
 mod compiler;
 mod device;
@@ -119,9 +119,9 @@ impl PortableBackend for TritonBackend {
             })
             .map_err(|err| BackendError::execution(err.to_string()))?;
 
-        let bundle: bundle::TritonBundle = serde_json::from_str(&converted.module)
+        let artifact: artifact::TritonArtifact = serde_json::from_str(&converted.module)
             .map_err(|err| BackendError::execution(err.to_string()))?;
-        self.executor.execute_bundle(&bundle, entry_inputs)
+        self.executor.execute_artifact(&artifact, entry_inputs)
     }
 }
 
@@ -187,9 +187,9 @@ impl ConversionTarget for TritonConversionTarget {
             .map_err(|err| ConversionError::new(err.to_string()))?;
 
         let entrypoint = default_entrypoint_name(&optimized)?;
-        let bundle = codegen::lower_program_to_bundle(&optimized, &entrypoint)?;
+        let artifact = codegen::lower_program_to_artifact(&optimized, &entrypoint)?;
 
-        let encoded = serde_json::to_string_pretty(&bundle)
+        let encoded = serde_json::to_string_pretty(&artifact)
             .map_err(|err| ConversionError::new(err.to_string()))?;
 
         Ok(ConvertedIr {

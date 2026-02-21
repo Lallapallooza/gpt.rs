@@ -1,7 +1,20 @@
-use crate::bundle::{KernelKind, KernelSpec};
+use serde::{Deserialize, Serialize};
 
 pub const EWISE_BINARY_KERNEL_ID: &str = "gpt_rs.triton.kernel.elementwise_binary_f32.v1";
 pub const EWISE_BINARY_SYMBOL: &str = "gpt_rs_triton_ewise_binary_f32";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KernelSpec {
+    pub id: String,
+    pub kind: KernelKind,
+    pub source: String,
+    pub symbol: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum KernelKind {
+    ElementwiseBinaryF32,
+}
 
 pub fn elementwise_binary_kernel_spec() -> KernelSpec {
     KernelSpec {

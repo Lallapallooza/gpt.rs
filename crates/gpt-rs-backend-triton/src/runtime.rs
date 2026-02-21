@@ -3,13 +3,15 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use gpt_rs::backend::spec::{
-    BackendError, BackendResult, DType, Dimension, ElementwiseBinaryOp, ReduceKind,
+    BackendError, BackendResult, DType, Dimension, ElementwiseBinaryOp, Operand, Operation,
+    ReduceKind, TensorLiteral, TensorSpec, ValueId, ValueType,
 };
 use libloading::Library;
 
-use crate::bundle::{BundleStep, KernelKind, KernelSpec, SerializableLiteral, TritonBundle};
+use crate::artifact::TritonArtifact;
 use crate::compiler::KernelCompiler;
 use crate::device::{self, CudaDriver, CudaFunction, DeviceBuffer};
+use crate::kernels::{KernelKind, KernelSpec, EWISE_BINARY_KERNEL_ID};
 use crate::tensor::TritonTensor;
 
 pub struct TritonExecutor {
@@ -29,153 +31,136 @@ impl TritonExecutor {
         }
     }
 
-    pub fn execute_bundle(
+    pub fn execute_artifact(
         &self,
-        bundle: &TritonBundle,
+        artifact: &TritonArtifact,
         entry_inputs: &[TritonTensor],
     ) -> BackendResult<Vec<TritonTensor>> {
-        if bundle.parameter_ids.len() != entry_inputs.len() {
+        let function = artifact
+            .program
+            .functions
+            .iter()
+            .find(|function| function.name == artifact.program.entry)
+            .ok_or_else(|| BackendError::execution("triton artifact entry function not found"))?;
+
+        if function.parameter_ids.len() != entry_inputs.len() {
             return Err(BackendError::execution(format!(
                 "triton entry input arity mismatch: expected {}, got {}",
-                bundle.parameter_ids.len(),
+                function.parameter_ids.len(),
                 entry_inputs.len()
             )));
         }
 
         let driver = device::driver()?;
-        let mut values: HashMap<u32, TritonTensor> = HashMap::new();
-        for (value_id, input) in bundle
-            .parameter_ids
-            .iter()
-            .copied()
-            .zip(entry_inputs.iter())
-        {
-            values.insert(value_id, input.clone());
-        }
-
-        let kernel_specs = bundle
+        let kernels = artifact
             .kernels
             .iter()
             .map(|spec| (spec.id.as_str(), spec))
             .collect::<HashMap<_, _>>();
 
-        for step in &bundle.steps {
-            match step {
-                BundleStep::Constant { value_id, literal } => {
-                    let tensor = literal_to_tensor(&driver, literal)?;
-                    values.insert(*value_id, tensor);
-                }
-                BundleStep::Alias {
-                    value_id,
-                    source_id,
-                    spec,
-                } => {
-                    let source = values.get(source_id).cloned().ok_or_else(|| {
-                        BackendError::execution(format!(
-                            "alias source value {} missing from runtime state",
-                            source_id
-                        ))
-                    })?;
-                    values.insert(
-                        *value_id,
-                        TritonTensor {
-                            spec: spec.clone(),
-                            buffer: source.buffer,
-                        },
-                    );
-                }
-                BundleStep::ElementwiseBinary {
-                    value_id,
-                    lhs_id,
-                    rhs_id,
-                    op,
-                    spec,
-                    kernel_id,
-                } => {
-                    let lhs = values.get(lhs_id).cloned().ok_or_else(|| {
-                        BackendError::execution(format!(
-                            "lhs value {} missing for elementwise step",
-                            lhs_id
-                        ))
-                    })?;
-                    let rhs = values.get(rhs_id).cloned().ok_or_else(|| {
-                        BackendError::execution(format!(
-                            "rhs value {} missing for elementwise step",
-                            rhs_id
-                        ))
-                    })?;
-                    let kernel = kernel_specs.get(kernel_id.as_str()).ok_or_else(|| {
-                        BackendError::execution(format!(
-                            "kernel '{}' missing from bundle",
-                            kernel_id
-                        ))
-                    })?;
-                    let out =
-                        self.execute_elementwise_binary(&driver, kernel, *op, &lhs, &rhs, spec)?;
-                    values.insert(*value_id, out);
-                }
-                BundleStep::DotGeneral {
-                    value_id,
-                    lhs_id,
-                    rhs_id,
-                    lhs_spec,
-                    rhs_spec,
-                    out_spec,
-                    spec,
-                } => {
-                    let lhs = values.get(lhs_id).cloned().ok_or_else(|| {
-                        BackendError::execution(format!(
-                            "lhs value {} missing for dot_general step",
-                            lhs_id
-                        ))
-                    })?;
-                    let rhs = values.get(rhs_id).cloned().ok_or_else(|| {
-                        BackendError::execution(format!(
-                            "rhs value {} missing for dot_general step",
-                            rhs_id
-                        ))
-                    })?;
-                    let args = DotGeneralArgs {
-                        spec,
-                        lhs_spec,
-                        rhs_spec,
-                        out_spec,
-                    };
-                    let out = self.execute_dot_general(&driver, args, &lhs, &rhs)?;
-                    values.insert(*value_id, out);
-                }
-                BundleStep::Reduce {
-                    value_id,
-                    input_id,
-                    input_spec,
-                    out_spec,
-                    spec,
-                } => {
-                    let input = values.get(input_id).cloned().ok_or_else(|| {
-                        BackendError::execution(format!(
-                            "input value {} missing for reduce step",
-                            input_id
-                        ))
-                    })?;
-                    let out = self.execute_reduce_sum_last_axis(
-                        &driver, input_spec, out_spec, spec, &input,
-                    )?;
-                    values.insert(*value_id, out);
-                }
-            }
+        let mut values: HashMap<ValueId, TritonTensor> = HashMap::new();
+        for (value_id, input) in function.parameter_ids.iter().zip(entry_inputs.iter()) {
+            values.insert(*value_id, input.clone());
         }
 
-        let mut results = Vec::with_capacity(bundle.result_ids.len());
-        for result_id in &bundle.result_ids {
+        for instruction in &function.body {
+            let output = self.execute_instruction(&driver, &kernels, &values, instruction)?;
+            values.insert(instruction.id, output);
+        }
+
+        let mut results = Vec::with_capacity(function.result_ids.len());
+        for result_id in &function.result_ids {
             let value = values.get(result_id).cloned().ok_or_else(|| {
                 BackendError::execution(format!(
-                    "bundle result value {} missing from runtime state",
-                    result_id
+                    "missing result value {} in triton runtime",
+                    result_id.0
                 ))
             })?;
             results.push(value);
         }
         Ok(results)
+    }
+
+    fn execute_instruction(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernels: &HashMap<&str, &KernelSpec>,
+        values: &HashMap<ValueId, TritonTensor>,
+        instruction: &gpt_rs::backend::spec::Instruction,
+    ) -> BackendResult<TritonTensor> {
+        match &instruction.op {
+            Operation::Constant(literal) => literal_to_tensor(driver, literal),
+            Operation::StopGradient | Operation::Reshape(_) => {
+                let source =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
+                let out_spec = output_tensor_spec(&instruction.output)?;
+                let src_bytes = byte_len(&source.spec)?;
+                let out_bytes = byte_len(&out_spec)?;
+                if src_bytes != out_bytes {
+                    return Err(BackendError::execution(format!(
+                        "alias byte-size mismatch: source={} bytes, output={} bytes",
+                        src_bytes, out_bytes
+                    )));
+                }
+                Ok(TritonTensor::new(out_spec, source.buffer))
+            }
+            Operation::ElementwiseBinary(op) => {
+                let lhs =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
+                let rhs =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.get(1))?;
+                let out_spec = output_tensor_spec(&instruction.output)?;
+                let kernel = kernels.get(EWISE_BINARY_KERNEL_ID).ok_or_else(|| {
+                    BackendError::execution("missing elementwise binary kernel in triton artifact")
+                })?;
+                self.execute_elementwise_binary(driver, kernel, *op, &lhs, &rhs, &out_spec)
+            }
+            Operation::DotGeneral(spec) => {
+                let lhs =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
+                let rhs =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.get(1))?;
+                let out_spec = output_tensor_spec(&instruction.output)?;
+                let args = DotGeneralArgs {
+                    spec,
+                    lhs_spec: &lhs.spec,
+                    rhs_spec: &rhs.spec,
+                    out_spec: &out_spec,
+                };
+                self.execute_dot_general(driver, args, &lhs, &rhs)
+            }
+            Operation::Reduce(spec) => {
+                let input =
+                    self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
+                let out_spec = output_tensor_spec(&instruction.output)?;
+                self.execute_reduce_sum_last_axis(driver, &input.spec, &out_spec, spec, &input)
+            }
+            other => Err(BackendError::execution(format!(
+                "triton runtime does not support instruction op: {:?}",
+                other
+            ))),
+        }
+    }
+
+    fn resolve_operand_tensor(
+        &self,
+        driver: &Arc<CudaDriver>,
+        values: &HashMap<ValueId, TritonTensor>,
+        operand: Option<&Operand>,
+    ) -> BackendResult<TritonTensor> {
+        match operand {
+            Some(Operand::Value(id)) => values.get(id).cloned().ok_or_else(|| {
+                BackendError::execution(format!(
+                    "operand value {} missing from triton runtime state",
+                    id.0
+                ))
+            }),
+            Some(Operand::Literal(literal)) => literal_to_tensor(driver, literal),
+            Some(Operand::TupleElement { .. }) => Err(BackendError::execution(
+                "tuple element operands are not supported by triton runtime",
+            )),
+            None => Err(BackendError::execution("missing instruction operand")),
+        }
     }
 
     fn execute_elementwise_binary(
@@ -185,7 +170,7 @@ impl TritonExecutor {
         op: ElementwiseBinaryOp,
         lhs: &TritonTensor,
         rhs: &TritonTensor,
-        spec: &gpt_rs::backend::spec::TensorSpec,
+        spec: &TensorSpec,
     ) -> BackendResult<TritonTensor> {
         if lhs.spec != *spec || rhs.spec != *spec {
             return Err(BackendError::execution(
@@ -301,8 +286,8 @@ impl TritonExecutor {
     fn execute_reduce_sum_last_axis(
         &self,
         driver: &Arc<CudaDriver>,
-        input_spec: &gpt_rs::backend::spec::TensorSpec,
-        out_spec: &gpt_rs::backend::spec::TensorSpec,
+        input_spec: &TensorSpec,
+        out_spec: &TensorSpec,
         spec: &gpt_rs::backend::spec::ReduceSpec,
         input: &TritonTensor,
     ) -> BackendResult<TritonTensor> {
@@ -425,7 +410,7 @@ struct LoadedKernel {
 
 fn literal_to_tensor(
     driver: &Arc<CudaDriver>,
-    literal: &SerializableLiteral,
+    literal: &TensorLiteral,
 ) -> BackendResult<TritonTensor> {
     let expected = byte_len(&literal.spec)?;
     if expected != literal.bytes.len() {
@@ -437,11 +422,20 @@ fn literal_to_tensor(
         )));
     }
 
-    let buffer = driver.alloc_and_upload(&literal.bytes)?;
+    let buffer = driver.alloc_and_upload(literal.bytes.as_ref())?;
     Ok(TritonTensor::new(literal.spec.clone(), buffer))
 }
 
-fn byte_len(spec: &gpt_rs::backend::spec::TensorSpec) -> BackendResult<usize> {
+fn output_tensor_spec(output: &ValueType) -> BackendResult<TensorSpec> {
+    match output {
+        ValueType::Tensor(spec) => Ok(spec.clone()),
+        ValueType::Tuple(_) => Err(BackendError::execution(
+            "tuple outputs are not supported by triton runtime",
+        )),
+    }
+}
+
+fn byte_len(spec: &TensorSpec) -> BackendResult<usize> {
     spec.byte_len().ok_or_else(|| {
         BackendError::execution(format!(
             "cannot compute byte length for dtype {:?} and shape {:?}",
@@ -498,9 +492,9 @@ fn f32_to_bytes(values: &[f32]) -> Vec<u8> {
 
 struct DotGeneralArgs<'a> {
     spec: &'a gpt_rs::backend::spec::DotGeneralSpec,
-    lhs_spec: &'a gpt_rs::backend::spec::TensorSpec,
-    rhs_spec: &'a gpt_rs::backend::spec::TensorSpec,
-    out_spec: &'a gpt_rs::backend::spec::TensorSpec,
+    lhs_spec: &'a TensorSpec,
+    rhs_spec: &'a TensorSpec,
+    out_spec: &'a TensorSpec,
 }
 
 type CublasStatus = i32;

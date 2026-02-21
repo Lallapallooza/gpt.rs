@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use gpt_rs::backend::spec::{BackendError, BackendResult};
 use serde::Deserialize;
 
-use crate::bundle::KernelSpec;
+use crate::kernels::KernelSpec;
 
 #[derive(Debug, Clone)]
 pub struct CompiledKernel {

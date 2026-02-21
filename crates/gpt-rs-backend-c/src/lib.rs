@@ -763,6 +763,17 @@ fn c_profile_enabled() -> bool {
     }
 }
 
+fn c_accelerated_kernels_supported() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("fma")
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
 fn c_cache_debug_enabled() -> bool {
     match std::env::var("GPTRS_C_CACHE_DEBUG") {
         Ok(value) if !value.trim().is_empty() => parse_bool(&value),
@@ -781,6 +792,11 @@ fn cache_fingerprint(key: &ConversionCacheKey, converted: &ConvertedIr) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hasher);
     converted.module.hash(&mut hasher);
+    hasher.write_u8(if c_accelerated_kernels_supported() {
+        1
+    } else {
+        0
+    });
     hasher.finish()
 }
 
@@ -826,9 +842,15 @@ fn compile_c(src: &Path, out: &Path) -> BackendResult<()> {
     if !cfg!(target_os = "windows") {
         cmd.arg("-march=native");
     }
-    if !cfg!(target_os = "windows") {
+    if !cfg!(target_os = "windows") && c_accelerated_kernels_supported() {
         cmd.arg("-mavx512f");
         cmd.arg("-mfma");
+    } else if !cfg!(target_os = "windows") {
+        // Build baseline C kernels when AVX512/FMA are unavailable.
+        cmd.arg("-mno-avx512f");
+        cmd.arg("-mno-fma");
+    }
+    if !cfg!(target_os = "windows") {
         cmd.arg("-ffast-math");
         cmd.arg("-fno-math-errno");
         cmd.arg("-fno-trapping-math");

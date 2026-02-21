@@ -1,7 +1,10 @@
 
 // Kernel scaffold (SIMD hooks can be added here).
-#if defined(__AVX512F__)
+#if defined(__AVX512F__) && defined(__FMA__)
+#define GPTRS_HAS_AVX512 1
 #include <immintrin.h>
+#else
+#define GPTRS_HAS_AVX512 0
 #endif
 
 #if defined(__GNUC__)
@@ -14,8 +17,10 @@
 #define GPTRS_THREAD_LOCAL
 #endif
 
-#if !defined(__AVX512F__) || !defined(__FMA__)
-#error "gpt_rs_c_matmul_f32 requires AVX512F+FMA"
+#if GPTRS_HAS_AVX512
+#define GPTRS_PREFETCH(ptr) _mm_prefetch((const char*)(ptr), _MM_HINT_T0)
+#else
+#define GPTRS_PREFETCH(ptr) ((void)(ptr))
 #endif
 
 #define GPTRS_MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -62,8 +67,6 @@ static inline uint64_t gpt_rs_c_now_ns(void) {
 enum { GPTRS_MR = 6, GPTRS_NR = 16 };
 enum { GPTRS_MC = 120, GPTRS_NC = 256, GPTRS_KC = 256 };
 enum { GPTRS_PREFETCH_DIST = 8 };
-
-#define GPTRS_PREFETCH(ptr) _mm_prefetch((const char*)(ptr), _MM_HINT_T0)
 
 static inline size_t gpt_rs_choose_kc(size_t k) {
     if (k <= 1152) {
@@ -166,6 +169,7 @@ static inline int gpt_rs_bpack_cache_prepare(
     size_t n,
     size_t k
 ) {
+#if GPTRS_HAS_AVX512
     if (!cache) {
         return 0;
     }
@@ -225,4 +229,13 @@ static inline int gpt_rs_bpack_cache_prepare(
         }
     }
     return 1;
+#else
+    (void)b;
+    (void)n;
+    (void)k;
+    if (!cache) {
+        return 0;
+    }
+    return 0;
+#endif
 }

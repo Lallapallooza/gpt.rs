@@ -111,13 +111,15 @@ impl PortableBackend for TritonBackend {
         let options = ConversionOptions::default();
         let key = ConversionCacheKey::new(program, target.as_ref(), &options, None)
             .map_err(|err| BackendError::execution(err.to_string()))?;
-        let converted = self
-            .conversion_cache
-            .get_or_convert(key, || {
-                target.check(program, &options)?;
-                target.convert(program, &options)
-            })
-            .map_err(|err| BackendError::execution(err.to_string()))?;
+        let converted = {
+            let _convert_scope = gpt_rs::profiling::compile_scope("triton_backend.convert");
+            self.conversion_cache
+                .get_or_convert(key, || {
+                    target.check(program, &options)?;
+                    target.convert(program, &options)
+                })
+                .map_err(|err| BackendError::execution(err.to_string()))?
+        };
 
         let artifact: artifact::TritonArtifact = serde_json::from_str(&converted.module)
             .map_err(|err| BackendError::execution(err.to_string()))?;

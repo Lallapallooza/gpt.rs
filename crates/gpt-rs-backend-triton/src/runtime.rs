@@ -7,6 +7,7 @@ use gpt_rs::backend::spec::{
     ElementwiseUnaryOp, Operand, Operation, ReduceKind, TensorLiteral, TensorSpec, ValueId,
     ValueType,
 };
+use gpt_rs::profiling::{self, ScopeMeta, WorkStats};
 use libloading::Library;
 
 use crate::artifact::TritonArtifact;
@@ -334,8 +335,6 @@ impl TritonExecutor {
         let count_u32 = u32::try_from(element_count).map_err(|_| {
             BackendError::execution("elementwise tensor too large for u32 launch size")
         })?;
-        let block_x = 256u32;
-        let grid_x = count_u32.div_ceil(block_x);
 
         let mut lhs_ptr = lhs.buffer.device_ptr();
         let mut rhs_ptr = rhs.buffer.device_ptr();
@@ -353,13 +352,7 @@ impl TritonExecutor {
             (&mut op_u32 as *mut u32).cast::<c_void>(),
             (&mut opaque_ptr as *mut u64).cast::<c_void>(),
         ];
-        driver.launch_kernel(
-            &loaded.function,
-            (grid_x, 1, 1),
-            (block_x, 1, 1),
-            0,
-            &mut params,
-        )?;
+        launch_1d(driver, &loaded, count_u32, 256, &mut params)?;
 
         Ok(out)
     }
@@ -398,8 +391,6 @@ impl TritonExecutor {
         let count_u32 = u32::try_from(element_count).map_err(|_| {
             BackendError::execution("elementwise unary tensor too large for u32 launch size")
         })?;
-        let block_x = 256u32;
-        let grid_x = count_u32.div_ceil(block_x);
 
         let mut in_ptr = input.buffer.device_ptr();
         let mut out_ptr = out.buffer.device_ptr();
@@ -415,13 +406,7 @@ impl TritonExecutor {
             (&mut op_u32 as *mut u32).cast::<c_void>(),
             (&mut opaque_ptr as *mut u64).cast::<c_void>(),
         ];
-        driver.launch_kernel(
-            &loaded.function,
-            (grid_x, 1, 1),
-            (block_x, 1, 1),
-            0,
-            &mut params,
-        )?;
+        launch_1d(driver, &loaded, count_u32, 256, &mut params)?;
 
         Ok(out)
     }
@@ -505,7 +490,7 @@ impl TritonExecutor {
             (&mut is3 as *mut i32).cast::<c_void>(),
             (&mut opaque_ptr as *mut u64).cast::<c_void>(),
         ];
-        launch_1d(driver, &loaded.function, n, 256, &mut params)?;
+        launch_1d(driver, &loaded, n, 256, &mut params)?;
         Ok(out)
     }
 
@@ -628,7 +613,7 @@ impl TritonExecutor {
             (&mut st3 as *mut i32).cast::<c_void>(),
             (&mut opaque_ptr as *mut u64).cast::<c_void>(),
         ];
-        launch_1d(driver, &loaded.function, n, 256, &mut params)?;
+        launch_1d(driver, &loaded, n, 256, &mut params)?;
         Ok(out)
     }
 
@@ -771,7 +756,7 @@ impl TritonExecutor {
             (&mut is4 as *mut i32).cast::<c_void>(),
             (&mut opaque_ptr as *mut u64).cast::<c_void>(),
         ];
-        launch_1d(driver, &loaded.function, n, 256, &mut params)?;
+        launch_1d(driver, &loaded, n, 256, &mut params)?;
         Ok(out)
     }
 
@@ -850,7 +835,7 @@ impl TritonExecutor {
             (&mut rs3 as *mut i32).cast::<c_void>(),
             (&mut opaque_ptr as *mut u64).cast::<c_void>(),
         ];
-        launch_1d(driver, &loaded.function, n, 256, &mut params)?;
+        launch_1d(driver, &loaded, n, 256, &mut params)?;
         Ok(out)
     }
 
@@ -911,7 +896,7 @@ impl TritonExecutor {
             (&mut axis_i32 as *mut i32).cast::<c_void>(),
             (&mut opaque_ptr as *mut u64).cast::<c_void>(),
         ];
-        launch_1d(driver, &loaded.function, n, 256, &mut params)?;
+        launch_1d(driver, &loaded, n, 256, &mut params)?;
         Ok(out)
     }
 
@@ -959,7 +944,7 @@ impl TritonExecutor {
             (&mut op_u32 as *mut u32).cast::<c_void>(),
             (&mut opaque_ptr as *mut u64).cast::<c_void>(),
         ];
-        launch_1d(driver, &loaded.function, n, 256, &mut params)?;
+        launch_1d(driver, &loaded, n, 256, &mut params)?;
         Ok(out)
     }
 
@@ -1011,7 +996,7 @@ impl TritonExecutor {
             (&mut n as *mut u32).cast::<c_void>(),
             (&mut opaque_ptr as *mut u64).cast::<c_void>(),
         ];
-        launch_1d(driver, &loaded.function, n, 256, &mut params)?;
+        launch_1d(driver, &loaded, n, 256, &mut params)?;
         Ok(out)
     }
 
@@ -1078,7 +1063,7 @@ impl TritonExecutor {
             (&mut vocab as *mut i32).cast::<c_void>(),
             (&mut opaque_ptr as *mut u64).cast::<c_void>(),
         ];
-        launch_1d(driver, &loaded.function, n, 256, &mut params_arr)?;
+        launch_1d(driver, &loaded, n, 256, &mut params_arr)?;
         Ok(out)
     }
 
@@ -1187,7 +1172,7 @@ impl TritonExecutor {
             (&mut st3 as *mut i32).cast::<c_void>(),
             (&mut opaque_ptr as *mut u64).cast::<c_void>(),
         ];
-        launch_1d(driver, &loaded.function, n, 256, &mut params)?;
+        launch_1d(driver, &loaded, n, 256, &mut params)?;
         Ok(out)
     }
 
@@ -1277,13 +1262,7 @@ impl TritonExecutor {
             (&mut opaque_ptr as *mut u64).cast::<c_void>(),
         ];
         let rows_u32 = usize_to_u32(rows, "reduce_max rows")?;
-        driver.launch_kernel(
-            &loaded.function,
-            (rows_u32, 1, 1),
-            (256, 1, 1),
-            0,
-            &mut params,
-        )?;
+        launch_1d(driver, &loaded, rows_u32, 256, &mut params)?;
         Ok(out)
     }
 
@@ -1368,7 +1347,7 @@ impl TritonExecutor {
             (&mut patch_dim_i32 as *mut i32).cast::<c_void>(),
             (&mut opaque_ptr as *mut u64).cast::<c_void>(),
         ];
-        launch_1d(driver, &loaded.function, n, 256, &mut params)?;
+        launch_1d(driver, &loaded, n, 256, &mut params)?;
         Ok(out)
     }
 
@@ -1467,7 +1446,7 @@ impl TritonExecutor {
             (&mut pad_left as *mut i32).cast::<c_void>(),
             (&mut opaque_ptr as *mut u64).cast::<c_void>(),
         ];
-        launch_1d(driver, &loaded.function, n, 128, &mut params)?;
+        launch_1d(driver, &loaded, n, 128, &mut params)?;
         Ok(out)
     }
 
@@ -1775,14 +1754,20 @@ impl TritonExecutor {
             .get(&compiled.fingerprint)
             .cloned()
         {
+            profiling::cache_event("triton_backend.module_hit_mem");
             return Ok(found);
         }
+        profiling::cache_event("triton_backend.module_miss_mem");
 
-        let module = driver.load_ptx_module(compiled.ptx.as_ref())?;
-        let function = driver.get_function(&module, compiled.symbol.as_ref())?;
+        let function = {
+            let _load_scope = profiling::compile_scope("triton_backend.dlopen");
+            let module = driver.load_ptx_module(compiled.ptx.as_ref())?;
+            driver.get_function(&module, compiled.symbol.as_ref())?
+        };
         let loaded = Arc::new(LoadedKernel {
             fingerprint: compiled.fingerprint,
             function,
+            profile_signature: profiling::signature_id(&spec.id),
         });
         self.loaded_kernels
             .lock()
@@ -1837,6 +1822,7 @@ struct LoadedKernel {
     #[allow(dead_code)]
     fingerprint: u64,
     function: CudaFunction,
+    profile_signature: Option<u32>,
 }
 
 fn literal_to_tensor(
@@ -2193,7 +2179,7 @@ fn dynamic_update_rank4_layout(
 
 fn launch_1d(
     driver: &Arc<CudaDriver>,
-    function: &CudaFunction,
+    kernel: &LoadedKernel,
     n: u32,
     block_x: u32,
     params: &mut [*mut c_void],
@@ -2201,8 +2187,18 @@ fn launch_1d(
     if n == 0 {
         return Ok(());
     }
+    let _scope = profiling::backend_scope_with_meta("backend.triton.kernel", || {
+        let meta = kernel
+            .profile_signature
+            .map(ScopeMeta::signature)
+            .unwrap_or_default();
+        meta.with_work(WorkStats {
+            elements: u64::from(n),
+            ..WorkStats::default()
+        })
+    });
     let grid_x = n.div_ceil(block_x);
-    driver.launch_kernel(function, (grid_x, 1, 1), (block_x, 1, 1), 0, params)
+    driver.launch_kernel(&kernel.function, (grid_x, 1, 1), (block_x, 1, 1), 0, params)
 }
 
 fn read_i32_tensor(tensor: &TritonTensor) -> BackendResult<Vec<i32>> {
@@ -2265,6 +2261,32 @@ fn f32_to_bytes(values: &[f32]) -> Vec<u8> {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     bytes
+}
+
+fn cublas_profile_scope(
+    transposed_rhs: bool,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> profiling::ScopeGuard {
+    let signature = format!("sgemm.m{m}.n{n}.k{k}.rhs_t{}", u8::from(transposed_rhs));
+    profiling::backend_scope_with_meta("backend.triton.cublas_sgemm", || {
+        let meta = profiling::signature_id(&signature)
+            .map(ScopeMeta::signature)
+            .unwrap_or_default();
+        let m_u64 = m as u64;
+        let n_u64 = n as u64;
+        let k_u64 = k as u64;
+        let work = WorkStats {
+            elements: m_u64.saturating_mul(n_u64),
+            flops: m_u64
+                .saturating_mul(n_u64)
+                .saturating_mul(k_u64)
+                .saturating_mul(2),
+            ..WorkStats::default()
+        };
+        meta.with_work(work)
+    })
 }
 
 struct DotGeneralArgs<'a> {
@@ -2376,6 +2398,7 @@ impl CublasContext {
         n: usize,
         k: usize,
     ) -> BackendResult<()> {
+        let _scope = cublas_profile_scope(false, m, n, k);
         let m_i32 = i32::try_from(m)
             .map_err(|_| BackendError::execution("matrix dimension m exceeds i32"))?;
         let n_i32 = i32::try_from(n)
@@ -2421,6 +2444,7 @@ impl CublasContext {
         n: usize,
         k: usize,
     ) -> BackendResult<()> {
+        let _scope = cublas_profile_scope(true, m, n, k);
         let m_i32 = i32::try_from(m)
             .map_err(|_| BackendError::execution("matrix dimension m exceeds i32"))?;
         let n_i32 = i32::try_from(n)

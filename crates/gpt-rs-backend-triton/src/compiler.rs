@@ -4,6 +4,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use gpt_rs::backend::spec::{BackendError, BackendResult};
+use gpt_rs::profiling;
 use serde::Deserialize;
 
 use crate::kernels::KernelSpec;
@@ -42,8 +43,10 @@ impl KernelCompiler {
             .get(&fingerprint)
             .cloned()
         {
+            profiling::cache_event("triton_backend.kernel_hit_mem");
             return Ok(found);
         }
+        profiling::cache_event("triton_backend.kernel_miss_mem");
 
         let gate = {
             let mut guard = self
@@ -64,6 +67,7 @@ impl KernelCompiler {
             .get(&fingerprint)
             .cloned()
         {
+            profiling::cache_event("triton_backend.kernel_hit_mem");
             return Ok(found);
         }
 
@@ -76,9 +80,13 @@ impl KernelCompiler {
         let meta_path = cache_dir.join(format!("kernel_{fingerprint:016x}_{arch}.meta.json"));
 
         if !ptx_path.exists() || !meta_path.exists() {
+            profiling::cache_event("triton_backend.kernel_miss_disk");
             std::fs::write(&source_path, &kernel.source)
                 .map_err(|err| BackendError::execution(err.to_string()))?;
+            let _compile_scope = profiling::compile_scope("triton_backend.compile");
             run_tritoncc_compile(&compiler, &arch, &source_path, &ptx_path, &meta_path)?;
+        } else {
+            profiling::cache_event("triton_backend.kernel_hit_disk");
         }
 
         let ptx = std::fs::read_to_string(&ptx_path)

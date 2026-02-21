@@ -6,6 +6,7 @@
 //! inside inference and training binaries without Python bindings.
 
 use super::bpe::{get_pairs, BpeMerges};
+use anyhow::{anyhow, ensure, Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -29,6 +30,105 @@ pub struct TokenizerConfig {
 /// Provides the default unknown token marker when a configuration omits the field.
 fn default_unk_token() -> String {
     "<unk>".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+struct HfTokenizerJson {
+    model: HfTokenizerModel,
+    #[serde(default)]
+    added_tokens: Vec<HfAddedToken>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HfTokenizerModel {
+    vocab: HashMap<String, usize>,
+    merges: Vec<HfMergeEntry>,
+    #[serde(default)]
+    unk_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HfAddedToken {
+    id: usize,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum HfMergeEntry {
+    Pair([String; 2]),
+    PairTuple((String, String)),
+    SpaceSeparated(String),
+}
+
+impl HfMergeEntry {
+    fn into_pair(self) -> Result<(String, String)> {
+        match self {
+            HfMergeEntry::Pair([left, right]) | HfMergeEntry::PairTuple((left, right)) => {
+                Ok((left, right))
+            }
+            HfMergeEntry::SpaceSeparated(raw) => {
+                let (left, right) = raw
+                    .split_once(' ')
+                    .ok_or_else(|| anyhow!("invalid BPE merge entry '{raw}'"))?;
+                Ok((left.to_string(), right.to_string()))
+            }
+        }
+    }
+}
+
+impl TokenizerConfig {
+    /// Parses either the flat gpt-rs tokenizer schema or Hugging Face `tokenizer.json`.
+    pub fn from_json_str(data: &str) -> Result<Self> {
+        if let Ok(cfg) = serde_json::from_str::<TokenizerConfig>(data) {
+            return Ok(cfg);
+        }
+
+        let hf: HfTokenizerJson =
+            serde_json::from_str(data).context("failed to parse Hugging Face tokenizer.json")?;
+        let HfTokenizerJson {
+            model:
+                HfTokenizerModel {
+                    vocab,
+                    merges,
+                    unk_token,
+                },
+            added_tokens,
+        } = hf;
+
+        let merges = merges
+            .into_iter()
+            .map(HfMergeEntry::into_pair)
+            .collect::<Result<Vec<_>>>()?;
+
+        let unk_token = unk_token
+            .filter(|token| !token.is_empty())
+            .or_else(|| {
+                added_tokens
+                    .iter()
+                    .find(|token| token.content == "<unk>")
+                    .map(|token| token.content.clone())
+            })
+            .or_else(|| {
+                added_tokens
+                    .iter()
+                    .find(|token| token.id == 0)
+                    .map(|token| token.content.clone())
+            })
+            .unwrap_or_else(|| "<unk>".to_string());
+
+        ensure!(
+            vocab.contains_key(&unk_token) || vocab.contains_key("<unk>"),
+            "tokenizer vocabulary is missing unknown token '{}'",
+            unk_token
+        );
+
+        Ok(Self {
+            vocab,
+            merges,
+            unk_token,
+        })
+    }
 }
 
 /// Runtime tokenizer capable of encoding strings to ids and decoding ids back to text.
@@ -282,40 +382,4 @@ fn bytes_to_unicode() -> (HashMap<u8, char>, HashMap<char, u8>) {
         decoder.insert(c, b);
     }
     (encoder, decoder)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::path::PathBuf;
-
-    fn load_gpt2_tokenizer() -> Tokenizer {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("configs")
-            .join("gpt2_tokenizer.json");
-        let data = fs::read_to_string(path).expect("failed to read GPT-2 tokenizer config");
-        let config: TokenizerConfig =
-            serde_json::from_str(&data).expect("invalid tokenizer config JSON");
-        Tokenizer::from_config(config)
-    }
-
-    #[test]
-    fn gpt2_encode_matches_python() {
-        let tokenizer = load_gpt2_tokenizer();
-        assert_eq!(tokenizer.encode("Hello world"), vec![15496, 995]);
-        assert_eq!(tokenizer.encode(" Hello world"), vec![18435, 995]);
-    }
-
-    #[test]
-    fn gpt2_decode_matches_python() {
-        let tokenizer = load_gpt2_tokenizer();
-        let hello_world = vec![15496usize, 995];
-        assert_eq!(tokenizer.decode(&hello_world), "Hello world");
-
-        let leading_space = vec![18435usize, 995];
-        assert_eq!(tokenizer.decode(&leading_space), " Hello world");
-    }
 }

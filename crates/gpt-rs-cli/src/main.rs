@@ -222,8 +222,12 @@ fn load_tokenizer(path: impl AsRef<Path>) -> Result<Tokenizer> {
     let path = path.as_ref();
     let data = fs::read_to_string(path)
         .with_context(|| format!("failed to read tokenizer from {}", path.display()))?;
-    let cfg: TokenizerConfig = serde_json::from_str(&data)
-        .with_context(|| format!("invalid tokenizer config in {}", path.display()))?;
+    let cfg = TokenizerConfig::from_json_str(&data).with_context(|| {
+        format!(
+            "invalid tokenizer config in {} (expected flat gpt-rs schema or Hugging Face tokenizer.json)",
+            path.display()
+        )
+    })?;
     Ok(Tokenizer::from_config(cfg))
 }
 

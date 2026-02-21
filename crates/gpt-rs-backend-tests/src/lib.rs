@@ -6,49 +6,52 @@ pub mod torch_parity;
 #[macro_export]
 macro_rules! define_backend_tests {
     ($module:ident, $backend_ctor:expr) => {
+        $crate::define_backend_tests!($module, $backend_ctor, test);
+    };
+    ($module:ident, $backend_ctor:expr, $test_attr:meta) => {
         #[cfg(test)]
         mod $module {
             use std::sync::Arc;
 
             use $crate::{api_invariants, smoke};
 
-            #[test]
+            #[$test_attr]
             fn smoke_matmul_matches_expected() {
                 let backend = ($backend_ctor)();
                 smoke::matmul_matches_expected(&backend);
             }
 
-            #[test]
+            #[$test_attr]
             fn smoke_gpt_forward_shape() {
                 let backend = ($backend_ctor)();
                 smoke::gpt_forward_shape(&backend);
             }
 
-            #[test]
+            #[$test_attr]
             fn api_linear_initializes_from_host_and_device_weights() {
                 let backend = ($backend_ctor)();
                 api_invariants::linear_initializes_from_host_and_device_weights(&backend);
             }
 
-            #[test]
+            #[$test_attr]
             fn api_layer_norm_initializes_from_host_and_device_tensors() {
                 let backend = ($backend_ctor)();
                 api_invariants::layer_norm_initializes_from_host_and_device_tensors(&backend);
             }
 
-            #[test]
+            #[$test_attr]
             fn api_embedding_initializes_from_device_tensor() {
                 let backend = ($backend_ctor)();
                 api_invariants::embedding_initializes_from_device_tensor(&backend);
             }
 
-            #[test]
+            #[$test_attr]
             fn api_feed_forward_accepts_mixed_tensor_inputs() {
                 let backend = ($backend_ctor)();
                 api_invariants::feed_forward_accepts_mixed_tensor_inputs(&backend);
             }
 
-            #[test]
+            #[$test_attr]
             fn api_multi_head_attention_accepts_device_parameters() {
                 let backend = ($backend_ctor)();
                 api_invariants::multi_head_attention_accepts_device_parameters(&backend);
@@ -76,7 +79,7 @@ macro_rules! define_backend_tests {
 
                 macro_rules! parity_test {
                     ($name:ident, $func:path) => {
-                        #[test]
+                        #[$test_attr]
                         fn $name() {
                             let backend = ($backend_ctor)();
                             run_parity!(backend, $name, |backend| {

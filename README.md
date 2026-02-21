@@ -165,6 +165,15 @@ uv run python scripts/export.py export --exporter ministral_3_3b_instruct_2512 \
   --config-out configs/ministral_3_3b_instruct_2512_model.json \
   --tokenizer-out configs/ministral_3_3b_instruct_2512_tokenizer.json
 
+# run Ministral generation in pure Rust CLI (release build)
+cargo run --release -p gpt-rs-cli -- generate \
+  --checkpoint checkpoints/ministral_3_3b_instruct_2512.bin \
+  --tokenizer configs/ministral_3_3b_instruct_2512_tokenizer.json \
+  --prompt "Hello" \
+  --max-tokens 32 \
+  --backend faer \
+  --kv-cache
+
 # validate Ministral checkpoint against Torch
 uv run python scripts/eval.py --model ministral_3_3b_instruct_2512 --workload validate \
   --checkpoint checkpoints/ministral_3_3b_instruct_2512.bin \

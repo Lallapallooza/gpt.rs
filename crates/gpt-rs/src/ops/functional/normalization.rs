@@ -22,7 +22,21 @@ pub struct LayerNormResult<B: PortableBackend + 'static> {
     pub inv_std: DeviceTensor<B>,
 }
 
+/// Outputs produced by [`rms_norm`], including cached intermediates.
+pub struct RmsNormResult<B: PortableBackend + 'static> {
+    pub output: DeviceTensor<B>,
+    pub normalized: DeviceTensor<B>,
+    pub inv_rms: DeviceTensor<B>,
+}
+
 struct LayerNormPlan {
+    last_dim_axis: usize,
+    feature_dim: usize,
+    reduce_shape: Vec<usize>,
+    input_shape: Vec<usize>,
+}
+
+struct RmsNormPlan {
     last_dim_axis: usize,
     feature_dim: usize,
     reduce_shape: Vec<usize>,
@@ -61,6 +75,34 @@ fn validate_layer_norm<B: PortableBackend + 'static>(
     reduce_shape[last_dim] = 1;
 
     Ok(LayerNormPlan {
+        last_dim_axis: last_dim,
+        feature_dim,
+        reduce_shape,
+        input_shape: x.shape().dims().to_vec(),
+    })
+}
+
+/// Validates RMSNorm tensors and prepares reduction/broadcast metadata.
+fn validate_rms_norm<B: PortableBackend + 'static>(
+    x: &DeviceTensor<B>,
+    gamma: &DeviceTensor<B>,
+) -> Result<RmsNormPlan> {
+    ensure_same_dtype("rms_norm x", x, "gamma", gamma)?;
+    ensure_dtype_equals("rms_norm x", x, TensorDType::F32)?;
+    ensure_rank_at_least("rms_norm input", x, 1)?;
+    ensure_same_backend("rms_norm", x, gamma)?;
+
+    let rank = x.shape().rank();
+    let last_dim = rank - 1;
+    let feature_dim = x.shape().dims()[last_dim];
+
+    ensure_rank("rms_norm gamma", gamma, 1)?;
+    ensure_last_dim("rms_norm gamma", gamma, feature_dim)?;
+
+    let mut reduce_shape = x.shape().dims().to_vec();
+    reduce_shape[last_dim] = 1;
+
+    Ok(RmsNormPlan {
         last_dim_axis: last_dim,
         feature_dim,
         reduce_shape,
@@ -128,5 +170,48 @@ pub fn layer_norm<B: PortableBackend + 'static>(
         normalized,
         mean,
         inv_std,
+    })
+}
+
+/// Applies RMS normalization across the last tensor dimension.
+///
+/// The captured graph computes:
+/// - squared activations and their mean along the last axis;
+/// - reciprocal root mean square via `rsqrt(mean(x^2) + eps)`;
+/// - normalized output `x * inv_rms`;
+/// - affine scale by `gamma`.
+#[support_runtime_overload]
+#[ptir_pattern(target = "gpt_rs.rms_norm_f32")]
+pub fn rms_norm<B: PortableBackend + 'static>(
+    _backend: &B,
+    x: &DeviceTensor<B>,
+    gamma: &DeviceTensor<B>,
+    eps: f32,
+) -> Result<RmsNormResult<B>> {
+    let plan = validate_rms_norm(x, gamma)?;
+    let (graph, (output_id, normalized_id, inv_rms_id)) = capture_ptir!({ x, gamma }, |session| {
+        let squared = x * x;
+        let sum = squared.reduce_sum(vec![plan.last_dim_axis], true);
+        let inv_count = scalar_broadcast(
+            &session,
+            1.0f32 / plan.feature_dim as f32,
+            &plan.reduce_shape,
+        );
+        let mean_square = sum * inv_count;
+        let inv_rms = (mean_square + scalar_broadcast(&session, eps, &plan.reduce_shape)).rsqrt();
+        let normalized = x * inv_rms.broadcast_to(plan.input_shape.clone());
+        let gamma_broadcast = gamma.broadcast_to(plan.input_shape.clone());
+        let output = normalized * gamma_broadcast;
+        Ok((output.id(), normalized.id(), inv_rms.id()))
+    })?;
+
+    let output = (Arc::clone(&graph), output_id).into_device_tensor()?;
+    let normalized = (Arc::clone(&graph), normalized_id).into_device_tensor()?;
+    let inv_rms = (graph, inv_rms_id).into_device_tensor()?;
+
+    Ok(RmsNormResult {
+        output,
+        normalized,
+        inv_rms,
     })
 }

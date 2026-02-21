@@ -9,6 +9,7 @@ pub mod embedding;
 pub mod feed_forward;
 pub mod layer_norm;
 pub mod linear;
+pub mod rms_norm;
 
 pub use crate::ops::functional::AttentionCache;
 pub use attention::{AttentionConfig, CausalSelfAttention};
@@ -17,3 +18,4 @@ pub use embedding::Embedding;
 pub use feed_forward::FeedForward;
 pub use layer_norm::LayerNorm;
 pub use linear::Linear;
+pub use rms_norm::RmsNorm;

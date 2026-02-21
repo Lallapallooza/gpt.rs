@@ -10,4 +10,5 @@ pub mod layer_norm_layer;
 pub mod linear;
 pub mod matmul;
 pub mod multi_head_attention_layer;
+pub mod rms_norm_layer;
 pub mod vision_ops;

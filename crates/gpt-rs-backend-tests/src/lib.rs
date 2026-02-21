@@ -30,7 +30,7 @@ macro_rules! define_backend_tests {
                 use $crate::torch_parity::{
                     arithmetic, attention, device_layers, embedding_layer, feed_forward_layer,
                     functional_ops, harness, layer_norm_layer, linear, matmul,
-                    multi_head_attention_layer, vision_ops,
+                    multi_head_attention_layer, rms_norm_layer, vision_ops,
                 };
 
                 macro_rules! run_parity {
@@ -92,6 +92,8 @@ macro_rules! define_backend_tests {
             parity_test!(torch_functional_softmax_last_dim_extreme_logits_matches_torch, functional_ops::softmax_last_dim_extreme_logits_matches_torch);
             parity_test!(torch_functional_softmax_last_dim_misaligned_matches_torch, functional_ops::softmax_last_dim_misaligned_matches_torch);
             parity_test!(torch_functional_gelu_matches_torch, functional_ops::gelu_matches_torch);
+            parity_test!(torch_functional_silu_matches_torch, functional_ops::silu_matches_torch);
+            parity_test!(torch_functional_silu_extreme_inputs_match_torch, functional_ops::silu_extreme_inputs_match_torch);
             parity_test!(torch_functional_gelu_matches_torch_1d_256, functional_ops::gelu_matches_torch_1d_256);
             parity_test!(torch_functional_gelu_matches_torch_2d_4x16, functional_ops::gelu_matches_torch_2d_4x16);
             parity_test!(torch_functional_gelu_matches_torch_3d_2x3x8, functional_ops::gelu_matches_torch_3d_2x3x8);
@@ -103,6 +105,8 @@ macro_rules! define_backend_tests {
             parity_test!(torch_functional_add_bias_rejects_mismatched_dimension, functional_ops::add_bias_rejects_mismatched_dimension);
             parity_test!(torch_functional_add_bias_rejects_mismatched_dimension_3d, functional_ops::add_bias_rejects_mismatched_dimension_3d);
             parity_test!(torch_functional_layer_norm_matches_torch, functional_ops::layer_norm_matches_torch);
+            parity_test!(torch_functional_rms_norm_matches_torch, functional_ops::rms_norm_matches_torch);
+            parity_test!(torch_functional_rms_norm_rejects_gamma_mismatch, functional_ops::rms_norm_rejects_gamma_mismatch);
             parity_test!(torch_functional_layer_norm_matches_torch_embed_dim1, functional_ops::layer_norm_matches_torch_embed_dim1);
             parity_test!(torch_functional_layer_norm_matches_torch_prime_embed, functional_ops::layer_norm_matches_torch_prime_embed);
             parity_test!(torch_functional_layer_norm_matches_torch_large_embed, functional_ops::layer_norm_matches_torch_large_embed);
@@ -183,6 +187,9 @@ macro_rules! define_backend_tests {
             parity_test!(torch_layer_norm_matches_torch_eps_1e3, layer_norm_layer::layer_norm_matches_torch_eps_1e3);
             parity_test!(torch_layer_norm_matches_torch_eps_1e1, layer_norm_layer::layer_norm_matches_torch_eps_1e1);
             parity_test!(torch_layer_norm_state_constant_input_matches_moments, layer_norm_layer::layer_norm_state_constant_input_matches_moments);
+            parity_test!(torch_rms_norm_layer_matches_torch_basic, rms_norm_layer::rms_norm_layer_matches_torch_basic);
+            parity_test!(torch_rms_norm_layer_matches_torch_seq_batch, rms_norm_layer::rms_norm_layer_matches_torch_seq_batch);
+            parity_test!(torch_rms_norm_layer_matches_torch_constant_input, rms_norm_layer::rms_norm_layer_matches_torch_constant_input);
             parity_test!(torch_embedding_matches_torch_basic, embedding_layer::embedding_matches_torch_basic);
             parity_test!(torch_embedding_supports_duplicate_indices, embedding_layer::embedding_supports_duplicate_indices);
             parity_test!(torch_embedding_matches_torch_vocab64_embed32_seq16_rank1, embedding_layer::embedding_matches_torch_vocab64_embed32_seq16_rank1);

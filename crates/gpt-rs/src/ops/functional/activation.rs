@@ -111,3 +111,25 @@ pub fn gelu<B: PortableBackend + 'static>(
     })?
     .into_device_tensor()
 }
+
+/// Applies the SiLU activation (`x * sigmoid(x)`), also known as Swish.
+///
+/// The captured graph uses the numerically stable identity
+/// `sigmoid(x) = 1 / (1 + exp(-x))`.
+#[support_runtime_overload]
+#[ptir_pattern(target = "gpt_rs.silu_f32")]
+pub fn silu<B: PortableBackend + 'static>(
+    _backend: &B,
+    x: &DeviceTensor<B>,
+) -> Result<DeviceTensor<B>> {
+    ensure_rank_at_least("silu input", x, 1)?;
+
+    capture_ptir!({ input = x }, |_session| {
+        let neg = input * -1.0f32;
+        let exp = neg.exp();
+        let denom = 1.0f32 + exp;
+        let out = input / denom;
+        Ok(out.id())
+    })?
+    .into_device_tensor()
+}

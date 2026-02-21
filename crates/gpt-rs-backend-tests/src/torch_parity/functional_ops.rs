@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use gpt_rs::backend::spec::PortableBackend;
 use gpt_rs::nn::layers::AttentionConfig;
-use gpt_rs::ops::functional::{self, LayerNormResult};
+use gpt_rs::ops::functional::{self, LayerNormResult, RmsNormResult};
 use tch::{Kind, Tensor as TchTensor};
 
 use super::common::*;
@@ -56,6 +56,21 @@ fn gelu_case<B: PortableBackend + 'static>(backend: &Arc<B>, shape: &[usize], da
     let actual = timed_gpt(|| {
         let device = device_tensor_from_data(backend, shape, data);
         let result = functional::gelu(backend.as_ref(), &device).unwrap();
+        to_host_vec(&result)
+    });
+
+    assert_close(&expected, &actual);
+}
+
+fn silu_case<B: PortableBackend + 'static>(backend: &Arc<B>, shape: &[usize], data: &[f32]) {
+    let expected = timed_torch(|| {
+        let expected_tensor = tch_tensor_from_vec(shape, data).silu();
+        tensor_to_vec(&expected_tensor)
+    });
+
+    let actual = timed_gpt(|| {
+        let device = device_tensor_from_data(backend, shape, data);
+        let result = functional::silu(backend.as_ref(), &device).unwrap();
         to_host_vec(&result)
     });
 
@@ -157,6 +172,58 @@ fn layer_norm_case<B: PortableBackend + 'static>(
     assert_close(&expected_output, &actual_output);
 }
 
+fn rms_norm_case<B: PortableBackend + 'static>(
+    backend: &Arc<B>,
+    shape: &[usize],
+    data: &[f32],
+    gamma: &[f32],
+    eps: f64,
+) {
+    let last_dim = *shape.last().unwrap();
+
+    let (actual_output, actual_normalized, actual_inv_rms) = timed_gpt(|| {
+        let x = device_tensor_from_data(backend, shape, data);
+        let gamma_dev = device_tensor_from_data(backend, &[last_dim], gamma);
+        let RmsNormResult {
+            output,
+            normalized,
+            inv_rms,
+        } = functional::rms_norm(backend.as_ref(), &x, &gamma_dev, eps as f32).unwrap();
+
+        (
+            to_host_vec(&output),
+            to_host_vec(&normalized),
+            to_host_vec(&inv_rms),
+        )
+    });
+
+    let (expected_output, expected_normalized, expected_inv_rms) = timed_torch(|| {
+        let x_t = tch_tensor_from_vec(shape, data);
+        let gamma_t = tch_tensor_from_vec(&[last_dim], gamma);
+        let dims: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
+        let last_axis = (shape.len() as i64) - 1;
+
+        let mean_square = x_t.square().mean_dim(&[last_axis][..], true, Kind::Float);
+        let inv_rms = (&mean_square + eps).rsqrt();
+        let normalized = &x_t * inv_rms.expand(dims.clone(), true);
+        let rank = shape.len();
+        let mut broadcast_shape = vec![1i64; rank];
+        broadcast_shape[rank - 1] = last_dim as i64;
+        let gamma_broadcast = gamma_t.reshape(broadcast_shape).expand(dims.clone(), true);
+        let output = &normalized * gamma_broadcast;
+
+        (
+            tensor_to_vec(&output),
+            tensor_to_vec(&normalized),
+            tensor_to_vec(&inv_rms),
+        )
+    });
+
+    assert_close(&expected_inv_rms, &actual_inv_rms);
+    assert_close(&expected_normalized, &actual_normalized);
+    assert_close(&expected_output, &actual_output);
+}
+
 /// Dropout parity relies on the PTIR inspection tests in
 /// `crates/gpt-rs/tests/functional_softmax.rs::dropout_emits_rng_mask_sequence` because backend RNG
 /// streams are not yet aligned with Torch for deterministic numerical comparisons.
@@ -198,6 +265,22 @@ pub fn gelu_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
     });
 
     assert_close(&expected, &actual);
+}
+
+pub fn silu_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    let mut rng = seeded_rng(0x5100_u64);
+    let shape = vector_shape();
+    let len: usize = shape.iter().product();
+    let data = random_vec(&mut rng, len);
+    silu_case(backend, &shape, &data);
+}
+
+pub fn silu_extreme_inputs_match_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    let mut rng = seeded_rng(0x5101_u64);
+    let shape = [3usize, 17usize];
+    let len: usize = shape.iter().product();
+    let data = random_vec_range(&mut rng, len, -40.0, 40.0);
+    silu_case(backend, &shape, &data);
 }
 
 pub fn add_bias_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
@@ -309,6 +392,32 @@ pub fn layer_norm_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) 
     assert_close(&expected_inv_std, &actual_inv_std);
     assert_close(&expected_normalized, &actual_normalized);
     assert_close(&expected_output, &actual_output);
+}
+
+pub fn rms_norm_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    let mut rng = seeded_rng(0xA504_u64);
+    let shape = layer_norm_shape();
+    let len: usize = shape.iter().product();
+    let last_dim = *shape.last().unwrap();
+    let data = random_vec(&mut rng, len);
+    let gamma = random_vec(&mut rng, last_dim);
+    rms_norm_case(backend, &shape, &data, &gamma, 1e-5);
+}
+
+pub fn rms_norm_rejects_gamma_mismatch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    let err = timed_gpt(|| {
+        let x = device_tensor_from_data(backend, &layer_norm_shape(), &[0.0; 24]);
+        let gamma = device_tensor_from_data(backend, &[3], &[1.0; 3]);
+        match functional::rms_norm(backend.as_ref(), &x, &gamma, 1e-5) {
+            Ok(_) => panic!("rms_norm should reject gamma shape mismatch"),
+            Err(err) => err,
+        }
+    });
+    assert!(
+        err.to_string().contains("last dimension"),
+        "error should mention last dimension mismatch, got: {}",
+        err
+    );
 }
 
 pub fn softmax_last_dim_len1_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {

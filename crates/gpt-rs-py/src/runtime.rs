@@ -10,7 +10,7 @@ use gpt_rs::tensor::{DeviceTensor, Shape, Tensor};
 use numpy::{PyArray, PyArrayMethods, PyReadonlyArrayDyn, PyUntypedArrayMethods as _};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
 
 fn tensor_to_numpy<'py>(py: Python<'py>, host: &Tensor) -> PyResult<Bound<'py, PyAny>> {
     let shape = host.shape().dims();
@@ -165,6 +165,35 @@ impl PyLoadedModel {
         let logits = logits.map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
         let row = last_logits_row(&logits)?;
         Ok(PyArray::from_vec_bound(py, row.to_vec()).into_any())
+    }
+
+    /// Return named layer activations for token-only models that expose debug hooks.
+    ///
+    /// The returned list contains dictionaries with:
+    /// - `name`: activation name (for example `blocks.3.output`)
+    /// - `tensor`: numpy array view of the host tensor
+    fn debug_token_activations<'py>(
+        &mut self,
+        py: Python<'py>,
+        tokens: Vec<usize>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let activations = py.allow_threads(|| match &mut self.inner {
+            PyLoadedModelInner::Cpu { model, .. } => model.debug_token_activations(&tokens),
+            #[cfg(feature = "faer")]
+            PyLoadedModelInner::Faer { model, .. } => model.debug_token_activations(&tokens),
+            #[cfg(feature = "conversion-c")]
+            PyLoadedModelInner::C { model, .. } => model.debug_token_activations(&tokens),
+        });
+        let activations = activations.map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))?;
+
+        let out = PyList::empty_bound(py);
+        for (name, tensor) in activations {
+            let entry = PyDict::new_bound(py);
+            entry.set_item("name", name)?;
+            entry.set_item("tensor", tensor_to_numpy(py, &tensor)?)?;
+            out.append(entry)?;
+        }
+        Ok(out.into_any())
     }
 
     #[pyo3(signature = (prompt_tokens, max_new_tokens, *, temperature=1.0, top_k=None, kv_cache=true, kv_cache_capacity=None))]

@@ -28,24 +28,23 @@ pub enum RopeScaling {
     },
     Yarn {
         factor: f32,
-        mscale: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mscale: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mscale_all_dim: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        beta_fast: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        beta_slow: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        original_max_position_embeddings: Option<usize>,
+        #[serde(default = "default_yarn_truncate")]
+        truncate: bool,
     },
 }
 
-impl RopeScaling {
-    fn position_factor(self) -> f32 {
-        match self {
-            RopeScaling::None => 1.0,
-            RopeScaling::Linear { factor } | RopeScaling::Yarn { factor, .. } => factor,
-        }
-    }
-
-    fn magnitude_scale(self) -> f32 {
-        match self {
-            RopeScaling::Yarn { mscale, .. } => mscale,
-            RopeScaling::None | RopeScaling::Linear { .. } => 1.0,
-        }
-    }
+const fn default_yarn_truncate() -> bool {
+    true
 }
 
 /// Configuration for rotary cache generation.
@@ -85,27 +84,124 @@ fn build_rotary_cache_range(start: usize, len: usize, config: RopeConfig) -> Res
         config.theta
     );
 
-    let pos_factor = config.scaling.position_factor();
-    ensure!(
-        pos_factor.is_finite() && pos_factor > 0.0,
-        "rope scaling factor must be finite and positive (got {pos_factor})"
-    );
-    let magnitude = config.scaling.magnitude_scale();
+    let half = config.rotary_dim / 2;
+    let base_inv_freq = |i: usize| {
+        let exponent = (2.0 * i as f32) / (config.rotary_dim as f32);
+        config.theta.powf(-exponent)
+    };
+
+    let (inv_freqs, magnitude): (Vec<f32>, f32) = match config.scaling {
+        RopeScaling::None => ((0..half).map(base_inv_freq).collect(), 1.0),
+        RopeScaling::Linear { factor } => {
+            ensure!(
+                factor.is_finite() && factor > 0.0,
+                "rope scaling factor must be finite and positive (got {factor})"
+            );
+            ((0..half).map(|i| base_inv_freq(i) / factor).collect(), 1.0)
+        }
+        RopeScaling::Yarn {
+            factor,
+            mscale,
+            mscale_all_dim,
+            beta_fast,
+            beta_slow,
+            original_max_position_embeddings,
+            truncate,
+        } => {
+            ensure!(
+                factor.is_finite() && factor > 0.0,
+                "rope yarn factor must be finite and positive (got {factor})"
+            );
+            let original_max_position_embeddings =
+                original_max_position_embeddings.ok_or_else(|| {
+                    anyhow::anyhow!("rope yarn original_max_position_embeddings missing")
+                })?;
+            ensure!(
+                original_max_position_embeddings > 0,
+                "rope yarn original_max_position_embeddings must be > 0"
+            );
+
+            let beta_fast = beta_fast.unwrap_or(32.0);
+            let beta_slow = beta_slow.unwrap_or(1.0);
+            ensure!(
+                beta_fast.is_finite() && beta_slow.is_finite() && beta_fast >= beta_slow,
+                "rope yarn beta range is invalid: beta_fast={beta_fast} beta_slow={beta_slow}"
+            );
+
+            let get_mscale = |scale: f32, mscale: f32| {
+                if scale <= 1.0 {
+                    1.0
+                } else {
+                    0.1 * mscale * scale.ln() + 1.0
+                }
+            };
+
+            let magnitude = match (mscale, mscale_all_dim) {
+                (Some(ms), Some(ms_all)) if ms != 0.0 && ms_all != 0.0 => {
+                    get_mscale(factor, ms) / get_mscale(factor, ms_all)
+                }
+                _ => get_mscale(factor, 1.0),
+            };
+
+            ensure!(
+                magnitude.is_finite() && magnitude > 0.0,
+                "rope yarn magnitude must be finite and positive (got {magnitude})"
+            );
+
+            let find_correction_dim = |num_rotations: f32| {
+                (config.rotary_dim as f32
+                    * (original_max_position_embeddings as f32
+                        / (num_rotations * 2.0 * std::f32::consts::PI))
+                        .ln())
+                    / (2.0 * config.theta.ln())
+            };
+
+            let mut low = find_correction_dim(beta_fast);
+            let mut high = find_correction_dim(beta_slow);
+            if truncate {
+                low = low.floor();
+                high = high.ceil();
+            }
+            low = low.max(0.0);
+            high = high.min((config.rotary_dim.saturating_sub(1)) as f32);
+
+            let mut ramp_max = high;
+            if (low - ramp_max).abs() < f32::EPSILON {
+                ramp_max += 0.001;
+            }
+
+            let inv_freqs = (0..half)
+                .map(|i| {
+                    let base = config
+                        .theta
+                        .powf((2.0 * i as f32) / (config.rotary_dim as f32));
+                    let inv_freq_extrapolation = 1.0 / base;
+                    let inv_freq_interpolation = 1.0 / (factor * base);
+
+                    let linear = (i as f32 - low) / (ramp_max - low);
+                    let ramp = linear.clamp(0.0, 1.0);
+                    let extrapolation_factor = 1.0 - ramp;
+                    inv_freq_interpolation * (1.0 - extrapolation_factor)
+                        + inv_freq_extrapolation * extrapolation_factor
+                })
+                .collect::<Vec<f32>>();
+
+            (inv_freqs, magnitude)
+        }
+    };
+
     ensure!(
         magnitude.is_finite() && magnitude > 0.0,
         "rope magnitude scale must be finite and positive (got {magnitude})"
     );
 
-    let half = config.rotary_dim / 2;
     let mut cos = Vec::with_capacity(len * half);
     let mut sin = Vec::with_capacity(len * half);
 
     for pos in start..start + len {
-        let scaled_pos = (pos as f32) / pos_factor;
-        for i in 0..half {
-            let exponent = (2.0 * i as f32) / (config.rotary_dim as f32);
-            let inv_freq = config.theta.powf(-exponent);
-            let angle = scaled_pos * inv_freq;
+        let pos = pos as f32;
+        for &inv_freq in &inv_freqs {
+            let angle = pos * inv_freq;
             cos.push(angle.cos() * magnitude);
             sin.push(angle.sin() * magnitude);
         }
@@ -204,23 +300,14 @@ pub fn apply_rope<B: PortableBackend + 'static>(
             vec![0, 0, 0],
             vec![plan.num_heads, plan.seq_len, plan.rotary_dim],
         );
-        let x_pairs = x_rot.reshape(vec![
-            plan.num_heads,
-            plan.seq_len,
-            plan.half_rotary_dim,
-            2,
-        ]);
-
-        let x_even = x_pairs.slice(
-            vec![0, 0, 0, 0],
-            vec![plan.num_heads, plan.seq_len, plan.half_rotary_dim, 1],
+        let x_first = x_rot.slice(
+            vec![0, 0, 0],
+            vec![plan.num_heads, plan.seq_len, plan.half_rotary_dim],
         );
-        let x_even = x_even.reshape(vec![plan.num_heads, plan.seq_len, plan.half_rotary_dim]);
-        let x_odd = x_pairs.slice(
-            vec![0, 0, 0, 1],
-            vec![plan.num_heads, plan.seq_len, plan.half_rotary_dim, 1],
+        let x_second = x_rot.slice(
+            vec![0, 0, plan.half_rotary_dim],
+            vec![plan.num_heads, plan.seq_len, plan.half_rotary_dim],
         );
-        let x_odd = x_odd.reshape(vec![plan.num_heads, plan.seq_len, plan.half_rotary_dim]);
 
         let cos_b = cos
             .reshape(vec![1, plan.seq_len, plan.half_rotary_dim])
@@ -229,23 +316,9 @@ pub fn apply_rope<B: PortableBackend + 'static>(
             .reshape(vec![1, plan.seq_len, plan.half_rotary_dim])
             .broadcast_to(vec![plan.num_heads, plan.seq_len, plan.half_rotary_dim]);
 
-        let rotated_even = x_even * cos_b - x_odd * sin_b;
-        let rotated_odd = x_odd * cos_b + x_even * sin_b;
-
-        let rotated_even = rotated_even.reshape(vec![
-            plan.num_heads,
-            plan.seq_len,
-            plan.half_rotary_dim,
-            1,
-        ]);
-        let rotated_odd = rotated_odd.reshape(vec![
-            plan.num_heads,
-            plan.seq_len,
-            plan.half_rotary_dim,
-            1,
-        ]);
-        let rotated_pairs = ptir::Tensor::concat(3, &[rotated_even, rotated_odd]);
-        let rotated = rotated_pairs.reshape(vec![plan.num_heads, plan.seq_len, plan.rotary_dim]);
+        let rotated_first = x_first * cos_b - x_second * sin_b;
+        let rotated_second = x_second * cos_b + x_first * sin_b;
+        let rotated = ptir::Tensor::concat(2, &[rotated_first, rotated_second]);
 
         let output = if plan.rotary_dim == plan.head_dim {
             rotated
@@ -391,26 +464,17 @@ pub fn apply_rope_qkv_packed<B: PortableBackend + 'static>(
             vec![0, 0, 0],
             vec![plan.num_query_heads, plan.seq_len, rotary_dim],
         );
-        let q_rot_pairs = q_rot.reshape(vec![plan.num_query_heads, plan.seq_len, half_rotary, 2]);
-        let q_even = q_rot_pairs
-            .slice(
-                vec![0, 0, 0, 0],
-                vec![plan.num_query_heads, plan.seq_len, half_rotary, 1],
-            )
-            .reshape(vec![plan.num_query_heads, plan.seq_len, half_rotary]);
-        let q_odd = q_rot_pairs
-            .slice(
-                vec![0, 0, 0, 1],
-                vec![plan.num_query_heads, plan.seq_len, half_rotary, 1],
-            )
-            .reshape(vec![plan.num_query_heads, plan.seq_len, half_rotary]);
-        let q_even_rot = q_even * cos_q - q_odd * sin_q;
-        let q_odd_rot = q_odd * cos_q + q_even * sin_q;
-        let q_even_col =
-            q_even_rot.reshape(vec![plan.num_query_heads, plan.seq_len, half_rotary, 1]);
-        let q_odd_col = q_odd_rot.reshape(vec![plan.num_query_heads, plan.seq_len, half_rotary, 1]);
-        let q_rot_pairs = ptir::Tensor::concat(3, &[q_even_col, q_odd_col]);
-        let q_rot = q_rot_pairs.reshape(vec![plan.num_query_heads, plan.seq_len, rotary_dim]);
+        let q_first = q_rot.slice(
+            vec![0, 0, 0],
+            vec![plan.num_query_heads, plan.seq_len, half_rotary],
+        );
+        let q_second = q_rot.slice(
+            vec![0, 0, half_rotary],
+            vec![plan.num_query_heads, plan.seq_len, half_rotary],
+        );
+        let q_first_rot = q_first * cos_q - q_second * sin_q;
+        let q_second_rot = q_second * cos_q + q_first * sin_q;
+        let q_rot = ptir::Tensor::concat(2, &[q_first_rot, q_second_rot]);
         let q_heads = if rotary_dim == plan.head_dim {
             q_rot
         } else {
@@ -437,36 +501,17 @@ pub fn apply_rope_qkv_packed<B: PortableBackend + 'static>(
             vec![0, 0, 0],
             vec![plan.num_key_value_heads, plan.seq_len, rotary_dim],
         );
-        let k_rot_pairs =
-            k_rot.reshape(vec![plan.num_key_value_heads, plan.seq_len, half_rotary, 2]);
-        let k_even = k_rot_pairs
-            .slice(
-                vec![0, 0, 0, 0],
-                vec![plan.num_key_value_heads, plan.seq_len, half_rotary, 1],
-            )
-            .reshape(vec![plan.num_key_value_heads, plan.seq_len, half_rotary]);
-        let k_odd = k_rot_pairs
-            .slice(
-                vec![0, 0, 0, 1],
-                vec![plan.num_key_value_heads, plan.seq_len, half_rotary, 1],
-            )
-            .reshape(vec![plan.num_key_value_heads, plan.seq_len, half_rotary]);
-        let k_even_rot = k_even * cos_k - k_odd * sin_k;
-        let k_odd_rot = k_odd * cos_k + k_even * sin_k;
-        let k_even_col = k_even_rot.reshape(vec![
-            plan.num_key_value_heads,
-            plan.seq_len,
-            half_rotary,
-            1,
-        ]);
-        let k_odd_col = k_odd_rot.reshape(vec![
-            plan.num_key_value_heads,
-            plan.seq_len,
-            half_rotary,
-            1,
-        ]);
-        let k_rot_pairs = ptir::Tensor::concat(3, &[k_even_col, k_odd_col]);
-        let k_rot = k_rot_pairs.reshape(vec![plan.num_key_value_heads, plan.seq_len, rotary_dim]);
+        let k_first = k_rot.slice(
+            vec![0, 0, 0],
+            vec![plan.num_key_value_heads, plan.seq_len, half_rotary],
+        );
+        let k_second = k_rot.slice(
+            vec![0, 0, half_rotary],
+            vec![plan.num_key_value_heads, plan.seq_len, half_rotary],
+        );
+        let k_first_rot = k_first * cos_k - k_second * sin_k;
+        let k_second_rot = k_second * cos_k + k_first * sin_k;
+        let k_rot = ptir::Tensor::concat(2, &[k_first_rot, k_second_rot]);
         let k_heads = if rotary_dim == plan.kv_head_dim {
             k_rot
         } else {

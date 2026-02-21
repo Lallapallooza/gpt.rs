@@ -51,7 +51,9 @@ def _resolve_torch_dtype(name: str) -> Any:
 
 
 def _rope_scaling_from_hf(cfg: Any) -> Dict[str, Any]:
-    raw = getattr(cfg, "rope_scaling", None)
+    raw = getattr(cfg, "rope_parameters", None)
+    if raw is None:
+        raw = getattr(cfg, "rope_scaling", None)
     if raw is None:
         return {"kind": "none"}
 
@@ -74,12 +76,24 @@ def _rope_scaling_from_hf(cfg: Any) -> Dict[str, Any]:
     if rope_type == "linear":
         return {"kind": "linear", "factor": factor}
     if rope_type == "yarn":
-        mscale_value = rope_scaling.get("mscale")
-        if mscale_value is None:
-            mscale_value = rope_scaling.get("attention_factor")
-        if mscale_value is None:
-            mscale_value = 1.0
-        return {"kind": "yarn", "factor": factor, "mscale": float(mscale_value)}
+        out: Dict[str, Any] = {"kind": "yarn", "factor": factor}
+
+        original_max = rope_scaling.get("original_max_position_embeddings")
+        if original_max is None:
+            raise ValueError(
+                "Ministral Yarn rope parameters require original_max_position_embeddings"
+            )
+        out["original_max_position_embeddings"] = int(original_max)
+
+        for key in ("mscale", "mscale_all_dim", "beta_fast", "beta_slow"):
+            value = rope_scaling.get(key)
+            if value is not None:
+                out[key] = float(value)
+
+        truncate_value = rope_scaling.get("truncate")
+        if truncate_value is not None:
+            out["truncate"] = bool(truncate_value)
+        return out
     raise ValueError(f"unsupported rope scaling type for Ministral exporter: {rope_type!r}")
 
 
@@ -347,7 +361,7 @@ class MinistralExporter:
                 "generate_tokens": 0,
                 "max_prompt_tokens": 64,
                 "trust_remote_code": False,
-                "torch_dtype": "auto",
+                "torch_dtype": "float32",
             },
         ),
     )

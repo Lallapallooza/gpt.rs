@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 use crate::backend::spec::PortableBackend;
 use crate::inference::CausalLanguageModel;
@@ -13,6 +13,13 @@ pub trait LoadedModel<B: PortableBackend + 'static>: Send {
     fn kind(&self) -> &str;
 
     fn forward(&mut self, input: ModelInput<B>) -> Result<ModelOutput>;
+
+    fn debug_token_activations(&mut self, _tokens: &[usize]) -> Result<Vec<(String, Tensor)>> {
+        bail!(
+            "model kind '{}' does not support debug_token_activations",
+            self.kind()
+        );
+    }
 
     fn as_causal_lm(&self) -> Option<&dyn CausalLanguageModel<B>> {
         None
@@ -40,6 +47,12 @@ impl<B: PortableBackend + 'static> LoadedModel<B> for ModelHandle<B> {
 
     fn forward(&mut self, input: ModelInput<B>) -> Result<ModelOutput> {
         with_registry(Arc::clone(&self.registry), || self.inner.forward(input))
+    }
+
+    fn debug_token_activations(&mut self, tokens: &[usize]) -> Result<Vec<(String, Tensor)>> {
+        with_registry(Arc::clone(&self.registry), || {
+            self.inner.debug_token_activations(tokens)
+        })
     }
 
     fn as_causal_lm(&self) -> Option<&dyn CausalLanguageModel<B>> {

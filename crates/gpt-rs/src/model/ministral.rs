@@ -212,10 +212,41 @@ pub struct Ministral<B: PortableBackend + 'static> {
 
 impl<B: PortableBackend + 'static> Ministral<B> {
     fn rope_config(&self) -> RopeConfig {
+        let scaling = match self.config.rope_scaling {
+            RopeScaling::Yarn {
+                factor,
+                mscale,
+                mscale_all_dim,
+                beta_fast,
+                beta_slow,
+                original_max_position_embeddings,
+                truncate,
+            } => {
+                let inferred_original = match original_max_position_embeddings {
+                    Some(value) => value,
+                    None => ((self.config.context_length as f32) / factor).round() as usize,
+                }
+                .max(1);
+                let inferred_mscale_all_dim = match (mscale, mscale_all_dim) {
+                    (Some(ms), None) => Some(ms),
+                    (_, existing) => existing,
+                };
+                RopeScaling::Yarn {
+                    factor,
+                    mscale,
+                    mscale_all_dim: inferred_mscale_all_dim,
+                    beta_fast,
+                    beta_slow,
+                    original_max_position_embeddings: Some(inferred_original),
+                    truncate,
+                }
+            }
+            other => other,
+        };
         RopeConfig {
             rotary_dim: self.config.rotary_dim,
             theta: self.config.rope_theta,
-            scaling: self.config.rope_scaling,
+            scaling,
         }
     }
 
@@ -423,6 +454,88 @@ impl<B: PortableBackend + 'static> Ministral<B> {
         let normalized = self.final_norm.forward(&hidden)?;
         let logits = normalized.matmul(&self.lm_head)?;
         logits.to_host()
+    }
+
+    pub fn forward_debug_token_activations(
+        &self,
+        tokens: &[usize],
+    ) -> Result<Vec<(String, Tensor)>> {
+        self.validate_tokens(tokens)?;
+
+        let token_indices_host = Tensor::from_i32(
+            Shape::new([tokens.len()]),
+            tokens
+                .iter()
+                .map(|&idx| {
+                    i32::try_from(idx).map_err(|_| anyhow!("token index {} exceeds i32::MAX", idx))
+                })
+                .collect::<Result<Vec<i32>>>()?,
+        )?;
+        let token_indices = DeviceTensor::from_host(Arc::clone(&self.backend), token_indices_host)?;
+        let mut hidden = self.tok_embeddings.forward(&token_indices)?;
+        let (cos, sin) = self.rope_tables(0, tokens.len())?;
+
+        let mut activations = Vec::with_capacity(self.blocks.len() * 9 + 3);
+        activations.push(("tok_embeddings".to_string(), hidden.to_host()?));
+
+        for (layer_idx, block) in self.blocks.iter().enumerate() {
+            let normed = block.norm_1.forward(&hidden)?;
+            activations.push((format!("blocks.{layer_idx}.norm_1"), normed.to_host()?));
+
+            let qkv = block.attention.proj_qkv.forward(&normed)?;
+            activations.push((format!("blocks.{layer_idx}.attention.qkv"), qkv.to_host()?));
+            let qkv_rope = functional::apply_rope_qkv_packed(
+                self.backend.as_ref(),
+                &block.attention.config,
+                &qkv,
+                &cos,
+                &sin,
+            )?;
+            activations.push((
+                format!("blocks.{layer_idx}.attention.qkv_rope"),
+                qkv_rope.to_host()?,
+            ));
+
+            let functional::AttentionComputation {
+                output: attention_context,
+                ..
+            } = functional::attention(
+                self.backend.as_ref(),
+                &block.attention.config,
+                &qkv_rope,
+                None,
+            )?;
+            activations.push((
+                format!("blocks.{layer_idx}.attention.context"),
+                attention_context.to_host()?,
+            ));
+            let attn_output = block.attention.proj_out.forward(&attention_context)?;
+            activations.push((
+                format!("blocks.{layer_idx}.attention.output"),
+                attn_output.to_host()?,
+            ));
+
+            let residual = attn_output.add(&hidden)?;
+            activations.push((format!("blocks.{layer_idx}.residual"), residual.to_host()?));
+
+            let normed2 = block.norm_2.forward(&residual)?;
+            activations.push((format!("blocks.{layer_idx}.norm_2"), normed2.to_host()?));
+            let ff_output = block.feed_forward.forward(&normed2)?;
+            activations.push((
+                format!("blocks.{layer_idx}.feed_forward.output"),
+                ff_output.to_host()?,
+            ));
+
+            hidden = ff_output.add(&residual)?;
+            activations.push((format!("blocks.{layer_idx}.output"), hidden.to_host()?));
+        }
+
+        let normalized = self.final_norm.forward(&hidden)?;
+        activations.push(("final_norm".to_string(), normalized.to_host()?));
+
+        let logits = normalized.matmul(&self.lm_head)?;
+        activations.push(("logits".to_string(), logits.to_host()?));
+        Ok(activations)
     }
 
     pub fn forward_with_cache(
@@ -764,6 +877,13 @@ impl<B: PortableBackend + 'static> crate::runtime::LoadedModel<B> for Ministral<
                 bail!("model '{KIND}' expects token input, got vision input")
             }
         }
+    }
+
+    fn debug_token_activations(
+        &mut self,
+        tokens: &[usize],
+    ) -> Result<Vec<(String, crate::tensor::Tensor)>> {
+        Ministral::forward_debug_token_activations(self, tokens)
     }
 
     fn as_causal_lm(&self) -> Option<&dyn crate::inference::CausalLanguageModel<B>> {

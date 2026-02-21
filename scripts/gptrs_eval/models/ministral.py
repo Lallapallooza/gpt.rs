@@ -62,7 +62,7 @@ class MinistralCase:
             Path("checkpoints/ministral_3_3b_instruct_2512.bin"),
         )
         trust_remote_code_default = bool(defaults.get("trust_remote_code", False))
-        torch_dtype_default = str(defaults.get("torch_dtype", "auto"))
+        torch_dtype_default = str(defaults.get("torch_dtype", "float32"))
 
         parser.add_argument("--prompt", default=prompt_default, help="Prompt text.")
         parser.add_argument(
@@ -129,11 +129,12 @@ class MinistralCase:
         return gpt.load_model(str(checkpoint))
 
     def _build_hf(self, cfg: RunConfig) -> Tuple[Any, Any]:
+        import torch
         from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
         torch_model_id = str(cfg.params.get("torch_model", _DEFAULT_MODEL_ID))
         trust_remote_code = bool(cfg.params.get("trust_remote_code", False))
-        torch_dtype = _resolve_torch_dtype(str(cfg.params.get("torch_dtype", "auto")))
+        torch_dtype = _resolve_torch_dtype(str(cfg.params.get("torch_dtype", "float32")))
 
         model_kwargs: Dict[str, Any] = {"trust_remote_code": trust_remote_code}
         if torch_dtype != "auto":
@@ -155,6 +156,10 @@ class MinistralCase:
             )
         torch_model.eval()
         torch_model.to(cfg.torch_device)
+        if torch_dtype is torch.float32:
+            # Some HF checkpoints still materialize bf16 parameters under auto/fallback paths.
+            # Enforce float32 explicitly when requested for deterministic parity checks.
+            torch_model = torch_model.to(dtype=torch.float32)
 
         tokenizer = AutoTokenizer.from_pretrained(
             torch_model_id,

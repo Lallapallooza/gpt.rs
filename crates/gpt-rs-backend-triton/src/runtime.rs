@@ -92,9 +92,30 @@ impl TritonExecutor {
             values.insert(*value_id, input.clone());
         }
 
-        for instruction in &function.body {
-            let output = self.execute_instruction(&driver, &kernels, &values, instruction)?;
-            values.insert(instruction.id, output);
+        let mut pending = function.body.iter().collect::<Vec<_>>();
+        while !pending.is_empty() {
+            let mut next = Vec::new();
+            let mut progress = false;
+            for instruction in pending {
+                if !instruction_operands_ready(instruction, &values) {
+                    next.push(instruction);
+                    continue;
+                }
+                let output = self.execute_instruction(&driver, &kernels, &values, instruction)?;
+                values.insert(instruction.id, output);
+                progress = true;
+            }
+            if !progress {
+                let instruction = next[0];
+                let missing = first_missing_operand_value(instruction, &values)
+                    .map(|id| id.0.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                return Err(BackendError::execution(format!(
+                    "triton runtime dependency resolution stalled at value {} for instruction {} ({:?})",
+                    missing, instruction.id.0, instruction.op
+                )));
+            }
+            pending = next;
         }
 
         let mut results = Vec::with_capacity(function.result_ids.len());
@@ -396,7 +417,9 @@ impl TritonExecutor {
         if n == 0 {
             return Ok(out);
         }
-        let n_u32 = usize_to_u32(n, "fused elementwise element count")?;
+        let n_u32 = u32::try_from(n).map_err(|_| {
+            BackendError::execution("fused elementwise element count exceeds u32 range")
+        })?;
         let mut params: Vec<*mut c_void> = Vec::with_capacity(input_tensors.len() + 3);
         let mut ptr_args: Vec<u64> = input_tensors
             .iter()
@@ -632,7 +655,8 @@ impl TritonExecutor {
 
         let mut in_ptr = input.buffer.device_ptr();
         let mut out_ptr = out.buffer.device_ptr();
-        let mut n = usize_to_u32(element_count, "broadcast element count")?;
+        let mut n = u32::try_from(element_count)
+            .map_err(|_| BackendError::execution("broadcast element count exceeds u32 range"))?;
         let mut od0 = out_dims[0];
         let mut od1 = out_dims[1];
         let mut od2 = out_dims[2];
@@ -755,7 +779,8 @@ impl TritonExecutor {
 
         let mut in_ptr = input.buffer.device_ptr();
         let mut out_ptr = out.buffer.device_ptr();
-        let mut n = usize_to_u32(element_count, "slice element count")?;
+        let mut n = u32::try_from(element_count)
+            .map_err(|_| BackendError::execution("slice element count exceeds u32 range"))?;
         let mut od0 = out_dims[0];
         let mut od1 = out_dims[1];
         let mut od2 = out_dims[2];
@@ -906,7 +931,8 @@ impl TritonExecutor {
 
         let mut in_ptr = input.buffer.device_ptr();
         let mut out_ptr = out.buffer.device_ptr();
-        let mut n = usize_to_u32(element_count, "transpose element count")?;
+        let mut n = u32::try_from(element_count)
+            .map_err(|_| BackendError::execution("transpose element count exceeds u32 range"))?;
         let mut od0 = out_dims[0];
         let mut od1 = out_dims[1];
         let mut od2 = out_dims[2];
@@ -976,7 +1002,8 @@ impl TritonExecutor {
         let mut lhs_ptr = lhs.buffer.device_ptr();
         let mut rhs_ptr = rhs.buffer.device_ptr();
         let mut out_ptr = out.buffer.device_ptr();
-        let mut n = usize_to_u32(element_count, "concat element count")?;
+        let mut n = u32::try_from(element_count)
+            .map_err(|_| BackendError::execution("concat element count exceeds u32 range"))?;
         let mut od0 = out_dims[0];
         let mut od1 = out_dims[1];
         let mut od2 = out_dims[2];
@@ -1056,10 +1083,12 @@ impl TritonExecutor {
         let aligned_axis = (4usize - out_dims.len())
             .checked_add(spec.axis)
             .ok_or_else(|| BackendError::execution("iota axis alignment overflow"))?;
-        let axis = usize_to_i32(aligned_axis, "iota axis")?;
+        let axis = i32::try_from(aligned_axis)
+            .map_err(|_| BackendError::execution("iota axis exceeds i32 range"))?;
 
         let mut out_ptr = out.buffer.device_ptr();
-        let mut n = usize_to_u32(element_count, "iota element count")?;
+        let mut n = u32::try_from(element_count)
+            .map_err(|_| BackendError::execution("iota element count exceeds u32 range"))?;
         let mut od0 = od0;
         let mut od1 = od1;
         let mut od2 = od2;
@@ -1113,7 +1142,8 @@ impl TritonExecutor {
         let mut lhs_ptr = lhs.buffer.device_ptr();
         let mut rhs_ptr = rhs.buffer.device_ptr();
         let mut out_ptr = out.buffer.device_ptr();
-        let mut n = usize_to_u32(element_count, "compare element count")?;
+        let mut n = u32::try_from(element_count)
+            .map_err(|_| BackendError::execution("compare element count exceeds u32 range"))?;
         let mut op_u32 = opcode;
         let mut opaque_ptr = 0u64;
         let mut params = [
@@ -1166,7 +1196,8 @@ impl TritonExecutor {
         let mut true_ptr = when_true.buffer.device_ptr();
         let mut false_ptr = when_false.buffer.device_ptr();
         let mut out_ptr = out.buffer.device_ptr();
-        let mut n = usize_to_u32(element_count, "select element count")?;
+        let mut n = u32::try_from(element_count)
+            .map_err(|_| BackendError::execution("select element count exceeds u32 range"))?;
         let mut opaque_ptr = 0u64;
         let mut params = [
             (&mut pred_ptr as *mut u64).cast::<c_void>(),
@@ -1232,9 +1263,12 @@ impl TritonExecutor {
         let mut weight_ptr = params.buffer.device_ptr();
         let mut indices_ptr = indices.buffer.device_ptr();
         let mut out_ptr = out.buffer.device_ptr();
-        let mut n = usize_to_u32(out_count, "take element count")?;
-        let mut embed = usize_to_i32(embed_dim, "take embed_dim")?;
-        let mut vocab = usize_to_i32(vocab, "take vocab")?;
+        let mut n = u32::try_from(out_count)
+            .map_err(|_| BackendError::execution("take element count exceeds u32 range"))?;
+        let mut embed = i32::try_from(embed_dim)
+            .map_err(|_| BackendError::execution("take embed_dim exceeds i32 range"))?;
+        let mut vocab = i32::try_from(vocab)
+            .map_err(|_| BackendError::execution("take vocab exceeds i32 range"))?;
         let mut opaque_ptr = 0u64;
         let mut params_arr = [
             (&mut weight_ptr as *mut u64).cast::<c_void>(),
@@ -1326,7 +1360,9 @@ impl TritonExecutor {
 
         let mut update_ptr = update.buffer.device_ptr();
         let mut out_ptr = out.buffer.device_ptr();
-        let mut n = usize_to_u32(update_elems, "dynamic_update_slice update elements")?;
+        let mut n = u32::try_from(update_elems).map_err(|_| {
+            BackendError::execution("dynamic_update_slice update elements exceeds u32 range")
+        })?;
         let mut ud0 = update_dims4[0];
         let mut ud1 = update_dims4[1];
         let mut ud2 = update_dims4[2];
@@ -1444,8 +1480,10 @@ impl TritonExecutor {
         let loaded = self.load_kernel(driver, kernel)?;
         let mut in_ptr = input.buffer.device_ptr();
         let mut out_ptr = out.buffer.device_ptr();
-        let mut rows_i32 = usize_to_i32(rows, "reduce_max rows")?;
-        let mut cols_i32 = usize_to_i32(cols, "reduce_max cols")?;
+        let mut rows_i32 = i32::try_from(rows)
+            .map_err(|_| BackendError::execution("reduce_max rows exceeds i32 range"))?;
+        let mut cols_i32 = i32::try_from(cols)
+            .map_err(|_| BackendError::execution("reduce_max cols exceeds i32 range"))?;
         let mut opaque_ptr = 0u64;
         let mut params = [
             (&mut in_ptr as *mut u64).cast::<c_void>(),
@@ -1454,7 +1492,8 @@ impl TritonExecutor {
             (&mut cols_i32 as *mut i32).cast::<c_void>(),
             (&mut opaque_ptr as *mut u64).cast::<c_void>(),
         ];
-        let rows_u32 = usize_to_u32(rows, "reduce_max rows")?;
+        let rows_u32 = u32::try_from(rows)
+            .map_err(|_| BackendError::execution("reduce_max rows exceeds u32 range"))?;
         launch_program_grid(driver, &loaded, rows_u32, 256, rows_u32, &mut params)?;
         Ok(out)
     }
@@ -1508,21 +1547,37 @@ impl TritonExecutor {
 
         let mut in_ptr = input.buffer.device_ptr();
         let mut out_ptr = out.buffer.device_ptr();
-        let mut n = usize_to_u32(elem_count, "extract_patches element count")?;
-        let mut in_h = usize_to_i32(in_dims[1], "extract_patches in_h")?;
-        let mut in_w = usize_to_i32(in_dims[2], "extract_patches in_w")?;
-        let mut in_c = usize_to_i32(in_dims[3], "extract_patches in_c")?;
-        let mut out_h = usize_to_i32(out_dims[1], "extract_patches out_h")?;
-        let mut out_w = usize_to_i32(out_dims[2], "extract_patches out_w")?;
-        let mut k_h = usize_to_i32(spec.window[0], "extract_patches k_h")?;
-        let mut k_w = usize_to_i32(spec.window[1], "extract_patches k_w")?;
-        let mut s_h = usize_to_i32(spec.strides[0], "extract_patches s_h")?;
-        let mut s_w = usize_to_i32(spec.strides[1], "extract_patches s_w")?;
-        let mut d_h = usize_to_i32(spec.dilation[0], "extract_patches d_h")?;
-        let mut d_w = usize_to_i32(spec.dilation[1], "extract_patches d_w")?;
-        let mut pad_top = usize_to_i32(spec.padding[0].0, "extract_patches pad_top")?;
-        let mut pad_left = usize_to_i32(spec.padding[1].0, "extract_patches pad_left")?;
-        let mut patch_dim_i32 = usize_to_i32(patch_dim, "extract_patches patch_dim")?;
+        let mut n = u32::try_from(elem_count).map_err(|_| {
+            BackendError::execution("extract_patches element count exceeds u32 range")
+        })?;
+        let mut in_h = i32::try_from(in_dims[1])
+            .map_err(|_| BackendError::execution("extract_patches in_h exceeds i32 range"))?;
+        let mut in_w = i32::try_from(in_dims[2])
+            .map_err(|_| BackendError::execution("extract_patches in_w exceeds i32 range"))?;
+        let mut in_c = i32::try_from(in_dims[3])
+            .map_err(|_| BackendError::execution("extract_patches in_c exceeds i32 range"))?;
+        let mut out_h = i32::try_from(out_dims[1])
+            .map_err(|_| BackendError::execution("extract_patches out_h exceeds i32 range"))?;
+        let mut out_w = i32::try_from(out_dims[2])
+            .map_err(|_| BackendError::execution("extract_patches out_w exceeds i32 range"))?;
+        let mut k_h = i32::try_from(spec.window[0])
+            .map_err(|_| BackendError::execution("extract_patches k_h exceeds i32 range"))?;
+        let mut k_w = i32::try_from(spec.window[1])
+            .map_err(|_| BackendError::execution("extract_patches k_w exceeds i32 range"))?;
+        let mut s_h = i32::try_from(spec.strides[0])
+            .map_err(|_| BackendError::execution("extract_patches s_h exceeds i32 range"))?;
+        let mut s_w = i32::try_from(spec.strides[1])
+            .map_err(|_| BackendError::execution("extract_patches s_w exceeds i32 range"))?;
+        let mut d_h = i32::try_from(spec.dilation[0])
+            .map_err(|_| BackendError::execution("extract_patches d_h exceeds i32 range"))?;
+        let mut d_w = i32::try_from(spec.dilation[1])
+            .map_err(|_| BackendError::execution("extract_patches d_w exceeds i32 range"))?;
+        let mut pad_top = i32::try_from(spec.padding[0].0)
+            .map_err(|_| BackendError::execution("extract_patches pad_top exceeds i32 range"))?;
+        let mut pad_left = i32::try_from(spec.padding[1].0)
+            .map_err(|_| BackendError::execution("extract_patches pad_left exceeds i32 range"))?;
+        let mut patch_dim_i32 = i32::try_from(patch_dim)
+            .map_err(|_| BackendError::execution("extract_patches patch_dim exceeds i32 range"))?;
         let mut opaque_ptr = 0u64;
         let mut params = [
             (&mut in_ptr as *mut u64).cast::<c_void>(),
@@ -1613,20 +1668,35 @@ impl TritonExecutor {
 
         let mut in_ptr = input.buffer.device_ptr();
         let mut out_ptr = out.buffer.device_ptr();
-        let mut n = usize_to_u32(elem_count, "reduce_window element count")?;
-        let mut in_h = usize_to_i32(in_dims[1], "reduce_window in_h")?;
-        let mut in_w = usize_to_i32(in_dims[2], "reduce_window in_w")?;
-        let mut in_c = usize_to_i32(in_dims[3], "reduce_window in_c")?;
-        let mut out_h = usize_to_i32(out_dims[1], "reduce_window out_h")?;
-        let mut out_w = usize_to_i32(out_dims[2], "reduce_window out_w")?;
-        let mut k_h = usize_to_i32(spec.window_dims[1], "reduce_window k_h")?;
-        let mut k_w = usize_to_i32(spec.window_dims[2], "reduce_window k_w")?;
-        let mut s_h = usize_to_i32(spec.strides[1], "reduce_window s_h")?;
-        let mut s_w = usize_to_i32(spec.strides[2], "reduce_window s_w")?;
-        let mut d_h = usize_to_i32(spec.window_dilation[1], "reduce_window d_h")?;
-        let mut d_w = usize_to_i32(spec.window_dilation[2], "reduce_window d_w")?;
-        let mut pad_top = usize_to_i32(spec.padding[1].0, "reduce_window pad_top")?;
-        let mut pad_left = usize_to_i32(spec.padding[2].0, "reduce_window pad_left")?;
+        let mut n = u32::try_from(elem_count).map_err(|_| {
+            BackendError::execution("reduce_window element count exceeds u32 range")
+        })?;
+        let mut in_h = i32::try_from(in_dims[1])
+            .map_err(|_| BackendError::execution("reduce_window in_h exceeds i32 range"))?;
+        let mut in_w = i32::try_from(in_dims[2])
+            .map_err(|_| BackendError::execution("reduce_window in_w exceeds i32 range"))?;
+        let mut in_c = i32::try_from(in_dims[3])
+            .map_err(|_| BackendError::execution("reduce_window in_c exceeds i32 range"))?;
+        let mut out_h = i32::try_from(out_dims[1])
+            .map_err(|_| BackendError::execution("reduce_window out_h exceeds i32 range"))?;
+        let mut out_w = i32::try_from(out_dims[2])
+            .map_err(|_| BackendError::execution("reduce_window out_w exceeds i32 range"))?;
+        let mut k_h = i32::try_from(spec.window_dims[1])
+            .map_err(|_| BackendError::execution("reduce_window k_h exceeds i32 range"))?;
+        let mut k_w = i32::try_from(spec.window_dims[2])
+            .map_err(|_| BackendError::execution("reduce_window k_w exceeds i32 range"))?;
+        let mut s_h = i32::try_from(spec.strides[1])
+            .map_err(|_| BackendError::execution("reduce_window s_h exceeds i32 range"))?;
+        let mut s_w = i32::try_from(spec.strides[2])
+            .map_err(|_| BackendError::execution("reduce_window s_w exceeds i32 range"))?;
+        let mut d_h = i32::try_from(spec.window_dilation[1])
+            .map_err(|_| BackendError::execution("reduce_window d_h exceeds i32 range"))?;
+        let mut d_w = i32::try_from(spec.window_dilation[2])
+            .map_err(|_| BackendError::execution("reduce_window d_w exceeds i32 range"))?;
+        let mut pad_top = i32::try_from(spec.padding[1].0)
+            .map_err(|_| BackendError::execution("reduce_window pad_top exceeds i32 range"))?;
+        let mut pad_left = i32::try_from(spec.padding[2].0)
+            .map_err(|_| BackendError::execution("reduce_window pad_left exceeds i32 range"))?;
         let mut opaque_ptr = 0u64;
         let mut params = [
             (&mut in_ptr as *mut u64).cast::<c_void>(),
@@ -1890,8 +1960,10 @@ impl TritonExecutor {
         let loaded = self.load_kernel(driver, kernel)?;
         let mut in_ptr = input.buffer.device_ptr();
         let mut out_ptr = out.buffer.device_ptr();
-        let mut rows_i32 = usize_to_i32(rows, "reduce_sum rows")?;
-        let mut cols_i32 = usize_to_i32(cols, "reduce_sum cols")?;
+        let mut rows_i32 = i32::try_from(rows)
+            .map_err(|_| BackendError::execution("reduce_sum rows exceeds i32 range"))?;
+        let mut cols_i32 = i32::try_from(cols)
+            .map_err(|_| BackendError::execution("reduce_sum cols exceeds i32 range"))?;
         let mut opaque_ptr = 0u64;
         let mut params = [
             (&mut in_ptr as *mut u64).cast::<c_void>(),
@@ -1900,7 +1972,8 @@ impl TritonExecutor {
             (&mut cols_i32 as *mut i32).cast::<c_void>(),
             (&mut opaque_ptr as *mut u64).cast::<c_void>(),
         ];
-        let rows_u32 = usize_to_u32(rows, "reduce_sum rows")?;
+        let rows_u32 = u32::try_from(rows)
+            .map_err(|_| BackendError::execution("reduce_sum rows exceeds u32 range"))?;
         launch_program_grid(driver, &loaded, rows_u32, 256, rows_u32, &mut params)?;
         Ok(out)
     }
@@ -1964,6 +2037,33 @@ impl TritonExecutor {
             ))),
         }
     }
+}
+
+fn instruction_operands_ready(
+    instruction: &gpt_rs::backend::spec::Instruction,
+    values: &HashMap<ValueId, TritonTensor>,
+) -> bool {
+    instruction.operands.iter().all(|operand| match operand {
+        Operand::Value(id) => values.contains_key(id),
+        Operand::TupleElement { tuple, .. } => values.contains_key(tuple),
+        Operand::Literal(_) => true,
+    })
+}
+
+fn first_missing_operand_value(
+    instruction: &gpt_rs::backend::spec::Instruction,
+    values: &HashMap<ValueId, TritonTensor>,
+) -> Option<ValueId> {
+    for operand in &instruction.operands {
+        match operand {
+            Operand::Value(id) if !values.contains_key(id) => return Some(*id),
+            Operand::TupleElement { tuple, .. } if !values.contains_key(tuple) => {
+                return Some(*tuple)
+            }
+            Operand::Literal(_) | Operand::Value(_) | Operand::TupleElement { .. } => {}
+        }
+    }
+    None
 }
 
 struct LoadedKernel {
@@ -2036,14 +2136,6 @@ fn static_element_count(shape: &gpt_rs::backend::spec::Shape) -> BackendResult<u
     })
 }
 
-fn usize_to_u32(value: usize, what: &str) -> BackendResult<u32> {
-    u32::try_from(value).map_err(|_| BackendError::execution(format!("{what} exceeds u32 range")))
-}
-
-fn usize_to_i32(value: usize, what: &str) -> BackendResult<i32> {
-    i32::try_from(value).map_err(|_| BackendError::execution(format!("{what} exceeds i32 range")))
-}
-
 fn align_dims4(dims: &[usize]) -> BackendResult<(i32, i32, i32, i32)> {
     if dims.len() > 4 {
         return Err(BackendError::execution(format!(
@@ -2057,10 +2149,10 @@ fn align_dims4(dims: &[usize]) -> BackendResult<(i32, i32, i32, i32)> {
         aligned[offset + idx] = *value;
     }
     Ok((
-        usize_to_i32(aligned[0], "dim0")?,
-        usize_to_i32(aligned[1], "dim1")?,
-        usize_to_i32(aligned[2], "dim2")?,
-        usize_to_i32(aligned[3], "dim3")?,
+        i32::try_from(aligned[0]).map_err(|_| BackendError::execution("dim0 exceeds i32 range"))?,
+        i32::try_from(aligned[1]).map_err(|_| BackendError::execution("dim1 exceeds i32 range"))?,
+        i32::try_from(aligned[2]).map_err(|_| BackendError::execution("dim2 exceeds i32 range"))?,
+        i32::try_from(aligned[3]).map_err(|_| BackendError::execution("dim3 exceeds i32 range"))?,
     ))
 }
 
@@ -2111,8 +2203,10 @@ fn broadcast_rank4_layout(
         } else {
             base_strides[axis]
         };
-        in_strides[axis] = usize_to_i32(stride, "broadcast input stride")?;
-        out_i32[axis] = usize_to_i32(out_dim, "broadcast output dim")?;
+        in_strides[axis] = i32::try_from(stride)
+            .map_err(|_| BackendError::execution("broadcast input stride exceeds i32 range"))?;
+        out_i32[axis] = i32::try_from(out_dim)
+            .map_err(|_| BackendError::execution("broadcast output dim exceeds i32 range"))?;
     }
 
     Ok((out_i32, in_strides))
@@ -2160,9 +2254,12 @@ fn slice_rank4_layout(
     let mut strides_i32 = [0i32; 4];
     let mut starts_i32 = [0i32; 4];
     for axis in 0..4 {
-        out_i32[axis] = usize_to_i32(out4[axis], "slice output dim")?;
-        strides_i32[axis] = usize_to_i32(strides[axis], "slice input stride")?;
-        starts_i32[axis] = usize_to_i32(starts4[axis], "slice start")?;
+        out_i32[axis] = i32::try_from(out4[axis])
+            .map_err(|_| BackendError::execution("slice output dim exceeds i32 range"))?;
+        strides_i32[axis] = i32::try_from(strides[axis])
+            .map_err(|_| BackendError::execution("slice input stride exceeds i32 range"))?;
+        starts_i32[axis] = i32::try_from(starts4[axis])
+            .map_err(|_| BackendError::execution("slice start exceeds i32 range"))?;
     }
     Ok((out_i32, strides_i32, starts_i32))
 }
@@ -2211,8 +2308,10 @@ fn transpose_rank5_layout(
     let mut out_i32 = [0i32; 5];
     let mut strides_i32 = [0i32; 5];
     for axis in 0..5 {
-        out_i32[axis] = usize_to_i32(out5[axis], "transpose output dim")?;
-        strides_i32[axis] = usize_to_i32(strides5[axis], "transpose input stride")?;
+        out_i32[axis] = i32::try_from(out5[axis])
+            .map_err(|_| BackendError::execution("transpose output dim exceeds i32 range"))?;
+        strides_i32[axis] = i32::try_from(strides5[axis])
+            .map_err(|_| BackendError::execution("transpose input stride exceeds i32 range"))?;
     }
     Ok((out_i32, strides_i32))
 }
@@ -2289,13 +2388,18 @@ fn concat_rank4_layout(
     let mut lhs_i32 = [0i32; 4];
     let mut rhs_i32 = [0i32; 4];
     for idx in 0..4 {
-        out_i32[idx] = usize_to_i32(out4[idx], "concat output dim")?;
-        lhs_i32[idx] = usize_to_i32(lhs4[idx], "concat lhs stride")?;
-        rhs_i32[idx] = usize_to_i32(rhs4[idx], "concat rhs stride")?;
+        out_i32[idx] = i32::try_from(out4[idx])
+            .map_err(|_| BackendError::execution("concat output dim exceeds i32 range"))?;
+        lhs_i32[idx] = i32::try_from(lhs4[idx])
+            .map_err(|_| BackendError::execution("concat lhs stride exceeds i32 range"))?;
+        rhs_i32[idx] = i32::try_from(rhs4[idx])
+            .map_err(|_| BackendError::execution("concat rhs stride exceeds i32 range"))?;
     }
 
-    let axis_i32 = usize_to_i32(offset + axis, "concat axis")?;
-    let split_i32 = usize_to_i32(lhs_dims[axis], "concat split")?;
+    let axis_i32 = i32::try_from(offset + axis)
+        .map_err(|_| BackendError::execution("concat axis exceeds i32 range"))?;
+    let split_i32 = i32::try_from(lhs_dims[axis])
+        .map_err(|_| BackendError::execution("concat split exceeds i32 range"))?;
     Ok((out_i32, lhs_i32, rhs_i32, axis_i32, split_i32))
 }
 
@@ -2329,9 +2433,13 @@ fn dynamic_update_rank4_layout(
     let mut out_strides_i32 = [0i32; 4];
     let mut starts_i32 = [0i32; 4];
     for idx in 0..4 {
-        update_i32[idx] = usize_to_i32(update4[idx], "dynamic_update update dim")?;
-        out_strides_i32[idx] = usize_to_i32(out_strides4[idx], "dynamic_update output stride")?;
-        starts_i32[idx] = usize_to_i32(starts4[idx], "dynamic_update start")?;
+        update_i32[idx] = i32::try_from(update4[idx])
+            .map_err(|_| BackendError::execution("dynamic_update update dim exceeds i32 range"))?;
+        out_strides_i32[idx] = i32::try_from(out_strides4[idx]).map_err(|_| {
+            BackendError::execution("dynamic_update output stride exceeds i32 range")
+        })?;
+        starts_i32[idx] = i32::try_from(starts4[idx])
+            .map_err(|_| BackendError::execution("dynamic_update start exceeds i32 range"))?;
     }
     Ok((update_i32, out_strides_i32, starts_i32))
 }

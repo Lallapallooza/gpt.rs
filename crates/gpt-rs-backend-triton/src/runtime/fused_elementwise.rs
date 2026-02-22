@@ -4,6 +4,7 @@ use std::hash::{Hash, Hasher};
 use gpt_rs::backend::fusion::{
     FUSION_ATTR_KIND, FUSION_ATTR_VERSION, FUSION_KIND_ELEMENTWISE_DAG_V1,
 };
+use gpt_rs::backend::shape_helpers::{contiguous_strides_or_error, static_dims_or_error};
 use gpt_rs::backend::spec::{
     BackendError, BackendResult, CustomCallAttr, CustomCallSpec, DType, TensorSpec,
 };
@@ -80,10 +81,20 @@ impl FusedElementwisePlan {
             }
         }
 
-        let out_dims = static_dims(&out_spec.shape)?;
+        let out_dims = static_dims_or_error(&out_spec.shape, |_| {
+            BackendError::execution(
+                "dynamic dimensions are not supported by fused elementwise runtime",
+            )
+        })?;
         let input_dims = input_specs
             .iter()
-            .map(|spec| static_dims(&spec.shape))
+            .map(|spec| {
+                static_dims_or_error(&spec.shape, |_| {
+                    BackendError::execution(
+                        "dynamic dimensions are not supported by fused elementwise runtime",
+                    )
+                })
+            })
             .collect::<BackendResult<Vec<_>>>()?;
 
         let source = emit_kernel_source(
@@ -201,7 +212,9 @@ fn emit_kernel_source(
 
     for (input_idx, dims) in input_dims.iter().enumerate() {
         let aligned = align_shape_to_rank(dims, out_dims.len())?;
-        let strides = contiguous_strides(aligned.as_slice())?;
+        let strides = contiguous_strides_or_error(aligned.as_slice(), || {
+            BackendError::execution("stride overflow")
+        })?;
         let index = input_index_expr(aligned.as_slice(), strides.as_slice(), out_dims.len());
         out.line(format!(
             "    in{input_idx} = tl.load(in{input_idx}_ptr + ({index}), mask=mask, other=0.0)"
@@ -292,7 +305,8 @@ fn input_index_expr(aligned_dims: &[usize], strides: &[usize], rank: usize) -> S
         }
     }
     if terms.is_empty() {
-        "0".to_string()
+        // Keep the index block-shaped for masked loads from broadcast scalars.
+        "offs * 0".to_string()
     } else {
         terms.join(" + ")
     }
@@ -366,33 +380,6 @@ fn align_shape_to_rank(dims: &[usize], rank: usize) -> BackendResult<Vec<usize>>
     let start = rank - dims.len();
     aligned[start..].copy_from_slice(dims);
     Ok(aligned)
-}
-
-fn static_dims(shape: &gpt_rs::backend::spec::Shape) -> BackendResult<Vec<usize>> {
-    let mut dims = Vec::with_capacity(shape.rank());
-    for dim in shape.dims() {
-        match dim {
-            gpt_rs::backend::spec::Dimension::Static(value) => dims.push(*value),
-            gpt_rs::backend::spec::Dimension::Dynamic(_) => {
-                return Err(BackendError::execution(
-                    "dynamic dimensions are not supported by fused elementwise runtime",
-                ))
-            }
-        }
-    }
-    Ok(dims)
-}
-
-fn contiguous_strides(dims: &[usize]) -> BackendResult<Vec<usize>> {
-    let mut strides = vec![0usize; dims.len()];
-    let mut stride = 1usize;
-    for axis in (0..dims.len()).rev() {
-        strides[axis] = stride;
-        stride = stride
-            .checked_mul(dims[axis])
-            .ok_or_else(|| BackendError::execution("stride overflow"))?;
-    }
-    Ok(strides)
 }
 
 fn fused_kernel_hash(

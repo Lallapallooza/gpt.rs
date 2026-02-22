@@ -13,14 +13,15 @@ impl BackendPipeline<crate::TritonBackend> for TritonPipeline {
         // Reserved for layout/dtype normalization passes.
     }
 
-    fn populate_fuse(&self, p: &mut PipelineBuilder<crate::TritonBackend>) {
+    fn populate_fuse(&self, _p: &mut PipelineBuilder<crate::TritonBackend>) {
+        // Fusion hints are emitted in cleanup so post-fusion canonicalization/CSE/DCE
+        // cannot invalidate hint bodies or captured inputs.
+    }
+
+    fn populate_cleanup(&self, p: &mut PipelineBuilder<crate::TritonBackend>) {
         let pass =
             FusionHintPass::new(Arc::new(TritonHintLegalizer), Arc::new(TritonHintCostModel))
                 .with_min_score(0);
         p.pass(Arc::new(pass));
-    }
-
-    fn populate_cleanup(&self, _p: &mut PipelineBuilder<crate::TritonBackend>) {
-        // Reserved for post-fusion canonicalization passes.
     }
 }

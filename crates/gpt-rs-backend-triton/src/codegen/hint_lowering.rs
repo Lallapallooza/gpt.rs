@@ -76,6 +76,15 @@ fn lower_function_hints(function: &mut Function) -> ConversionResult<()> {
             }
             continue;
         }
+        if !inputs_available_before(function, hint.inputs.as_slice(), insert_pos, &covered) {
+            if hint.policy == HintPolicy::Required {
+                return Err(ConversionError::new(format!(
+                    "required hint id={} references inputs that are unavailable at insertion point",
+                    hint.id
+                )));
+            }
+            continue;
+        }
 
         let mut removed_any = false;
         function.body.retain(|inst| {
@@ -163,4 +172,27 @@ fn custom_call_string(attr: Option<&CustomCallAttr>) -> Option<&str> {
         Some(CustomCallAttr::String(value)) => Some(value.as_str()),
         _ => None,
     }
+}
+
+fn inputs_available_before(
+    function: &Function,
+    inputs: &[ValueId],
+    insert_pos: usize,
+    covered: &HashSet<ValueId>,
+) -> bool {
+    for input in inputs {
+        if covered.contains(input) {
+            return false;
+        }
+        if function.parameter_ids.contains(input) {
+            continue;
+        }
+        let Some(def_pos) = function.body.iter().position(|inst| inst.id == *input) else {
+            return false;
+        };
+        if def_pos >= insert_pos {
+            return false;
+        }
+    }
+    true
 }

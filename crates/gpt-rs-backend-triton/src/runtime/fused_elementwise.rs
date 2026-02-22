@@ -1,12 +1,14 @@
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 
+use gpt_rs::backend::fusion::{
+    FUSION_ATTR_KIND, FUSION_ATTR_VERSION, FUSION_KIND_ELEMENTWISE_DAG_V1,
+};
 use gpt_rs::backend::spec::{
     BackendError, BackendResult, CustomCallAttr, CustomCallSpec, DType, TensorSpec,
 };
 
 use crate::kernels::{KernelKind, KernelSpec};
-use crate::targets::{FUSION_ATTR_KIND, FUSION_ATTR_VERSION, FUSION_KIND_ELEMENTWISE_DAG_V1};
 
 #[derive(Debug, Clone)]
 pub struct FusedElementwisePlan {

@@ -4,6 +4,7 @@ mod broadcast_canonicalization;
 mod cast_canonicalization;
 mod cse;
 mod dce;
+mod elementwise_dag_fusion;
 mod elementwise_simplification;
 mod param_only_fold_to_param;
 mod reshape_canonicalization;
@@ -16,6 +17,7 @@ pub use broadcast_canonicalization::{
 pub use cast_canonicalization::{CastCanonicalizationPass, EliminateRedundantCast};
 pub use cse::CommonSubexpressionEliminationPass;
 pub use dce::DeadCodeEliminationPass;
+pub use elementwise_dag_fusion::ElementwiseDagFusionPass;
 pub use elementwise_simplification::ElementwiseSimplificationPass;
 pub use param_only_fold_to_param::ParamOnlyFoldToParamPass;
 pub use reshape_canonicalization::{

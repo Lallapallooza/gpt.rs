@@ -1,4 +1,7 @@
 use gpt_rs::backend::conversion::{ConversionError, ConversionResult};
+use gpt_rs::backend::fusion::{
+    FUSION_ATTR_KIND, FUSION_ATTR_VERSION, FUSION_KIND_ELEMENTWISE_DAG_V1,
+};
 use gpt_rs::backend::spec::{
     CustomCallAttr, DType, ElementwiseUnaryOp, Function, Operand, Operation, Program, ReduceKind,
     TensorSpec, ValueType,
@@ -13,10 +16,7 @@ use crate::kernels::{
     reduce_window_max_nhwc_kernel_spec, select_i1_f32_kernel_spec, slice_kernel_spec,
     take_f32_i32_kernel_spec, transpose_kernel_spec,
 };
-use crate::targets::{
-    FUSION_ATTR_KIND, FUSION_ATTR_VERSION, FUSION_KIND_ELEMENTWISE_DAG_V1,
-    TARGET_ELEMENTWISE_FUSED_F32_V1,
-};
+use crate::targets::TARGET_ELEMENTWISE_FUSED_F32_V1;
 
 pub fn lower_program_to_artifact(
     program: &Program,

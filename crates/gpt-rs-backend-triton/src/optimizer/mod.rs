@@ -1,6 +1,4 @@
-mod fusion;
 mod pipeline;
-mod utils;
 
 use gpt_rs::backend::conversion::ConversionResult;
 use gpt_rs::backend::optimizer::{

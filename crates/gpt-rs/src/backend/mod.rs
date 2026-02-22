@@ -1,5 +1,6 @@
 pub mod conversion;
 pub mod driver;
+pub mod fusion;
 pub mod index;
 pub mod optimizer;
 pub mod param_resolver;

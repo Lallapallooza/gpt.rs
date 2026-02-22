@@ -1,3 +1,5 @@
+mod fused_elementwise;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -5,9 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use gpt_rs::backend::spec::{
-    BackendError, BackendResult, ComparisonOp, DType, Dimension, ElementwiseBinaryOp,
-    ElementwiseUnaryOp, Operand, Operation, ReduceKind, TensorLiteral, TensorSpec, ValueId,
-    ValueType,
+    BackendError, BackendResult, ComparisonOp, CustomCallSpec, DType, Dimension,
+    ElementwiseBinaryOp, ElementwiseUnaryOp, Operand, Operation, ReduceKind, TensorLiteral,
+    TensorSpec, ValueId, ValueType,
 };
 use gpt_rs::profiling::{self, ScopeMeta, WorkStats};
 use libloading::Library;
@@ -23,6 +25,7 @@ use crate::kernels::{
     REDUCE_WINDOW_MAX_NHWC_KERNEL_ID, SELECT_I1_F32_KERNEL_ID, SLICE_KERNEL_ID,
     TAKE_F32_I32_KERNEL_ID, TRANSPOSE_KERNEL_ID,
 };
+use crate::targets::TARGET_ELEMENTWISE_FUSED_F32_V1;
 use crate::tensor::TritonTensor;
 
 thread_local! {
@@ -299,6 +302,10 @@ impl TritonExecutor {
                     })?;
                 self.execute_reduce_window(driver, kernel, &input, spec, &out_spec)
             }
+            Operation::CustomCall(spec) => {
+                let out_spec = output_tensor_spec(&instruction.output)?;
+                self.execute_custom_call(driver, values, instruction, spec, &out_spec)
+            }
             other => Err(BackendError::execution(format!(
                 "triton runtime does not support instruction op: {:?}",
                 other
@@ -325,6 +332,74 @@ impl TritonExecutor {
             )),
             None => Err(BackendError::execution("missing instruction operand")),
         }
+    }
+
+    fn execute_custom_call(
+        &self,
+        driver: &Arc<CudaDriver>,
+        values: &HashMap<ValueId, TritonTensor>,
+        instruction: &gpt_rs::backend::spec::Instruction,
+        spec: &CustomCallSpec,
+        out_spec: &TensorSpec,
+    ) -> BackendResult<TritonTensor> {
+        match spec.target.as_str() {
+            TARGET_ELEMENTWISE_FUSED_F32_V1 => self.execute_fused_elementwise_custom_call(
+                driver,
+                values,
+                instruction,
+                spec,
+                out_spec,
+            ),
+            _ => Err(BackendError::execution(format!(
+                "unsupported triton custom_call target '{}'",
+                spec.target
+            ))),
+        }
+    }
+
+    fn execute_fused_elementwise_custom_call(
+        &self,
+        driver: &Arc<CudaDriver>,
+        values: &HashMap<ValueId, TritonTensor>,
+        instruction: &gpt_rs::backend::spec::Instruction,
+        spec: &CustomCallSpec,
+        out_spec: &TensorSpec,
+    ) -> BackendResult<TritonTensor> {
+        let plan = fused_elementwise::FusedElementwisePlan::parse(spec)?;
+        let input_tensors = instruction
+            .operands
+            .iter()
+            .map(|operand| self.resolve_operand_tensor(driver, values, Some(operand)))
+            .collect::<BackendResult<Vec<_>>>()?;
+        let input_specs = input_tensors
+            .iter()
+            .map(|tensor| tensor.spec.clone())
+            .collect::<Vec<_>>();
+        let kernel = plan.build_kernel_spec(out_spec, input_specs.as_slice())?;
+
+        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let loaded = self.load_kernel(driver, &kernel)?;
+        let n = static_element_count(&out_spec.shape)?;
+        if n == 0 {
+            return Ok(out);
+        }
+        let n_u32 = usize_to_u32(n, "fused elementwise element count")?;
+        let mut params: Vec<*mut c_void> = Vec::with_capacity(input_tensors.len() + 3);
+        let mut ptr_args: Vec<u64> = input_tensors
+            .iter()
+            .map(|tensor| tensor.buffer.device_ptr())
+            .collect::<Vec<_>>();
+        for ptr in &mut ptr_args {
+            params.push((ptr as *mut u64).cast::<c_void>());
+        }
+        let mut out_ptr = out.buffer.device_ptr();
+        params.push((&mut out_ptr as *mut u64).cast::<c_void>());
+        let mut n_kernel = n_u32;
+        params.push((&mut n_kernel as *mut u32).cast::<c_void>());
+        let mut opaque_ptr = 0u64;
+        params.push((&mut opaque_ptr as *mut u64).cast::<c_void>());
+        launch_1d(driver, &loaded, n_u32, 256, params.as_mut_slice())?;
+        Ok(out)
     }
 
     fn execute_elementwise_binary(

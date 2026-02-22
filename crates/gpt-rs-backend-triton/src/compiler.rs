@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -203,24 +204,12 @@ fn tritoncc_backend() -> String {
 }
 
 fn kernel_fingerprint(kernel: &KernelSpec, arch: &str, compiler: &str, backend: &str) -> u64 {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(kernel.id.as_bytes());
-    bytes.extend_from_slice(kernel.symbol.as_bytes());
-    bytes.extend_from_slice(kernel.source.as_bytes());
-    bytes.extend_from_slice(arch.as_bytes());
-    bytes.extend_from_slice(compiler.as_bytes());
-    bytes.extend_from_slice(backend.as_bytes());
-    fnv1a(&bytes)
-}
-
-fn fnv1a(bytes: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x100000001b3;
-
-    let mut hash = OFFSET;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    kernel.id.hash(&mut hasher);
+    kernel.symbol.hash(&mut hasher);
+    kernel.source.hash(&mut hasher);
+    arch.hash(&mut hasher);
+    compiler.hash(&mut hasher);
+    backend.hash(&mut hasher);
+    hasher.finish()
 }

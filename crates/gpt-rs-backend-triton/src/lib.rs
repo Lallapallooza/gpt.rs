@@ -5,6 +5,7 @@ mod device;
 mod kernels;
 mod optimizer;
 mod runtime;
+mod targets;
 mod tensor;
 
 use std::sync::Arc;
@@ -226,6 +227,7 @@ fn triton_legality_spec() -> LegalitySpec {
             OperationKind::DynamicUpdateSlice,
             OperationKind::ExtractPatches,
             OperationKind::ReduceWindow,
+            OperationKind::CustomCall,
         ])
         .allow_dtypes([DType::F32, DType::Si32, DType::I1])
         .with_dynamic_dims(false)

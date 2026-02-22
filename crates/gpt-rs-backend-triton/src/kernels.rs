@@ -92,6 +92,7 @@ pub enum KernelKind {
     DynamicUpdateSliceF32Rank4,
     ExtractPatchesNhwcF32,
     ReduceWindowMaxNhwcF32,
+    FusedElementwiseF32,
 }
 
 pub fn elementwise_binary_kernel_spec() -> KernelSpec {

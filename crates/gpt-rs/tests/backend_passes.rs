@@ -1,13 +1,19 @@
+use std::sync::Arc;
+
 use gpt_rs::backend::{
     driver::{apply_patterns_and_fold_greedily, GreedyConfig},
+    fusion::{FusionCandidate, HintCostModel, HintLegalizer},
     optimizer::{EntryParam, EntrySignature, OptimizeConfig, OptimizeContext, OptimizeServices},
     param_resolver::InMemoryParamResolver,
     passes::{
         BroadcastCanonicalizationPass, CastCanonicalizationPass, EliminateIdentityBroadcast,
-        EliminateRedundantCast, FunctionPass,
+        EliminateRedundantCast, FunctionPass, FusionHintPass,
     },
     pattern::{BroadcastOpView, CastOpView, PatternSet},
-    spec::{Dimension, Function, Operation, PortableBackend, Program},
+    spec::{
+        DType, Dimension, DotGeneralSpec, Function, HintKind, HintPolicy, Operand, Operation,
+        PortableBackend, Program, ProgramBuilder, Shape, TensorSpec, ValueType,
+    },
 };
 use gpt_rs::ptir_program;
 use gpt_rs::tensor::InputRole;
@@ -190,4 +196,91 @@ fn run_pass<B: PortableBackend + 'static, P: FunctionPass<B>>(
     let cfg = OptimizeConfig::default();
     let mut cx = OptimizeContext::new(backend, services, entry, cfg);
     pass.run(function, &mut cx)
+}
+
+struct AlwaysLegal;
+
+impl HintLegalizer<CpuPortableBackend> for AlwaysLegal {
+    fn can_fuse(
+        &self,
+        _function: &Function,
+        _candidate: &FusionCandidate,
+        _cx: &OptimizeContext<CpuPortableBackend>,
+    ) -> Result<HintPolicy, gpt_rs::backend::fusion::FusionRejectReason> {
+        Ok(HintPolicy::Preferred)
+    }
+}
+
+struct PreferDotCost;
+
+impl HintCostModel<CpuPortableBackend> for PreferDotCost {
+    fn score(
+        &self,
+        _function: &Function,
+        candidate: &FusionCandidate,
+        _cx: &OptimizeContext<CpuPortableBackend>,
+    ) -> i64 {
+        match candidate.kind {
+            HintKind::DotEpilogue => 200,
+            HintKind::ElementwiseDag => 50,
+            HintKind::ReductionChain => 0,
+        }
+    }
+}
+
+#[test]
+fn fusion_hint_pass_materializes_dot_epilogue_hint_region() {
+    let spec_a = TensorSpec::new(
+        DType::F32,
+        Shape::new(vec![Dimension::from_usize(2), Dimension::from_usize(3)]),
+    );
+    let spec_b = TensorSpec::new(
+        DType::F32,
+        Shape::new(vec![Dimension::from_usize(3), Dimension::from_usize(4)]),
+    );
+    let spec_out = TensorSpec::new(
+        DType::F32,
+        Shape::new(vec![Dimension::from_usize(2), Dimension::from_usize(4)]),
+    );
+    let mut builder = ProgramBuilder::new();
+    let lhs = builder.add_parameter(ValueType::Tensor(spec_a.clone()));
+    let rhs = builder.add_parameter(ValueType::Tensor(spec_b.clone()));
+    let bias = builder.add_parameter(ValueType::Tensor(spec_out.clone()));
+    let dot = builder.emit_single(
+        Operation::DotGeneral(DotGeneralSpec {
+            batch_lhs: vec![],
+            batch_rhs: vec![],
+            contract_lhs: vec![1],
+            contract_rhs: vec![0],
+            accum_dtype: None,
+            out_dtype: None,
+        }),
+        vec![Operand::Value(lhs), Operand::Value(rhs)],
+        ValueType::Tensor(spec_out.clone()),
+    );
+    let biased = builder.emit_single(
+        Operation::ElementwiseBinary(gpt_rs::backend::spec::ElementwiseBinaryOp::Add),
+        vec![Operand::Value(dot), Operand::Value(bias)],
+        ValueType::Tensor(spec_out.clone()),
+    );
+    let out = builder.emit_single(
+        Operation::ElementwiseUnary(gpt_rs::backend::spec::ElementwiseUnaryOp::Tanh),
+        vec![Operand::Value(biased)],
+        ValueType::Tensor(spec_out),
+    );
+    let mut function = builder.finish("main", vec![out]);
+
+    let pass = FusionHintPass::new(Arc::new(AlwaysLegal), Arc::new(PreferDotCost));
+    let backend = CpuPortableBackend::new();
+    let result = run_pass(&backend, &pass, &mut function);
+    assert!(result.changed);
+    assert_eq!(result.rewrites_applied, 1);
+    assert_eq!(function.hints.len(), 1);
+    let hint = &function.hints[0];
+    assert_eq!(hint.kind, HintKind::DotEpilogue);
+    assert_eq!(hint.inputs.len(), 3);
+    assert_eq!(hint.exports, vec![biased]);
+    assert_eq!(hint.body.len(), 2);
+    assert_eq!(hint.body[0].id, dot);
+    assert_eq!(hint.body[1].id, biased);
 }

@@ -1,6 +1,9 @@
+mod hint_lowering;
+
 use gpt_rs::backend::conversion::{ConversionError, ConversionResult};
 use gpt_rs::backend::fusion::{
-    FUSION_ATTR_KIND, FUSION_ATTR_VERSION, FUSION_KIND_ELEMENTWISE_DAG_V1,
+    FUSION_ATTR_KIND, FUSION_ATTR_VERSION, FUSION_KIND_DOT_EPILOGUE_V1,
+    FUSION_KIND_ELEMENTWISE_DAG_V1,
 };
 use gpt_rs::backend::spec::{
     CustomCallAttr, DType, ElementwiseUnaryOp, Function, Operand, Operation, Program, ReduceKind,
@@ -16,7 +19,7 @@ use crate::kernels::{
     reduce_window_max_nhwc_kernel_spec, select_i1_f32_kernel_spec, slice_kernel_spec,
     take_f32_i32_kernel_spec, transpose_kernel_spec,
 };
-use crate::targets::TARGET_ELEMENTWISE_FUSED_F32_V1;
+use crate::targets::{TARGET_DOT_BIAS_FUSED_F32_V1, TARGET_ELEMENTWISE_FUSED_F32_V1};
 
 pub fn lower_program_to_artifact(
     program: &Program,
@@ -26,7 +29,8 @@ pub fn lower_program_to_artifact(
     // compiler even before every kernel family is hooked into runtime dispatch.
     let _ = prepacked_kernel_sources();
 
-    let function = entry_function(program)?;
+    let lowered_program = hint_lowering::lower_hint_regions_to_custom_calls(program)?;
+    let function = entry_function(&lowered_program)?;
     for instruction in &function.body {
         validate_instruction(function, instruction)?;
     }
@@ -52,7 +56,7 @@ pub fn lower_program_to_artifact(
 
     Ok(TritonArtifact::new(
         entrypoint_symbol.to_string(),
-        program.clone(),
+        lowered_program,
         kernels,
     ))
 }
@@ -394,66 +398,114 @@ fn validate_instruction(
             }
             Ok(())
         }
-        Operation::CustomCall(spec) => {
-            if spec.target != TARGET_ELEMENTWISE_FUSED_F32_V1 {
-                return Err(ConversionError::new(format!(
-                    "unsupported triton custom_call target '{}'",
-                    spec.target
-                )));
-            }
-            let version =
-                custom_call_i64(spec.attrs.get(FUSION_ATTR_VERSION), FUSION_ATTR_VERSION)?;
-            if version != 1 {
-                return Err(ConversionError::new(format!(
-                    "unsupported fused elementwise payload version {version}"
-                )));
-            }
-            let kind = custom_call_string(spec.attrs.get(FUSION_ATTR_KIND), FUSION_ATTR_KIND)?;
-            if kind != FUSION_KIND_ELEMENTWISE_DAG_V1 {
-                return Err(ConversionError::new(format!(
-                    "unsupported fused elementwise payload kind '{kind}'"
-                )));
-            }
-            let out_spec = ensure_tensor_output(&instruction.output)?;
-            if out_spec.dtype != DType::F32 {
-                return Err(ConversionError::new(
-                    "triton fused elementwise custom_call requires F32 output",
-                ));
-            }
-            let kinds = custom_call_i64_array(spec.attrs.get("ops_kind"), "ops_kind")?;
-            let codes = custom_call_i64_array(spec.attrs.get("ops_code"), "ops_code")?;
-            let lhs = custom_call_i64_array(spec.attrs.get("lhs"), "lhs")?;
-            let rhs = custom_call_i64_array(spec.attrs.get("rhs"), "rhs")?;
-            let node_count = kinds.len();
-            if node_count < 2 {
-                return Err(ConversionError::new(
-                    "triton fused elementwise requires at least two fused nodes",
-                ));
-            }
-            if codes.len() != node_count || lhs.len() != node_count || rhs.len() != node_count {
-                return Err(ConversionError::new(
-                    "triton fused elementwise attr arrays must have equal length",
-                ));
-            }
-            if instruction.operands.is_empty() {
-                return Err(ConversionError::new(
-                    "triton fused elementwise requires at least one operand",
-                ));
-            }
-            for operand in &instruction.operands {
-                let input_spec = operand_tensor_spec_for_operand(
-                    function,
-                    Some(operand),
-                    "fused elementwise input",
-                )?;
-                if input_spec.dtype != DType::F32 {
+        Operation::CustomCall(spec) => match spec.target.as_str() {
+            TARGET_ELEMENTWISE_FUSED_F32_V1 => {
+                let version =
+                    custom_call_i64(spec.attrs.get(FUSION_ATTR_VERSION), FUSION_ATTR_VERSION)?;
+                if version != 1 {
+                    return Err(ConversionError::new(format!(
+                        "unsupported fused elementwise payload version {version}"
+                    )));
+                }
+                let kind = custom_call_string(spec.attrs.get(FUSION_ATTR_KIND), FUSION_ATTR_KIND)?;
+                if kind != FUSION_KIND_ELEMENTWISE_DAG_V1 {
+                    return Err(ConversionError::new(format!(
+                        "unsupported fused elementwise payload kind '{kind}'"
+                    )));
+                }
+                let out_spec = ensure_tensor_output(&instruction.output)?;
+                if out_spec.dtype != DType::F32 {
                     return Err(ConversionError::new(
-                        "triton fused elementwise requires F32 inputs",
+                        "triton fused elementwise custom_call requires F32 output",
                     ));
                 }
+                let kinds = custom_call_i64_array(spec.attrs.get("ops_kind"), "ops_kind")?;
+                let codes = custom_call_i64_array(spec.attrs.get("ops_code"), "ops_code")?;
+                let lhs = custom_call_i64_array(spec.attrs.get("lhs"), "lhs")?;
+                let rhs = custom_call_i64_array(spec.attrs.get("rhs"), "rhs")?;
+                let node_count = kinds.len();
+                if node_count < 2 {
+                    return Err(ConversionError::new(
+                        "triton fused elementwise requires at least two fused nodes",
+                    ));
+                }
+                if codes.len() != node_count || lhs.len() != node_count || rhs.len() != node_count {
+                    return Err(ConversionError::new(
+                        "triton fused elementwise attr arrays must have equal length",
+                    ));
+                }
+                if instruction.operands.is_empty() {
+                    return Err(ConversionError::new(
+                        "triton fused elementwise requires at least one operand",
+                    ));
+                }
+                for operand in &instruction.operands {
+                    let input_spec = operand_tensor_spec_for_operand(
+                        function,
+                        Some(operand),
+                        "fused elementwise input",
+                    )?;
+                    if input_spec.dtype != DType::F32 {
+                        return Err(ConversionError::new(
+                            "triton fused elementwise requires F32 inputs",
+                        ));
+                    }
+                }
+                Ok(())
             }
-            Ok(())
-        }
+            TARGET_DOT_BIAS_FUSED_F32_V1 => {
+                let version =
+                    custom_call_i64(spec.attrs.get(FUSION_ATTR_VERSION), FUSION_ATTR_VERSION)?;
+                if version != 1 {
+                    return Err(ConversionError::new(format!(
+                        "unsupported fused dot-epilogue payload version {version}"
+                    )));
+                }
+                let kind = custom_call_string(spec.attrs.get(FUSION_ATTR_KIND), FUSION_ATTR_KIND)?;
+                if kind != FUSION_KIND_DOT_EPILOGUE_V1 {
+                    return Err(ConversionError::new(format!(
+                        "unsupported fused dot-epilogue payload kind '{kind}'"
+                    )));
+                }
+                if instruction.operands.len() < 3 {
+                    return Err(ConversionError::new(
+                        "triton fused dot+bias requires at least three operands",
+                    ));
+                }
+                let out_spec = ensure_tensor_output(&instruction.output)?;
+                if out_spec.dtype != DType::F32 {
+                    return Err(ConversionError::new(
+                        "triton fused dot+bias requires F32 output",
+                    ));
+                }
+                for operand in &instruction.operands {
+                    let input_spec =
+                        operand_tensor_spec_for_operand(function, Some(operand), "dot+bias input")?;
+                    if input_spec.dtype != DType::F32 {
+                        return Err(ConversionError::new(
+                            "triton fused dot+bias requires F32 inputs",
+                        ));
+                    }
+                }
+                let add_input = custom_call_i64(spec.attrs.get("dot_add_input"), "dot_add_input")?;
+                if add_input < 0 || add_input as usize >= instruction.operands.len() {
+                    return Err(ConversionError::new(
+                        "triton fused dot+bias has out-of-range dot_add_input index",
+                    ));
+                }
+                let _ = custom_call_i64_array(spec.attrs.get("dot_batch_lhs"), "dot_batch_lhs")?;
+                let _ = custom_call_i64_array(spec.attrs.get("dot_batch_rhs"), "dot_batch_rhs")?;
+                let _ =
+                    custom_call_i64_array(spec.attrs.get("dot_contract_lhs"), "dot_contract_lhs")?;
+                let _ =
+                    custom_call_i64_array(spec.attrs.get("dot_contract_rhs"), "dot_contract_rhs")?;
+                Ok(())
+            }
+            _ => Err(ConversionError::new(format!(
+                "unsupported triton custom_call target '{}'",
+                spec.target
+            ))),
+        },
         other => Err(ConversionError::new(format!(
             "triton lowering does not support operation: {:?}",
             other

@@ -1,3 +1,4 @@
+mod fusion_policy;
 mod pipeline;
 
 use gpt_rs::backend::conversion::ConversionResult;
@@ -8,6 +9,7 @@ use gpt_rs::backend::optimizer::{
 use gpt_rs::backend::spec::PortableBackend;
 use gpt_rs::tensor::InputRole;
 
+pub use fusion_policy::{TritonHintCostModel, TritonHintLegalizer};
 pub use pipeline::TritonPipeline;
 
 pub fn optimize_program_for_triton(

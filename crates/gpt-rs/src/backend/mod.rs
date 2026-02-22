@@ -10,5 +10,6 @@ pub mod pipeline;
 pub mod ptir_utils;
 pub mod registry;
 pub mod rewriter;
+pub mod shape_helpers;
 pub mod spec;
 pub mod text_ir;

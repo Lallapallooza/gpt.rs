@@ -265,6 +265,7 @@ fn parse_program(text: &str) -> Program {
         parameters: params,
         parameter_ids: param_ids,
         body,
+        hints: vec![],
         results,
         result_ids,
     }])

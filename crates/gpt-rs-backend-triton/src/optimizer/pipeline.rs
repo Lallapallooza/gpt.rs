@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use gpt_rs::backend::passes::ElementwiseDagFusionPass;
+use gpt_rs::backend::passes::FusionHintPass;
 use gpt_rs::backend::pipeline::{BackendPipeline, PipelineBuilder};
 
-use crate::targets::TARGET_ELEMENTWISE_FUSED_F32_V1;
+use super::{TritonHintCostModel, TritonHintLegalizer};
 
 #[derive(Debug, Default)]
 pub struct TritonPipeline;
@@ -14,9 +14,10 @@ impl BackendPipeline<crate::TritonBackend> for TritonPipeline {
     }
 
     fn populate_fuse(&self, p: &mut PipelineBuilder<crate::TritonBackend>) {
-        p.pass(Arc::new(ElementwiseDagFusionPass::new(
-            TARGET_ELEMENTWISE_FUSED_F32_V1,
-        )));
+        let pass =
+            FusionHintPass::new(Arc::new(TritonHintLegalizer), Arc::new(TritonHintCostModel))
+                .with_min_score(0);
+        p.pass(Arc::new(pass));
     }
 
     fn populate_cleanup(&self, _p: &mut PipelineBuilder<crate::TritonBackend>) {

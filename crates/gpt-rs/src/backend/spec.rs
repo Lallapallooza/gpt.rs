@@ -699,6 +699,39 @@ pub struct Region {
     pub results: Vec<ValueType>,
 }
 
+/// High-level fusion hint kinds discovered by optimizer analyses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HintKind {
+    ElementwiseDag,
+    DotEpilogue,
+    ReductionChain,
+}
+
+/// Execution preference for a fusion hint region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HintPolicy {
+    Optional,
+    Preferred,
+    Required,
+}
+
+/// Function-level fusion hint that groups a PTIR instruction region.
+///
+/// Hints are advisory and live above normal PTIR operations. Backends can decide
+/// whether to materialize them as fused artifacts or inline their `body` as plain
+/// instructions depending on support and policy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HintRegion {
+    pub id: u32,
+    pub kind: HintKind,
+    pub policy: HintPolicy,
+    pub inputs: Vec<ValueId>,
+    pub exports: Vec<ValueId>,
+    pub body: Vec<Instruction>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub attrs: BTreeMap<String, CustomCallAttr>,
+}
+
 /// PTIR function describing a reusable computation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Function {
@@ -707,6 +740,8 @@ pub struct Function {
     pub parameter_ids: Vec<ValueId>,
     pub results: Vec<ValueType>,
     pub body: Vec<Instruction>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<HintRegion>,
     pub result_ids: Vec<ValueId>,
 }
 
@@ -862,6 +897,12 @@ fn fmt_function(function: &Function, indent: usize, f: &mut fmt::Formatter<'_>) 
             fmt_instruction(instruction, indent + 2, f)?;
         }
     }
+    if !function.hints.is_empty() {
+        write_line(f, indent + 1, "hints:")?;
+        for hint in &function.hints {
+            fmt_hint_region(hint, indent + 2, f)?;
+        }
+    }
     if !function.result_ids.is_empty() {
         write_line(f, indent + 1, "results:")?;
         for (value_id, value_type) in function.result_ids.iter().zip(function.results.iter()) {
@@ -901,6 +942,48 @@ fn fmt_region(region: &Region, indent: usize, f: &mut fmt::Formatter<'_>) -> fmt
                 indent + 2,
                 &format!("%res{} : {}", index, format_value_type(value_type)),
             )?;
+        }
+    }
+    write_line(f, indent, "}")
+}
+
+fn fmt_hint_region(hint: &HintRegion, indent: usize, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write_line(
+        f,
+        indent,
+        &format!(
+            "fused_hint id={} kind={:?} policy={:?} {{",
+            hint.id, hint.kind, hint.policy
+        ),
+    )?;
+    if !hint.inputs.is_empty() {
+        let inputs = hint
+            .inputs
+            .iter()
+            .map(|id| format!("%{}", id.0))
+            .collect::<Vec<_>>()
+            .join(", ");
+        write_line(f, indent + 1, &format!("inputs: [{inputs}]"))?;
+    }
+    if !hint.exports.is_empty() {
+        let exports = hint
+            .exports
+            .iter()
+            .map(|id| format!("%{}", id.0))
+            .collect::<Vec<_>>()
+            .join(", ");
+        write_line(f, indent + 1, &format!("exports: [{exports}]"))?;
+    }
+    if !hint.attrs.is_empty() {
+        write_line(f, indent + 1, "attrs:")?;
+        for (key, value) in &hint.attrs {
+            write_line(f, indent + 2, &format!("{key} = {:?}", value))?;
+        }
+    }
+    if !hint.body.is_empty() {
+        write_line(f, indent + 1, "body:")?;
+        for instruction in &hint.body {
+            fmt_instruction(instruction, indent + 2, f)?;
         }
     }
     write_line(f, indent, "}")
@@ -1053,6 +1136,7 @@ impl ProgramBuilder {
             parameter_ids,
             results,
             body: self.instructions,
+            hints: Vec::new(),
             result_ids,
         }
     }

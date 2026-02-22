@@ -6,6 +6,7 @@ mod cse;
 mod dce;
 mod elementwise_dag_fusion;
 mod elementwise_simplification;
+mod fusion_hints;
 mod param_only_fold_to_param;
 mod reshape_canonicalization;
 mod slice_canonicalization;
@@ -19,6 +20,7 @@ pub use cse::CommonSubexpressionEliminationPass;
 pub use dce::DeadCodeEliminationPass;
 pub use elementwise_dag_fusion::ElementwiseDagFusionPass;
 pub use elementwise_simplification::ElementwiseSimplificationPass;
+pub use fusion_hints::FusionHintPass;
 pub use param_only_fold_to_param::ParamOnlyFoldToParamPass;
 pub use reshape_canonicalization::{
     CollapseReshapeChain, EliminateIdentityReshape, ReshapeCanonicalizationPass,

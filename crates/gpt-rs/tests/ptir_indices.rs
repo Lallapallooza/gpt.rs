@@ -70,6 +70,7 @@ fn function_indices_enforce_duplicate_definition_error() {
         parameter_ids: vec![ValueId(0)],
         results: vec![tensor_ty.clone()],
         body: vec![instruction.clone()],
+        hints: vec![],
         result_ids: vec![ValueId(0)],
     };
 
@@ -95,6 +96,7 @@ fn function_indices_error_on_missing_operand_definition() {
         parameter_ids: vec![ValueId(0)],
         results: vec![tensor_ty],
         body: vec![instruction],
+        hints: vec![],
         result_ids: vec![ValueId(1)],
     };
 
@@ -140,6 +142,7 @@ fn function_indices_handle_tuple_operands_and_literals() {
         parameter_ids: vec![ValueId(0)],
         results: vec![tensor_ty],
         body: vec![tuple_inst, consumer],
+        hints: vec![],
         result_ids: vec![final_result],
     };
 
@@ -157,6 +160,7 @@ fn function_indices_error_when_result_missing_definition() {
         parameter_ids: vec![ValueId(0)],
         results: vec![tensor_ty],
         body: Vec::new(),
+        hints: vec![],
         result_ids: vec![ValueId(1)],
     };
 

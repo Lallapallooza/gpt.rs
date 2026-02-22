@@ -3,8 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::backend::index::InstId;
 use crate::backend::rewriter::ProgramRewriter;
 use crate::backend::spec::{
-    DType, Dimension, ElementwiseBinaryOp, ElementwiseUnaryOp, Operand, Operation, TensorSpec,
-    ValueId,
+    DType, ElementwiseBinaryOp, ElementwiseUnaryOp, Operand, Operation, TensorSpec, ValueId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +30,7 @@ pub struct FusionNode {
 pub struct ElementwiseDag {
     pub inputs: Vec<Operand>,
     pub nodes: Vec<FusionNode>,
+    pub node_values: Vec<ValueId>,
 }
 
 pub fn unary_opcode(op: ElementwiseUnaryOp) -> i64 {
@@ -66,11 +66,12 @@ pub fn build_elementwise_dag(
     if root_spec.dtype != DType::F32 {
         return None;
     }
-    let root_dims = static_dims(&root_spec)?;
+    let root_dims = root_spec.shape.static_dims()?;
 
     let mut inputs: Vec<Operand> = Vec::new();
     let mut input_map: HashMap<ValueId, usize> = HashMap::new();
     let mut nodes: Vec<FusionNode> = Vec::new();
+    let mut node_values: Vec<ValueId> = Vec::new();
     let mut memo: HashMap<ValueId, FusionRef> = HashMap::new();
     let mut visiting: HashSet<ValueId> = HashSet::new();
 
@@ -80,6 +81,7 @@ pub fn build_elementwise_dag(
         inputs: &'a mut Vec<Operand>,
         input_map: &'a mut HashMap<ValueId, usize>,
         nodes: &'a mut Vec<FusionNode>,
+        node_values: &'a mut Vec<ValueId>,
         memo: &'a mut HashMap<ValueId, FusionRef>,
         visiting: &'a mut HashSet<ValueId>,
     }
@@ -92,7 +94,7 @@ pub fn build_elementwise_dag(
         if spec.dtype != DType::F32 {
             return None;
         }
-        let dims = static_dims(&spec)?;
+        let dims = spec.shape.static_dims()?;
         if !is_broadcastable(ctx.root_dims, &dims) {
             return None;
         }
@@ -109,7 +111,7 @@ pub fn build_elementwise_dag(
                 if literal.spec.dtype != DType::F32 {
                     return None;
                 }
-                let dims = static_dims(&literal.spec)?;
+                let dims = literal.spec.shape.static_dims()?;
                 if !is_broadcastable(ctx.root_dims, &dims) {
                     return None;
                 }
@@ -147,7 +149,7 @@ pub fn build_elementwise_dag(
                 Operation::ElementwiseUnary(op) => {
                     let spec = tensor_spec_of(ctx.rewriter, value)?;
                     if spec.dtype != DType::F32
-                        || static_dims(&spec).as_deref() != Some(ctx.root_dims)
+                        || spec.shape.static_dims().as_deref() != Some(ctx.root_dims)
                     {
                         None
                     } else if !force_fuse && ctx.rewriter.users_of(value).len() != 1 {
@@ -162,13 +164,14 @@ pub fn build_elementwise_dag(
                             lhs,
                             rhs: None,
                         });
+                        ctx.node_values.push(value);
                         Some(FusionRef::Node(idx))
                     }
                 }
                 Operation::ElementwiseBinary(op) => {
                     let spec = tensor_spec_of(ctx.rewriter, value)?;
                     if spec.dtype != DType::F32
-                        || static_dims(&spec).as_deref() != Some(ctx.root_dims)
+                        || spec.shape.static_dims().as_deref() != Some(ctx.root_dims)
                     {
                         None
                     } else if !force_fuse && ctx.rewriter.users_of(value).len() != 1 {
@@ -184,13 +187,14 @@ pub fn build_elementwise_dag(
                             lhs,
                             rhs: Some(rhs),
                         });
+                        ctx.node_values.push(value);
                         Some(FusionRef::Node(idx))
                     }
                 }
                 Operation::BroadcastTo(_) => {
                     let spec = tensor_spec_of(ctx.rewriter, value)?;
                     if spec.dtype != DType::F32
-                        || static_dims(&spec).as_deref() != Some(ctx.root_dims)
+                        || spec.shape.static_dims().as_deref() != Some(ctx.root_dims)
                     {
                         None
                     } else if ctx.rewriter.users_of(value).len() == 1 {
@@ -219,6 +223,7 @@ pub fn build_elementwise_dag(
         inputs: &mut inputs,
         input_map: &mut input_map,
         nodes: &mut nodes,
+        node_values: &mut node_values,
         memo: &mut memo,
         visiting: &mut visiting,
     };
@@ -229,7 +234,11 @@ pub fn build_elementwise_dag(
     if nodes.len() < 2 {
         return None;
     }
-    Some(ElementwiseDag { inputs, nodes })
+    Some(ElementwiseDag {
+        inputs,
+        nodes,
+        node_values,
+    })
 }
 
 fn is_broadcastable(root_dims: &[usize], in_dims: &[usize]) -> bool {
@@ -251,15 +260,4 @@ fn tensor_spec_of(rewriter: &ProgramRewriter<'_>, value: ValueId) -> Option<Tens
         Some(crate::backend::spec::ValueType::Tensor(spec)) => Some(spec.clone()),
         _ => None,
     }
-}
-
-fn static_dims(spec: &TensorSpec) -> Option<Vec<usize>> {
-    spec.shape
-        .dims()
-        .iter()
-        .map(|dim| match dim {
-            Dimension::Static(v) => Some(*v),
-            Dimension::Dynamic(_) => None,
-        })
-        .collect()
 }

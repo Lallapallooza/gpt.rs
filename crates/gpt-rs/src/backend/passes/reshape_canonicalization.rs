@@ -5,26 +5,11 @@ use crate::backend::{
     rewriter::ProgramRewriter,
     spec::{
         Dimension, Function, Operand, Operation, PortableBackend, ReshapeDim, ReshapeSpec,
-        TensorSpec, ValueType,
+        ValueType,
     },
 };
 
 use super::{FunctionPass, FunctionPassResult};
-
-fn static_shape(spec: &TensorSpec) -> Option<Vec<usize>> {
-    let mut dims = Vec::with_capacity(spec.shape.rank());
-    for dim in spec.shape.dims() {
-        match dim {
-            Dimension::Static(v) => dims.push(*v),
-            Dimension::Dynamic(_) => return None,
-        }
-    }
-    Some(dims)
-}
-
-fn element_count(spec: &TensorSpec) -> Option<usize> {
-    static_shape(spec).and_then(|dims| dims.iter().try_fold(1usize, |acc, d| acc.checked_mul(*d)))
-}
 
 /// Remove reshapes that do not change the logical shape.
 pub struct EliminateIdentityReshape;
@@ -85,16 +70,16 @@ impl OpRewritePattern<ReshapeOpView> for CollapseReshapeChain {
         };
 
         // Only fold when all shapes are static and element counts match to avoid dynamic surprises.
-        let Some(_base_dims) = static_shape(&base_ty) else {
+        let Some(_base_dims) = base_ty.shape.static_dims() else {
             return false;
         };
-        let Some(result_dims) = static_shape(&result_ty) else {
+        let Some(result_dims) = result_ty.shape.static_dims() else {
             return false;
         };
-        let Some(base_elems) = element_count(&base_ty) else {
+        let Some(base_elems) = base_ty.element_count() else {
             return false;
         };
-        let Some(result_elems) = element_count(&result_ty) else {
+        let Some(result_elems) = result_ty.element_count() else {
             return false;
         };
         if base_elems != result_elems {

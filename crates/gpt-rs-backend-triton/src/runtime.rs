@@ -1,3 +1,4 @@
+mod fused_dot_epilogue;
 mod fused_elementwise;
 
 use std::cell::RefCell;
@@ -6,10 +7,13 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use gpt_rs::backend::shape_helpers::{
+    checked_element_count_or_error, contiguous_strides_or_error, static_dims_or_error,
+};
 use gpt_rs::backend::spec::{
-    BackendError, BackendResult, ComparisonOp, CustomCallSpec, DType, Dimension,
-    ElementwiseBinaryOp, ElementwiseUnaryOp, Operand, Operation, ReduceKind, TensorLiteral,
-    TensorSpec, ValueId, ValueType,
+    BackendError, BackendResult, ComparisonOp, CustomCallSpec, DType, ElementwiseBinaryOp,
+    ElementwiseUnaryOp, Operand, Operation, ReduceKind, TensorLiteral, TensorSpec, ValueId,
+    ValueType,
 };
 use gpt_rs::profiling::{self, ScopeMeta, WorkStats};
 use libloading::Library;
@@ -25,7 +29,7 @@ use crate::kernels::{
     REDUCE_WINDOW_MAX_NHWC_KERNEL_ID, SELECT_I1_F32_KERNEL_ID, SLICE_KERNEL_ID,
     TAKE_F32_I32_KERNEL_ID, TRANSPOSE_KERNEL_ID,
 };
-use crate::targets::TARGET_ELEMENTWISE_FUSED_F32_V1;
+use crate::targets::{TARGET_DOT_BIAS_FUSED_F32_V1, TARGET_ELEMENTWISE_FUSED_F32_V1};
 use crate::tensor::TritonTensor;
 
 thread_local! {
@@ -304,7 +308,7 @@ impl TritonExecutor {
             }
             Operation::CustomCall(spec) => {
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                self.execute_custom_call(driver, values, instruction, spec, &out_spec)
+                self.execute_custom_call(driver, kernels, values, instruction, spec, &out_spec)
             }
             other => Err(BackendError::execution(format!(
                 "triton runtime does not support instruction op: {:?}",
@@ -337,6 +341,7 @@ impl TritonExecutor {
     fn execute_custom_call(
         &self,
         driver: &Arc<CudaDriver>,
+        kernels: &HashMap<&str, &KernelSpec>,
         values: &HashMap<ValueId, TritonTensor>,
         instruction: &gpt_rs::backend::spec::Instruction,
         spec: &CustomCallSpec,
@@ -345,6 +350,14 @@ impl TritonExecutor {
         match spec.target.as_str() {
             TARGET_ELEMENTWISE_FUSED_F32_V1 => self.execute_fused_elementwise_custom_call(
                 driver,
+                values,
+                instruction,
+                spec,
+                out_spec,
+            ),
+            TARGET_DOT_BIAS_FUSED_F32_V1 => self.execute_fused_dot_bias_custom_call(
+                driver,
+                kernels,
                 values,
                 instruction,
                 spec,
@@ -400,6 +413,57 @@ impl TritonExecutor {
         params.push((&mut opaque_ptr as *mut u64).cast::<c_void>());
         launch_1d(driver, &loaded, n_u32, 256, params.as_mut_slice())?;
         Ok(out)
+    }
+
+    fn execute_fused_dot_bias_custom_call(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernels: &HashMap<&str, &KernelSpec>,
+        values: &HashMap<ValueId, TritonTensor>,
+        instruction: &gpt_rs::backend::spec::Instruction,
+        spec: &CustomCallSpec,
+        out_spec: &TensorSpec,
+    ) -> BackendResult<TritonTensor> {
+        let _scope = profiling::backend_scope("backend.triton.fused.dot_epilogue");
+        if instruction.operands.len() < 3 {
+            return Err(BackendError::execution(
+                "fused dot+bias custom_call requires at least three operands",
+            ));
+        }
+        let plan = fused_dot_epilogue::FusedDotBiasPlan::parse(spec, instruction.operands.len())?;
+        let lhs = self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
+        let rhs = self.resolve_operand_tensor(driver, values, instruction.operands.get(1))?;
+        let bias =
+            self.resolve_operand_tensor(driver, values, instruction.operands.get(plan.add_input))?;
+
+        let dot = self.execute_dot_general(
+            driver,
+            DotGeneralArgs {
+                spec: &plan.dot,
+                lhs_spec: &lhs.spec,
+                rhs_spec: &rhs.spec,
+                out_spec,
+            },
+            &lhs,
+            &rhs,
+        )?;
+
+        let bias_ready = if bias.spec == *out_spec {
+            bias
+        } else {
+            self.execute_broadcast(driver, kernels, &bias, out_spec)?
+        };
+        let kernel = kernels.get(EWISE_BINARY_KERNEL_ID).ok_or_else(|| {
+            BackendError::execution("missing elementwise binary kernel in triton artifact")
+        })?;
+        self.execute_elementwise_binary(
+            driver,
+            kernel,
+            ElementwiseBinaryOp::Add,
+            &dot,
+            &bias_ready,
+            out_spec,
+        )
     }
 
     fn execute_elementwise_binary(
@@ -617,8 +681,16 @@ impl TritonExecutor {
             DType::F32 => self.execute_slice_f32(driver, kernels, input, &spec.starts, out_spec),
             DType::Si32 => {
                 // Minimal i32 slice support for attention decode path (rank-1).
-                let in_dims = static_dims(&input.spec.shape)?;
-                let out_dims = static_dims(&out_spec.shape)?;
+                let in_dims = static_dims_or_error(&input.spec.shape, |_| {
+                    BackendError::execution(
+                        "dynamic dimensions are not supported by triton runtime",
+                    )
+                })?;
+                let out_dims = static_dims_or_error(&out_spec.shape, |_| {
+                    BackendError::execution(
+                        "dynamic dimensions are not supported by triton runtime",
+                    )
+                })?;
                 if in_dims.len() != 1 || out_dims.len() != 1 || spec.starts.len() != 1 {
                     return Err(BackendError::execution(
                         "slice Si32 path currently supports rank-1 only",
@@ -757,7 +829,11 @@ impl TritonExecutor {
             DType::F32 => self.execute_slice_f32(driver, kernels, input, &static_starts, out_spec),
             DType::Si32 => {
                 // Rank-1 Si32 dynamic slice is required by decode attention query position path.
-                let in_dims = static_dims(&input.spec.shape)?;
+                let in_dims = static_dims_or_error(&input.spec.shape, |_| {
+                    BackendError::execution(
+                        "dynamic dimensions are not supported by triton runtime",
+                    )
+                })?;
                 if in_dims.len() != 1 || static_starts.len() != 1 || spec.sizes.len() != 1 {
                     return Err(BackendError::execution(
                         "dynamic_slice Si32 path currently supports rank-1 only",
@@ -959,7 +1035,9 @@ impl TritonExecutor {
                 kernel.kind
             )));
         }
-        let out_dims = static_dims(&out_spec.shape)?;
+        let out_dims = static_dims_or_error(&out_spec.shape, |_| {
+            BackendError::execution("dynamic dimensions are not supported by triton runtime")
+        })?;
         if spec.axis >= out_dims.len() {
             return Err(BackendError::execution("iota axis out of bounds"));
         }
@@ -975,7 +1053,7 @@ impl TritonExecutor {
         }
         let loaded = self.load_kernel(driver, kernel)?;
         let (od0, od1, od2, od3) = align_dims4(&out_dims)?;
-        let aligned_axis = (4 - out_dims.len())
+        let aligned_axis = (4usize - out_dims.len())
             .checked_add(spec.axis)
             .ok_or_else(|| BackendError::execution("iota axis alignment overflow"))?;
         let axis = usize_to_i32(aligned_axis, "iota axis")?;
@@ -1124,7 +1202,9 @@ impl TritonExecutor {
                 kernel.kind
             )));
         }
-        let params_dims = static_dims(&params.spec.shape)?;
+        let params_dims = static_dims_or_error(&params.spec.shape, |_| {
+            BackendError::execution("dynamic dimensions are not supported by triton runtime")
+        })?;
         if params_dims.len() != 2 {
             return Err(BackendError::execution(
                 "take runtime currently supports rank-2 params only",
@@ -1193,8 +1273,12 @@ impl TritonExecutor {
                 kernel.kind
             )));
         }
-        let base_dims = static_dims(&base.spec.shape)?;
-        let update_dims = static_dims(&update.spec.shape)?;
+        let base_dims = static_dims_or_error(&base.spec.shape, |_| {
+            BackendError::execution("dynamic dimensions are not supported by triton runtime")
+        })?;
+        let update_dims = static_dims_or_error(&update.spec.shape, |_| {
+            BackendError::execution("dynamic dimensions are not supported by triton runtime")
+        })?;
         if base_dims.len() > 4 {
             return Err(BackendError::execution(
                 "dynamic_update_slice runtime supports rank <= 4 only",
@@ -1334,7 +1418,9 @@ impl TritonExecutor {
                 "reduce_max currently supports F32 only",
             ));
         }
-        let input_dims = static_dims(&input_spec.shape)?;
+        let input_dims = static_dims_or_error(&input_spec.shape, |_| {
+            BackendError::execution("dynamic dimensions are not supported by triton runtime")
+        })?;
         if input_dims.is_empty() {
             return Err(BackendError::execution(
                 "reduce_max does not support scalar inputs",
@@ -1348,7 +1434,7 @@ impl TritonExecutor {
         }
         let rows = input_dims[..last_axis]
             .iter()
-            .try_fold(1usize, |acc, dim| acc.checked_mul(*dim))
+            .try_fold(1usize, |acc: usize, dim| acc.checked_mul(*dim))
             .ok_or_else(|| BackendError::execution("reduce_max row dimension overflow"))?;
         let cols = input_dims[last_axis];
         let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
@@ -1392,8 +1478,12 @@ impl TritonExecutor {
                 "extract_patches runtime currently supports F32 only",
             ));
         }
-        let in_dims = static_dims(&input.spec.shape)?;
-        let out_dims = static_dims(&out_spec.shape)?;
+        let in_dims = static_dims_or_error(&input.spec.shape, |_| {
+            BackendError::execution("dynamic dimensions are not supported by triton runtime")
+        })?;
+        let out_dims = static_dims_or_error(&out_spec.shape, |_| {
+            BackendError::execution("dynamic dimensions are not supported by triton runtime")
+        })?;
         if in_dims.len() != 4 || out_dims.len() != 4 {
             return Err(BackendError::execution(
                 "extract_patches runtime expects rank-4 NHWC input/output",
@@ -1482,8 +1572,12 @@ impl TritonExecutor {
                 "reduce_window runtime currently supports F32 only",
             ));
         }
-        let in_dims = static_dims(&input.spec.shape)?;
-        let out_dims = static_dims(&out_spec.shape)?;
+        let in_dims = static_dims_or_error(&input.spec.shape, |_| {
+            BackendError::execution("dynamic dimensions are not supported by triton runtime")
+        })?;
+        let out_dims = static_dims_or_error(&out_spec.shape, |_| {
+            BackendError::execution("dynamic dimensions are not supported by triton runtime")
+        })?;
         if in_dims.len() != 4 || out_dims.len() != 4 {
             return Err(BackendError::execution(
                 "reduce_window runtime expects rank-4 NHWC input/output",
@@ -1582,9 +1676,15 @@ impl TritonExecutor {
             ));
         }
 
-        let lhs_dims = static_dims(&lhs_spec.shape)?;
-        let rhs_dims = static_dims(&rhs_spec.shape)?;
-        let out_dims = static_dims(&out_spec.shape)?;
+        let lhs_dims = static_dims_or_error(&lhs_spec.shape, |_| {
+            BackendError::execution("dynamic dimensions are not supported by triton runtime")
+        })?;
+        let rhs_dims = static_dims_or_error(&rhs_spec.shape, |_| {
+            BackendError::execution("dynamic dimensions are not supported by triton runtime")
+        })?;
+        let out_dims = static_dims_or_error(&out_spec.shape, |_| {
+            BackendError::execution("dynamic dimensions are not supported by triton runtime")
+        })?;
         let cublas = self.cublas(driver)?;
 
         // Rank-2 matrix multiplication: [M,K] · [K,N] => [M,N].
@@ -1762,7 +1862,9 @@ impl TritonExecutor {
             )));
         }
 
-        let input_dims = static_dims(&input_spec.shape)?;
+        let input_dims = static_dims_or_error(&input_spec.shape, |_| {
+            BackendError::execution("dynamic dimensions are not supported by triton runtime")
+        })?;
         if input_dims.is_empty() {
             return Err(BackendError::execution(
                 "reduce runtime does not support scalar inputs",
@@ -1777,7 +1879,7 @@ impl TritonExecutor {
 
         let rows = input_dims[..last_axis]
             .iter()
-            .try_fold(1usize, |acc, dim| acc.checked_mul(*dim))
+            .try_fold(1usize, |acc: usize, dim| acc.checked_mul(*dim))
             .ok_or_else(|| BackendError::execution("reduce row dimension overflow"))?;
         let cols = input_dims[last_axis];
 
@@ -1925,30 +2027,13 @@ fn byte_len(spec: &TensorSpec) -> BackendResult<usize> {
     })
 }
 
-fn static_dims(shape: &gpt_rs::backend::spec::Shape) -> BackendResult<Vec<usize>> {
-    let mut dims = Vec::with_capacity(shape.rank());
-    for dim in shape.dims() {
-        match dim {
-            Dimension::Static(value) => dims.push(*value),
-            Dimension::Dynamic(_) => {
-                return Err(BackendError::execution(
-                    "dynamic dimensions are not supported by triton runtime",
-                ))
-            }
-        }
-    }
-    Ok(dims)
-}
-
 fn static_element_count(shape: &gpt_rs::backend::spec::Shape) -> BackendResult<usize> {
-    let dims = static_dims(shape)?;
-    let mut count = 1usize;
-    for dim in dims {
-        count = count
-            .checked_mul(dim)
-            .ok_or_else(|| BackendError::execution("element count overflow"))?;
-    }
-    Ok(count)
+    let dims = static_dims_or_error(shape, |_| {
+        BackendError::execution("dynamic dimensions are not supported by triton runtime")
+    })?;
+    checked_element_count_or_error(dims.as_slice(), || {
+        BackendError::execution("element count overflow")
+    })
 }
 
 fn usize_to_u32(value: usize, what: &str) -> BackendResult<u32> {
@@ -1957,18 +2042,6 @@ fn usize_to_u32(value: usize, what: &str) -> BackendResult<u32> {
 
 fn usize_to_i32(value: usize, what: &str) -> BackendResult<i32> {
     i32::try_from(value).map_err(|_| BackendError::execution(format!("{what} exceeds i32 range")))
-}
-
-fn contiguous_strides(dims: &[usize]) -> BackendResult<Vec<usize>> {
-    let mut strides = vec![0usize; dims.len()];
-    let mut stride = 1usize;
-    for axis in (0..dims.len()).rev() {
-        strides[axis] = stride;
-        stride = stride
-            .checked_mul(dims[axis])
-            .ok_or_else(|| BackendError::execution("stride overflow"))?;
-    }
-    Ok(strides)
 }
 
 fn align_dims4(dims: &[usize]) -> BackendResult<(i32, i32, i32, i32)> {
@@ -1995,8 +2068,12 @@ fn broadcast_rank4_layout(
     in_shape: &gpt_rs::backend::spec::Shape,
     out_shape: &gpt_rs::backend::spec::Shape,
 ) -> BackendResult<([i32; 4], [i32; 4])> {
-    let in_dims = static_dims(in_shape)?;
-    let out_dims = static_dims(out_shape)?;
+    let in_dims = static_dims_or_error(in_shape, |_| {
+        BackendError::execution("dynamic dimensions are not supported by triton runtime")
+    })?;
+    let out_dims = static_dims_or_error(out_shape, |_| {
+        BackendError::execution("dynamic dimensions are not supported by triton runtime")
+    })?;
     if out_dims.len() > 4 || in_dims.len() > 4 {
         return Err(BackendError::execution(
             "broadcast runtime supports rank <= 4 only",
@@ -2017,7 +2094,8 @@ fn broadcast_rank4_layout(
         in4[4 - in_dims.len() + idx] = *dim;
     }
 
-    let base_strides = contiguous_strides(&in4)?;
+    let base_strides =
+        contiguous_strides_or_error(&in4, || BackendError::execution("stride overflow"))?;
     let mut in_strides = [0i32; 4];
     let mut out_i32 = [0i32; 4];
     for axis in 0..4 {
@@ -2045,8 +2123,12 @@ fn slice_rank4_layout(
     out_shape: &gpt_rs::backend::spec::Shape,
     starts: &[usize],
 ) -> BackendResult<([i32; 4], [i32; 4], [i32; 4])> {
-    let in_dims = static_dims(in_shape)?;
-    let out_dims = static_dims(out_shape)?;
+    let in_dims = static_dims_or_error(in_shape, |_| {
+        BackendError::execution("dynamic dimensions are not supported by triton runtime")
+    })?;
+    let out_dims = static_dims_or_error(out_shape, |_| {
+        BackendError::execution("dynamic dimensions are not supported by triton runtime")
+    })?;
     if in_dims.len() > 4 || out_dims.len() > 4 {
         return Err(BackendError::execution(
             "slice runtime supports rank <= 4 only",
@@ -2073,7 +2155,7 @@ fn slice_rank4_layout(
     in4[offset..(offset + in_dims.len())].copy_from_slice(&in_dims);
     out4[offset..(offset + out_dims.len())].copy_from_slice(&out_dims);
     starts4[offset..(offset + starts.len())].copy_from_slice(starts);
-    let strides = contiguous_strides(&in4)?;
+    let strides = contiguous_strides_or_error(&in4, || BackendError::execution("stride overflow"))?;
     let mut out_i32 = [0i32; 4];
     let mut strides_i32 = [0i32; 4];
     let mut starts_i32 = [0i32; 4];
@@ -2090,8 +2172,12 @@ fn transpose_rank5_layout(
     out_shape: &gpt_rs::backend::spec::Shape,
     perm: &[usize],
 ) -> BackendResult<([i32; 5], [i32; 5])> {
-    let in_dims = static_dims(in_shape)?;
-    let out_dims = static_dims(out_shape)?;
+    let in_dims = static_dims_or_error(in_shape, |_| {
+        BackendError::execution("dynamic dimensions are not supported by triton runtime")
+    })?;
+    let out_dims = static_dims_or_error(out_shape, |_| {
+        BackendError::execution("dynamic dimensions are not supported by triton runtime")
+    })?;
     if in_dims.len() > 5 || out_dims.len() > 5 {
         return Err(BackendError::execution(
             "transpose runtime supports rank <= 5 only",
@@ -2102,7 +2188,8 @@ fn transpose_rank5_layout(
             "transpose rank/permutation mismatch",
         ));
     }
-    let input_strides = contiguous_strides(&in_dims)?;
+    let input_strides =
+        contiguous_strides_or_error(&in_dims, || BackendError::execution("stride overflow"))?;
     let mut mapped_strides = vec![0usize; perm.len()];
     let mut seen = vec![false; perm.len()];
     for (axis, src_axis) in perm.iter().enumerate() {
@@ -2150,9 +2237,15 @@ fn concat_rank4_layout(
     out_shape: &gpt_rs::backend::spec::Shape,
     axis: isize,
 ) -> BackendResult<ConcatRank4Layout> {
-    let lhs_dims = static_dims(lhs_shape)?;
-    let rhs_dims = static_dims(rhs_shape)?;
-    let out_dims = static_dims(out_shape)?;
+    let lhs_dims = static_dims_or_error(lhs_shape, |_| {
+        BackendError::execution("dynamic dimensions are not supported by triton runtime")
+    })?;
+    let rhs_dims = static_dims_or_error(rhs_shape, |_| {
+        BackendError::execution("dynamic dimensions are not supported by triton runtime")
+    })?;
+    let out_dims = static_dims_or_error(out_shape, |_| {
+        BackendError::execution("dynamic dimensions are not supported by triton runtime")
+    })?;
     if lhs_dims.len() > 4 || rhs_dims.len() > 4 || out_dims.len() > 4 {
         return Err(BackendError::execution(
             "concat runtime supports rank <= 4 only",
@@ -2179,8 +2272,10 @@ fn concat_rank4_layout(
         }
     }
 
-    let lhs_strides = contiguous_strides(&lhs_dims)?;
-    let rhs_strides = contiguous_strides(&rhs_dims)?;
+    let lhs_strides =
+        contiguous_strides_or_error(&lhs_dims, || BackendError::execution("stride overflow"))?;
+    let rhs_strides =
+        contiguous_strides_or_error(&rhs_dims, || BackendError::execution("stride overflow"))?;
 
     let mut out4 = [1usize; 4];
     let mut lhs4 = [0usize; 4];
@@ -2219,7 +2314,8 @@ fn dynamic_update_rank4_layout(
             "dynamic_update_slice rank mismatch",
         ));
     }
-    let out_strides = contiguous_strides(out_dims)?;
+    let out_strides =
+        contiguous_strides_or_error(out_dims, || BackendError::execution("stride overflow"))?;
 
     let mut update4 = [1usize; 4];
     let mut out_strides4 = [0usize; 4];
@@ -2275,7 +2371,7 @@ fn launch_program_grid(
             ..WorkStats::default()
         })
     });
-    if triton_gpu_event_timing_enabled() {
+    if GPU_EVENT_TIMING_ENABLED.load(Ordering::Relaxed) {
         let _elapsed_ms = driver.time_with_events("backend.triton.kernel", || {
             driver.launch_kernel(&kernel.function, (grid_x, 1, 1), (block_x, 1, 1), 0, params)
         })?;
@@ -2283,10 +2379,6 @@ fn launch_program_grid(
     } else {
         driver.launch_kernel(&kernel.function, (grid_x, 1, 1), (block_x, 1, 1), 0, params)
     }
-}
-
-fn triton_gpu_event_timing_enabled() -> bool {
-    GPU_EVENT_TIMING_ENABLED.load(Ordering::Relaxed)
 }
 
 fn read_i32_tensor(tensor: &TritonTensor) -> BackendResult<Vec<i32>> {
@@ -2493,7 +2585,7 @@ impl CublasContext {
     where
         F: FnOnce() -> BackendResult<()>,
     {
-        if triton_gpu_event_timing_enabled() {
+        if GPU_EVENT_TIMING_ENABLED.load(Ordering::Relaxed) {
             let _elapsed_ms = self.driver.time_with_events(op_name, op)?;
             Ok(())
         } else {

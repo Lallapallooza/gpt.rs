@@ -233,6 +233,7 @@ fn type_mismatch_same_key_tensor_dtype() {
             operands: vec![Operand::Value(param_id)],
             output: ValueType::Tensor(i32_spec),
         }],
+        hints: vec![],
         result_ids: Vec::new(),
     };
     let program = Program::new("main").with_functions(vec![function]);
@@ -256,6 +257,7 @@ fn type_mismatch_same_key_tensor_shape() {
             operands: vec![Operand::Value(param_id)],
             output: ValueType::Tensor(spec_b),
         }],
+        hints: vec![],
         result_ids: Vec::new(),
     };
     let program = Program::new("main").with_functions(vec![function]);
@@ -287,6 +289,7 @@ fn type_mismatch_tuple_element_path_specific() {
             operands: vec![Operand::Value(param_id)],
             output: output_ty,
         }],
+        hints: vec![],
         result_ids: Vec::new(),
     };
     let program = Program::new("main").with_functions(vec![function]);
@@ -1956,6 +1959,7 @@ fn type_mismatch_in_tuple_element_on_reinsertion() {
             operands: vec![Operand::Value(param_id)],
             output: output_ty,
         }],
+        hints: vec![],
         result_ids: Vec::new(),
     };
     let program = Program::new("main").with_functions(vec![function]);

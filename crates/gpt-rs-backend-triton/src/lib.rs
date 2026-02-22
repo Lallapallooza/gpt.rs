@@ -143,7 +143,7 @@ impl ConversionTarget for TritonConversionTarget {
     }
 
     fn version(&self) -> u64 {
-        3
+        4
     }
 
     fn file_extension(&self) -> &str {

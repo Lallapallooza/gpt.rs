@@ -1,6 +1,9 @@
 use gpt_rs::backend::spec::{ElementwiseBinaryOp, ElementwiseUnaryOp};
 
 pub const TARGET_ELEMENTWISE_FUSED_F32_V1: &str = "gpt_rs.triton.fused_elementwise.f32.v1";
+pub const FUSION_ATTR_VERSION: &str = "fusion_version";
+pub const FUSION_ATTR_KIND: &str = "fusion_kind";
+pub const FUSION_KIND_ELEMENTWISE_DAG_V1: &str = "elementwise_dag_v1";
 
 pub fn unary_code(op: ElementwiseUnaryOp) -> i64 {
     match op {

@@ -6,6 +6,7 @@ use gpt_rs::backend::spec::{
 };
 
 use crate::kernels::{KernelKind, KernelSpec};
+use crate::targets::{FUSION_ATTR_KIND, FUSION_ATTR_VERSION, FUSION_KIND_ELEMENTWISE_DAG_V1};
 
 #[derive(Debug, Clone)]
 pub struct FusedElementwisePlan {
@@ -17,6 +18,18 @@ pub struct FusedElementwisePlan {
 
 impl FusedElementwisePlan {
     pub fn parse(spec: &CustomCallSpec) -> BackendResult<Self> {
+        let version = custom_call_i64(spec, FUSION_ATTR_VERSION)?;
+        if version != 1 {
+            return Err(BackendError::execution(format!(
+                "unsupported fused elementwise payload version {version}"
+            )));
+        }
+        let kind = custom_call_string(spec, FUSION_ATTR_KIND)?;
+        if kind != FUSION_KIND_ELEMENTWISE_DAG_V1 {
+            return Err(BackendError::execution(format!(
+                "unsupported fused elementwise payload kind '{kind}'"
+            )));
+        }
         let ops_kind = custom_call_i64_array(spec, "ops_kind")?.clone();
         let ops_code = custom_call_i64_array(spec, "ops_code")?.clone();
         let lhs = custom_call_i64_array(spec, "lhs")?.clone();
@@ -95,6 +108,24 @@ impl FusedElementwisePlan {
             source,
             symbol,
         })
+    }
+}
+
+fn custom_call_i64(spec: &CustomCallSpec, key: &str) -> BackendResult<i64> {
+    match spec.attrs.get(key) {
+        Some(CustomCallAttr::I64(value)) => Ok(*value),
+        _ => Err(BackendError::execution(format!(
+            "triton custom_call missing i64 attr '{key}'"
+        ))),
+    }
+}
+
+fn custom_call_string<'a>(spec: &'a CustomCallSpec, key: &str) -> BackendResult<&'a str> {
+    match spec.attrs.get(key) {
+        Some(CustomCallAttr::String(value)) => Ok(value.as_str()),
+        _ => Err(BackendError::execution(format!(
+            "triton custom_call missing string attr '{key}'"
+        ))),
     }
 }
 

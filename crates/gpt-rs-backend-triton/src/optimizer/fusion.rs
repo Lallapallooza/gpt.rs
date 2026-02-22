@@ -9,7 +9,10 @@ use gpt_rs::backend::{
     },
 };
 
-use crate::targets::{binary_code, unary_code, TARGET_ELEMENTWISE_FUSED_F32_V1};
+use crate::targets::{
+    binary_code, unary_code, FUSION_ATTR_KIND, FUSION_ATTR_VERSION, FUSION_KIND_ELEMENTWISE_DAG_V1,
+    TARGET_ELEMENTWISE_FUSED_F32_V1,
+};
 
 use super::utils::{static_dims, tensor_spec_of};
 
@@ -295,6 +298,11 @@ impl FunctionPass<crate::TritonBackend> for TritonElementwiseFusionPass {
             }
 
             let mut attrs = BTreeMap::new();
+            attrs.insert(FUSION_ATTR_VERSION.into(), CustomCallAttr::I64(1));
+            attrs.insert(
+                FUSION_ATTR_KIND.into(),
+                CustomCallAttr::String(FUSION_KIND_ELEMENTWISE_DAG_V1.to_string()),
+            );
             attrs.insert("ops_kind".into(), CustomCallAttr::I64Array(kinds));
             attrs.insert("ops_code".into(), CustomCallAttr::I64Array(codes));
             attrs.insert("lhs".into(), CustomCallAttr::I64Array(lhs));

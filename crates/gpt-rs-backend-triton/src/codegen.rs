@@ -13,7 +13,10 @@ use crate::kernels::{
     reduce_window_max_nhwc_kernel_spec, select_i1_f32_kernel_spec, slice_kernel_spec,
     take_f32_i32_kernel_spec, transpose_kernel_spec,
 };
-use crate::targets::TARGET_ELEMENTWISE_FUSED_F32_V1;
+use crate::targets::{
+    FUSION_ATTR_KIND, FUSION_ATTR_VERSION, FUSION_KIND_ELEMENTWISE_DAG_V1,
+    TARGET_ELEMENTWISE_FUSED_F32_V1,
+};
 
 pub fn lower_program_to_artifact(
     program: &Program,
@@ -398,6 +401,19 @@ fn validate_instruction(
                     spec.target
                 )));
             }
+            let version =
+                custom_call_i64(spec.attrs.get(FUSION_ATTR_VERSION), FUSION_ATTR_VERSION)?;
+            if version != 1 {
+                return Err(ConversionError::new(format!(
+                    "unsupported fused elementwise payload version {version}"
+                )));
+            }
+            let kind = custom_call_string(spec.attrs.get(FUSION_ATTR_KIND), FUSION_ATTR_KIND)?;
+            if kind != FUSION_KIND_ELEMENTWISE_DAG_V1 {
+                return Err(ConversionError::new(format!(
+                    "unsupported fused elementwise payload kind '{kind}'"
+                )));
+            }
             let out_spec = ensure_tensor_output(&instruction.output)?;
             if out_spec.dtype != DType::F32 {
                 return Err(ConversionError::new(
@@ -453,6 +469,27 @@ fn custom_call_i64_array<'a>(
         Some(CustomCallAttr::I64Array(values)) => Ok(values.as_slice()),
         _ => Err(ConversionError::new(format!(
             "triton custom_call missing i64 array attr '{name}'"
+        ))),
+    }
+}
+
+fn custom_call_i64(attr: Option<&CustomCallAttr>, name: &str) -> ConversionResult<i64> {
+    match attr {
+        Some(CustomCallAttr::I64(value)) => Ok(*value),
+        _ => Err(ConversionError::new(format!(
+            "triton custom_call missing i64 attr '{name}'"
+        ))),
+    }
+}
+
+fn custom_call_string<'a>(
+    attr: Option<&'a CustomCallAttr>,
+    name: &str,
+) -> ConversionResult<&'a str> {
+    match attr {
+        Some(CustomCallAttr::String(value)) => Ok(value.as_str()),
+        _ => Err(ConversionError::new(format!(
+            "triton custom_call missing string attr '{name}'"
         ))),
     }
 }

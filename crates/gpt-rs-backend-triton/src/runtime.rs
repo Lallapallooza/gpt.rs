@@ -95,30 +95,15 @@ impl TritonExecutor {
         }
         let launch_start = KERNEL_LAUNCH_COUNT.load(Ordering::Relaxed);
 
-        let mut pending = function.body.iter().collect::<Vec<_>>();
-        while !pending.is_empty() {
-            let mut next = Vec::new();
-            let mut progress = false;
-            for instruction in pending {
-                if !instruction_operands_ready(instruction, &values) {
-                    next.push(instruction);
-                    continue;
-                }
-                let output = self.execute_instruction(&driver, &kernels, &values, instruction)?;
-                values.insert(instruction.id, output);
-                progress = true;
-            }
-            if !progress {
-                let instruction = next[0];
-                let missing = first_missing_operand_value(instruction, &values)
-                    .map(|id| id.0.to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
+        for instruction in &function.body {
+            if let Some(missing) = first_missing_operand_value(instruction, &values) {
                 return Err(BackendError::execution(format!(
-                    "triton runtime dependency resolution stalled at value {} for instruction {} ({:?})",
-                    missing, instruction.id.0, instruction.op
+                    "triton runtime operand value {} missing before instruction {} ({:?})",
+                    missing.0, instruction.id.0, instruction.op
                 )));
             }
-            pending = next;
+            let output = self.execute_instruction(&driver, &kernels, &values, instruction)?;
+            values.insert(instruction.id, output);
         }
 
         let mut results = Vec::with_capacity(function.result_ids.len());
@@ -2184,17 +2169,6 @@ impl TritonExecutor {
             ))),
         }
     }
-}
-
-fn instruction_operands_ready(
-    instruction: &gpt_rs::backend::spec::Instruction,
-    values: &HashMap<ValueId, TritonTensor>,
-) -> bool {
-    instruction.operands.iter().all(|operand| match operand {
-        Operand::Value(id) => values.contains_key(id),
-        Operand::TupleElement { tuple, .. } => values.contains_key(tuple),
-        Operand::Literal(_) => true,
-    })
 }
 
 fn first_missing_operand_value(

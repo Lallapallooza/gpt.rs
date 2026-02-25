@@ -96,6 +96,7 @@ impl TritonExecutor {
             values.insert(*value_id, input.clone());
         }
         let launch_start = KERNEL_LAUNCH_COUNT.load(Ordering::Relaxed);
+        let dispatch_start = std::time::Instant::now();
 
         for instruction in &function.body {
             if let Some(missing) = first_missing_operand_value(instruction, &values) {
@@ -118,6 +119,16 @@ impl TritonExecutor {
             })?;
             results.push(value);
         }
+        let dispatch_elapsed = dispatch_start.elapsed();
+        profiling::record_backend_aggregate(
+            "backend.triton.dispatch",
+            1,
+            dispatch_elapsed,
+            WorkStats {
+                elements: function.body.len() as u64,
+                ..WorkStats::default()
+            },
+        );
         let launch_end = KERNEL_LAUNCH_COUNT.load(Ordering::Relaxed);
         let launched = launch_end.saturating_sub(launch_start);
         if launched != 0 {

@@ -616,7 +616,7 @@ pub enum CustomCallAttr {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CustomCallSpec {
     pub target: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub attrs: BTreeMap<String, CustomCallAttr>,
 }
 
@@ -728,7 +728,7 @@ pub struct HintRegion {
     pub inputs: Vec<ValueId>,
     pub exports: Vec<ValueId>,
     pub body: Vec<Instruction>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub attrs: BTreeMap<String, CustomCallAttr>,
 }
 
@@ -740,7 +740,7 @@ pub struct Function {
     pub parameter_ids: Vec<ValueId>,
     pub results: Vec<ValueType>,
     pub body: Vec<Instruction>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub hints: Vec<HintRegion>,
     pub result_ids: Vec<ValueId>,
 }

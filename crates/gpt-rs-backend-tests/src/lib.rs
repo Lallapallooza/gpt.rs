@@ -1,4 +1,5 @@
 pub mod api_invariants;
+pub mod recording_backend;
 pub mod smoke;
 #[cfg(feature = "torch")]
 pub mod torch_parity;

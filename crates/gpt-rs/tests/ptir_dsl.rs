@@ -2,73 +2,18 @@ use std::{
     f32::consts::SQRT_2,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use gpt_rs::backend::spec::{
-    BackendResult, DType as BackendDType, Dimension, ElementwiseBinaryOp, ElementwiseUnaryOp,
-    Instruction, Operation, PortableBackend, Program, ReduceKind, TensorInit, TensorLiteral,
+    DType as BackendDType, Dimension, ElementwiseBinaryOp, ElementwiseUnaryOp, Operation,
+    ReduceKind,
 };
 use gpt_rs::ops::graph::GraphArena;
 use gpt_rs::ops::ptir::{tensor, DotAttrs, DotDims, PtirGraph, PtirSession};
 use gpt_rs::tensor::{DeviceTensor, Shape as DeviceShape};
 use gpt_rs::{axes, DType as FrontendDType};
-
-#[derive(Default)]
-struct RecordingBackend {
-    last_program: Mutex<Option<Program>>,
-}
-
-impl RecordingBackend {
-    fn recorded_program(&self) -> Option<Program> {
-        self.last_program
-            .lock()
-            .expect("backend mutex poisoned")
-            .clone()
-    }
-}
-
-impl PortableBackend for RecordingBackend {
-    type TensorHandle = ();
-
-    fn backend_name(&self) -> &str {
-        "recording"
-    }
-
-    fn materialize(&self, _init: TensorInit) -> BackendResult<Self::TensorHandle> {
-        Ok(())
-    }
-
-    fn to_literal(&self, _tensor: &Self::TensorHandle) -> BackendResult<TensorLiteral> {
-        unreachable!("recording backend never materializes tensors")
-    }
-
-    fn execute_instruction(
-        &self,
-        _instruction: &Instruction,
-        _inputs: &[Self::TensorHandle],
-    ) -> BackendResult<Vec<Self::TensorHandle>> {
-        unreachable!("recording backend does not execute individual instructions")
-    }
-
-    fn run_program(
-        &self,
-        program: &Program,
-        _entry_inputs: &[Self::TensorHandle],
-    ) -> BackendResult<Vec<Self::TensorHandle>> {
-        let outputs = program
-            .functions
-            .iter()
-            .find(|function| function.name == program.entry)
-            .map(|function| function.results.len())
-            .unwrap_or(0);
-        self.last_program
-            .lock()
-            .expect("backend mutex poisoned")
-            .replace(program.clone());
-        Ok(vec![(); outputs])
-    }
-}
+use gpt_rs_backend_tests::recording_backend::RecordingBackend;
 
 #[test]
 fn dsl_elementwise_chain_emits_expected_program() {

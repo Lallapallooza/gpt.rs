@@ -1,70 +1,15 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use gpt_rs::backend::spec::{
-    BackendResult, Dimension, ElementwiseBinaryOp, ElementwiseUnaryOp, Function, Instruction,
-    Operation, PortableBackend, Program, ReduceKind, TensorInit, TensorLiteral,
+    Dimension, ElementwiseBinaryOp, ElementwiseUnaryOp, Function, Operation, PortableBackend,
+    ReduceKind,
 };
 use gpt_rs::nn::layers::AttentionConfig;
 use gpt_rs::ops::functional;
 use gpt_rs::ops::functional::softmax_last_dim;
 use gpt_rs::tensor::{DeviceTensor, Shape as DeviceShape};
 use gpt_rs::DType;
-
-#[derive(Default)]
-struct RecordingBackend {
-    last_program: Mutex<Option<Program>>,
-}
-
-impl RecordingBackend {
-    fn recorded_program(&self) -> Option<Program> {
-        self.last_program
-            .lock()
-            .expect("backend mutex poisoned")
-            .clone()
-    }
-}
-
-impl PortableBackend for RecordingBackend {
-    type TensorHandle = ();
-
-    fn backend_name(&self) -> &str {
-        "recording"
-    }
-
-    fn materialize(&self, _init: TensorInit) -> BackendResult<Self::TensorHandle> {
-        Ok(())
-    }
-
-    fn to_literal(&self, _tensor: &Self::TensorHandle) -> BackendResult<TensorLiteral> {
-        unreachable!("recording backend never materializes tensors")
-    }
-
-    fn execute_instruction(
-        &self,
-        _instruction: &Instruction,
-        _inputs: &[Self::TensorHandle],
-    ) -> BackendResult<Vec<Self::TensorHandle>> {
-        unreachable!("recording backend does not execute standalone instructions")
-    }
-
-    fn run_program(
-        &self,
-        program: &Program,
-        _entry_inputs: &[Self::TensorHandle],
-    ) -> BackendResult<Vec<Self::TensorHandle>> {
-        let outputs = program
-            .functions
-            .iter()
-            .find(|function| function.name == program.entry)
-            .map(|function| function.results.len())
-            .unwrap_or(0);
-        self.last_program
-            .lock()
-            .expect("backend mutex poisoned")
-            .replace(program.clone());
-        Ok(vec![(); outputs])
-    }
-}
+use gpt_rs_backend_tests::recording_backend::RecordingBackend;
 
 #[test]
 fn softmax_last_dim_uses_ptir_dsl() {

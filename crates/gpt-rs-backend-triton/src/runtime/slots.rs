@@ -86,10 +86,7 @@ impl SlotAllocator {
             ))
         })?;
         let buffer = match maybe_existing {
-            Some(buffer) => {
-                driver.zero_device_bytes(buffer.device_ptr(), actual)?;
-                Arc::clone(buffer)
-            }
+            Some(buffer) => Arc::clone(buffer),
             None => {
                 let allocated = driver.alloc_zeroed(actual)?;
                 let slot_ref = self.slot_buffers.get_mut(slot_id).ok_or_else(|| {

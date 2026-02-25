@@ -592,22 +592,19 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
             })
             .collect();
 
-        let mut ordered = Vec::new();
-        for value in &inner.order {
-            if pending.contains(value) {
-                ordered.push(*value);
-            }
-        }
+        let mut ordered: Vec<_> = pending.into_iter().collect();
+        ordered.sort_by_key(|value| value.0);
 
         // Preserve a deterministic result list using creation order, but emit only the
         // requested values (exports + explicit targets). This prevents every SSA value
         // from appearing as a program output.
-        let mut result_values = Vec::new();
-        for value in &inner.order {
-            if requested.contains(value) {
-                result_values.push(*value);
-            }
-        }
+        let mut result_values: Vec<_> = requested
+            .iter()
+            .copied()
+            .filter(|value| inner.nodes.contains_key(value))
+            .collect();
+        result_values.sort_by_key(|value| value.0);
+        result_values.dedup();
 
         let mut nodes = Vec::with_capacity(ordered.len());
         for value in &ordered {
@@ -629,9 +626,12 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
         let mut signature_targets: Vec<_> = targets.to_vec();
         ensure_targets_sorted(&mut signature_targets);
 
+        // Plan cache keys intentionally ignore arena version so decode-style workloads can reuse
+        // the same structural plan across successive graph mutations. Concrete ValueId bindings
+        // are rebound per-context in `get_or_build_plan`.
         let key = PlanKey::new(
             self.backend.backend_name(),
-            inner.version,
+            0,
             &input_signatures,
             &exports,
             &signature_targets,
@@ -654,7 +654,9 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
     fn get_or_build_plan(&self, context: PlanContext) -> Result<(Arc<CachedPlan>, bool)> {
         if let Some(plan) = self.plan_cache.get(&context.key) {
             crate::profiling::cache_event("plan_cache_hit");
-            return Ok((plan, true));
+            return self
+                .rebind_plan_for_context(plan, context)
+                .map(|plan| (plan, true));
         }
         crate::profiling::cache_event("plan_cache_miss");
 
@@ -667,6 +669,42 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
         };
         self.plan_cache.insert(Arc::clone(&plan));
         Ok((plan, false))
+    }
+
+    fn rebind_plan_for_context(
+        &self,
+        plan: Arc<CachedPlan>,
+        context: PlanContext,
+    ) -> Result<Arc<CachedPlan>> {
+        if plan.outputs == context.outputs
+            && plan.exports == context.exports
+            && plan.parameter_specs.len() == context.parameter_specs.len()
+            && plan
+                .parameter_specs
+                .iter()
+                .zip(context.parameter_specs.iter())
+                .all(|(cached, current)| {
+                    cached.value == current.value && cached.spec == current.spec
+                })
+        {
+            return Ok(plan);
+        }
+
+        let (plan_parameter_specs, plan_parameter_values) = {
+            let _scope = crate::profiling::compile_scope("graph::bind_plan_inputs");
+            build_arg_bindings(&plan.inputs, &context.parameter_specs)?
+        };
+
+        Ok(Arc::new(CachedPlan::new(
+            context.key,
+            Arc::clone(&plan.program),
+            plan.program_cache_hit,
+            plan.inputs.clone(),
+            plan_parameter_specs,
+            plan_parameter_values,
+            context.outputs,
+            context.exports,
+        )))
     }
 
     fn build_plan_from_context(&self, context: PlanContext) -> Result<Arc<CachedPlan>> {

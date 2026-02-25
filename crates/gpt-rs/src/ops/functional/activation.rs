@@ -9,7 +9,7 @@ use gpt_rs_macros::{capture_ptir, ptir_pattern, support_runtime_overload};
 use crate::backend::spec::PortableBackend;
 use crate::ops::functional::common::{
     ensure_rank_at_least, ensure_same_backend, ensure_same_dtype, ensure_shape_matches,
-    CaptureIntoDeviceTensor,
+    softmax_last_axis_ptir, CaptureIntoDeviceTensor,
 };
 use crate::ops::ptir;
 use crate::tensor::DeviceTensor;
@@ -82,11 +82,8 @@ pub fn softmax_last_dim<B: PortableBackend + 'static>(
 ) -> Result<DeviceTensor<B>> {
     let plan = validate_softmax_last_dim(x)?;
     capture_ptir!({ input = x }, |_session| {
-        let max = input.reduce_max([plan.axis], true);
-        let shifted = input - max.broadcast_like(&input);
-        let exp_values = shifted.exp();
-        let sum = exp_values.reduce_sum([plan.axis], true);
-        Ok((exp_values / sum.broadcast_like(&input)).id())
+        let output = softmax_last_axis_ptir(&input, plan.axis);
+        Ok(output.id())
     })?
     .into_device_tensor()
 }

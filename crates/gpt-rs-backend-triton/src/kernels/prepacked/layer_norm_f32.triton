@@ -1,0 +1,55 @@
+# gpt_rs.kernel: layer_norm_f32
+# gpt_rs.symbol: gpt_rs_triton_layer_norm_f32
+# gpt_rs.signature: in_ptr=*fp32,gamma_ptr=*fp32,beta_ptr=*fp32,out_ptr=*fp32,rows=i32,cols=i32,eps=fp32
+# gpt_rs.param_abi: *fp32,*fp32,*fp32,*fp32,i32,i32,fp32,*opaque
+# gpt_rs.constexpr: BLOCK_SIZE=256
+# gpt_rs.num_warps: 8
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def gpt_rs_triton_layer_norm_f32(
+    in_ptr,
+    gamma_ptr,
+    beta_ptr,
+    out_ptr,
+    rows,
+    cols,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= rows:
+        return
+
+    offs = tl.arange(0, BLOCK_SIZE)
+    row_base = pid * cols
+
+    sum_vals = tl.zeros([BLOCK_SIZE], tl.float32)
+    sumsq_vals = tl.zeros([BLOCK_SIZE], tl.float32)
+    col = 0
+    while col < cols:
+        idx = col + offs
+        mask = idx < cols
+        x = tl.load(in_ptr + row_base + idx, mask=mask, other=0.0)
+        sum_vals += x
+        sumsq_vals += x * x
+        col += BLOCK_SIZE
+
+    cols_f = tl.cast(cols, tl.float32)
+    mean = tl.sum(sum_vals, axis=0) / cols_f
+    var = tl.sum(sumsq_vals, axis=0) / cols_f - mean * mean
+    inv_std = tl.rsqrt(var + eps)
+
+    col = 0
+    while col < cols:
+        idx = col + offs
+        mask = idx < cols
+        x = tl.load(in_ptr + row_base + idx, mask=mask, other=0.0)
+        g = tl.load(gamma_ptr + idx, mask=mask, other=0.0)
+        b = tl.load(beta_ptr + idx, mask=mask, other=0.0)
+        y = (x - mean) * inv_std
+        tl.store(out_ptr + row_base + idx, y * g + b, mask=mask)
+        col += BLOCK_SIZE

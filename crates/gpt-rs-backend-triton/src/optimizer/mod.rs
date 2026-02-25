@@ -1,5 +1,8 @@
 mod fusion_policy;
+mod layer_norm_fusion;
 mod pipeline;
+mod rewrite_utils;
+mod softmax_fusion;
 
 use gpt_rs::backend::conversion::ConversionResult;
 use gpt_rs::backend::optimizer::{
@@ -10,7 +13,9 @@ use gpt_rs::backend::spec::PortableBackend;
 use gpt_rs::tensor::InputRole;
 
 pub use fusion_policy::{TritonHintCostModel, TritonHintLegalizer};
+pub use layer_norm_fusion::TritonLayerNormFusionPass;
 pub use pipeline::TritonPipeline;
+pub use softmax_fusion::TritonSoftmaxFusionPass;
 
 pub fn optimize_program_for_triton(
     program: &gpt_rs::backend::spec::Program,

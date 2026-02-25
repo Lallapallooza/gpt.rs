@@ -18,6 +18,8 @@ pub const REDUCE_SUM_LAST_AXIS_KERNEL_ID: &str = "gpt_rs.triton.kernel.reduce_su
 pub const REDUCE_SUM_LAST_AXIS_SYMBOL: &str = "gpt_rs_triton_reduce_sum_last_axis_f32";
 pub const REDUCE_MAX_LAST_AXIS_KERNEL_ID: &str = "gpt_rs.triton.kernel.reduce_max_last_axis_f32.v1";
 pub const REDUCE_MAX_LAST_AXIS_SYMBOL: &str = "gpt_rs_triton_reduce_max_last_axis_f32";
+pub const SOFTMAX_LAST_AXIS_KERNEL_ID: &str = "gpt_rs.triton.kernel.softmax_last_axis_f32.v1";
+pub const SOFTMAX_LAST_AXIS_SYMBOL: &str = "gpt_rs_triton_softmax_last_axis_f32";
 pub const IOTA_SI32_KERNEL_ID: &str = "gpt_rs.triton.kernel.iota_si32_rank4.v1";
 pub const IOTA_SI32_SYMBOL: &str = "gpt_rs_triton_iota_si32_rank4";
 pub const COMPARE_SI32_I1_KERNEL_ID: &str = "gpt_rs.triton.kernel.compare_si32_i1.v1";
@@ -36,6 +38,8 @@ pub const REDUCE_WINDOW_MAX_NHWC_KERNEL_ID: &str =
 pub const REDUCE_WINDOW_MAX_NHWC_SYMBOL: &str = "gpt_rs_triton_reduce_window_max_nhwc_f32";
 pub const DOT_BIAS_RANK2_KERNEL_ID: &str = "gpt_rs.triton.kernel.dot_bias_rank2_f32.v1";
 pub const DOT_BIAS_RANK2_SYMBOL: &str = "gpt_rs_triton_dot_bias_rank2_f32";
+pub const LAYER_NORM_F32_KERNEL_ID: &str = "gpt_rs.triton.kernel.layer_norm_f32.v1";
+pub const LAYER_NORM_F32_SYMBOL: &str = "gpt_rs_triton_layer_norm_f32";
 pub const PREPACKED_EWISE_BINARY_KERNEL: &str =
     include_str!("kernels/prepacked/elementwise_binary_f32.triton");
 pub const PREPACKED_EWISE_UNARY_KERNEL: &str =
@@ -66,9 +70,13 @@ pub const PREPACKED_REDUCE_WINDOW_MAX_NHWC_KERNEL: &str =
     include_str!("kernels/prepacked/reduce_window_max_nhwc_f32.triton");
 pub const PREPACKED_DOT_BIAS_RANK2_KERNEL: &str =
     include_str!("kernels/prepacked/dot_bias_rank2_f32.triton");
+pub const PREPACKED_LAYER_NORM_F32_KERNEL: &str =
+    include_str!("kernels/prepacked/layer_norm_f32.triton");
 pub const PREPACKED_MATMUL_KERNEL: &str = include_str!("kernels/prepacked/matmul_f32.triton");
 pub const PREPACKED_REDUCE_SUM_LAST_AXIS_KERNEL: &str =
     include_str!("kernels/prepacked/reduce_sum_last_axis_f32.triton");
+pub const PREPACKED_SOFTMAX_LAST_AXIS_KERNEL: &str =
+    include_str!("kernels/prepacked/softmax_last_axis_f32.triton");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KernelSpec {
@@ -89,6 +97,7 @@ pub enum KernelKind {
     ConcatF32Rank4,
     ReduceSumLastAxisF32,
     ReduceMaxLastAxisF32,
+    SoftmaxLastAxisF32,
     IotaSi32Rank4,
     CompareSi32I1,
     SelectI1F32,
@@ -97,6 +106,7 @@ pub enum KernelKind {
     ExtractPatchesNhwcF32,
     ReduceWindowMaxNhwcF32,
     DotBiasRank2F32,
+    LayerNormF32,
     FusedElementwiseF32,
 }
 
@@ -181,6 +191,15 @@ pub fn reduce_max_last_axis_kernel_spec() -> KernelSpec {
     }
 }
 
+pub fn softmax_last_axis_kernel_spec() -> KernelSpec {
+    KernelSpec {
+        id: SOFTMAX_LAST_AXIS_KERNEL_ID.to_string(),
+        kind: KernelKind::SoftmaxLastAxisF32,
+        source: PREPACKED_SOFTMAX_LAST_AXIS_KERNEL.to_string(),
+        symbol: SOFTMAX_LAST_AXIS_SYMBOL.to_string(),
+    }
+}
+
 pub fn iota_si32_kernel_spec() -> KernelSpec {
     KernelSpec {
         id: IOTA_SI32_KERNEL_ID.to_string(),
@@ -253,6 +272,15 @@ pub fn dot_bias_rank2_kernel_spec() -> KernelSpec {
     }
 }
 
+pub fn layer_norm_f32_kernel_spec() -> KernelSpec {
+    KernelSpec {
+        id: LAYER_NORM_F32_KERNEL_ID.to_string(),
+        kind: KernelKind::LayerNormF32,
+        source: PREPACKED_LAYER_NORM_F32_KERNEL.to_string(),
+        symbol: LAYER_NORM_F32_SYMBOL.to_string(),
+    }
+}
+
 pub fn elementwise_binary_triton_source() -> String {
     PREPACKED_EWISE_BINARY_KERNEL.to_string()
 }
@@ -279,7 +307,9 @@ pub fn prepacked_kernel_sources() -> &'static [&'static str] {
         PREPACKED_EXTRACT_PATCHES_NHWC_KERNEL,
         PREPACKED_REDUCE_WINDOW_MAX_NHWC_KERNEL,
         PREPACKED_DOT_BIAS_RANK2_KERNEL,
+        PREPACKED_LAYER_NORM_F32_KERNEL,
         PREPACKED_MATMUL_KERNEL,
         PREPACKED_REDUCE_SUM_LAST_AXIS_KERNEL,
+        PREPACKED_SOFTMAX_LAST_AXIS_KERNEL,
     ]
 }

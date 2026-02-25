@@ -46,6 +46,39 @@ impl OperationView for CastOpView {
 }
 
 #[derive(Clone)]
+pub struct AnyOpView {
+    pub root: InstId,
+    pub operands: Vec<Operand>,
+    pub result: ValueId,
+    pub result_type: ValueType,
+    pub op: Operation,
+}
+
+impl AnyOpView {
+    pub fn new(root: InstId, rewriter: &ProgramRewriter) -> Option<Self> {
+        let operands = rewriter.operands(root).to_vec();
+        let result = rewriter.value_of(root);
+        let result_type = rewriter.type_of(result)?.clone();
+        let op = rewriter.op(root).clone();
+        Some(Self {
+            root,
+            operands,
+            result,
+            result_type,
+            op,
+        })
+    }
+}
+
+impl OperationView for AnyOpView {
+    const MATCHER: super::OperationMatcher = filters::any;
+
+    fn extract(root: InstId, rewriter: &ProgramRewriter) -> Option<Self> {
+        Self::new(root, rewriter)
+    }
+}
+
+#[derive(Clone)]
 pub struct BroadcastOpView {
     pub root: InstId,
     pub operands: Vec<Operand>,
@@ -658,3 +691,97 @@ macro_rules! define_reduce_view {
 define_reduce_view!(ReduceSumOpView, reduce_sum, ReduceKind::Sum);
 define_reduce_view!(ReduceMaxOpView, reduce_max, ReduceKind::Max);
 define_reduce_view!(ReduceMinOpView, reduce_min, ReduceKind::Min);
+
+#[derive(Clone)]
+pub struct SoftmaxDecompositionView {
+    pub output: DivOpView,
+    pub exp_values: ExpOpView,
+    pub shifted: SubOpView,
+    pub sum: ReduceSumOpView,
+    pub max: ReduceMaxOpView,
+    pub sum_broadcast: Option<BroadcastOpView>,
+    pub max_broadcast: Option<BroadcastOpView>,
+}
+
+impl SoftmaxDecompositionView {
+    pub fn new(root: InstId, rewriter: &ProgramRewriter) -> Option<Self> {
+        let output = DivOpView::new(root, rewriter)?;
+        let div_lhs = value_operand(output.operands.first())?;
+        let div_rhs = value_operand(output.operands.get(1))?;
+
+        let exp_values = ExpOpView::new(rewriter.inst_of(div_lhs)?, rewriter)?;
+        let exp_input = value_operand(exp_values.operands.first())?;
+
+        let (sum, sum_broadcast) = reduce_sum_chain(div_rhs, rewriter)?;
+        let sum_input = value_operand(sum.operands.first())?;
+        if sum_input != exp_values.result {
+            return None;
+        }
+
+        let shifted = SubOpView::new(rewriter.inst_of(exp_input)?, rewriter)?;
+        let shifted_lhs = value_operand(shifted.operands.first())?;
+        let shifted_rhs = value_operand(shifted.operands.get(1))?;
+
+        let (max, max_broadcast) = reduce_max_chain(shifted_rhs, rewriter)?;
+        let max_input = value_operand(max.operands.first())?;
+        if shifted_lhs != max_input {
+            return None;
+        }
+
+        Some(Self {
+            output,
+            exp_values,
+            shifted,
+            sum,
+            max,
+            sum_broadcast,
+            max_broadcast,
+        })
+    }
+}
+
+impl OperationView for SoftmaxDecompositionView {
+    const MATCHER: super::OperationMatcher = filters::div;
+
+    fn extract(root: InstId, rewriter: &ProgramRewriter) -> Option<Self> {
+        Self::new(root, rewriter)
+    }
+}
+
+fn reduce_sum_chain(
+    value: ValueId,
+    rewriter: &ProgramRewriter,
+) -> Option<(ReduceSumOpView, Option<BroadcastOpView>)> {
+    reduce_chain(value, rewriter, ReduceSumOpView::new)
+}
+
+fn reduce_max_chain(
+    value: ValueId,
+    rewriter: &ProgramRewriter,
+) -> Option<(ReduceMaxOpView, Option<BroadcastOpView>)> {
+    reduce_chain(value, rewriter, ReduceMaxOpView::new)
+}
+
+fn reduce_chain<R>(
+    value: ValueId,
+    rewriter: &ProgramRewriter,
+    reduce_ctor: fn(InstId, &ProgramRewriter) -> Option<R>,
+) -> Option<(R, Option<BroadcastOpView>)> {
+    let producer = rewriter.inst_of(value)?;
+    if let Some(broadcast) = BroadcastOpView::new(producer, rewriter) {
+        let reduce_value = value_operand(broadcast.operands.first())?;
+        let reduce_inst = rewriter.inst_of(reduce_value)?;
+        let reduce = reduce_ctor(reduce_inst, rewriter)?;
+        return Some((reduce, Some(broadcast)));
+    }
+
+    let reduce = reduce_ctor(producer, rewriter)?;
+    Some((reduce, None))
+}
+
+fn value_operand(operand: Option<&Operand>) -> Option<ValueId> {
+    match operand {
+        Some(Operand::Value(value)) => Some(*value),
+        _ => None,
+    }
+}

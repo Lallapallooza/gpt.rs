@@ -11,7 +11,7 @@ use gpt_rs::backend::{
 
 use crate::targets::{binary_code, unary_code, TARGET_ELEMENTWISE_FUSED_F32_V1};
 
-use super::utils::{static_dims, tensor_spec_of};
+use super::utils::tensor_spec_of;
 
 enum FusedKind {
     Unary,
@@ -79,7 +79,7 @@ fn build_fusion_plan<'a, 'r>(
         if spec.dtype != DType::F32 {
             return None;
         }
-        let dims = static_dims(&spec)?;
+        let dims = spec.shape.static_dims()?;
         if !is_broadcastable(ctx.root_dims, &dims) {
             return None;
         }
@@ -96,7 +96,7 @@ fn build_fusion_plan<'a, 'r>(
                 if literal.spec.dtype != DType::F32 {
                     return None;
                 }
-                let dims = static_dims(&literal.spec)?;
+                let dims = literal.spec.shape.static_dims()?;
                 if !is_broadcastable(ctx.root_dims, &dims) {
                     return None;
                 }
@@ -134,7 +134,7 @@ fn build_fusion_plan<'a, 'r>(
                 Operation::ElementwiseUnary(op) => {
                     let spec = tensor_spec_of(ctx.rewriter, value)?;
                     if spec.dtype != DType::F32
-                        || static_dims(&spec).as_deref() != Some(ctx.root_dims)
+                        || spec.shape.static_dims().as_deref() != Some(ctx.root_dims)
                     {
                         None
                     } else if !force_fuse && ctx.rewriter.users_of(value).len() != 1 {
@@ -155,7 +155,7 @@ fn build_fusion_plan<'a, 'r>(
                 Operation::ElementwiseBinary(op) => {
                     let spec = tensor_spec_of(ctx.rewriter, value)?;
                     if spec.dtype != DType::F32
-                        || static_dims(&spec).as_deref() != Some(ctx.root_dims)
+                        || spec.shape.static_dims().as_deref() != Some(ctx.root_dims)
                     {
                         None
                     } else if !force_fuse && ctx.rewriter.users_of(value).len() != 1 {
@@ -177,7 +177,7 @@ fn build_fusion_plan<'a, 'r>(
                 Operation::BroadcastTo(_) => {
                     let spec = tensor_spec_of(ctx.rewriter, value)?;
                     if spec.dtype != DType::F32
-                        || static_dims(&spec).as_deref() != Some(ctx.root_dims)
+                        || spec.shape.static_dims().as_deref() != Some(ctx.root_dims)
                     {
                         None
                     } else if ctx.rewriter.users_of(value).len() == 1 {
@@ -258,7 +258,7 @@ impl FunctionPass<crate::CBackend> for CElementwiseFusionPass {
             if root_spec.dtype != DType::F32 {
                 continue;
             }
-            let root_dims = match static_dims(&root_spec) {
+            let root_dims = match root_spec.shape.static_dims() {
                 Some(dims) => dims,
                 None => continue,
             };

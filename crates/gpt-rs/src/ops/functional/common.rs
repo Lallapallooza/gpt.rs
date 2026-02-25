@@ -11,9 +11,24 @@ use gpt_rs_macros::capture_ptir;
 
 use crate::backend::spec::{PortableBackend, ValueId};
 use crate::ops::graph::GraphArena;
+use crate::ops::ptir;
 pub(crate) use crate::ops::ptir::scalar_broadcast;
 use crate::tensor::spec_utils::{frontend_dtype, shape_from_spec};
 use crate::tensor::{DType as TensorDType, DeviceTensor};
+
+/// Builds numerically-stable softmax over a selected axis using PTIR tensor ops.
+///
+/// This helper centralizes softmax decomposition so all callsites emit the same IR pattern.
+pub(crate) fn softmax_last_axis_ptir<'ctx, 'gb, B: PortableBackend + 'static>(
+    input: &ptir::Tensor<'ctx, 'gb, B>,
+    axis: usize,
+) -> ptir::Tensor<'ctx, 'gb, B> {
+    let max = input.reduce_max([axis], true);
+    let shifted = *input - max.broadcast_like(input);
+    let exp_values = shifted.exp();
+    let sum = exp_values.reduce_sum([axis], true);
+    exp_values / sum.broadcast_like(input)
+}
 
 /// Extension trait exposing ergonomic math helpers on device tensors.
 pub trait DeviceTensorOps<B: PortableBackend + 'static>: Sized {

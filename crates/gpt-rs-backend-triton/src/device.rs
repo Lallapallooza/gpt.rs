@@ -325,18 +325,6 @@ impl CudaDriver {
         Ok(())
     }
 
-    pub fn zero_device_bytes(&self, ptr: CUdeviceptr, bytes: usize) -> BackendResult<()> {
-        if bytes == 0 {
-            return Ok(());
-        }
-        self.ensure_current()?;
-        // SAFETY: `ptr` points to a valid CUDA allocation and `bytes` is caller-validated.
-        unsafe {
-            check_cuda((self.fns.cu_memset_d8_v2)(ptr, 0, bytes), "cuMemsetD8_v2")?;
-        }
-        Ok(())
-    }
-
     fn alloc(self: &Arc<Self>, bytes: usize) -> BackendResult<Arc<DeviceBuffer>> {
         if bytes != 0 {
             let cached_ptr = {

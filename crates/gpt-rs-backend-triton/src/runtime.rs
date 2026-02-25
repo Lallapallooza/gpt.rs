@@ -1,6 +1,9 @@
 mod fused_dot_epilogue;
 mod fused_elementwise;
+mod layer_norm;
 mod slots;
+mod softmax;
+mod values;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -31,9 +34,13 @@ use crate::kernels::{
     REDUCE_SUM_LAST_AXIS_KERNEL_ID, REDUCE_WINDOW_MAX_NHWC_KERNEL_ID, SELECT_I1_F32_KERNEL_ID,
     SLICE_KERNEL_ID, TAKE_F32_I32_KERNEL_ID, TRANSPOSE_KERNEL_ID,
 };
-use crate::targets::{TARGET_DOT_BIAS_FUSED_F32_V1, TARGET_ELEMENTWISE_FUSED_F32_V1};
+use crate::targets::{
+    TARGET_DOT_BIAS_FUSED_F32_V1, TARGET_ELEMENTWISE_FUSED_F32_V1, TARGET_LAYER_NORM_FUSED_F32_V1,
+    TARGET_SOFTMAX_LAST_AXIS_FUSED_F32_V1,
+};
 use crate::tensor::TritonTensor;
 use slots::SlotAllocator;
+use values::DenseValueStore;
 
 thread_local! {
     static EXECUTION_KERNEL_STACK: RefCell<Vec<HashMap<String, Arc<LoadedKernel>>>> =
@@ -95,19 +102,15 @@ impl TritonExecutor {
         let preloaded = self.preload_execution_kernels(&driver, &artifact.kernels)?;
         let _execution_kernel_guard = ExecutionKernelGuard::push(preloaded);
 
-        let mut values: HashMap<ValueId, TritonTensor> = HashMap::new();
-        for (value_id, input) in function.parameter_ids.iter().zip(entry_inputs.iter()) {
-            values.insert(*value_id, input.clone());
-        }
+        let mut values = initialize_values(function, entry_inputs);
         if function_slot_plan.is_some() {
             profiling::cache_event("triton_backend.slot_plan_available");
         } else {
             profiling::cache_event("triton_backend.slot_plan_missing");
         }
-        let mut slot_allocator = SlotAllocator::new(function_slot_plan, value_last_use.clone());
+        let mut slot_allocator = SlotAllocator::new(function_slot_plan, value_last_use);
         let launch_start = KERNEL_LAUNCH_COUNT.load(Ordering::Relaxed);
         let dispatch_start = std::time::Instant::now();
-        let initial_values = values.clone();
         if let Some((missing, instruction)) = self.execute_body_single_pass(
             &driver,
             &kernels,
@@ -116,7 +119,7 @@ impl TritonExecutor {
             function,
         )? {
             profiling::cache_event("triton_backend.dispatch_fallback_worklist");
-            values = initial_values;
+            values = initialize_values(function, entry_inputs);
             profiling::cache_event("triton_backend.slot_plan_disabled_worklist");
             slot_allocator = SlotAllocator::new(None, HashMap::new());
             self.execute_body_worklist(
@@ -136,7 +139,7 @@ impl TritonExecutor {
 
         let mut results = Vec::with_capacity(function.result_ids.len());
         for result_id in &function.result_ids {
-            let value = values.get(result_id).cloned().ok_or_else(|| {
+            let value = values.get_cloned(*result_id).ok_or_else(|| {
                 BackendError::execution(format!(
                     "missing result value {} in triton runtime",
                     result_id.0
@@ -171,7 +174,7 @@ impl TritonExecutor {
         &self,
         driver: &Arc<CudaDriver>,
         kernels: &HashMap<&str, &KernelSpec>,
-        values: &mut HashMap<ValueId, TritonTensor>,
+        values: &mut DenseValueStore,
         slot_allocator: &mut SlotAllocator,
         function: &gpt_rs::backend::spec::Function,
     ) -> BackendResult<Option<(ValueId, gpt_rs::backend::spec::Instruction)>> {
@@ -197,7 +200,7 @@ impl TritonExecutor {
         &self,
         driver: &Arc<CudaDriver>,
         kernels: &HashMap<&str, &KernelSpec>,
-        values: &mut HashMap<ValueId, TritonTensor>,
+        values: &mut DenseValueStore,
         slot_allocator: &mut SlotAllocator,
         function: &gpt_rs::backend::spec::Function,
     ) -> BackendResult<()> {
@@ -248,7 +251,7 @@ impl TritonExecutor {
         &self,
         driver: &Arc<CudaDriver>,
         kernels: &HashMap<&str, &KernelSpec>,
-        values: &HashMap<ValueId, TritonTensor>,
+        values: &DenseValueStore,
         slot_allocator: &mut SlotAllocator,
         instruction: &gpt_rs::backend::spec::Instruction,
         instruction_pos: usize,
@@ -616,11 +619,11 @@ impl TritonExecutor {
     fn resolve_operand_tensor(
         &self,
         driver: &Arc<CudaDriver>,
-        values: &HashMap<ValueId, TritonTensor>,
+        values: &DenseValueStore,
         operand: Option<&Operand>,
     ) -> BackendResult<TritonTensor> {
         match operand {
-            Some(Operand::Value(id)) => values.get(id).cloned().ok_or_else(|| {
+            Some(Operand::Value(id)) => values.get_cloned(*id).ok_or_else(|| {
                 BackendError::execution(format!(
                     "operand value {} missing from triton runtime state",
                     id.0
@@ -638,7 +641,7 @@ impl TritonExecutor {
         &self,
         driver: &Arc<CudaDriver>,
         kernels: &HashMap<&str, &KernelSpec>,
-        values: &HashMap<ValueId, TritonTensor>,
+        values: &DenseValueStore,
         instruction: &gpt_rs::backend::spec::Instruction,
         spec: &CustomCallSpec,
         out: OutputBinding<'_>,
@@ -660,6 +663,17 @@ impl TritonExecutor {
                 spec,
                 out,
             ),
+            TARGET_LAYER_NORM_FUSED_F32_V1 => {
+                self.execute_layer_norm_custom_call(driver, kernels, values, instruction, spec, out)
+            }
+            TARGET_SOFTMAX_LAST_AXIS_FUSED_F32_V1 => self.execute_softmax_last_axis_custom_call(
+                driver,
+                kernels,
+                values,
+                instruction,
+                spec,
+                out,
+            ),
             _ => Err(BackendError::execution(format!(
                 "unsupported triton custom_call target '{}'",
                 spec.target
@@ -670,7 +684,7 @@ impl TritonExecutor {
     fn execute_fused_elementwise_custom_call(
         &self,
         driver: &Arc<CudaDriver>,
-        values: &HashMap<ValueId, TritonTensor>,
+        values: &DenseValueStore,
         instruction: &gpt_rs::backend::spec::Instruction,
         spec: &CustomCallSpec,
         out_spec: &TensorSpec,
@@ -750,7 +764,7 @@ impl TritonExecutor {
         &self,
         driver: &Arc<CudaDriver>,
         kernels: &HashMap<&str, &KernelSpec>,
-        values: &HashMap<ValueId, TritonTensor>,
+        values: &DenseValueStore,
         instruction: &gpt_rs::backend::spec::Instruction,
         spec: &CustomCallSpec,
         out: OutputBinding<'_>,
@@ -1144,6 +1158,20 @@ impl TritonExecutor {
             return Err(BackendError::execution(
                 "slice starts and sizes length mismatch",
             ));
+        }
+        if let Some(copy) = contiguous_slice_copy_plan(&input.spec, out_spec, &spec.starts)? {
+            let out = allocate_output_tensor(driver, out_spec, output)?;
+            if copy.byte_len == 0 {
+                return Ok(out);
+            }
+            let src_ptr = input
+                .buffer
+                .device_ptr()
+                .checked_add(copy.byte_offset)
+                .ok_or_else(|| BackendError::execution("slice contiguous pointer overflow"))?;
+            driver.copy_device_to_device(out.buffer.device_ptr(), src_ptr, copy.byte_len)?;
+            profiling::cache_event("triton_backend.slice_d2d");
+            return Ok(out);
         }
 
         match out_spec.dtype {
@@ -2513,14 +2541,12 @@ impl TritonExecutor {
 
 fn first_missing_operand_value(
     instruction: &gpt_rs::backend::spec::Instruction,
-    values: &HashMap<ValueId, TritonTensor>,
+    values: &DenseValueStore,
 ) -> Option<ValueId> {
     for operand in &instruction.operands {
         match operand {
-            Operand::Value(id) if !values.contains_key(id) => return Some(*id),
-            Operand::TupleElement { tuple, .. } if !values.contains_key(tuple) => {
-                return Some(*tuple)
-            }
+            Operand::Value(id) if !values.contains(*id) => return Some(*id),
+            Operand::TupleElement { tuple, .. } if !values.contains(*tuple) => return Some(*tuple),
             Operand::Literal(_) | Operand::Value(_) | Operand::TupleElement { .. } => {}
         }
     }
@@ -2569,6 +2595,17 @@ fn compute_value_last_use(
         }
     }
     last_use
+}
+
+fn initialize_values(
+    function: &gpt_rs::backend::spec::Function,
+    entry_inputs: &[TritonTensor],
+) -> DenseValueStore {
+    let mut values = DenseValueStore::new(function);
+    for (value_id, input) in function.parameter_ids.iter().zip(entry_inputs.iter()) {
+        values.insert(*value_id, input.clone());
+    }
+    values
 }
 
 struct LoadedKernel {
@@ -2831,6 +2868,84 @@ fn slice_rank4_layout(
             .map_err(|_| BackendError::execution("slice start exceeds i32 range"))?;
     }
     Ok((out_i32, strides_i32, starts_i32))
+}
+
+struct ContiguousSliceCopyPlan {
+    byte_offset: u64,
+    byte_len: usize,
+}
+
+fn contiguous_slice_copy_plan(
+    input_spec: &TensorSpec,
+    out_spec: &TensorSpec,
+    starts: &[usize],
+) -> BackendResult<Option<ContiguousSliceCopyPlan>> {
+    let in_dims = static_dims_or_error(&input_spec.shape, |_| {
+        BackendError::execution("dynamic dimensions are not supported by triton runtime")
+    })?;
+    let out_dims = static_dims_or_error(&out_spec.shape, |_| {
+        BackendError::execution("dynamic dimensions are not supported by triton runtime")
+    })?;
+    if in_dims.len() != out_dims.len() || starts.len() != in_dims.len() {
+        return Ok(None);
+    }
+
+    for axis in 0..in_dims.len() {
+        if match starts[axis].checked_add(out_dims[axis]) {
+            Some(end) => end > in_dims[axis],
+            None => true,
+        } {
+            return Err(BackendError::execution(format!(
+                "slice out of bounds at axis {axis}"
+            )));
+        }
+    }
+
+    let first_non_full =
+        (0..in_dims.len()).find(|&axis| starts[axis] != 0 || out_dims[axis] != in_dims[axis]);
+    if let Some(axis) = first_non_full {
+        // A contiguous subrange in row-major memory can only have one truncated axis,
+        // with all leading axes selecting exactly one index and all trailing axes full.
+        if (0..axis).any(|idx| out_dims[idx] != 1) {
+            return Ok(None);
+        }
+        if ((axis + 1)..in_dims.len()).any(|idx| starts[idx] != 0 || out_dims[idx] != in_dims[idx])
+        {
+            return Ok(None);
+        }
+    }
+
+    let strides =
+        contiguous_strides_or_error(&in_dims, || BackendError::execution("stride overflow"))?;
+    let mut offset_elems = 0usize;
+    for axis in 0..in_dims.len() {
+        offset_elems = offset_elems
+            .checked_add(
+                starts[axis]
+                    .checked_mul(strides[axis])
+                    .ok_or_else(|| BackendError::execution("slice contiguous offset overflow"))?,
+            )
+            .ok_or_else(|| BackendError::execution("slice contiguous offset overflow"))?;
+    }
+
+    let elem_size = out_spec
+        .dtype
+        .size_in_bytes()
+        .ok_or_else(|| BackendError::execution("slice contiguous unsupported dtype size"))?;
+    let byte_offset = u64::try_from(
+        offset_elems
+            .checked_mul(elem_size)
+            .ok_or_else(|| BackendError::execution("slice contiguous byte offset overflow"))?,
+    )
+    .map_err(|_| BackendError::execution("slice contiguous byte offset exceeds u64"))?;
+    let byte_len = out_spec
+        .byte_len()
+        .ok_or_else(|| BackendError::execution("slice contiguous output byte length unknown"))?;
+
+    Ok(Some(ContiguousSliceCopyPlan {
+        byte_offset,
+        byte_len,
+    }))
 }
 
 fn transpose_rank5_layout(

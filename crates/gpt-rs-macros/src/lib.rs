@@ -363,6 +363,7 @@ impl Parse for PatternAttr {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewKind {
+    Any,
     Add,
     Sub,
     Mul,
@@ -387,6 +388,7 @@ enum ViewKind {
 impl ViewKind {
     fn view_type_tokens(self) -> TokenStream2 {
         match self {
+            ViewKind::Any => quote!(::gpt_rs::backend::pattern::AnyOpView),
             ViewKind::Add => quote!(::gpt_rs::backend::pattern::AddOpView),
             ViewKind::Sub => quote!(::gpt_rs::backend::pattern::SubOpView),
             ViewKind::Mul => quote!(::gpt_rs::backend::pattern::MulOpView),
@@ -413,6 +415,7 @@ impl ViewKind {
 
     fn view_type_name(self) -> &'static str {
         match self {
+            ViewKind::Any => "AnyOpView",
             ViewKind::Add => "AddOpView",
             ViewKind::Sub => "SubOpView",
             ViewKind::Mul => "MulOpView",
@@ -437,6 +440,7 @@ impl ViewKind {
 
     fn matcher_tokens(self) -> TokenStream2 {
         match self {
+            ViewKind::Any => quote!(::gpt_rs::backend::pattern::filters::any),
             ViewKind::Add => quote!(::gpt_rs::backend::pattern::filters::add),
             ViewKind::Sub => quote!(::gpt_rs::backend::pattern::filters::sub),
             ViewKind::Mul => quote!(::gpt_rs::backend::pattern::filters::mul),
@@ -465,6 +469,7 @@ impl ViewKind {
 
     fn preferred_anchor_score(self) -> u8 {
         match self {
+            ViewKind::Any => 20,
             ViewKind::ExtractPatches => 0,
             ViewKind::DotGeneral => 1,
             ViewKind::ReduceMax | ViewKind::ReduceSum => 2,
@@ -477,6 +482,7 @@ impl ViewKind {
 
     fn bind_suffix(self) -> &'static str {
         match self {
+            ViewKind::Any => "op",
             ViewKind::Add => "add",
             ViewKind::Sub => "sub",
             ViewKind::Mul => "mul",
@@ -591,6 +597,13 @@ fn infer_view_kind(expr: &Expr, known: &std::collections::HashSet<String>) -> Op
             let name = path.path.segments.last()?.ident.to_string();
             match name.as_str() {
                 "concat" | "try_concat" => Some(ViewKind::Concat),
+                _ if call
+                    .args
+                    .iter()
+                    .any(|arg| expr_tree_mentions_known_tensor(arg, known)) =>
+                {
+                    Some(ViewKind::Any)
+                }
                 _ => None,
             }
         }

@@ -1,0 +1,56 @@
+# gpt_rs.kernel: softmax_last_axis_f32
+# gpt_rs.symbol: gpt_rs_triton_softmax_last_axis_f32
+# gpt_rs.signature: in_ptr=*fp32,out_ptr=*fp32,rows=i32,cols=i32
+# gpt_rs.param_abi: *fp32,*fp32,i32,i32,*opaque
+# gpt_rs.constexpr: BLOCK_SIZE=256
+# gpt_rs.num_warps: 8
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def gpt_rs_triton_softmax_last_axis_f32(
+    in_ptr,
+    out_ptr,
+    rows,
+    cols,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= rows:
+        return
+
+    offs = tl.arange(0, BLOCK_SIZE)
+    row_base = pid * cols
+
+    max_vals = tl.full([BLOCK_SIZE], -float("inf"), tl.float32)
+    col = 0
+    while col < cols:
+        idx = col + offs
+        mask = idx < cols
+        x = tl.load(in_ptr + row_base + idx, mask=mask, other=-float("inf"))
+        max_vals = tl.maximum(max_vals, x)
+        col += BLOCK_SIZE
+
+    row_max = tl.max(max_vals, axis=0)
+
+    sum_vals = tl.zeros([BLOCK_SIZE], tl.float32)
+    col = 0
+    while col < cols:
+        idx = col + offs
+        mask = idx < cols
+        x = tl.load(in_ptr + row_base + idx, mask=mask, other=-float("inf"))
+        sum_vals += tl.exp(x - row_max)
+        col += BLOCK_SIZE
+
+    inv_sum = 1.0 / tl.sum(sum_vals, axis=0)
+
+    col = 0
+    while col < cols:
+        idx = col + offs
+        mask = idx < cols
+        x = tl.load(in_ptr + row_base + idx, mask=mask, other=-float("inf"))
+        y = tl.exp(x - row_max) * inv_sum
+        tl.store(out_ptr + row_base + idx, y, mask=mask)
+        col += BLOCK_SIZE

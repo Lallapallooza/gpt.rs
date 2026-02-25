@@ -115,6 +115,12 @@ pub enum PassEventKind {
         pass: String,
         stats: OptimizerPassStats,
     },
+    OptimizerPassIr {
+        run_id: Option<usize>,
+        function: String,
+        pass: String,
+        program_ptir: String,
+    },
 }
 
 /// Result of running a pass.
@@ -412,6 +418,26 @@ impl ExecutionTraceSink for FileTraceSink {
         if !self.options.emit_pass_events {
             return;
         }
+        if let PassEventKind::OptimizerPassIr {
+            run_id,
+            function,
+            pass,
+            program_ptir,
+        } = &event.kind
+        {
+            let pass_dir = self.root.join("passes");
+            let _ = std::fs::create_dir_all(&pass_dir);
+            let idx = self.sequence.fetch_add(1, Ordering::Relaxed);
+            let run = run_id
+                .map(|value| format!("run_{value:04}"))
+                .unwrap_or_else(|| "run_none".to_string());
+            let file_name = format!(
+                "{idx:05}_{run}_{}_{}.ptir",
+                sanitize_file_fragment(function),
+                sanitize_file_fragment(pass)
+            );
+            let _ = std::fs::write(pass_dir.join(file_name), program_ptir);
+        }
         if let Ok(mut file_guard) = self.pass_log.lock() {
             if file_guard.is_none() {
                 let path = self.root.join("passes.jsonl");
@@ -433,3 +459,19 @@ impl ExecutionTraceSink for FileTraceSink {
 }
 
 use std::io::Write;
+
+fn sanitize_file_fragment(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "unnamed".to_string()
+    } else {
+        out
+    }
+}

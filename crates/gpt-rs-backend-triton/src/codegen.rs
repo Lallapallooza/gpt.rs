@@ -15,12 +15,15 @@ use crate::kernels::{
     broadcast_kernel_spec, broadcast_si32_kernel_spec, compare_si32_i1_kernel_spec,
     concat_kernel_spec, dot_bias_rank2_kernel_spec, dynamic_update_slice_f32_kernel_spec,
     elementwise_binary_kernel_spec, elementwise_unary_kernel_spec,
-    extract_patches_nhwc_kernel_spec, iota_si32_kernel_spec, prepacked_kernel_sources,
-    reduce_max_last_axis_kernel_spec, reduce_sum_last_axis_kernel_spec,
+    extract_patches_nhwc_kernel_spec, iota_si32_kernel_spec, layer_norm_f32_kernel_spec,
+    prepacked_kernel_sources, reduce_max_last_axis_kernel_spec, reduce_sum_last_axis_kernel_spec,
     reduce_window_max_nhwc_kernel_spec, select_i1_f32_kernel_spec, slice_kernel_spec,
-    take_f32_i32_kernel_spec, transpose_kernel_spec,
+    softmax_last_axis_kernel_spec, take_f32_i32_kernel_spec, transpose_kernel_spec,
 };
-use crate::targets::{TARGET_DOT_BIAS_FUSED_F32_V1, TARGET_ELEMENTWISE_FUSED_F32_V1};
+use crate::targets::{
+    TARGET_DOT_BIAS_FUSED_F32_V1, TARGET_ELEMENTWISE_FUSED_F32_V1, TARGET_LAYER_NORM_FUSED_F32_V1,
+    TARGET_SOFTMAX_LAST_AXIS_FUSED_F32_V1,
+};
 
 pub fn lower_program_to_artifact(
     program: &Program,
@@ -55,6 +58,8 @@ pub fn lower_program_to_artifact(
         extract_patches_nhwc_kernel_spec(),
         reduce_window_max_nhwc_kernel_spec(),
         dot_bias_rank2_kernel_spec(),
+        layer_norm_f32_kernel_spec(),
+        softmax_last_axis_kernel_spec(),
     ];
 
     Ok(TritonArtifact::new(
@@ -505,6 +510,115 @@ fn validate_instruction(
                     custom_call_i64_array(spec.attrs.get("dot_contract_rhs"), "dot_contract_rhs")?;
                 Ok(())
             }
+            TARGET_LAYER_NORM_FUSED_F32_V1 => {
+                if instruction.operands.len() != 3 {
+                    return Err(ConversionError::new(
+                        "triton fused layer_norm requires exactly three inputs",
+                    ));
+                }
+                let out_spec = ensure_tensor_output(&instruction.output)?;
+                if out_spec.dtype != DType::F32 {
+                    return Err(ConversionError::new(
+                        "triton fused layer_norm requires F32 output",
+                    ));
+                }
+                let input_spec = operand_tensor_spec_for_operand(
+                    function,
+                    instruction.operands.first(),
+                    "input",
+                )?;
+                let gamma_spec = operand_tensor_spec_for_operand(
+                    function,
+                    instruction.operands.get(1),
+                    "gamma",
+                )?;
+                let beta_spec =
+                    operand_tensor_spec_for_operand(function, instruction.operands.get(2), "beta")?;
+                if input_spec.dtype != DType::F32
+                    || gamma_spec.dtype != DType::F32
+                    || beta_spec.dtype != DType::F32
+                {
+                    return Err(ConversionError::new(
+                        "triton fused layer_norm requires F32 input/gamma/beta",
+                    ));
+                }
+                if input_spec.shape != out_spec.shape {
+                    return Err(ConversionError::new(
+                        "triton fused layer_norm requires matching input/output shapes",
+                    ));
+                }
+                let input_dims = input_spec.shape.static_dims().ok_or_else(|| {
+                    ConversionError::new(
+                        "triton fused layer_norm requires static input shape dimensions",
+                    )
+                })?;
+                if input_dims.is_empty() {
+                    return Err(ConversionError::new(
+                        "triton fused layer_norm requires rank >= 1 input",
+                    ));
+                }
+                let axis = custom_call_i64(spec.attrs.get("axis"), "axis")?;
+                let expected = i64::try_from(input_dims.len() - 1).map_err(|_| {
+                    ConversionError::new("triton fused layer_norm rank exceeds i64 range")
+                })?;
+                if axis != expected {
+                    return Err(ConversionError::new(
+                        "triton fused layer_norm currently supports last-axis only",
+                    ));
+                }
+                let feature = input_dims[input_dims.len() - 1];
+                let gamma_dims = gamma_spec.shape.static_dims().ok_or_else(|| {
+                    ConversionError::new(
+                        "triton fused layer_norm requires static gamma shape dimensions",
+                    )
+                })?;
+                let beta_dims = beta_spec.shape.static_dims().ok_or_else(|| {
+                    ConversionError::new(
+                        "triton fused layer_norm requires static beta shape dimensions",
+                    )
+                })?;
+                if gamma_dims.as_slice() != [feature] || beta_dims.as_slice() != [feature] {
+                    return Err(ConversionError::new(
+                        "triton fused layer_norm requires gamma/beta shape [hidden_size]",
+                    ));
+                }
+                let _ = custom_call_f64(spec.attrs.get("eps"), "eps")?;
+                Ok(())
+            }
+            TARGET_SOFTMAX_LAST_AXIS_FUSED_F32_V1 => {
+                if instruction.operands.len() != 1 {
+                    return Err(ConversionError::new(
+                        "triton fused softmax requires exactly one input",
+                    ));
+                }
+                let out_spec = ensure_tensor_output(&instruction.output)?;
+                if out_spec.dtype != DType::F32 {
+                    return Err(ConversionError::new(
+                        "triton fused softmax requires F32 output",
+                    ));
+                }
+                let input_spec = operand_tensor_spec_for_operand(
+                    function,
+                    instruction.operands.first(),
+                    "input",
+                )?;
+                if input_spec.dtype != DType::F32 || input_spec.shape != out_spec.shape {
+                    return Err(ConversionError::new(
+                        "triton fused softmax requires matching F32 input/output shape",
+                    ));
+                }
+                let axis = custom_call_i64(spec.attrs.get("axis"), "axis")?;
+                let rank = out_spec.shape.dims().len();
+                let expected = i64::try_from(rank.saturating_sub(1)).map_err(|_| {
+                    ConversionError::new("triton fused softmax rank exceeds i64 range")
+                })?;
+                if axis != expected {
+                    return Err(ConversionError::new(
+                        "triton fused softmax currently supports last-axis only",
+                    ));
+                }
+                Ok(())
+            }
             _ => Err(ConversionError::new(format!(
                 "unsupported triton custom_call target '{}'",
                 spec.target
@@ -534,6 +648,15 @@ fn custom_call_i64(attr: Option<&CustomCallAttr>, name: &str) -> ConversionResul
         Some(CustomCallAttr::I64(value)) => Ok(*value),
         _ => Err(ConversionError::new(format!(
             "triton custom_call missing i64 attr '{name}'"
+        ))),
+    }
+}
+
+fn custom_call_f64(attr: Option<&CustomCallAttr>, name: &str) -> ConversionResult<f64> {
+    match attr {
+        Some(CustomCallAttr::F64(value)) => Ok(*value),
+        _ => Err(ConversionError::new(format!(
+            "triton custom_call missing f64 attr '{name}'"
         ))),
     }
 }

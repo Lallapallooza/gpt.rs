@@ -17,7 +17,7 @@ use gpt_rs::ops::functional::conv::Conv2dPattern;
 
 use crate::targets::TARGET_CONV2D_NHWC_F32_V1;
 
-use super::utils::{single_user, static_dims, tensor_spec_of};
+use super::utils::{single_user, tensor_spec_of};
 
 fn conv2d_attrs_from_extract(
     spec: &ExtractPatchesSpec,
@@ -124,7 +124,7 @@ impl OpRewritePattern<Conv2dPattern> for LowerCConv2dNhwcF32 {
             Some(spec) if spec.dtype == DType::F32 => spec,
             _ => return false,
         };
-        let Some(in_dims) = static_dims(&input_spec) else {
+        let Some(in_dims) = input_spec.shape.static_dims() else {
             return false;
         };
         if in_dims.len() != 4 {
@@ -136,7 +136,7 @@ impl OpRewritePattern<Conv2dPattern> for LowerCConv2dNhwcF32 {
             ValueType::Tensor(spec) if spec.dtype == DType::F32 => spec.clone(),
             _ => return false,
         };
-        let Some(patch_dims) = static_dims(&output_patches_spec) else {
+        let Some(patch_dims) = output_patches_spec.shape.static_dims() else {
             return false;
         };
         if patch_dims.len() != 4 {
@@ -161,7 +161,7 @@ impl OpRewritePattern<Conv2dPattern> for LowerCConv2dNhwcF32 {
             Some(spec) if spec.dtype == DType::F32 => spec,
             _ => return false,
         };
-        let Some(patches_dims) = static_dims(&patches_spec) else {
+        let Some(patches_dims) = patches_spec.shape.static_dims() else {
             return false;
         };
         if patches_dims.as_slice() != [n, patch_dims[1], patch_dims[2], k_h, k_w, c_in] {
@@ -188,7 +188,7 @@ impl OpRewritePattern<Conv2dPattern> for LowerCConv2dNhwcF32 {
             Some(spec) if spec.dtype == DType::F32 => spec,
             _ => return false,
         };
-        let Some(weight_dims) = static_dims(&weight_spec) else {
+        let Some(weight_dims) = weight_spec.shape.static_dims() else {
             return false;
         };
         let [c_out, w_c_in, w_k_h, w_k_w] = weight_dims.as_slice() else {
@@ -203,7 +203,7 @@ impl OpRewritePattern<Conv2dPattern> for LowerCConv2dNhwcF32 {
             Some(spec) if spec.dtype == DType::F32 => spec,
             _ => return false,
         };
-        let Some(out_dims) = static_dims(&out_spec) else {
+        let Some(out_dims) = out_spec.shape.static_dims() else {
             return false;
         };
         if out_dims.as_slice() != [n, patch_dims[1], patch_dims[2], c_out] {

@@ -436,6 +436,14 @@ fn run_with_backend<B: PortableBackend + 'static>(
     command: Command,
     profile: bool,
 ) -> Result<bool> {
+    // Keep profiler instrumentation compiled in, but suspend runtime collection unless
+    // the user explicitly asked for a report via `--profile`.
+    let _suspend_profiler = if profile {
+        None
+    } else {
+        Some(profiling::suspend())
+    };
+
     match command {
         Command::Generate(args) => {
             run_generate(&backend, &args, profile)?;

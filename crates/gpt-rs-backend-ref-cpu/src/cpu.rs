@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpt_rs::backend::param_resolver::{InMemoryParamResolver, ParamResolver};
+use gpt_rs::backend::shape_helpers::static_dims_or_error;
 use gpt_rs::backend::spec::{
     BackendError, BackendResult, BroadcastToSpec, CastSpec, ComparisonOp, ConcatSpec, DType,
     Dimension, DotGeneralSpec, ElementwiseBinaryOp, ElementwiseUnaryOp, ExtractPatchesSpec,
     Instruction, IotaSpec, Literal, Operand, Operation, PortableBackend, Program, ReduceKind,
-    ReduceSpec, ReduceWindowSpec, ReshapeSpec, Shape, TensorInit, TensorLiteral, TensorSpec,
-    ValueId, ValueType,
+    ReduceSpec, ReduceWindowSpec, ReshapeSpec, TensorInit, TensorLiteral, TensorSpec, ValueId,
+    ValueType,
 };
 
 #[derive(Clone)]
@@ -211,7 +212,14 @@ fn literal_to_tensor(literal: &TensorLiteral) -> BackendResult<CpuTensor> {
 }
 
 fn zeroed_tensor(spec: &TensorSpec) -> BackendResult<CpuTensor> {
-    let elem_count = element_count(&spec.shape)?;
+    let elem_count = static_dims_or_error(&spec.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?
+    .into_iter()
+    .product();
     match spec.dtype {
         DType::F32 => Ok(CpuTensor {
             spec: spec.clone(),
@@ -343,16 +351,22 @@ fn spec_elements(spec: &TensorSpec) -> u64 {
         .product()
 }
 
-fn spec_bytes(spec: &TensorSpec) -> u64 {
-    spec_elements(spec).saturating_mul(dtype_size_in_bytes(spec.dtype))
-}
-
 fn dot_general_flops(lhs: &TensorSpec, rhs: &TensorSpec, spec: &DotGeneralSpec) -> u64 {
-    let lhs_dims = match static_dims(&lhs.shape) {
+    let lhs_dims = match static_dims_or_error(&lhs.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    }) {
         Ok(dims) => dims,
         Err(_) => return 0,
     };
-    let rhs_dims = match static_dims(&rhs.shape) {
+    let rhs_dims = match static_dims_or_error(&rhs.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    }) {
         Ok(dims) => dims,
         Err(_) => return 0,
     };
@@ -402,8 +416,12 @@ fn estimate_work_stats(
     output_spec: &TensorSpec,
 ) -> gpt_rs::profiling::WorkStats {
     let out_elements = spec_elements(output_spec);
-    let out_bytes = spec_bytes(output_spec);
-    let bytes_read = inputs.iter().map(|t| spec_bytes(&t.spec)).sum();
+    let out_bytes =
+        spec_elements(output_spec).saturating_mul(dtype_size_in_bytes(output_spec.dtype));
+    let bytes_read = inputs
+        .iter()
+        .map(|t| spec_elements(&t.spec).saturating_mul(dtype_size_in_bytes(t.spec.dtype)))
+        .sum();
 
     let flops = match op {
         Operation::ElementwiseBinary(_)
@@ -496,7 +514,12 @@ fn format_operands(operands: &[Operand], inputs: &[CpuTensor]) -> String {
 }
 
 fn format_operand(operand: &Operand, tensor: &CpuTensor) -> String {
-    let shape_desc = match static_dims(&tensor.spec.shape) {
+    let shape_desc = match static_dims_or_error(&tensor.spec.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    }) {
         Ok(dims) => {
             if dims.is_empty() {
                 String::from("[]")
@@ -624,7 +647,23 @@ fn op_reshape(
     _spec: &ReshapeSpec,
 ) -> BackendResult<CpuTensor> {
     let input = expect_single(inputs)?;
-    if element_count(&input.spec.shape)? != element_count(&output.shape)? {
+    if static_dims_or_error(&input.spec.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?
+    .into_iter()
+    .product::<usize>()
+        != static_dims_or_error(&output.shape, |sym| {
+            BackendError::execution(format!(
+                "dynamic dimension {} not supported at runtime",
+                sym.as_str()
+            ))
+        })?
+        .into_iter()
+        .product::<usize>()
+    {
         return Err(BackendError::execution("reshape element count mismatch"));
     }
     let data = match &input.data {
@@ -644,14 +683,24 @@ fn op_slice(
     spec: &gpt_rs::backend::spec::SliceSpec,
 ) -> BackendResult<CpuTensor> {
     let input = expect_single(inputs)?;
-    let input_dims = static_dims(&input.spec.shape)?;
+    let input_dims = static_dims_or_error(&input.spec.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
     if spec.starts.len() != input_dims.len() || spec.sizes.len() != input_dims.len() {
         return Err(BackendError::execution("slice rank mismatch"));
     }
     match &input.data {
         TensorData::F32(values) => {
             let values = values.as_ref();
-            let out_dims = static_dims(&output.shape)?;
+            let out_dims = static_dims_or_error(&output.shape, |sym| {
+                BackendError::execution(format!(
+                    "dynamic dimension {} not supported at runtime",
+                    sym.as_str()
+                ))
+            })?;
             if out_dims.len() != input_dims.len() {
                 return Err(BackendError::execution("slice output rank mismatch"));
             }
@@ -724,7 +773,12 @@ fn op_dynamic_slice(
     let input = &inputs[0];
     let starts_tensor = &inputs[1];
 
-    let input_dims = static_dims(&input.spec.shape)?;
+    let input_dims = static_dims_or_error(&input.spec.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
     if input_dims.len() != spec.sizes.len() {
         return Err(BackendError::execution(
             "dynamic_slice sizes length must match input rank",
@@ -735,7 +789,12 @@ fn op_dynamic_slice(
         TensorData::Si32(values) => values.as_ref(),
         _ => return Err(BackendError::execution("dynamic_slice starts must be si32")),
     };
-    let starts_dims = static_dims(&starts_tensor.spec.shape)?;
+    let starts_dims = static_dims_or_error(&starts_tensor.spec.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
     if starts_dims.len() != 1 || starts_dims[0] != input_dims.len() {
         return Err(BackendError::execution(
             "dynamic_slice starts must be 1-D of length equal to rank",
@@ -760,7 +819,12 @@ fn op_dynamic_slice(
         clamped_starts.push(if start > max_start { max_start } else { start });
     }
 
-    let out_dims = static_dims(&output.shape)?;
+    let out_dims = static_dims_or_error(&output.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
     if out_dims != spec.sizes {
         return Err(BackendError::execution(
             "dynamic_slice output shape mismatch",
@@ -823,8 +887,18 @@ fn op_dynamic_update_slice(
     let update = &inputs[1];
     let starts_tensor = &inputs[2];
 
-    let base_dims = static_dims(&base.spec.shape)?;
-    let update_dims = static_dims(&update.spec.shape)?;
+    let base_dims = static_dims_or_error(&base.spec.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
+    let update_dims = static_dims_or_error(&update.spec.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
 
     if base_dims.len() != spec.sizes.len() {
         return Err(BackendError::execution(
@@ -850,7 +924,12 @@ fn op_dynamic_update_slice(
             ))
         }
     };
-    let starts_dims = static_dims(&starts_tensor.spec.shape)?;
+    let starts_dims = static_dims_or_error(&starts_tensor.spec.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
     if starts_dims.len() != 1 || starts_dims[0] != base_dims.len() {
         return Err(BackendError::execution(
             "dynamic_update_slice starts must be 1-D of length equal to rank",
@@ -983,14 +1062,24 @@ fn op_transpose(
     spec: &gpt_rs::backend::spec::TransposeSpec,
 ) -> BackendResult<CpuTensor> {
     let input = expect_single(inputs)?;
-    let input_dims = static_dims(&input.spec.shape)?;
+    let input_dims = static_dims_or_error(&input.spec.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
     if spec.perm.len() != input_dims.len() {
         return Err(BackendError::execution("transpose rank mismatch"));
     }
     match &input.data {
         TensorData::F32(values) => {
             let values = values.as_ref();
-            let out_dims = static_dims(&output.shape)?;
+            let out_dims = static_dims_or_error(&output.shape, |sym| {
+                BackendError::execution(format!(
+                    "dynamic dimension {} not supported at runtime",
+                    sym.as_str()
+                ))
+            })?;
             let mut result = vec![0.0f32; out_dims.iter().product()];
             let input_strides = compute_strides(&input_dims);
             for (idx, slot) in result.iter_mut().enumerate() {
@@ -1019,9 +1108,24 @@ fn op_broadcast_to(
     spec: &BroadcastToSpec,
 ) -> BackendResult<CpuTensor> {
     let input = expect_single(inputs)?;
-    let input_dims = static_dims(&input.spec.shape)?;
-    let out_dims = static_dims(&output.shape)?;
-    let spec_dims = static_dims(&spec.result_shape)?;
+    let input_dims = static_dims_or_error(&input.spec.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
+    let out_dims = static_dims_or_error(&output.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
+    let spec_dims = static_dims_or_error(&spec.result_shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
     if out_dims != spec_dims {
         return Err(BackendError::execution(
             "broadcast_to result shape mismatch",
@@ -1384,7 +1488,17 @@ fn op_cast(inputs: &[CpuTensor], output: &TensorSpec, spec: &CastSpec) -> Backen
     if output.dtype != spec.dtype {
         return Err(BackendError::execution("cast output dtype mismatch"));
     }
-    if static_dims(&input.spec.shape)? != static_dims(&output.shape)? {
+    if static_dims_or_error(&input.spec.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })? != static_dims_or_error(&output.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })? {
         return Err(BackendError::execution("cast shape mismatch"));
     }
 
@@ -1475,12 +1589,27 @@ fn op_take(inputs: &[CpuTensor], output: &TensorSpec) -> BackendResult<CpuTensor
     let data = &inputs[0];
     let indices = &inputs[1];
 
-    let data_dims = static_dims(&data.spec.shape)?;
+    let data_dims = static_dims_or_error(&data.spec.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
     if data_dims.is_empty() {
         return Err(BackendError::execution("take requires rank >= 1"));
     }
-    let indices_dims = static_dims(&indices.spec.shape)?;
-    let out_dims = static_dims(&output.shape)?;
+    let indices_dims = static_dims_or_error(&indices.spec.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
+    let out_dims = static_dims_or_error(&output.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
 
     let vocab = data_dims[0];
     let inner = data_dims.iter().skip(1).product::<usize>();
@@ -1627,7 +1756,12 @@ fn op_reduce(
     match &input.data {
         TensorData::F32(values) => {
             let values = values.as_ref();
-            let dims = static_dims(&input.spec.shape)?;
+            let dims = static_dims_or_error(&input.spec.shape, |sym| {
+                BackendError::execution(format!(
+                    "dynamic dimension {} not supported at runtime",
+                    sym.as_str()
+                ))
+            })?;
             if axis >= dims.len() {
                 return Err(BackendError::execution("reduce axis out of range"));
             }
@@ -1687,7 +1821,12 @@ fn op_extract_patches(
         }
     };
 
-    let dims = static_dims(&input.spec.shape)?;
+    let dims = static_dims_or_error(&input.spec.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
     if dims.len() != 4 {
         return Err(BackendError::unimplemented(
             "extract_patches",
@@ -1748,7 +1887,12 @@ fn op_extract_patches(
         .and_then(|v| v.checked_mul(c))
         .ok_or_else(|| BackendError::execution("extract_patches patch size overflow"))?;
 
-    let out_dims = static_dims(&output.shape)?;
+    let out_dims = static_dims_or_error(&output.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
     if out_dims.as_slice() != [n, out_h, out_w, patch_dim] {
         return Err(BackendError::execution(format!(
             "extract_patches output shape mismatch: expected [{n}x{out_h}x{out_w}x{patch_dim}], got {:?}",
@@ -1817,7 +1961,12 @@ fn op_reduce_window(
         }
     }
 
-    let in_dims = static_dims(&input.spec.shape)?;
+    let in_dims = static_dims_or_error(&input.spec.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
     if in_dims.len() != 4 {
         return Err(BackendError::unimplemented(
             "reduce_window",
@@ -1836,7 +1985,12 @@ fn op_reduce_window(
         ));
     }
 
-    let out_dims = static_dims(&output.shape)?;
+    let out_dims = static_dims_or_error(&output.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
     if out_dims.len() != 4 {
         return Err(BackendError::execution(
             "reduce_window output must have rank 4",
@@ -1991,8 +2145,18 @@ fn op_dot_general(
             }
             let lhs_values = lhs_values.as_ref();
             let rhs_values = rhs_values.as_ref();
-            let lhs_dims = static_dims(&lhs.spec.shape)?;
-            let rhs_dims = static_dims(&rhs.spec.shape)?;
+            let lhs_dims = static_dims_or_error(&lhs.spec.shape, |sym| {
+                BackendError::execution(format!(
+                    "dynamic dimension {} not supported at runtime",
+                    sym.as_str()
+                ))
+            })?;
+            let rhs_dims = static_dims_or_error(&rhs.spec.shape, |sym| {
+                BackendError::execution(format!(
+                    "dynamic dimension {} not supported at runtime",
+                    sym.as_str()
+                ))
+            })?;
             let lhs_strides = compute_strides(&lhs_dims);
             let rhs_strides = compute_strides(&rhs_dims);
 
@@ -2017,7 +2181,16 @@ fn op_dot_general(
             let contract_shape: Vec<usize> =
                 lhs_contract_axes.iter().map(|&ax| lhs_dims[ax]).collect();
 
-            let mut output_data = vec![0.0f32; element_count(&output.shape)?];
+            let mut output_data =
+                vec![
+                    0.0f32;
+                    static_dims_or_error(&output.shape, |sym| BackendError::execution(format!(
+                        "dynamic dimension {} not supported at runtime",
+                        sym.as_str()
+                    )))?
+                    .into_iter()
+                    .product()
+                ];
             let mut out_index = 0usize;
 
             for batch_index in MultiIndex::new(&batch_shape) {
@@ -2129,7 +2302,12 @@ fn op_concat(
         return Err(BackendError::execution("concat expects at least one input"));
     }
 
-    let out_dims = static_dims(&output.shape)?;
+    let out_dims = static_dims_or_error(&output.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
     let rank = out_dims.len();
     let axis = {
         let raw = spec.axis;
@@ -2159,7 +2337,12 @@ fn op_concat(
                 if tensor.spec.dtype != output.dtype {
                     return Err(BackendError::execution("concat requires matching dtypes"));
                 }
-                let dims = static_dims(&tensor.spec.shape)?;
+                let dims = static_dims_or_error(&tensor.spec.shape, |sym| {
+                    BackendError::execution(format!(
+                        "dynamic dimension {} not supported at runtime",
+                        sym.as_str()
+                    ))
+                })?;
                 if dims.len() != rank {
                     return Err(BackendError::execution("concat rank mismatch"));
                 }
@@ -2222,9 +2405,24 @@ fn op_gather(
         return Err(BackendError::execution("gather output dtype mismatch"));
     }
 
-    let data_dims = static_dims(&data.spec.shape)?;
-    let indices_dims = static_dims(&indices.spec.shape)?;
-    let out_dims = static_dims(&output.shape)?;
+    let data_dims = static_dims_or_error(&data.spec.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
+    let indices_dims = static_dims_or_error(&indices.spec.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
+    let out_dims = static_dims_or_error(&output.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
     if out_dims != indices_dims {
         return Err(BackendError::execution("gather output shape mismatch"));
     }
@@ -2313,12 +2511,24 @@ fn op_gather(
 }
 
 fn op_iota(output: &TensorSpec, spec: &IotaSpec) -> BackendResult<CpuTensor> {
-    let dims = static_dims(&spec.shape)?;
+    let dims = static_dims_or_error(&spec.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?;
     let axis = spec.axis;
     if axis >= dims.len() {
         return Err(BackendError::execution("iota axis out of range"));
     }
-    let len = element_count(&spec.shape)?;
+    let len = static_dims_or_error(&spec.shape, |sym| {
+        BackendError::execution(format!(
+            "dynamic dimension {} not supported at runtime",
+            sym.as_str()
+        ))
+    })?
+    .into_iter()
+    .product();
     match spec.dtype {
         DType::Si32 => {
             let mut result = vec![0i32; len];
@@ -2341,24 +2551,6 @@ fn expect_single(inputs: &[CpuTensor]) -> BackendResult<&CpuTensor> {
     } else {
         Ok(&inputs[0])
     }
-}
-
-fn static_dims(shape: &Shape) -> BackendResult<Vec<usize>> {
-    shape
-        .dims()
-        .iter()
-        .map(|dim| match dim {
-            Dimension::Static(v) => Ok(*v),
-            Dimension::Dynamic(sym) => Err(BackendError::execution(format!(
-                "dynamic dimension {} not supported at runtime",
-                sym.as_str()
-            ))),
-        })
-        .collect()
-}
-
-fn element_count(shape: &Shape) -> BackendResult<usize> {
-    Ok(static_dims(shape)?.into_iter().product())
 }
 
 fn compute_strides(dims: &[usize]) -> Vec<usize> {

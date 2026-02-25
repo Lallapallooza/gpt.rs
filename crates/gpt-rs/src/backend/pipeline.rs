@@ -10,7 +10,7 @@ use crate::backend::passes::{
     DeadCodeEliminationPass, ElementwiseSimplificationPass, ParamOnlyFoldToParamPass,
     ReshapeCanonicalizationPass, SliceCanonicalizationPass, TransposeCanonicalizationPass,
 };
-use crate::backend::spec::{Function, PortableBackend};
+use crate::backend::spec::{Function, PortableBackend, Program};
 use crate::ops::trace::{emit_pass_event, OptimizerPassStats, PassEvent, PassEventKind};
 
 pub enum Step<B: PortableBackend + 'static> {
@@ -121,7 +121,8 @@ impl<B: PortableBackend + 'static> PipelineOptimizer<B> {
 
 impl<B: PortableBackend + 'static> Optimizer<B> for PipelineOptimizer<B> {
     fn optimize(&self, function: &mut Function, cx: &mut OptimizeContext<B>) -> PassResult {
-        let run_id = if self.log_stats {
+        let track_run_id = self.log_stats || crate::ops::trace::current_sink().is_some();
+        let run_id = if track_run_id {
             Some(self.run_counter.fetch_add(1, Ordering::Relaxed))
         } else {
             None
@@ -156,8 +157,9 @@ fn run_steps<B: PortableBackend + 'static>(
                 let stats = pass.run(function, cx);
                 changed_any |= stats.changed;
                 *totals = totals.merge(stats);
-                if log_stats {
-                    emit_optimizer_pass_stats(pass.name(), function, run_id, stats);
+                let emit_ir = crate::ops::trace::current_sink().is_some();
+                if log_stats || emit_ir {
+                    emit_optimizer_pass_stats(pass.name(), function, run_id, stats, emit_ir);
                 }
             }
             Step::FixedPoint { max_iters, steps } => {
@@ -186,6 +188,7 @@ fn emit_optimizer_pass_stats(
     function: &Function,
     run_id: Option<usize>,
     stats: PassResult,
+    emit_ir: bool,
 ) {
     emit_pass_event(PassEvent {
         timestamp: SystemTime::now(),
@@ -203,4 +206,19 @@ fn emit_optimizer_pass_stats(
             },
         },
     });
+    if emit_ir {
+        let program_ptir = Program::new(function.name.clone())
+            .with_functions(vec![function.clone()])
+            .to_text();
+        emit_pass_event(PassEvent {
+            timestamp: SystemTime::now(),
+            trace_id: None,
+            kind: PassEventKind::OptimizerPassIr {
+                run_id,
+                function: function.name.clone(),
+                pass: name.to_string(),
+                program_ptir,
+            },
+        });
+    }
 }

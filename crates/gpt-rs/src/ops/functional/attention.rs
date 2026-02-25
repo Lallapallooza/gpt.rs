@@ -12,7 +12,7 @@ use crate::nn::layers::attention::AttentionConfig;
 use crate::ops::functional::common::{
     ensure_axis_in_bounds, ensure_dims_match_except_axis, ensure_last_dim, ensure_rank,
     ensure_same_backend, ensure_same_dtype, ensure_shape_matches, ensure_slice_within_bounds,
-    scalar_broadcast, CaptureIntoDeviceTensor,
+    scalar_broadcast, softmax_last_axis_ptir, CaptureIntoDeviceTensor,
 };
 use crate::ops::functional::resolve_graph_from_tensors;
 use crate::ops::functional::runtime::CacheKeyArg;
@@ -420,14 +420,7 @@ pub fn attention<B: PortableBackend + 'static>(
                 let mask = sliced_mask.broadcast_to(vec![num_query_heads, plan.seq_len, total_len]);
 
                 let masked_scores = scaled_scores + mask;
-                let max_scores = masked_scores.reduce_max(vec![2], true);
-                let stabilized =
-                    masked_scores - max_scores.broadcast_to(vec![num_query_heads, plan.seq_len, total_len]);
-
-                let exp_scores = stabilized.exp();
-                let sum_scores = exp_scores.reduce_sum(vec![2], true);
-                let softmax =
-                    exp_scores / sum_scores.broadcast_to(vec![num_query_heads, plan.seq_len, total_len]);
+                let softmax = softmax_last_axis_ptir(&masked_scores, 2);
 
                 let context = softmax.dot_general(
                     &v_grouped,
@@ -508,14 +501,7 @@ pub fn attention<B: PortableBackend + 'static>(
                 let mask = sliced_mask.broadcast_to(vec![num_query_heads, plan.seq_len, total_len]);
 
                 let masked_scores = scaled_scores + mask;
-                let max_scores = masked_scores.reduce_max(vec![2], true);
-                let stabilized =
-                    masked_scores - max_scores.broadcast_to(vec![num_query_heads, plan.seq_len, total_len]);
-
-                let exp_scores = stabilized.exp();
-                let sum_scores = exp_scores.reduce_sum(vec![2], true);
-                let softmax =
-                    exp_scores / sum_scores.broadcast_to(vec![num_query_heads, plan.seq_len, total_len]);
+                let softmax = softmax_last_axis_ptir(&masked_scores, 2);
 
                 let context = softmax.dot_general(
                     &v_grouped,
@@ -762,15 +748,7 @@ pub fn attention_decode_cache<B: PortableBackend + 'static>(
             let mask = mask_2d.broadcast_to(vec![num_query_heads, plan.seq_len, effective_capacity]);
 
             let masked_scores = scaled_scores + mask;
-            let max_scores = masked_scores.reduce_max(vec![2], true);
-            let stabilized = masked_scores
-                - max_scores.broadcast_to(vec![num_query_heads, plan.seq_len, effective_capacity]);
-
-            let exp_scores = stabilized.exp();
-            let sum_scores = exp_scores.reduce_sum(vec![2], true);
-            let softmax =
-                exp_scores
-                    / sum_scores.broadcast_to(vec![num_query_heads, plan.seq_len, effective_capacity]);
+            let softmax = softmax_last_axis_ptir(&masked_scores, 2);
 
             let context = softmax.dot_general(
                 &v_grouped,

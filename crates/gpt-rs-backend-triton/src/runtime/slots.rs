@@ -13,7 +13,7 @@ pub(crate) struct SlotAllocator {
     value_last_use: HashMap<ValueId, usize>,
     slot_byte_len: Vec<Option<usize>>,
     slot_buffers: Vec<Option<Arc<DeviceBuffer>>>,
-    slot_owner: Vec<Option<ValueId>>,
+    slot_release_pos: Vec<usize>,
 }
 
 impl SlotAllocator {
@@ -27,7 +27,7 @@ impl SlotAllocator {
                 value_last_use,
                 slot_byte_len: Vec::new(),
                 slot_buffers: Vec::new(),
-                slot_owner: Vec::new(),
+                slot_release_pos: Vec::new(),
             };
         };
         let mut value_to_slot = HashMap::with_capacity(plan.value_slots.len());
@@ -39,7 +39,7 @@ impl SlotAllocator {
             value_last_use,
             slot_byte_len: plan.slots.iter().map(|slot| slot.byte_len).collect(),
             slot_buffers: vec![None; plan.slots.len()],
-            slot_owner: vec![None; plan.slots.len()],
+            slot_release_pos: vec![0; plan.slots.len()],
         }
     }
 
@@ -69,24 +69,15 @@ impl SlotAllocator {
                 )));
             }
         }
-        let current_owner = self.slot_owner.get(slot_id).copied().ok_or_else(|| {
+        let slot_release_pos = self.slot_release_pos.get(slot_id).copied().ok_or_else(|| {
             BackendError::execution(format!(
-                "slot {} for value {} is outside runtime owner bounds",
+                "slot {} for value {} is outside runtime release bounds",
                 slot_id, value.0
             ))
         })?;
-        if let Some(owner) = current_owner {
-            if owner != value {
-                let owner_live_end = self
-                    .value_last_use
-                    .get(&owner)
-                    .copied()
-                    .unwrap_or(usize::MAX);
-                if owner_live_end >= instruction_pos {
-                    // Runtime order indicates this slot is still live; skip slot reuse for safety.
-                    return Ok(None);
-                }
-            }
+        if slot_release_pos >= instruction_pos {
+            // Runtime order indicates this slot is still live; skip slot reuse for safety.
+            return Ok(None);
         }
         let maybe_existing = self.slot_buffers.get(slot_id).ok_or_else(|| {
             BackendError::execution(format!(
@@ -111,13 +102,19 @@ impl SlotAllocator {
                 allocated
             }
         };
-        let owner_ref = self.slot_owner.get_mut(slot_id).ok_or_else(|| {
+        let value_live_end = self.value_last_use.get(&value).copied().ok_or_else(|| {
             BackendError::execution(format!(
-                "slot {} for value {} disappeared during owner update",
+                "missing last-use position for slot-backed value {}",
+                value.0
+            ))
+        })?;
+        let release_ref = self.slot_release_pos.get_mut(slot_id).ok_or_else(|| {
+            BackendError::execution(format!(
+                "slot {} for value {} disappeared during release update",
                 slot_id, value.0
             ))
         })?;
-        *owner_ref = Some(value);
+        *release_ref = value_live_end;
         Ok(Some(TritonTensor::new(spec.clone(), buffer)))
     }
 
@@ -131,8 +128,13 @@ impl SlotAllocator {
         if source_binding.slot != alias_binding.slot {
             return;
         }
-        if let Some(owner_ref) = self.slot_owner.get_mut(source_binding.slot) {
-            *owner_ref = Some(alias);
+        let alias_live_end = self
+            .value_last_use
+            .get(&alias)
+            .copied()
+            .unwrap_or(usize::MAX);
+        if let Some(release_ref) = self.slot_release_pos.get_mut(source_binding.slot) {
+            *release_ref = (*release_ref).max(alias_live_end);
         }
     }
 }

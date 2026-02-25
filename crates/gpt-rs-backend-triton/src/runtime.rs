@@ -83,7 +83,8 @@ impl TritonExecutor {
                 entry_inputs.len()
             )));
         }
-        let value_last_use = compute_value_last_use(function);
+        let function_slot_plan = artifact.buffer_plan.functions.get(&function.name);
+        let value_last_use = compute_value_last_use(function, function_slot_plan);
 
         let driver = device::driver()?;
         let kernels = artifact
@@ -98,37 +99,12 @@ impl TritonExecutor {
         for (value_id, input) in function.parameter_ids.iter().zip(entry_inputs.iter()) {
             values.insert(*value_id, input.clone());
         }
-        let function_slot_plan = artifact.buffer_plan.functions.get(&function.name);
-        let has_dot = function
-            .body
-            .iter()
-            .any(|inst| matches!(inst.op, Operation::DotGeneral(_)));
-        let has_reduce = function
-            .body
-            .iter()
-            .any(|inst| matches!(inst.op, Operation::Reduce(_)));
-        let slot_plan_supported = function
-            .body
-            .iter()
-            .all(|inst| !matches!(inst.op, Operation::DynamicUpdateSlice(_)))
-            && !(has_dot && has_reduce);
         if function_slot_plan.is_some() {
-            if slot_plan_supported {
-                profiling::cache_event("triton_backend.slot_plan_available");
-            } else if has_dot && has_reduce {
-                profiling::cache_event("triton_backend.slot_plan_unsupported_dot_reduce_mix");
-            } else {
-                profiling::cache_event("triton_backend.slot_plan_unsupported_dynamic_update");
-            }
+            profiling::cache_event("triton_backend.slot_plan_available");
         } else {
             profiling::cache_event("triton_backend.slot_plan_missing");
         }
-        let runtime_slot_plan = if slot_plan_supported {
-            function_slot_plan
-        } else {
-            None
-        };
-        let mut slot_allocator = SlotAllocator::new(runtime_slot_plan, value_last_use.clone());
+        let mut slot_allocator = SlotAllocator::new(function_slot_plan, value_last_use.clone());
         let launch_start = KERNEL_LAUNCH_COUNT.load(Ordering::Relaxed);
         let dispatch_start = std::time::Instant::now();
         let initial_values = values.clone();
@@ -2551,7 +2527,10 @@ fn first_missing_operand_value(
     None
 }
 
-fn compute_value_last_use(function: &gpt_rs::backend::spec::Function) -> HashMap<ValueId, usize> {
+fn compute_value_last_use(
+    function: &gpt_rs::backend::spec::Function,
+    slot_plan: Option<&crate::artifact::TritonFunctionSlotPlan>,
+) -> HashMap<ValueId, usize> {
     let mut last_use = HashMap::new();
     for (idx, instruction) in function.body.iter().enumerate() {
         let pos = idx + 1;
@@ -2580,6 +2559,14 @@ fn compute_value_last_use(function: &gpt_rs::backend::spec::Function) -> HashMap
             .entry(*value)
             .and_modify(|existing| *existing = (*existing).max(result_pos))
             .or_insert(result_pos);
+    }
+    if let Some(slot_plan) = slot_plan {
+        for slot_binding in &slot_plan.value_slots {
+            last_use
+                .entry(slot_binding.value)
+                .and_modify(|existing| *existing = (*existing).max(slot_binding.live_end))
+                .or_insert(slot_binding.live_end);
+        }
     }
     last_use
 }

@@ -48,6 +48,7 @@ pub(crate) fn set_gpu_event_timing_enabled(enabled: bool) {
 pub struct TritonExecutor {
     compiler: KernelCompiler,
     loaded_kernels: Mutex<HashMap<u64, Arc<LoadedKernel>>>,
+    fused_kernel_specs: Mutex<HashMap<u64, KernelSpec>>,
     cublas: OnceLock<Result<Arc<CublasContext>, String>>,
 }
 
@@ -56,6 +57,7 @@ impl TritonExecutor {
         Self {
             compiler: KernelCompiler::new(),
             loaded_kernels: Mutex::new(HashMap::new()),
+            fused_kernel_specs: Mutex::new(HashMap::new()),
             cublas: OnceLock::new(),
         }
     }
@@ -417,7 +419,22 @@ impl TritonExecutor {
             .iter()
             .map(|tensor| tensor.spec.clone())
             .collect::<Vec<_>>();
-        let kernel = plan.build_kernel_spec(out_spec, input_specs.as_slice())?;
+        let kernel_key = plan.cache_fingerprint(out_spec, input_specs.as_slice())?;
+        let kernel = {
+            let mut cache = self
+                .fused_kernel_specs
+                .lock()
+                .expect("triton fused kernel-spec cache poisoned");
+            if let Some(cached) = cache.get(&kernel_key).cloned() {
+                profiling::cache_event("triton_backend.fused_kernel_spec_hit");
+                cached
+            } else {
+                profiling::cache_event("triton_backend.fused_kernel_spec_miss");
+                let built = plan.build_kernel_spec(out_spec, input_specs.as_slice())?;
+                cache.insert(kernel_key, built.clone());
+                built
+            }
+        };
         let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
         let loaded = self.load_kernel(driver, &kernel)?;
         let n = static_element_count(&out_spec.shape)?;

@@ -137,6 +137,37 @@ impl FusedElementwisePlan {
             symbol,
         })
     }
+
+    pub fn cache_fingerprint(
+        &self,
+        out_spec: &TensorSpec,
+        input_specs: &[TensorSpec],
+    ) -> BackendResult<u64> {
+        let out_dims = static_dims_or_error(&out_spec.shape, |_| {
+            BackendError::execution(
+                "dynamic dimensions are not supported by fused elementwise runtime",
+            )
+        })?;
+        let input_dims = input_specs
+            .iter()
+            .map(|spec| {
+                static_dims_or_error(&spec.shape, |_| {
+                    BackendError::execution(
+                        "dynamic dimensions are not supported by fused elementwise runtime",
+                    )
+                })
+            })
+            .collect::<BackendResult<Vec<_>>>()?;
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        out_dims.hash(&mut hasher);
+        input_dims.hash(&mut hasher);
+        self.ops_kind.hash(&mut hasher);
+        self.ops_code.hash(&mut hasher);
+        self.lhs.hash(&mut hasher);
+        self.rhs.hash(&mut hasher);
+        Ok(hasher.finish())
+    }
 }
 
 fn custom_call_i64(spec: &CustomCallSpec, key: &str) -> BackendResult<i64> {

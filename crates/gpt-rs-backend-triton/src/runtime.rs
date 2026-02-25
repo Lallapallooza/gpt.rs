@@ -4,8 +4,9 @@ mod fused_elementwise;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use gpt_rs::backend::shape_helpers::{
     checked_element_count_or_error, contiguous_strides_or_error, static_dims_or_error,
@@ -23,11 +24,11 @@ use crate::compiler::KernelCompiler;
 use crate::device::{self, CudaDriver, CudaFunction, DeviceBuffer};
 use crate::kernels::{
     KernelKind, KernelSpec, BROADCAST_KERNEL_ID, BROADCAST_SI32_KERNEL_ID,
-    COMPARE_SI32_I1_KERNEL_ID, CONCAT_KERNEL_ID, DYNAMIC_UPDATE_SLICE_F32_KERNEL_ID,
-    EWISE_BINARY_KERNEL_ID, EWISE_UNARY_KERNEL_ID, EXTRACT_PATCHES_NHWC_KERNEL_ID,
-    IOTA_SI32_KERNEL_ID, REDUCE_MAX_LAST_AXIS_KERNEL_ID, REDUCE_SUM_LAST_AXIS_KERNEL_ID,
-    REDUCE_WINDOW_MAX_NHWC_KERNEL_ID, SELECT_I1_F32_KERNEL_ID, SLICE_KERNEL_ID,
-    TAKE_F32_I32_KERNEL_ID, TRANSPOSE_KERNEL_ID,
+    COMPARE_SI32_I1_KERNEL_ID, CONCAT_KERNEL_ID, DOT_BIAS_RANK2_KERNEL_ID,
+    DYNAMIC_UPDATE_SLICE_F32_KERNEL_ID, EWISE_BINARY_KERNEL_ID, EWISE_UNARY_KERNEL_ID,
+    EXTRACT_PATCHES_NHWC_KERNEL_ID, IOTA_SI32_KERNEL_ID, REDUCE_MAX_LAST_AXIS_KERNEL_ID,
+    REDUCE_SUM_LAST_AXIS_KERNEL_ID, REDUCE_WINDOW_MAX_NHWC_KERNEL_ID, SELECT_I1_F32_KERNEL_ID,
+    SLICE_KERNEL_ID, TAKE_F32_I32_KERNEL_ID, TRANSPOSE_KERNEL_ID,
 };
 use crate::targets::{TARGET_DOT_BIAS_FUSED_F32_V1, TARGET_ELEMENTWISE_FUSED_F32_V1};
 use crate::tensor::TritonTensor;
@@ -38,6 +39,7 @@ thread_local! {
 }
 
 static GPU_EVENT_TIMING_ENABLED: AtomicBool = AtomicBool::new(false);
+static KERNEL_LAUNCH_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn set_gpu_event_timing_enabled(enabled: bool) {
     GPU_EVENT_TIMING_ENABLED.store(enabled, Ordering::Relaxed);
@@ -91,6 +93,7 @@ impl TritonExecutor {
         for (value_id, input) in function.parameter_ids.iter().zip(entry_inputs.iter()) {
             values.insert(*value_id, input.clone());
         }
+        let launch_start = KERNEL_LAUNCH_COUNT.load(Ordering::Relaxed);
 
         let mut pending = function.body.iter().collect::<Vec<_>>();
         while !pending.is_empty() {
@@ -127,6 +130,16 @@ impl TritonExecutor {
                 ))
             })?;
             results.push(value);
+        }
+        let launch_end = KERNEL_LAUNCH_COUNT.load(Ordering::Relaxed);
+        let launched = launch_end.saturating_sub(launch_start);
+        if launched != 0 {
+            profiling::record_backend_aggregate(
+                "backend.triton.launch_count",
+                launched,
+                Duration::ZERO,
+                WorkStats::default(),
+            );
         }
         Ok(results)
     }
@@ -405,12 +418,21 @@ impl TritonExecutor {
             .iter()
             .map(|operand| self.resolve_operand_tensor(driver, values, Some(operand)))
             .collect::<BackendResult<Vec<_>>>()?;
+        self.execute_fused_elementwise_plan(driver, &plan, input_tensors.as_slice(), out_spec)
+    }
+
+    fn execute_fused_elementwise_plan(
+        &self,
+        driver: &Arc<CudaDriver>,
+        plan: &fused_elementwise::FusedElementwisePlan,
+        input_tensors: &[TritonTensor],
+        out_spec: &TensorSpec,
+    ) -> BackendResult<TritonTensor> {
         let input_specs = input_tensors
             .iter()
             .map(|tensor| tensor.spec.clone())
             .collect::<Vec<_>>();
         let kernel = plan.build_kernel_spec(out_spec, input_specs.as_slice())?;
-
         let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
         let loaded = self.load_kernel(driver, &kernel)?;
         let n = static_element_count(&out_spec.shape)?;
@@ -459,6 +481,23 @@ impl TritonExecutor {
         let bias =
             self.resolve_operand_tensor(driver, values, instruction.operands.get(plan.add_input))?;
 
+        if let Some(kernel) = kernels.get(DOT_BIAS_RANK2_KERNEL_ID) {
+            let rank2_args = DotBiasRank2Args {
+                driver,
+                kernel,
+                plan: &plan,
+                lhs: &lhs,
+                rhs: &rhs,
+                bias: &bias,
+                out_spec,
+            };
+            if let Some(out) = self.try_execute_dot_bias_rank2(rank2_args)? {
+                return Ok(out);
+            }
+        }
+
+        ensure_static_broadcastable(&out_spec.shape, &bias.spec.shape, "fused dot+bias bias")?;
+
         let dot = self.execute_dot_general(
             driver,
             DotGeneralArgs {
@@ -470,23 +509,131 @@ impl TritonExecutor {
             &lhs,
             &rhs,
         )?;
-
-        let bias_ready = if bias.spec == *out_spec {
-            bias
-        } else {
-            self.execute_broadcast(driver, kernels, &bias, out_spec)?
-        };
-        let kernel = kernels.get(EWISE_BINARY_KERNEL_ID).ok_or_else(|| {
-            BackendError::execution("missing elementwise binary kernel in triton artifact")
-        })?;
-        self.execute_elementwise_binary(
+        let epilogue_plan = fused_elementwise::FusedElementwisePlan::from_components(
+            vec![1],
+            vec![0],
+            vec![0],
+            vec![1],
+        )?;
+        let epilogue_inputs = vec![dot, bias];
+        self.execute_fused_elementwise_plan(
             driver,
-            kernel,
-            ElementwiseBinaryOp::Add,
-            &dot,
-            &bias_ready,
+            &epilogue_plan,
+            epilogue_inputs.as_slice(),
             out_spec,
         )
+    }
+
+    fn try_execute_dot_bias_rank2(
+        &self,
+        args: DotBiasRank2Args<'_>,
+    ) -> BackendResult<Option<TritonTensor>> {
+        let DotBiasRank2Args {
+            driver,
+            kernel,
+            plan,
+            lhs,
+            rhs,
+            bias,
+            out_spec,
+        } = args;
+        if !matches!(kernel.kind, KernelKind::DotBiasRank2F32) {
+            return Err(BackendError::execution(format!(
+                "unexpected dot+bias kernel kind: {:?}",
+                kernel.kind
+            )));
+        }
+
+        if !plan.dot.batch_lhs.is_empty()
+            || !plan.dot.batch_rhs.is_empty()
+            || plan.dot.contract_lhs.as_slice() != [1]
+            || plan.dot.contract_rhs.as_slice() != [0]
+        {
+            return Ok(None);
+        }
+
+        if lhs.spec.dtype != DType::F32
+            || rhs.spec.dtype != DType::F32
+            || bias.spec.dtype != DType::F32
+            || out_spec.dtype != DType::F32
+        {
+            return Ok(None);
+        }
+
+        let lhs_dims = static_dims_or_error(&lhs.spec.shape, |_| {
+            BackendError::execution("dynamic dimensions are not supported by triton runtime")
+        })?;
+        let rhs_dims = static_dims_or_error(&rhs.spec.shape, |_| {
+            BackendError::execution("dynamic dimensions are not supported by triton runtime")
+        })?;
+        let bias_dims = static_dims_or_error(&bias.spec.shape, |_| {
+            BackendError::execution("dynamic dimensions are not supported by triton runtime")
+        })?;
+        let out_dims = static_dims_or_error(&out_spec.shape, |_| {
+            BackendError::execution("dynamic dimensions are not supported by triton runtime")
+        })?;
+
+        if lhs_dims.len() != 2 || rhs_dims.len() != 2 || out_dims.len() != 2 {
+            return Ok(None);
+        }
+
+        let m = lhs_dims[0];
+        let k = lhs_dims[1];
+        let rhs_k = rhs_dims[0];
+        let n = rhs_dims[1];
+        if k != rhs_k || out_dims[0] != m || out_dims[1] != n {
+            return Ok(None);
+        }
+        let bias_rank1 = bias_dims.len() == 1 && bias_dims[0] == n;
+        let bias_row = bias_dims.len() == 2 && m == 1 && bias_dims[0] == 1 && bias_dims[1] == n;
+        if !(bias_rank1 || bias_row) {
+            return Ok(None);
+        }
+
+        if m == 0 || n == 0 || k == 0 {
+            let out =
+                TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+            return Ok(Some(out));
+        }
+
+        let mut m_i32 = i32::try_from(m)
+            .map_err(|_| BackendError::execution("dot+bias m exceeds i32 range"))?;
+        let mut n_i32 = i32::try_from(n)
+            .map_err(|_| BackendError::execution("dot+bias n exceeds i32 range"))?;
+        let mut k_i32 = i32::try_from(k)
+            .map_err(|_| BackendError::execution("dot+bias k exceeds i32 range"))?;
+
+        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let loaded = self.load_kernel(driver, kernel)?;
+
+        let mut lhs_ptr = lhs.buffer.device_ptr();
+        let mut rhs_ptr = rhs.buffer.device_ptr();
+        let mut bias_ptr = bias.buffer.device_ptr();
+        let mut out_ptr = out.buffer.device_ptr();
+        let mut opaque_ptr = 0u64;
+
+        let mut params = [
+            (&mut lhs_ptr as *mut u64).cast::<c_void>(),
+            (&mut rhs_ptr as *mut u64).cast::<c_void>(),
+            (&mut bias_ptr as *mut u64).cast::<c_void>(),
+            (&mut out_ptr as *mut u64).cast::<c_void>(),
+            (&mut m_i32 as *mut i32).cast::<c_void>(),
+            (&mut n_i32 as *mut i32).cast::<c_void>(),
+            (&mut k_i32 as *mut i32).cast::<c_void>(),
+            (&mut opaque_ptr as *mut u64).cast::<c_void>(),
+        ];
+
+        let block_n = 128u32;
+        let m_u32 = u32::try_from(m)
+            .map_err(|_| BackendError::execution("dot+bias m exceeds u32 range"))?;
+        let n_u32 = u32::try_from(n)
+            .map_err(|_| BackendError::execution("dot+bias n exceeds u32 range"))?;
+        let n_blocks = n_u32.div_ceil(block_n);
+        let work = m_u32
+            .checked_mul(n_u32)
+            .ok_or_else(|| BackendError::execution("dot+bias work element overflow"))?;
+        launch_program_grid_2d(driver, &loaded, m_u32, n_blocks, block_n, work, &mut params)?;
+        Ok(Some(out))
     }
 
     fn execute_elementwise_binary(
@@ -2136,6 +2283,39 @@ fn static_element_count(shape: &gpt_rs::backend::spec::Shape) -> BackendResult<u
     })
 }
 
+fn ensure_static_broadcastable(
+    out_shape: &gpt_rs::backend::spec::Shape,
+    in_shape: &gpt_rs::backend::spec::Shape,
+    context: &str,
+) -> BackendResult<()> {
+    let out_dims = static_dims_or_error(out_shape, |_| {
+        BackendError::execution("dynamic dimensions are not supported by triton runtime")
+    })?;
+    let in_dims = static_dims_or_error(in_shape, |_| {
+        BackendError::execution("dynamic dimensions are not supported by triton runtime")
+    })?;
+    if in_dims.len() > out_dims.len() {
+        return Err(BackendError::execution(format!(
+            "{context} rank mismatch: input rank {} exceeds output rank {}",
+            in_dims.len(),
+            out_dims.len()
+        )));
+    }
+    let offset = out_dims.len() - in_dims.len();
+    for (idx, in_dim) in in_dims.iter().enumerate() {
+        let out_dim = out_dims[offset + idx];
+        if *in_dim != 1 && *in_dim != out_dim {
+            return Err(BackendError::execution(format!(
+                "{context} shape mismatch: input dim {} (axis {}) is incompatible with output dim {}",
+                in_dim,
+                idx,
+                out_dim
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn align_dims4(dims: &[usize]) -> BackendResult<(i32, i32, i32, i32)> {
     if dims.len() > 4 {
         return Err(BackendError::execution(format!(
@@ -2469,6 +2649,22 @@ fn launch_program_grid(
     if grid_x == 0 {
         return Ok(());
     }
+    launch_program_grid_2d(driver, kernel, grid_x, 1, block_x, work_elements, params)
+}
+
+fn launch_program_grid_2d(
+    driver: &Arc<CudaDriver>,
+    kernel: &LoadedKernel,
+    grid_x: u32,
+    grid_y: u32,
+    block_x: u32,
+    work_elements: u32,
+    params: &mut [*mut c_void],
+) -> BackendResult<()> {
+    if grid_x == 0 || grid_y == 0 {
+        return Ok(());
+    }
+    KERNEL_LAUNCH_COUNT.fetch_add(1, Ordering::Relaxed);
     let _scope = profiling::backend_scope_with_meta("backend.triton.kernel", || {
         let meta = kernel
             .profile_signature
@@ -2480,12 +2676,45 @@ fn launch_program_grid(
         })
     });
     if GPU_EVENT_TIMING_ENABLED.load(Ordering::Relaxed) {
-        let _elapsed_ms = driver.time_with_events("backend.triton.kernel", || {
-            driver.launch_kernel(&kernel.function, (grid_x, 1, 1), (block_x, 1, 1), 0, params)
+        let host_start = std::time::Instant::now();
+        let elapsed_ms = driver.time_with_events("backend.triton.kernel", || {
+            driver.launch_kernel(
+                &kernel.function,
+                (grid_x, grid_y, 1),
+                (block_x, 1, 1),
+                0,
+                params,
+            )
         })?;
+        let host_duration = host_start.elapsed();
+        let gpu_duration = Duration::from_secs_f64(f64::from(elapsed_ms) * 1e-3);
+        let work = WorkStats {
+            elements: u64::from(work_elements),
+            ..WorkStats::default()
+        };
+        profiling::record_backend_aggregate_with_signature(
+            "backend.triton.kernel_gpu",
+            kernel.profile_signature,
+            1,
+            gpu_duration,
+            work,
+        );
+        profiling::record_backend_aggregate_with_signature(
+            "backend.triton.kernel_host",
+            kernel.profile_signature,
+            1,
+            host_duration,
+            work,
+        );
         Ok(())
     } else {
-        driver.launch_kernel(&kernel.function, (grid_x, 1, 1), (block_x, 1, 1), 0, params)
+        driver.launch_kernel(
+            &kernel.function,
+            (grid_x, grid_y, 1),
+            (block_x, 1, 1),
+            0,
+            params,
+        )
     }
 }
 
@@ -2606,6 +2835,16 @@ struct DotGeneralArgs<'a> {
     spec: &'a gpt_rs::backend::spec::DotGeneralSpec,
     lhs_spec: &'a TensorSpec,
     rhs_spec: &'a TensorSpec,
+    out_spec: &'a TensorSpec,
+}
+
+struct DotBiasRank2Args<'a> {
+    driver: &'a Arc<CudaDriver>,
+    kernel: &'a KernelSpec,
+    plan: &'a fused_dot_epilogue::FusedDotBiasPlan,
+    lhs: &'a TritonTensor,
+    rhs: &'a TritonTensor,
+    bias: &'a TritonTensor,
     out_spec: &'a TensorSpec,
 }
 

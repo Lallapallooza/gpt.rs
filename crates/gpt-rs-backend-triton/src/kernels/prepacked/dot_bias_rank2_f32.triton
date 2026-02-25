@@ -1,0 +1,50 @@
+# gpt_rs.kernel: dot_bias_rank2_f32
+# gpt_rs.symbol: gpt_rs_triton_dot_bias_rank2_f32
+# gpt_rs.signature: lhs_ptr=*fp32,rhs_ptr=*fp32,bias_ptr=*fp32,out_ptr=*fp32,m=i32,n=i32,k=i32
+# gpt_rs.param_abi: *fp32,*fp32,*fp32,*fp32,i32,i32,i32,*opaque
+# gpt_rs.constexpr: BLOCK_N=128,BLOCK_K=32
+# gpt_rs.num_warps: 4
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def gpt_rs_triton_dot_bias_rank2_f32(
+    lhs_ptr,
+    rhs_ptr,
+    bias_ptr,
+    out_ptr,
+    m,
+    n,
+    k,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < n
+
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    k_start = 0
+    while k_start < k:
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < k
+
+        lhs_ptrs = lhs_ptr + pid_m * k + offs_k
+        lhs = tl.load(lhs_ptrs, mask=k_mask, other=0.0)
+
+        rhs_ptrs = rhs_ptr + offs_k[:, None] * n + offs_n[None, :]
+        rhs = tl.load(rhs_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+
+        acc += tl.sum(rhs * lhs[:, None], axis=0)
+        k_start += BLOCK_K
+
+    bias = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)
+    out = acc + bias
+
+    out_ptrs = out_ptr + pid_m * n + offs_n
+    tl.store(out_ptrs, out, mask=n_mask)

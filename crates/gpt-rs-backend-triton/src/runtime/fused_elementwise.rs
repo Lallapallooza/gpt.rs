@@ -37,6 +37,21 @@ impl FusedElementwisePlan {
         let ops_code = custom_call_i64_array(spec, "ops_code")?.clone();
         let lhs = custom_call_i64_array(spec, "lhs")?.clone();
         let rhs = custom_call_i64_array(spec, "rhs")?.clone();
+        let plan = Self::from_components(ops_kind, ops_code, lhs, rhs)?;
+        if plan.ops_kind.len() < 2 {
+            return Err(BackendError::execution(
+                "fused elementwise custom_call requires at least two nodes",
+            ));
+        }
+        Ok(plan)
+    }
+
+    pub fn from_components(
+        ops_kind: Vec<i64>,
+        ops_code: Vec<i64>,
+        lhs: Vec<i64>,
+        rhs: Vec<i64>,
+    ) -> BackendResult<Self> {
         if ops_kind.len() != ops_code.len()
             || ops_kind.len() != lhs.len()
             || ops_kind.len() != rhs.len()
@@ -45,9 +60,9 @@ impl FusedElementwisePlan {
                 "fused elementwise custom_call attrs length mismatch",
             ));
         }
-        if ops_kind.len() < 2 {
+        if ops_kind.is_empty() {
             return Err(BackendError::execution(
-                "fused elementwise custom_call requires at least two nodes",
+                "fused elementwise plan requires at least one node",
             ));
         }
         Ok(Self {

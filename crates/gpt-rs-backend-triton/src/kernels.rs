@@ -34,6 +34,8 @@ pub const EXTRACT_PATCHES_NHWC_SYMBOL: &str = "gpt_rs_triton_extract_patches_nhw
 pub const REDUCE_WINDOW_MAX_NHWC_KERNEL_ID: &str =
     "gpt_rs.triton.kernel.reduce_window_max_nhwc_f32.v1";
 pub const REDUCE_WINDOW_MAX_NHWC_SYMBOL: &str = "gpt_rs_triton_reduce_window_max_nhwc_f32";
+pub const DOT_BIAS_RANK2_KERNEL_ID: &str = "gpt_rs.triton.kernel.dot_bias_rank2_f32.v1";
+pub const DOT_BIAS_RANK2_SYMBOL: &str = "gpt_rs_triton_dot_bias_rank2_f32";
 pub const PREPACKED_EWISE_BINARY_KERNEL: &str =
     include_str!("kernels/prepacked/elementwise_binary_f32.triton");
 pub const PREPACKED_EWISE_UNARY_KERNEL: &str =
@@ -62,6 +64,8 @@ pub const PREPACKED_EXTRACT_PATCHES_NHWC_KERNEL: &str =
     include_str!("kernels/prepacked/extract_patches_nhwc_f32.triton");
 pub const PREPACKED_REDUCE_WINDOW_MAX_NHWC_KERNEL: &str =
     include_str!("kernels/prepacked/reduce_window_max_nhwc_f32.triton");
+pub const PREPACKED_DOT_BIAS_RANK2_KERNEL: &str =
+    include_str!("kernels/prepacked/dot_bias_rank2_f32.triton");
 pub const PREPACKED_MATMUL_KERNEL: &str = include_str!("kernels/prepacked/matmul_f32.triton");
 pub const PREPACKED_REDUCE_SUM_LAST_AXIS_KERNEL: &str =
     include_str!("kernels/prepacked/reduce_sum_last_axis_f32.triton");
@@ -92,6 +96,7 @@ pub enum KernelKind {
     DynamicUpdateSliceF32Rank4,
     ExtractPatchesNhwcF32,
     ReduceWindowMaxNhwcF32,
+    DotBiasRank2F32,
     FusedElementwiseF32,
 }
 
@@ -239,6 +244,15 @@ pub fn reduce_window_max_nhwc_kernel_spec() -> KernelSpec {
     }
 }
 
+pub fn dot_bias_rank2_kernel_spec() -> KernelSpec {
+    KernelSpec {
+        id: DOT_BIAS_RANK2_KERNEL_ID.to_string(),
+        kind: KernelKind::DotBiasRank2F32,
+        source: PREPACKED_DOT_BIAS_RANK2_KERNEL.to_string(),
+        symbol: DOT_BIAS_RANK2_SYMBOL.to_string(),
+    }
+}
+
 pub fn elementwise_binary_triton_source() -> String {
     PREPACKED_EWISE_BINARY_KERNEL.to_string()
 }
@@ -264,6 +278,7 @@ pub fn prepacked_kernel_sources() -> &'static [&'static str] {
         PREPACKED_DYNAMIC_UPDATE_SLICE_F32_KERNEL,
         PREPACKED_EXTRACT_PATCHES_NHWC_KERNEL,
         PREPACKED_REDUCE_WINDOW_MAX_NHWC_KERNEL,
+        PREPACKED_DOT_BIAS_RANK2_KERNEL,
         PREPACKED_MATMUL_KERNEL,
         PREPACKED_REDUCE_SUM_LAST_AXIS_KERNEL,
     ]

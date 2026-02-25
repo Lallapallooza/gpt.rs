@@ -2,7 +2,7 @@ mod artifact;
 mod codegen;
 mod compiler;
 mod device;
-mod kernels;
+pub mod kernels;
 mod optimizer;
 mod runtime;
 mod targets;
@@ -46,6 +46,14 @@ impl TritonBackend {
 
     pub fn is_available() -> bool {
         device::is_available()
+    }
+
+    pub fn convert_for_execution(
+        &self,
+        program: &Program,
+        options: &ConversionOptions,
+    ) -> ConversionResult<ConvertedIr> {
+        convert_program_for_triton(program, options, Some(self))
     }
 }
 
@@ -192,14 +200,7 @@ fn convert_program_for_triton(
     backend: Option<&TritonBackend>,
 ) -> ConversionResult<ConvertedIr> {
     check_program_for_triton(program)?;
-    let optimized = match backend {
-        // Backend run path receives programs already optimized by graph arena with full
-        // role/stable-id entry metadata. Re-running optimizer here would currently degrade
-        // that metadata to all-Arg and can block param-only folding behavior.
-        Some(_) => program.clone(),
-        // CLI conversion path still runs the Triton optimizer pipeline.
-        None => optimizer::optimize_program_for_triton(program)?,
-    };
+    let optimized = optimizer::optimize_program_for_triton(program)?;
 
     let buffer_opts = BufferizeOptions {
         require_static_shapes: true,
@@ -208,7 +209,7 @@ fn convert_program_for_triton(
     let buffer_plan = plan_buffers_with(&optimized, &buffer_opts)
         .map_err(|err| ConversionError::new(err.to_string()))?;
 
-    let _ = options;
+    let _ = (options, backend);
     let entrypoint = default_entrypoint_name(&optimized)?;
     let artifact = codegen::lower_program_to_artifact(&optimized, &entrypoint, buffer_plan)?;
 

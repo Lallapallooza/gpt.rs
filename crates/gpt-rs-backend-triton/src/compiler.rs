@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
+use gpt_rs::backend::hashing::FingerprintHasher;
 use gpt_rs::backend::spec::{BackendError, BackendResult};
 use gpt_rs::profiling;
 use serde::Deserialize;
@@ -37,10 +37,7 @@ impl KernelCompiler {
         let backend = tritoncc_backend();
         let fingerprint = kernel_fingerprint(kernel, &arch, &compiler, &backend);
 
-        if let Some(found) = self
-            .compiled
-            .lock()
-            .expect("triton kernel cache poisoned")
+        if let Some(found) = lock_cache(&self.compiled, "kernel cache")?
             .get(&fingerprint)
             .cloned()
         {
@@ -50,21 +47,15 @@ impl KernelCompiler {
         profiling::cache_event("triton_backend.kernel_miss_mem");
 
         let gate = {
-            let mut guard = self
-                .compile_gates
-                .lock()
-                .expect("triton compile gate cache poisoned");
+            let mut guard = lock_cache(&self.compile_gates, "compile gate cache")?;
             guard
                 .entry(fingerprint)
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
-        let _gate_lock = gate.lock().expect("triton compile gate poisoned");
+        let _gate_lock = lock_cache(&gate, "compile gate")?;
 
-        if let Some(found) = self
-            .compiled
-            .lock()
-            .expect("triton kernel cache poisoned")
+        if let Some(found) = lock_cache(&self.compiled, "kernel cache")?
             .get(&fingerprint)
             .cloned()
         {
@@ -102,10 +93,7 @@ impl KernelCompiler {
             ptx: Arc::from(ptx),
             symbol: Arc::from(parsed.kernel_symbol),
         });
-        self.compiled
-            .lock()
-            .expect("triton kernel cache poisoned")
-            .insert(fingerprint, Arc::clone(&compiled));
+        lock_cache(&self.compiled, "kernel cache")?.insert(fingerprint, Arc::clone(&compiled));
         Ok(compiled)
     }
 }
@@ -204,12 +192,18 @@ fn tritoncc_backend() -> String {
 }
 
 fn kernel_fingerprint(kernel: &KernelSpec, arch: &str, compiler: &str, backend: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    kernel.id.hash(&mut hasher);
-    kernel.symbol.hash(&mut hasher);
-    kernel.source.hash(&mut hasher);
-    arch.hash(&mut hasher);
-    compiler.hash(&mut hasher);
-    backend.hash(&mut hasher);
+    let mut hasher = FingerprintHasher::new();
+    hasher.write(&kernel.id);
+    hasher.write(&kernel.symbol);
+    hasher.write(&kernel.source);
+    hasher.write(&arch);
+    hasher.write(&compiler);
+    hasher.write(&backend);
     hasher.finish()
+}
+
+fn lock_cache<'a, T>(mutex: &'a Mutex<T>, name: &str) -> BackendResult<MutexGuard<'a, T>> {
+    mutex
+        .lock()
+        .map_err(|_| BackendError::execution(format!("triton {name} mutex poisoned")))
 }

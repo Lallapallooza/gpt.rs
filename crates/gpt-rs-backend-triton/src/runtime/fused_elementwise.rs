@@ -1,9 +1,7 @@
-use std::fmt::Write as _;
-use std::hash::{Hash, Hasher};
-
 use gpt_rs::backend::fusion::{
     FUSION_ATTR_KIND, FUSION_ATTR_VERSION, FUSION_KIND_ELEMENTWISE_DAG_V1,
 };
+use gpt_rs::backend::hashing::FingerprintHasher;
 use gpt_rs::backend::shape_helpers::{contiguous_strides_or_error, static_dims_or_error};
 use gpt_rs::backend::spec::{
     BackendError, BackendResult, CustomCallAttr, CustomCallSpec, DType, TensorSpec,
@@ -159,13 +157,13 @@ impl FusedElementwisePlan {
             })
             .collect::<BackendResult<Vec<_>>>()?;
 
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        out_dims.hash(&mut hasher);
-        input_dims.hash(&mut hasher);
-        self.ops_kind.hash(&mut hasher);
-        self.ops_code.hash(&mut hasher);
-        self.lhs.hash(&mut hasher);
-        self.rhs.hash(&mut hasher);
+        let mut hasher = FingerprintHasher::new();
+        hasher.write(&out_dims);
+        hasher.write(&input_dims);
+        hasher.write(&self.ops_kind);
+        hasher.write(&self.ops_code);
+        hasher.write(&self.lhs);
+        hasher.write(&self.rhs);
         Ok(hasher.finish())
     }
 }
@@ -437,14 +435,14 @@ fn fused_kernel_hash(
     lhs: &[i64],
     rhs: &[i64],
 ) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    source.hash(&mut hasher);
-    out_dims.hash(&mut hasher);
-    input_dims.hash(&mut hasher);
-    ops_kind.hash(&mut hasher);
-    ops_code.hash(&mut hasher);
-    lhs.hash(&mut hasher);
-    rhs.hash(&mut hasher);
+    let mut hasher = FingerprintHasher::new();
+    hasher.write(&source);
+    hasher.write(&out_dims);
+    hasher.write(&input_dims);
+    hasher.write(&ops_kind);
+    hasher.write(&ops_code);
+    hasher.write(&lhs);
+    hasher.write(&rhs);
     hasher.finish()
 }
 
@@ -455,7 +453,8 @@ struct TritonSourceWriter {
 
 impl TritonSourceWriter {
     fn line(&mut self, line: impl AsRef<str>) {
-        writeln!(&mut self.source, "{}", line.as_ref()).expect("write to string");
+        self.source.push_str(line.as_ref());
+        self.source.push('\n');
     }
 
     fn blank(&mut self) {

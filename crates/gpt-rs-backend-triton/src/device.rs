@@ -1,6 +1,6 @@
 use std::ffi::{c_void, CString};
 use std::fmt;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use gpt_rs::backend::spec::{BackendError, BackendResult};
 use libloading::Library;
@@ -327,13 +327,7 @@ impl CudaDriver {
 
     fn alloc(self: &Arc<Self>, bytes: usize) -> BackendResult<Arc<DeviceBuffer>> {
         if bytes != 0 {
-            let cached_ptr = {
-                let mut cache = self
-                    .alloc_cache
-                    .lock()
-                    .expect("triton allocator cache mutex poisoned");
-                cache.take(bytes)
-            };
+            let cached_ptr = { self.lock_alloc_cache()?.take(bytes) };
             if let Some(ptr) = cached_ptr {
                 return Ok(Arc::new(DeviceBuffer {
                     driver: Arc::clone(self),
@@ -368,11 +362,10 @@ impl CudaDriver {
             return;
         }
         let should_free = {
-            let mut cache = self
-                .alloc_cache
-                .lock()
-                .expect("triton allocator cache mutex poisoned");
-            !cache.put(ptr, bytes)
+            match self.alloc_cache.lock() {
+                Ok(mut cache) => !cache.put(ptr, bytes),
+                Err(poisoned) => !poisoned.into_inner().put(ptr, bytes),
+            }
         };
         if should_free {
             let _ = self.free_ptr(ptr);
@@ -387,11 +380,10 @@ impl CudaDriver {
 
     fn release_cached_allocations(&mut self) {
         let pointers = {
-            let mut cache = self
-                .alloc_cache
-                .lock()
-                .expect("triton allocator cache mutex poisoned");
-            cache.drain()
+            match self.alloc_cache.lock() {
+                Ok(mut cache) => cache.drain(),
+                Err(poisoned) => poisoned.into_inner().drain(),
+            }
         };
         if pointers.is_empty() {
             return;
@@ -574,6 +566,12 @@ impl CudaDriver {
 
     fn ctx_ptr(&self) -> CUcontext {
         self.ctx as CUcontext
+    }
+
+    fn lock_alloc_cache(&self) -> BackendResult<MutexGuard<'_, AllocCache>> {
+        self.alloc_cache
+            .lock()
+            .map_err(|_| BackendError::execution("triton allocator cache mutex poisoned"))
     }
 }
 

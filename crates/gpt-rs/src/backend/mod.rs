@@ -1,7 +1,9 @@
 pub mod conversion;
 pub mod driver;
 pub mod fusion;
+pub mod hashing;
 pub mod index;
+pub mod ir_query;
 pub mod optimizer;
 pub mod param_resolver;
 pub mod passes;
@@ -13,3 +15,4 @@ pub mod rewriter;
 pub mod shape_helpers;
 pub mod spec;
 pub mod text_ir;
+pub mod topology;

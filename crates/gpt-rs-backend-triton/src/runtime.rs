@@ -1,3 +1,4 @@
+mod executor;
 mod fused_dot_epilogue;
 mod fused_elementwise;
 mod layer_norm;
@@ -9,7 +10,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use gpt_rs::backend::shape_helpers::{
@@ -20,12 +21,12 @@ use gpt_rs::backend::spec::{
     ElementwiseUnaryOp, Operand, Operation, ReduceKind, TensorLiteral, TensorSpec, ValueId,
     ValueType,
 };
+use gpt_rs::backend::topology;
 use gpt_rs::profiling::{self, ScopeMeta, WorkStats};
 use libloading::Library;
 
-use crate::artifact::TritonArtifact;
 use crate::compiler::KernelCompiler;
-use crate::device::{self, CudaDriver, CudaFunction, DeviceBuffer};
+use crate::device::{CudaDriver, CudaFunction, DeviceBuffer};
 use crate::kernels::{
     KernelKind, KernelSpec, BROADCAST_KERNEL_ID, BROADCAST_SI32_KERNEL_ID,
     COMPARE_SI32_I1_KERNEL_ID, CONCAT_KERNEL_ID, DOT_BIAS_RANK2_KERNEL_ID,
@@ -69,182 +70,6 @@ impl TritonExecutor {
             fused_kernel_specs: Mutex::new(HashMap::new()),
             cublas: OnceLock::new(),
         }
-    }
-
-    pub fn execute_artifact(
-        &self,
-        artifact: &TritonArtifact,
-        entry_inputs: &[TritonTensor],
-    ) -> BackendResult<Vec<TritonTensor>> {
-        let function = artifact
-            .program
-            .functions
-            .iter()
-            .find(|function| function.name == artifact.program.entry)
-            .ok_or_else(|| BackendError::execution("triton artifact entry function not found"))?;
-
-        if function.parameter_ids.len() != entry_inputs.len() {
-            return Err(BackendError::execution(format!(
-                "triton entry input arity mismatch: expected {}, got {}",
-                function.parameter_ids.len(),
-                entry_inputs.len()
-            )));
-        }
-        let function_slot_plan = artifact.buffer_plan.functions.get(&function.name);
-        let value_last_use = compute_value_last_use(function, function_slot_plan);
-
-        let driver = device::driver()?;
-        let kernels = artifact
-            .kernels
-            .iter()
-            .map(|spec| (spec.id.as_str(), spec))
-            .collect::<HashMap<_, _>>();
-        let preloaded = self.preload_execution_kernels(&driver, &artifact.kernels)?;
-        let _execution_kernel_guard = ExecutionKernelGuard::push(preloaded);
-
-        let mut values = initialize_values(function, entry_inputs);
-        if function_slot_plan.is_some() {
-            profiling::cache_event("triton_backend.slot_plan_available");
-        } else {
-            profiling::cache_event("triton_backend.slot_plan_missing");
-        }
-        let mut slot_allocator = SlotAllocator::new(function_slot_plan, value_last_use);
-        let launch_start = KERNEL_LAUNCH_COUNT.load(Ordering::Relaxed);
-        let dispatch_start = std::time::Instant::now();
-        if let Some((missing, instruction)) = self.execute_body_single_pass(
-            &driver,
-            &kernels,
-            &mut values,
-            &mut slot_allocator,
-            function,
-        )? {
-            profiling::cache_event("triton_backend.dispatch_fallback_worklist");
-            values = initialize_values(function, entry_inputs);
-            profiling::cache_event("triton_backend.slot_plan_disabled_worklist");
-            slot_allocator = SlotAllocator::new(None, HashMap::new());
-            self.execute_body_worklist(
-                &driver,
-                &kernels,
-                &mut values,
-                &mut slot_allocator,
-                function,
-            )
-            .map_err(|err| {
-                BackendError::execution(format!(
-                    "{} (single-pass first missing value {} before instruction {} ({:?}))",
-                    err, missing.0, instruction.id.0, instruction.op
-                ))
-            })?;
-        }
-
-        let mut results = Vec::with_capacity(function.result_ids.len());
-        for result_id in &function.result_ids {
-            let value = values.get_cloned(*result_id).ok_or_else(|| {
-                BackendError::execution(format!(
-                    "missing result value {} in triton runtime",
-                    result_id.0
-                ))
-            })?;
-            results.push(value);
-        }
-        let dispatch_elapsed = dispatch_start.elapsed();
-        profiling::record_backend_aggregate(
-            "backend.triton.dispatch",
-            1,
-            dispatch_elapsed,
-            WorkStats {
-                elements: function.body.len() as u64,
-                ..WorkStats::default()
-            },
-        );
-        let launch_end = KERNEL_LAUNCH_COUNT.load(Ordering::Relaxed);
-        let launched = launch_end.saturating_sub(launch_start);
-        if launched != 0 {
-            profiling::record_backend_aggregate(
-                "backend.triton.launch_count",
-                launched,
-                Duration::ZERO,
-                WorkStats::default(),
-            );
-        }
-        Ok(results)
-    }
-
-    fn execute_body_single_pass(
-        &self,
-        driver: &Arc<CudaDriver>,
-        kernels: &HashMap<&str, &KernelSpec>,
-        values: &mut DenseValueStore,
-        slot_allocator: &mut SlotAllocator,
-        function: &gpt_rs::backend::spec::Function,
-    ) -> BackendResult<Option<(ValueId, gpt_rs::backend::spec::Instruction)>> {
-        for (idx, instruction) in function.body.iter().enumerate() {
-            if let Some(missing) = first_missing_operand_value(instruction, values) {
-                return Ok(Some((missing, instruction.clone())));
-            }
-            let instruction_pos = idx + 1;
-            let output = self.execute_instruction(
-                driver,
-                kernels,
-                values,
-                slot_allocator,
-                instruction,
-                instruction_pos,
-            )?;
-            values.insert(instruction.id, output);
-        }
-        Ok(None)
-    }
-
-    fn execute_body_worklist(
-        &self,
-        driver: &Arc<CudaDriver>,
-        kernels: &HashMap<&str, &KernelSpec>,
-        values: &mut DenseValueStore,
-        slot_allocator: &mut SlotAllocator,
-        function: &gpt_rs::backend::spec::Function,
-    ) -> BackendResult<()> {
-        let mut pending = function.body.iter().collect::<Vec<_>>();
-        while !pending.is_empty() {
-            let mut next = Vec::new();
-            let mut progress = false;
-            for instruction in pending {
-                if first_missing_operand_value(instruction, values).is_some() {
-                    next.push(instruction);
-                    continue;
-                }
-                let output = self.execute_instruction(
-                    driver,
-                    kernels,
-                    values,
-                    slot_allocator,
-                    instruction,
-                    0,
-                )?;
-                values.insert(instruction.id, output);
-                progress = true;
-            }
-            if !progress {
-                return Err(BackendError::execution(
-                    "triton runtime dependency resolution stalled",
-                ));
-            }
-            pending = next;
-        }
-        Ok(())
-    }
-
-    fn preload_execution_kernels(
-        &self,
-        driver: &Arc<CudaDriver>,
-        specs: &[KernelSpec],
-    ) -> BackendResult<HashMap<String, Arc<LoadedKernel>>> {
-        let mut out = HashMap::with_capacity(specs.len());
-        for spec in specs {
-            let loaded = self.load_kernel(driver, spec)?;
-            out.insert(spec.id.clone(), loaded);
-        }
-        Ok(out)
     }
 
     fn execute_instruction(
@@ -719,10 +544,7 @@ impl TritonExecutor {
             .collect::<Vec<_>>();
         let kernel_key = plan.cache_fingerprint(out_spec, input_specs.as_slice())?;
         let kernel = {
-            let mut cache = self
-                .fused_kernel_specs
-                .lock()
-                .expect("triton fused kernel-spec cache poisoned");
+            let mut cache = lock_named(&self.fused_kernel_specs, "fused kernel-spec cache")?;
             if let Some(cached) = cache.get(&kernel_key).cloned() {
                 profiling::cache_event("triton_backend.fused_kernel_spec_hit");
                 cached
@@ -2496,7 +2318,7 @@ impl TritonExecutor {
         if let Some(found) = self
             .loaded_kernels
             .lock()
-            .expect("triton loaded kernel cache poisoned")
+            .map_err(|_| BackendError::execution("triton loaded kernel cache mutex poisoned"))?
             .get(&compiled.fingerprint)
             .cloned()
         {
@@ -2517,7 +2339,7 @@ impl TritonExecutor {
         });
         self.loaded_kernels
             .lock()
-            .expect("triton loaded kernel cache poisoned")
+            .map_err(|_| BackendError::execution("triton loaded kernel cache mutex poisoned"))?
             .insert(compiled.fingerprint, Arc::clone(&loaded));
         Ok(loaded)
     }
@@ -2551,6 +2373,14 @@ fn first_missing_operand_value(
         }
     }
     None
+}
+
+fn validate_function_topology(function: &gpt_rs::backend::spec::Function) -> BackendResult<()> {
+    topology::validate_function_topology(function).map_err(|err| {
+        BackendError::execution(format!(
+            "triton runtime function topology validation failed: {err}"
+        ))
+    })
 }
 
 fn compute_value_last_use(
@@ -3765,6 +3595,12 @@ fn check_cublas(status: CublasStatus, call: &str) -> BackendResult<()> {
             "cuBLAS call {call} failed with status {status}"
         )))
     }
+}
+
+fn lock_named<'a, T>(mutex: &'a Mutex<T>, name: &str) -> BackendResult<MutexGuard<'a, T>> {
+    mutex
+        .lock()
+        .map_err(|_| BackendError::execution(format!("triton {name} mutex poisoned")))
 }
 
 impl Default for TritonExecutor {

@@ -107,45 +107,22 @@ fn match_softmax_last_axis_from_decomposition_view(
     rewriter: &ProgramRewriter,
     view: &SoftmaxDecompositionView,
 ) -> Option<SoftmaxRewrite> {
-    match_softmax_last_axis(
-        rewriter,
-        view.max.result,
-        &view.max.spec,
-        &view.max.operands,
-        view.shifted.root,
-        view.shifted.result,
-        &view.shifted.operands,
-        view.exp_values.root,
-        view.exp_values.result,
-        &view.exp_values.operands,
-        view.sum.result,
-        &view.sum.spec,
-        &view.sum.operands,
-        view.output.root,
-        view.output.result,
-        &view.output.operands,
-    )
-}
+    let max_result = view.max.result;
+    let max_spec = &view.max.spec;
+    let max_operands = &view.max.operands;
+    let shifted_root = view.shifted.root;
+    let shifted_result = view.shifted.result;
+    let shifted_operands = &view.shifted.operands;
+    let exp_root = view.exp_values.root;
+    let exp_result = view.exp_values.result;
+    let exp_operands = &view.exp_values.operands;
+    let sum_result = view.sum.result;
+    let sum_spec = &view.sum.spec;
+    let sum_operands = &view.sum.operands;
+    let output_root = view.output.root;
+    let output = view.output.result;
+    let output_operands = &view.output.operands;
 
-#[allow(clippy::too_many_arguments)]
-fn match_softmax_last_axis(
-    rewriter: &ProgramRewriter,
-    max_result: ValueId,
-    max_spec: &gpt_rs::backend::spec::ReduceSpec,
-    max_operands: &[Operand],
-    shifted_root: InstId,
-    shifted_result: ValueId,
-    shifted_operands: &[Operand],
-    exp_root: InstId,
-    exp_result: ValueId,
-    exp_operands: &[Operand],
-    sum_result: ValueId,
-    sum_spec: &gpt_rs::backend::spec::ReduceSpec,
-    sum_operands: &[Operand],
-    output_root: InstId,
-    output: ValueId,
-    output_operands: &[Operand],
-) -> Option<SoftmaxRewrite> {
     let out_spec = tensor_spec_of(rewriter, output)
         .or_else(|| reject_softmax("triton_softmax_reject_missing_out_spec"))?;
     if out_spec.dtype != DType::F32 {

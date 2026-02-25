@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::ffi::CStr;
-use std::hash::{Hash, Hasher};
 use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,6 +15,7 @@ use gpt_rs::backend::conversion::{
     ConversionCacheKey, ConversionError, ConversionOptions, ConversionResult, ConversionTarget,
     ConvertedEntrypoint, ConvertedIr, LegalityReport, LegalitySpec, OperationKind,
 };
+use gpt_rs::backend::hashing::{fnv1a_hash, FingerprintHasher};
 use gpt_rs::backend::optimizer::{
     default_optimizer, EntryParam, EntrySignature, OptimizeConfig, OptimizeContext,
     OptimizeServices,
@@ -789,9 +789,9 @@ fn c_cache_dir() -> PathBuf {
 }
 
 fn cache_fingerprint(key: &ConversionCacheKey, converted: &ConvertedIr) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hasher);
-    converted.module.hash(&mut hasher);
+    let mut hasher = FingerprintHasher::new();
+    hasher.write(key);
+    hasher.write(&converted.module);
     hasher.write_u8(if c_accelerated_kernels_supported() {
         1
     } else {
@@ -801,21 +801,9 @@ fn cache_fingerprint(key: &ConversionCacheKey, converted: &ConvertedIr) -> u64 {
 }
 
 fn cache_key_hash(key: &ConversionCacheKey) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hasher);
+    let mut hasher = FingerprintHasher::new();
+    hasher.write(key);
     hasher.finish()
-}
-
-fn fnv1a_hash(bytes: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x100000001b3;
-
-    let mut hash = OFFSET;
-    for byte in bytes {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
 }
 
 fn lib_ext() -> &'static str {

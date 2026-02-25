@@ -239,9 +239,11 @@ fn reorder_function_body_topologically(function: &mut Function) -> ConversionRes
     while let Some(idx) = ready.pop_front() {
         scheduled.push(function.body[idx].clone());
         for user_idx in &users[idx] {
-            let slot = indegree
-                .get_mut(*user_idx)
-                .expect("topological indegree index must be valid");
+            let slot = indegree.get_mut(*user_idx).ok_or_else(|| {
+                ConversionError::new(format!(
+                    "topological reordering internal error: invalid indegree index {user_idx}"
+                ))
+            })?;
             if *slot > 0 {
                 *slot -= 1;
                 if *slot == 0 {

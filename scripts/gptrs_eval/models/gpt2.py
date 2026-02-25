@@ -182,6 +182,7 @@ class Gpt2Case:
 
         prompt = str(cfg.params.get("prompt", "Hello"))
         torch_model_id = str(cfg.params.get("torch_model", "gpt2"))
+        torch_device = str(cfg.torch_device)
         kv_cache = bool(cfg.params.get("kv_cache", True))
         max_tokens = int(cfg.params.get("bench_tokens", 64))
 
@@ -195,22 +196,35 @@ class Gpt2Case:
         except RuntimeError:
             pass
 
+        device = torch.device(torch_device)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise SystemExit(
+                "torch benchmark requested CUDA device but torch.cuda.is_available() is false"
+            )
+
         rs_tokenizer, rs_model = self._build_gpt_rs(cfg)
         prompt_tokens: List[int] = list(rs_tokenizer.encode(prompt))
 
-        torch_model = AutoModelForCausalLM.from_pretrained(torch_model_id).eval()
-        input_ids = torch.tensor(prompt_tokens, dtype=torch.long).unsqueeze(0)
+        torch_model = cast(Any, AutoModelForCausalLM.from_pretrained(torch_model_id))
+        torch_model = torch_model.to(device).eval()
+        input_ids = torch.tensor(prompt_tokens, dtype=torch.long, device=device).unsqueeze(0)
         attention_mask = torch.ones_like(input_ids)
         pad_token_id = int(getattr(torch_model.config, "eos_token_id", 50256))
 
+        def torch_sync() -> None:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+
         @torch.no_grad()
         def torch_once() -> None:
+            torch_sync()
             _ = torch_model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=max_tokens,
                 pad_token_id=pad_token_id,
             )
+            torch_sync()
 
         def gptrs_once() -> None:
             out_tokens = rs_model.generate_tokens(
@@ -221,7 +235,15 @@ class Gpt2Case:
             )
             _ = int(out_tokens[-1])
 
-        torch_times = time_many(torch_once, warmup=cfg.warmup, iters=cfg.iters)
+        torch_times = time_many(
+            torch_once,
+            warmup=cfg.warmup,
+            iters=cfg.iters,
+            before_warmup=torch_sync,
+            after_warmup=torch_sync,
+            before_iters=torch_sync,
+            after_iters=torch_sync,
+        )
         with debug_context(cfg.params) as dbg:
             gptrs_times = time_many(
                 gptrs_once,

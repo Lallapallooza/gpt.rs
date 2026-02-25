@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use gpt_rs::backend::conversion::{ConversionOptions, ConversionTarget};
 use gpt_rs::backend::fusion::{FUSION_ATTR_KIND, FUSION_ATTR_VERSION, FUSION_KIND_DOT_EPILOGUE_V1};
@@ -141,4 +141,134 @@ fn required_unsupported_hint_fails_conversion() {
         err.to_string().contains("required hint"),
         "unexpected error: {err}"
     );
+}
+
+#[test]
+fn convert_reorders_out_of_order_body_topologically() {
+    let spec_in = TensorSpec::new(
+        DType::F32,
+        Shape::new(vec![Dimension::from_usize(2), Dimension::from_usize(3)]),
+    );
+    let spec_w = TensorSpec::new(
+        DType::F32,
+        Shape::new(vec![Dimension::from_usize(3), Dimension::from_usize(4)]),
+    );
+    let spec_out = TensorSpec::new(
+        DType::F32,
+        Shape::new(vec![Dimension::from_usize(2), Dimension::from_usize(4)]),
+    );
+    let dot = Instruction {
+        id: ValueId(3),
+        op: Operation::DotGeneral(DotGeneralSpec {
+            batch_lhs: vec![],
+            batch_rhs: vec![],
+            contract_lhs: vec![1],
+            contract_rhs: vec![0],
+            accum_dtype: None,
+            out_dtype: None,
+        }),
+        operands: vec![Operand::Value(ValueId(0)), Operand::Value(ValueId(1))],
+        output: ValueType::Tensor(spec_out.clone()),
+    };
+    let add = Instruction {
+        id: ValueId(4),
+        op: Operation::ElementwiseBinary(gpt_rs::backend::spec::ElementwiseBinaryOp::Add),
+        operands: vec![Operand::Value(ValueId(3)), Operand::Value(ValueId(2))],
+        output: ValueType::Tensor(spec_out.clone()),
+    };
+    let consume = Instruction {
+        id: ValueId(5),
+        op: Operation::ElementwiseUnary(gpt_rs::backend::spec::ElementwiseUnaryOp::Tanh),
+        operands: vec![Operand::Value(ValueId(4))],
+        output: ValueType::Tensor(spec_out.clone()),
+    };
+    let mut attrs = BTreeMap::new();
+    attrs.insert(FUSION_ATTR_VERSION.to_string(), CustomCallAttr::I64(1));
+    attrs.insert(
+        FUSION_ATTR_KIND.to_string(),
+        CustomCallAttr::String(FUSION_KIND_DOT_EPILOGUE_V1.to_string()),
+    );
+    attrs.insert(
+        "dot_batch_lhs".to_string(),
+        CustomCallAttr::I64Array(vec![]),
+    );
+    attrs.insert(
+        "dot_batch_rhs".to_string(),
+        CustomCallAttr::I64Array(vec![]),
+    );
+    attrs.insert(
+        "dot_contract_lhs".to_string(),
+        CustomCallAttr::I64Array(vec![1]),
+    );
+    attrs.insert(
+        "dot_contract_rhs".to_string(),
+        CustomCallAttr::I64Array(vec![0]),
+    );
+    attrs.insert("dot_add_input".to_string(), CustomCallAttr::I64(2));
+    let hint = HintRegion {
+        id: 9,
+        kind: HintKind::DotEpilogue,
+        policy: HintPolicy::Preferred,
+        inputs: vec![ValueId(0), ValueId(1), ValueId(2)],
+        exports: vec![ValueId(4)],
+        body: vec![dot.clone(), add.clone()],
+        attrs,
+    };
+    let function = Function {
+        name: "main".to_string(),
+        parameters: vec![
+            ValueType::Tensor(spec_in),
+            ValueType::Tensor(spec_w),
+            ValueType::Tensor(spec_out.clone()),
+        ],
+        parameter_ids: vec![ValueId(0), ValueId(1), ValueId(2)],
+        results: vec![ValueType::Tensor(spec_out)],
+        body: vec![dot, add, consume],
+        hints: vec![hint],
+        result_ids: vec![ValueId(5)],
+    };
+    let program = Program::new("main").with_functions(vec![function]);
+
+    let target = gpt_rs_backend_triton::TritonConversionTarget::new();
+    let converted = target
+        .convert(&program, &ConversionOptions::default())
+        .expect("triton conversion should succeed");
+    let artifact_json: serde_json::Value =
+        serde_json::from_str(&converted.module).expect("artifact json");
+    let lowered_program: Program =
+        serde_json::from_value(artifact_json["program"].clone()).expect("artifact program");
+    let entry_fn = lowered_program
+        .functions
+        .iter()
+        .find(|func| func.name == lowered_program.entry)
+        .expect("entry function");
+    assert_function_topological(entry_fn);
+}
+
+fn assert_function_topological(function: &Function) {
+    let mut available = function
+        .parameter_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    for instruction in &function.body {
+        for operand in &instruction.operands {
+            match operand {
+                Operand::Value(value) => assert!(
+                    available.contains(value),
+                    "value {} is used before definition in instruction {}",
+                    value.0,
+                    instruction.id.0
+                ),
+                Operand::TupleElement { tuple, .. } => assert!(
+                    available.contains(tuple),
+                    "tuple value {} is used before definition in instruction {}",
+                    tuple.0,
+                    instruction.id.0
+                ),
+                Operand::Literal(_) => {}
+            }
+        }
+        available.insert(instruction.id);
+    }
 }

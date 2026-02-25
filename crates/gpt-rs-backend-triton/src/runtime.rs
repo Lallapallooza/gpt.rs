@@ -97,16 +97,19 @@ impl TritonExecutor {
         }
         let launch_start = KERNEL_LAUNCH_COUNT.load(Ordering::Relaxed);
         let dispatch_start = std::time::Instant::now();
-
-        for instruction in &function.body {
-            if let Some(missing) = first_missing_operand_value(instruction, &values) {
-                return Err(BackendError::execution(format!(
-                    "triton runtime operand value {} missing before instruction {} ({:?})",
-                    missing.0, instruction.id.0, instruction.op
-                )));
-            }
-            let output = self.execute_instruction(&driver, &kernels, &values, instruction)?;
-            values.insert(instruction.id, output);
+        let initial_values = values.clone();
+        if let Some((missing, instruction)) =
+            self.execute_body_single_pass(&driver, &kernels, &mut values, function)?
+        {
+            profiling::cache_event("triton_backend.dispatch_fallback_worklist");
+            values = initial_values;
+            self.execute_body_worklist(&driver, &kernels, &mut values, function)
+                .map_err(|err| {
+                    BackendError::execution(format!(
+                        "{} (single-pass first missing value {} before instruction {} ({:?}))",
+                        err, missing.0, instruction.id.0, instruction.op
+                    ))
+                })?;
         }
 
         let mut results = Vec::with_capacity(function.result_ids.len());
@@ -140,6 +143,53 @@ impl TritonExecutor {
             );
         }
         Ok(results)
+    }
+
+    fn execute_body_single_pass(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernels: &HashMap<&str, &KernelSpec>,
+        values: &mut HashMap<ValueId, TritonTensor>,
+        function: &gpt_rs::backend::spec::Function,
+    ) -> BackendResult<Option<(ValueId, gpt_rs::backend::spec::Instruction)>> {
+        for instruction in &function.body {
+            if let Some(missing) = first_missing_operand_value(instruction, values) {
+                return Ok(Some((missing, instruction.clone())));
+            }
+            let output = self.execute_instruction(driver, kernels, values, instruction)?;
+            values.insert(instruction.id, output);
+        }
+        Ok(None)
+    }
+
+    fn execute_body_worklist(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernels: &HashMap<&str, &KernelSpec>,
+        values: &mut HashMap<ValueId, TritonTensor>,
+        function: &gpt_rs::backend::spec::Function,
+    ) -> BackendResult<()> {
+        let mut pending = function.body.iter().collect::<Vec<_>>();
+        while !pending.is_empty() {
+            let mut next = Vec::new();
+            let mut progress = false;
+            for instruction in pending {
+                if first_missing_operand_value(instruction, values).is_some() {
+                    next.push(instruction);
+                    continue;
+                }
+                let output = self.execute_instruction(driver, kernels, values, instruction)?;
+                values.insert(instruction.id, output);
+                progress = true;
+            }
+            if !progress {
+                return Err(BackendError::execution(
+                    "triton runtime dependency resolution stalled",
+                ));
+            }
+            pending = next;
+        }
+        Ok(())
     }
 
     fn preload_execution_kernels(

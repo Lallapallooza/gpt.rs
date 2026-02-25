@@ -16,6 +16,7 @@ pub fn lower_hint_regions_to_custom_calls(program: &Program) -> ConversionResult
     let mut lowered = program.clone();
     for function in &mut lowered.functions {
         lower_function_hints(function)?;
+        reorder_function_body_topologically(function)?;
     }
     Ok(lowered)
 }
@@ -195,4 +196,68 @@ fn inputs_available_before(
         }
     }
     true
+}
+
+fn reorder_function_body_topologically(function: &mut Function) -> ConversionResult<()> {
+    if function.body.len() < 2 {
+        return Ok(());
+    }
+
+    let mut def_index = std::collections::HashMap::with_capacity(function.body.len());
+    for (idx, instruction) in function.body.iter().enumerate() {
+        def_index.insert(instruction.id, idx);
+    }
+
+    let mut indegree = vec![0usize; function.body.len()];
+    let mut users = vec![Vec::<usize>::new(); function.body.len()];
+    for (idx, instruction) in function.body.iter().enumerate() {
+        let mut deps = 0usize;
+        for operand in &instruction.operands {
+            let maybe_dep = match operand {
+                Operand::Value(value) => def_index.get(value).copied(),
+                Operand::TupleElement { tuple, .. } => def_index.get(tuple).copied(),
+                Operand::Literal(_) => None,
+            };
+            if let Some(dep_idx) = maybe_dep {
+                if dep_idx != idx {
+                    deps = deps.saturating_add(1);
+                    users[dep_idx].push(idx);
+                }
+            }
+        }
+        indegree[idx] = deps;
+    }
+
+    let mut ready = std::collections::VecDeque::new();
+    for (idx, deps) in indegree.iter().enumerate() {
+        if *deps == 0 {
+            ready.push_back(idx);
+        }
+    }
+
+    let mut scheduled = Vec::with_capacity(function.body.len());
+    while let Some(idx) = ready.pop_front() {
+        scheduled.push(function.body[idx].clone());
+        for user_idx in &users[idx] {
+            let slot = indegree
+                .get_mut(*user_idx)
+                .expect("topological indegree index must be valid");
+            if *slot > 0 {
+                *slot -= 1;
+                if *slot == 0 {
+                    ready.push_back(*user_idx);
+                }
+            }
+        }
+    }
+
+    if scheduled.len() != function.body.len() {
+        return Err(ConversionError::new(format!(
+            "failed to topologically reorder function '{}' (cycle or unresolved dependency)",
+            function.name
+        )));
+    }
+
+    function.body = scheduled;
+    Ok(())
 }

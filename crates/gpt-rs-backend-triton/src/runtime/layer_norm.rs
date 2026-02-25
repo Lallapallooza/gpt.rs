@@ -13,6 +13,15 @@ use super::{
     allocate_output_tensor, launch_program_grid, DenseValueStore, OutputBinding, TritonExecutor,
 };
 
+struct LayerNormDispatch<'a> {
+    input: &'a TritonTensor,
+    gamma: &'a TritonTensor,
+    beta: &'a TritonTensor,
+    axis: i64,
+    eps: f32,
+    out: OutputBinding<'a>,
+}
+
 impl TritonExecutor {
     pub(super) fn execute_layer_norm_custom_call(
         &self,
@@ -55,38 +64,44 @@ impl TritonExecutor {
         let input = self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
         let gamma = self.resolve_operand_tensor(driver, values, instruction.operands.get(1))?;
         let beta = self.resolve_operand_tensor(driver, values, instruction.operands.get(2))?;
-        self.execute_layer_norm_f32(driver, kernels, &input, &gamma, &beta, axis, eps, out)
+        self.execute_layer_norm_f32(
+            driver,
+            kernels,
+            LayerNormDispatch {
+                input: &input,
+                gamma: &gamma,
+                beta: &beta,
+                axis,
+                eps,
+                out,
+            },
+        )
     }
 
     fn execute_layer_norm_f32(
         &self,
         driver: &Arc<CudaDriver>,
         kernels: &HashMap<&str, &KernelSpec>,
-        input: &TritonTensor,
-        gamma: &TritonTensor,
-        beta: &TritonTensor,
-        axis: i64,
-        eps: f32,
-        out: OutputBinding<'_>,
+        dispatch: LayerNormDispatch<'_>,
     ) -> BackendResult<TritonTensor> {
-        let out_spec = out.spec;
-        let output = out.tensor;
-        if input.spec.dtype != DType::F32
-            || gamma.spec.dtype != DType::F32
-            || beta.spec.dtype != DType::F32
+        let out_spec = dispatch.out.spec;
+        let output = dispatch.out.tensor;
+        if dispatch.input.spec.dtype != DType::F32
+            || dispatch.gamma.spec.dtype != DType::F32
+            || dispatch.beta.spec.dtype != DType::F32
             || out_spec.dtype != DType::F32
         {
             return Err(BackendError::execution(
                 "fused layer_norm currently supports F32 only",
             ));
         }
-        if input.spec.shape != out_spec.shape {
+        if dispatch.input.spec.shape != out_spec.shape {
             return Err(BackendError::execution(
                 "fused layer_norm input/output shape mismatch",
             ));
         }
 
-        let input_dims = static_dims_or_error(&input.spec.shape, |_| {
+        let input_dims = static_dims_or_error(&dispatch.input.spec.shape, |_| {
             BackendError::execution("dynamic dimensions are not supported by fused layer_norm")
         })?;
         if input_dims.is_empty() {
@@ -96,17 +111,17 @@ impl TritonExecutor {
         }
         let expected_axis = i64::try_from(input_dims.len() - 1)
             .map_err(|_| BackendError::execution("fused layer_norm rank exceeds i64 range"))?;
-        if axis != expected_axis {
+        if dispatch.axis != expected_axis {
             return Err(BackendError::execution(
                 "fused layer_norm currently supports last-axis only",
             ));
         }
 
         let cols = input_dims[input_dims.len() - 1];
-        let gamma_dims = static_dims_or_error(&gamma.spec.shape, |_| {
+        let gamma_dims = static_dims_or_error(&dispatch.gamma.spec.shape, |_| {
             BackendError::execution("dynamic dimensions are not supported by fused layer_norm")
         })?;
-        let beta_dims = static_dims_or_error(&beta.spec.shape, |_| {
+        let beta_dims = static_dims_or_error(&dispatch.beta.spec.shape, |_| {
             BackendError::execution("dynamic dimensions are not supported by fused layer_norm")
         })?;
         if gamma_dims.as_slice() != [cols] || beta_dims.as_slice() != [cols] {
@@ -135,15 +150,15 @@ impl TritonExecutor {
         }
         let loaded = self.load_kernel(driver, kernel)?;
 
-        let mut in_ptr = input.buffer.device_ptr();
-        let mut gamma_ptr = gamma.buffer.device_ptr();
-        let mut beta_ptr = beta.buffer.device_ptr();
+        let mut in_ptr = dispatch.input.buffer.device_ptr();
+        let mut gamma_ptr = dispatch.gamma.buffer.device_ptr();
+        let mut beta_ptr = dispatch.beta.buffer.device_ptr();
         let mut out_ptr = out.buffer.device_ptr();
         let mut rows_i32 = i32::try_from(rows)
             .map_err(|_| BackendError::execution("fused layer_norm rows exceeds i32 range"))?;
         let mut cols_i32 = i32::try_from(cols)
             .map_err(|_| BackendError::execution("fused layer_norm cols exceeds i32 range"))?;
-        let mut eps_f32 = eps;
+        let mut eps_f32 = dispatch.eps;
         let mut opaque_ptr = 0u64;
         let mut params = [
             (&mut in_ptr as *mut u64).cast::<c_void>(),

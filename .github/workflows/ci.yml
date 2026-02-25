@@ -51,4 +51,8 @@ jobs:
           PY
 
       - name: Run tests (workspace)
-        run: cargo test --workspace --exclude gpt-rs-py --exclude gpt-rs-backend-c
+        run: >-
+          cargo test --workspace
+          --exclude gpt-rs-py
+          --exclude gpt-rs-backend-c
+          --exclude gpt-rs-backend-triton

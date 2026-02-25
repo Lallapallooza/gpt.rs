@@ -83,6 +83,7 @@ impl TritonExecutor {
                 entry_inputs.len()
             )));
         }
+        let value_last_use = compute_value_last_use(function);
 
         let driver = device::driver()?;
         let kernels = artifact
@@ -97,7 +98,37 @@ impl TritonExecutor {
         for (value_id, input) in function.parameter_ids.iter().zip(entry_inputs.iter()) {
             values.insert(*value_id, input.clone());
         }
-        let mut slot_allocator = SlotAllocator::new(None);
+        let function_slot_plan = artifact.buffer_plan.functions.get(&function.name);
+        let has_dot = function
+            .body
+            .iter()
+            .any(|inst| matches!(inst.op, Operation::DotGeneral(_)));
+        let has_reduce = function
+            .body
+            .iter()
+            .any(|inst| matches!(inst.op, Operation::Reduce(_)));
+        let slot_plan_supported = function
+            .body
+            .iter()
+            .all(|inst| !matches!(inst.op, Operation::DynamicUpdateSlice(_)))
+            && !(has_dot && has_reduce);
+        if function_slot_plan.is_some() {
+            if slot_plan_supported {
+                profiling::cache_event("triton_backend.slot_plan_available");
+            } else if has_dot && has_reduce {
+                profiling::cache_event("triton_backend.slot_plan_unsupported_dot_reduce_mix");
+            } else {
+                profiling::cache_event("triton_backend.slot_plan_unsupported_dynamic_update");
+            }
+        } else {
+            profiling::cache_event("triton_backend.slot_plan_missing");
+        }
+        let runtime_slot_plan = if slot_plan_supported {
+            function_slot_plan
+        } else {
+            None
+        };
+        let mut slot_allocator = SlotAllocator::new(runtime_slot_plan, value_last_use.clone());
         let launch_start = KERNEL_LAUNCH_COUNT.load(Ordering::Relaxed);
         let dispatch_start = std::time::Instant::now();
         let initial_values = values.clone();
@@ -110,7 +141,8 @@ impl TritonExecutor {
         )? {
             profiling::cache_event("triton_backend.dispatch_fallback_worklist");
             values = initial_values;
-            slot_allocator = SlotAllocator::new(None);
+            profiling::cache_event("triton_backend.slot_plan_disabled_worklist");
+            slot_allocator = SlotAllocator::new(None, HashMap::new());
             self.execute_body_worklist(
                 &driver,
                 &kernels,
@@ -167,12 +199,19 @@ impl TritonExecutor {
         slot_allocator: &mut SlotAllocator,
         function: &gpt_rs::backend::spec::Function,
     ) -> BackendResult<Option<(ValueId, gpt_rs::backend::spec::Instruction)>> {
-        for instruction in &function.body {
+        for (idx, instruction) in function.body.iter().enumerate() {
             if let Some(missing) = first_missing_operand_value(instruction, values) {
                 return Ok(Some((missing, instruction.clone())));
             }
-            let output =
-                self.execute_instruction(driver, kernels, values, slot_allocator, instruction)?;
+            let instruction_pos = idx + 1;
+            let output = self.execute_instruction(
+                driver,
+                kernels,
+                values,
+                slot_allocator,
+                instruction,
+                instruction_pos,
+            )?;
             values.insert(instruction.id, output);
         }
         Ok(None)
@@ -195,8 +234,14 @@ impl TritonExecutor {
                     next.push(instruction);
                     continue;
                 }
-                let output =
-                    self.execute_instruction(driver, kernels, values, slot_allocator, instruction)?;
+                let output = self.execute_instruction(
+                    driver,
+                    kernels,
+                    values,
+                    slot_allocator,
+                    instruction,
+                    0,
+                )?;
                 values.insert(instruction.id, output);
                 progress = true;
             }
@@ -230,14 +275,25 @@ impl TritonExecutor {
         values: &HashMap<ValueId, TritonTensor>,
         slot_allocator: &mut SlotAllocator,
         instruction: &gpt_rs::backend::spec::Instruction,
+        instruction_pos: usize,
     ) -> BackendResult<TritonTensor> {
         match &instruction.op {
             Operation::Constant(literal) => {
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                let output = slot_allocator.output_for_value(
+                    driver,
+                    instruction.id,
+                    &out_spec,
+                    instruction_pos,
+                )?;
                 literal_to_tensor(driver, literal, output)
             }
             Operation::StopGradient | Operation::Reshape(_) => {
+                let source_value = match instruction.operands.first() {
+                    Some(Operand::Value(id)) => Some(*id),
+                    Some(Operand::TupleElement { tuple, .. }) => Some(*tuple),
+                    _ => None,
+                };
                 let source =
                     self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
@@ -249,6 +305,9 @@ impl TritonExecutor {
                         src_bytes, out_bytes
                     )));
                 }
+                if let Some(source_value) = source_value {
+                    slot_allocator.propagate_alias(source_value, instruction.id);
+                }
                 Ok(TritonTensor::new(out_spec, source.buffer))
             }
             Operation::ElementwiseBinary(op) => {
@@ -257,7 +316,12 @@ impl TritonExecutor {
                 let rhs =
                     self.resolve_operand_tensor(driver, values, instruction.operands.get(1))?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                let output = slot_allocator.output_for_value(
+                    driver,
+                    instruction.id,
+                    &out_spec,
+                    instruction_pos,
+                )?;
                 let kernel = kernels.get(EWISE_BINARY_KERNEL_ID).ok_or_else(|| {
                     BackendError::execution("missing elementwise binary kernel in triton artifact")
                 })?;
@@ -274,7 +338,12 @@ impl TritonExecutor {
                 let input =
                     self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                let output = slot_allocator.output_for_value(
+                    driver,
+                    instruction.id,
+                    &out_spec,
+                    instruction_pos,
+                )?;
                 let kernel = kernels.get(EWISE_UNARY_KERNEL_ID).ok_or_else(|| {
                     BackendError::execution("missing elementwise unary kernel in triton artifact")
                 })?;
@@ -284,14 +353,24 @@ impl TritonExecutor {
                 let input =
                     self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                let output = slot_allocator.output_for_value(
+                    driver,
+                    instruction.id,
+                    &out_spec,
+                    instruction_pos,
+                )?;
                 self.execute_broadcast(driver, kernels, &input, &out_spec, output)
             }
             Operation::Slice(spec) => {
                 let input =
                     self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                let output = slot_allocator.output_for_value(
+                    driver,
+                    instruction.id,
+                    &out_spec,
+                    instruction_pos,
+                )?;
                 self.execute_slice(driver, kernels, &input, spec, &out_spec, output)
             }
             Operation::DynamicSlice(spec) => {
@@ -300,7 +379,12 @@ impl TritonExecutor {
                 let starts =
                     self.resolve_operand_tensor(driver, values, instruction.operands.get(1))?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                let output = slot_allocator.output_for_value(
+                    driver,
+                    instruction.id,
+                    &out_spec,
+                    instruction_pos,
+                )?;
                 self.execute_dynamic_slice(
                     driver,
                     kernels,
@@ -314,7 +398,12 @@ impl TritonExecutor {
                 let input =
                     self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                let output = slot_allocator.output_for_value(
+                    driver,
+                    instruction.id,
+                    &out_spec,
+                    instruction_pos,
+                )?;
                 self.execute_transpose(driver, kernels, &input, spec, &out_spec, output)
             }
             Operation::Concat(spec) => {
@@ -328,7 +417,12 @@ impl TritonExecutor {
                 let rhs =
                     self.resolve_operand_tensor(driver, values, instruction.operands.get(1))?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                let output = slot_allocator.output_for_value(
+                    driver,
+                    instruction.id,
+                    &out_spec,
+                    instruction_pos,
+                )?;
                 self.execute_concat(
                     driver,
                     kernels,
@@ -340,7 +434,12 @@ impl TritonExecutor {
             }
             Operation::Iota(spec) => {
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                let output = slot_allocator.output_for_value(
+                    driver,
+                    instruction.id,
+                    &out_spec,
+                    instruction_pos,
+                )?;
                 let kernel = kernels.get(IOTA_SI32_KERNEL_ID).ok_or_else(|| {
                     BackendError::execution("missing iota kernel in triton artifact")
                 })?;
@@ -352,7 +451,12 @@ impl TritonExecutor {
                 let rhs =
                     self.resolve_operand_tensor(driver, values, instruction.operands.get(1))?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                let output = slot_allocator.output_for_value(
+                    driver,
+                    instruction.id,
+                    &out_spec,
+                    instruction_pos,
+                )?;
                 let kernel = kernels.get(COMPARE_SI32_I1_KERNEL_ID).ok_or_else(|| {
                     BackendError::execution("missing compare kernel in triton artifact")
                 })?;
@@ -373,7 +477,12 @@ impl TritonExecutor {
                 let when_false =
                     self.resolve_operand_tensor(driver, values, instruction.operands.get(2))?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                let output = slot_allocator.output_for_value(
+                    driver,
+                    instruction.id,
+                    &out_spec,
+                    instruction_pos,
+                )?;
                 let kernel = kernels.get(SELECT_I1_F32_KERNEL_ID).ok_or_else(|| {
                     BackendError::execution("missing select kernel in triton artifact")
                 })?;
@@ -392,7 +501,12 @@ impl TritonExecutor {
                 let indices =
                     self.resolve_operand_tensor(driver, values, instruction.operands.get(1))?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                let output = slot_allocator.output_for_value(
+                    driver,
+                    instruction.id,
+                    &out_spec,
+                    instruction_pos,
+                )?;
                 let kernel = kernels.get(TAKE_F32_I32_KERNEL_ID).ok_or_else(|| {
                     BackendError::execution("missing take kernel in triton artifact")
                 })?;
@@ -406,7 +520,12 @@ impl TritonExecutor {
                 let starts =
                     self.resolve_operand_tensor(driver, values, instruction.operands.get(2))?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                let output = slot_allocator.output_for_value(
+                    driver,
+                    instruction.id,
+                    &out_spec,
+                    instruction_pos,
+                )?;
                 let kernel = kernels
                     .get(DYNAMIC_UPDATE_SLICE_F32_KERNEL_ID)
                     .ok_or_else(|| {
@@ -435,14 +554,24 @@ impl TritonExecutor {
                     rhs_spec: &rhs.spec,
                     out_spec: &out_spec,
                 };
-                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                let output = slot_allocator.output_for_value(
+                    driver,
+                    instruction.id,
+                    &out_spec,
+                    instruction_pos,
+                )?;
                 self.execute_dot_general(driver, args, &lhs, &rhs, output)
             }
             Operation::Reduce(spec) => {
                 let input =
                     self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                let output = slot_allocator.output_for_value(
+                    driver,
+                    instruction.id,
+                    &out_spec,
+                    instruction_pos,
+                )?;
                 self.execute_reduce(
                     driver,
                     kernels,
@@ -456,7 +585,12 @@ impl TritonExecutor {
                 let input =
                     self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                let output = slot_allocator.output_for_value(
+                    driver,
+                    instruction.id,
+                    &out_spec,
+                    instruction_pos,
+                )?;
                 let kernel = kernels.get(EXTRACT_PATCHES_NHWC_KERNEL_ID).ok_or_else(|| {
                     BackendError::execution("missing extract_patches kernel in triton artifact")
                 })?;
@@ -466,7 +600,12 @@ impl TritonExecutor {
                 let input =
                     self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                let output = slot_allocator.output_for_value(
+                    driver,
+                    instruction.id,
+                    &out_spec,
+                    instruction_pos,
+                )?;
                 let kernel = kernels
                     .get(REDUCE_WINDOW_MAX_NHWC_KERNEL_ID)
                     .ok_or_else(|| {
@@ -476,7 +615,12 @@ impl TritonExecutor {
             }
             Operation::CustomCall(spec) => {
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                let output = slot_allocator.output_for_value(
+                    driver,
+                    instruction.id,
+                    &out_spec,
+                    instruction_pos,
+                )?;
                 self.execute_custom_call(
                     driver,
                     kernels,
@@ -2405,6 +2549,39 @@ fn first_missing_operand_value(
         }
     }
     None
+}
+
+fn compute_value_last_use(function: &gpt_rs::backend::spec::Function) -> HashMap<ValueId, usize> {
+    let mut last_use = HashMap::new();
+    for (idx, instruction) in function.body.iter().enumerate() {
+        let pos = idx + 1;
+        last_use.entry(instruction.id).or_insert(pos);
+        for operand in &instruction.operands {
+            match operand {
+                Operand::Value(id) => {
+                    last_use
+                        .entry(*id)
+                        .and_modify(|existing| *existing = (*existing).max(pos))
+                        .or_insert(pos);
+                }
+                Operand::TupleElement { tuple, .. } => {
+                    last_use
+                        .entry(*tuple)
+                        .and_modify(|existing| *existing = (*existing).max(pos))
+                        .or_insert(pos);
+                }
+                Operand::Literal(_) => {}
+            }
+        }
+    }
+    let result_pos = function.body.len() + 1;
+    for value in &function.result_ids {
+        last_use
+            .entry(*value)
+            .and_modify(|existing| *existing = (*existing).max(result_pos))
+            .or_insert(result_pos);
+    }
+    last_use
 }
 
 struct LoadedKernel {

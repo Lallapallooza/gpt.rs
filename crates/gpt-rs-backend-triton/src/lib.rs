@@ -193,7 +193,11 @@ fn convert_program_for_triton(
 ) -> ConversionResult<ConvertedIr> {
     check_program_for_triton(program)?;
     let optimized = match backend {
-        Some(backend) => optimizer::optimize_program_for_triton_with_backend(backend, program)?,
+        // Backend run path receives programs already optimized by graph arena with full
+        // role/stable-id entry metadata. Re-running optimizer here would currently degrade
+        // that metadata to all-Arg and can block param-only folding behavior.
+        Some(_) => program.clone(),
+        // CLI conversion path still runs the Triton optimizer pipeline.
         None => optimizer::optimize_program_for_triton(program)?,
     };
 

@@ -70,9 +70,13 @@ impl From<&gpt_rs::backend::conversion::FunctionBufferPlan> for TritonFunctionSl
             .buffers
             .iter()
             .filter_map(|buffer| {
+                if !buffer.path.is_empty() {
+                    return None;
+                }
                 buffer.slot.map(|slot| TritonValueSlot {
                     value: buffer.value,
                     slot,
+                    live_end: buffer.live_range.end,
                 })
             })
             .collect();
@@ -90,4 +94,5 @@ pub struct TritonSlotSpec {
 pub struct TritonValueSlot {
     pub value: ValueId,
     pub slot: usize,
+    pub live_end: usize,
 }

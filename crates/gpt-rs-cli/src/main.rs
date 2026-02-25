@@ -522,6 +522,8 @@ fn run_generate<B: PortableBackend + 'static>(
     }
 
     let mut stdout = io::stdout();
+    let mut pending_output = String::new();
+    let mut pending_tokens = 0usize;
     let warmup = args.warmup_tokens.min(args.max_tokens);
 
     if warmup == 0 {
@@ -529,6 +531,8 @@ fn run_generate<B: PortableBackend + 'static>(
             profiling::reset();
         }
         let t0 = std::time::Instant::now();
+        let mut model_elapsed = std::time::Duration::ZERO;
+        let mut first_step_elapsed = std::time::Duration::ZERO;
 
         let mut generator = Generator::new_with_kv_cache_capacity(
             lm,
@@ -539,19 +543,30 @@ fn run_generate<B: PortableBackend + 'static>(
         )?;
 
         for step in 0..args.max_tokens {
+            let step_t0 = std::time::Instant::now();
             let token = if step + 1 == args.max_tokens {
                 generator.step_final()?
             } else {
                 generator.step()?
             };
+            let step_elapsed = step_t0.elapsed();
+            model_elapsed += step_elapsed;
+            if step == 0 {
+                first_step_elapsed = step_elapsed;
+            }
             let piece = tokenizer.decode(&[token]);
-            stdout.write_all(piece.as_bytes())?;
-            stdout.flush()?;
+            stream_piece(
+                &mut stdout,
+                &mut pending_output,
+                &mut pending_tokens,
+                piece.as_str(),
+            )?;
         }
 
         let out = generator.into_tokens();
-        let elapsed = t0.elapsed();
+        let wall_elapsed = t0.elapsed();
 
+        flush_stream_buffer(&mut stdout, &mut pending_output, &mut pending_tokens)?;
         stdout.write_all(b"\n")?;
         stdout.flush()?;
 
@@ -562,9 +577,18 @@ fn run_generate<B: PortableBackend + 'static>(
         eprintln!(
             "Generated {} tokens in {:.2?} ({:.2} tokens/sec)",
             emitted,
-            elapsed,
-            (emitted as f64) / elapsed.as_secs_f64().max(1e-9),
+            model_elapsed,
+            (emitted as f64) / model_elapsed.as_secs_f64().max(1e-9),
         );
+        if emitted > 1 {
+            let steady_tokens = emitted - 1;
+            let steady_elapsed = model_elapsed.saturating_sub(first_step_elapsed);
+            eprintln!(
+                "Decode steady-state (excluding first token): {:.2} tokens/sec",
+                (steady_tokens as f64) / steady_elapsed.as_secs_f64().max(1e-9)
+            );
+        }
+        eprintln!("Wall time including decode/output: {:.2?}", wall_elapsed);
 
         return Ok(());
     }
@@ -587,29 +611,41 @@ fn run_generate<B: PortableBackend + 'static>(
             generator.step()?
         };
         let piece = tokenizer.decode(&[token]);
-        stdout.write_all(piece.as_bytes())?;
-        stdout.flush()?;
+        stream_piece(
+            &mut stdout,
+            &mut pending_output,
+            &mut pending_tokens,
+            piece.as_str(),
+        )?;
     }
 
     if profile {
         profiling::reset();
     }
     let t0 = std::time::Instant::now();
+    let mut model_elapsed = std::time::Duration::ZERO;
 
     for step in 0..measured_steps {
+        let step_t0 = std::time::Instant::now();
         let token = if step + 1 == measured_steps {
             generator.step_final()?
         } else {
             generator.step()?
         };
+        model_elapsed += step_t0.elapsed();
         let piece = tokenizer.decode(&[token]);
-        stdout.write_all(piece.as_bytes())?;
-        stdout.flush()?;
+        stream_piece(
+            &mut stdout,
+            &mut pending_output,
+            &mut pending_tokens,
+            piece.as_str(),
+        )?;
     }
 
     let out = generator.into_tokens();
-    let elapsed = t0.elapsed();
+    let wall_elapsed = t0.elapsed();
 
+    flush_stream_buffer(&mut stdout, &mut pending_output, &mut pending_tokens)?;
     stdout.write_all(b"\n")?;
     stdout.flush()?;
 
@@ -622,10 +658,46 @@ fn run_generate<B: PortableBackend + 'static>(
         "Generated {} tokens ({} warmup) in {:.2?} ({:.2} tokens/sec)",
         measured,
         warmup,
-        elapsed,
-        (measured as f64) / elapsed.as_secs_f64().max(1e-9),
+        model_elapsed,
+        (measured as f64) / model_elapsed.as_secs_f64().max(1e-9),
+    );
+    eprintln!(
+        "Wall time including decode/output for measured tokens: {:.2?}",
+        wall_elapsed
     );
 
+    Ok(())
+}
+
+const STREAM_FLUSH_TOKENS: usize = 16;
+const STREAM_FLUSH_BYTES: usize = 4096;
+
+fn stream_piece(
+    stdout: &mut io::Stdout,
+    pending_output: &mut String,
+    pending_tokens: &mut usize,
+    piece: &str,
+) -> Result<()> {
+    pending_output.push_str(piece);
+    *pending_tokens = pending_tokens.saturating_add(1);
+    if *pending_tokens >= STREAM_FLUSH_TOKENS || pending_output.len() >= STREAM_FLUSH_BYTES {
+        flush_stream_buffer(stdout, pending_output, pending_tokens)?;
+    }
+    Ok(())
+}
+
+fn flush_stream_buffer(
+    stdout: &mut io::Stdout,
+    pending_output: &mut String,
+    pending_tokens: &mut usize,
+) -> Result<()> {
+    if pending_output.is_empty() {
+        return Ok(());
+    }
+    stdout.write_all(pending_output.as_bytes())?;
+    pending_output.clear();
+    *pending_tokens = 0;
+    stdout.flush()?;
     Ok(())
 }
 

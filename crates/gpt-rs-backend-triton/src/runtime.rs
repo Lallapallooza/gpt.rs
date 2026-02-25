@@ -92,13 +92,12 @@ impl TritonExecutor {
             .collect::<HashMap<_, _>>();
         let preloaded = self.preload_execution_kernels(&driver, &artifact.kernels)?;
         let _execution_kernel_guard = ExecutionKernelGuard::push(preloaded);
-        let function_plan = artifact.buffer_plan.function(&function.name);
 
         let mut values: HashMap<ValueId, TritonTensor> = HashMap::new();
         for (value_id, input) in function.parameter_ids.iter().zip(entry_inputs.iter()) {
             values.insert(*value_id, input.clone());
         }
-        let mut slot_allocator = SlotAllocator::new(function_plan);
+        let mut slot_allocator = SlotAllocator::new(None);
         let launch_start = KERNEL_LAUNCH_COUNT.load(Ordering::Relaxed);
         let dispatch_start = std::time::Instant::now();
         let initial_values = values.clone();
@@ -111,7 +110,7 @@ impl TritonExecutor {
         )? {
             profiling::cache_event("triton_backend.dispatch_fallback_worklist");
             values = initial_values;
-            slot_allocator = SlotAllocator::new(function_plan);
+            slot_allocator = SlotAllocator::new(None);
             self.execute_body_worklist(
                 &driver,
                 &kernels,
@@ -650,19 +649,21 @@ impl TritonExecutor {
         let bias =
             self.resolve_operand_tensor(driver, values, instruction.operands.get(plan.add_input))?;
 
-        if let Some(kernel) = kernels.get(DOT_BIAS_RANK2_KERNEL_ID) {
-            let rank2_args = DotBiasRank2Args {
-                driver,
-                kernel,
-                plan: &plan,
-                lhs: &lhs,
-                rhs: &rhs,
-                bias: &bias,
-                out_spec,
-                output: output.clone(),
-            };
-            if let Some(out) = self.try_execute_dot_bias_rank2(rank2_args)? {
-                return Ok(out);
+        if prefer_custom_dot_bias_kernel(&lhs.spec, &rhs.spec, out_spec) {
+            if let Some(kernel) = kernels.get(DOT_BIAS_RANK2_KERNEL_ID) {
+                let rank2_args = DotBiasRank2Args {
+                    driver,
+                    kernel,
+                    plan: &plan,
+                    lhs: &lhs,
+                    rhs: &rhs,
+                    bias: &bias,
+                    out_spec,
+                    output: output.clone(),
+                };
+                if let Some(out) = self.try_execute_dot_bias_rank2(rank2_args)? {
+                    return Ok(out);
+                }
             }
         }
 
@@ -2983,6 +2984,10 @@ fn unary_opcode(op: ElementwiseUnaryOp) -> BackendResult<u32> {
         ElementwiseUnaryOp::Rsqrt => Ok(6),
         ElementwiseUnaryOp::Reciprocal => Ok(7),
     }
+}
+
+fn prefer_custom_dot_bias_kernel(_lhs: &TensorSpec, _rhs: &TensorSpec, _out: &TensorSpec) -> bool {
+    true
 }
 
 fn compare_opcode(op: ComparisonOp) -> u32 {

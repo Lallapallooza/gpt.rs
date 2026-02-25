@@ -39,12 +39,6 @@ pub struct TritonArtifactBufferPlan {
     pub functions: HashMap<String, TritonFunctionSlotPlan>,
 }
 
-impl TritonArtifactBufferPlan {
-    pub fn function(&self, name: &str) -> Option<&TritonFunctionSlotPlan> {
-        self.functions.get(name)
-    }
-}
-
 impl From<BufferPlan> for TritonArtifactBufferPlan {
     fn from(value: BufferPlan) -> Self {
         let functions = value

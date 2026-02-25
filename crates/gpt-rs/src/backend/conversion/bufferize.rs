@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::backend::spec::{
     DType, Program, Region, RegionId, Shape, TensorSpec, ValueId, ValueType,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveRange {
     pub start: usize,
     pub end: usize,
@@ -18,14 +19,14 @@ impl LiveRange {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AliasKind {
     None,
     Identity,
     View,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferUsage(u8);
 
 impl BufferUsage {
@@ -67,13 +68,13 @@ impl BufferUsage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BufferKey {
     pub value: ValueId,
     pub path: Vec<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferSpec {
     pub value: ValueId,
     pub path: Vec<usize>,
@@ -88,7 +89,7 @@ pub struct BufferSpec {
     pub slot: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferSlot {
     pub id: usize,
     pub dtype: DType,
@@ -96,7 +97,7 @@ pub struct BufferSlot {
     pub usage: BufferUsage,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FunctionBufferPlan {
     pub buffers: Vec<BufferSpec>,
     pub values: HashMap<BufferKey, usize>,
@@ -156,7 +157,7 @@ impl FunctionBufferPlan {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BufferPlan {
     pub functions: HashMap<String, FunctionBufferPlan>,
     pub regions: HashMap<RegionId, FunctionBufferPlan>,
@@ -172,7 +173,7 @@ impl BufferPlan {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BufferizeOptions {
     pub require_static_shapes: bool,
     pub require_known_dtypes: bool,

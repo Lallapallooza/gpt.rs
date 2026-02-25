@@ -116,8 +116,7 @@ impl PortableBackend for TritonBackend {
             let _convert_scope = gpt_rs::profiling::compile_scope("triton_backend.convert");
             self.conversion_cache
                 .get_or_convert(key, || {
-                    target.check(program, &options)?;
-                    target.convert(program, &options)
+                    convert_program_for_triton(program, &options, Some(self))
                 })
                 .map_err(|err| BackendError::execution(err.to_string()))?
         };
@@ -143,7 +142,7 @@ impl ConversionTarget for TritonConversionTarget {
     }
 
     fn version(&self) -> u64 {
-        5
+        6
     }
 
     fn file_extension(&self) -> &str {
@@ -151,27 +150,7 @@ impl ConversionTarget for TritonConversionTarget {
     }
 
     fn check(&self, program: &Program, _options: &ConversionOptions) -> ConversionResult<()> {
-        let legality = triton_legality_spec();
-        if let Err(report) = check_program_legality(program, &legality) {
-            let summary = report
-                .diagnostics
-                .first()
-                .map(|d| d.message.clone())
-                .unwrap_or_else(|| "unknown legality failure".to_string());
-            return Err(ConversionError::new(format!(
-                "triton legality check failed ({} diagnostics): {}",
-                report.diagnostics.len(),
-                summary
-            )));
-        }
-
-        let buffer_opts = BufferizeOptions {
-            require_static_shapes: true,
-            require_known_dtypes: true,
-        };
-        plan_buffers_with(program, &buffer_opts)
-            .map_err(|err| ConversionError::new(err.to_string()))?;
-        Ok(())
+        check_program_for_triton(program)
     }
 
     fn convert(
@@ -179,30 +158,66 @@ impl ConversionTarget for TritonConversionTarget {
         program: &Program,
         options: &ConversionOptions,
     ) -> ConversionResult<ConvertedIr> {
-        self.check(program, options)?;
-        let optimized = optimizer::optimize_program_for_triton(program)?;
-
-        let buffer_opts = BufferizeOptions {
-            require_static_shapes: true,
-            require_known_dtypes: true,
-        };
-        plan_buffers_with(&optimized, &buffer_opts)
-            .map_err(|err| ConversionError::new(err.to_string()))?;
-
-        let entrypoint = default_entrypoint_name(&optimized)?;
-        let artifact = codegen::lower_program_to_artifact(&optimized, &entrypoint)?;
-
-        let encoded = serde_json::to_string_pretty(&artifact)
-            .map_err(|err| ConversionError::new(err.to_string()))?;
-
-        Ok(ConvertedIr {
-            module: encoded,
-            entrypoints: vec![ConvertedEntrypoint {
-                ptir: program.entry.clone(),
-                symbol: entrypoint,
-            }],
-        })
+        convert_program_for_triton(program, options, None)
     }
+}
+
+fn check_program_for_triton(program: &Program) -> ConversionResult<()> {
+    let legality = triton_legality_spec();
+    if let Err(report) = check_program_legality(program, &legality) {
+        let summary = report
+            .diagnostics
+            .first()
+            .map(|d| d.message.clone())
+            .unwrap_or_else(|| "unknown legality failure".to_string());
+        return Err(ConversionError::new(format!(
+            "triton legality check failed ({} diagnostics): {}",
+            report.diagnostics.len(),
+            summary
+        )));
+    }
+
+    let buffer_opts = BufferizeOptions {
+        require_static_shapes: true,
+        require_known_dtypes: true,
+    };
+    plan_buffers_with(program, &buffer_opts)
+        .map_err(|err| ConversionError::new(err.to_string()))?;
+    Ok(())
+}
+
+fn convert_program_for_triton(
+    program: &Program,
+    options: &ConversionOptions,
+    backend: Option<&TritonBackend>,
+) -> ConversionResult<ConvertedIr> {
+    check_program_for_triton(program)?;
+    let optimized = match backend {
+        Some(backend) => optimizer::optimize_program_for_triton_with_backend(backend, program)?,
+        None => optimizer::optimize_program_for_triton(program)?,
+    };
+
+    let buffer_opts = BufferizeOptions {
+        require_static_shapes: true,
+        require_known_dtypes: true,
+    };
+    let buffer_plan = plan_buffers_with(&optimized, &buffer_opts)
+        .map_err(|err| ConversionError::new(err.to_string()))?;
+
+    let _ = options;
+    let entrypoint = default_entrypoint_name(&optimized)?;
+    let artifact = codegen::lower_program_to_artifact(&optimized, &entrypoint, buffer_plan)?;
+
+    let encoded = serde_json::to_string_pretty(&artifact)
+        .map_err(|err| ConversionError::new(err.to_string()))?;
+
+    Ok(ConvertedIr {
+        module: encoded,
+        entrypoints: vec![ConvertedEntrypoint {
+            ptir: program.entry.clone(),
+            symbol: entrypoint,
+        }],
+    })
 }
 
 fn triton_legality_spec() -> LegalitySpec {

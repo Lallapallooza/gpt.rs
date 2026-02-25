@@ -1,5 +1,6 @@
 mod fused_dot_epilogue;
 mod fused_elementwise;
+mod slots;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -32,6 +33,7 @@ use crate::kernels::{
 };
 use crate::targets::{TARGET_DOT_BIAS_FUSED_F32_V1, TARGET_ELEMENTWISE_FUSED_F32_V1};
 use crate::tensor::TritonTensor;
+use slots::SlotAllocator;
 
 thread_local! {
     static EXECUTION_KERNEL_STACK: RefCell<Vec<HashMap<String, Arc<LoadedKernel>>>> =
@@ -90,26 +92,39 @@ impl TritonExecutor {
             .collect::<HashMap<_, _>>();
         let preloaded = self.preload_execution_kernels(&driver, &artifact.kernels)?;
         let _execution_kernel_guard = ExecutionKernelGuard::push(preloaded);
+        let function_plan = artifact.buffer_plan.function(&function.name);
 
         let mut values: HashMap<ValueId, TritonTensor> = HashMap::new();
         for (value_id, input) in function.parameter_ids.iter().zip(entry_inputs.iter()) {
             values.insert(*value_id, input.clone());
         }
+        let mut slot_allocator = SlotAllocator::new(function_plan);
         let launch_start = KERNEL_LAUNCH_COUNT.load(Ordering::Relaxed);
         let dispatch_start = std::time::Instant::now();
         let initial_values = values.clone();
-        if let Some((missing, instruction)) =
-            self.execute_body_single_pass(&driver, &kernels, &mut values, function)?
-        {
+        if let Some((missing, instruction)) = self.execute_body_single_pass(
+            &driver,
+            &kernels,
+            &mut values,
+            &mut slot_allocator,
+            function,
+        )? {
             profiling::cache_event("triton_backend.dispatch_fallback_worklist");
             values = initial_values;
-            self.execute_body_worklist(&driver, &kernels, &mut values, function)
-                .map_err(|err| {
-                    BackendError::execution(format!(
-                        "{} (single-pass first missing value {} before instruction {} ({:?}))",
-                        err, missing.0, instruction.id.0, instruction.op
-                    ))
-                })?;
+            slot_allocator = SlotAllocator::new(function_plan);
+            self.execute_body_worklist(
+                &driver,
+                &kernels,
+                &mut values,
+                &mut slot_allocator,
+                function,
+            )
+            .map_err(|err| {
+                BackendError::execution(format!(
+                    "{} (single-pass first missing value {} before instruction {} ({:?}))",
+                    err, missing.0, instruction.id.0, instruction.op
+                ))
+            })?;
         }
 
         let mut results = Vec::with_capacity(function.result_ids.len());
@@ -150,13 +165,15 @@ impl TritonExecutor {
         driver: &Arc<CudaDriver>,
         kernels: &HashMap<&str, &KernelSpec>,
         values: &mut HashMap<ValueId, TritonTensor>,
+        slot_allocator: &mut SlotAllocator,
         function: &gpt_rs::backend::spec::Function,
     ) -> BackendResult<Option<(ValueId, gpt_rs::backend::spec::Instruction)>> {
         for instruction in &function.body {
             if let Some(missing) = first_missing_operand_value(instruction, values) {
                 return Ok(Some((missing, instruction.clone())));
             }
-            let output = self.execute_instruction(driver, kernels, values, instruction)?;
+            let output =
+                self.execute_instruction(driver, kernels, values, slot_allocator, instruction)?;
             values.insert(instruction.id, output);
         }
         Ok(None)
@@ -167,6 +184,7 @@ impl TritonExecutor {
         driver: &Arc<CudaDriver>,
         kernels: &HashMap<&str, &KernelSpec>,
         values: &mut HashMap<ValueId, TritonTensor>,
+        slot_allocator: &mut SlotAllocator,
         function: &gpt_rs::backend::spec::Function,
     ) -> BackendResult<()> {
         let mut pending = function.body.iter().collect::<Vec<_>>();
@@ -178,7 +196,8 @@ impl TritonExecutor {
                     next.push(instruction);
                     continue;
                 }
-                let output = self.execute_instruction(driver, kernels, values, instruction)?;
+                let output =
+                    self.execute_instruction(driver, kernels, values, slot_allocator, instruction)?;
                 values.insert(instruction.id, output);
                 progress = true;
             }
@@ -210,10 +229,15 @@ impl TritonExecutor {
         driver: &Arc<CudaDriver>,
         kernels: &HashMap<&str, &KernelSpec>,
         values: &HashMap<ValueId, TritonTensor>,
+        slot_allocator: &mut SlotAllocator,
         instruction: &gpt_rs::backend::spec::Instruction,
     ) -> BackendResult<TritonTensor> {
         match &instruction.op {
-            Operation::Constant(literal) => literal_to_tensor(driver, literal),
+            Operation::Constant(literal) => {
+                let out_spec = output_tensor_spec(&instruction.output)?;
+                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                literal_to_tensor(driver, literal, output)
+            }
             Operation::StopGradient | Operation::Reshape(_) => {
                 let source =
                     self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
@@ -234,31 +258,42 @@ impl TritonExecutor {
                 let rhs =
                     self.resolve_operand_tensor(driver, values, instruction.operands.get(1))?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
+                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
                 let kernel = kernels.get(EWISE_BINARY_KERNEL_ID).ok_or_else(|| {
                     BackendError::execution("missing elementwise binary kernel in triton artifact")
                 })?;
-                self.execute_elementwise_binary(driver, kernel, *op, &lhs, &rhs, &out_spec)
+                self.execute_elementwise_binary(
+                    driver,
+                    kernel,
+                    *op,
+                    &lhs,
+                    &rhs,
+                    OutputBinding::new(&out_spec, output),
+                )
             }
             Operation::ElementwiseUnary(op) => {
                 let input =
                     self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
+                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
                 let kernel = kernels.get(EWISE_UNARY_KERNEL_ID).ok_or_else(|| {
                     BackendError::execution("missing elementwise unary kernel in triton artifact")
                 })?;
-                self.execute_elementwise_unary(driver, kernel, *op, &input, &out_spec)
+                self.execute_elementwise_unary(driver, kernel, *op, &input, &out_spec, output)
             }
             Operation::BroadcastTo(_) => {
                 let input =
                     self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                self.execute_broadcast(driver, kernels, &input, &out_spec)
+                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                self.execute_broadcast(driver, kernels, &input, &out_spec, output)
             }
             Operation::Slice(spec) => {
                 let input =
                     self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                self.execute_slice(driver, kernels, &input, spec, &out_spec)
+                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                self.execute_slice(driver, kernels, &input, spec, &out_spec, output)
             }
             Operation::DynamicSlice(spec) => {
                 let input =
@@ -266,13 +301,22 @@ impl TritonExecutor {
                 let starts =
                     self.resolve_operand_tensor(driver, values, instruction.operands.get(1))?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                self.execute_dynamic_slice(driver, kernels, &input, &starts, spec, &out_spec)
+                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                self.execute_dynamic_slice(
+                    driver,
+                    kernels,
+                    &input,
+                    &starts,
+                    spec,
+                    OutputBinding::new(&out_spec, output),
+                )
             }
             Operation::Transpose(spec) => {
                 let input =
                     self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                self.execute_transpose(driver, kernels, &input, spec, &out_spec)
+                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                self.execute_transpose(driver, kernels, &input, spec, &out_spec, output)
             }
             Operation::Concat(spec) => {
                 if instruction.operands.len() != 2 {
@@ -285,14 +329,23 @@ impl TritonExecutor {
                 let rhs =
                     self.resolve_operand_tensor(driver, values, instruction.operands.get(1))?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                self.execute_concat(driver, kernels, &lhs, &rhs, spec, &out_spec)
+                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                self.execute_concat(
+                    driver,
+                    kernels,
+                    &lhs,
+                    &rhs,
+                    spec,
+                    OutputBinding::new(&out_spec, output),
+                )
             }
             Operation::Iota(spec) => {
                 let out_spec = output_tensor_spec(&instruction.output)?;
+                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
                 let kernel = kernels.get(IOTA_SI32_KERNEL_ID).ok_or_else(|| {
                     BackendError::execution("missing iota kernel in triton artifact")
                 })?;
-                self.execute_iota(driver, kernel, spec, &out_spec)
+                self.execute_iota(driver, kernel, spec, &out_spec, output)
             }
             Operation::Compare(spec) => {
                 let lhs =
@@ -300,10 +353,18 @@ impl TritonExecutor {
                 let rhs =
                     self.resolve_operand_tensor(driver, values, instruction.operands.get(1))?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
+                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
                 let kernel = kernels.get(COMPARE_SI32_I1_KERNEL_ID).ok_or_else(|| {
                     BackendError::execution("missing compare kernel in triton artifact")
                 })?;
-                self.execute_compare(driver, kernel, spec.op, &lhs, &rhs, &out_spec)
+                self.execute_compare(
+                    driver,
+                    kernel,
+                    spec.op,
+                    &lhs,
+                    &rhs,
+                    OutputBinding::new(&out_spec, output),
+                )
             }
             Operation::Select => {
                 let pred =
@@ -313,10 +374,18 @@ impl TritonExecutor {
                 let when_false =
                     self.resolve_operand_tensor(driver, values, instruction.operands.get(2))?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
+                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
                 let kernel = kernels.get(SELECT_I1_F32_KERNEL_ID).ok_or_else(|| {
                     BackendError::execution("missing select kernel in triton artifact")
                 })?;
-                self.execute_select(driver, kernel, &pred, &when_true, &when_false, &out_spec)
+                self.execute_select(
+                    driver,
+                    kernel,
+                    &pred,
+                    &when_true,
+                    &when_false,
+                    OutputBinding::new(&out_spec, output),
+                )
             }
             Operation::Take => {
                 let params =
@@ -324,10 +393,11 @@ impl TritonExecutor {
                 let indices =
                     self.resolve_operand_tensor(driver, values, instruction.operands.get(1))?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
+                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
                 let kernel = kernels.get(TAKE_F32_I32_KERNEL_ID).ok_or_else(|| {
                     BackendError::execution("missing take kernel in triton artifact")
                 })?;
-                self.execute_take(driver, kernel, &params, &indices, &out_spec)
+                self.execute_take(driver, kernel, &params, &indices, &out_spec, output)
             }
             Operation::DynamicUpdateSlice(_spec) => {
                 let base =
@@ -337,6 +407,7 @@ impl TritonExecutor {
                 let starts =
                     self.resolve_operand_tensor(driver, values, instruction.operands.get(2))?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
+                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
                 let kernel = kernels
                     .get(DYNAMIC_UPDATE_SLICE_F32_KERNEL_ID)
                     .ok_or_else(|| {
@@ -345,7 +416,12 @@ impl TritonExecutor {
                         )
                     })?;
                 self.execute_dynamic_update_slice(
-                    driver, kernel, &base, &update, &starts, &out_spec,
+                    driver,
+                    kernel,
+                    &base,
+                    &update,
+                    &starts,
+                    OutputBinding::new(&out_spec, output),
                 )
             }
             Operation::DotGeneral(spec) => {
@@ -360,37 +436,56 @@ impl TritonExecutor {
                     rhs_spec: &rhs.spec,
                     out_spec: &out_spec,
                 };
-                self.execute_dot_general(driver, args, &lhs, &rhs)
+                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                self.execute_dot_general(driver, args, &lhs, &rhs, output)
             }
             Operation::Reduce(spec) => {
                 let input =
                     self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                self.execute_reduce(driver, kernels, &input.spec, &out_spec, spec, &input)
+                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                self.execute_reduce(
+                    driver,
+                    kernels,
+                    &input.spec,
+                    spec,
+                    &input,
+                    OutputBinding::new(&out_spec, output),
+                )
             }
             Operation::ExtractPatches(spec) => {
                 let input =
                     self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
+                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
                 let kernel = kernels.get(EXTRACT_PATCHES_NHWC_KERNEL_ID).ok_or_else(|| {
                     BackendError::execution("missing extract_patches kernel in triton artifact")
                 })?;
-                self.execute_extract_patches(driver, kernel, &input, spec, &out_spec)
+                self.execute_extract_patches(driver, kernel, &input, spec, &out_spec, output)
             }
             Operation::ReduceWindow(spec) => {
                 let input =
                     self.resolve_operand_tensor(driver, values, instruction.operands.first())?;
                 let out_spec = output_tensor_spec(&instruction.output)?;
+                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
                 let kernel = kernels
                     .get(REDUCE_WINDOW_MAX_NHWC_KERNEL_ID)
                     .ok_or_else(|| {
                         BackendError::execution("missing reduce_window kernel in triton artifact")
                     })?;
-                self.execute_reduce_window(driver, kernel, &input, spec, &out_spec)
+                self.execute_reduce_window(driver, kernel, &input, spec, &out_spec, output)
             }
             Operation::CustomCall(spec) => {
                 let out_spec = output_tensor_spec(&instruction.output)?;
-                self.execute_custom_call(driver, kernels, values, instruction, spec, &out_spec)
+                let output = slot_allocator.output_for_value(driver, instruction.id, &out_spec)?;
+                self.execute_custom_call(
+                    driver,
+                    kernels,
+                    values,
+                    instruction,
+                    spec,
+                    OutputBinding::new(&out_spec, output),
+                )
             }
             other => Err(BackendError::execution(format!(
                 "triton runtime does not support instruction op: {:?}",
@@ -412,7 +507,7 @@ impl TritonExecutor {
                     id.0
                 ))
             }),
-            Some(Operand::Literal(literal)) => literal_to_tensor(driver, literal),
+            Some(Operand::Literal(literal)) => literal_to_tensor(driver, literal, None),
             Some(Operand::TupleElement { .. }) => Err(BackendError::execution(
                 "tuple element operands are not supported by triton runtime",
             )),
@@ -427,7 +522,7 @@ impl TritonExecutor {
         values: &HashMap<ValueId, TritonTensor>,
         instruction: &gpt_rs::backend::spec::Instruction,
         spec: &CustomCallSpec,
-        out_spec: &TensorSpec,
+        out: OutputBinding<'_>,
     ) -> BackendResult<TritonTensor> {
         match spec.target.as_str() {
             TARGET_ELEMENTWISE_FUSED_F32_V1 => self.execute_fused_elementwise_custom_call(
@@ -435,7 +530,8 @@ impl TritonExecutor {
                 values,
                 instruction,
                 spec,
-                out_spec,
+                out.spec,
+                out.tensor,
             ),
             TARGET_DOT_BIAS_FUSED_F32_V1 => self.execute_fused_dot_bias_custom_call(
                 driver,
@@ -443,7 +539,7 @@ impl TritonExecutor {
                 values,
                 instruction,
                 spec,
-                out_spec,
+                out,
             ),
             _ => Err(BackendError::execution(format!(
                 "unsupported triton custom_call target '{}'",
@@ -459,6 +555,7 @@ impl TritonExecutor {
         instruction: &gpt_rs::backend::spec::Instruction,
         spec: &CustomCallSpec,
         out_spec: &TensorSpec,
+        output: Option<TritonTensor>,
     ) -> BackendResult<TritonTensor> {
         let plan = fused_elementwise::FusedElementwisePlan::parse(spec)?;
         let input_tensors = instruction
@@ -466,7 +563,13 @@ impl TritonExecutor {
             .iter()
             .map(|operand| self.resolve_operand_tensor(driver, values, Some(operand)))
             .collect::<BackendResult<Vec<_>>>()?;
-        self.execute_fused_elementwise_plan(driver, &plan, input_tensors.as_slice(), out_spec)
+        self.execute_fused_elementwise_plan(
+            driver,
+            &plan,
+            input_tensors.as_slice(),
+            out_spec,
+            output,
+        )
     }
 
     fn execute_fused_elementwise_plan(
@@ -475,6 +578,7 @@ impl TritonExecutor {
         plan: &fused_elementwise::FusedElementwisePlan,
         input_tensors: &[TritonTensor],
         out_spec: &TensorSpec,
+        output: Option<TritonTensor>,
     ) -> BackendResult<TritonTensor> {
         let input_specs = input_tensors
             .iter()
@@ -496,7 +600,7 @@ impl TritonExecutor {
                 built
             }
         };
-        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let out = allocate_output_tensor(driver, out_spec, output)?;
         let loaded = self.load_kernel(driver, &kernel)?;
         let n = static_element_count(&out_spec.shape)?;
         if n == 0 {
@@ -530,8 +634,10 @@ impl TritonExecutor {
         values: &HashMap<ValueId, TritonTensor>,
         instruction: &gpt_rs::backend::spec::Instruction,
         spec: &CustomCallSpec,
-        out_spec: &TensorSpec,
+        out: OutputBinding<'_>,
     ) -> BackendResult<TritonTensor> {
+        let out_spec = out.spec;
+        let output = out.tensor;
         let _scope = profiling::backend_scope("backend.triton.fused.dot_epilogue");
         if instruction.operands.len() < 3 {
             return Err(BackendError::execution(
@@ -553,6 +659,7 @@ impl TritonExecutor {
                 rhs: &rhs,
                 bias: &bias,
                 out_spec,
+                output: output.clone(),
             };
             if let Some(out) = self.try_execute_dot_bias_rank2(rank2_args)? {
                 return Ok(out);
@@ -571,6 +678,7 @@ impl TritonExecutor {
             },
             &lhs,
             &rhs,
+            None,
         )?;
         let epilogue_plan = fused_elementwise::FusedElementwisePlan::from_components(
             vec![1],
@@ -584,6 +692,7 @@ impl TritonExecutor {
             &epilogue_plan,
             epilogue_inputs.as_slice(),
             out_spec,
+            output,
         )
     }
 
@@ -599,6 +708,7 @@ impl TritonExecutor {
             rhs,
             bias,
             out_spec,
+            output,
         } = args;
         if !matches!(kernel.kind, KernelKind::DotBiasRank2F32) {
             return Err(BackendError::execution(format!(
@@ -654,8 +764,7 @@ impl TritonExecutor {
         }
 
         if m == 0 || n == 0 || k == 0 {
-            let out =
-                TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+            let out = allocate_output_tensor(driver, out_spec, output)?;
             return Ok(Some(out));
         }
 
@@ -666,7 +775,7 @@ impl TritonExecutor {
         let mut k_i32 = i32::try_from(k)
             .map_err(|_| BackendError::execution("dot+bias k exceeds i32 range"))?;
 
-        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let out = allocate_output_tensor(driver, out_spec, output)?;
         let loaded = self.load_kernel(driver, kernel)?;
 
         let mut lhs_ptr = lhs.buffer.device_ptr();
@@ -706,8 +815,10 @@ impl TritonExecutor {
         op: ElementwiseBinaryOp,
         lhs: &TritonTensor,
         rhs: &TritonTensor,
-        spec: &TensorSpec,
+        out: OutputBinding<'_>,
     ) -> BackendResult<TritonTensor> {
+        let spec = out.spec;
+        let output = out.tensor;
         if lhs.spec != *spec || rhs.spec != *spec {
             return Err(BackendError::execution(
                 "elementwise operands/spec mismatch in triton runtime",
@@ -727,7 +838,7 @@ impl TritonExecutor {
         }
 
         let element_count = static_element_count(&spec.shape)?;
-        let out = TritonTensor::new(spec.clone(), driver.alloc_zeroed(byte_len(spec)?)?);
+        let out = allocate_output_tensor(driver, spec, output)?;
 
         let loaded = self.load_kernel(driver, kernel)?;
         let opcode = binary_opcode(op);
@@ -763,6 +874,7 @@ impl TritonExecutor {
         op: ElementwiseUnaryOp,
         input: &TritonTensor,
         spec: &TensorSpec,
+        output: Option<TritonTensor>,
     ) -> BackendResult<TritonTensor> {
         if input.spec != *spec {
             return Err(BackendError::execution(
@@ -783,7 +895,7 @@ impl TritonExecutor {
         }
 
         let element_count = static_element_count(&spec.shape)?;
-        let out = TritonTensor::new(spec.clone(), driver.alloc_zeroed(byte_len(spec)?)?);
+        let out = allocate_output_tensor(driver, spec, output)?;
 
         let loaded = self.load_kernel(driver, kernel)?;
         let opcode = unary_opcode(op)?;
@@ -816,6 +928,7 @@ impl TritonExecutor {
         kernels: &HashMap<&str, &KernelSpec>,
         input: &TritonTensor,
         out_spec: &TensorSpec,
+        output: Option<TritonTensor>,
     ) -> BackendResult<TritonTensor> {
         if input.spec.dtype != out_spec.dtype {
             return Err(BackendError::execution(
@@ -829,7 +942,7 @@ impl TritonExecutor {
             )));
         }
 
-        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let out = allocate_output_tensor(driver, out_spec, output)?;
         let element_count = static_element_count(&out_spec.shape)?;
         if element_count == 0 {
             return Ok(out);
@@ -901,6 +1014,7 @@ impl TritonExecutor {
         input: &TritonTensor,
         spec: &gpt_rs::backend::spec::SliceSpec,
         out_spec: &TensorSpec,
+        output: Option<TritonTensor>,
     ) -> BackendResult<TritonTensor> {
         if input.spec.dtype != out_spec.dtype {
             return Err(BackendError::execution("slice input/output dtype mismatch"));
@@ -912,7 +1026,9 @@ impl TritonExecutor {
         }
 
         match out_spec.dtype {
-            DType::F32 => self.execute_slice_f32(driver, kernels, input, &spec.starts, out_spec),
+            DType::F32 => {
+                self.execute_slice_f32(driver, kernels, input, &spec.starts, out_spec, output)
+            }
             DType::Si32 => {
                 // Minimal i32 slice support for attention decode path (rank-1).
                 let in_dims = static_dims_or_error(&input.spec.shape, |_| {
@@ -938,8 +1054,7 @@ impl TritonExecutor {
                 } {
                     return Err(BackendError::execution("slice Si32 bounds check failed"));
                 }
-                let out =
-                    TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+                let out = allocate_output_tensor(driver, out_spec, output)?;
                 let offset_bytes = start
                     .checked_mul(4)
                     .ok_or_else(|| BackendError::execution("slice Si32 offset overflow"))?;
@@ -967,6 +1082,7 @@ impl TritonExecutor {
         input: &TritonTensor,
         starts: &[usize],
         out_spec: &TensorSpec,
+        output: Option<TritonTensor>,
     ) -> BackendResult<TritonTensor> {
         let kernel = kernels
             .get(SLICE_KERNEL_ID)
@@ -980,7 +1096,7 @@ impl TritonExecutor {
         let (out_dims, in_strides, starts4) =
             slice_rank4_layout(&input.spec.shape, &out_spec.shape, starts)?;
 
-        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let out = allocate_output_tensor(driver, out_spec, output)?;
         let element_count = static_element_count(&out_spec.shape)?;
         if element_count == 0 {
             return Ok(out);
@@ -1033,8 +1149,10 @@ impl TritonExecutor {
         input: &TritonTensor,
         starts: &TritonTensor,
         spec: &gpt_rs::backend::spec::DynamicSliceSpec,
-        out_spec: &TensorSpec,
+        out: OutputBinding<'_>,
     ) -> BackendResult<TritonTensor> {
+        let out_spec = out.spec;
+        let output = out.tensor;
         if starts.spec.dtype != DType::Si32 {
             return Err(BackendError::execution("dynamic_slice starts must be Si32"));
         }
@@ -1061,7 +1179,9 @@ impl TritonExecutor {
         }
 
         match out_spec.dtype {
-            DType::F32 => self.execute_slice_f32(driver, kernels, input, &static_starts, out_spec),
+            DType::F32 => {
+                self.execute_slice_f32(driver, kernels, input, &static_starts, out_spec, output)
+            }
             DType::Si32 => {
                 // Rank-1 Si32 dynamic slice is required by decode attention query position path.
                 let in_dims = static_dims_or_error(&input.spec.shape, |_| {
@@ -1084,8 +1204,7 @@ impl TritonExecutor {
                         "dynamic_slice Si32 bounds check failed",
                     ));
                 }
-                let out =
-                    TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+                let out = allocate_output_tensor(driver, out_spec, output)?;
                 let offset_bytes = start
                     .checked_mul(4)
                     .ok_or_else(|| BackendError::execution("dynamic_slice Si32 offset overflow"))?;
@@ -1115,6 +1234,7 @@ impl TritonExecutor {
         input: &TritonTensor,
         spec: &gpt_rs::backend::spec::TransposeSpec,
         out_spec: &TensorSpec,
+        output: Option<TritonTensor>,
     ) -> BackendResult<TritonTensor> {
         if input.spec.dtype != DType::F32 || out_spec.dtype != DType::F32 {
             return Err(BackendError::execution(
@@ -1132,7 +1252,7 @@ impl TritonExecutor {
         }
         let (out_dims, in_strides) =
             transpose_rank5_layout(&input.spec.shape, &out_spec.shape, &spec.perm)?;
-        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let out = allocate_output_tensor(driver, out_spec, output)?;
         let element_count = static_element_count(&out_spec.shape)?;
         if element_count == 0 {
             return Ok(out);
@@ -1181,8 +1301,10 @@ impl TritonExecutor {
         lhs: &TritonTensor,
         rhs: &TritonTensor,
         spec: &gpt_rs::backend::spec::ConcatSpec,
-        out_spec: &TensorSpec,
+        out: OutputBinding<'_>,
     ) -> BackendResult<TritonTensor> {
+        let out_spec = out.spec;
+        let output = out.tensor;
         if lhs.spec.dtype != DType::F32
             || rhs.spec.dtype != DType::F32
             || out_spec.dtype != DType::F32
@@ -1202,7 +1324,7 @@ impl TritonExecutor {
         }
         let (out_dims, lhs_strides, rhs_strides, axis, split) =
             concat_rank4_layout(&lhs.spec.shape, &rhs.spec.shape, &out_spec.shape, spec.axis)?;
-        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let out = allocate_output_tensor(driver, out_spec, output)?;
         let element_count = static_element_count(&out_spec.shape)?;
         if element_count == 0 {
             return Ok(out);
@@ -1260,6 +1382,7 @@ impl TritonExecutor {
         kernel: &KernelSpec,
         spec: &gpt_rs::backend::spec::IotaSpec,
         out_spec: &TensorSpec,
+        output: Option<TritonTensor>,
     ) -> BackendResult<TritonTensor> {
         if out_spec.dtype != DType::Si32 {
             return Err(BackendError::execution(
@@ -1283,7 +1406,7 @@ impl TritonExecutor {
                 "iota runtime supports rank <= 4 only",
             ));
         }
-        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let out = allocate_output_tensor(driver, out_spec, output)?;
         let element_count = static_element_count(&out_spec.shape)?;
         if element_count == 0 {
             return Ok(out);
@@ -1326,8 +1449,10 @@ impl TritonExecutor {
         op: ComparisonOp,
         lhs: &TritonTensor,
         rhs: &TritonTensor,
-        out_spec: &TensorSpec,
+        out: OutputBinding<'_>,
     ) -> BackendResult<TritonTensor> {
+        let out_spec = out.spec;
+        let output = out.tensor;
         if lhs.spec != rhs.spec {
             return Err(BackendError::execution("compare operand spec mismatch"));
         }
@@ -1342,7 +1467,7 @@ impl TritonExecutor {
                 kernel.kind
             )));
         }
-        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let out = allocate_output_tensor(driver, out_spec, output)?;
         let element_count = static_element_count(&out_spec.shape)?;
         if element_count == 0 {
             return Ok(out);
@@ -1375,8 +1500,10 @@ impl TritonExecutor {
         predicate: &TritonTensor,
         when_true: &TritonTensor,
         when_false: &TritonTensor,
-        out_spec: &TensorSpec,
+        out: OutputBinding<'_>,
     ) -> BackendResult<TritonTensor> {
+        let out_spec = out.spec;
+        let output = out.tensor;
         if predicate.spec.dtype != DType::I1 {
             return Err(BackendError::execution("select predicate must be I1"));
         }
@@ -1396,7 +1523,7 @@ impl TritonExecutor {
                 kernel.kind
             )));
         }
-        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let out = allocate_output_tensor(driver, out_spec, output)?;
         let element_count = static_element_count(&out_spec.shape)?;
         if element_count == 0 {
             return Ok(out);
@@ -1428,6 +1555,7 @@ impl TritonExecutor {
         params: &TritonTensor,
         indices: &TritonTensor,
         out_spec: &TensorSpec,
+        output: Option<TritonTensor>,
     ) -> BackendResult<TritonTensor> {
         if params.spec.dtype != DType::F32
             || indices.spec.dtype != DType::Si32
@@ -1465,7 +1593,7 @@ impl TritonExecutor {
             )));
         }
 
-        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let out = allocate_output_tensor(driver, out_spec, output)?;
         if out_count == 0 {
             return Ok(out);
         }
@@ -1500,8 +1628,10 @@ impl TritonExecutor {
         base: &TritonTensor,
         update: &TritonTensor,
         starts: &TritonTensor,
-        out_spec: &TensorSpec,
+        out: OutputBinding<'_>,
     ) -> BackendResult<TritonTensor> {
+        let out_spec = out.spec;
+        let output = out.tensor;
         if base.spec.dtype != DType::F32
             || update.spec.dtype != DType::F32
             || starts.spec.dtype != DType::Si32
@@ -1554,7 +1684,7 @@ impl TritonExecutor {
             }
         }
 
-        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let out = allocate_output_tensor(driver, out_spec, output)?;
         driver.copy_device_to_device(
             out.buffer.device_ptr(),
             base.buffer.device_ptr(),
@@ -1613,9 +1743,9 @@ impl TritonExecutor {
         driver: &Arc<CudaDriver>,
         kernels: &HashMap<&str, &KernelSpec>,
         input_spec: &TensorSpec,
-        out_spec: &TensorSpec,
         spec: &gpt_rs::backend::spec::ReduceSpec,
         input: &TritonTensor,
+        out: OutputBinding<'_>,
     ) -> BackendResult<TritonTensor> {
         match spec.kind {
             ReduceKind::Sum => {
@@ -1624,7 +1754,14 @@ impl TritonExecutor {
                         "missing reduce_sum_last_axis kernel in triton artifact",
                     )
                 })?;
-                self.execute_reduce_sum_last_axis(driver, kernel, input_spec, out_spec, spec, input)
+                self.execute_reduce_sum_last_axis(
+                    driver,
+                    kernel,
+                    input_spec,
+                    spec,
+                    input,
+                    out.clone(),
+                )
             }
             ReduceKind::Max => {
                 let kernel = kernels.get(REDUCE_MAX_LAST_AXIS_KERNEL_ID).ok_or_else(|| {
@@ -1632,7 +1769,7 @@ impl TritonExecutor {
                         "missing reduce_max_last_axis kernel in triton artifact",
                     )
                 })?;
-                self.execute_reduce_max_last_axis(driver, kernel, input_spec, out_spec, spec, input)
+                self.execute_reduce_max_last_axis(driver, kernel, input_spec, spec, input, out)
             }
             other => Err(BackendError::execution(format!(
                 "reduce runtime unsupported kind {:?}",
@@ -1646,10 +1783,12 @@ impl TritonExecutor {
         driver: &Arc<CudaDriver>,
         kernel: &KernelSpec,
         input_spec: &TensorSpec,
-        out_spec: &TensorSpec,
         spec: &gpt_rs::backend::spec::ReduceSpec,
         input: &TritonTensor,
+        out: OutputBinding<'_>,
     ) -> BackendResult<TritonTensor> {
+        let out_spec = out.spec;
+        let output = out.tensor;
         if !matches!(kernel.kind, KernelKind::ReduceMaxLastAxisF32) {
             return Err(BackendError::execution(format!(
                 "unexpected reduce_max kernel kind: {:?}",
@@ -1683,7 +1822,7 @@ impl TritonExecutor {
             .try_fold(1usize, |acc: usize, dim| acc.checked_mul(*dim))
             .ok_or_else(|| BackendError::execution("reduce_max row dimension overflow"))?;
         let cols = input_dims[last_axis];
-        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let out = allocate_output_tensor(driver, out_spec, output)?;
         if rows == 0 || cols == 0 {
             return Ok(out);
         }
@@ -1715,6 +1854,7 @@ impl TritonExecutor {
         input: &TritonTensor,
         spec: &gpt_rs::backend::spec::ExtractPatchesSpec,
         out_spec: &TensorSpec,
+        output: Option<TritonTensor>,
     ) -> BackendResult<TritonTensor> {
         if !matches!(kernel.kind, KernelKind::ExtractPatchesNhwcF32) {
             return Err(BackendError::execution(format!(
@@ -1747,7 +1887,7 @@ impl TritonExecutor {
                 "extract_patches runtime currently supports 2D window only",
             ));
         }
-        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let out = allocate_output_tensor(driver, out_spec, output)?;
         let elem_count = static_element_count(&out_spec.shape)?;
         if elem_count == 0 {
             return Ok(out);
@@ -1820,6 +1960,7 @@ impl TritonExecutor {
         input: &TritonTensor,
         spec: &gpt_rs::backend::spec::ReduceWindowSpec,
         out_spec: &TensorSpec,
+        output: Option<TritonTensor>,
     ) -> BackendResult<TritonTensor> {
         if !matches!(kernel.kind, KernelKind::ReduceWindowMaxNhwcF32) {
             return Err(BackendError::execution(format!(
@@ -1869,7 +2010,7 @@ impl TritonExecutor {
             ));
         }
 
-        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let out = allocate_output_tensor(driver, out_spec, output)?;
         let elem_count = static_element_count(&out_spec.shape)?;
         if elem_count == 0 {
             return Ok(out);
@@ -1937,6 +2078,7 @@ impl TritonExecutor {
         args: DotGeneralArgs<'_>,
         lhs: &TritonTensor,
         rhs: &TritonTensor,
+        output: Option<TritonTensor>,
     ) -> BackendResult<TritonTensor> {
         let DotGeneralArgs {
             spec,
@@ -1989,8 +2131,7 @@ impl TritonExecutor {
                 ));
             }
 
-            let out =
-                TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+            let out = allocate_output_tensor(driver, out_spec, output.clone())?;
             cublas.sgemm_row_major(&lhs.buffer, &rhs.buffer, &out.buffer, m, n, k)?;
             return Ok(out);
         }
@@ -2025,8 +2166,7 @@ impl TritonExecutor {
                 ));
             }
 
-            let out =
-                TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+            let out = allocate_output_tensor(driver, out_spec, output.clone())?;
             let lhs_stride = m
                 .checked_mul(k)
                 .ok_or_else(|| BackendError::execution("batched lhs stride overflow"))?;
@@ -2079,8 +2219,7 @@ impl TritonExecutor {
                 ));
             }
 
-            let out =
-                TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+            let out = allocate_output_tensor(driver, out_spec, output)?;
             let lhs_stride = m
                 .checked_mul(k)
                 .ok_or_else(|| BackendError::execution("batched lhs stride overflow"))?;
@@ -2118,10 +2257,12 @@ impl TritonExecutor {
         driver: &Arc<CudaDriver>,
         kernel: &KernelSpec,
         input_spec: &TensorSpec,
-        out_spec: &TensorSpec,
         spec: &gpt_rs::backend::spec::ReduceSpec,
         input: &TritonTensor,
+        out: OutputBinding<'_>,
     ) -> BackendResult<TritonTensor> {
+        let out_spec = out.spec;
+        let output = out.tensor;
         if input.spec != *input_spec {
             return Err(BackendError::execution("reduce tensor/spec mismatch"));
         }
@@ -2163,7 +2304,7 @@ impl TritonExecutor {
             .ok_or_else(|| BackendError::execution("reduce row dimension overflow"))?;
         let cols = input_dims[last_axis];
 
-        let out = TritonTensor::new(out_spec.clone(), driver.alloc_zeroed(byte_len(out_spec)?)?);
+        let out = allocate_output_tensor(driver, out_spec, output)?;
         if rows == 0 || cols == 0 {
             return Ok(out);
         }
@@ -2292,6 +2433,7 @@ impl Drop for ExecutionKernelGuard {
 fn literal_to_tensor(
     driver: &Arc<CudaDriver>,
     literal: &TensorLiteral,
+    output: Option<TritonTensor>,
 ) -> BackendResult<TritonTensor> {
     let expected = byte_len(&literal.spec)?;
     if expected != literal.bytes.len() {
@@ -2303,8 +2445,38 @@ fn literal_to_tensor(
         )));
     }
 
-    let buffer = driver.alloc_and_upload(literal.bytes.as_ref())?;
-    Ok(TritonTensor::new(literal.spec.clone(), buffer))
+    let out = allocate_output_tensor(driver, &literal.spec, output)?;
+    if expected != out.buffer.bytes() {
+        return Err(BackendError::execution(format!(
+            "literal destination byte length mismatch: expected {}, got {}",
+            expected,
+            out.buffer.bytes()
+        )));
+    }
+    driver.upload_to_device(out.buffer.device_ptr(), literal.bytes.as_ref())?;
+    Ok(out)
+}
+
+fn allocate_output_tensor(
+    driver: &Arc<CudaDriver>,
+    spec: &TensorSpec,
+    output: Option<TritonTensor>,
+) -> BackendResult<TritonTensor> {
+    match output {
+        Some(tensor) => {
+            if tensor.spec != *spec {
+                return Err(BackendError::execution(format!(
+                    "slot output spec mismatch: expected {:?}, got {:?}",
+                    spec, tensor.spec
+                )));
+            }
+            Ok(tensor)
+        }
+        None => Ok(TritonTensor::new(
+            spec.clone(),
+            driver.alloc_zeroed(byte_len(spec)?)?,
+        )),
+    }
 }
 
 fn output_tensor_spec(output: &ValueType) -> BackendResult<TensorSpec> {
@@ -2890,6 +3062,18 @@ struct DotGeneralArgs<'a> {
     out_spec: &'a TensorSpec,
 }
 
+#[derive(Clone)]
+struct OutputBinding<'a> {
+    spec: &'a TensorSpec,
+    tensor: Option<TritonTensor>,
+}
+
+impl<'a> OutputBinding<'a> {
+    fn new(spec: &'a TensorSpec, tensor: Option<TritonTensor>) -> Self {
+        Self { spec, tensor }
+    }
+}
+
 struct DotBiasRank2Args<'a> {
     driver: &'a Arc<CudaDriver>,
     kernel: &'a KernelSpec,
@@ -2898,6 +3082,7 @@ struct DotBiasRank2Args<'a> {
     rhs: &'a TritonTensor,
     bias: &'a TritonTensor,
     out_spec: &'a TensorSpec,
+    output: Option<TritonTensor>,
 }
 
 #[derive(Copy, Clone)]

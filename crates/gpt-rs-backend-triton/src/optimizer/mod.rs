@@ -15,8 +15,15 @@ pub use pipeline::TritonPipeline;
 pub fn optimize_program_for_triton(
     program: &gpt_rs::backend::spec::Program,
 ) -> ConversionResult<gpt_rs::backend::spec::Program> {
-    let mut optimized = program.clone();
     let backend = crate::TritonBackend::new();
+    optimize_program_for_triton_with_backend(&backend, program)
+}
+
+pub fn optimize_program_for_triton_with_backend(
+    backend: &crate::TritonBackend,
+    program: &gpt_rs::backend::spec::Program,
+) -> ConversionResult<gpt_rs::backend::spec::Program> {
+    let mut optimized = program.clone();
     let optimizer = default_optimizer(backend.pipeline());
     let params = backend.param_resolver();
 
@@ -38,7 +45,7 @@ pub fn optimize_program_for_triton(
             params: params.as_deref(),
         };
         let cfg = OptimizeConfig::default();
-        let mut cx = OptimizeContext::new(&backend, services, entry, cfg);
+        let mut cx = OptimizeContext::new(backend, services, entry, cfg);
         let _ = optimizer.optimize(function, &mut cx);
     }
 

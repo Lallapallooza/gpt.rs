@@ -1,6 +1,6 @@
 mod hint_lowering;
 
-use gpt_rs::backend::conversion::{ConversionError, ConversionResult};
+use gpt_rs::backend::conversion::{BufferPlan, ConversionError, ConversionResult};
 use gpt_rs::backend::fusion::{
     FUSION_ATTR_KIND, FUSION_ATTR_VERSION, FUSION_KIND_DOT_EPILOGUE_V1,
     FUSION_KIND_ELEMENTWISE_DAG_V1,
@@ -25,6 +25,7 @@ use crate::targets::{TARGET_DOT_BIAS_FUSED_F32_V1, TARGET_ELEMENTWISE_FUSED_F32_
 pub fn lower_program_to_artifact(
     program: &Program,
     entrypoint_symbol: &str,
+    buffer_plan: BufferPlan,
 ) -> ConversionResult<TritonArtifact> {
     // Touch all prepacked assets so they are included and validated by the
     // compiler even before every kernel family is hooked into runtime dispatch.
@@ -59,6 +60,7 @@ pub fn lower_program_to_artifact(
     Ok(TritonArtifact::new(
         entrypoint_symbol.to_string(),
         lowered_program,
+        buffer_plan,
         kernels,
     ))
 }

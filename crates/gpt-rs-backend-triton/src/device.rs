@@ -1,6 +1,6 @@
 use std::ffi::{c_void, CString};
 use std::fmt;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use gpt_rs::backend::spec::{BackendError, BackendResult};
 use libloading::Library;
@@ -99,10 +99,12 @@ pub struct CudaDriver {
     fns: DriverFns,
     // Stored as usize so CudaDriver can satisfy Send/Sync requirements for backend traits.
     ctx: usize,
+    alloc_cache: Mutex<AllocCache>,
 }
 
 impl Drop for CudaDriver {
     fn drop(&mut self) {
+        self.release_cached_allocations();
         if self.ctx != 0 {
             // SAFETY: Context is owned by this driver instance and destroyed once on drop.
             let _ = unsafe { (self.fns.cu_ctx_destroy_v2)(self.ctx_ptr()) };
@@ -142,8 +144,7 @@ impl DeviceBuffer {
 
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
-        // SAFETY: Device pointer was allocated by this driver and is released once on drop.
-        let _ = unsafe { (self.driver.fns.cu_mem_free_v2)(self.ptr) };
+        self.driver.recycle(self.ptr, self.bytes);
     }
 }
 
@@ -235,6 +236,7 @@ impl CudaDriver {
                 _lib: lib,
                 fns,
                 ctx: ctx as usize,
+                alloc_cache: Mutex::new(AllocCache::default()),
             })
         }
     }
@@ -273,6 +275,21 @@ impl CudaDriver {
         Ok(buffer)
     }
 
+    pub fn upload_to_device(&self, dst: CUdeviceptr, bytes: &[u8]) -> BackendResult<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.ensure_current()?;
+        // SAFETY: Destination device pointer is valid and caller provides exact source buffer.
+        unsafe {
+            check_cuda(
+                (self.fns.cu_memcpy_hto_d_v2)(dst, bytes.as_ptr() as *const c_void, bytes.len()),
+                "cuMemcpyHtoD_v2",
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn download(&self, ptr: CUdeviceptr, bytes: usize) -> BackendResult<Vec<u8>> {
         self.ensure_current()?;
         let mut out = vec![0u8; bytes];
@@ -309,6 +326,23 @@ impl CudaDriver {
     }
 
     fn alloc(self: &Arc<Self>, bytes: usize) -> BackendResult<Arc<DeviceBuffer>> {
+        if bytes != 0 {
+            let cached_ptr = {
+                let mut cache = self
+                    .alloc_cache
+                    .lock()
+                    .expect("triton allocator cache mutex poisoned");
+                cache.take(bytes)
+            };
+            if let Some(ptr) = cached_ptr {
+                return Ok(Arc::new(DeviceBuffer {
+                    driver: Arc::clone(self),
+                    ptr,
+                    bytes,
+                }));
+            }
+        }
+
         self.ensure_current()?;
         let mut ptr: CUdeviceptr = 0;
         // SAFETY: `ptr` is a valid out pointer for CUDA allocation.
@@ -323,6 +357,53 @@ impl CudaDriver {
             ptr,
             bytes,
         }))
+    }
+
+    fn recycle(&self, ptr: CUdeviceptr, bytes: usize) {
+        if ptr == 0 {
+            return;
+        }
+        if bytes == 0 {
+            let _ = self.free_ptr(ptr);
+            return;
+        }
+        let should_free = {
+            let mut cache = self
+                .alloc_cache
+                .lock()
+                .expect("triton allocator cache mutex poisoned");
+            !cache.put(ptr, bytes)
+        };
+        if should_free {
+            let _ = self.free_ptr(ptr);
+        }
+    }
+
+    fn free_ptr(&self, ptr: CUdeviceptr) -> BackendResult<()> {
+        self.ensure_current()?;
+        // SAFETY: `ptr` is a CUDA allocation associated with this context.
+        unsafe { check_cuda((self.fns.cu_mem_free_v2)(ptr), "cuMemFree_v2") }
+    }
+
+    fn release_cached_allocations(&mut self) {
+        let pointers = {
+            let mut cache = self
+                .alloc_cache
+                .lock()
+                .expect("triton allocator cache mutex poisoned");
+            cache.drain()
+        };
+        if pointers.is_empty() {
+            return;
+        }
+        if self.ctx != 0 {
+            // SAFETY: Context is owned by this driver and valid until drop returns.
+            let _ = unsafe { (self.fns.cu_ctx_set_current)(self.ctx_ptr()) };
+        }
+        for ptr in pointers {
+            // SAFETY: pointers were cached from successful allocations and are released once.
+            let _ = unsafe { (self.fns.cu_mem_free_v2)(ptr) };
+        }
     }
 
     pub fn load_ptx_module(self: &Arc<Self>, ptx: &str) -> BackendResult<Arc<CudaModule>> {
@@ -579,5 +660,48 @@ fn check_cuda(code: CUresult, op: &str) -> BackendResult<()> {
         Err(BackendError::execution(format!(
             "CUDA driver call {op} failed with code {code}"
         )))
+    }
+}
+
+#[derive(Default)]
+struct AllocCache {
+    bins: std::collections::HashMap<usize, Vec<CUdeviceptr>>,
+    cached_bytes: usize,
+}
+
+impl AllocCache {
+    const MAX_CACHED_BYTES: usize = 512 * 1024 * 1024;
+
+    fn take(&mut self, bytes: usize) -> Option<CUdeviceptr> {
+        let ptr = self.bins.get_mut(&bytes).and_then(Vec::pop);
+        if ptr.is_some() {
+            self.cached_bytes = self.cached_bytes.saturating_sub(bytes);
+            if self.bins.get(&bytes).is_some_and(Vec::is_empty) {
+                self.bins.remove(&bytes);
+            }
+        }
+        ptr
+    }
+
+    fn put(&mut self, ptr: CUdeviceptr, bytes: usize) -> bool {
+        if self
+            .cached_bytes
+            .checked_add(bytes)
+            .is_none_or(|sum| sum > Self::MAX_CACHED_BYTES)
+        {
+            return false;
+        }
+        self.cached_bytes += bytes;
+        self.bins.entry(bytes).or_default().push(ptr);
+        true
+    }
+
+    fn drain(&mut self) -> Vec<CUdeviceptr> {
+        self.cached_bytes = 0;
+        let mut out = Vec::new();
+        for (_, mut pointers) in std::mem::take(&mut self.bins) {
+            out.append(&mut pointers);
+        }
+        out
     }
 }

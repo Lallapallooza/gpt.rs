@@ -70,6 +70,8 @@ pub struct ProgramContext {
     pub graph_id: usize,
     pub backend: String,
     pub plan_hash: u64,
+    pub plan_graph_hash: u64,
+    pub plan_specialization_hash: u64,
     pub cache: ProgramCacheInfo,
     pub targets: Vec<ValueId>,
     pub outputs: Vec<ValueId>,

@@ -77,12 +77,20 @@ impl ExecutionTraceSink for ContextSink {
     fn after_program(&self, _context: &ProgramContext, _stats: &ProgramStats) {}
 }
 
+fn tensor_from_data_with_shape(
+    backend: &Arc<NamedCpuBackend>,
+    shape: &[usize],
+    data: &[f32],
+) -> anyhow::Result<DeviceTensor<NamedCpuBackend>> {
+    let host = Tensor::from_vec(Shape::new(shape.to_vec()), data.to_vec())?;
+    DeviceTensor::from_host(Arc::clone(backend), host)
+}
+
 fn tensor_from_data(
     backend: &Arc<NamedCpuBackend>,
     data: &[f32],
 ) -> anyhow::Result<DeviceTensor<NamedCpuBackend>> {
-    let host = Tensor::from_vec(Shape::new([2, 2]), data.to_vec())?;
-    DeviceTensor::from_host(Arc::clone(backend), host)
+    tensor_from_data_with_shape(backend, &[2, 2], data)
 }
 
 fn add_scalar_literal(
@@ -136,6 +144,14 @@ fn literal_value_change_does_not_reuse_program_cache() -> anyhow::Result<()> {
         !second.cache.program_cache_hit,
         "program cache was reused across different literal values"
     );
+    assert_eq!(
+        first.plan_graph_hash, second.plan_graph_hash,
+        "stable graph hash should match across literal-only changes"
+    );
+    assert_ne!(
+        first.plan_specialization_hash, second.plan_specialization_hash,
+        "specialization hash should differ across literal-only changes"
+    );
 
     Ok(())
 }
@@ -168,6 +184,57 @@ fn identical_literal_graph_reuses_program_cache() -> anyhow::Result<()> {
     assert!(
         second.cache.program_cache_hit,
         "expected second identical graph to hit program cache"
+    );
+    assert_eq!(
+        first.plan_graph_hash, second.plan_graph_hash,
+        "stable graph hash should match identical graph executions"
+    );
+    assert_eq!(
+        first.plan_specialization_hash, second.plan_specialization_hash,
+        "specialization hash should match identical graph executions"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn shape_change_keeps_graph_hash_but_changes_specialization() -> anyhow::Result<()> {
+    let _serial_guard = TRACE_TEST_MUTEX.lock().expect("trace test mutex poisoned");
+    let backend = Arc::new(NamedCpuBackend::new("cpu-shape-specialization-cache-test"));
+    let sink = Arc::new(ContextSink {
+        contexts: Mutex::new(Vec::new()),
+    });
+    let _trace_guard = trace::install_global_sink(sink.clone() as Arc<dyn ExecutionTraceSink>);
+
+    let input1 = tensor_from_data_with_shape(&backend, &[2, 2], &[1.0, 2.0, 3.0, 4.0])?;
+    let _ = add_scalar_literal(&input1, 1.0)?.to_host()?;
+
+    let input2 = tensor_from_data_with_shape(
+        &backend,
+        &[4, 4],
+        &[
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+        ],
+    )?;
+    let _ = add_scalar_literal(&input2, 1.0)?.to_host()?;
+
+    let contexts = sink
+        .contexts
+        .lock()
+        .expect("trace context sink mutex poisoned")
+        .clone();
+    let (first, second) = contexts_after_two_runs(&contexts);
+    assert!(
+        !second.cache.program_cache_hit,
+        "shape specialization change should not reuse cached program"
+    );
+    assert_eq!(
+        first.plan_graph_hash, second.plan_graph_hash,
+        "stable graph hash should ignore shape specialization changes"
+    );
+    assert_ne!(
+        first.plan_specialization_hash, second.plan_specialization_hash,
+        "specialization hash should change with shape specialization"
     );
 
     Ok(())

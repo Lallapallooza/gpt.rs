@@ -65,8 +65,8 @@ use crate::tensor::{DeviceTensor, InputRole};
 use super::builder::GraphBuilder;
 use super::plan::{
     ensure_exports_sorted, ensure_parameters_sorted, ensure_targets_sorted, get_cached_program,
-    insert_cached_program, CachedPlan, InputSignature, ParameterSpec, PlanCache, PlanKey, PlanNode,
-    DEFAULT_PLAN_CACHE_CAPACITY,
+    insert_cached_program, CacheMissReason, CachedPlan, InputSignature, ParameterSpec, PlanCache,
+    PlanKey, PlanNode, PlanNodeView, DEFAULT_PLAN_CACHE_CAPACITY,
 };
 use super::state::{GraphInner, NodeState, ParameterRecord};
 
@@ -77,10 +77,17 @@ pub struct GraphArena<B: PortableBackend + 'static> {
     inner: Mutex<GraphInner<B>>,
     plan_cache: PlanCacheState,
     optimizer: Option<Arc<dyn Optimizer<B>>>,
+    miss_telemetry: Mutex<CacheMissTelemetry>,
     id: usize,
 }
 
 static ARENA_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Default)]
+struct CacheMissTelemetry {
+    last_plan_by_graph: HashMap<u64, PlanKey>,
+    last_program_by_graph: HashMap<u64, PlanKey>,
+}
 
 /// Configures how an arena caches compiled plans and rewrites graphs.
 pub enum CachePolicy<B: PortableBackend + 'static> {
@@ -176,6 +183,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
             inner: Mutex::new(GraphInner::new()),
             plan_cache,
             optimizer,
+            miss_telemetry: Mutex::new(CacheMissTelemetry::default()),
             id,
         })
     }
@@ -610,18 +618,18 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
         result_values.sort_by_key(|value| value.0);
         result_values.dedup();
 
-        let mut nodes = Vec::with_capacity(ordered.len());
+        let mut node_views = Vec::with_capacity(ordered.len());
         for value in &ordered {
             let node = inner
                 .nodes
                 .get(value)
                 .ok_or_else(|| anyhow!("missing node for value {:?}", value))?;
-            nodes.push(PlanNode {
-                value: *value,
-                op: node.op.clone(),
-                operands: node.operands.clone(),
-                spec: node.spec.clone(),
-            });
+            node_views.push(PlanNodeView::new(
+                *value,
+                &node.op,
+                node.operands.as_slice(),
+                &node.spec,
+            ));
         }
 
         let mut exports: Vec<_> = inner.exports.iter().copied().collect();
@@ -633,18 +641,18 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
         // Plan cache keys intentionally ignore arena version so decode-style workloads can reuse
         // the same structural plan across successive graph mutations. Concrete ValueId bindings
         // are rebound per-context in `get_or_build_plan`.
-        let key = PlanKey::new(
+        let key = PlanKey::new_from_views(
             self.backend.backend_name(),
             0,
             &input_signatures,
             &exports,
             &signature_targets,
-            &nodes,
+            node_views.as_slice(),
         )?;
 
         let context = PlanContext {
             key,
-            nodes,
+            ordered_values: ordered,
             input_signatures,
             parameter_specs,
             outputs: result_values,
@@ -658,6 +666,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
     fn get_or_build_plan(&self, context: PlanContext) -> Result<(Arc<CachedPlan>, bool)> {
         if let Some(plan) = self.plan_cache.get(&context.key) {
             crate::profiling::cache_event("plan_cache_hit");
+            self.record_plan_key(context.key, false);
             return self
                 .rebind_plan_for_context(plan, context)
                 .map(|plan| (plan, true));
@@ -665,8 +674,11 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
         crate::profiling::cache_event("plan_cache_miss");
         if self.plan_cache.is_enabled() {
             crate::profiling::cache_event("plan_cache_miss_lookup");
+            let reason = self.record_plan_key(context.key, true);
+            emit_cache_miss_reason(CacheKind::Plan, reason);
         } else {
             crate::profiling::cache_event("plan_cache_miss_disabled");
+            emit_cache_miss_reason(CacheKind::Plan, CacheMissReason::BackendOptionChange);
         }
 
         let plan = {
@@ -719,21 +731,19 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
     fn build_plan_from_context(&self, context: PlanContext) -> Result<Arc<CachedPlan>> {
         let PlanContext {
             key,
-            nodes,
+            ordered_values,
             input_signatures,
             parameter_specs,
             outputs,
             exports,
-            arena_version: _arena_version,
+            arena_version,
         } = context;
 
-        let program_cache_key = PlanKey {
-            version: 0,
-            hash: key.hash,
-        };
+        let program_cache_key = key.with_version(0);
 
         if let Some(cached) = get_cached_program(&program_cache_key) {
             crate::profiling::cache_event("program_cache_hit");
+            self.record_program_key(program_cache_key, false);
             let (plan_parameter_specs, plan_parameter_values) = {
                 let _scope = crate::profiling::compile_scope("graph::bind_plan_inputs");
                 build_arg_bindings(&cached.inputs, &parameter_specs)?
@@ -752,9 +762,12 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
         }
         crate::profiling::cache_event("program_cache_miss");
         crate::profiling::cache_event("program_cache_miss_lookup");
+        let reason = self.record_program_key(program_cache_key, true);
+        emit_cache_miss_reason(CacheKind::Program, reason);
 
         let (mut function, entry_params) = {
             let _scope = crate::profiling::compile_scope("graph::lower_to_program");
+            let nodes = self.materialize_plan_nodes(ordered_values.as_slice(), arena_version)?;
 
             let mut builder = ProgramBuilder::new();
             let mut mapping: HashMap<ValueId, ValueId> = HashMap::new();
@@ -880,6 +893,58 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
         )))
     }
 
+    fn record_plan_key(&self, key: PlanKey, miss: bool) -> CacheMissReason {
+        let mut telemetry = self
+            .miss_telemetry
+            .lock()
+            .expect("graph arena miss telemetry poisoned");
+        let previous = telemetry.last_plan_by_graph.insert(key.graph_hash, key);
+        if miss {
+            key.classify_change_from(previous)
+        } else {
+            CacheMissReason::Unknown
+        }
+    }
+
+    fn record_program_key(&self, key: PlanKey, miss: bool) -> CacheMissReason {
+        let mut telemetry = self
+            .miss_telemetry
+            .lock()
+            .expect("graph arena miss telemetry poisoned");
+        let previous = telemetry.last_program_by_graph.insert(key.graph_hash, key);
+        if miss {
+            key.classify_change_from(previous)
+        } else {
+            CacheMissReason::Unknown
+        }
+    }
+
+    fn materialize_plan_nodes(
+        &self,
+        ordered_values: &[ValueId],
+        arena_version: u64,
+    ) -> Result<Vec<PlanNode>> {
+        let inner = self.inner.lock().expect("graph arena poisoned");
+        if inner.version != arena_version {
+            return Err(StalePlanError.into());
+        }
+
+        let mut nodes = Vec::with_capacity(ordered_values.len());
+        for value in ordered_values {
+            let node = inner
+                .nodes
+                .get(value)
+                .ok_or_else(|| anyhow!("missing node for value {:?}", value))?;
+            nodes.push(PlanNode {
+                value: *value,
+                op: node.op.clone(),
+                operands: node.operands.clone(),
+                spec: node.spec.clone(),
+            });
+        }
+        Ok(nodes)
+    }
+
     fn try_execute_plan(
         &self,
         plan: &Arc<CachedPlan>,
@@ -894,6 +959,8 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
             graph_id: self.id,
             backend: self.backend.backend_name().to_string(),
             plan_hash: plan.key.hash,
+            plan_graph_hash: plan.key.graph_hash,
+            plan_specialization_hash: plan.key.specialization_hash,
             cache: ProgramCacheInfo {
                 plan_cache_hit,
                 program_cache_hit: plan.program_cache_hit,
@@ -1100,6 +1167,52 @@ impl fmt::Display for StalePlanError {
 
 impl std::error::Error for StalePlanError {}
 
+enum CacheKind {
+    Plan,
+    Program,
+}
+
+const PLAN_CACHE_MISS_REASON_EVENTS: [&str; 7] = [
+    "plan_cache_miss_reason.shape_specialization_change",
+    "plan_cache_miss_reason.dtype_change",
+    "plan_cache_miss_reason.layout_change",
+    "plan_cache_miss_reason.literal_value_only_change",
+    "plan_cache_miss_reason.kv_bucket_change",
+    "plan_cache_miss_reason.backend_option_change",
+    "plan_cache_miss_reason.unknown",
+];
+
+const PROGRAM_CACHE_MISS_REASON_EVENTS: [&str; 7] = [
+    "program_cache_miss_reason.shape_specialization_change",
+    "program_cache_miss_reason.dtype_change",
+    "program_cache_miss_reason.layout_change",
+    "program_cache_miss_reason.literal_value_only_change",
+    "program_cache_miss_reason.kv_bucket_change",
+    "program_cache_miss_reason.backend_option_change",
+    "program_cache_miss_reason.unknown",
+];
+
+fn cache_miss_reason_index(reason: CacheMissReason) -> usize {
+    match reason {
+        CacheMissReason::ShapeSpecializationChange => 0,
+        CacheMissReason::DTypeChange => 1,
+        CacheMissReason::LayoutChange => 2,
+        CacheMissReason::LiteralValueOnlyChange => 3,
+        CacheMissReason::KvBucketChange => 4,
+        CacheMissReason::BackendOptionChange => 5,
+        CacheMissReason::Unknown => 6,
+    }
+}
+
+fn emit_cache_miss_reason(kind: CacheKind, reason: CacheMissReason) {
+    let index = cache_miss_reason_index(reason);
+    let event = match kind {
+        CacheKind::Plan => PLAN_CACHE_MISS_REASON_EVENTS[index],
+        CacheKind::Program => PROGRAM_CACHE_MISS_REASON_EVENTS[index],
+    };
+    crate::profiling::cache_event(event);
+}
+
 enum PrepareResult<B: PortableBackend + 'static> {
     AllReady(Vec<B::TensorHandle>),
     NeedsPlan(PlanContext),
@@ -1141,7 +1254,7 @@ fn build_arg_bindings(
 
 struct PlanContext {
     key: PlanKey,
-    nodes: Vec<PlanNode>,
+    ordered_values: Vec<ValueId>,
     input_signatures: Vec<InputSignature>,
     parameter_specs: Vec<ParameterSpec>,
     outputs: Vec<ValueId>,

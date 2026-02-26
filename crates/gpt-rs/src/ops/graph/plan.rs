@@ -11,6 +11,7 @@ use once_cell::sync::Lazy;
 use serde::Serialize;
 
 use crate::backend::hashing::fnv1a_hash;
+use crate::backend::op_signature::operation_kind;
 use crate::backend::optimizer::PlanInputs;
 use crate::backend::spec::{Operand, Operation, Program, TensorLiteral, TensorSpec, ValueId};
 use crate::tensor::InputRole;
@@ -33,25 +34,86 @@ static PROGRAM_CACHE: Lazy<Mutex<LruCache<PlanKey, CachedProgram>>> = Lazy::new(
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(super) struct PlanKey {
     pub(super) version: u64,
+    pub(super) graph_hash: u64,
+    pub(super) specialization_hash: u64,
+    pub(super) shape_hash: u64,
+    pub(super) dtype_hash: u64,
+    pub(super) layout_hash: u64,
+    pub(super) literal_hash: u64,
+    pub(super) kv_bucket_hash: u64,
+    pub(super) backend_option_hash: u64,
     pub(super) hash: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CacheMissReason {
+    ShapeSpecializationChange,
+    DTypeChange,
+    LayoutChange,
+    LiteralValueOnlyChange,
+    KvBucketChange,
+    BackendOptionChange,
+    Unknown,
+}
+
 impl PlanKey {
-    pub(super) fn new(
+    pub(super) fn new_from_views(
         backend: &str,
         version: u64,
         inputs: &[InputSignature],
         exports: &[ValueId],
         targets: &[ValueId],
-        nodes: &[PlanNode],
+        node_views: &[PlanNodeView<'_>],
     ) -> Result<Self> {
-        let signature = SignatureData::from_components(inputs, exports, targets, nodes);
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(backend.as_bytes());
-        bytes.push(0);
-        bytes.extend(bincode::serialize(&signature)?);
-        let hash = fnv1a_hash(&bytes);
-        Ok(PlanKey { version, hash })
+        let signature = SignatureData::from_views(inputs, exports, targets, node_views);
+        let graph_hash = hash_serializable(&GraphSignatureData::from_signature(&signature))?;
+        let specialization = SpecializationData::from_signature(backend, &signature)?;
+        let mut combined = [0u8; 16];
+        combined[..8].copy_from_slice(&graph_hash.to_le_bytes());
+        combined[8..].copy_from_slice(&specialization.specialization_hash.to_le_bytes());
+        let hash = fnv1a_hash(&combined);
+        Ok(PlanKey {
+            version,
+            graph_hash,
+            specialization_hash: specialization.specialization_hash,
+            shape_hash: specialization.shape_hash,
+            dtype_hash: specialization.dtype_hash,
+            layout_hash: specialization.layout_hash,
+            literal_hash: specialization.literal_hash,
+            kv_bucket_hash: specialization.kv_bucket_hash,
+            backend_option_hash: specialization.backend_option_hash,
+            hash,
+        })
+    }
+
+    pub(super) fn with_version(self, version: u64) -> Self {
+        Self { version, ..self }
+    }
+
+    pub(super) fn classify_change_from(self, previous: Option<PlanKey>) -> CacheMissReason {
+        let Some(previous) = previous else {
+            return CacheMissReason::Unknown;
+        };
+        if self.backend_option_hash != previous.backend_option_hash {
+            return CacheMissReason::BackendOptionChange;
+        }
+        if self.kv_bucket_hash != previous.kv_bucket_hash && self.shape_hash != previous.shape_hash
+        {
+            return CacheMissReason::KvBucketChange;
+        }
+        if self.shape_hash != previous.shape_hash {
+            return CacheMissReason::ShapeSpecializationChange;
+        }
+        if self.dtype_hash != previous.dtype_hash {
+            return CacheMissReason::DTypeChange;
+        }
+        if self.layout_hash != previous.layout_hash {
+            return CacheMissReason::LayoutChange;
+        }
+        if self.literal_hash != previous.literal_hash {
+            return CacheMissReason::LiteralValueOnlyChange;
+        }
+        CacheMissReason::Unknown
     }
 }
 
@@ -69,6 +131,36 @@ pub(super) struct PlanNode {
     pub(super) op: Operation,
     pub(super) operands: Vec<Operand>,
     pub(super) spec: TensorSpec,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PlanNodeView<'a> {
+    pub(super) value: ValueId,
+    pub(super) op: &'a Operation,
+    pub(super) operands: &'a [Operand],
+    pub(super) spec: &'a TensorSpec,
+}
+
+impl<'a> PlanNodeView<'a> {
+    pub(super) fn new(
+        value: ValueId,
+        op: &'a Operation,
+        operands: &'a [Operand],
+        spec: &'a TensorSpec,
+    ) -> Self {
+        Self {
+            value,
+            op,
+            operands,
+            spec,
+        }
+    }
+}
+
+impl<'a> From<&'a PlanNode> for PlanNodeView<'a> {
+    fn from(node: &'a PlanNode) -> Self {
+        Self::new(node.value, &node.op, node.operands.as_slice(), &node.spec)
+    }
 }
 
 /// Specification for a graph input that will become a PTIR parameter.
@@ -193,11 +285,11 @@ struct SignatureData {
 }
 
 impl SignatureData {
-    fn from_components(
+    fn from_views(
         inputs: &[InputSignature],
         exports: &[ValueId],
         targets: &[ValueId],
-        nodes: &[PlanNode],
+        nodes: &[PlanNodeView<'_>],
     ) -> Self {
         Canonicalizer::canonicalize(inputs, exports, targets, nodes)
     }
@@ -225,11 +317,280 @@ enum SignatureOperand {
     Literal(SignatureLiteral),
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct SignatureLiteral {
     spec: TensorSpec,
     byte_len: usize,
     byte_hash: u64,
+}
+
+#[derive(Serialize)]
+struct GraphSignatureData {
+    inputs: Vec<GraphSignatureInput>,
+    exports: Vec<ValueId>,
+    targets: Vec<ValueId>,
+    nodes: Vec<GraphSignatureNode>,
+}
+
+impl GraphSignatureData {
+    fn from_signature(signature: &SignatureData) -> Self {
+        Self {
+            inputs: signature
+                .inputs
+                .iter()
+                .map(|input| GraphSignatureInput {
+                    role: input.role,
+                    has_stable_id: input.stable_id.is_some(),
+                })
+                .collect(),
+            exports: signature.exports.clone(),
+            targets: signature.targets.clone(),
+            nodes: signature
+                .nodes
+                .iter()
+                .map(|node| GraphSignatureNode {
+                    value: node.value,
+                    op_kind: operation_kind(&node.op),
+                    operands: node
+                        .operands
+                        .iter()
+                        .map(|operand| match operand {
+                            SignatureOperand::Value(value) => GraphSignatureOperand::Value(*value),
+                            SignatureOperand::TupleElement { tuple, index } => {
+                                GraphSignatureOperand::TupleElement {
+                                    tuple: *tuple,
+                                    index: *index,
+                                }
+                            }
+                            SignatureOperand::Literal(literal) => {
+                                GraphSignatureOperand::Literal(literal.spec.clone())
+                            }
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct GraphSignatureInput {
+    role: InputRole,
+    has_stable_id: bool,
+}
+
+#[derive(Serialize)]
+struct GraphSignatureNode {
+    value: ValueId,
+    op_kind: &'static str,
+    operands: Vec<GraphSignatureOperand>,
+}
+
+#[derive(Serialize)]
+enum GraphSignatureOperand {
+    Value(ValueId),
+    TupleElement { tuple: ValueId, index: usize },
+    Literal(TensorSpec),
+}
+
+#[derive(Clone, Copy)]
+struct SpecializationData {
+    specialization_hash: u64,
+    shape_hash: u64,
+    dtype_hash: u64,
+    layout_hash: u64,
+    literal_hash: u64,
+    kv_bucket_hash: u64,
+    backend_option_hash: u64,
+}
+
+impl SpecializationData {
+    fn from_signature(backend: &str, signature: &SignatureData) -> Result<Self> {
+        let shape_hash = hash_serializable(&ShapeSignature::from_signature(signature))?;
+        let dtype_hash = hash_serializable(&DTypeSignature::from_signature(signature))?;
+        let layout_hash = hash_serializable(&LayoutSignature::from_signature(signature))?;
+        let literal_hash = hash_serializable(&LiteralSignature::from_signature(signature))?;
+        let kv_bucket_hash = hash_serializable(&KvBucketSignature::from_signature(signature))?;
+        let op_hash = hash_serializable(
+            &signature
+                .nodes
+                .iter()
+                .map(|node| &node.op)
+                .collect::<Vec<_>>(),
+        )?;
+        let backend_option_hash = fnv1a_hash(backend.as_bytes());
+        let specialization_hash = hash_serializable(&[
+            op_hash,
+            shape_hash,
+            dtype_hash,
+            layout_hash,
+            literal_hash,
+            kv_bucket_hash,
+            backend_option_hash,
+        ])?;
+        Ok(Self {
+            specialization_hash,
+            shape_hash,
+            dtype_hash,
+            layout_hash,
+            literal_hash,
+            kv_bucket_hash,
+            backend_option_hash,
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct ShapeSignature {
+    input_shapes: Vec<crate::backend::spec::Shape>,
+    output_shapes: Vec<crate::backend::spec::Shape>,
+    literal_shapes: Vec<crate::backend::spec::Shape>,
+}
+
+impl ShapeSignature {
+    fn from_signature(signature: &SignatureData) -> Self {
+        let mut literal_shapes = Vec::new();
+        for node in &signature.nodes {
+            for operand in &node.operands {
+                if let SignatureOperand::Literal(literal) = operand {
+                    literal_shapes.push(literal.spec.shape.clone());
+                }
+            }
+        }
+        Self {
+            input_shapes: signature
+                .inputs
+                .iter()
+                .map(|input| input.spec.shape.clone())
+                .collect(),
+            output_shapes: signature
+                .nodes
+                .iter()
+                .map(|node| node.spec.shape.clone())
+                .collect(),
+            literal_shapes,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct DTypeSignature {
+    input_dtypes: Vec<crate::backend::spec::DType>,
+    output_dtypes: Vec<crate::backend::spec::DType>,
+    literal_dtypes: Vec<crate::backend::spec::DType>,
+}
+
+impl DTypeSignature {
+    fn from_signature(signature: &SignatureData) -> Self {
+        let mut literal_dtypes = Vec::new();
+        for node in &signature.nodes {
+            for operand in &node.operands {
+                if let SignatureOperand::Literal(literal) = operand {
+                    literal_dtypes.push(literal.spec.dtype);
+                }
+            }
+        }
+        Self {
+            input_dtypes: signature
+                .inputs
+                .iter()
+                .map(|input| input.spec.dtype)
+                .collect(),
+            output_dtypes: signature.nodes.iter().map(|node| node.spec.dtype).collect(),
+            literal_dtypes,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct LayoutSignature {
+    transpose_perms: Vec<Vec<usize>>,
+    dot_dims: Vec<DotLayoutSignature>,
+}
+
+impl LayoutSignature {
+    fn from_signature(signature: &SignatureData) -> Self {
+        let mut transpose_perms = Vec::new();
+        let mut dot_dims = Vec::new();
+        for node in &signature.nodes {
+            match &node.op {
+                Operation::Transpose(spec) => transpose_perms.push(spec.perm.clone()),
+                Operation::DotGeneral(spec) => dot_dims.push(DotLayoutSignature {
+                    batch_lhs: spec.batch_lhs.clone(),
+                    batch_rhs: spec.batch_rhs.clone(),
+                    contract_lhs: spec.contract_lhs.clone(),
+                    contract_rhs: spec.contract_rhs.clone(),
+                }),
+                _ => {}
+            }
+        }
+        Self {
+            transpose_perms,
+            dot_dims,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct DotLayoutSignature {
+    batch_lhs: Vec<usize>,
+    batch_rhs: Vec<usize>,
+    contract_lhs: Vec<usize>,
+    contract_rhs: Vec<usize>,
+}
+
+#[derive(Serialize)]
+struct LiteralSignature {
+    literals: Vec<SignatureLiteral>,
+}
+
+impl LiteralSignature {
+    fn from_signature(signature: &SignatureData) -> Self {
+        let mut literals = Vec::new();
+        for node in &signature.nodes {
+            for operand in &node.operands {
+                if let SignatureOperand::Literal(literal) = operand {
+                    literals.push(literal.clone());
+                }
+            }
+        }
+        Self { literals }
+    }
+}
+
+#[derive(Serialize)]
+struct KvBucketSignature {
+    buckets: Vec<usize>,
+}
+
+impl KvBucketSignature {
+    fn from_signature(signature: &SignatureData) -> Self {
+        let mut buckets = Vec::new();
+        for input in &signature.inputs {
+            collect_bucket_dims(input.spec.shape.dims(), &mut buckets);
+        }
+        for node in &signature.nodes {
+            collect_bucket_dims(node.spec.shape.dims(), &mut buckets);
+            for operand in &node.operands {
+                if let SignatureOperand::Literal(literal) = operand {
+                    collect_bucket_dims(literal.spec.shape.dims(), &mut buckets);
+                }
+            }
+        }
+        buckets.sort_unstable();
+        buckets.dedup();
+        Self { buckets }
+    }
+}
+
+fn collect_bucket_dims(dims: &[crate::backend::spec::Dimension], out: &mut Vec<usize>) {
+    for dim in dims {
+        if let crate::backend::spec::Dimension::Static(value) = dim {
+            if *value >= 8 && value.is_power_of_two() {
+                out.push(*value);
+            }
+        }
+    }
 }
 
 struct Canonicalizer {
@@ -276,7 +637,7 @@ impl Canonicalizer {
         inputs: &[InputSignature],
         exports: &[ValueId],
         targets: &[ValueId],
-        nodes: &[PlanNode],
+        nodes: &[PlanNodeView<'_>],
     ) -> SignatureData {
         let mut canon = Canonicalizer::new();
 
@@ -313,6 +674,11 @@ impl Canonicalizer {
             nodes: sig_nodes,
         }
     }
+}
+
+fn hash_serializable<T: Serialize>(value: &T) -> Result<u64> {
+    let bytes = bincode::serialize(value)?;
+    Ok(fnv1a_hash(&bytes))
 }
 
 pub(super) fn ensure_targets_sorted(targets: &mut Vec<ValueId>) {

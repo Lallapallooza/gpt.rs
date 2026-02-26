@@ -27,6 +27,10 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod benchmark;
+
+use benchmark::compile_freeze::{self, CompileFreezeGate};
+
 fn model_namespace_for_backend<B: PortableBackend + ?Sized>(backend: &B) -> ModelNamespaceId {
     if backend.backend_name() == "c" {
         ModelNamespaceId(0)
@@ -268,6 +272,21 @@ struct BenchmarkArgs {
         help = "Fixed KV-cache capacity for decode (disables power-of-two growth buckets)"
     )]
     kv_cache_capacity: Option<usize>,
+
+    #[arg(
+        long,
+        default_value_t = 16,
+        value_name = "N",
+        help = "Measured decode token threshold after which compile activity is considered an anomaly"
+    )]
+    compile_freeze_after: usize,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Fail benchmark when compile activity occurs after --compile-freeze-after"
+    )]
+    strict_compile_freeze: bool,
 }
 
 #[derive(ClapArgs, Clone)]
@@ -869,6 +888,7 @@ fn run_benchmark<B: PortableBackend + 'static>(
                     "prefill",
                     profile_full,
                     artifact_config,
+                    None,
                 )?;
                 return Ok(true);
             }
@@ -908,6 +928,7 @@ fn run_benchmark<B: PortableBackend + 'static>(
                     "first-token",
                     profile_full,
                     artifact_config,
+                    None,
                 )?;
                 return Ok(true);
             }
@@ -942,6 +963,18 @@ fn run_benchmark<B: PortableBackend + 'static>(
             if profile {
                 profiling::reset();
             }
+            let freeze_capture_token = args.compile_freeze_after.min(measured_steps);
+            let mut compile_baseline_ms = if profile && freeze_capture_token == 0 {
+                profiling::take_profile_snapshot_with_options(
+                    false,
+                    &profiling::ProfileFormatOptions::default(),
+                )
+                .and_then(|snapshot| {
+                    compile_freeze::compile_ms_from_report_json(snapshot.report_json.as_str())
+                })
+            } else {
+                None
+            };
             let elapsed = {
                 let _scope =
                     profile.then(|| profiling::backend_scope("benchmark.decode_steady_total"));
@@ -951,6 +984,17 @@ fn run_benchmark<B: PortableBackend + 'static>(
                         generator.step_final()?;
                     } else {
                         generator.step()?;
+                    }
+                    if profile && step + 1 == freeze_capture_token {
+                        compile_baseline_ms = profiling::take_profile_snapshot_with_options(
+                            false,
+                            &profiling::ProfileFormatOptions::default(),
+                        )
+                        .and_then(|snapshot| {
+                            compile_freeze::compile_ms_from_report_json(
+                                snapshot.report_json.as_str(),
+                            )
+                        });
                     }
                 }
                 t0.elapsed()
@@ -972,6 +1016,11 @@ fn run_benchmark<B: PortableBackend + 'static>(
                     "decode-steady",
                     profile_full,
                     artifact_config,
+                    Some(CompileFreezeGate {
+                        measured_token_threshold: args.compile_freeze_after,
+                        strict: args.strict_compile_freeze,
+                        baseline_compile_ms: compile_baseline_ms,
+                    }),
                 )?;
                 return Ok(true);
             }
@@ -987,6 +1036,7 @@ fn emit_profile_with_attribution(
     label: &str,
     profile_full: bool,
     artifact_config: &ProfileArtifactConfig,
+    compile_freeze_gate: Option<CompileFreezeGate>,
 ) -> Result<()> {
     let format_options = profiling::ProfileFormatOptions {
         measured_units: Some(measured_units).filter(|units| *units > 0.0),
@@ -995,6 +1045,35 @@ fn emit_profile_with_attribution(
         ..profiling::ProfileFormatOptions::default()
     };
     if let Some(snapshot) = profiling::take_profile_snapshot_with_options(false, &format_options) {
+        if let Some(gate) = compile_freeze_gate {
+            match compile_freeze::evaluate_compile_freeze(snapshot.report_json.as_str(), gate) {
+                Some(observation) if observation.has_anomaly() => {
+                    eprintln!(
+                        "Compile freeze check: compile activity detected after measured token {} ({:.3} ms total)",
+                        gate.measured_token_threshold,
+                        observation.compile_ms_after_threshold
+                    );
+                    if gate.strict {
+                        bail!(
+                            "strict compile freeze violation: compile activity ({:.3} ms) occurred after measured token {}",
+                            observation.compile_ms_after_threshold,
+                            gate.measured_token_threshold
+                        );
+                    }
+                }
+                Some(_) => {
+                    eprintln!(
+                        "Compile freeze check: no compile activity detected after measured token {}",
+                        gate.measured_token_threshold
+                    );
+                }
+                None => {
+                    eprintln!(
+                        "Compile freeze check: unavailable (missing profiler baseline or compile tables)"
+                    );
+                }
+            }
+        }
         if let Some(component_ms) = measured_component_ms_from_report_json(&snapshot.report_json) {
             let wall_ms = elapsed.as_secs_f64() * 1_000.0;
             let coverage = if wall_ms > 0.0 {

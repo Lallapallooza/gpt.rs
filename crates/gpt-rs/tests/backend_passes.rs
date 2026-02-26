@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use gpt_rs::backend::{
@@ -228,6 +229,42 @@ impl HintCostModel<CpuPortableBackend> for PreferDotCost {
     }
 }
 
+struct CountingLegalizer {
+    calls: Arc<AtomicUsize>,
+}
+
+impl HintLegalizer<CpuPortableBackend> for CountingLegalizer {
+    fn can_fuse(
+        &self,
+        _function: &Function,
+        _candidate: &FusionCandidate,
+        _cx: &OptimizeContext<CpuPortableBackend>,
+    ) -> Result<HintPolicy, gpt_rs::backend::fusion::FusionRejectReason> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(HintPolicy::Preferred)
+    }
+}
+
+struct CountingCost {
+    calls: Arc<AtomicUsize>,
+}
+
+impl HintCostModel<CpuPortableBackend> for CountingCost {
+    fn score(
+        &self,
+        _function: &Function,
+        candidate: &FusionCandidate,
+        _cx: &OptimizeContext<CpuPortableBackend>,
+    ) -> i64 {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match candidate.kind {
+            HintKind::DotEpilogue => 200,
+            HintKind::ElementwiseDag => 50,
+            HintKind::ReductionChain => 0,
+        }
+    }
+}
+
 #[test]
 fn fusion_hint_pass_materializes_dot_epilogue_hint_region() {
     let spec_a = TensorSpec::new(
@@ -283,4 +320,86 @@ fn fusion_hint_pass_materializes_dot_epilogue_hint_region() {
     assert_eq!(hint.body.len(), 2);
     assert_eq!(hint.body[0].id, dot);
     assert_eq!(hint.body[1].id, biased);
+}
+
+fn build_dot_epilogue_function() -> Function {
+    let spec_a = TensorSpec::new(
+        DType::F32,
+        Shape::new(vec![Dimension::from_usize(2), Dimension::from_usize(3)]),
+    );
+    let spec_b = TensorSpec::new(
+        DType::F32,
+        Shape::new(vec![Dimension::from_usize(3), Dimension::from_usize(4)]),
+    );
+    let spec_out = TensorSpec::new(
+        DType::F32,
+        Shape::new(vec![Dimension::from_usize(2), Dimension::from_usize(4)]),
+    );
+    let mut builder = ProgramBuilder::new();
+    let lhs = builder.add_parameter(ValueType::Tensor(spec_a.clone()));
+    let rhs = builder.add_parameter(ValueType::Tensor(spec_b.clone()));
+    let bias = builder.add_parameter(ValueType::Tensor(spec_out.clone()));
+    let dot = builder.emit_single(
+        Operation::DotGeneral(DotGeneralSpec {
+            batch_lhs: vec![],
+            batch_rhs: vec![],
+            contract_lhs: vec![1],
+            contract_rhs: vec![0],
+            accum_dtype: None,
+            out_dtype: None,
+        }),
+        vec![Operand::Value(lhs), Operand::Value(rhs)],
+        ValueType::Tensor(spec_out.clone()),
+    );
+    let biased = builder.emit_single(
+        Operation::ElementwiseBinary(gpt_rs::backend::spec::ElementwiseBinaryOp::Add),
+        vec![Operand::Value(dot), Operand::Value(bias)],
+        ValueType::Tensor(spec_out.clone()),
+    );
+    let out = builder.emit_single(
+        Operation::ElementwiseUnary(gpt_rs::backend::spec::ElementwiseUnaryOp::Tanh),
+        vec![Operand::Value(biased)],
+        ValueType::Tensor(spec_out),
+    );
+    builder.finish("main", vec![out])
+}
+
+#[test]
+fn fusion_hint_pass_selected_memo_skips_legalize_and_cost_on_repeat_graph() {
+    let legalizer_calls = Arc::new(AtomicUsize::new(0));
+    let cost_calls = Arc::new(AtomicUsize::new(0));
+    let pass = FusionHintPass::new(
+        Arc::new(CountingLegalizer {
+            calls: Arc::clone(&legalizer_calls),
+        }),
+        Arc::new(CountingCost {
+            calls: Arc::clone(&cost_calls),
+        }),
+    )
+    .with_min_score(97);
+    let backend = CpuPortableBackend::new();
+
+    let mut function_first = build_dot_epilogue_function();
+    let first = run_pass(&backend, &pass, &mut function_first);
+    assert!(first.changed);
+    let legalizer_after_first = legalizer_calls.load(Ordering::SeqCst);
+    let cost_after_first = cost_calls.load(Ordering::SeqCst);
+    assert!(legalizer_after_first > 0);
+    assert!(cost_after_first > 0);
+
+    let mut function_second = build_dot_epilogue_function();
+    let second = run_pass(&backend, &pass, &mut function_second);
+    assert!(second.changed);
+
+    let legalizer_after_second = legalizer_calls.load(Ordering::SeqCst);
+    let cost_after_second = cost_calls.load(Ordering::SeqCst);
+    assert_eq!(
+        legalizer_after_second, legalizer_after_first,
+        "selected memoized hints should skip legalizer on repeated graph"
+    );
+    assert_eq!(
+        cost_after_second, cost_after_first,
+        "selected memoized hints should skip cost model on repeated graph"
+    );
+    assert_eq!(function_first.hints, function_second.hints);
 }

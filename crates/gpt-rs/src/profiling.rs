@@ -2070,6 +2070,17 @@ fn section_rows_sorted(rows: &[TableRow]) -> Vec<TableRow> {
 }
 
 #[cfg(feature = "profiler")]
+fn cache_miss_reason_from_row_name(name: &str) -> Option<(&'static str, &str)> {
+    if let Some(reason) = name.strip_prefix("plan_cache_miss_reason.") {
+        return Some(("plan_cache", reason));
+    }
+    if let Some(reason) = name.strip_prefix("program_cache_miss_reason.") {
+        return Some(("program_cache", reason));
+    }
+    None
+}
+
+#[cfg(feature = "profiler")]
 pub fn report_to_jsonl(report: &ProfilerReport, options: &ProfileFormatOptions) -> String {
     let mut lines = Vec::new();
     lines.push(serde_json::json!({
@@ -2135,6 +2146,17 @@ pub fn report_to_jsonl(report: &ProfilerReport, options: &ProfileFormatOptions) 
                     "calls_per_unit": calls_per_unit.map(|v| format!("{v:.6}")),
                     "ms_per_unit": ms_per_unit.map(|v| format!("{v:.6}")),
                 }));
+                if table_name == "caches" {
+                    if let Some((cache, reason)) = cache_miss_reason_from_row_name(&row.name) {
+                        lines.push(serde_json::json!({
+                            "type": "cache_miss_reason",
+                            "section": section.section,
+                            "cache": cache,
+                            "reason": reason,
+                            "count": row.calls
+                        }));
+                    }
+                }
             }
         }
     }

@@ -15,6 +15,7 @@ fn profile_snapshot_includes_deterministic_jsonl_lines() {
         WorkStats::default(),
     );
     profiling::cache_event("cache.hit");
+    profiling::cache_event("program_cache_miss_reason.literal_value_only_change");
 
     let options = ProfileFormatOptions {
         measured_units: Some(3.0),
@@ -47,6 +48,14 @@ fn profile_snapshot_includes_deterministic_jsonl_lines() {
         value["type"] == "kpi" && value["name"] == "backend_ms/token"
     });
     assert!(has_unit_kpi);
+
+    let has_reason_row = lines.iter().any(|line| {
+        let value: serde_json::Value = serde_json::from_str(line).expect("json line");
+        value["type"] == "cache_miss_reason"
+            && value["cache"] == "program_cache"
+            && value["reason"] == "literal_value_only_change"
+    });
+    assert!(has_reason_row);
 }
 
 #[test]

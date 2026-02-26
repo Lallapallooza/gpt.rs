@@ -4,6 +4,7 @@ pub mod fusion;
 pub mod hashing;
 pub mod index;
 pub mod ir_query;
+pub mod op_signature;
 pub mod optimizer;
 pub mod param_resolver;
 pub mod passes;

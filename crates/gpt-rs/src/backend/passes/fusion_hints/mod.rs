@@ -5,7 +5,9 @@ use crate::backend::fusion::{
     SelectedFusion,
 };
 use crate::backend::optimizer::{FunctionPass, OptimizeContext, PassResult};
-use crate::backend::spec::{HintKind, PortableBackend};
+use crate::backend::spec::{Function, HintKind, PortableBackend};
+
+mod memo;
 
 pub struct FusionHintPass<B: PortableBackend + 'static> {
     legalizer: Arc<dyn HintLegalizer<B>>,
@@ -29,23 +31,26 @@ impl<B: PortableBackend + 'static> FusionHintPass<B> {
         self.min_score = min_score;
         self
     }
-}
 
-impl<B: PortableBackend + 'static> FunctionPass<B> for FusionHintPass<B> {
-    fn name(&self) -> &'static str {
-        "fusion_hint_regions"
+    fn materialize_and_report(function: &mut Function, selected: &[SelectedFusion]) -> PassResult {
+        for selected_hint in selected {
+            emit_selected(selected_hint.candidate.kind);
+        }
+        let changed = materialize_hints(function, selected);
+        PassResult {
+            changed,
+            iterations: 1,
+            rewrites_applied: selected.len(),
+            erased_insts: 0,
+        }
     }
 
-    fn run(
+    fn select_fusions(
         &self,
-        function: &mut crate::backend::spec::Function,
-        cx: &mut OptimizeContext<B>,
-    ) -> PassResult {
-        let candidates = match discover_candidates(function) {
-            Ok(candidates) => candidates,
-            Err(_) => return PassResult::default(),
-        };
-
+        function: &Function,
+        candidates: Vec<crate::backend::fusion::FusionCandidate>,
+        cx: &OptimizeContext<B>,
+    ) -> Vec<SelectedFusion> {
         let mut eligible = Vec::<SelectedFusion>::new();
         for candidate in candidates {
             emit_discovered(candidate.kind);
@@ -72,22 +77,43 @@ impl<B: PortableBackend + 'static> FunctionPass<B> for FusionHintPass<B> {
         for _ in 0..selection.rejected_overlap {
             crate::profiling::cache_event("fusion_hint_rejected_overlap");
         }
-        let selected = selection
+        selection
             .selected
             .into_iter()
             .map(|idx| eligible[idx].clone())
-            .collect::<Vec<_>>();
-        for selected_hint in &selected {
-            emit_selected(selected_hint.candidate.kind);
+            .collect()
+    }
+}
+
+impl<B: PortableBackend + 'static> FunctionPass<B> for FusionHintPass<B> {
+    fn name(&self) -> &'static str {
+        "fusion_hint_regions"
+    }
+
+    fn run(&self, function: &mut Function, cx: &mut OptimizeContext<B>) -> PassResult {
+        let memo_key = memo::build_key(function, cx.backend().backend_name(), self.min_score);
+
+        match memo::lookup(function, &memo_key) {
+            memo::MemoLookup::Selected(selected) => {
+                return Self::materialize_and_report(function, selected.as_slice());
+            }
+            memo::MemoLookup::Candidates(candidates) => {
+                let selected = self.select_fusions(function, candidates, cx);
+                memo::store_selected(&memo_key, function, selected.as_slice());
+                return Self::materialize_and_report(function, selected.as_slice());
+            }
+            memo::MemoLookup::Miss => {}
         }
 
-        let changed = materialize_hints(function, selected.as_slice());
-        PassResult {
-            changed,
-            iterations: 1,
-            rewrites_applied: selected.len(),
-            erased_insts: 0,
-        }
+        let candidates = match discover_candidates(function) {
+            Ok(candidates) => candidates,
+            Err(_) => return PassResult::default(),
+        };
+        memo::store_candidates(memo_key.clone(), function, candidates.as_slice());
+
+        let selected = self.select_fusions(function, candidates, cx);
+        memo::store_selected(&memo_key, function, selected.as_slice());
+        Self::materialize_and_report(function, selected.as_slice())
     }
 }
 

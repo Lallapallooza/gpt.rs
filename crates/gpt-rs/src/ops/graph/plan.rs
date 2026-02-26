@@ -10,8 +10,9 @@ use lru::LruCache;
 use once_cell::sync::Lazy;
 use serde::Serialize;
 
+use crate::backend::hashing::fnv1a_hash;
 use crate::backend::optimizer::PlanInputs;
-use crate::backend::spec::{Operand, Operation, Program, TensorSpec, ValueId};
+use crate::backend::spec::{Operand, Operation, Program, TensorLiteral, TensorSpec, ValueId};
 use crate::tensor::InputRole;
 
 /// Default number of cached plans retained per arena before LRU eviction kicks in.
@@ -49,7 +50,7 @@ impl PlanKey {
         bytes.extend_from_slice(backend.as_bytes());
         bytes.push(0);
         bytes.extend(bincode::serialize(&signature)?);
-        let hash = fnv_hash(&bytes);
+        let hash = fnv1a_hash(&bytes);
         Ok(PlanKey { version, hash })
     }
 }
@@ -213,8 +214,22 @@ struct SignatureInput {
 struct SignatureNode {
     value: ValueId,
     op: Operation,
-    operands: Vec<Operand>,
+    operands: Vec<SignatureOperand>,
     spec: TensorSpec,
+}
+
+#[derive(Serialize)]
+enum SignatureOperand {
+    Value(ValueId),
+    TupleElement { tuple: ValueId, index: usize },
+    Literal(SignatureLiteral),
+}
+
+#[derive(Serialize)]
+struct SignatureLiteral {
+    spec: TensorSpec,
+    byte_len: usize,
+    byte_hash: u64,
 }
 
 struct Canonicalizer {
@@ -238,14 +253,22 @@ impl Canonicalizer {
         })
     }
 
-    fn canon_operand(&mut self, operand: &Operand) -> Operand {
+    fn canon_operand(&mut self, operand: &Operand) -> SignatureOperand {
         match operand {
-            Operand::Value(v) => Operand::Value(self.canon_value(*v)),
-            Operand::TupleElement { tuple, index } => Operand::TupleElement {
+            Operand::Value(v) => SignatureOperand::Value(self.canon_value(*v)),
+            Operand::TupleElement { tuple, index } => SignatureOperand::TupleElement {
                 tuple: self.canon_value(*tuple),
                 index: *index,
             },
-            Operand::Literal(lit) => Operand::Literal(lit.clone()),
+            Operand::Literal(lit) => SignatureOperand::Literal(Self::literal_signature(lit)),
+        }
+    }
+
+    fn literal_signature(lit: &TensorLiteral) -> SignatureLiteral {
+        SignatureLiteral {
+            spec: lit.spec.clone(),
+            byte_len: lit.bytes.len(),
+            byte_hash: fnv1a_hash(lit.bytes.as_ref()),
         }
     }
 
@@ -290,18 +313,6 @@ impl Canonicalizer {
             nodes: sig_nodes,
         }
     }
-}
-
-fn fnv_hash(bytes: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x100000001b3;
-
-    let mut hash = OFFSET;
-    for byte in bytes {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
 }
 
 pub(super) fn ensure_targets_sorted(targets: &mut Vec<ValueId>) {

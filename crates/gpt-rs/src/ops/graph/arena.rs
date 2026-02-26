@@ -127,6 +127,10 @@ enum PlanCacheState {
 }
 
 impl PlanCacheState {
+    fn is_enabled(&self) -> bool {
+        matches!(self, PlanCacheState::Enabled(_))
+    }
+
     fn get(&self, key: &PlanKey) -> Option<Arc<CachedPlan>> {
         match self {
             PlanCacheState::Disabled => None,
@@ -659,6 +663,11 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
                 .map(|plan| (plan, true));
         }
         crate::profiling::cache_event("plan_cache_miss");
+        if self.plan_cache.is_enabled() {
+            crate::profiling::cache_event("plan_cache_miss_lookup");
+        } else {
+            crate::profiling::cache_event("plan_cache_miss_disabled");
+        }
 
         let plan = {
             let _scope = crate::profiling::compile_scope("graph::build_plan");
@@ -742,6 +751,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
             )));
         }
         crate::profiling::cache_event("program_cache_miss");
+        crate::profiling::cache_event("program_cache_miss_lookup");
 
         let (mut function, entry_params) = {
             let _scope = crate::profiling::compile_scope("graph::lower_to_program");

@@ -36,6 +36,7 @@ pub(super) struct PlanKey {
     pub(super) version: u64,
     pub(super) graph_hash: u64,
     pub(super) specialization_hash: u64,
+    pub(super) input_binding_hash: u64,
     pub(super) shape_hash: u64,
     pub(super) dtype_hash: u64,
     pub(super) layout_hash: u64,
@@ -76,6 +77,7 @@ impl PlanKey {
             version,
             graph_hash,
             specialization_hash: specialization.specialization_hash,
+            input_binding_hash: specialization.input_binding_hash,
             shape_hash: specialization.shape_hash,
             dtype_hash: specialization.dtype_hash,
             layout_hash: specialization.layout_hash,
@@ -396,6 +398,7 @@ enum GraphSignatureOperand {
 #[derive(Clone, Copy)]
 struct SpecializationData {
     specialization_hash: u64,
+    input_binding_hash: u64,
     shape_hash: u64,
     dtype_hash: u64,
     layout_hash: u64,
@@ -406,6 +409,13 @@ struct SpecializationData {
 
 impl SpecializationData {
     fn from_signature(backend: &str, signature: &SignatureData) -> Result<Self> {
+        let input_binding_hash = hash_serializable(
+            &signature
+                .inputs
+                .iter()
+                .map(|input| (input.role, input.stable_id))
+                .collect::<Vec<_>>(),
+        )?;
         let shape_hash = hash_serializable(&ShapeSignature::from_signature(signature))?;
         let dtype_hash = hash_serializable(&DTypeSignature::from_signature(signature))?;
         let layout_hash = hash_serializable(&LayoutSignature::from_signature(signature))?;
@@ -421,6 +431,7 @@ impl SpecializationData {
         let backend_option_hash = fnv1a_hash(backend.as_bytes());
         let specialization_hash = hash_serializable(&[
             op_hash,
+            input_binding_hash,
             shape_hash,
             dtype_hash,
             layout_hash,
@@ -430,6 +441,7 @@ impl SpecializationData {
         ])?;
         Ok(Self {
             specialization_hash,
+            input_binding_hash,
             shape_hash,
             dtype_hash,
             layout_hash,

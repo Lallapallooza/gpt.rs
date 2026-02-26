@@ -520,7 +520,9 @@ fn main() -> Result<()> {
             ..profiling::ProfileFormatOptions::default()
         };
         if let Some(snapshot) = profiling::take_profile_snapshot_with_options(false, &options) {
-            eprintln!("{}", snapshot.formatted);
+            if let Some(formatted) = snapshot.formatted_str() {
+                eprintln!("{formatted}");
+            }
             write_profile_artifacts(&snapshot, &artifact_config)?;
         } else {
             eprintln!(
@@ -970,7 +972,9 @@ fn run_benchmark<B: PortableBackend + 'static>(
                     &profiling::ProfileFormatOptions::default(),
                 )
                 .and_then(|snapshot| {
-                    compile_freeze::compile_ms_from_report_json(snapshot.report_json.as_str())
+                    snapshot
+                        .report_json_str()
+                        .and_then(compile_freeze::compile_ms_from_report_json)
                 })
             } else {
                 None
@@ -991,9 +995,9 @@ fn run_benchmark<B: PortableBackend + 'static>(
                             &profiling::ProfileFormatOptions::default(),
                         )
                         .and_then(|snapshot| {
-                            compile_freeze::compile_ms_from_report_json(
-                                snapshot.report_json.as_str(),
-                            )
+                            snapshot
+                                .report_json_str()
+                                .and_then(compile_freeze::compile_ms_from_report_json)
                         });
                     }
                 }
@@ -1045,8 +1049,9 @@ fn emit_profile_with_attribution(
         ..profiling::ProfileFormatOptions::default()
     };
     if let Some(snapshot) = profiling::take_profile_snapshot_with_options(false, &format_options) {
+        let report_json = snapshot.report_json_str().unwrap_or("");
         if let Some(gate) = compile_freeze_gate {
-            match compile_freeze::evaluate_compile_freeze(snapshot.report_json.as_str(), gate) {
+            match compile_freeze::evaluate_compile_freeze(report_json, gate) {
                 Some(observation) if observation.has_anomaly() => {
                     eprintln!(
                         "Compile freeze check: compile activity detected after measured token {} ({:.3} ms total)",
@@ -1074,7 +1079,7 @@ fn emit_profile_with_attribution(
                 }
             }
         }
-        if let Some(component_ms) = measured_component_ms_from_report_json(&snapshot.report_json) {
+        if let Some(component_ms) = measured_component_ms_from_report_json(report_json) {
             let wall_ms = elapsed.as_secs_f64() * 1_000.0;
             let coverage = if wall_ms > 0.0 {
                 (component_ms / wall_ms) * 100.0
@@ -1100,7 +1105,9 @@ fn emit_profile_with_attribution(
         } else {
             eprintln!("Attribution ({label}): unavailable (failed to parse profiler report).");
         }
-        eprintln!("{}", snapshot.formatted);
+        if let Some(formatted) = snapshot.formatted_str() {
+            eprintln!("{formatted}");
+        }
         write_profile_artifacts(&snapshot, artifact_config)?;
     } else {
         eprintln!(
@@ -1121,7 +1128,8 @@ fn write_profile_artifacts(
         .with_context(|| format!("failed to create profile output dir {}", out_dir.display()))?;
 
     let jsonl_path = out_dir.join("profile.jsonl");
-    fs::write(&jsonl_path, snapshot.profile_jsonl.as_bytes())
+    let profile_jsonl = snapshot.profile_jsonl_str().unwrap_or("");
+    fs::write(&jsonl_path, profile_jsonl.as_bytes())
         .with_context(|| format!("failed to write {}", jsonl_path.display()))?;
 
     if artifact_config.write_timeline || artifact_config.write_flamegraph {

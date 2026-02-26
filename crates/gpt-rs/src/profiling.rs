@@ -1237,6 +1237,36 @@ pub struct ProfileSnapshot {
 }
 
 #[cfg(feature = "profiler")]
+impl ProfileSnapshot {
+    pub fn formatted_str(&self) -> Option<&str> {
+        Some(self.formatted.as_str())
+    }
+
+    pub fn report_json_str(&self) -> Option<&str> {
+        Some(self.report_json.as_str())
+    }
+
+    pub fn profile_jsonl_str(&self) -> Option<&str> {
+        Some(self.profile_jsonl.as_str())
+    }
+}
+
+#[cfg(not(feature = "profiler"))]
+impl ProfileSnapshot {
+    pub fn formatted_str(&self) -> Option<&str> {
+        None
+    }
+
+    pub fn report_json_str(&self) -> Option<&str> {
+        None
+    }
+
+    pub fn profile_jsonl_str(&self) -> Option<&str> {
+        None
+    }
+}
+
+#[cfg(feature = "profiler")]
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct ProfilerTables {
     pub layers: Vec<TableRow>,

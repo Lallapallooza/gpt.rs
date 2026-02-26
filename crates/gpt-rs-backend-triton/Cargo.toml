@@ -18,4 +18,6 @@ default = []
 torch = ["gpt-rs-backend-tests/torch"]
 
 [dev-dependencies]
+anyhow = { workspace = true }
 gpt-rs-backend-tests = { path = "../gpt-rs-backend-tests", version = "0.1.0" }
+gpt-rs-macros = { path = "../gpt-rs-macros", version = "0.1.0" }

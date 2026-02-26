@@ -1,0 +1,31 @@
+# gpt_rs.kernel: dynamic_slice_si32_rank1
+# gpt_rs.symbol: gpt_rs_triton_dynamic_slice_si32_rank1
+# gpt_rs.signature: in_ptr=*i32,starts_ptr=*i32,out_ptr=*i32,n=i32,max_start=i32
+# gpt_rs.param_abi: *i32,*i32,*i32,u32,i32,*opaque
+# gpt_rs.constexpr: BLOCK_SIZE=256
+# gpt_rs.num_warps: 4
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def gpt_rs_triton_dynamic_slice_si32_rank1(
+    in_ptr,
+    starts_ptr,
+    out_ptr,
+    n,
+    max_start,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = idx < n
+
+    raw_start = tl.load(starts_ptr)
+    start = tl.maximum(raw_start, 0)
+    start = tl.minimum(start, max_start)
+    src_idx = start + idx
+
+    values = tl.load(in_ptr + src_idx, mask=mask, other=0)
+    tl.store(out_ptr + idx, values, mask=mask)

@@ -5,6 +5,7 @@ mod fused_dot_epilogue;
 mod fused_elementwise;
 mod kernel_cache;
 mod layer_norm;
+mod literals;
 mod ops;
 mod slots;
 mod softmax;
@@ -27,11 +28,13 @@ use gpt_rs::backend::spec::{
 use gpt_rs::backend::topology;
 use gpt_rs::profiling::{self, ScopeMeta, WorkStats};
 
+use crate::artifact::TritonFunctionBufferPlan;
 use crate::compiler::KernelCompiler;
 use crate::device::{CudaDriver, DeviceBuffer};
 use crate::kernels::{
     KernelKind, KernelSpec, BROADCAST_KERNEL_ID, BROADCAST_SI32_KERNEL_ID,
     COMPARE_SI32_I1_KERNEL_ID, CONCAT_KERNEL_ID, DOT_BIAS_RANK2_KERNEL_ID,
+    DYNAMIC_SLICE_F32_KERNEL_ID, DYNAMIC_SLICE_SI32_RANK1_KERNEL_ID,
     DYNAMIC_UPDATE_SLICE_F32_KERNEL_ID, EWISE_BINARY_KERNEL_ID, EWISE_UNARY_KERNEL_ID,
     EXTRACT_PATCHES_NHWC_KERNEL_ID, IOTA_SI32_KERNEL_ID, REDUCE_MAX_LAST_AXIS_KERNEL_ID,
     REDUCE_SUM_LAST_AXIS_KERNEL_ID, REDUCE_WINDOW_MAX_NHWC_KERNEL_ID, SELECT_I1_F32_KERNEL_ID,
@@ -61,6 +64,7 @@ pub struct TritonExecutor {
     compiler: KernelCompiler,
     loaded_kernels: Mutex<HashMap<u64, Arc<LoadedKernel>>>,
     fused_kernel_specs: Mutex<HashMap<u64, KernelSpec>>,
+    literal_tensors: Mutex<HashMap<u64, TritonTensor>>,
     cublas: OnceLock<Result<Arc<CublasContext>, String>>,
 }
 
@@ -70,6 +74,7 @@ impl TritonExecutor {
             compiler: KernelCompiler::new(),
             loaded_kernels: Mutex::new(HashMap::new()),
             fused_kernel_specs: Mutex::new(HashMap::new()),
+            literal_tensors: Mutex::new(HashMap::new()),
             cublas: OnceLock::new(),
         }
     }
@@ -99,7 +104,7 @@ fn validate_function_topology(function: &gpt_rs::backend::spec::Function) -> Bac
 
 fn compute_value_last_use(
     function: &gpt_rs::backend::spec::Function,
-    slot_plan: Option<&crate::artifact::TritonFunctionSlotPlan>,
+    slot_plan: Option<&TritonFunctionBufferPlan>,
 ) -> HashMap<ValueId, usize> {
     let mut last_use = HashMap::new();
     for (idx, instruction) in function.body.iter().enumerate() {
@@ -131,11 +136,15 @@ fn compute_value_last_use(
             .or_insert(result_pos);
     }
     if let Some(slot_plan) = slot_plan {
-        for slot_binding in &slot_plan.value_slots {
+        for slot_binding in slot_plan
+            .buffers
+            .iter()
+            .filter(|buffer| buffer.slot.is_some() && buffer.path.is_empty())
+        {
             last_use
                 .entry(slot_binding.value)
-                .and_modify(|existing| *existing = (*existing).max(slot_binding.live_end))
-                .or_insert(slot_binding.live_end);
+                .and_modify(|existing| *existing = (*existing).max(slot_binding.live_range.end))
+                .or_insert(slot_binding.live_range.end);
         }
     }
     last_use

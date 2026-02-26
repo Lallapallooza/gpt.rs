@@ -44,7 +44,7 @@ impl<'a, B: PortableBackend + 'static> GraphBuilder<'a, B> {
                 if role == InputRole::Param {
                     self.arena.param_resolver.set(stable_id, handle.clone());
                 }
-                self.inner.parameters.push(ParameterRecord {
+                self.inner.push_parameter(ParameterRecord {
                     value,
                     spec,
                     handle: Some(handle),
@@ -77,7 +77,7 @@ impl<'a, B: PortableBackend + 'static> GraphBuilder<'a, B> {
                         source: Arc::clone(source),
                     },
                 );
-                self.inner.parameters.push(ParameterRecord {
+                self.inner.push_parameter(ParameterRecord {
                     value,
                     spec,
                     handle: None,
@@ -95,7 +95,7 @@ impl<'a, B: PortableBackend + 'static> GraphBuilder<'a, B> {
                     let handle = tensor.materialize()?;
                     let value_id = self.allocate_value();
                     let spec = tensor.tensor_spec();
-                    self.inner.parameters.push(ParameterRecord {
+                    self.inner.push_parameter(ParameterRecord {
                         value: value_id,
                         spec,
                         handle: Some(handle),

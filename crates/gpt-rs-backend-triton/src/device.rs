@@ -564,6 +564,10 @@ impl CudaDriver {
         }
     }
 
+    pub fn stream_handle(&self) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
     fn ctx_ptr(&self) -> CUcontext {
         self.ctx as CUcontext
     }

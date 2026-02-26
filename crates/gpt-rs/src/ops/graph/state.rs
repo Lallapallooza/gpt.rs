@@ -15,6 +15,7 @@ pub(super) struct GraphInner<B: PortableBackend + 'static> {
     pub(super) nodes: HashMap<ValueId, NodeRecord<B>>,
     pub(super) order: Vec<ValueId>,
     pub(super) parameters: Vec<ParameterRecord<B>>,
+    pub(super) parameter_by_value: HashMap<ValueId, usize>,
     pub(super) parameter_lookup: HashMap<(InputRole, u128), ValueId>,
     pub(super) param_sources: HashMap<u128, ParamSourceRecord<B>>,
     pub(super) exports: HashSet<ValueId>,
@@ -29,6 +30,7 @@ impl<B: PortableBackend + 'static> GraphInner<B> {
             nodes: HashMap::new(),
             order: Vec::new(),
             parameters: Vec::new(),
+            parameter_by_value: HashMap::new(),
             parameter_lookup: HashMap::new(),
             param_sources: HashMap::new(),
             exports: HashSet::new(),
@@ -38,6 +40,24 @@ impl<B: PortableBackend + 'static> GraphInner<B> {
 
     pub(super) fn bump_version(&mut self) {
         self.version = self.version.wrapping_add(1);
+    }
+
+    pub(super) fn parameter(&self, value: ValueId) -> Option<&ParameterRecord<B>> {
+        self.parameter_by_value
+            .get(&value)
+            .copied()
+            .and_then(|idx| self.parameters.get(idx))
+    }
+
+    pub(super) fn parameter_mut(&mut self, value: ValueId) -> Option<&mut ParameterRecord<B>> {
+        let idx = self.parameter_by_value.get(&value).copied()?;
+        self.parameters.get_mut(idx)
+    }
+
+    pub(super) fn push_parameter(&mut self, record: ParameterRecord<B>) {
+        let idx = self.parameters.len();
+        self.parameter_by_value.insert(record.value, idx);
+        self.parameters.push(record);
     }
 }
 

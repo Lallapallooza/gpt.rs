@@ -1,7 +1,7 @@
 # gpt_rs.kernel: dynamic_update_slice_f32_rank4
 # gpt_rs.symbol: gpt_rs_triton_dynamic_update_slice_f32_rank4
-# gpt_rs.signature: update_ptr=*fp32,out_ptr=*fp32,n=i32,ud0=i32,ud1=i32,ud2=i32,ud3=i32,os0=i32,os1=i32,os2=i32,os3=i32,st0=i32,st1=i32,st2=i32,st3=i32
-# gpt_rs.param_abi: *fp32,*fp32,u32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,*opaque
+# gpt_rs.signature: update_ptr=*fp32,out_ptr=*fp32,starts_ptr=*i32,n=i32,ud0=i32,ud1=i32,ud2=i32,ud3=i32,os0=i32,os1=i32,os2=i32,os3=i32,mx0=i32,mx1=i32,mx2=i32,mx3=i32,start_offset=i32
+# gpt_rs.param_abi: *fp32,*fp32,*i32,u32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,i32,*opaque
 # gpt_rs.constexpr: BLOCK_SIZE=256
 # gpt_rs.num_warps: 8
 
@@ -13,6 +13,7 @@ import triton.language as tl
 def gpt_rs_triton_dynamic_update_slice_f32_rank4(
     update_ptr,
     out_ptr,
+    starts_ptr,
     n,
     ud0,
     ud1,
@@ -22,15 +23,31 @@ def gpt_rs_triton_dynamic_update_slice_f32_rank4(
     os1,
     os2,
     os3,
-    st0,
-    st1,
-    st2,
-    st3,
+    mx0,
+    mx1,
+    mx2,
+    mx3,
+    start_offset,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = idx < n
+
+    s0_idx = 0 - start_offset
+    s1_idx = 1 - start_offset
+    s2_idx = 2 - start_offset
+    s3_idx = 3 - start_offset
+
+    st0_raw = tl.load(starts_ptr + tl.maximum(s0_idx, 0), mask=s0_idx >= 0, other=0)
+    st1_raw = tl.load(starts_ptr + tl.maximum(s1_idx, 0), mask=s1_idx >= 0, other=0)
+    st2_raw = tl.load(starts_ptr + tl.maximum(s2_idx, 0), mask=s2_idx >= 0, other=0)
+    st3_raw = tl.load(starts_ptr + tl.maximum(s3_idx, 0), mask=s3_idx >= 0, other=0)
+
+    st0 = tl.minimum(tl.maximum(st0_raw, 0), mx0)
+    st1 = tl.minimum(tl.maximum(st1_raw, 0), mx1)
+    st2 = tl.minimum(tl.maximum(st2_raw, 0), mx2)
+    st3 = tl.minimum(tl.maximum(st3_raw, 0), mx3)
 
     plane23 = ud2 * ud3
     plane123 = ud1 * plane23

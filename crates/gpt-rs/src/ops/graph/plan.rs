@@ -59,22 +59,41 @@ pub(super) enum CacheMissReason {
 }
 
 impl PlanKey {
-    pub(super) fn new_from_views(
+    pub(super) fn new_pair_from_views(
         backend: &str,
         version: u64,
         inputs: &[InputSignature],
         exports: &[ValueId],
         targets: &[ValueId],
         node_views: &[PlanNodeView<'_>],
-    ) -> Result<Self> {
+    ) -> Result<(Self, Self)> {
         let signature = SignatureData::from_views(inputs, exports, targets, node_views);
-        let graph_hash = hash_serializable(&GraphSignatureData::from_signature(&signature))?;
+        let graph_body = GraphSignatureBody::from_signature(&signature);
+        let full_graph_hash =
+            graph_body.hash(signature.exports.as_slice(), signature.targets.as_slice())?;
+        let compile_graph_hash = graph_body.hash(&[], &[])?;
         let specialization = SpecializationData::from_signature(backend, &signature)?;
+
+        Ok((
+            Self::from_graph_and_specialization(version, full_graph_hash, specialization),
+            Self::from_graph_and_specialization(version, compile_graph_hash, specialization),
+        ))
+    }
+
+    pub(super) fn with_version(self, version: u64) -> Self {
+        Self { version, ..self }
+    }
+
+    fn from_graph_and_specialization(
+        version: u64,
+        graph_hash: u64,
+        specialization: SpecializationData,
+    ) -> Self {
         let mut combined = [0u8; 16];
         combined[..8].copy_from_slice(&graph_hash.to_le_bytes());
         combined[8..].copy_from_slice(&specialization.specialization_hash.to_le_bytes());
         let hash = fnv1a_hash(&combined);
-        Ok(PlanKey {
+        PlanKey {
             version,
             graph_hash,
             specialization_hash: specialization.specialization_hash,
@@ -86,11 +105,7 @@ impl PlanKey {
             kv_bucket_hash: specialization.kv_bucket_hash,
             backend_option_hash: specialization.backend_option_hash,
             hash,
-        })
-    }
-
-    pub(super) fn with_version(self, version: u64) -> Self {
-        Self { version, ..self }
+        }
     }
 
     pub(super) fn classify_change_from(self, previous: Option<PlanKey>) -> CacheMissReason {
@@ -185,7 +200,8 @@ pub(super) struct CachedPlan {
     pub(super) inputs: PlanInputs,
     pub(super) parameter_specs: Vec<ParameterSpec>,
     pub(super) parameter_values: Vec<ValueId>,
-    pub(super) outputs: Vec<ValueId>,
+    pub(super) requested_outputs: Vec<ValueId>,
+    pub(super) program_outputs: Vec<ValueId>,
     pub(super) exports: Vec<ValueId>,
 }
 
@@ -198,7 +214,8 @@ impl CachedPlan {
         inputs: PlanInputs,
         parameter_specs: Vec<ParameterSpec>,
         parameter_values: Vec<ValueId>,
-        outputs: Vec<ValueId>,
+        requested_outputs: Vec<ValueId>,
+        program_outputs: Vec<ValueId>,
         exports: Vec<ValueId>,
     ) -> Self {
         CachedPlan {
@@ -208,7 +225,8 @@ impl CachedPlan {
             inputs,
             parameter_specs,
             parameter_values,
-            outputs,
+            requested_outputs,
+            program_outputs,
             exports,
         }
     }
@@ -218,6 +236,7 @@ impl CachedPlan {
 pub(super) struct CachedProgram {
     pub(super) program: Arc<Program>,
     pub(super) inputs: PlanInputs,
+    pub(super) program_outputs: Vec<ValueId>,
 }
 
 pub(super) fn get_cached_program(key: &PlanKey) -> Option<CachedProgram> {
@@ -225,9 +244,21 @@ pub(super) fn get_cached_program(key: &PlanKey) -> Option<CachedProgram> {
     cache.get(key).cloned()
 }
 
-pub(super) fn insert_cached_program(key: PlanKey, program: Arc<Program>, inputs: PlanInputs) {
+pub(super) fn insert_cached_program(
+    key: PlanKey,
+    program: Arc<Program>,
+    inputs: PlanInputs,
+    program_outputs: Vec<ValueId>,
+) {
     let mut cache = PROGRAM_CACHE.lock().expect("program cache poisoned");
-    cache.put(key, CachedProgram { program, inputs });
+    cache.put(
+        key,
+        CachedProgram {
+            program,
+            inputs,
+            program_outputs,
+        },
+    );
 }
 
 /// In-memory LRU cache keyed by [`PlanKey`].
@@ -330,15 +361,12 @@ struct SignatureLiteral {
     byte_hash: u64,
 }
 
-#[derive(Serialize)]
-struct GraphSignatureData {
+struct GraphSignatureBody {
     inputs: Vec<GraphSignatureInput>,
-    exports: Vec<ValueId>,
-    targets: Vec<ValueId>,
     nodes: Vec<GraphSignatureNode>,
 }
 
-impl GraphSignatureData {
+impl GraphSignatureBody {
     fn from_signature(signature: &SignatureData) -> Self {
         Self {
             inputs: signature
@@ -349,8 +377,6 @@ impl GraphSignatureData {
                     has_stable_id: input.stable_id.is_some(),
                 })
                 .collect(),
-            exports: signature.exports.clone(),
-            targets: signature.targets.clone(),
             nodes: signature
                 .nodes
                 .iter()
@@ -377,6 +403,23 @@ impl GraphSignatureData {
                 .collect(),
         }
     }
+
+    fn hash(&self, exports: &[ValueId], targets: &[ValueId]) -> Result<u64> {
+        hash_serializable(&GraphSignatureView {
+            inputs: self.inputs.as_slice(),
+            exports,
+            targets,
+            nodes: self.nodes.as_slice(),
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct GraphSignatureView<'a> {
+    inputs: &'a [GraphSignatureInput],
+    exports: &'a [ValueId],
+    targets: &'a [ValueId],
+    nodes: &'a [GraphSignatureNode],
 }
 
 #[derive(Serialize)]

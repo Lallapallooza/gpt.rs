@@ -26,7 +26,7 @@ impl TritonExecutor {
                     &out_spec,
                     instruction_pos,
                 )?;
-                literal_to_tensor(driver, literal, output)
+                self.materialize_literal(driver, literal, output)
             }
             Operation::StopGradient | Operation::Reshape(_) => {
                 let source_value = match instruction.operands.first() {
@@ -390,7 +390,7 @@ impl TritonExecutor {
                     id.0
                 ))
             }),
-            Some(Operand::Literal(literal)) => literal_to_tensor(driver, literal, None),
+            Some(Operand::Literal(literal)) => self.materialize_literal(driver, literal, None),
             Some(Operand::TupleElement { .. }) => Err(BackendError::execution(
                 "tuple element operands are not supported by triton runtime",
             )),

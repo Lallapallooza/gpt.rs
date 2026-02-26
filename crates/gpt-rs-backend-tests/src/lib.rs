@@ -29,6 +29,12 @@ macro_rules! define_backend_tests {
             }
 
             #[$test_attr]
+            fn smoke_gpt_kv_cache_matches_full_context_decode() {
+                let backend = ($backend_ctor)();
+                smoke::gpt_kv_cache_matches_full_context_decode(&backend);
+            }
+
+            #[$test_attr]
             fn api_linear_initializes_from_host_and_device_weights() {
                 let backend = ($backend_ctor)();
                 api_invariants::linear_initializes_from_host_and_device_weights(&backend);

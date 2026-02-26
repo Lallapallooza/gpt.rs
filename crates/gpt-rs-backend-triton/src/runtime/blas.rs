@@ -135,9 +135,13 @@ type CublasHandle = *mut c_void;
 const CUBLAS_STATUS_SUCCESS: CublasStatus = 0;
 const CUBLAS_OP_N: i32 = 0;
 const CUBLAS_OP_T: i32 = 1;
+const CUBLAS_POINTER_MODE_DEVICE: i32 = 1;
 
 type CublasCreateFn = unsafe extern "C" fn(handle: *mut CublasHandle) -> CublasStatus;
 type CublasDestroyFn = unsafe extern "C" fn(handle: CublasHandle) -> CublasStatus;
+type CublasSetStreamFn =
+    unsafe extern "C" fn(handle: CublasHandle, stream: *mut c_void) -> CublasStatus;
+type CublasSetPointerModeFn = unsafe extern "C" fn(handle: CublasHandle, mode: i32) -> CublasStatus;
 type CublasSgemmFn = unsafe extern "C" fn(
     handle: CublasHandle,
     transa: i32,
@@ -178,6 +182,8 @@ type CublasSgemmStridedBatchedFn = unsafe extern "C" fn(
 struct CublasFns {
     create: CublasCreateFn,
     destroy: CublasDestroyFn,
+    set_stream: CublasSetStreamFn,
+    set_pointer_mode: CublasSetPointerModeFn,
     sgemm: CublasSgemmFn,
     sgemm_strided_batched: CublasSgemmStridedBatchedFn,
 }
@@ -187,6 +193,8 @@ pub(super) struct CublasContext {
     fns: CublasFns,
     handle: usize,
     driver: Arc<CudaDriver>,
+    alpha: Arc<DeviceBuffer>,
+    beta: Arc<DeviceBuffer>,
 }
 
 impl Drop for CublasContext {
@@ -215,6 +223,8 @@ impl CublasContext {
         let fns = CublasFns {
             create: load_cublas_symbol(&lib, b"cublasCreate_v2\0")?,
             destroy: load_cublas_symbol(&lib, b"cublasDestroy_v2\0")?,
+            set_stream: load_cublas_symbol(&lib, b"cublasSetStream_v2\0")?,
+            set_pointer_mode: load_cublas_symbol(&lib, b"cublasSetPointerMode_v2\0")?,
             sgemm: load_cublas_symbol(&lib, b"cublasSgemm_v2\0")?,
             sgemm_strided_batched: load_cublas_symbol(&lib, b"cublasSgemmStridedBatched\0")?,
         };
@@ -227,13 +237,26 @@ impl CublasContext {
                 (fns.create)(&mut handle as *mut CublasHandle),
                 "cublasCreate_v2",
             )?;
+            check_cublas(
+                (fns.set_stream)(handle, driver.stream_handle()),
+                "cublasSetStream_v2",
+            )?;
+            check_cublas(
+                (fns.set_pointer_mode)(handle, CUBLAS_POINTER_MODE_DEVICE),
+                "cublasSetPointerMode_v2",
+            )?;
         }
+
+        let alpha = driver.alloc_and_upload(&1.0f32.to_ne_bytes())?;
+        let beta = driver.alloc_and_upload(&0.0f32.to_ne_bytes())?;
 
         Ok(Self {
             _lib: lib,
             fns,
             handle: handle as usize,
             driver,
+            alpha,
+            beta,
         })
     }
 
@@ -304,8 +327,8 @@ impl CublasContext {
             .map_err(|_| BackendError::execution("matrix dimension k exceeds i32"))?;
 
         self.driver.ensure_current()?;
-        let alpha = 1.0f32;
-        let beta = 0.0f32;
+        let alpha_ptr = self.alpha.device_ptr() as usize as *const f32;
+        let beta_ptr = self.beta.device_ptr() as usize as *const f32;
         // Row-major C = A * B using column-major GEMM: C^T = B^T * A^T.
         self.run_cublas_timed("cublasSgemm_v2", || {
             // SAFETY: pointers are valid CUDA device pointers for buffers sized according to m,n,k.
@@ -318,12 +341,12 @@ impl CublasContext {
                         n_i32,
                         m_i32,
                         k_i32,
-                        &alpha as *const f32,
+                        alpha_ptr,
                         rhs_ptr as usize as *const f32,
                         n_i32,
                         lhs_ptr as usize as *const f32,
                         k_i32,
-                        &beta as *const f32,
+                        beta_ptr,
                         out_ptr as usize as *mut f32,
                         n_i32,
                     ),
@@ -368,8 +391,8 @@ impl CublasContext {
             .map_err(|_| BackendError::execution("out stride exceeds i64"))?;
 
         self.driver.ensure_current()?;
-        let alpha = 1.0f32;
-        let beta = 0.0f32;
+        let alpha_ptr = self.alpha.device_ptr() as usize as *const f32;
+        let beta_ptr = self.beta.device_ptr() as usize as *const f32;
         // Row-major C = A * B using column-major GEMM: C^T = B^T * A^T.
         // Batch-strided variant follows the same transform.
         self.run_cublas_timed("cublasSgemmStridedBatched", || {
@@ -383,14 +406,14 @@ impl CublasContext {
                         n_i32,
                         m_i32,
                         k_i32,
-                        &alpha as *const f32,
+                        alpha_ptr,
                         rhs_ptr as usize as *const f32,
                         n_i32,
                         rhs_stride_i64,
                         lhs_ptr as usize as *const f32,
                         k_i32,
                         lhs_stride_i64,
-                        &beta as *const f32,
+                        beta_ptr,
                         out_ptr as usize as *mut f32,
                         n_i32,
                         out_stride_i64,
@@ -437,8 +460,8 @@ impl CublasContext {
             .map_err(|_| BackendError::execution("out stride exceeds i64"))?;
 
         self.driver.ensure_current()?;
-        let alpha = 1.0f32;
-        let beta = 0.0f32;
+        let alpha_ptr = self.alpha.device_ptr() as usize as *const f32;
+        let beta_ptr = self.beta.device_ptr() as usize as *const f32;
         // Row-major C = A(MxK) * B^T where rhs pointer stores row-major B(NxK).
         // Column-major equivalent per batch:
         // C^T(NxM) = B(NxK) * A^T(KxM), with cuBLAS transa=Transpose for rhs operand.
@@ -453,14 +476,14 @@ impl CublasContext {
                         n_i32,
                         m_i32,
                         k_i32,
-                        &alpha as *const f32,
+                        alpha_ptr,
                         rhs_ptr as usize as *const f32,
                         k_i32,
                         rhs_stride_i64,
                         lhs_ptr as usize as *const f32,
                         k_i32,
                         lhs_stride_i64,
-                        &beta as *const f32,
+                        beta_ptr,
                         out_ptr as usize as *mut f32,
                         n_i32,
                         out_stride_i64,

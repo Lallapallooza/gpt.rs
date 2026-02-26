@@ -488,7 +488,8 @@ fn main() -> Result<()> {
         "triton" => {
             #[cfg(feature = "backend-triton")]
             {
-                gpt_rs_backend_triton::set_gpu_event_timing(profile_enabled);
+                // Per-op CUDA event timing is only enabled for `--profile-full`.
+                gpt_rs_backend_triton::set_gpu_event_timing(profile_enabled && args.profile_full);
                 let backend = Arc::new(TritonBackend::new());
                 run_with_backend(
                     backend,

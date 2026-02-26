@@ -255,69 +255,160 @@ impl TritonExecutor {
                 "dynamic_slice sizes length must match input rank",
             ));
         }
-        let starts_values = read_i32_tensor(starts)?;
-        if starts_values.len() != rank {
-            return Err(BackendError::execution(
-                "dynamic_slice starts length must match input rank",
-            ));
-        }
-        let mut static_starts = Vec::with_capacity(rank);
-        for value in starts_values {
-            if value < 0 {
-                return Err(BackendError::execution(
-                    "dynamic_slice starts must be non-negative",
-                ));
-            }
-            static_starts.push(value as usize);
-        }
+        validate_starts_vector_shape(&starts.spec, rank, "dynamic_slice")?;
 
         match out_spec.dtype {
             DType::F32 => {
-                self.execute_slice_f32(driver, kernels, input, &static_starts, out_spec, output)
+                self.execute_dynamic_slice_f32(driver, kernels, input, starts, out_spec, output)
             }
-            DType::Si32 => {
-                // Rank-1 Si32 dynamic slice is required by decode attention query position path.
-                let in_dims = static_dims_or_error(&input.spec.shape, |_| {
-                    BackendError::execution(
-                        "dynamic dimensions are not supported by triton runtime",
-                    )
-                })?;
-                if in_dims.len() != 1 || static_starts.len() != 1 || spec.sizes.len() != 1 {
-                    return Err(BackendError::execution(
-                        "dynamic_slice Si32 path currently supports rank-1 only",
-                    ));
-                }
-                let start = static_starts[0];
-                let len = spec.sizes[0];
-                if match start.checked_add(len) {
-                    Some(end) => end > in_dims[0],
-                    None => true,
-                } {
-                    return Err(BackendError::execution(
-                        "dynamic_slice Si32 bounds check failed",
-                    ));
-                }
-                let out = allocate_output_tensor(driver, out_spec, output)?;
-                let offset_bytes = start
-                    .checked_mul(4)
-                    .ok_or_else(|| BackendError::execution("dynamic_slice Si32 offset overflow"))?;
-                let src_ptr = input
-                    .buffer
-                    .device_ptr()
-                    .checked_add(u64::try_from(offset_bytes).map_err(|_| {
-                        BackendError::execution("dynamic_slice Si32 offset conversion overflow")
-                    })?)
-                    .ok_or_else(|| {
-                        BackendError::execution("dynamic_slice Si32 pointer overflow")
-                    })?;
-                driver.copy_device_to_device(out.buffer.device_ptr(), src_ptr, len * 4)?;
-                Ok(out)
-            }
+            DType::Si32 => self
+                .execute_dynamic_slice_si32_rank1(driver, kernels, input, starts, out_spec, output),
             _ => Err(BackendError::execution(format!(
                 "dynamic_slice unsupported dtype {:?}",
                 out_spec.dtype
             ))),
         }
+    }
+
+    fn execute_dynamic_slice_f32(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernels: &HashMap<&str, &KernelSpec>,
+        input: &TritonTensor,
+        starts: &TritonTensor,
+        out_spec: &TensorSpec,
+        output: Option<TritonTensor>,
+    ) -> BackendResult<TritonTensor> {
+        let kernel = kernels.get(DYNAMIC_SLICE_F32_KERNEL_ID).ok_or_else(|| {
+            BackendError::execution("missing dynamic_slice_f32 kernel in triton artifact")
+        })?;
+        if !matches!(kernel.kind, KernelKind::DynamicSliceF32Rank4) {
+            return Err(BackendError::execution(format!(
+                "unexpected dynamic_slice_f32 kernel kind: {:?}",
+                kernel.kind
+            )));
+        }
+
+        let (out_dims, in_strides, max_starts, start_offset) =
+            dynamic_slice_rank4_layout(&input.spec.shape, &out_spec.shape)?;
+        let out = allocate_output_tensor(driver, out_spec, output)?;
+        let element_count = static_element_count(&out_spec.shape)?;
+        if element_count == 0 {
+            return Ok(out);
+        }
+        let loaded = self.load_kernel(driver, kernel)?;
+
+        let mut in_ptr = input.buffer.device_ptr();
+        let mut starts_ptr = starts.buffer.device_ptr();
+        let mut out_ptr = out.buffer.device_ptr();
+        let mut n = u32::try_from(element_count).map_err(|_| {
+            BackendError::execution("dynamic_slice_f32 element count exceeds u32 range")
+        })?;
+        let mut od0 = out_dims[0];
+        let mut od1 = out_dims[1];
+        let mut od2 = out_dims[2];
+        let mut od3 = out_dims[3];
+        let mut is0 = in_strides[0];
+        let mut is1 = in_strides[1];
+        let mut is2 = in_strides[2];
+        let mut is3 = in_strides[3];
+        let mut mx0 = max_starts[0];
+        let mut mx1 = max_starts[1];
+        let mut mx2 = max_starts[2];
+        let mut mx3 = max_starts[3];
+        let mut start_offset_i32 = start_offset;
+        let mut opaque_ptr = 0u64;
+        let mut params = [
+            (&mut in_ptr as *mut u64).cast::<c_void>(),
+            (&mut starts_ptr as *mut u64).cast::<c_void>(),
+            (&mut out_ptr as *mut u64).cast::<c_void>(),
+            (&mut n as *mut u32).cast::<c_void>(),
+            (&mut od0 as *mut i32).cast::<c_void>(),
+            (&mut od1 as *mut i32).cast::<c_void>(),
+            (&mut od2 as *mut i32).cast::<c_void>(),
+            (&mut od3 as *mut i32).cast::<c_void>(),
+            (&mut is0 as *mut i32).cast::<c_void>(),
+            (&mut is1 as *mut i32).cast::<c_void>(),
+            (&mut is2 as *mut i32).cast::<c_void>(),
+            (&mut is3 as *mut i32).cast::<c_void>(),
+            (&mut mx0 as *mut i32).cast::<c_void>(),
+            (&mut mx1 as *mut i32).cast::<c_void>(),
+            (&mut mx2 as *mut i32).cast::<c_void>(),
+            (&mut mx3 as *mut i32).cast::<c_void>(),
+            (&mut start_offset_i32 as *mut i32).cast::<c_void>(),
+            (&mut opaque_ptr as *mut u64).cast::<c_void>(),
+        ];
+        launch_1d(driver, &loaded, n, 256, &mut params)?;
+        Ok(out)
+    }
+
+    fn execute_dynamic_slice_si32_rank1(
+        &self,
+        driver: &Arc<CudaDriver>,
+        kernels: &HashMap<&str, &KernelSpec>,
+        input: &TritonTensor,
+        starts: &TritonTensor,
+        out_spec: &TensorSpec,
+        output: Option<TritonTensor>,
+    ) -> BackendResult<TritonTensor> {
+        let in_dims = static_dims_or_error(&input.spec.shape, |_| {
+            BackendError::execution("dynamic dimensions are not supported by triton runtime")
+        })?;
+        let out_dims = static_dims_or_error(&out_spec.shape, |_| {
+            BackendError::execution("dynamic dimensions are not supported by triton runtime")
+        })?;
+        if in_dims.len() != 1 || out_dims.len() != 1 {
+            return Err(BackendError::execution(
+                "dynamic_slice Si32 path currently supports rank-1 only",
+            ));
+        }
+        if out_dims[0] > in_dims[0] {
+            return Err(BackendError::execution(
+                "dynamic_slice Si32 size exceeds input dim",
+            ));
+        }
+        let max_start = i32::try_from(in_dims[0] - out_dims[0]).map_err(|_| {
+            BackendError::execution("dynamic_slice Si32 max start exceeds i32 range")
+        })?;
+        let kernel = kernels
+            .get(DYNAMIC_SLICE_SI32_RANK1_KERNEL_ID)
+            .ok_or_else(|| {
+                BackendError::execution(
+                    "missing dynamic_slice_si32_rank1 kernel in triton artifact",
+                )
+            })?;
+        if !matches!(kernel.kind, KernelKind::DynamicSliceSi32Rank1) {
+            return Err(BackendError::execution(format!(
+                "unexpected dynamic_slice_si32_rank1 kernel kind: {:?}",
+                kernel.kind
+            )));
+        }
+
+        let out = allocate_output_tensor(driver, out_spec, output)?;
+        let element_count = static_element_count(&out_spec.shape)?;
+        if element_count == 0 {
+            return Ok(out);
+        }
+        let loaded = self.load_kernel(driver, kernel)?;
+
+        let mut in_ptr = input.buffer.device_ptr();
+        let mut starts_ptr = starts.buffer.device_ptr();
+        let mut out_ptr = out.buffer.device_ptr();
+        let mut n = u32::try_from(element_count).map_err(|_| {
+            BackendError::execution("dynamic_slice Si32 element count exceeds u32 range")
+        })?;
+        let mut max_start_i32 = max_start;
+        let mut opaque_ptr = 0u64;
+        let mut params = [
+            (&mut in_ptr as *mut u64).cast::<c_void>(),
+            (&mut starts_ptr as *mut u64).cast::<c_void>(),
+            (&mut out_ptr as *mut u64).cast::<c_void>(),
+            (&mut n as *mut u32).cast::<c_void>(),
+            (&mut max_start_i32 as *mut i32).cast::<c_void>(),
+            (&mut opaque_ptr as *mut u64).cast::<c_void>(),
+        ];
+        launch_1d(driver, &loaded, n, 256, &mut params)?;
+        Ok(out)
     }
 
     pub(super) fn execute_transpose(
@@ -506,31 +597,7 @@ impl TritonExecutor {
                 "dynamic_update_slice runtime supports rank <= 4 only",
             ));
         }
-        let starts_values = read_i32_tensor(starts)?;
-        if starts_values.len() != base_dims.len() {
-            return Err(BackendError::execution(
-                "dynamic_update_slice starts length mismatch",
-            ));
-        }
-        let mut starts_usize = Vec::with_capacity(starts_values.len());
-        for value in starts_values {
-            if value < 0 {
-                return Err(BackendError::execution(
-                    "dynamic_update_slice starts must be non-negative",
-                ));
-            }
-            starts_usize.push(value as usize);
-        }
-        for axis in 0..base_dims.len() {
-            let end = starts_usize[axis]
-                .checked_add(update_dims[axis])
-                .ok_or_else(|| BackendError::execution("dynamic_update_slice bounds overflow"))?;
-            if end > base_dims[axis] {
-                return Err(BackendError::execution(
-                    "dynamic_update_slice update exceeds base bounds",
-                ));
-            }
-        }
+        validate_starts_vector_shape(&starts.spec, base_dims.len(), "dynamic_update_slice")?;
 
         let out = allocate_output_tensor(driver, out_spec, output)?;
         driver.copy_device_to_device(
@@ -543,11 +610,12 @@ impl TritonExecutor {
             return Ok(out);
         }
         let loaded = self.load_kernel(driver, kernel)?;
-        let (update_dims4, out_strides4, starts4) =
-            dynamic_update_rank4_layout(&update_dims, &base_dims, &starts_usize)?;
+        let (update_dims4, out_strides4, max_starts4, start_offset) =
+            dynamic_update_rank4_layout(&update_dims, &base_dims)?;
 
         let mut update_ptr = update.buffer.device_ptr();
         let mut out_ptr = out.buffer.device_ptr();
+        let mut starts_ptr = starts.buffer.device_ptr();
         let mut n = u32::try_from(update_elems).map_err(|_| {
             BackendError::execution("dynamic_update_slice update elements exceeds u32 range")
         })?;
@@ -559,14 +627,16 @@ impl TritonExecutor {
         let mut os1 = out_strides4[1];
         let mut os2 = out_strides4[2];
         let mut os3 = out_strides4[3];
-        let mut st0 = starts4[0];
-        let mut st1 = starts4[1];
-        let mut st2 = starts4[2];
-        let mut st3 = starts4[3];
+        let mut mx0 = max_starts4[0];
+        let mut mx1 = max_starts4[1];
+        let mut mx2 = max_starts4[2];
+        let mut mx3 = max_starts4[3];
+        let mut start_offset_i32 = start_offset;
         let mut opaque_ptr = 0u64;
         let mut params = [
             (&mut update_ptr as *mut u64).cast::<c_void>(),
             (&mut out_ptr as *mut u64).cast::<c_void>(),
+            (&mut starts_ptr as *mut u64).cast::<c_void>(),
             (&mut n as *mut u32).cast::<c_void>(),
             (&mut ud0 as *mut i32).cast::<c_void>(),
             (&mut ud1 as *mut i32).cast::<c_void>(),
@@ -576,13 +646,37 @@ impl TritonExecutor {
             (&mut os1 as *mut i32).cast::<c_void>(),
             (&mut os2 as *mut i32).cast::<c_void>(),
             (&mut os3 as *mut i32).cast::<c_void>(),
-            (&mut st0 as *mut i32).cast::<c_void>(),
-            (&mut st1 as *mut i32).cast::<c_void>(),
-            (&mut st2 as *mut i32).cast::<c_void>(),
-            (&mut st3 as *mut i32).cast::<c_void>(),
+            (&mut mx0 as *mut i32).cast::<c_void>(),
+            (&mut mx1 as *mut i32).cast::<c_void>(),
+            (&mut mx2 as *mut i32).cast::<c_void>(),
+            (&mut mx3 as *mut i32).cast::<c_void>(),
+            (&mut start_offset_i32 as *mut i32).cast::<c_void>(),
             (&mut opaque_ptr as *mut u64).cast::<c_void>(),
         ];
         launch_1d(driver, &loaded, n, 256, &mut params)?;
         Ok(out)
     }
+}
+
+fn validate_starts_vector_shape(
+    starts_spec: &TensorSpec,
+    rank: usize,
+    op: &str,
+) -> BackendResult<()> {
+    let starts_dims = static_dims_or_error(&starts_spec.shape, |_| {
+        BackendError::execution("dynamic dimensions are not supported by triton runtime")
+    })?;
+    if starts_dims.len() != 1 {
+        return Err(BackendError::execution(format!(
+            "{op} starts must be rank-1, got rank {}",
+            starts_dims.len()
+        )));
+    }
+    if starts_dims[0] != rank {
+        return Err(BackendError::execution(format!(
+            "{op} starts length mismatch: expected {rank}, got {}",
+            starts_dims[0]
+        )));
+    }
+    Ok(())
 }

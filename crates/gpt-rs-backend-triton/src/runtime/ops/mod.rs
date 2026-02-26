@@ -1,5 +1,8 @@
 use super::*;
 
+pub(super) type Rank4Layout = ([i32; 4], [i32; 4], [i32; 4]);
+pub(super) type DynamicRank4Layout = ([i32; 4], [i32; 4], [i32; 4], i32);
+
 pub(super) fn literal_to_tensor(
     driver: &Arc<CudaDriver>,
     literal: &TensorLiteral,
@@ -190,7 +193,7 @@ pub(super) fn slice_rank4_layout(
     in_shape: &gpt_rs::backend::spec::Shape,
     out_shape: &gpt_rs::backend::spec::Shape,
     starts: &[usize],
-) -> BackendResult<([i32; 4], [i32; 4], [i32; 4])> {
+) -> BackendResult<Rank4Layout> {
     let in_dims = static_dims_or_error(in_shape, |_| {
         BackendError::execution("dynamic dimensions are not supported by triton runtime")
     })?;
@@ -236,6 +239,62 @@ pub(super) fn slice_rank4_layout(
             .map_err(|_| BackendError::execution("slice start exceeds i32 range"))?;
     }
     Ok((out_i32, strides_i32, starts_i32))
+}
+
+pub(super) fn dynamic_slice_rank4_layout(
+    in_shape: &gpt_rs::backend::spec::Shape,
+    out_shape: &gpt_rs::backend::spec::Shape,
+) -> BackendResult<DynamicRank4Layout> {
+    let in_dims = static_dims_or_error(in_shape, |_| {
+        BackendError::execution("dynamic dimensions are not supported by triton runtime")
+    })?;
+    let out_dims = static_dims_or_error(out_shape, |_| {
+        BackendError::execution("dynamic dimensions are not supported by triton runtime")
+    })?;
+    if in_dims.len() > 4 || out_dims.len() > 4 {
+        return Err(BackendError::execution(
+            "dynamic_slice runtime supports rank <= 4 only",
+        ));
+    }
+    if in_dims.len() != out_dims.len() {
+        return Err(BackendError::execution(
+            "dynamic_slice starts/sizes rank mismatch",
+        ));
+    }
+
+    let mut in4 = [1usize; 4];
+    let mut out4 = [1usize; 4];
+    let mut max4 = [0usize; 4];
+    let offset = 4 - in_dims.len();
+    for axis in 0..in_dims.len() {
+        let in_dim = in_dims[axis];
+        let out_dim = out_dims[axis];
+        if out_dim > in_dim {
+            return Err(BackendError::execution(format!(
+                "dynamic_slice size exceeds dimension at axis {axis}",
+            )));
+        }
+        let dst = offset + axis;
+        in4[dst] = in_dim;
+        out4[dst] = out_dim;
+        max4[dst] = in_dim - out_dim;
+    }
+
+    let strides = contiguous_strides_or_error(&in4, || BackendError::execution("stride overflow"))?;
+    let mut out_i32 = [0i32; 4];
+    let mut strides_i32 = [0i32; 4];
+    let mut max_i32 = [0i32; 4];
+    for axis in 0..4 {
+        out_i32[axis] = i32::try_from(out4[axis])
+            .map_err(|_| BackendError::execution("dynamic_slice output dim exceeds i32 range"))?;
+        strides_i32[axis] = i32::try_from(strides[axis])
+            .map_err(|_| BackendError::execution("dynamic_slice input stride exceeds i32 range"))?;
+        max_i32[axis] = i32::try_from(max4[axis])
+            .map_err(|_| BackendError::execution("dynamic_slice max start exceeds i32 range"))?;
+    }
+    let start_offset = i32::try_from(offset)
+        .map_err(|_| BackendError::execution("dynamic_slice start offset exceeds i32 range"))?;
+    Ok((out_i32, strides_i32, max_i32, start_offset))
 }
 
 pub(super) struct ContiguousSliceCopyPlan {
@@ -458,14 +517,13 @@ pub(super) fn concat_rank4_layout(
 pub(super) fn dynamic_update_rank4_layout(
     update_dims: &[usize],
     out_dims: &[usize],
-    starts: &[usize],
-) -> BackendResult<([i32; 4], [i32; 4], [i32; 4])> {
+) -> BackendResult<DynamicRank4Layout> {
     if update_dims.len() > 4 || out_dims.len() > 4 {
         return Err(BackendError::execution(
             "dynamic_update_slice runtime supports rank <= 4 only",
         ));
     }
-    if update_dims.len() != out_dims.len() || starts.len() != out_dims.len() {
+    if update_dims.len() != out_dims.len() {
         return Err(BackendError::execution(
             "dynamic_update_slice rank mismatch",
         ));
@@ -475,25 +533,35 @@ pub(super) fn dynamic_update_rank4_layout(
 
     let mut update4 = [1usize; 4];
     let mut out_strides4 = [0usize; 4];
-    let mut starts4 = [0usize; 4];
+    let mut max4 = [0usize; 4];
     let offset = 4 - out_dims.len();
-    update4[offset..(offset + out_dims.len())].copy_from_slice(update_dims);
-    out_strides4[offset..(offset + out_dims.len())].copy_from_slice(&out_strides);
-    starts4[offset..(offset + out_dims.len())].copy_from_slice(starts);
+    for axis in 0..out_dims.len() {
+        if update_dims[axis] > out_dims[axis] {
+            return Err(BackendError::execution(
+                "dynamic_update_slice size exceeds base dimension",
+            ));
+        }
+        let dst = offset + axis;
+        update4[dst] = update_dims[axis];
+        out_strides4[dst] = out_strides[axis];
+        max4[dst] = out_dims[axis] - update_dims[axis];
+    }
 
     let mut update_i32 = [0i32; 4];
     let mut out_strides_i32 = [0i32; 4];
-    let mut starts_i32 = [0i32; 4];
+    let mut max_i32 = [0i32; 4];
     for idx in 0..4 {
         update_i32[idx] = i32::try_from(update4[idx])
             .map_err(|_| BackendError::execution("dynamic_update update dim exceeds i32 range"))?;
         out_strides_i32[idx] = i32::try_from(out_strides4[idx]).map_err(|_| {
             BackendError::execution("dynamic_update output stride exceeds i32 range")
         })?;
-        starts_i32[idx] = i32::try_from(starts4[idx])
-            .map_err(|_| BackendError::execution("dynamic_update start exceeds i32 range"))?;
+        max_i32[idx] = i32::try_from(max4[idx])
+            .map_err(|_| BackendError::execution("dynamic_update max start exceeds i32 range"))?;
     }
-    Ok((update_i32, out_strides_i32, starts_i32))
+    let start_offset = i32::try_from(offset)
+        .map_err(|_| BackendError::execution("dynamic_update start offset exceeds i32 range"))?;
+    Ok((update_i32, out_strides_i32, max_i32, start_offset))
 }
 
 pub(super) fn launch_1d(
@@ -588,25 +656,6 @@ pub(super) fn launch_program_grid_2d(
             params,
         )
     }
-}
-
-pub(super) fn read_i32_tensor(tensor: &TritonTensor) -> BackendResult<Vec<i32>> {
-    if tensor.spec.dtype != DType::Si32 {
-        return Err(BackendError::execution(
-            "read_i32_tensor requires Si32 tensor",
-        ));
-    }
-    let bytes = tensor.buffer.read_to_vec()?;
-    if bytes.len() % 4 != 0 {
-        return Err(BackendError::execution(
-            "Si32 tensor byte length is not divisible by 4",
-        ));
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
-        out.push(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-    Ok(out)
 }
 
 pub(super) fn binary_opcode(op: ElementwiseBinaryOp) -> u32 {

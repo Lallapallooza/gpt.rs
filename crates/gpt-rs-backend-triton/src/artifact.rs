@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
-use gpt_rs::backend::conversion::BufferPlan;
-use gpt_rs::backend::spec::{Program, ValueId};
+use gpt_rs::backend::conversion::{BufferPlan, BufferSlot, BufferSpec};
+use gpt_rs::backend::spec::{Program, RegionId};
 use serde::{Deserialize, Serialize};
 
 use crate::kernels::KernelSpec;
 
-pub const TRITON_ARTIFACT_VERSION: u32 = 2;
+pub const TRITON_ARTIFACT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TritonArtifact {
@@ -36,63 +36,69 @@ impl TritonArtifact {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TritonArtifactBufferPlan {
-    pub functions: HashMap<String, TritonFunctionSlotPlan>,
+    pub functions: HashMap<String, TritonFunctionBufferPlan>,
+    #[serde(default)]
+    pub regions: Vec<TritonRegionBufferPlan>,
 }
 
 impl From<BufferPlan> for TritonArtifactBufferPlan {
     fn from(value: BufferPlan) -> Self {
-        let functions = value
-            .functions
-            .iter()
-            .map(|(name, plan)| (name.clone(), TritonFunctionSlotPlan::from(plan)))
-            .collect();
-        Self { functions }
+        let mut regions = value
+            .regions
+            .into_iter()
+            .map(|(id, plan)| TritonRegionBufferPlan {
+                id,
+                plan: plan.into(),
+            })
+            .collect::<Vec<_>>();
+        regions.sort_by_key(|entry| entry.id.0);
+        Self {
+            functions: value
+                .functions
+                .into_iter()
+                .map(|(name, plan)| (name, plan.into()))
+                .collect(),
+            regions,
+        }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TritonRegionBufferPlan {
+    pub id: RegionId,
+    pub plan: TritonFunctionBufferPlan,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TritonFunctionSlotPlan {
-    pub slots: Vec<TritonSlotSpec>,
-    pub value_slots: Vec<TritonValueSlot>,
+pub struct TritonFunctionBufferPlan {
+    pub buffers: Vec<BufferSpec>,
+    pub slots: Vec<BufferSlot>,
 }
 
-impl From<&gpt_rs::backend::conversion::FunctionBufferPlan> for TritonFunctionSlotPlan {
-    fn from(value: &gpt_rs::backend::conversion::FunctionBufferPlan) -> Self {
-        let slots = value
-            .slots
-            .iter()
-            .map(|slot| TritonSlotSpec {
-                id: slot.id,
-                byte_len: slot.byte_len,
-            })
-            .collect();
-        let value_slots = value
-            .buffers
-            .iter()
-            .filter_map(|buffer| {
-                if !buffer.path.is_empty() {
-                    return None;
-                }
-                buffer.slot.map(|slot| TritonValueSlot {
-                    value: buffer.value,
-                    slot,
-                    live_end: buffer.live_range.end,
-                })
-            })
-            .collect();
-        Self { slots, value_slots }
+impl From<gpt_rs::backend::conversion::FunctionBufferPlan> for TritonFunctionBufferPlan {
+    fn from(value: gpt_rs::backend::conversion::FunctionBufferPlan) -> Self {
+        let mut buffers = value.buffers;
+        canonicalize_alias_groups(buffers.as_mut_slice());
+        Self {
+            buffers,
+            slots: value.slots,
+        }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TritonSlotSpec {
-    pub id: usize,
-    pub byte_len: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TritonValueSlot {
-    pub value: ValueId,
-    pub slot: usize,
-    pub live_end: usize,
+fn canonicalize_alias_groups(buffers: &mut [BufferSpec]) {
+    let mut map = HashMap::<usize, usize>::new();
+    let mut next = 0usize;
+    for buffer in buffers {
+        let canonical = match map.get(&buffer.alias_group) {
+            Some(value) => *value,
+            None => {
+                let value = next;
+                next = next.saturating_add(1);
+                map.insert(buffer.alias_group, value);
+                value
+            }
+        };
+        buffer.alias_group = canonical;
+    }
 }

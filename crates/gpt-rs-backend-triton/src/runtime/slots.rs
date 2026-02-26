@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use gpt_rs::backend::spec::{BackendError, BackendResult, TensorSpec, ValueId};
 
-use crate::artifact::TritonFunctionSlotPlan;
+use crate::artifact::TritonFunctionBufferPlan;
 use crate::device::{CudaDriver, DeviceBuffer};
 use crate::tensor::TritonTensor;
 
@@ -18,7 +18,7 @@ pub(crate) struct SlotAllocator {
 
 impl SlotAllocator {
     pub(crate) fn new(
-        plan: Option<&TritonFunctionSlotPlan>,
+        plan: Option<&TritonFunctionBufferPlan>,
         value_last_use: HashMap<ValueId, usize>,
     ) -> Self {
         let Some(plan) = plan else {
@@ -30,9 +30,15 @@ impl SlotAllocator {
                 slot_release_pos: Vec::new(),
             };
         };
-        let mut value_to_slot = HashMap::with_capacity(plan.value_slots.len());
-        for binding in &plan.value_slots {
-            value_to_slot.insert(binding.value, SlotBinding { slot: binding.slot });
+        let mut value_to_slot = HashMap::new();
+        for binding in plan
+            .buffers
+            .iter()
+            .filter(|buffer| buffer.slot.is_some() && buffer.path.is_empty())
+        {
+            if let Some(slot) = binding.slot {
+                value_to_slot.insert(binding.value, SlotBinding { slot });
+            }
         }
         Self {
             value_to_slot,

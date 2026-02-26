@@ -10,6 +10,11 @@ pub const BROADCAST_SI32_KERNEL_ID: &str = "gpt_rs.triton.kernel.broadcast_si32_
 pub const BROADCAST_SI32_SYMBOL: &str = "gpt_rs_triton_broadcast_si32_rank4";
 pub const SLICE_KERNEL_ID: &str = "gpt_rs.triton.kernel.slice_f32_rank4.v1";
 pub const SLICE_SYMBOL: &str = "gpt_rs_triton_slice_f32_rank4";
+pub const DYNAMIC_SLICE_F32_KERNEL_ID: &str = "gpt_rs.triton.kernel.dynamic_slice_f32_rank4.v1";
+pub const DYNAMIC_SLICE_F32_SYMBOL: &str = "gpt_rs_triton_dynamic_slice_f32_rank4";
+pub const DYNAMIC_SLICE_SI32_RANK1_KERNEL_ID: &str =
+    "gpt_rs.triton.kernel.dynamic_slice_si32_rank1.v1";
+pub const DYNAMIC_SLICE_SI32_RANK1_SYMBOL: &str = "gpt_rs_triton_dynamic_slice_si32_rank1";
 pub const TRANSPOSE_KERNEL_ID: &str = "gpt_rs.triton.kernel.transpose_f32_rank5.v1";
 pub const TRANSPOSE_SYMBOL: &str = "gpt_rs_triton_transpose_f32_rank5";
 pub const CONCAT_KERNEL_ID: &str = "gpt_rs.triton.kernel.concat_f32_rank4.v1";
@@ -46,6 +51,10 @@ pub const EWISE_UNARY_KERNEL_SOURCE: &str = include_str!("kernels/elementwise_un
 pub const BROADCAST_KERNEL_SOURCE: &str = include_str!("kernels/broadcast_f32_rank4.triton");
 pub const BROADCAST_SI32_KERNEL_SOURCE: &str = include_str!("kernels/broadcast_si32_rank4.triton");
 pub const SLICE_KERNEL_SOURCE: &str = include_str!("kernels/slice_f32_rank4.triton");
+pub const DYNAMIC_SLICE_F32_KERNEL_SOURCE: &str =
+    include_str!("kernels/dynamic_slice_f32_rank4.triton");
+pub const DYNAMIC_SLICE_SI32_RANK1_KERNEL_SOURCE: &str =
+    include_str!("kernels/dynamic_slice_si32_rank1.triton");
 pub const TRANSPOSE_KERNEL_SOURCE: &str = include_str!("kernels/transpose_f32_rank5.triton");
 pub const CONCAT_KERNEL_SOURCE: &str = include_str!("kernels/concat_f32_rank4.triton");
 pub const REDUCE_SUM_LAST_AXIS_KERNEL_SOURCE: &str =
@@ -83,6 +92,8 @@ pub enum KernelKind {
     BroadcastF32Rank4,
     BroadcastSi32Rank4,
     SliceF32Rank4,
+    DynamicSliceF32Rank4,
+    DynamicSliceSi32Rank1,
     TransposeF32Rank5,
     ConcatF32Rank4,
     ReduceSumLastAxisF32,
@@ -138,6 +149,18 @@ const BUILTIN_KERNEL_DESCRIPTORS: &[KernelDescriptor] = &[
         kind: KernelKind::SliceF32Rank4,
         symbol: SLICE_SYMBOL,
         source: SLICE_KERNEL_SOURCE,
+    },
+    KernelDescriptor {
+        id: DYNAMIC_SLICE_F32_KERNEL_ID,
+        kind: KernelKind::DynamicSliceF32Rank4,
+        symbol: DYNAMIC_SLICE_F32_SYMBOL,
+        source: DYNAMIC_SLICE_F32_KERNEL_SOURCE,
+    },
+    KernelDescriptor {
+        id: DYNAMIC_SLICE_SI32_RANK1_KERNEL_ID,
+        kind: KernelKind::DynamicSliceSi32Rank1,
+        symbol: DYNAMIC_SLICE_SI32_RANK1_SYMBOL,
+        source: DYNAMIC_SLICE_SI32_RANK1_KERNEL_SOURCE,
     },
     KernelDescriptor {
         id: TRANSPOSE_KERNEL_ID,
@@ -246,6 +269,8 @@ pub fn builtin_kernel_sources() -> &'static [&'static str] {
         BROADCAST_KERNEL_SOURCE,
         BROADCAST_SI32_KERNEL_SOURCE,
         SLICE_KERNEL_SOURCE,
+        DYNAMIC_SLICE_F32_KERNEL_SOURCE,
+        DYNAMIC_SLICE_SI32_RANK1_KERNEL_SOURCE,
         TRANSPOSE_KERNEL_SOURCE,
         CONCAT_KERNEL_SOURCE,
         REDUCE_SUM_LAST_AXIS_KERNEL_SOURCE,

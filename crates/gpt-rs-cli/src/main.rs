@@ -82,6 +82,35 @@ struct Args {
 
     #[arg(long, global = true, help = "Print gpt-rs profiler tables to stderr")]
     profile: bool,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Show full backend profiling rows without compact filtering"
+    )]
+    profile_full: bool,
+
+    #[arg(
+        long,
+        value_name = "DIR",
+        global = true,
+        help = "Write profiling artifacts to the specified directory"
+    )]
+    profile_out: Option<PathBuf>,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Write Chrome trace timeline artifact (timeline.chrome_trace.json; requires --profile-out)"
+    )]
+    profile_timeline: bool,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Write flamegraph artifacts (flamegraph.folded and flamegraph.speedscope.json; requires --profile-out)"
+    )]
+    profile_flamegraph: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -90,6 +119,31 @@ enum DumpMode {
     All,
     #[value(name = "compile")]
     Compile,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProfileArtifactConfig {
+    out_dir: Option<PathBuf>,
+    write_timeline: bool,
+    write_flamegraph: bool,
+}
+
+impl ProfileArtifactConfig {
+    fn trace_enabled(&self) -> bool {
+        self.write_timeline || self.write_flamegraph
+    }
+
+    fn artifacts_enabled(&self) -> bool {
+        self.out_dir.is_some()
+    }
+}
+
+struct TraceEnableGuard;
+
+impl Drop for TraceEnableGuard {
+    fn drop(&mut self) {
+        profiling::trace_disable();
+    }
 }
 
 #[derive(Subcommand)]
@@ -332,18 +386,34 @@ fn load_vision_input_tensor(args: &VisionInputArgs) -> Result<Tensor> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let artifact_config = ProfileArtifactConfig {
+        out_dir: args.profile_out.clone(),
+        write_timeline: args.profile_timeline,
+        write_flamegraph: args.profile_flamegraph,
+    };
+    if artifact_config.trace_enabled() && artifact_config.out_dir.is_none() {
+        bail!("--profile-timeline and --profile-flamegraph require --profile-out <DIR>");
+    }
+    let profile_enabled = args.profile || args.profile_full || artifact_config.artifacts_enabled();
     let _trace_guard = args
         .dump_dir
         .as_ref()
         .map(|dir| install_dump_sink(dir, args.dump_mode))
         .transpose()?;
+    let _profile_trace_guard = if profile_enabled && artifact_config.trace_enabled() {
+        profiling::trace_reset();
+        profiling::trace_enable();
+        Some(TraceEnableGuard)
+    } else {
+        None
+    };
 
     #[cfg(feature = "conversion-c")]
     gpt_rs_backend_c::register_conversion_targets();
     #[cfg(feature = "backend-triton")]
     gpt_rs_backend_triton::register_conversion_targets();
 
-    if args.profile {
+    if profile_enabled {
         profiling::reset();
     }
 
@@ -369,13 +439,25 @@ fn main() -> Result<()> {
     let profile_consumed = match backend_env.trim() {
         "faer" => {
             let backend = Arc::new(FaerCpuBackend::create());
-            run_with_backend(backend, command, args.profile)?
+            run_with_backend(
+                backend,
+                command,
+                profile_enabled,
+                args.profile_full,
+                &artifact_config,
+            )?
         }
         "c" => {
             #[cfg(feature = "conversion-c")]
             {
                 let backend = Arc::new(CBackend::new());
-                run_with_backend(backend, command, args.profile)?
+                run_with_backend(
+                    backend,
+                    command,
+                    profile_enabled,
+                    args.profile_full,
+                    &artifact_config,
+                )?
             }
             #[cfg(not(feature = "conversion-c"))]
             {
@@ -387,9 +469,15 @@ fn main() -> Result<()> {
         "triton" => {
             #[cfg(feature = "backend-triton")]
             {
-                gpt_rs_backend_triton::set_gpu_event_timing(args.profile);
+                gpt_rs_backend_triton::set_gpu_event_timing(profile_enabled);
                 let backend = Arc::new(TritonBackend::new());
-                run_with_backend(backend, command, args.profile)?
+                run_with_backend(
+                    backend,
+                    command,
+                    profile_enabled,
+                    args.profile_full,
+                    &artifact_config,
+                )?
             }
             #[cfg(not(feature = "backend-triton"))]
             {
@@ -407,9 +495,14 @@ fn main() -> Result<()> {
         }
     };
 
-    if args.profile && !profile_consumed {
-        if let Some(report) = profiling::take_formatted_tables() {
-            eprintln!("{}", report);
+    if profile_enabled && !profile_consumed {
+        let options = profiling::ProfileFormatOptions {
+            profile_full: args.profile_full,
+            ..profiling::ProfileFormatOptions::default()
+        };
+        if let Some(snapshot) = profiling::take_profile_snapshot_with_options(false, &options) {
+            eprintln!("{}", snapshot.formatted);
+            write_profile_artifacts(&snapshot, &artifact_config)?;
         } else {
             eprintln!(
                 "profiling enabled but no report available; rebuild gpt-rs with profiler support"
@@ -435,6 +528,8 @@ fn run_with_backend<B: PortableBackend + 'static>(
     backend: Arc<B>,
     command: Command,
     profile: bool,
+    profile_full: bool,
+    artifact_config: &ProfileArtifactConfig,
 ) -> Result<bool> {
     // Keep profiler instrumentation compiled in, but suspend runtime collection unless
     // the user explicitly asked for a report via `--profile`.
@@ -449,7 +544,9 @@ fn run_with_backend<B: PortableBackend + 'static>(
             run_generate(&backend, &args, profile)?;
             Ok(false)
         }
-        Command::Benchmark(args) => run_benchmark(&backend, &args, profile),
+        Command::Benchmark(args) => {
+            run_benchmark(&backend, &args, profile, profile_full, artifact_config)
+        }
         Command::Forward(args) => {
             run_forward(&backend, &args, profile)?;
             Ok(false)
@@ -713,6 +810,8 @@ fn run_benchmark<B: PortableBackend + 'static>(
     backend: &Arc<B>,
     args: &BenchmarkArgs,
     profile: bool,
+    profile_full: bool,
+    artifact_config: &ProfileArtifactConfig,
 ) -> Result<bool> {
     let namespace = model_namespace_for_backend(backend.as_ref());
     let model =
@@ -763,7 +862,14 @@ fn run_benchmark<B: PortableBackend + 'static>(
             );
 
             if profile {
-                emit_profile_with_attribution(elapsed, 1.0, "prefill")?;
+                emit_profile_with_attribution(
+                    elapsed,
+                    1.0,
+                    Some("run"),
+                    "prefill",
+                    profile_full,
+                    artifact_config,
+                )?;
                 return Ok(true);
             }
             Ok(false)
@@ -795,7 +901,14 @@ fn run_benchmark<B: PortableBackend + 'static>(
             );
 
             if profile {
-                emit_profile_with_attribution(elapsed, 1.0, "first-token")?;
+                emit_profile_with_attribution(
+                    elapsed,
+                    1.0,
+                    Some("run"),
+                    "first-token",
+                    profile_full,
+                    artifact_config,
+                )?;
                 return Ok(true);
             }
             Ok(false)
@@ -852,7 +965,14 @@ fn run_benchmark<B: PortableBackend + 'static>(
             );
 
             if profile {
-                emit_profile_with_attribution(elapsed, measured_steps as f64, "decode-steady")?;
+                emit_profile_with_attribution(
+                    elapsed,
+                    measured_steps as f64,
+                    Some("token"),
+                    "decode-steady",
+                    profile_full,
+                    artifact_config,
+                )?;
                 return Ok(true);
             }
             Ok(false)
@@ -863,11 +983,19 @@ fn run_benchmark<B: PortableBackend + 'static>(
 fn emit_profile_with_attribution(
     elapsed: std::time::Duration,
     measured_units: f64,
+    unit_label: Option<&str>,
     label: &str,
+    profile_full: bool,
+    artifact_config: &ProfileArtifactConfig,
 ) -> Result<()> {
-    if let Some((formatted, report_json)) = profiling::take_formatted_tables_and_report_json(false)
-    {
-        if let Some(component_ms) = measured_component_ms_from_report_json(&report_json) {
+    let format_options = profiling::ProfileFormatOptions {
+        measured_units: Some(measured_units).filter(|units| *units > 0.0),
+        unit_label: unit_label.map(str::to_string),
+        profile_full,
+        ..profiling::ProfileFormatOptions::default()
+    };
+    if let Some(snapshot) = profiling::take_profile_snapshot_with_options(false, &format_options) {
+        if let Some(component_ms) = measured_component_ms_from_report_json(&snapshot.report_json) {
             let wall_ms = elapsed.as_secs_f64() * 1_000.0;
             let coverage = if wall_ms > 0.0 {
                 (component_ms / wall_ms) * 100.0
@@ -893,11 +1021,56 @@ fn emit_profile_with_attribution(
         } else {
             eprintln!("Attribution ({label}): unavailable (failed to parse profiler report).");
         }
-        eprintln!("{formatted}");
+        eprintln!("{}", snapshot.formatted);
+        write_profile_artifacts(&snapshot, artifact_config)?;
     } else {
         eprintln!(
             "profiling enabled but no report available; rebuild gpt-rs with profiler support"
         );
+    }
+    Ok(())
+}
+
+fn write_profile_artifacts(
+    snapshot: &profiling::ProfileSnapshot,
+    artifact_config: &ProfileArtifactConfig,
+) -> Result<()> {
+    let Some(out_dir) = artifact_config.out_dir.as_ref() else {
+        return Ok(());
+    };
+    fs::create_dir_all(out_dir)
+        .with_context(|| format!("failed to create profile output dir {}", out_dir.display()))?;
+
+    let jsonl_path = out_dir.join("profile.jsonl");
+    fs::write(&jsonl_path, snapshot.profile_jsonl.as_bytes())
+        .with_context(|| format!("failed to write {}", jsonl_path.display()))?;
+
+    if artifact_config.write_timeline || artifact_config.write_flamegraph {
+        let Some(trace_json) = profiling::take_trace_json() else {
+            return Err(anyhow!(
+                "trace export requested but no trace events were captured; ensure profiler support is enabled"
+            ));
+        };
+        if artifact_config.write_timeline {
+            let timeline_path = out_dir.join("timeline.chrome_trace.json");
+            fs::write(&timeline_path, trace_json.as_bytes())
+                .with_context(|| format!("failed to write {}", timeline_path.display()))?;
+        }
+        if artifact_config.write_flamegraph {
+            let folded =
+                profiling::chrome_trace_to_folded(trace_json.as_str()).ok_or_else(|| {
+                    anyhow!("failed to convert Chrome trace into folded flamegraph format")
+                })?;
+            let folded_path = out_dir.join("flamegraph.folded");
+            fs::write(&folded_path, folded.as_bytes())
+                .with_context(|| format!("failed to write {}", folded_path.display()))?;
+
+            let speedscope = profiling::chrome_trace_to_speedscope(trace_json.as_str())
+                .ok_or_else(|| anyhow!("failed to convert Chrome trace into speedscope format"))?;
+            let speedscope_path = out_dir.join("flamegraph.speedscope.json");
+            fs::write(&speedscope_path, speedscope.as_bytes())
+                .with_context(|| format!("failed to write {}", speedscope_path.display()))?;
+        }
     }
     Ok(())
 }

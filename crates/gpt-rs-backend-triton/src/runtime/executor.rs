@@ -84,7 +84,7 @@ impl TritonExecutor {
         }
         let dispatch_elapsed = dispatch_start.elapsed();
         profiling::record_backend_aggregate(
-            "backend.triton.dispatch",
+            "backend.triton.exec.dispatch",
             1,
             dispatch_elapsed,
             WorkStats {
@@ -96,7 +96,7 @@ impl TritonExecutor {
         let launched = launch_end.saturating_sub(launch_start);
         if launched != 0 {
             profiling::record_backend_aggregate(
-                "backend.triton.launch_count",
+                "backend.triton.exec.launches",
                 launched,
                 Duration::ZERO,
                 WorkStats::default(),

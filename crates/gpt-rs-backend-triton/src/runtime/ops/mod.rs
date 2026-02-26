@@ -537,7 +537,7 @@ pub(super) fn launch_program_grid_2d(
         return Ok(());
     }
     KERNEL_LAUNCH_COUNT.fetch_add(1, Ordering::Relaxed);
-    let _scope = profiling::backend_scope_with_meta("backend.triton.kernel", || {
+    let _scope = profiling::backend_scope_with_meta("backend.triton.kernel.total", || {
         let meta = kernel
             .profile_signature
             .map(ScopeMeta::signature)
@@ -549,7 +549,7 @@ pub(super) fn launch_program_grid_2d(
     });
     if GPU_EVENT_TIMING_ENABLED.load(Ordering::Relaxed) {
         let host_start = std::time::Instant::now();
-        let elapsed_ms = driver.time_with_events("backend.triton.kernel", || {
+        let elapsed_ms = driver.time_with_events("backend.triton.kernel.total", || {
             driver.launch_kernel(
                 &kernel.function,
                 (grid_x, grid_y, 1),
@@ -565,14 +565,14 @@ pub(super) fn launch_program_grid_2d(
             ..WorkStats::default()
         };
         profiling::record_backend_aggregate_with_signature(
-            "backend.triton.kernel_gpu",
+            "backend.triton.kernel.gpu",
             kernel.profile_signature,
             1,
             gpu_duration,
             work,
         );
         profiling::record_backend_aggregate_with_signature(
-            "backend.triton.kernel_host",
+            "backend.triton.kernel.host",
             kernel.profile_signature,
             1,
             host_duration,

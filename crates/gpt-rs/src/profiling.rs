@@ -3,6 +3,8 @@ use std::cell::Cell;
 #[cfg(feature = "profiler")]
 use std::cell::RefCell;
 use std::collections::HashMap;
+#[cfg(feature = "profiler")]
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 #[cfg(feature = "profiler")]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,7 +16,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 #[cfg(feature = "profiler")]
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[cfg_attr(not(feature = "profiler"), allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -468,6 +470,216 @@ pub fn take_trace_json_pretty() -> Option<String> {
 
 #[cfg(not(feature = "profiler"))]
 pub fn take_trace_json_pretty() -> Option<String> {
+    None
+}
+
+#[cfg(feature = "profiler")]
+#[derive(Debug, Deserialize)]
+struct TraceJson {
+    #[serde(rename = "traceEvents")]
+    trace_events: Vec<TraceEventJson>,
+}
+
+#[cfg(feature = "profiler")]
+#[derive(Debug, Deserialize)]
+struct TraceEventJson {
+    name: String,
+    cat: String,
+    ph: String,
+    ts: u64,
+    dur: u64,
+    tid: u64,
+    #[serde(default)]
+    args: TraceArgsJson,
+}
+
+#[cfg(feature = "profiler")]
+#[derive(Debug, Default, Deserialize)]
+struct TraceArgsJson {
+    #[serde(default)]
+    excl_us: u64,
+}
+
+#[cfg(feature = "profiler")]
+pub fn chrome_trace_to_folded(trace_json: &str) -> Option<String> {
+    let parsed: TraceJson = serde_json::from_str(trace_json).ok()?;
+    let mut by_tid: BTreeMap<u64, Vec<TraceEventJson>> = BTreeMap::new();
+    for event in parsed.trace_events {
+        if event.ph != "X" || event.dur == 0 {
+            continue;
+        }
+        by_tid.entry(event.tid).or_default().push(event);
+    }
+
+    let mut folded: BTreeMap<String, u64> = BTreeMap::new();
+    for (_tid, mut events) in by_tid {
+        events.sort_by(|a, b| {
+            a.ts.cmp(&b.ts)
+                .then_with(|| b.dur.cmp(&a.dur))
+                .then_with(|| a.cat.cmp(&b.cat))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        let mut stack: Vec<(u64, String)> = Vec::new();
+        for event in events {
+            while let Some((end_ts, _)) = stack.last() {
+                if event.ts >= *end_ts {
+                    stack.pop();
+                } else {
+                    break;
+                }
+            }
+            let mut frame_names = stack
+                .iter()
+                .map(|(_, name)| name.clone())
+                .collect::<Vec<_>>();
+            let frame_name = format!("{}::{}", event.cat, event.name);
+            frame_names.push(frame_name.clone());
+            let stack_key = frame_names.join(";");
+            let exclusive = if event.args.excl_us == 0 {
+                event.dur
+            } else {
+                event.args.excl_us
+            };
+            if exclusive > 0 {
+                let entry = folded.entry(stack_key).or_insert(0);
+                *entry = entry.saturating_add(exclusive);
+            }
+            let end_ts = event.ts.saturating_add(event.dur);
+            stack.push((end_ts, frame_name));
+        }
+    }
+
+    let mut out = String::new();
+    for (stack, micros) in folded {
+        out.push_str(&format!("{stack} {micros}\n"));
+    }
+    Some(out)
+}
+
+#[cfg(not(feature = "profiler"))]
+pub fn chrome_trace_to_folded(_trace_json: &str) -> Option<String> {
+    None
+}
+
+#[cfg(feature = "profiler")]
+#[derive(Serialize)]
+struct SpeedscopeFile {
+    #[serde(rename = "$schema")]
+    schema: &'static str,
+    name: &'static str,
+    exporter: &'static str,
+    #[serde(rename = "activeProfileIndex")]
+    active_profile_index: usize,
+    shared: SpeedscopeShared,
+    profiles: Vec<SpeedscopeProfile>,
+}
+
+#[cfg(feature = "profiler")]
+#[derive(Serialize)]
+struct SpeedscopeShared {
+    frames: Vec<SpeedscopeFrame>,
+}
+
+#[cfg(feature = "profiler")]
+#[derive(Serialize)]
+struct SpeedscopeFrame {
+    name: String,
+}
+
+#[cfg(feature = "profiler")]
+#[derive(Serialize)]
+struct SpeedscopeProfile {
+    #[serde(rename = "type")]
+    profile_type: &'static str,
+    name: &'static str,
+    unit: &'static str,
+    #[serde(rename = "startValue")]
+    start_value: u64,
+    #[serde(rename = "endValue")]
+    end_value: u64,
+    samples: Vec<Vec<usize>>,
+    weights: Vec<u64>,
+}
+
+#[cfg(feature = "profiler")]
+pub fn chrome_trace_to_speedscope(trace_json: &str) -> Option<String> {
+    let folded = chrome_trace_to_folded(trace_json)?;
+    let mut stacks = Vec::<(Vec<String>, u64)>::new();
+    for line in folded.lines().filter(|line| !line.trim().is_empty()) {
+        let (stack, micros) = line.rsplit_once(' ')?;
+        let weight = micros.parse::<u64>().ok()?;
+        if weight == 0 {
+            continue;
+        }
+        let frames = stack
+            .split(';')
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if frames.is_empty() {
+            continue;
+        }
+        stacks.push((frames, weight));
+    }
+    stacks.sort_by(|a, b| {
+        let a_key = a.0.join(";");
+        let b_key = b.0.join(";");
+        a_key.cmp(&b_key).then_with(|| a.1.cmp(&b.1))
+    });
+
+    let mut frame_names = BTreeSet::new();
+    for (frames, _) in &stacks {
+        for frame in frames {
+            frame_names.insert(frame.clone());
+        }
+    }
+    let frames = frame_names
+        .into_iter()
+        .map(|name| SpeedscopeFrame { name })
+        .collect::<Vec<_>>();
+    let frame_map = frames
+        .iter()
+        .enumerate()
+        .map(|(idx, frame)| (frame.name.clone(), idx))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut samples = Vec::<Vec<usize>>::new();
+    let mut weights = Vec::<u64>::new();
+    for (stack, weight) in stacks {
+        let sample = stack
+            .iter()
+            .filter_map(|frame| frame_map.get(frame).copied())
+            .collect::<Vec<_>>();
+        if sample.is_empty() {
+            continue;
+        }
+        samples.push(sample);
+        weights.push(weight);
+    }
+    let end_value = weights
+        .iter()
+        .copied()
+        .fold(0u64, |acc, weight| acc.saturating_add(weight));
+    let file = SpeedscopeFile {
+        schema: "https://www.speedscope.app/file-format-schema.json",
+        name: "gpt-rs profile",
+        exporter: "gpt-rs",
+        active_profile_index: 0,
+        shared: SpeedscopeShared { frames },
+        profiles: vec![SpeedscopeProfile {
+            profile_type: "sampled",
+            name: "profile",
+            unit: "microseconds",
+            start_value: 0,
+            end_value,
+            samples,
+            weights,
+        }],
+    };
+    serde_json::to_string_pretty(&file).ok()
+}
+
+#[cfg(not(feature = "profiler"))]
+pub fn chrome_trace_to_speedscope(_trace_json: &str) -> Option<String> {
     None
 }
 
@@ -989,6 +1201,41 @@ pub struct TableRow {
     _private: (),
 }
 
+#[derive(Debug, Clone)]
+pub struct ProfileFormatOptions {
+    pub measured_units: Option<f64>,
+    pub unit_label: Option<String>,
+    pub profile_full: bool,
+    pub backend_top_n: usize,
+    pub backend_min_percent: f64,
+}
+
+impl Default for ProfileFormatOptions {
+    fn default() -> Self {
+        Self {
+            measured_units: None,
+            unit_label: None,
+            profile_full: false,
+            backend_top_n: 24,
+            backend_min_percent: 1.0,
+        }
+    }
+}
+
+#[cfg(feature = "profiler")]
+#[derive(Debug, Clone)]
+pub struct ProfileSnapshot {
+    pub formatted: String,
+    pub report_json: String,
+    pub profile_jsonl: String,
+}
+
+#[cfg(not(feature = "profiler"))]
+#[derive(Debug, Clone, Default)]
+pub struct ProfileSnapshot {
+    _private: (),
+}
+
 #[cfg(feature = "profiler")]
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct ProfilerTables {
@@ -1275,7 +1522,158 @@ pub fn take_report_json_pretty() -> Option<String> {
 }
 
 #[cfg(feature = "profiler")]
+fn positive_measured_units(options: &ProfileFormatOptions) -> Option<f64> {
+    options.measured_units.filter(|value| *value > 0.0)
+}
+
+#[cfg(feature = "profiler")]
+fn format_execution_kpis(tables: &ProfilerTables, options: &ProfileFormatOptions) -> String {
+    let total_layers_ms: f64 = tables.layers.iter().map(|row| row.excl_ms).sum();
+    let total_functionals_ms: f64 = tables.functionals.iter().map(|row| row.excl_ms).sum();
+    let total_backend_ms: f64 = tables.backend.iter().map(|row| row.excl_ms).sum();
+    let total_compilation_ms: f64 = tables.compilation.iter().map(|row| row.excl_ms).sum();
+    let total_compile_passes_ms: f64 = tables.compile_passes.iter().map(|row| row.excl_ms).sum();
+    let total_cache_events: u64 = tables.caches.iter().map(|row| row.calls).sum();
+    let total_backend_calls: u64 = tables.backend.iter().map(|row| row.calls).sum();
+    let total_measured_ms = total_layers_ms
+        + total_functionals_ms
+        + total_backend_ms
+        + total_compilation_ms
+        + total_compile_passes_ms;
+    let total_compile_ms = total_compilation_ms + total_compile_passes_ms;
+    let unit_label = options.unit_label.as_deref().unwrap_or("unit");
+    let units = positive_measured_units(options);
+
+    let mut rows: Vec<(String, String)> = Vec::new();
+    rows.push((
+        "measured_ms.total".to_string(),
+        format!("{total_measured_ms:.3}"),
+    ));
+    rows.push((
+        "layers_ms.total".to_string(),
+        format!("{total_layers_ms:.3}"),
+    ));
+    rows.push((
+        "functionals_ms.total".to_string(),
+        format!("{total_functionals_ms:.3}"),
+    ));
+    rows.push((
+        "backend_ms.total".to_string(),
+        format!("{total_backend_ms:.3}"),
+    ));
+    rows.push((
+        "compile_ms.total".to_string(),
+        format!("{total_compile_ms:.3}"),
+    ));
+    rows.push((
+        "backend_calls.total".to_string(),
+        total_backend_calls.to_string(),
+    ));
+    rows.push((
+        "cache_events.total".to_string(),
+        total_cache_events.to_string(),
+    ));
+
+    if let Some(units) = units {
+        rows.push((
+            format!("measured_ms/{unit_label}"),
+            format!("{:.3}", total_measured_ms / units),
+        ));
+        rows.push((
+            format!("backend_ms/{unit_label}"),
+            format!("{:.3}", total_backend_ms / units),
+        ));
+        rows.push((
+            format!("compile_ms/{unit_label}"),
+            format!("{:.3}", total_compile_ms / units),
+        ));
+        rows.push((
+            format!("backend_calls/{unit_label}"),
+            format!("{:.3}", (total_backend_calls as f64) / units),
+        ));
+    }
+
+    let metric_width = rows
+        .iter()
+        .map(|(metric, _)| metric.len())
+        .max()
+        .unwrap_or("metric".len())
+        .max("metric".len());
+    let value_width = rows
+        .iter()
+        .map(|(_, value)| value.len())
+        .max()
+        .unwrap_or("value".len())
+        .max("value".len());
+
+    let mut output = String::new();
+    output.push_str("Execution KPIs\n");
+    output.push_str(&format!(
+        "| {metric} | {value} |\n",
+        metric = format_args!("{:<width$}", "metric", width = metric_width),
+        value = format_args!("{:<width$}", "value", width = value_width),
+    ));
+    output.push_str(&format!(
+        "|-{metric}-|-{value}-|\n",
+        metric = "-".repeat(metric_width),
+        value = "-".repeat(value_width),
+    ));
+    for (metric, value) in rows {
+        output.push_str(&format!(
+            "| {metric} | {value} |\n",
+            metric = format_args!("{:<width$}", metric, width = metric_width),
+            value = format_args!("{:>width$}", value, width = value_width),
+        ));
+    }
+    output
+}
+
+#[cfg(feature = "profiler")]
+fn maybe_compact_backend_rows(
+    rows: &[TableRow],
+    options: &ProfileFormatOptions,
+) -> (Vec<TableRow>, Option<String>) {
+    if options.profile_full || rows.len() <= options.backend_top_n {
+        return (rows.to_vec(), None);
+    }
+
+    let mut selected = Vec::with_capacity(rows.len());
+    let mut omitted_rows = 0usize;
+    let mut omitted_ms = 0.0f64;
+    for (idx, row) in rows.iter().enumerate() {
+        if idx < options.backend_top_n || row.percent >= options.backend_min_percent {
+            selected.push(row.clone());
+        } else {
+            omitted_rows += 1;
+            omitted_ms += row.excl_ms;
+        }
+    }
+
+    if omitted_rows == 0 {
+        (selected, None)
+    } else {
+        (
+            selected,
+            Some(format!(
+                "(compact: showing {} of {} rows, omitted {:.3} ms; use --profile-full for full backend table)",
+                rows.len().saturating_sub(omitted_rows),
+                rows.len(),
+                omitted_ms
+            )),
+        )
+    }
+}
+
+#[cfg(feature = "profiler")]
 pub fn format_tables(tables: &ProfilerTables) -> String {
+    format_tables_with_options(tables, &ProfileFormatOptions::default())
+}
+
+#[cfg(feature = "profiler")]
+pub fn format_tables_with_options(
+    tables: &ProfilerTables,
+    options: &ProfileFormatOptions,
+) -> String {
     fn display_name_len(row: &TableRow) -> usize {
         match row.signature.as_ref() {
             None => row.name.len(),
@@ -1290,10 +1688,18 @@ pub fn format_tables(tables: &ProfilerTables) -> String {
         }
     }
 
-    fn format_table(label: &str, column: &str, rows: &[TableRow]) -> String {
+    fn format_table(
+        label: &str,
+        column: &str,
+        rows: &[TableRow],
+        options: &ProfileFormatOptions,
+    ) -> String {
         let mut output = String::new();
         output.push_str(label);
         output.push('\n');
+
+        let units = positive_measured_units(options);
+        let include_unit_columns = units.is_some();
 
         let name_width = rows
             .iter()
@@ -1308,6 +1714,8 @@ pub fn format_tables(tables: &ProfilerTables) -> String {
         let mut incl_width = "total_ms".len();
         let mut percent_width = "%tbl".len();
         let mut global_percent_width = "%all".len();
+        let mut calls_per_unit_width = "calls/unit".len();
+        let mut ms_per_unit_width = "ms/unit".len();
 
         for row in rows {
             calls_width = calls_width.max(format!("{}", row.calls).len());
@@ -1317,64 +1725,125 @@ pub fn format_tables(tables: &ProfilerTables) -> String {
             percent_width = percent_width.max(format!("{:.2}", row.percent).len());
             global_percent_width =
                 global_percent_width.max(format!("{:.2}", row.percent_global).len());
+            if let Some(units) = units {
+                calls_per_unit_width =
+                    calls_per_unit_width.max(format!("{:.3}", (row.calls as f64) / units).len());
+                ms_per_unit_width =
+                    ms_per_unit_width.max(format!("{:.3}", row.excl_ms / units).len());
+            }
         }
 
-        let header = format!(
-            "| {column} | {calls} | {per} | {excl} | {incl} | {percent} | {global} |\n",
-            column = format_args!("{:<width$}", column, width = name_width),
-            calls = format_args!("{:^width$}", "#", width = calls_width),
-            per = format_args!("{:^width$}", "ms/call", width = per_width),
-            excl = format_args!("{:^width$}", "self_ms", width = excl_width),
-            incl = format_args!("{:^width$}", "total_ms", width = incl_width),
-            percent = format_args!("{:^width$}", "%tbl", width = percent_width),
-            global = format_args!("{:^width$}", "%all", width = global_percent_width),
-        );
-        output.push_str(&header);
-        let separator = format!(
-            "|-{name}-|-{calls}-|-{per}-|-{excl}-|-{incl}-|-{percent}-|-{global}-|\n",
-            name = "-".repeat(name_width),
-            calls = "-".repeat(calls_width),
-            per = "-".repeat(per_width),
-            excl = "-".repeat(excl_width),
-            incl = "-".repeat(incl_width),
-            percent = "-".repeat(percent_width),
-            global = "-".repeat(global_percent_width),
-        );
-        output.push_str(&separator);
+        if include_unit_columns {
+            output.push_str(&format!(
+                "| {column} | {calls} | {per} | {excl} | {incl} | {calls_unit} | {ms_unit} | {percent} | {global} |\n",
+                column = format_args!("{:<width$}", column, width = name_width),
+                calls = format_args!("{:^width$}", "#", width = calls_width),
+                per = format_args!("{:^width$}", "ms/call", width = per_width),
+                excl = format_args!("{:^width$}", "self_ms", width = excl_width),
+                incl = format_args!("{:^width$}", "total_ms", width = incl_width),
+                calls_unit = format_args!("{:^width$}", "calls/unit", width = calls_per_unit_width),
+                ms_unit = format_args!("{:^width$}", "ms/unit", width = ms_per_unit_width),
+                percent = format_args!("{:^width$}", "%tbl", width = percent_width),
+                global = format_args!("{:^width$}", "%all", width = global_percent_width),
+            ));
+            output.push_str(&format!(
+                "|-{name}-|-{calls}-|-{per}-|-{excl}-|-{incl}-|-{calls_unit}-|-{ms_unit}-|-{percent}-|-{global}-|\n",
+                name = "-".repeat(name_width),
+                calls = "-".repeat(calls_width),
+                per = "-".repeat(per_width),
+                excl = "-".repeat(excl_width),
+                incl = "-".repeat(incl_width),
+                calls_unit = "-".repeat(calls_per_unit_width),
+                ms_unit = "-".repeat(ms_per_unit_width),
+                percent = "-".repeat(percent_width),
+                global = "-".repeat(global_percent_width),
+            ));
+        } else {
+            output.push_str(&format!(
+                "| {column} | {calls} | {per} | {excl} | {incl} | {percent} | {global} |\n",
+                column = format_args!("{:<width$}", column, width = name_width),
+                calls = format_args!("{:^width$}", "#", width = calls_width),
+                per = format_args!("{:^width$}", "ms/call", width = per_width),
+                excl = format_args!("{:^width$}", "self_ms", width = excl_width),
+                incl = format_args!("{:^width$}", "total_ms", width = incl_width),
+                percent = format_args!("{:^width$}", "%tbl", width = percent_width),
+                global = format_args!("{:^width$}", "%all", width = global_percent_width),
+            ));
+            output.push_str(&format!(
+                "|-{name}-|-{calls}-|-{per}-|-{excl}-|-{incl}-|-{percent}-|-{global}-|\n",
+                name = "-".repeat(name_width),
+                calls = "-".repeat(calls_width),
+                per = "-".repeat(per_width),
+                excl = "-".repeat(excl_width),
+                incl = "-".repeat(incl_width),
+                percent = "-".repeat(percent_width),
+                global = "-".repeat(global_percent_width),
+            ));
+        }
 
         if rows.is_empty() {
-            let empty_row = format!(
-                "| {value} | {calls} | {per} | {excl} | {incl} | {percent} | {global} |\n",
-                value = format_args!("{:<width$}", "(no data)", width = name_width),
-                calls = format_args!("{:>width$}", "-", width = calls_width),
-                per = format_args!("{:>width$}", "-", width = per_width),
-                excl = format_args!("{:>width$}", "-", width = excl_width),
-                incl = format_args!("{:>width$}", "-", width = incl_width),
-                percent = format_args!("{:>width$}", "-", width = percent_width),
-                global = format_args!("{:>width$}", "-", width = global_percent_width),
-            );
-            output.push_str(&empty_row);
+            if include_unit_columns {
+                output.push_str(&format!(
+                    "| {value} | {calls} | {per} | {excl} | {incl} | {calls_unit} | {ms_unit} | {percent} | {global} |\n",
+                    value = format_args!("{:<width$}", "(no data)", width = name_width),
+                    calls = format_args!("{:>width$}", "-", width = calls_width),
+                    per = format_args!("{:>width$}", "-", width = per_width),
+                    excl = format_args!("{:>width$}", "-", width = excl_width),
+                    incl = format_args!("{:>width$}", "-", width = incl_width),
+                    calls_unit = format_args!("{:>width$}", "-", width = calls_per_unit_width),
+                    ms_unit = format_args!("{:>width$}", "-", width = ms_per_unit_width),
+                    percent = format_args!("{:>width$}", "-", width = percent_width),
+                    global = format_args!("{:>width$}", "-", width = global_percent_width),
+                ));
+            } else {
+                output.push_str(&format!(
+                    "| {value} | {calls} | {per} | {excl} | {incl} | {percent} | {global} |\n",
+                    value = format_args!("{:<width$}", "(no data)", width = name_width),
+                    calls = format_args!("{:>width$}", "-", width = calls_width),
+                    per = format_args!("{:>width$}", "-", width = per_width),
+                    excl = format_args!("{:>width$}", "-", width = excl_width),
+                    incl = format_args!("{:>width$}", "-", width = incl_width),
+                    percent = format_args!("{:>width$}", "-", width = percent_width),
+                    global = format_args!("{:>width$}", "-", width = global_percent_width),
+                ));
+            }
             return output;
         }
 
         for row in rows {
-            let per_call = format!("{:.3}", row.per_ms);
+            let display_name = display_name(row);
+            let per = format!("{:.3}", row.per_ms);
             let excl = format!("{:.3}", row.excl_ms);
             let incl = format!("{:.3}", row.incl_ms);
             let percent = format!("{:.2}", row.percent);
-            let global_percent = format!("{:.2}", row.percent_global);
-            let display_name = display_name(row);
-            let line = format!(
-                "| {name} | {calls} | {per} | {excl} | {incl} | {percent} | {global} |\n",
-                name = format_args!("{:<width$}", display_name, width = name_width),
-                calls = format_args!("{:>width$}", row.calls, width = calls_width),
-                per = format_args!("{:>width$}", per_call, width = per_width),
-                excl = format_args!("{:>width$}", excl, width = excl_width),
-                incl = format_args!("{:>width$}", incl, width = incl_width),
-                percent = format_args!("{:>width$}", percent, width = percent_width),
-                global = format_args!("{:>width$}", global_percent, width = global_percent_width),
-            );
-            output.push_str(&line);
+            let global = format!("{:.2}", row.percent_global);
+            if let Some(units) = units {
+                let calls_unit = format!("{:.3}", (row.calls as f64) / units);
+                let ms_unit = format!("{:.3}", row.excl_ms / units);
+                output.push_str(&format!(
+                    "| {name} | {calls} | {per} | {excl} | {incl} | {calls_unit} | {ms_unit} | {percent} | {global} |\n",
+                    name = format_args!("{:<width$}", display_name, width = name_width),
+                    calls = format_args!("{:>width$}", row.calls, width = calls_width),
+                    per = format_args!("{:>width$}", per, width = per_width),
+                    excl = format_args!("{:>width$}", excl, width = excl_width),
+                    incl = format_args!("{:>width$}", incl, width = incl_width),
+                    calls_unit = format_args!("{:>width$}", calls_unit, width = calls_per_unit_width),
+                    ms_unit = format_args!("{:>width$}", ms_unit, width = ms_per_unit_width),
+                    percent = format_args!("{:>width$}", percent, width = percent_width),
+                    global = format_args!("{:>width$}", global, width = global_percent_width),
+                ));
+            } else {
+                output.push_str(&format!(
+                    "| {name} | {calls} | {per} | {excl} | {incl} | {percent} | {global} |\n",
+                    name = format_args!("{:<width$}", display_name, width = name_width),
+                    calls = format_args!("{:>width$}", row.calls, width = calls_width),
+                    per = format_args!("{:>width$}", per, width = per_width),
+                    excl = format_args!("{:>width$}", excl, width = excl_width),
+                    incl = format_args!("{:>width$}", incl, width = incl_width),
+                    percent = format_args!("{:>width$}", percent, width = percent_width),
+                    global = format_args!("{:>width$}", global, width = global_percent_width),
+                ));
+            }
         }
         output
     }
@@ -1438,33 +1907,60 @@ pub fn format_tables(tables: &ProfilerTables) -> String {
         output
     }
 
+    let (backend_rows, backend_compact_suffix) =
+        maybe_compact_backend_rows(&tables.backend, options);
+    let backend_label = match backend_compact_suffix {
+        Some(suffix) => format!("Backend Ops {suffix}"),
+        None => "Backend Ops".to_string(),
+    };
+
     let mut out = String::new();
-    out.push_str(&format_table("Layers", "layer", &tables.layers));
+    out.push_str(&format_execution_kpis(tables, options));
+    out.push('\n');
+    out.push('\n');
+    out.push_str(&format_table("Layers", "layer", &tables.layers, options));
+    out.push('\n');
     out.push('\n');
     out.push_str(&format_table(
         "Functionals",
         "functional",
         &tables.functionals,
+        options,
     ));
     out.push('\n');
-    out.push_str(&format_table("Backend Ops", "backend", &tables.backend));
     out.push('\n');
-    out.push_str(&format_table("Compilation", "compile", &tables.compilation));
+    out.push_str(&format_table(
+        backend_label.as_str(),
+        "backend",
+        backend_rows.as_slice(),
+        options,
+    ));
+    out.push('\n');
+    out.push('\n');
+    out.push_str(&format_table(
+        "Compilation",
+        "compile",
+        &tables.compilation,
+        options,
+    ));
+    out.push('\n');
     out.push('\n');
     out.push_str(&format_table(
         "Optimizer Passes",
         "pass",
         &tables.compile_passes,
+        options,
     ));
+    out.push('\n');
     out.push('\n');
     out.push_str(&format_cache_table("Cache Stats", "cache", &tables.caches));
     out
 }
 
 #[cfg(feature = "profiler")]
-fn format_report(report: &ProfilerReport) -> String {
+fn format_report_with_options(report: &ProfilerReport, options: &ProfileFormatOptions) -> String {
     if report.sections.len() == 1 {
-        return format_tables(&report.sections[0].tables);
+        return format_tables_with_options(&report.sections[0].tables, options);
     }
 
     let mut out = String::new();
@@ -1473,14 +1969,222 @@ fn format_report(report: &ProfilerReport) -> String {
             out.push('\n');
         }
         out.push_str(&format!("Section: {}\n\n", section.section));
-        out.push_str(&format_tables(&section.tables));
+        out.push_str(&format_tables_with_options(&section.tables, options));
     }
     out
 }
 
 #[cfg(feature = "profiler")]
+fn kpi_rows_for_report(
+    report: &ProfilerReport,
+    options: &ProfileFormatOptions,
+) -> Vec<(String, f64)> {
+    let mut layers_ms = 0.0f64;
+    let mut functionals_ms = 0.0f64;
+    let mut backend_ms = 0.0f64;
+    let mut compilation_ms = 0.0f64;
+    let mut compile_passes_ms = 0.0f64;
+    let mut backend_calls = 0u64;
+    let mut cache_events = 0u64;
+
+    for section in &report.sections {
+        layers_ms += section
+            .tables
+            .layers
+            .iter()
+            .map(|row| row.excl_ms)
+            .sum::<f64>();
+        functionals_ms += section
+            .tables
+            .functionals
+            .iter()
+            .map(|row| row.excl_ms)
+            .sum::<f64>();
+        backend_ms += section
+            .tables
+            .backend
+            .iter()
+            .map(|row| row.excl_ms)
+            .sum::<f64>();
+        compilation_ms += section
+            .tables
+            .compilation
+            .iter()
+            .map(|row| row.excl_ms)
+            .sum::<f64>();
+        compile_passes_ms += section
+            .tables
+            .compile_passes
+            .iter()
+            .map(|row| row.excl_ms)
+            .sum::<f64>();
+        backend_calls += section
+            .tables
+            .backend
+            .iter()
+            .map(|row| row.calls)
+            .sum::<u64>();
+        cache_events += section
+            .tables
+            .caches
+            .iter()
+            .map(|row| row.calls)
+            .sum::<u64>();
+    }
+
+    let compile_ms = compilation_ms + compile_passes_ms;
+    let measured_ms = layers_ms + functionals_ms + backend_ms + compile_ms;
+    let mut rows = vec![
+        ("measured_ms.total".to_string(), measured_ms),
+        ("layers_ms.total".to_string(), layers_ms),
+        ("functionals_ms.total".to_string(), functionals_ms),
+        ("backend_ms.total".to_string(), backend_ms),
+        ("compile_ms.total".to_string(), compile_ms),
+        ("backend_calls.total".to_string(), backend_calls as f64),
+        ("cache_events.total".to_string(), cache_events as f64),
+    ];
+    if let Some(units) = positive_measured_units(options) {
+        let unit_label = options.unit_label.as_deref().unwrap_or("unit");
+        rows.push((format!("measured_ms/{unit_label}"), measured_ms / units));
+        rows.push((format!("backend_ms/{unit_label}"), backend_ms / units));
+        rows.push((format!("compile_ms/{unit_label}"), compile_ms / units));
+        rows.push((
+            format!("backend_calls/{unit_label}"),
+            (backend_calls as f64) / units,
+        ));
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
+}
+
+#[cfg(feature = "profiler")]
+fn section_rows_sorted(rows: &[TableRow]) -> Vec<TableRow> {
+    let mut sorted = rows.to_vec();
+    sorted.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.signature.cmp(&b.signature))
+            .then_with(|| a.calls.cmp(&b.calls))
+    });
+    sorted
+}
+
+#[cfg(feature = "profiler")]
+pub fn report_to_jsonl(report: &ProfilerReport, options: &ProfileFormatOptions) -> String {
+    let mut lines = Vec::new();
+    lines.push(serde_json::json!({
+        "type": "meta",
+        "schema": "gpt-rs.profile.v1",
+        "unit_label": options.unit_label.as_deref(),
+        "measured_units": options.measured_units,
+        "profile_full": options.profile_full
+    }));
+
+    for (name, value) in kpi_rows_for_report(report, options) {
+        lines.push(serde_json::json!({
+            "type": "kpi",
+            "name": name,
+            "value": format!("{value:.6}")
+        }));
+    }
+
+    for section in &report.sections {
+        let tables = [
+            (
+                "layers",
+                section_rows_sorted(section.tables.layers.as_slice()),
+            ),
+            (
+                "functionals",
+                section_rows_sorted(section.tables.functionals.as_slice()),
+            ),
+            (
+                "backend",
+                section_rows_sorted(section.tables.backend.as_slice()),
+            ),
+            (
+                "compilation",
+                section_rows_sorted(section.tables.compilation.as_slice()),
+            ),
+            (
+                "compile_passes",
+                section_rows_sorted(section.tables.compile_passes.as_slice()),
+            ),
+            (
+                "caches",
+                section_rows_sorted(section.tables.caches.as_slice()),
+            ),
+        ];
+        for (table_name, rows) in tables {
+            for row in rows {
+                let units = positive_measured_units(options);
+                let calls_per_unit = units.map(|unit| (row.calls as f64) / unit);
+                let ms_per_unit = units.map(|unit| row.excl_ms / unit);
+                lines.push(serde_json::json!({
+                    "type": "row",
+                    "section": section.section,
+                    "table": table_name,
+                    "name": row.name,
+                    "signature": row.signature,
+                    "calls": row.calls,
+                    "ms_per_call": format!("{:.6}", row.per_ms),
+                    "self_ms": format!("{:.6}", row.excl_ms),
+                    "total_ms": format!("{:.6}", row.incl_ms),
+                    "pct_section": format!("{:.6}", row.percent),
+                    "pct_global": format!("{:.6}", row.percent_global),
+                    "calls_per_unit": calls_per_unit.map(|v| format!("{v:.6}")),
+                    "ms_per_unit": ms_per_unit.map(|v| format!("{v:.6}")),
+                }));
+            }
+        }
+    }
+
+    let mut out = String::new();
+    for line in lines {
+        if let Ok(serialized) = serde_json::to_string(&line) {
+            out.push_str(serialized.as_str());
+            out.push('\n');
+        }
+    }
+    out
+}
+
+#[cfg(feature = "profiler")]
+pub fn take_profile_snapshot_with_options(
+    pretty_report_json: bool,
+    options: &ProfileFormatOptions,
+) -> Option<ProfileSnapshot> {
+    let report = take_report()?;
+    let formatted = format_report_with_options(&report, options);
+    let report_json = if pretty_report_json {
+        serde_json::to_string_pretty(&report).ok()?
+    } else {
+        serde_json::to_string(&report).ok()?
+    };
+    let profile_jsonl = report_to_jsonl(&report, options);
+    Some(ProfileSnapshot {
+        formatted,
+        report_json,
+        profile_jsonl,
+    })
+}
+
+#[cfg(not(feature = "profiler"))]
+pub fn take_profile_snapshot_with_options(
+    _pretty_report_json: bool,
+    _options: &ProfileFormatOptions,
+) -> Option<ProfileSnapshot> {
+    None
+}
+
+#[cfg(feature = "profiler")]
 pub fn take_formatted_tables() -> Option<String> {
-    take_report().map(|report| format_report(&report))
+    take_formatted_tables_with_options(&ProfileFormatOptions::default())
+}
+
+#[cfg(feature = "profiler")]
+pub fn take_formatted_tables_with_options(options: &ProfileFormatOptions) -> Option<String> {
+    take_report().map(|report| format_report_with_options(&report, options))
 }
 
 #[cfg(not(feature = "profiler"))]
@@ -1490,18 +2194,33 @@ pub fn take_formatted_tables() -> Option<String> {
 
 #[cfg(feature = "profiler")]
 pub fn take_formatted_tables_and_report_json(pretty: bool) -> Option<(String, String)> {
-    let report = take_report()?;
-    let formatted = format_report(&report);
-    let json = if pretty {
-        serde_json::to_string_pretty(&report).ok()?
-    } else {
-        serde_json::to_string(&report).ok()?
-    };
-    Some((formatted, json))
+    take_formatted_tables_and_report_json_with_options(pretty, &ProfileFormatOptions::default())
+}
+
+#[cfg(feature = "profiler")]
+pub fn take_formatted_tables_and_report_json_with_options(
+    pretty: bool,
+    options: &ProfileFormatOptions,
+) -> Option<(String, String)> {
+    let snapshot = take_profile_snapshot_with_options(pretty, options)?;
+    Some((snapshot.formatted, snapshot.report_json))
 }
 
 #[cfg(not(feature = "profiler"))]
 pub fn take_formatted_tables_and_report_json(_pretty: bool) -> Option<(String, String)> {
+    None
+}
+
+#[cfg(not(feature = "profiler"))]
+pub fn take_formatted_tables_with_options(_options: &ProfileFormatOptions) -> Option<String> {
+    None
+}
+
+#[cfg(not(feature = "profiler"))]
+pub fn take_formatted_tables_and_report_json_with_options(
+    _pretty: bool,
+    _options: &ProfileFormatOptions,
+) -> Option<(String, String)> {
     None
 }
 

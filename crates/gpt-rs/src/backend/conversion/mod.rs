@@ -7,13 +7,16 @@ mod legality;
 mod registry;
 mod walker;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::backend::spec::{Program, ProgramSerdeError};
+use crate::backend::spec::{
+    Function, Instruction, Operand, Operation, Program, ProgramSerdeError, Region, RegionId,
+    ValueId,
+};
 
 pub use bufferize::{
     plan_buffers, plan_buffers_with, AliasKind, BufferKey, BufferPlan, BufferSlot, BufferSpec,
@@ -105,7 +108,7 @@ impl ConversionCacheKey {
         device_caps_hash: Option<u64>,
     ) -> ConversionResult<Self> {
         Ok(Self {
-            program_hash: hash_program(program)?,
+            program_hash: hash_program_canonical(program)?,
             target: target.name().to_string(),
             target_version: target.version(),
             options_hash: options.digest(),
@@ -116,6 +119,17 @@ impl ConversionCacheKey {
 
 type ConversionCacheEntry = Arc<OnceLock<ConversionResult<Arc<ConvertedIr>>>>;
 type ConversionCacheMap = HashMap<ConversionCacheKey, ConversionCacheEntry>;
+type CanonicalHashMemoMap = HashMap<CanonicalHashMemoKey, u64>;
+
+const CANONICAL_HASH_MEMO_CAPACITY: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct CanonicalHashMemoKey {
+    raw_hash: u64,
+    raw_len: usize,
+}
+
+static CANONICAL_HASH_MEMO: OnceLock<Mutex<CanonicalHashMemoMap>> = OnceLock::new();
 
 pub struct ConversionCache {
     entries: Mutex<ConversionCacheMap>,
@@ -164,8 +178,274 @@ impl Default for ConversionCache {
 }
 
 pub fn hash_program(program: &Program) -> ConversionResult<u64> {
-    let bytes = program.to_bincode_bytes()?;
+    let bytes = serialized_program(program)?;
     Ok(fnv_hash(&bytes))
+}
+
+pub fn hash_program_canonical(program: &Program) -> ConversionResult<u64> {
+    let raw_bytes = serialized_program(program)?;
+    let memo_key = CanonicalHashMemoKey {
+        raw_hash: fnv_hash(&raw_bytes),
+        raw_len: raw_bytes.len(),
+    };
+
+    if let Some(cached) = lookup_canonical_hash_memo(memo_key)? {
+        crate::profiling::cache_event("conversion_hash_canonical_memo_hit");
+        return Ok(cached);
+    }
+
+    crate::profiling::cache_event("conversion_hash_canonical_memo_miss");
+    let canonical = canonicalize_program_for_hash(program);
+    let bytes = canonical.to_bincode_bytes()?;
+    let canonical_hash = fnv_hash(&bytes);
+    store_canonical_hash_memo(memo_key, canonical_hash)?;
+    Ok(canonical_hash)
+}
+
+fn serialized_program(program: &Program) -> ConversionResult<Vec<u8>> {
+    program.to_bincode_bytes().map_err(ConversionError::from)
+}
+
+fn canonical_hash_memo() -> &'static Mutex<CanonicalHashMemoMap> {
+    CANONICAL_HASH_MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lookup_canonical_hash_memo(key: CanonicalHashMemoKey) -> ConversionResult<Option<u64>> {
+    let guard = canonical_hash_memo()
+        .lock()
+        .map_err(|_| ConversionError::new("canonical hash memo mutex poisoned"))?;
+    Ok(guard.get(&key).copied())
+}
+
+fn store_canonical_hash_memo(key: CanonicalHashMemoKey, value: u64) -> ConversionResult<()> {
+    let mut guard = canonical_hash_memo()
+        .lock()
+        .map_err(|_| ConversionError::new("canonical hash memo mutex poisoned"))?;
+    if guard.len() >= CANONICAL_HASH_MEMO_CAPACITY {
+        guard.clear();
+        crate::profiling::cache_event("conversion_hash_canonical_memo_clear");
+    }
+    guard.insert(key, value);
+    Ok(())
+}
+
+fn canonicalize_program_for_hash(program: &Program) -> Program {
+    let mut canonical = program.clone();
+    canonicalize_function_names_and_entry(&mut canonical);
+    let region_map = canonicalize_region_ids(&mut canonical);
+
+    for function in &mut canonical.functions {
+        canonicalize_function_value_ids(function);
+    }
+    for region in &mut canonical.regions {
+        canonicalize_region_value_ids(region);
+    }
+    remap_program_region_refs(&mut canonical, &region_map);
+    canonical
+}
+
+fn canonicalize_function_names_and_entry(program: &mut Program) {
+    let mut names = HashMap::<String, String>::new();
+    for (index, function) in program.functions.iter_mut().enumerate() {
+        let canonical_name = format!("f{index}");
+        names.insert(function.name.clone(), canonical_name.clone());
+        function.name = canonical_name;
+    }
+    if let Some(mapped) = names.get(&program.entry) {
+        program.entry = mapped.clone();
+    }
+}
+
+fn canonicalize_region_ids(program: &mut Program) -> HashMap<usize, usize> {
+    let mut map = HashMap::new();
+    for (index, region) in program.regions.iter_mut().enumerate() {
+        map.insert(region.id.0, index);
+        region.id = RegionId(index);
+    }
+    map
+}
+
+fn remap_program_region_refs(program: &mut Program, region_map: &HashMap<usize, usize>) {
+    for function in &mut program.functions {
+        for instruction in &mut function.body {
+            remap_instruction_regions(instruction, region_map);
+        }
+        for hint in &mut function.hints {
+            for instruction in &mut hint.body {
+                remap_instruction_regions(instruction, region_map);
+            }
+        }
+    }
+    for region in &mut program.regions {
+        for instruction in &mut region.body {
+            remap_instruction_regions(instruction, region_map);
+        }
+    }
+}
+
+fn remap_instruction_regions(instruction: &mut Instruction, region_map: &HashMap<usize, usize>) {
+    match &mut instruction.op {
+        Operation::Cond(spec) => {
+            if let Some(mapped) = region_map.get(&spec.true_region.0).copied() {
+                spec.true_region = RegionId(mapped);
+            }
+            if let Some(mapped) = region_map.get(&spec.false_region.0).copied() {
+                spec.false_region = RegionId(mapped);
+            }
+        }
+        Operation::While(spec) => {
+            if let Some(mapped) = region_map.get(&spec.cond_region.0).copied() {
+                spec.cond_region = RegionId(mapped);
+            }
+            if let Some(mapped) = region_map.get(&spec.body_region.0).copied() {
+                spec.body_region = RegionId(mapped);
+            }
+        }
+        Operation::Scan(spec) => {
+            if let Some(mapped) = region_map.get(&spec.body_region.0).copied() {
+                spec.body_region = RegionId(mapped);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn canonicalize_function_value_ids(function: &mut Function) {
+    let mut value_map = HashMap::<ValueId, ValueId>::new();
+    let mut next_value = 0u32;
+
+    for parameter in &mut function.parameter_ids {
+        let old = *parameter;
+        let new = ValueId(next_value);
+        next_value = next_value.saturating_add(1);
+        value_map.insert(old, new);
+        *parameter = new;
+    }
+
+    for instruction in &mut function.body {
+        canonicalize_instruction_id(instruction, &mut value_map, &mut next_value);
+    }
+
+    for (hint_index, hint) in function.hints.iter_mut().enumerate() {
+        hint.id = hint_index as u32;
+        for instruction in &mut hint.body {
+            canonicalize_instruction_id(instruction, &mut value_map, &mut next_value);
+        }
+    }
+
+    for instruction in &mut function.body {
+        remap_instruction_values(instruction, &value_map);
+    }
+
+    for hint in &mut function.hints {
+        remap_value_ids(hint.inputs.as_mut_slice(), &value_map);
+        remap_value_ids(hint.exports.as_mut_slice(), &value_map);
+        for instruction in &mut hint.body {
+            remap_instruction_values(instruction, &value_map);
+        }
+    }
+
+    remap_value_ids(function.result_ids.as_mut_slice(), &value_map);
+}
+
+fn canonicalize_region_value_ids(region: &mut Region) {
+    let mut value_map = HashMap::<ValueId, ValueId>::new();
+
+    let inferred = infer_region_parameter_ids(region);
+    for (index, old_value) in inferred
+        .into_iter()
+        .take(region.parameters.len())
+        .enumerate()
+    {
+        value_map.insert(old_value, ValueId(index as u32));
+    }
+
+    let mut next_value = region.parameters.len() as u32;
+    for instruction in &mut region.body {
+        canonicalize_instruction_id(instruction, &mut value_map, &mut next_value);
+    }
+    for instruction in &mut region.body {
+        remap_instruction_values(instruction, &value_map);
+    }
+}
+
+fn infer_region_parameter_ids(region: &Region) -> Vec<ValueId> {
+    let defined = region
+        .body
+        .iter()
+        .map(|instruction| instruction.id)
+        .collect::<HashSet<_>>();
+    let mut used = Vec::<ValueId>::new();
+
+    for instruction in &region.body {
+        for operand in &instruction.operands {
+            match operand {
+                Operand::Value(value) => used.push(*value),
+                Operand::TupleElement { tuple, .. } => used.push(*tuple),
+                Operand::Literal(_) => {}
+            }
+        }
+    }
+
+    used.sort_by_key(|value| value.0);
+    used.dedup();
+
+    let mut params = used
+        .into_iter()
+        .filter(|value| !defined.contains(value))
+        .collect::<Vec<_>>();
+    if params.len() == region.parameters.len() {
+        params
+    } else {
+        params.clear();
+        for index in 0..region.parameters.len() {
+            params.push(ValueId(index as u32));
+        }
+        params
+    }
+}
+
+fn canonicalize_instruction_id(
+    instruction: &mut Instruction,
+    value_map: &mut HashMap<ValueId, ValueId>,
+    next_value: &mut u32,
+) {
+    let old = instruction.id;
+    let new = if let Some(existing) = value_map.get(&old).copied() {
+        existing
+    } else {
+        let assigned = ValueId(*next_value);
+        *next_value = next_value.saturating_add(1);
+        value_map.insert(old, assigned);
+        assigned
+    };
+    instruction.id = new;
+}
+
+fn remap_instruction_values(instruction: &mut Instruction, value_map: &HashMap<ValueId, ValueId>) {
+    for operand in &mut instruction.operands {
+        match operand {
+            Operand::Value(value) => {
+                if let Some(mapped) = value_map.get(value).copied() {
+                    *value = mapped;
+                }
+            }
+            Operand::TupleElement { tuple, .. } => {
+                if let Some(mapped) = value_map.get(tuple).copied() {
+                    *tuple = mapped;
+                }
+            }
+            Operand::Literal(_) => {}
+        }
+    }
+}
+
+fn remap_value_ids(ids: &mut [ValueId], value_map: &HashMap<ValueId, ValueId>) {
+    for id in ids {
+        if let Some(mapped) = value_map.get(id).copied() {
+            *id = mapped;
+        }
+    }
 }
 
 pub fn sanitize_symbol(value: &str) -> String {

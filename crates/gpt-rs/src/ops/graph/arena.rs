@@ -87,6 +87,8 @@ static ARENA_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 struct CacheMissTelemetry {
     last_plan_by_graph: HashMap<u64, PlanKey>,
     last_program_by_graph: HashMap<u64, PlanKey>,
+    last_plan_any: Option<PlanKey>,
+    last_program_any: Option<PlanKey>,
 }
 
 /// Configures how an arena caches compiled plans and rewrites graphs.
@@ -898,9 +900,11 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
             .miss_telemetry
             .lock()
             .expect("graph arena miss telemetry poisoned");
+        let previous_any = telemetry.last_plan_any;
         let previous = telemetry.last_plan_by_graph.insert(key.graph_hash, key);
+        telemetry.last_plan_any = Some(key);
         if miss {
-            key.classify_change_from(previous)
+            key.classify_change_from(previous.or(previous_any))
         } else {
             CacheMissReason::Unknown
         }
@@ -911,9 +915,11 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
             .miss_telemetry
             .lock()
             .expect("graph arena miss telemetry poisoned");
+        let previous_any = telemetry.last_program_any;
         let previous = telemetry.last_program_by_graph.insert(key.graph_hash, key);
+        telemetry.last_program_any = Some(key);
         if miss {
-            key.classify_change_from(previous)
+            key.classify_change_from(previous.or(previous_any))
         } else {
             CacheMissReason::Unknown
         }
@@ -1172,23 +1178,25 @@ enum CacheKind {
     Program,
 }
 
-const PLAN_CACHE_MISS_REASON_EVENTS: [&str; 7] = [
+const PLAN_CACHE_MISS_REASON_EVENTS: [&str; 8] = [
     "plan_cache_miss_reason.shape_specialization_change",
     "plan_cache_miss_reason.dtype_change",
     "plan_cache_miss_reason.layout_change",
     "plan_cache_miss_reason.literal_value_only_change",
     "plan_cache_miss_reason.kv_bucket_change",
     "plan_cache_miss_reason.backend_option_change",
+    "plan_cache_miss_reason.graph_structure_change",
     "plan_cache_miss_reason.unknown",
 ];
 
-const PROGRAM_CACHE_MISS_REASON_EVENTS: [&str; 7] = [
+const PROGRAM_CACHE_MISS_REASON_EVENTS: [&str; 8] = [
     "program_cache_miss_reason.shape_specialization_change",
     "program_cache_miss_reason.dtype_change",
     "program_cache_miss_reason.layout_change",
     "program_cache_miss_reason.literal_value_only_change",
     "program_cache_miss_reason.kv_bucket_change",
     "program_cache_miss_reason.backend_option_change",
+    "program_cache_miss_reason.graph_structure_change",
     "program_cache_miss_reason.unknown",
 ];
 
@@ -1200,7 +1208,8 @@ fn cache_miss_reason_index(reason: CacheMissReason) -> usize {
         CacheMissReason::LiteralValueOnlyChange => 3,
         CacheMissReason::KvBucketChange => 4,
         CacheMissReason::BackendOptionChange => 5,
-        CacheMissReason::Unknown => 6,
+        CacheMissReason::GraphStructureChange => 6,
+        CacheMissReason::Unknown => 7,
     }
 }
 

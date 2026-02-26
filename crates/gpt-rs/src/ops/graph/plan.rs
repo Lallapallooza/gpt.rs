@@ -54,6 +54,7 @@ pub(super) enum CacheMissReason {
     LiteralValueOnlyChange,
     KvBucketChange,
     BackendOptionChange,
+    GraphStructureChange,
     Unknown,
 }
 
@@ -114,6 +115,9 @@ impl PlanKey {
         }
         if self.literal_hash != previous.literal_hash {
             return CacheMissReason::LiteralValueOnlyChange;
+        }
+        if self.graph_hash != previous.graph_hash {
+            return CacheMissReason::GraphStructureChange;
         }
         CacheMissReason::Unknown
     }
@@ -671,20 +675,52 @@ impl Canonicalizer {
 
         let exports = exports.iter().map(|v| canon.canon_value(*v)).collect();
         let targets = targets.iter().map(|v| canon.canon_value(*v)).collect();
+        let mut signature_inputs: Vec<SignatureInput> = inputs
+            .iter()
+            .map(|input| SignatureInput {
+                role: input.role,
+                stable_id: input.stable_id,
+                spec: input.spec.clone(),
+            })
+            .collect();
+        canonicalize_signature_inputs(signature_inputs.as_mut_slice());
 
         SignatureData {
-            inputs: inputs
-                .iter()
-                .map(|input| SignatureInput {
-                    role: input.role,
-                    stable_id: input.stable_id,
-                    spec: input.spec.clone(),
-                })
-                .collect(),
+            inputs: signature_inputs,
             exports,
             targets,
             nodes: sig_nodes,
         }
+    }
+}
+
+fn canonicalize_signature_inputs(inputs: &mut [SignatureInput]) {
+    inputs.sort_by(|lhs, rhs| {
+        let lhs_key = (
+            input_role_key(lhs.role),
+            lhs.stable_id.unwrap_or(u128::MAX),
+            tensor_spec_sort_hash(&lhs.spec),
+        );
+        let rhs_key = (
+            input_role_key(rhs.role),
+            rhs.stable_id.unwrap_or(u128::MAX),
+            tensor_spec_sort_hash(&rhs.spec),
+        );
+        lhs_key.cmp(&rhs_key)
+    });
+}
+
+fn input_role_key(role: InputRole) -> u8 {
+    match role {
+        InputRole::Arg => 0,
+        InputRole::Param => 1,
+    }
+}
+
+fn tensor_spec_sort_hash(spec: &TensorSpec) -> u64 {
+    match bincode::serialize(spec) {
+        Ok(bytes) => fnv1a_hash(&bytes),
+        Err(_) => 0,
     }
 }
 

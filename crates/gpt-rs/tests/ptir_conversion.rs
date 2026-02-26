@@ -41,6 +41,51 @@ fn sample_program_builder() -> (Program, ValueId, ValueId) {
     (program, param, out)
 }
 
+fn renumber_function_values(program: &Program, delta: u32) -> Program {
+    let mut out = program.clone();
+    let Some(function) = out.functions.first_mut() else {
+        return out;
+    };
+
+    for id in &mut function.parameter_ids {
+        id.0 = id.0.saturating_add(delta);
+    }
+
+    for instruction in &mut function.body {
+        instruction.id.0 = instruction.id.0.saturating_add(delta);
+        for operand in &mut instruction.operands {
+            match operand {
+                Operand::Value(value) => value.0 = value.0.saturating_add(delta),
+                Operand::TupleElement { tuple, .. } => {
+                    tuple.0 = tuple.0.saturating_add(delta);
+                }
+                Operand::Literal(_) => {}
+            }
+        }
+    }
+
+    for id in &mut function.result_ids {
+        id.0 = id.0.saturating_add(delta);
+    }
+    out
+}
+
+fn constant_program(value: f32) -> Program {
+    let spec = tensor_spec_static(DType::F32, &[1]);
+    let literal = gpt_rs::backend::spec::TensorLiteral::new(
+        spec.clone(),
+        Arc::from(value.to_le_bytes().to_vec()),
+    );
+    let mut builder = ProgramBuilder::new();
+    let constant = builder.emit_single(
+        Operation::Constant(literal),
+        Vec::new(),
+        ValueType::Tensor(spec),
+    );
+    let function = builder.finish("main", vec![constant]);
+    Program::new("main").with_functions(vec![function])
+}
+
 struct DummyTarget {
     name: String,
     hits: Arc<AtomicUsize>,
@@ -114,6 +159,42 @@ fn conversion_cache_dedups_builds() {
         .expect("second conversion");
 
     assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn conversion_cache_key_ignores_value_id_renumbering() {
+    let program = sample_program();
+    let renumbered = renumber_function_values(&program, 37);
+    let target = DummyTarget {
+        name: "dummy_cache_id_renumber".to_string(),
+        hits: Arc::new(AtomicUsize::new(0)),
+    };
+    let options = ConversionOptions::default();
+    let lhs = ConversionCacheKey::new(&program, &target, &options, None).expect("lhs key");
+    let rhs = ConversionCacheKey::new(&renumbered, &target, &options, None).expect("rhs key");
+
+    assert_eq!(
+        lhs, rhs,
+        "conversion cache key should be stable under pure ValueId renumbering"
+    );
+}
+
+#[test]
+fn conversion_cache_key_changes_when_literal_tensor_changes() {
+    let first = constant_program(1.0);
+    let second = constant_program(2.0);
+    let target = DummyTarget {
+        name: "dummy_cache_literal_change".to_string(),
+        hits: Arc::new(AtomicUsize::new(0)),
+    };
+    let options = ConversionOptions::default();
+    let lhs = ConversionCacheKey::new(&first, &target, &options, None).expect("lhs key");
+    let rhs = ConversionCacheKey::new(&second, &target, &options, None).expect("rhs key");
+
+    assert_ne!(
+        lhs, rhs,
+        "literal value change must produce a different conversion cache key"
+    );
 }
 
 #[test]

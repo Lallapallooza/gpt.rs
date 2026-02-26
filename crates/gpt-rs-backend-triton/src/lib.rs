@@ -8,9 +8,7 @@ mod runtime;
 mod targets;
 mod tensor;
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use gpt_rs::backend::conversion::{
     check_program_legality, default_entrypoint_name, get_conversion_target, plan_buffers_with,
@@ -33,7 +31,6 @@ pub use tensor::TritonTensor;
 pub struct TritonBackend {
     params: Arc<InMemoryParamResolver<TritonTensor>>,
     conversion_cache: ConversionCache,
-    converted_fast_cache: Mutex<HashMap<usize, Arc<ConvertedIr>>>,
     executor: runtime::TritonExecutor,
 }
 
@@ -43,7 +40,6 @@ impl TritonBackend {
         Self {
             params: Arc::new(InMemoryParamResolver::new()),
             conversion_cache: ConversionCache::new(),
-            converted_fast_cache: Mutex::new(HashMap::new()),
             executor: runtime::TritonExecutor::new(),
         }
     }
@@ -58,29 +54,6 @@ impl TritonBackend {
         options: &ConversionOptions,
     ) -> ConversionResult<ConvertedIr> {
         convert_program_for_triton(program, options, Some(self))
-    }
-
-    fn fast_converted_lookup(&self, program: &Program) -> Option<Arc<ConvertedIr>> {
-        let program_ptr = program as *const Program as usize;
-        let Ok(cache) = self.converted_fast_cache.lock() else {
-            gpt_rs::profiling::cache_event("triton_backend.convert_fast_cache_poisoned");
-            return None;
-        };
-        if let Some(converted) = cache.get(&program_ptr) {
-            gpt_rs::profiling::cache_event("triton_backend.convert_fast_cache_hit");
-            return Some(Arc::clone(converted));
-        }
-        gpt_rs::profiling::cache_event("triton_backend.convert_fast_cache_miss");
-        None
-    }
-
-    fn fast_converted_store(&self, program: &Program, converted: Arc<ConvertedIr>) {
-        let program_ptr = program as *const Program as usize;
-        if let Ok(mut cache) = self.converted_fast_cache.lock() {
-            cache.insert(program_ptr, converted);
-        } else {
-            gpt_rs::profiling::cache_event("triton_backend.convert_fast_cache_poisoned");
-        }
     }
 }
 
@@ -143,24 +116,17 @@ impl PortableBackend for TritonBackend {
     ) -> BackendResult<Vec<Self::TensorHandle>> {
         let converted = {
             let _convert_scope = gpt_rs::profiling::compile_scope("triton_backend.convert");
-            if let Some(cached) = self.fast_converted_lookup(program) {
-                cached
-            } else {
-                let target = get_conversion_target("triton").ok_or_else(|| {
-                    BackendError::execution("conversion target 'triton' is not registered")
-                })?;
-                let options = ConversionOptions::default();
-                let key = ConversionCacheKey::new(program, target.as_ref(), &options, None)
-                    .map_err(|err| BackendError::execution(err.to_string()))?;
-                let converted = self
-                    .conversion_cache
-                    .get_or_convert(key, || {
-                        convert_program_for_triton(program, &options, Some(self))
-                    })
-                    .map_err(|err| BackendError::execution(err.to_string()))?;
-                self.fast_converted_store(program, Arc::clone(&converted));
-                converted
-            }
+            let target = get_conversion_target("triton").ok_or_else(|| {
+                BackendError::execution("conversion target 'triton' is not registered")
+            })?;
+            let options = ConversionOptions::default();
+            let key = ConversionCacheKey::new(program, target.as_ref(), &options, None)
+                .map_err(|err| BackendError::execution(err.to_string()))?;
+            self.conversion_cache
+                .get_or_convert(key, || {
+                    convert_program_for_triton(program, &options, Some(self))
+                })
+                .map_err(|err| BackendError::execution(err.to_string()))?
         };
 
         let artifact: artifact::TritonArtifact = serde_json::from_str(&converted.module)

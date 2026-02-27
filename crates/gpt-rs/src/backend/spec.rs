@@ -1265,6 +1265,24 @@ impl std::error::Error for BackendError {}
 /// Convenience alias for results returned by backend routines.
 pub type BackendResult<T> = Result<T, BackendError>;
 
+/// Request metadata for backend-side decode token sampling.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecodeSampleRequest {
+    pub temperature: f32,
+    pub top_k: Option<usize>,
+    pub random_u: Option<f32>,
+}
+
+impl DecodeSampleRequest {
+    pub fn greedy() -> Self {
+        Self {
+            temperature: 0.0,
+            top_k: None,
+            random_u: None,
+        }
+    }
+}
+
 /// Portable backend trait that evaluates PTIR programs.
 pub trait PortableBackend: Send + Sync {
     type TensorHandle: Clone + Send + Sync + 'static;
@@ -1310,4 +1328,22 @@ pub trait PortableBackend: Send + Sync {
         program: &Program,
         entry_inputs: &[Self::TensorHandle],
     ) -> BackendResult<Vec<Self::TensorHandle>>;
+
+    /// Returns true when this backend can serve `sample_decode_token` for the request.
+    fn supports_decode_sampling(&self, _request: DecodeSampleRequest) -> bool {
+        false
+    }
+
+    /// Optional backend-side decode sampling hook.
+    ///
+    /// Backends can return `Some(token_id)` to bypass host logits materialization for decode.
+    /// Returning `Ok(None)` preserves existing CPU sampler behavior.
+    fn sample_decode_token(
+        &self,
+        _logits: &Self::TensorHandle,
+        _logits_spec: &TensorSpec,
+        _request: DecodeSampleRequest,
+    ) -> BackendResult<Option<usize>> {
+        Ok(None)
+    }
 }

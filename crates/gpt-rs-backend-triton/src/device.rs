@@ -1,8 +1,10 @@
 use std::ffi::{c_void, CString};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Instant;
 
 use gpt_rs::backend::spec::{BackendError, BackendResult};
+use gpt_rs::profiling::{self, WorkStats};
 use libloading::Library;
 
 type CUresult = i32;
@@ -38,6 +40,12 @@ type CuMemcpyDtoDV2Fn = unsafe extern "C" fn(
     dst_device: CUdeviceptr,
     src_device: CUdeviceptr,
     byte_count: usize,
+) -> CUresult;
+type CuMemcpyDtoDAsyncV2Fn = unsafe extern "C" fn(
+    dst_device: CUdeviceptr,
+    src_device: CUdeviceptr,
+    byte_count: usize,
+    h_stream: CUstream,
 ) -> CUresult;
 type CuMemsetD8V2Fn =
     unsafe extern "C" fn(dst_device: CUdeviceptr, value: u8, count: usize) -> CUresult;
@@ -82,6 +90,7 @@ struct DriverFns {
     cu_memcpy_hto_d_v2: CuMemcpyHtoDV2Fn,
     cu_memcpy_dto_h_v2: CuMemcpyDtoHV2Fn,
     cu_memcpy_dto_d_v2: CuMemcpyDtoDV2Fn,
+    cu_memcpy_dto_d_async_v2: Option<CuMemcpyDtoDAsyncV2Fn>,
     cu_memset_d8_v2: CuMemsetD8V2Fn,
     cu_module_load_data_ex: CuModuleLoadDataExFn,
     cu_module_unload: CuModuleUnloadFn,
@@ -203,6 +212,10 @@ impl CudaDriver {
             cu_memcpy_hto_d_v2: load_symbol(&lib, b"cuMemcpyHtoD_v2\0")?,
             cu_memcpy_dto_h_v2: load_symbol(&lib, b"cuMemcpyDtoH_v2\0")?,
             cu_memcpy_dto_d_v2: load_symbol(&lib, b"cuMemcpyDtoD_v2\0")?,
+            cu_memcpy_dto_d_async_v2: try_load_symbol_any(
+                &lib,
+                &[b"cuMemcpyDtoDAsync_v2\0", b"cuMemcpyDtoDAsync\0"],
+            ),
             cu_memset_d8_v2: load_symbol(&lib, b"cuMemsetD8_v2\0")?,
             cu_module_load_data_ex: load_symbol(&lib, b"cuModuleLoadDataEx\0")?,
             cu_module_unload: load_symbol(&lib, b"cuModuleUnload\0")?,
@@ -243,20 +256,7 @@ impl CudaDriver {
 
     pub fn alloc_and_upload(self: &Arc<Self>, bytes: &[u8]) -> BackendResult<Arc<DeviceBuffer>> {
         let buffer = self.alloc(bytes.len())?;
-        if !bytes.is_empty() {
-            self.ensure_current()?;
-            // SAFETY: Destination is a valid allocated device pointer and source host slice is valid.
-            unsafe {
-                check_cuda(
-                    (self.fns.cu_memcpy_hto_d_v2)(
-                        buffer.ptr,
-                        bytes.as_ptr() as *const c_void,
-                        bytes.len(),
-                    ),
-                    "cuMemcpyHtoD_v2",
-                )?;
-            }
-        }
+        self.upload_to_device(buffer.ptr, bytes)?;
         Ok(buffer)
     }
 
@@ -280,6 +280,7 @@ impl CudaDriver {
             return Ok(());
         }
         self.ensure_current()?;
+        let start = Instant::now();
         // SAFETY: Destination device pointer is valid and caller provides exact source buffer.
         unsafe {
             check_cuda(
@@ -287,13 +288,24 @@ impl CudaDriver {
                 "cuMemcpyHtoD_v2",
             )?;
         }
+        record_memcpy_backend("backend.triton.memcpy.h2d", bytes.len(), start.elapsed());
         Ok(())
     }
 
     pub fn download(&self, ptr: CUdeviceptr, bytes: usize) -> BackendResult<Vec<u8>> {
+        self.download_with_metric(ptr, bytes, "backend.triton.memcpy.d2h")
+    }
+
+    pub fn download_with_metric(
+        &self,
+        ptr: CUdeviceptr,
+        bytes: usize,
+        metric: &'static str,
+    ) -> BackendResult<Vec<u8>> {
         self.ensure_current()?;
         let mut out = vec![0u8; bytes];
         if bytes != 0 {
+            let start = Instant::now();
             // SAFETY: Source device pointer is valid for `bytes`; destination host buffer is valid and writable.
             unsafe {
                 check_cuda(
@@ -301,6 +313,7 @@ impl CudaDriver {
                     "cuMemcpyDtoH_v2",
                 )?;
             }
+            record_memcpy_backend(metric, bytes, start.elapsed());
         }
         Ok(out)
     }
@@ -314,14 +327,27 @@ impl CudaDriver {
         if bytes == 0 {
             return Ok(());
         }
+        if dst == src {
+            profiling::cache_event("triton_backend.memcpy_d2d.elided");
+            return Ok(());
+        }
         self.ensure_current()?;
+        let start = Instant::now();
         // SAFETY: src/dst pointers are valid CUDA allocations and byte range is provided by caller.
         unsafe {
-            check_cuda(
-                (self.fns.cu_memcpy_dto_d_v2)(dst, src, bytes),
-                "cuMemcpyDtoD_v2",
-            )?;
+            if let Some(copy_async) = self.fns.cu_memcpy_dto_d_async_v2 {
+                check_cuda(
+                    copy_async(dst, src, bytes, self.stream_handle() as CUstream),
+                    "cuMemcpyDtoDAsync_v2",
+                )?;
+            } else {
+                check_cuda(
+                    (self.fns.cu_memcpy_dto_d_v2)(dst, src, bytes),
+                    "cuMemcpyDtoD_v2",
+                )?;
+            }
         }
+        record_memcpy_backend("backend.triton.memcpy.d2d", bytes, start.elapsed());
         Ok(())
     }
 
@@ -653,6 +679,30 @@ fn load_symbol_any<T: Copy>(lib: &Library, names: &[&'static [u8]]) -> BackendRe
     Err(BackendError::execution(format!(
         "failed to resolve any CUDA symbol variant: {tried}"
     )))
+}
+
+fn try_load_symbol_any<T: Copy>(lib: &Library, names: &[&'static [u8]]) -> Option<T> {
+    for name in names {
+        // SAFETY: Caller provides expected symbol type from CUDA driver API.
+        if let Ok(sym) = unsafe { lib.get::<T>(name) } {
+            return Some(*sym);
+        }
+    }
+    None
+}
+
+fn record_memcpy_backend(name: &'static str, bytes: usize, elapsed: std::time::Duration) {
+    let byte_count = bytes as u64;
+    profiling::record_backend_aggregate(
+        name,
+        1,
+        elapsed,
+        WorkStats {
+            bytes_read: byte_count,
+            bytes_written: byte_count,
+            ..WorkStats::default()
+        },
+    );
 }
 
 fn check_cuda(code: CUresult, op: &str) -> BackendResult<()> {

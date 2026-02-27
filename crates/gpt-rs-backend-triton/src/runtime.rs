@@ -7,6 +7,7 @@ mod kernel_cache;
 mod layer_norm;
 mod literals;
 mod ops;
+mod sampling;
 mod slots;
 mod softmax;
 mod values;

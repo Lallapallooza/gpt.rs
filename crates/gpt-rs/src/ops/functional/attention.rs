@@ -186,11 +186,6 @@ struct DecodeAttentionPlan {
     seq_len: usize,
 }
 
-fn decode_cache_capacity(required_len: usize, max_len: usize) -> usize {
-    let bucket = required_len.next_power_of_two().max(1);
-    bucket.min(max_len)
-}
-
 fn validate_qkv_layout<B: PortableBackend + 'static>(
     config: &AttentionConfig,
     qkv: &DeviceTensor<B>,
@@ -674,7 +669,7 @@ pub fn attention_decode_cache<B: PortableBackend + 'static>(
         resolve_graph_from_tensors(&[qkv]).unwrap_or_else(|| GraphArena::new(qkv.backend()));
 
     let capacity = cache.capacity();
-    let effective_capacity = decode_cache_capacity(cache.len() + plan.seq_len, capacity);
+    let effective_capacity = capacity;
     let num_query_heads = config.num_query_heads;
     let num_kv_heads = config.num_key_value_heads;
     let head_dim = config.head_dim;

@@ -115,6 +115,7 @@ impl TritonExecutor {
                 .ok_or_else(|| BackendError::execution("slice contiguous pointer overflow"))?;
             driver.copy_device_to_device(out.buffer.device_ptr(), src_ptr, copy.byte_len)?;
             profiling::cache_event("triton_backend.slice_d2d");
+            profiling::cache_event("triton_backend.memcpy_d2d.slice_contiguous");
             return Ok(out);
         }
 
@@ -600,11 +601,17 @@ impl TritonExecutor {
         validate_starts_vector_shape(&starts.spec, base_dims.len(), "dynamic_update_slice")?;
 
         let out = allocate_output_tensor(driver, out_spec, output)?;
-        driver.copy_device_to_device(
-            out.buffer.device_ptr(),
-            base.buffer.device_ptr(),
-            byte_len(out_spec)?,
-        )?;
+        let copy_bytes = byte_len(out_spec)?;
+        if out.buffer.device_ptr() == base.buffer.device_ptr() {
+            profiling::cache_event("triton_backend.memcpy_d2d.elided");
+        } else {
+            driver.copy_device_to_device(
+                out.buffer.device_ptr(),
+                base.buffer.device_ptr(),
+                copy_bytes,
+            )?;
+            profiling::cache_event("triton_backend.memcpy_d2d.dynamic_update_base");
+        }
         let update_elems = static_element_count(&update.spec.shape)?;
         if update_elems == 0 {
             return Ok(out);

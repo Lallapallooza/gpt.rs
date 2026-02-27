@@ -1,4 +1,5 @@
 mod artifact;
+mod artifact_cache;
 mod codegen;
 mod compiler;
 mod device;
@@ -19,8 +20,8 @@ use gpt_rs::backend::conversion::{
 use gpt_rs::backend::param_resolver::{InMemoryParamResolver, ParamResolver};
 use gpt_rs::backend::pipeline::BackendPipeline;
 use gpt_rs::backend::spec::{
-    BackendError, BackendResult, DType, Instruction, PortableBackend, Program, TensorInit,
-    TensorLiteral, TensorSpec,
+    BackendError, BackendResult, DType, DecodeSampleRequest, Instruction, PortableBackend, Program,
+    TensorInit, TensorLiteral, TensorSpec,
 };
 
 pub use tensor::TritonTensor;
@@ -31,6 +32,8 @@ pub use tensor::TritonTensor;
 pub struct TritonBackend {
     params: Arc<InMemoryParamResolver<TritonTensor>>,
     conversion_cache: ConversionCache,
+    decoded_artifact_cache:
+        artifact_cache::DecodedArtifactCache<ConversionCacheKey, artifact::TritonArtifact>,
     executor: runtime::TritonExecutor,
 }
 
@@ -40,6 +43,7 @@ impl TritonBackend {
         Self {
             params: Arc::new(InMemoryParamResolver::new()),
             conversion_cache: ConversionCache::new(),
+            decoded_artifact_cache: artifact_cache::DecodedArtifactCache::new(),
             executor: runtime::TritonExecutor::new(),
         }
     }
@@ -54,6 +58,25 @@ impl TritonBackend {
         options: &ConversionOptions,
     ) -> ConversionResult<ConvertedIr> {
         convert_program_for_triton(program, options, Some(self))
+    }
+
+    fn decode_artifact_cached(
+        &self,
+        key: ConversionCacheKey,
+        module: &str,
+    ) -> BackendResult<Arc<artifact::TritonArtifact>> {
+        let (artifact, hit) = self
+            .decoded_artifact_cache
+            .get_or_try_insert_with(key, || {
+                let _scope = gpt_rs::profiling::compile_scope("triton_backend.decode_artifact");
+                serde_json::from_str(module).map_err(|err| BackendError::execution(err.to_string()))
+            })?;
+        if hit {
+            gpt_rs::profiling::cache_event("triton_backend.artifact_hit_mem");
+        } else {
+            gpt_rs::profiling::cache_event("triton_backend.artifact_miss_mem");
+        }
+        Ok(artifact)
     }
 }
 
@@ -114,24 +137,37 @@ impl PortableBackend for TritonBackend {
         program: &Program,
         entry_inputs: &[Self::TensorHandle],
     ) -> BackendResult<Vec<Self::TensorHandle>> {
+        let target = get_conversion_target("triton").ok_or_else(|| {
+            BackendError::execution("conversion target 'triton' is not registered")
+        })?;
+        let options = ConversionOptions::default();
+        let key = ConversionCacheKey::new(program, target.as_ref(), &options, None)
+            .map_err(|err| BackendError::execution(err.to_string()))?;
         let converted = {
             let _convert_scope = gpt_rs::profiling::compile_scope("triton_backend.convert");
-            let target = get_conversion_target("triton").ok_or_else(|| {
-                BackendError::execution("conversion target 'triton' is not registered")
-            })?;
-            let options = ConversionOptions::default();
-            let key = ConversionCacheKey::new(program, target.as_ref(), &options, None)
-                .map_err(|err| BackendError::execution(err.to_string()))?;
             self.conversion_cache
-                .get_or_convert(key, || {
+                .get_or_convert(key.clone(), || {
                     convert_program_for_triton(program, &options, Some(self))
                 })
                 .map_err(|err| BackendError::execution(err.to_string()))?
         };
+        let artifact = self.decode_artifact_cached(key, &converted.module)?;
+        self.executor
+            .execute_artifact(artifact.as_ref(), entry_inputs)
+    }
 
-        let artifact: artifact::TritonArtifact = serde_json::from_str(&converted.module)
-            .map_err(|err| BackendError::execution(err.to_string()))?;
-        self.executor.execute_artifact(&artifact, entry_inputs)
+    fn supports_decode_sampling(&self, request: DecodeSampleRequest) -> bool {
+        request.top_k.is_none()
+    }
+
+    fn sample_decode_token(
+        &self,
+        logits: &Self::TensorHandle,
+        logits_spec: &TensorSpec,
+        request: DecodeSampleRequest,
+    ) -> BackendResult<Option<usize>> {
+        self.executor
+            .sample_decode_token(logits, logits_spec, request)
     }
 }
 

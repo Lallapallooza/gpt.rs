@@ -1,0 +1,72 @@
+# gpt_rs.kernel: sample_temperature_last_axis_f32
+# gpt_rs.symbol: gpt_rs_triton_sample_temperature_last_axis_f32
+# gpt_rs.signature: logits_ptr=*fp32,out_ptr=*i32,rows=i32,cols=i32,temperature=fp32,seed=u32
+# gpt_rs.param_abi: *fp32,*i32,i32,i32,fp32,u32,*opaque
+# gpt_rs.constexpr: BLOCK_SIZE=256
+# gpt_rs.num_warps: 8
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def gpt_rs_triton_sample_temperature_last_axis_f32(
+    logits_ptr,
+    out_ptr,
+    rows,
+    cols,
+    temperature,
+    seed,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= rows:
+        return
+
+    if temperature <= 0.0:
+        tl.store(out_ptr + pid, 0)
+        return
+
+    offs = tl.arange(0, BLOCK_SIZE)
+    row_base = pid * cols
+    inv_temp = 1.0 / temperature
+
+    best_score = tl.full([], -float("inf"), tl.float32)
+    best_idx = tl.full([], 0, tl.int32)
+
+    col = 0
+    while col < cols:
+        idx = col + offs
+        mask = idx < cols
+
+        logits = tl.load(logits_ptr + row_base + idx, mask=mask, other=-float("inf"))
+        adjusted = logits * inv_temp
+
+        # Stateless per-index RNG from seed + index (xorshift-style hash).
+        x = idx.to(tl.uint32) ^ seed
+        x = x ^ (x >> 16)
+        x = x * 0x7FEB352D
+        x = x ^ (x >> 15)
+        x = x * 0x846CA68B
+        x = x ^ (x >> 16)
+
+        # Map to (0, 1) and apply Gumbel transform.
+        u = (x.to(tl.float32) + 1.0) * (1.0 / 4294967297.0)
+        u = tl.maximum(u, 1e-7)
+        u = tl.minimum(u, 1.0 - 1e-7)
+        gumbel = -tl.log(-tl.log(u))
+
+        score = adjusted + gumbel
+        score = tl.where(mask, score, -float("inf"))
+
+        block_best_score = tl.max(score, axis=0)
+        block_best_idx = tl.min(tl.where(score == block_best_score, idx, cols), axis=0)
+
+        take = (block_best_score > best_score) | (
+            (block_best_score == best_score) & (block_best_idx < best_idx)
+        )
+        best_score = tl.where(take, block_best_score, best_score)
+        best_idx = tl.where(take, block_best_idx, best_idx)
+        col += BLOCK_SIZE
+
+    tl.store(out_ptr + pid, best_idx)

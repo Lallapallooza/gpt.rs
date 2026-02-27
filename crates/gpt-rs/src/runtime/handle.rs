@@ -118,4 +118,19 @@ impl<B: PortableBackend + 'static> CausalLanguageModel<B> for ModelHandle<B> {
                 .forward_with_decode_cache_with_capacity(tokens, position_offset, caches, capacity)
         })
     }
+
+    fn forward_with_decode_cache_sample_next(
+        &self,
+        tokens: &[usize],
+        position_offset: usize,
+        caches: &mut [Option<crate::ops::functional::DecodeKvCache<B>>],
+        request: crate::backend::spec::DecodeSampleRequest,
+    ) -> Result<Option<usize>> {
+        with_registry(Arc::clone(&self.registry), || {
+            self.inner
+                .as_causal_lm()
+                .expect("ModelHandle::forward_with_decode_cache_sample_next called on a non-causal model")
+                .forward_with_decode_cache_sample_next(tokens, position_offset, caches, request)
+        })
+    }
 }

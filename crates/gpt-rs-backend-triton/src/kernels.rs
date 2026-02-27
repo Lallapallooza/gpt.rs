@@ -45,6 +45,13 @@ pub const DOT_BIAS_RANK2_KERNEL_ID: &str = "gpt_rs.triton.kernel.dot_bias_rank2_
 pub const DOT_BIAS_RANK2_SYMBOL: &str = "gpt_rs_triton_dot_bias_rank2_f32";
 pub const LAYER_NORM_F32_KERNEL_ID: &str = "gpt_rs.triton.kernel.layer_norm_f32.v1";
 pub const LAYER_NORM_F32_SYMBOL: &str = "gpt_rs_triton_layer_norm_f32";
+pub const SAMPLE_ARGMAX_LAST_AXIS_F32_KERNEL_ID: &str =
+    "gpt_rs.triton.kernel.sample_argmax_last_axis_f32.v1";
+pub const SAMPLE_ARGMAX_LAST_AXIS_F32_SYMBOL: &str = "gpt_rs_triton_sample_argmax_last_axis_f32";
+pub const SAMPLE_TEMPERATURE_LAST_AXIS_F32_KERNEL_ID: &str =
+    "gpt_rs.triton.kernel.sample_temperature_last_axis_f32.v1";
+pub const SAMPLE_TEMPERATURE_LAST_AXIS_F32_SYMBOL: &str =
+    "gpt_rs_triton_sample_temperature_last_axis_f32";
 
 pub const EWISE_BINARY_KERNEL_SOURCE: &str = include_str!("kernels/elementwise_binary_f32.triton");
 pub const EWISE_UNARY_KERNEL_SOURCE: &str = include_str!("kernels/elementwise_unary_f32.triton");
@@ -76,6 +83,10 @@ pub const REDUCE_WINDOW_MAX_NHWC_KERNEL_SOURCE: &str =
 pub const DOT_BIAS_RANK2_KERNEL_SOURCE: &str = include_str!("kernels/dot_bias_rank2_f32.triton");
 pub const LAYER_NORM_F32_KERNEL_SOURCE: &str = include_str!("kernels/layer_norm_f32.triton");
 pub const MATMUL_F32_KERNEL_SOURCE: &str = include_str!("kernels/matmul_f32.triton");
+pub const SAMPLE_ARGMAX_LAST_AXIS_F32_KERNEL_SOURCE: &str =
+    include_str!("kernels/sample_argmax_last_axis_f32.triton");
+pub const SAMPLE_TEMPERATURE_LAST_AXIS_F32_KERNEL_SOURCE: &str =
+    include_str!("kernels/sample_temperature_last_axis_f32.triton");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KernelSpec {
@@ -108,6 +119,8 @@ pub enum KernelKind {
     ReduceWindowMaxNhwcF32,
     DotBiasRank2F32,
     LayerNormF32,
+    SampleArgmaxLastAxisF32,
+    SampleTemperatureLastAxisF32,
     FusedElementwiseF32,
 }
 
@@ -295,5 +308,23 @@ fn descriptor_to_spec(descriptor: &KernelDescriptor) -> KernelSpec {
         kind: descriptor.kind,
         source: descriptor.source.to_string(),
         symbol: descriptor.symbol.to_string(),
+    }
+}
+
+pub fn sample_argmax_last_axis_kernel_spec() -> KernelSpec {
+    KernelSpec {
+        id: SAMPLE_ARGMAX_LAST_AXIS_F32_KERNEL_ID.to_string(),
+        kind: KernelKind::SampleArgmaxLastAxisF32,
+        source: SAMPLE_ARGMAX_LAST_AXIS_F32_KERNEL_SOURCE.to_string(),
+        symbol: SAMPLE_ARGMAX_LAST_AXIS_F32_SYMBOL.to_string(),
+    }
+}
+
+pub fn sample_temperature_last_axis_kernel_spec() -> KernelSpec {
+    KernelSpec {
+        id: SAMPLE_TEMPERATURE_LAST_AXIS_F32_KERNEL_ID.to_string(),
+        kind: KernelKind::SampleTemperatureLastAxisF32,
+        source: SAMPLE_TEMPERATURE_LAST_AXIS_F32_KERNEL_SOURCE.to_string(),
+        symbol: SAMPLE_TEMPERATURE_LAST_AXIS_F32_SYMBOL.to_string(),
     }
 }

@@ -1,0 +1,46 @@
+# gpt_rs.kernel: sample_argmax_last_axis_f32
+# gpt_rs.symbol: gpt_rs_triton_sample_argmax_last_axis_f32
+# gpt_rs.signature: logits_ptr=*fp32,out_ptr=*i32,rows=i32,cols=i32
+# gpt_rs.param_abi: *fp32,*i32,i32,i32,*opaque
+# gpt_rs.constexpr: BLOCK_SIZE=256
+# gpt_rs.num_warps: 8
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def gpt_rs_triton_sample_argmax_last_axis_f32(
+    logits_ptr,
+    out_ptr,
+    rows,
+    cols,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= rows:
+        return
+
+    offs = tl.arange(0, BLOCK_SIZE)
+    row_base = pid * cols
+
+    best_val = tl.full([], -float("inf"), tl.float32)
+    best_idx = tl.full([], 0, tl.int32)
+
+    col = 0
+    while col < cols:
+        idx = col + offs
+        mask = idx < cols
+        vals = tl.load(logits_ptr + row_base + idx, mask=mask, other=-float("inf"))
+
+        block_best_val = tl.max(vals, axis=0)
+        block_best_idx = tl.min(tl.where(vals == block_best_val, idx, cols), axis=0)
+
+        take = (block_best_val > best_val) | (
+            (block_best_val == best_val) & (block_best_idx < best_idx)
+        )
+        best_val = tl.where(take, block_best_val, best_val)
+        best_idx = tl.where(take, block_best_idx, best_idx)
+        col += BLOCK_SIZE
+
+    tl.store(out_ptr + pid, best_idx)

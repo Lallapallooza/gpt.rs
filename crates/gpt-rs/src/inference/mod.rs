@@ -3,7 +3,7 @@ pub mod sampler;
 
 use anyhow::Result;
 
-use crate::backend::spec::PortableBackend;
+use crate::backend::spec::{DecodeSampleRequest, PortableBackend};
 use crate::ops::functional::DecodeKvCache;
 use crate::tensor::Tensor;
 
@@ -27,4 +27,14 @@ pub trait CausalLanguageModel<B: PortableBackend + 'static> {
         caches: &mut [Option<DecodeKvCache<B>>],
         capacity: usize,
     ) -> Result<Tensor>;
+
+    fn forward_with_decode_cache_sample_next(
+        &self,
+        _tokens: &[usize],
+        _position_offset: usize,
+        _caches: &mut [Option<DecodeKvCache<B>>],
+        _request: DecodeSampleRequest,
+    ) -> Result<Option<usize>> {
+        Ok(None)
+    }
 }

@@ -639,6 +639,13 @@ fn run_generate<B: PortableBackend + 'static>(
         !prompt_tokens.is_empty(),
         "prompt produced an empty token sequence"
     );
+    let kv_cache_capacity = resolve_kv_cache_capacity(
+        args.kv_cache,
+        args.kv_cache_capacity,
+        prompt_tokens.len(),
+        args.max_tokens,
+        lm.context_length(),
+    );
 
     let mut sampler = Sampler::new(args.temperature);
     if args.greedy {
@@ -666,7 +673,7 @@ fn run_generate<B: PortableBackend + 'static>(
             &sampler,
             &prompt_tokens,
             args.kv_cache,
-            args.kv_cache_capacity,
+            kv_cache_capacity,
         )?;
 
         for step in 0..args.max_tokens {
@@ -725,7 +732,7 @@ fn run_generate<B: PortableBackend + 'static>(
         &sampler,
         &prompt_tokens,
         args.kv_cache,
-        args.kv_cache_capacity,
+        kv_cache_capacity,
     )?;
 
     let measured_steps = args.max_tokens.saturating_sub(warmup);
@@ -828,6 +835,28 @@ fn flush_stream_buffer(
     Ok(())
 }
 
+fn resolve_kv_cache_capacity(
+    kv_cache_enabled: bool,
+    requested_capacity: Option<usize>,
+    prompt_len: usize,
+    max_tokens: usize,
+    context_length: usize,
+) -> Option<usize> {
+    if !kv_cache_enabled {
+        return None;
+    }
+    if let Some(capacity) = requested_capacity {
+        return Some(capacity);
+    }
+    let required = prompt_len.saturating_add(max_tokens).max(1);
+    let auto_capacity = required.min(context_length);
+    if auto_capacity == 0 {
+        None
+    } else {
+        Some(auto_capacity)
+    }
+}
+
 fn run_benchmark<B: PortableBackend + 'static>(
     backend: &Arc<B>,
     args: &BenchmarkArgs,
@@ -851,6 +880,13 @@ fn run_benchmark<B: PortableBackend + 'static>(
         !prompt_tokens.is_empty(),
         "prompt produced an empty token sequence"
     );
+    let kv_cache_capacity = resolve_kv_cache_capacity(
+        args.kv_cache,
+        args.kv_cache_capacity,
+        prompt_tokens.len(),
+        args.max_tokens,
+        lm.context_length(),
+    );
 
     let mut sampler = Sampler::new(args.temperature);
     if args.greedy {
@@ -873,7 +909,7 @@ fn run_benchmark<B: PortableBackend + 'static>(
                     &sampler,
                     &prompt_tokens,
                     args.kv_cache,
-                    args.kv_cache_capacity,
+                    kv_cache_capacity,
                 )?;
                 t0.elapsed()
             };
@@ -910,7 +946,7 @@ fn run_benchmark<B: PortableBackend + 'static>(
                     &sampler,
                     &prompt_tokens,
                     args.kv_cache,
-                    args.kv_cache_capacity,
+                    kv_cache_capacity,
                 )?;
                 let token = generator.step_final()?;
                 (token, t0.elapsed())
@@ -956,7 +992,7 @@ fn run_benchmark<B: PortableBackend + 'static>(
                 &sampler,
                 &prompt_tokens,
                 args.kv_cache,
-                args.kv_cache_capacity,
+                kv_cache_capacity,
             )?;
 
             for _ in 0..warmup {

@@ -1,4 +1,4 @@
-use crate::backend::spec::PortableBackend;
+use crate::backend::spec::{DecodeSampleRequest, PortableBackend};
 use crate::module::{Module, ParamVisitor, ParamVisitorMut, TensorRole};
 use crate::nn::{AttentionConfig, CausalSelfAttention, Embedding, FeedForward, LayerNorm};
 use crate::ops::functional::{self, AttentionCache, DecodeKvCache};
@@ -537,6 +537,35 @@ impl<B: PortableBackend + 'static> Gpt<B> {
         self.forward_with_decode_cache_internal(tokens, position_offset, caches, Some(capacity))
     }
 
+    pub fn forward_with_decode_cache_sample_next(
+        &self,
+        tokens: &[usize],
+        position_offset: usize,
+        caches: &mut [Option<DecodeKvCache<B>>],
+        request: DecodeSampleRequest,
+    ) -> Result<Option<usize>> {
+        if !self.backend.supports_decode_sampling(request) {
+            return Ok(None);
+        }
+        let required_total = position_offset
+            .checked_add(tokens.len())
+            .ok_or_else(|| anyhow!("token position offset overflow"))?;
+        let fixed_capacity = caches
+            .iter()
+            .find_map(|slot| slot.as_ref().map(|cache| cache.capacity()))
+            .filter(|capacity| *capacity >= required_total);
+        let logits = self.forward_with_decode_cache_internal_device(
+            tokens,
+            position_offset,
+            caches,
+            fixed_capacity,
+        )?;
+        let handle = logits.materialize()?;
+        Ok(self
+            .backend
+            .sample_decode_token(&handle, &logits.tensor_spec(), request)?)
+    }
+
     fn forward_with_decode_cache_internal(
         &self,
         tokens: &[usize],
@@ -544,6 +573,22 @@ impl<B: PortableBackend + 'static> Gpt<B> {
         caches: &mut [Option<DecodeKvCache<B>>],
         fixed_capacity: Option<usize>,
     ) -> Result<Tensor> {
+        let logits = self.forward_with_decode_cache_internal_device(
+            tokens,
+            position_offset,
+            caches,
+            fixed_capacity,
+        )?;
+        logits.to_host()
+    }
+
+    fn forward_with_decode_cache_internal_device(
+        &self,
+        tokens: &[usize],
+        position_offset: usize,
+        caches: &mut [Option<DecodeKvCache<B>>],
+        fixed_capacity: Option<usize>,
+    ) -> Result<DeviceTensor<B>> {
         self.validate_tokens_with_offset(tokens, position_offset)?;
         ensure!(
             caches.len() == self.blocks.len(),
@@ -702,7 +747,7 @@ impl<B: PortableBackend + 'static> Gpt<B> {
             *slot = Some(new_cache);
         }
 
-        logits.to_host()
+        Ok(logits)
     }
 
     fn validate_tokens(&self, tokens: &[usize]) -> Result<()> {
@@ -933,6 +978,16 @@ impl<B: PortableBackend + 'static> crate::inference::CausalLanguageModel<B> for 
             caches,
             capacity,
         )
+    }
+
+    fn forward_with_decode_cache_sample_next(
+        &self,
+        tokens: &[usize],
+        position_offset: usize,
+        caches: &mut [Option<DecodeKvCache<B>>],
+        request: DecodeSampleRequest,
+    ) -> Result<Option<usize>> {
+        Gpt::forward_with_decode_cache_sample_next(self, tokens, position_offset, caches, request)
     }
 }
 

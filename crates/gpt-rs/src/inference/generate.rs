@@ -42,6 +42,7 @@ pub struct Generator<'a, B: PortableBackend + 'static> {
     window_start: usize,
     tokens: Vec<usize>,
     logits_row: Vec<f32>,
+    pending_sampled_token: Option<usize>,
     kv_cache_capacity: Option<usize>,
 }
 
@@ -95,6 +96,7 @@ impl<'a, B: PortableBackend + 'static> Generator<'a, B> {
             window_start,
             tokens,
             logits_row,
+            pending_sampled_token: None,
             kv_cache_capacity,
         })
     }
@@ -113,23 +115,13 @@ impl<'a, B: PortableBackend + 'static> Generator<'a, B> {
     /// This is intended for the final generation step: once the token is emitted, the caller can
     /// stop without paying for an unused forward pass.
     pub fn step_final(&mut self) -> Result<usize> {
-        let vocab = self.logits_row.len();
-        ensure!(vocab > 0, "logits row is empty");
-
-        let row_tensor =
-            Tensor::from_vec(Shape::new([vocab]), std::mem::take(&mut self.logits_row))?;
-        let next = self.sampler.sample(&row_tensor)?;
+        let next = self.take_next_token()?;
         self.tokens.push(next);
         Ok(next)
     }
 
     pub fn step(&mut self) -> Result<usize> {
-        let vocab = self.logits_row.len();
-        ensure!(vocab > 0, "logits row is empty");
-
-        let row_tensor =
-            Tensor::from_vec(Shape::new([vocab]), std::mem::take(&mut self.logits_row))?;
-        let next = self.sampler.sample(&row_tensor)?;
+        let next = self.take_next_token()?;
         self.tokens.push(next);
 
         let context_length = self.model.context_length();
@@ -146,6 +138,17 @@ impl<'a, B: PortableBackend + 'static> Generator<'a, B> {
             let offset = self.processed_len.min(context.len());
             let chunk = &context[offset..];
             ensure!(!chunk.is_empty(), "decode chunk must be non-empty");
+            if let Some(request) = self.sampler.decode_sample_request() {
+                if let Some(token) = self
+                    .model
+                    .forward_with_decode_cache_sample_next(chunk, offset, caches_vec, request)?
+                {
+                    self.processed_len = context.len();
+                    self.pending_sampled_token = Some(token);
+                    self.logits_row.clear();
+                    return Ok(next);
+                }
+            }
             let logits = if let Some(capacity) = self.kv_cache_capacity {
                 self.model
                     .forward_with_decode_cache_with_capacity(chunk, offset, caches_vec, capacity)?
@@ -163,6 +166,18 @@ impl<'a, B: PortableBackend + 'static> Generator<'a, B> {
         }
 
         Ok(next)
+    }
+
+    fn take_next_token(&mut self) -> Result<usize> {
+        if let Some(next) = self.pending_sampled_token.take() {
+            return Ok(next);
+        }
+
+        let vocab = self.logits_row.len();
+        ensure!(vocab > 0, "logits row is empty");
+        let row_tensor =
+            Tensor::from_vec(Shape::new([vocab]), std::mem::take(&mut self.logits_row))?;
+        self.sampler.sample(&row_tensor)
     }
 }
 

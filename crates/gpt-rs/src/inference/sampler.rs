@@ -1,7 +1,8 @@
+use crate::backend::spec::DecodeSampleRequest;
 use crate::tensor::Tensor;
 use anyhow::{bail, Result};
 use rand::distributions::{Distribution, WeightedIndex};
-use rand::thread_rng;
+use rand::{thread_rng, Rng};
 
 pub struct Sampler {
     pub temperature: f32,
@@ -68,6 +69,28 @@ impl Sampler {
         };
         let mut rng = thread_rng();
         Ok(dist.sample(&mut rng))
+    }
+
+    pub fn supports_backend_decode_sampling(&self) -> bool {
+        self.top_k.is_none()
+    }
+
+    pub fn decode_sample_request(&self) -> Option<DecodeSampleRequest> {
+        if !self.supports_backend_decode_sampling() {
+            return None;
+        }
+
+        if self.temperature <= 0.0 {
+            return Some(DecodeSampleRequest::greedy());
+        }
+
+        let mut rng = thread_rng();
+        let random_u = rng.gen_range(f32::EPSILON..(1.0 - f32::EPSILON));
+        Some(DecodeSampleRequest {
+            temperature: self.temperature,
+            top_k: None,
+            random_u: Some(random_u),
+        })
     }
 
     fn argmax(values: &[f32]) -> usize {

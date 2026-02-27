@@ -676,9 +676,9 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
     }
 
     fn get_or_build_plan(&self, context: PlanContext) -> Result<(Arc<CachedPlan>, bool)> {
-        if let Some(plan) = self.plan_cache.get(&context.key) {
+        if let Some(plan) = self.plan_cache.get(&context.compile_key) {
             crate::profiling::cache_event("plan_cache_hit");
-            self.record_plan_key(context.key, false);
+            self.record_plan_key(context.compile_key, false);
             return self
                 .rebind_plan_for_context(plan, context)
                 .map(|plan| (plan, true));
@@ -686,7 +686,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
         crate::profiling::cache_event("plan_cache_miss");
         if self.plan_cache.is_enabled() {
             crate::profiling::cache_event("plan_cache_miss_lookup");
-            let reason = self.record_plan_key(context.key, true);
+            let reason = self.record_plan_key(context.compile_key, true);
             emit_cache_miss_reason(CacheKind::Plan, reason);
         } else {
             crate::profiling::cache_event("plan_cache_miss_disabled");
@@ -743,7 +743,6 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
 
     fn build_plan_from_context(&self, context: PlanContext) -> Result<Arc<CachedPlan>> {
         let PlanContext {
-            key,
             compile_key,
             ordered_values,
             input_signatures,
@@ -751,6 +750,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
             outputs,
             exports,
             arena_version,
+            ..
         } = context;
 
         let program_cache_key = compile_key.with_version(0);
@@ -766,7 +766,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
                 };
 
                 return Ok(Arc::new(CachedPlan::new(
-                    key,
+                    compile_key,
                     cached.program,
                     true,
                     cached.inputs,
@@ -909,7 +909,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
             program_outputs.clone(),
         );
         Ok(Arc::new(CachedPlan::new(
-            key,
+            compile_key,
             program,
             false,
             inputs,

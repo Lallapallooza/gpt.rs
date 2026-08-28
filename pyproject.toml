@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "accelerate>=1.12,<2",
+    "huggingface-hub>=1.3,<2",
     "numpy>=1.24,<3",
+    "safetensors>=0.4.3,<1",
     "torch>=2.3.0,<3",
     "torchvision>=0.18,<1",
     "transformers>=5.2,<6",
@@ -47,17 +49,12 @@ ignore_missing_imports = true
 
 [tool.commitizen]
 name = "cz_conventional_commits"
-version = "0.1.0"
 tag_format = "v$version"
+# The cargo provider bumps [workspace.package].version in Cargo.toml and the members in Cargo.lock.
 version_provider = "cargo"
 version_scheme = "semver"
 major_version_zero = true
+# Path dependencies between workspace crates also pin the version.
 version_files = [
-    "Cargo.toml",
-    "crates/gpt-rs/Cargo.toml",
-    "crates/gpt-rs-cli/Cargo.toml",
-    "crates/gpt-rs-backend-ref-cpu/Cargo.toml",
-    "crates/gpt-rs-backend-faer/Cargo.toml",
-    "crates/gpt-rs-backend-tests/Cargo.toml",
-    "crates/gpt-rs-macros/Cargo.toml",
+    "crates/*/Cargo.toml:path = ",
 ]

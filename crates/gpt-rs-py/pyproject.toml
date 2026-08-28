@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "gpt-rs"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Pure Rust GPT-style transformer with Python bindings"
 authors = [{name = "gpt.rs contributors"}]
 license = {text = "Apache-2.0"}

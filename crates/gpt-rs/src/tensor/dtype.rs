@@ -1,7 +1,8 @@
 //! Enumerates the scalar element types supported by portable tensor backends.
 
 /// Logical dtype identifier shared between host tensors and backend handles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DType {
     /// 32-bit floating point following IEEE-754 semantics.
     F32,
@@ -41,6 +42,21 @@ impl DType {
             2 => Some(DType::BF16),
             3 => Some(DType::I32),
             _ => None,
+        }
+    }
+}
+
+impl std::str::FromStr for DType {
+    type Err = anyhow::Error;
+
+    /// Parses a dtype name as written in configs (`bf16`), ignoring case and surrounding whitespace.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "f32" => Ok(DType::F32),
+            "f16" => Ok(DType::F16),
+            "bf16" => Ok(DType::BF16),
+            "i32" => Ok(DType::I32),
+            other => anyhow::bail!("unknown dtype '{other}', expected f32, f16, bf16, or i32"),
         }
     }
 }

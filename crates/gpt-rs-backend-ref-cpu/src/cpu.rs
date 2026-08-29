@@ -10,6 +10,7 @@ use gpt_rs::backend::spec::{
     ReduceSpec, ReduceWindowSpec, ReshapeSpec, TensorInit, TensorLiteral, TensorSpec, ValueId,
     ValueType,
 };
+use half::{bf16, slice::HalfFloatSliceExt};
 
 #[derive(Clone)]
 pub struct CpuTensor {
@@ -22,6 +23,7 @@ pub enum TensorData {
     F32(Arc<[f32]>),
     Si32(Arc<[i32]>),
     Bool(Arc<[u8]>),
+    Bf16(Arc<[bf16]>),
 }
 
 pub trait CpuKernelInterceptor: Send + Sync {
@@ -184,14 +186,14 @@ impl<I: CpuKernelInterceptor> PortableBackend for GenericCpuBackend<I> {
 fn literal_to_tensor(literal: &TensorLiteral) -> BackendResult<CpuTensor> {
     match literal.spec.dtype {
         DType::F32 => {
-            let data = bytes_to_f32(&literal.bytes)?;
+            let data = from_le_bytes(&literal.bytes, f32::from_le_bytes)?;
             Ok(CpuTensor {
                 spec: literal.spec.clone(),
                 data: TensorData::F32(Arc::from(data)),
             })
         }
         DType::Si32 => {
-            let data = bytes_to_i32(&literal.bytes)?;
+            let data = from_le_bytes(&literal.bytes, i32::from_le_bytes)?;
             Ok(CpuTensor {
                 spec: literal.spec.clone(),
                 data: TensorData::Si32(Arc::from(data)),
@@ -202,6 +204,13 @@ fn literal_to_tensor(literal: &TensorLiteral) -> BackendResult<CpuTensor> {
             Ok(CpuTensor {
                 spec: literal.spec.clone(),
                 data: TensorData::Bool(Arc::from(data)),
+            })
+        }
+        DType::Bf16 => {
+            let data = from_le_bytes(&literal.bytes, bf16::from_le_bytes)?;
+            Ok(CpuTensor {
+                spec: literal.spec.clone(),
+                data: TensorData::Bf16(Arc::from(data)),
             })
         }
         _ => Err(BackendError::spec(
@@ -233,6 +242,10 @@ fn zeroed_tensor(spec: &TensorSpec) -> BackendResult<CpuTensor> {
             spec: spec.clone(),
             data: TensorData::Bool(Arc::from(vec![0; elem_count])),
         }),
+        DType::Bf16 => Ok(CpuTensor {
+            spec: spec.clone(),
+            data: TensorData::Bf16(Arc::from(vec![bf16::ZERO; elem_count])),
+        }),
         _ => Err(BackendError::spec(
             gpt_rs::backend::spec::SpecErrorCode::DTypeNotSupported,
             format!("zero init dtype {:?} unsupported", spec.dtype),
@@ -244,13 +257,17 @@ fn tensor_to_literal(tensor: &CpuTensor) -> BackendResult<TensorLiteral> {
     match &tensor.data {
         TensorData::F32(values) => Ok(TensorLiteral::new(
             tensor.spec.clone(),
-            f32_to_bytes(values.as_ref()),
+            to_le_bytes(values.as_ref(), f32::to_le_bytes),
         )),
         TensorData::Si32(values) => Ok(TensorLiteral::new(
             tensor.spec.clone(),
-            i32_to_bytes(values.as_ref()),
+            to_le_bytes(values.as_ref(), i32::to_le_bytes),
         )),
         TensorData::Bool(values) => Ok(TensorLiteral::new(tensor.spec.clone(), Arc::clone(values))),
+        TensorData::Bf16(values) => Ok(TensorLiteral::new(
+            tensor.spec.clone(),
+            to_le_bytes(values.as_ref(), bf16::to_le_bytes),
+        )),
     }
 }
 
@@ -445,7 +462,7 @@ fn estimate_work_stats(
         | Operation::Tile(_) => 0,
         Operation::DotGeneral(spec) => inputs
             .first()
-            .and_then(|lhs| inputs.get(1).map(|rhs| (lhs, rhs)))
+            .zip(inputs.get(1))
             .map(|(lhs, rhs)| dot_general_flops(&lhs.spec, &rhs.spec, spec))
             .unwrap_or(0),
         _ => 0,
@@ -670,6 +687,7 @@ fn op_reshape(
         TensorData::F32(values) => TensorData::F32(values.clone()),
         TensorData::Si32(values) => TensorData::Si32(values.clone()),
         TensorData::Bool(values) => TensorData::Bool(values.clone()),
+        TensorData::Bf16(values) => TensorData::Bf16(values.clone()),
     };
     Ok(CpuTensor {
         spec: output.clone(),
@@ -1172,6 +1190,10 @@ fn op_broadcast_to(
                 out_len,
             ))),
         }),
+        TensorData::Bf16(_) => Err(BackendError::unimplemented(
+            "broadcast_to",
+            "bf16 operands are not supported. Cast them to f32 first",
+        )),
     }
 }
 
@@ -1575,6 +1597,18 @@ fn op_cast(inputs: &[CpuTensor], output: &TensorSpec, spec: &CastSpec) -> Backen
                 data: TensorData::Bool(Arc::from(result)),
             })
         }
+        (TensorData::Bf16(values), DType::Bf16) => Ok(CpuTensor {
+            spec: output.clone(),
+            data: TensorData::Bf16(values.clone()),
+        }),
+        (TensorData::Bf16(values), DType::F32) => Ok(CpuTensor {
+            spec: output.clone(),
+            data: TensorData::F32(Arc::from(values.to_f32_vec())),
+        }),
+        (TensorData::F32(values), DType::Bf16) => Ok(CpuTensor {
+            spec: output.clone(),
+            data: TensorData::Bf16(values.iter().copied().map(bf16::from_f32).collect()),
+        }),
         _ => Err(BackendError::unimplemented(
             "cast",
             format!("cast not supported for dtype {:?}", output.dtype),
@@ -1624,27 +1658,45 @@ fn op_take(inputs: &[CpuTensor], output: &TensorSpec) -> BackendResult<CpuTensor
         _ => return Err(BackendError::execution("take indices must be si32")),
     };
 
+    let gather = |data: TensorData| CpuTensor {
+        spec: output.clone(),
+        data,
+    };
     match &data.data {
-        TensorData::F32(values) => {
-            let values = values.as_ref();
-            let mut result = vec![0.0f32; expected_out];
-            for (i, &index) in indices_values.iter().enumerate() {
-                if index < 0 || index as usize >= vocab {
-                    return Err(BackendError::execution("take index out of bounds"));
-                }
-                let idx = index as usize;
-                let src_offset = idx * inner;
-                let dst_offset = i * inner;
-                result[dst_offset..dst_offset + inner]
-                    .copy_from_slice(&values[src_offset..src_offset + inner]);
-            }
-            Ok(CpuTensor {
-                spec: output.clone(),
-                data: TensorData::F32(Arc::from(result)),
-            })
-        }
-        _ => Err(BackendError::execution("take only supports f32 tensors")),
+        TensorData::F32(values) => Ok(gather(TensorData::F32(Arc::from(take_rows(
+            values,
+            indices_values,
+            inner,
+            vocab,
+        )?)))),
+        TensorData::Bf16(values) => Ok(gather(TensorData::Bf16(Arc::from(take_rows(
+            values,
+            indices_values,
+            inner,
+            vocab,
+        )?)))),
+        _ => Err(BackendError::execution(
+            "take only supports f32 and bf16 tensors",
+        )),
     }
+}
+
+/// Gathers rows of `inner` elements from a `[vocab, inner]` table.
+fn take_rows<T: Copy + Default>(
+    values: &[T],
+    indices: &[i32],
+    inner: usize,
+    vocab: usize,
+) -> BackendResult<Vec<T>> {
+    let mut result = vec![T::default(); indices.len() * inner];
+    for (dst, &index) in result.chunks_exact_mut(inner.max(1)).zip(indices) {
+        let row = usize::try_from(index)
+            .ok()
+            .filter(|row| *row < vocab)
+            .ok_or_else(|| BackendError::execution("take index out of bounds"))?;
+        dst.copy_from_slice(&values[row * inner..(row + 1) * inner]);
+    }
+    Ok(result)
 }
 
 fn op_elementwise_binary(
@@ -1681,8 +1733,34 @@ fn op_elementwise_binary(
                 data: TensorData::F32(Arc::from(result)),
             })
         }
+        (TensorData::Si32(a), TensorData::Si32(b)) => {
+            if a.len() != b.len() {
+                return Err(BackendError::execution("elementwise size mismatch"));
+            }
+            let mut result = Vec::with_capacity(a.len());
+            for (&x, &y) in a.iter().zip(b.iter()) {
+                let value = match op {
+                    ElementwiseBinaryOp::Add => x.wrapping_add(y),
+                    ElementwiseBinaryOp::Sub => x.wrapping_sub(y),
+                    ElementwiseBinaryOp::Mul => x.wrapping_mul(y),
+                    ElementwiseBinaryOp::Div => {
+                        if y == 0 {
+                            return Err(BackendError::execution("integer division by zero"));
+                        }
+                        x.wrapping_div(y)
+                    }
+                    ElementwiseBinaryOp::Maximum => x.max(y),
+                    ElementwiseBinaryOp::Minimum => x.min(y),
+                };
+                result.push(value);
+            }
+            Ok(CpuTensor {
+                spec: output.clone(),
+                data: TensorData::Si32(Arc::from(result)),
+            })
+        }
         _ => Err(BackendError::execution(
-            "elementwise binary only supports f32 tensors",
+            "elementwise binary only supports f32 and si32 tensors",
         )),
     }
 }
@@ -2134,6 +2212,15 @@ fn op_dot_general(
             ));
         }
     }
+    // For bf16 operands, products and sums are in f32. A bf16 x bf16 product is exact in f32.
+    let widened;
+    let inputs = match (&inputs[0].data, &inputs[1].data) {
+        (TensorData::Bf16(lhs), TensorData::Bf16(rhs)) => {
+            widened = [widen_bf16(&inputs[0], lhs), widen_bf16(&inputs[1], rhs)];
+            &widened[..]
+        }
+        _ => inputs,
+    };
     let lhs = &inputs[0];
     let rhs = &inputs[1];
     match (&lhs.data, &rhs.data) {
@@ -2245,29 +2332,35 @@ fn op_compare(
     }
     let lhs = &inputs[0];
     let rhs = &inputs[1];
-    match (&lhs.data, &rhs.data) {
-        (TensorData::Si32(a), TensorData::Si32(b)) => {
-            let mut result = Vec::with_capacity(a.len());
-            for (&x, &y) in a.iter().zip(b.iter()) {
-                let flag = match spec.op {
-                    ComparisonOp::Less => x < y,
-                    ComparisonOp::LessEqual => x <= y,
-                    ComparisonOp::Equal => x == y,
-                    ComparisonOp::GreaterEqual => x >= y,
-                    ComparisonOp::Greater => x > y,
-                    ComparisonOp::NotEqual => x != y,
-                };
-                result.push(flag as u8);
-            }
-            Ok(CpuTensor {
-                spec: output.clone(),
-                data: TensorData::Bool(Arc::from(result)),
-            })
+    let flags = match (&lhs.data, &rhs.data) {
+        (TensorData::Si32(a), TensorData::Si32(b)) => compare_values(a, b, spec.op),
+        (TensorData::F32(a), TensorData::F32(b)) => compare_values(a, b, spec.op),
+        _ => {
+            return Err(BackendError::execution(
+                "compare only supports si32 and f32 tensors",
+            ))
         }
-        _ => Err(BackendError::execution(
-            "compare only supports si32 tensors",
-        )),
-    }
+    };
+    Ok(CpuTensor {
+        spec: output.clone(),
+        data: TensorData::Bool(Arc::from(flags)),
+    })
+}
+
+fn compare_values<T: PartialOrd>(lhs: &[T], rhs: &[T], op: ComparisonOp) -> Vec<u8> {
+    lhs.iter()
+        .zip(rhs)
+        .map(|(x, y)| {
+            u8::from(match op {
+                ComparisonOp::Less => x < y,
+                ComparisonOp::LessEqual => x <= y,
+                ComparisonOp::Equal => x == y,
+                ComparisonOp::GreaterEqual => x >= y,
+                ComparisonOp::Greater => x > y,
+                ComparisonOp::NotEqual => x != y,
+            })
+        })
+        .collect()
 }
 
 fn op_select(inputs: &[CpuTensor], output: &TensorSpec) -> BackendResult<CpuTensor> {
@@ -2329,66 +2422,93 @@ fn op_concat(
     let axis_inner = out_dims.iter().skip(axis + 1).product::<usize>();
     let outer = out_dims.iter().take(axis).product::<usize>();
 
-    match output.dtype {
-        DType::F32 => {
-            let mut inputs_info = Vec::with_capacity(inputs.len());
-            let mut axis_total = 0usize;
-            for tensor in inputs {
-                if tensor.spec.dtype != output.dtype {
-                    return Err(BackendError::execution("concat requires matching dtypes"));
-                }
-                let dims = static_dims_or_error(&tensor.spec.shape, |sym| {
-                    BackendError::execution(format!(
-                        "dynamic dimension {} not supported at runtime",
-                        sym.as_str()
-                    ))
-                })?;
-                if dims.len() != rank {
-                    return Err(BackendError::execution("concat rank mismatch"));
-                }
-                for (idx, (&dim, &out_dim)) in dims.iter().zip(out_dims.iter()).enumerate() {
-                    if idx != axis && dim != out_dim {
-                        return Err(BackendError::execution("concat dimension mismatch"));
-                    }
-                }
-                axis_total += dims[axis];
-                let data = match &tensor.data {
-                    TensorData::F32(values) => values.clone(),
-                    _ => return Err(BackendError::execution("concat only supports f32 tensors")),
-                };
-                inputs_info.push((dims[axis], data));
-            }
-
-            if axis_total != out_dims[axis] {
-                return Err(BackendError::execution(
-                    "concat inputs do not match output axis length",
-                ));
-            }
-
-            let result_len: usize = out_dims.iter().product();
-            let mut result = vec![0.0f32; result_len];
-            let stride_outer = out_dims[axis] * axis_inner;
-
-            for outer_idx in 0..outer {
-                let mut dst_offset = outer_idx * stride_outer;
-                for (axis_dim, data_arc) in &inputs_info {
-                    let slice = data_arc.as_ref();
-                    let chunk = (*axis_dim) * axis_inner;
-                    let src_start = outer_idx * chunk;
-                    let src_end = src_start + chunk;
-                    result[dst_offset..dst_offset + chunk]
-                        .copy_from_slice(&slice[src_start..src_end]);
-                    dst_offset += chunk;
-                }
-            }
-
-            Ok(CpuTensor {
-                spec: output.clone(),
-                data: TensorData::F32(Arc::from(result.into_boxed_slice())),
-            })
+    let mut axis_lens = Vec::with_capacity(inputs.len());
+    let mut axis_total = 0usize;
+    for tensor in inputs {
+        if tensor.spec.dtype != output.dtype {
+            return Err(BackendError::execution("concat requires matching dtypes"));
         }
-        _ => Err(BackendError::execution("concat only supports f32 tensors")),
+        let dims = static_dims_or_error(&tensor.spec.shape, |sym| {
+            BackendError::execution(format!(
+                "dynamic dimension {} not supported at runtime",
+                sym.as_str()
+            ))
+        })?;
+        if dims.len() != rank {
+            return Err(BackendError::execution("concat rank mismatch"));
+        }
+        for (idx, (&dim, &out_dim)) in dims.iter().zip(out_dims.iter()).enumerate() {
+            if idx != axis && dim != out_dim {
+                return Err(BackendError::execution("concat dimension mismatch"));
+            }
+        }
+        axis_total += dims[axis];
+        axis_lens.push(dims[axis]);
     }
+    if axis_total != out_dims[axis] {
+        return Err(BackendError::execution(
+            "concat inputs do not match output axis length",
+        ));
+    }
+
+    let result_len: usize = out_dims.iter().product();
+    let stride_outer = out_dims[axis] * axis_inner;
+    macro_rules! concat_as {
+        ($variant:ident) => {{
+            let mut parts = Vec::with_capacity(inputs.len());
+            for (tensor, &axis_len) in inputs.iter().zip(axis_lens.iter()) {
+                match &tensor.data {
+                    TensorData::$variant(values) => parts.push((axis_len, values.as_ref())),
+                    _ => return Err(BackendError::execution("concat storage/dtype mismatch")),
+                }
+            }
+            TensorData::$variant(Arc::from(concat_parts(
+                &parts,
+                outer,
+                axis_inner,
+                stride_outer,
+                result_len,
+            )))
+        }};
+    }
+    let data = match output.dtype {
+        DType::F32 => concat_as!(F32),
+        DType::Si32 => concat_as!(Si32),
+        DType::Bf16 => concat_as!(Bf16),
+        DType::I1 => concat_as!(Bool),
+        other => {
+            return Err(BackendError::execution(format!(
+                "concat does not support dtype {other:?}"
+            )))
+        }
+    };
+    Ok(CpuTensor {
+        spec: output.clone(),
+        data,
+    })
+}
+
+/// Concatenates `(axis_len, values)` parts along an axis with `outer` leading rows and
+/// `axis_inner` elements per axis step.
+fn concat_parts<T: Copy + Default>(
+    parts: &[(usize, &[T])],
+    outer: usize,
+    axis_inner: usize,
+    stride_outer: usize,
+    result_len: usize,
+) -> Vec<T> {
+    let mut result = vec![T::default(); result_len];
+    for outer_idx in 0..outer {
+        let mut dst_offset = outer_idx * stride_outer;
+        for (axis_dim, values) in parts {
+            let chunk = axis_dim * axis_inner;
+            let src_start = outer_idx * chunk;
+            result[dst_offset..dst_offset + chunk]
+                .copy_from_slice(&values[src_start..src_start + chunk]);
+            dst_offset += chunk;
+        }
+    }
+    result
 }
 
 fn op_gather(
@@ -2572,44 +2692,33 @@ fn unravel_index(mut index: usize, dims: &[usize]) -> Vec<usize> {
     coords
 }
 
-fn bytes_to_f32(bytes: &[u8]) -> BackendResult<Vec<f32>> {
-    if !bytes.len().is_multiple_of(4) {
-        return Err(BackendError::execution(
-            "literal byte length mismatches f32",
-        ));
+fn from_le_bytes<const N: usize, T>(
+    bytes: &[u8],
+    decode: fn([u8; N]) -> T,
+) -> BackendResult<Vec<T>> {
+    if !bytes.len().is_multiple_of(N) {
+        return Err(BackendError::execution(format!(
+            "literal byte length {} is not a multiple of the {N}-byte element size",
+            bytes.len()
+        )));
     }
     Ok(bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .chunks_exact(N)
+        .map(|chunk| decode(chunk.try_into().expect("chunks_exact yields N bytes")))
         .collect())
 }
 
-fn bytes_to_i32(bytes: &[u8]) -> BackendResult<Vec<i32>> {
-    if !bytes.len().is_multiple_of(4) {
-        return Err(BackendError::execution(
-            "literal byte length mismatches i32",
-        ));
-    }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect())
+fn to_le_bytes<const N: usize, T: Copy>(values: &[T], encode: fn(T) -> [u8; N]) -> Arc<[u8]> {
+    values.iter().flat_map(|&value| encode(value)).collect()
 }
 
-fn f32_to_bytes(values: &[f32]) -> std::sync::Arc<[u8]> {
-    let mut bytes = Vec::with_capacity(values.len() * 4);
-    for &value in values {
-        bytes.extend_from_slice(&value.to_le_bytes());
+fn widen_bf16(tensor: &CpuTensor, values: &[bf16]) -> CpuTensor {
+    let mut spec = tensor.spec.clone();
+    spec.dtype = DType::F32;
+    CpuTensor {
+        spec,
+        data: TensorData::F32(Arc::from(values.to_f32_vec())),
     }
-    std::sync::Arc::from(bytes.into_boxed_slice())
-}
-
-fn i32_to_bytes(values: &[i32]) -> std::sync::Arc<[u8]> {
-    let mut bytes = Vec::with_capacity(values.len() * 4);
-    for &value in values {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    std::sync::Arc::from(bytes.into_boxed_slice())
 }
 
 struct MultiIndex {

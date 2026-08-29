@@ -6,7 +6,7 @@ use rand::Rng;
 use std::mem::{size_of, ManuallyDrop};
 use std::sync::Arc;
 
-use crate::backend::spec::{Dimension, TensorLiteral, TensorSpec};
+use crate::backend::spec::{TensorLiteral, TensorSpec};
 
 /// Simple host-backed tensor used for literals, debugging, and tests.
 #[derive(Debug, Clone)]
@@ -47,6 +47,32 @@ impl Tensor {
             dtype: DType::I32,
             data: vec_into_bytes(data),
         })
+    }
+
+    /// Constructs a tensor of any dtype from little-endian element bytes. The constructor copies
+    /// the bytes into storage aligned for the element type, so `data()` and related methods can
+    /// reinterpret the buffer.
+    pub fn from_le_bytes(shape: Shape, dtype: DType, bytes: &[u8]) -> Result<Self> {
+        let len = shape.num_elements();
+        ensure!(
+            Some(bytes.len()) == len.checked_mul(dtype.size_in_bytes()),
+            "tensor byte length ({}) does not match shape {:?} with dtype {:?}",
+            bytes.len(),
+            shape.dims(),
+            dtype
+        );
+        let mut data = match dtype {
+            DType::F32 => vec_into_bytes(vec![0f32; len]),
+            DType::I32 => vec_into_bytes(vec![0i32; len]),
+            DType::BF16 | DType::F16 => vec_into_bytes(vec![0u16; len]),
+        };
+        data.copy_from_slice(bytes);
+        Ok(Tensor { shape, dtype, data })
+    }
+
+    /// Returns the element bytes in little-endian order.
+    pub fn to_le_bytes(&self) -> &[u8] {
+        &self.data
     }
 
     /// Returns a zero-initialized `F32` tensor of the requested shape.
@@ -191,9 +217,14 @@ impl Tensor {
                 .iter()
                 .map(|&x| E::from_f32(x as f32))
                 .collect(),
-            DType::F16 | DType::BF16 => {
-                panic!("astype is not supported for dtype {:?}", self.dtype)
-            }
+            DType::F16 => bytes_as_slice::<half::f16>(&self.data)
+                .iter()
+                .map(|&x| E::from_f32(x.to_f32()))
+                .collect(),
+            DType::BF16 => bytes_as_slice::<half::bf16>(&self.data)
+                .iter()
+                .map(|&x| E::from_f32(x.to_f32()))
+                .collect(),
         }
     }
 
@@ -208,37 +239,9 @@ impl Tensor {
 
     /// Reconstructs a host tensor from a backend literal.
     pub fn from_literal(literal: &TensorLiteral) -> Result<Self> {
-        let dtype = match literal.spec.dtype {
-            crate::backend::spec::DType::F32 => DType::F32,
-            crate::backend::spec::DType::Si32 => DType::I32,
-            other => {
-                bail!("portable backend produced unsupported dtype {:?}", other)
-            }
-        };
-        let dims: Vec<usize> = literal
-            .spec
-            .shape
-            .dims()
-            .iter()
-            .map(|d| match d {
-                Dimension::Static(value) => Ok(*value),
-                Dimension::Dynamic(symbol) => {
-                    bail!("portable backend produced dynamic dimension {:?}", symbol)
-                }
-            })
-            .collect::<Result<_>>()?;
-        let expected_bytes = Shape::new(dims.clone()).num_elements() * dtype.size_in_bytes();
-        ensure!(
-            literal.bytes.len() == expected_bytes,
-            "literal byte length {} does not match expected {}",
-            literal.bytes.len(),
-            expected_bytes
-        );
-        Ok(Tensor {
-            shape: Shape::new(dims),
-            dtype,
-            data: literal.bytes.as_ref().to_vec(),
-        })
+        let dtype = spec_utils::frontend_dtype(literal.spec.dtype)?;
+        let shape = spec_utils::shape_from_spec(&literal.spec)?;
+        Self::from_le_bytes(shape, dtype, &literal.bytes)
     }
 }
 

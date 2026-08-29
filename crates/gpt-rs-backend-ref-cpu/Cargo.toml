@@ -12,6 +12,7 @@ torch = ["gpt-rs-backend-tests/torch"]
 
 [dependencies]
 gpt-rs = { path = "../gpt-rs", version = "0.1.0" }
+half = "2.6"
 libm = "0.2"
 linkme = "0.3"
 

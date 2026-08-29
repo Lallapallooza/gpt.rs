@@ -5,15 +5,14 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use std::hash::{BuildHasher, Hash, Hasher};
+
 use anyhow::Result;
 use lru::LruCache;
 use once_cell::sync::Lazy;
-use serde::Serialize;
 
-use crate::backend::hashing::fnv1a_hash;
-use crate::backend::op_signature::operation_kind;
 use crate::backend::optimizer::PlanInputs;
-use crate::backend::spec::{Operand, Operation, Program, TensorLiteral, TensorSpec, ValueId};
+use crate::backend::spec::{Dimension, Operand, Operation, Program, Shape, TensorSpec, ValueId};
 use crate::tensor::InputRole;
 
 /// Default number of cached plans retained per arena before LRU eviction kicks in.
@@ -59,53 +58,122 @@ pub(super) enum CacheMissReason {
 }
 
 impl PlanKey {
-    pub(super) fn new_pair_from_views(
-        backend: &str,
-        version: u64,
-        inputs: &[InputSignature],
-        exports: &[ValueId],
-        targets: &[ValueId],
-        node_views: &[PlanNodeView<'_>],
-    ) -> Result<(Self, Self)> {
-        let signature = SignatureData::from_views(inputs, exports, targets, node_views);
-        let graph_body = GraphSignatureBody::from_signature(&signature);
-        let full_graph_hash =
-            graph_body.hash(signature.exports.as_slice(), signature.targets.as_slice())?;
-        let compile_graph_hash = graph_body.hash(&[], &[])?;
-        let specialization = SpecializationData::from_signature(backend, &signature)?;
+    /// Computes the key of `graph` in one pass, without allocating. The key covers the graph
+    /// structure (input roles, op kinds, operand topology) and every specialization component.
+    /// The values that a call requests are not part of the key, because plans bind outputs by
+    /// node rank.
+    pub(super) fn new<'n, F>(backend: &str, version: u64, graph: &PlanGraph<'_, F>) -> Result<Self>
+    where
+        F: Fn(ValueId) -> Option<PlanNodeView<'n>>,
+    {
+        debug_assert!(graph.nodes.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        debug_assert!(graph
+            .input_values
+            .windows(2)
+            .all(|pair| pair[0].0 < pair[1].0));
+        debug_assert_eq!(graph.inputs.len(), graph.input_values.len());
 
-        Ok((
-            Self::from_graph_and_specialization(version, full_graph_hash, specialization),
-            Self::from_graph_and_specialization(version, compile_graph_hash, specialization),
-        ))
+        let mut body = key_hasher();
+        let mut ops = key_hasher();
+        let mut bindings = key_hasher();
+        let mut shapes = key_hasher();
+        let mut dtypes = key_hasher();
+        let mut layouts = key_hasher();
+        let mut literals = key_hasher();
+        let mut buckets = 0u64;
+
+        body.write_usize(graph.inputs.len());
+        for input in graph.inputs {
+            input.role.hash(&mut body);
+            body.write_u8(u8::from(input.stable_id.is_some()));
+            input.role.hash(&mut bindings);
+            input.stable_id.hash(&mut bindings);
+            input.spec.shape.hash(&mut shapes);
+            input.spec.dtype.hash(&mut dtypes);
+            buckets |= bucket_mask(&input.spec.shape);
+        }
+
+        body.write_usize(graph.nodes.len());
+        for &node_value in graph.nodes {
+            let node = (graph.node_view)(node_value)
+                .ok_or_else(|| anyhow::anyhow!("missing node for value {node_value:?}"))?;
+            std::mem::discriminant(node.op).hash(&mut body);
+            body.write_usize(node.operands.len());
+            for operand in node.operands {
+                match operand {
+                    Operand::Value(value) => {
+                        body.write_u8(0);
+                        write_ref(&mut body, graph.value_ref(*value));
+                    }
+                    Operand::TupleElement { tuple, index } => {
+                        body.write_u8(1);
+                        write_ref(&mut body, graph.value_ref(*tuple));
+                        body.write_usize(*index);
+                    }
+                    Operand::Literal(literal) => {
+                        body.write_u8(2);
+                        literal.spec.hash(&mut body);
+                        literal.spec.shape.hash(&mut shapes);
+                        literal.spec.dtype.hash(&mut dtypes);
+                        buckets |= bucket_mask(&literal.spec.shape);
+                        literal.spec.hash(&mut literals);
+                        literal.bytes.hash(&mut literals);
+                    }
+                }
+            }
+            node.op.hash(&mut ops);
+            node.spec.shape.hash(&mut shapes);
+            node.spec.dtype.hash(&mut dtypes);
+            buckets |= bucket_mask(&node.spec.shape);
+            match node.op {
+                Operation::Transpose(spec) => spec.perm.hash(&mut layouts),
+                Operation::DotGeneral(spec) => (
+                    &spec.batch_lhs,
+                    &spec.batch_rhs,
+                    &spec.contract_lhs,
+                    &spec.contract_rhs,
+                )
+                    .hash(&mut layouts),
+                _ => {}
+            }
+        }
+
+        let mut backend_hasher = key_hasher();
+        backend.hash(&mut backend_hasher);
+        let graph_hash = body.finish();
+        let input_binding_hash = bindings.finish();
+        let shape_hash = shapes.finish();
+        let dtype_hash = dtypes.finish();
+        let layout_hash = layouts.finish();
+        let literal_hash = literals.finish();
+        let backend_option_hash = backend_hasher.finish();
+        let specialization_hash = combine(&[
+            ops.finish(),
+            input_binding_hash,
+            shape_hash,
+            dtype_hash,
+            layout_hash,
+            literal_hash,
+            buckets,
+            backend_option_hash,
+        ]);
+        Ok(PlanKey {
+            version,
+            graph_hash,
+            specialization_hash,
+            input_binding_hash,
+            shape_hash,
+            dtype_hash,
+            layout_hash,
+            literal_hash,
+            kv_bucket_hash: buckets,
+            backend_option_hash,
+            hash: combine(&[graph_hash, specialization_hash]),
+        })
     }
 
     pub(super) fn with_version(self, version: u64) -> Self {
         Self { version, ..self }
-    }
-
-    fn from_graph_and_specialization(
-        version: u64,
-        graph_hash: u64,
-        specialization: SpecializationData,
-    ) -> Self {
-        let mut combined = [0u8; 16];
-        combined[..8].copy_from_slice(&graph_hash.to_le_bytes());
-        combined[8..].copy_from_slice(&specialization.specialization_hash.to_le_bytes());
-        let hash = fnv1a_hash(&combined);
-        PlanKey {
-            version,
-            graph_hash,
-            specialization_hash: specialization.specialization_hash,
-            input_binding_hash: specialization.input_binding_hash,
-            shape_hash: specialization.shape_hash,
-            dtype_hash: specialization.dtype_hash,
-            layout_hash: specialization.layout_hash,
-            literal_hash: specialization.literal_hash,
-            kv_bucket_hash: specialization.kv_bucket_hash,
-            backend_option_hash: specialization.backend_option_hash,
-            hash,
-        }
     }
 
     pub(super) fn classify_change_from(self, previous: Option<PlanKey>) -> CacheMissReason {
@@ -154,33 +222,17 @@ pub(super) struct PlanNode {
     pub(super) spec: TensorSpec,
 }
 
+/// Borrowed view of a pending node: its operation, operands, and output spec.
 #[derive(Clone, Copy)]
 pub(super) struct PlanNodeView<'a> {
-    pub(super) value: ValueId,
     pub(super) op: &'a Operation,
     pub(super) operands: &'a [Operand],
     pub(super) spec: &'a TensorSpec,
 }
 
 impl<'a> PlanNodeView<'a> {
-    pub(super) fn new(
-        value: ValueId,
-        op: &'a Operation,
-        operands: &'a [Operand],
-        spec: &'a TensorSpec,
-    ) -> Self {
-        Self {
-            value,
-            op,
-            operands,
-            spec,
-        }
-    }
-}
-
-impl<'a> From<&'a PlanNode> for PlanNodeView<'a> {
-    fn from(node: &'a PlanNode) -> Self {
-        Self::new(node.value, &node.op, node.operands.as_slice(), &node.spec)
+    pub(super) fn new(op: &'a Operation, operands: &'a [Operand], spec: &'a TensorSpec) -> Self {
+        Self { op, operands, spec }
     }
 }
 
@@ -201,7 +253,12 @@ pub(super) struct CachedPlan {
     pub(super) parameter_specs: Vec<ParameterSpec>,
     pub(super) parameter_values: Vec<ValueId>,
     pub(super) requested_outputs: Vec<ValueId>,
+    /// Values that receive the program results, in result order.
     pub(super) program_outputs: Vec<ValueId>,
+    /// Positions of `program_outputs` in the pending nodes of the plan, followed by its parameters.
+    /// Both lists are sorted by value id. The program addresses its outputs by these positions in
+    /// any graph with the same key.
+    pub(super) output_ranks: Vec<usize>,
     pub(super) exports: Vec<ValueId>,
 }
 
@@ -216,6 +273,7 @@ impl CachedPlan {
         parameter_values: Vec<ValueId>,
         requested_outputs: Vec<ValueId>,
         program_outputs: Vec<ValueId>,
+        output_ranks: Vec<usize>,
         exports: Vec<ValueId>,
     ) -> Self {
         CachedPlan {
@@ -227,6 +285,7 @@ impl CachedPlan {
             parameter_values,
             requested_outputs,
             program_outputs,
+            output_ranks,
             exports,
         }
     }
@@ -236,7 +295,8 @@ impl CachedPlan {
 pub(super) struct CachedProgram {
     pub(super) program: Arc<Program>,
     pub(super) inputs: PlanInputs,
-    pub(super) program_outputs: Vec<ValueId>,
+    /// See [`CachedPlan::output_ranks`].
+    pub(super) output_ranks: Vec<usize>,
 }
 
 pub(super) fn get_cached_program(key: &PlanKey) -> Option<CachedProgram> {
@@ -248,7 +308,7 @@ pub(super) fn insert_cached_program(
     key: PlanKey,
     program: Arc<Program>,
     inputs: PlanInputs,
-    program_outputs: Vec<ValueId>,
+    output_ranks: Vec<usize>,
 ) {
     let mut cache = PROGRAM_CACHE.lock().expect("program cache poisoned");
     cache.put(
@@ -256,7 +316,7 @@ pub(super) fn insert_cached_program(
         CachedProgram {
             program,
             inputs,
-            program_outputs,
+            output_ranks,
         },
     );
 }
@@ -313,468 +373,95 @@ impl PlanCache {
     }
 }
 
-#[derive(Serialize)]
-struct SignatureData {
-    inputs: Vec<SignatureInput>,
-    exports: Vec<ValueId>,
-    targets: Vec<ValueId>,
-    nodes: Vec<SignatureNode>,
+/// Borrowed view of the pending graph that a plan key is computed from.
+///
+/// `nodes` and `input_values` are sorted by value id. The key canonicalizes each value by its
+/// position in those slices. Program parameters and results use the same order.
+pub(super) struct PlanGraph<'a, F> {
+    /// Input signatures in parameter order (aligned with `input_values`).
+    pub(super) inputs: &'a [InputSignature],
+    pub(super) input_values: &'a [ValueId],
+    pub(super) nodes: &'a [ValueId],
+    /// Looks up a pending node by value id.
+    pub(super) node_view: F,
 }
 
-impl SignatureData {
-    fn from_views(
-        inputs: &[InputSignature],
-        exports: &[ValueId],
-        targets: &[ValueId],
-        nodes: &[PlanNodeView<'_>],
-    ) -> Self {
-        Canonicalizer::canonicalize(inputs, exports, targets, nodes)
-    }
-}
-
-#[derive(Serialize)]
-struct SignatureInput {
-    role: InputRole,
-    stable_id: Option<u128>,
-    spec: TensorSpec,
-}
-
-#[derive(Serialize)]
-struct SignatureNode {
-    value: ValueId,
-    op: Operation,
-    operands: Vec<SignatureOperand>,
-    spec: TensorSpec,
-}
-
-#[derive(Serialize)]
-enum SignatureOperand {
-    Value(ValueId),
-    TupleElement { tuple: ValueId, index: usize },
-    Literal(SignatureLiteral),
-}
-
-#[derive(Serialize, Clone)]
-struct SignatureLiteral {
-    spec: TensorSpec,
-    byte_len: usize,
-    byte_hash: u64,
-}
-
-struct GraphSignatureBody {
-    inputs: Vec<GraphSignatureInput>,
-    nodes: Vec<GraphSignatureNode>,
-}
-
-impl GraphSignatureBody {
-    fn from_signature(signature: &SignatureData) -> Self {
-        Self {
-            inputs: signature
-                .inputs
-                .iter()
-                .map(|input| GraphSignatureInput {
-                    role: input.role,
-                    has_stable_id: input.stable_id.is_some(),
-                })
-                .collect(),
-            nodes: signature
-                .nodes
-                .iter()
-                .map(|node| GraphSignatureNode {
-                    value: node.value,
-                    op_kind: operation_kind(&node.op),
-                    operands: node
-                        .operands
-                        .iter()
-                        .map(|operand| match operand {
-                            SignatureOperand::Value(value) => GraphSignatureOperand::Value(*value),
-                            SignatureOperand::TupleElement { tuple, index } => {
-                                GraphSignatureOperand::TupleElement {
-                                    tuple: *tuple,
-                                    index: *index,
-                                }
-                            }
-                            SignatureOperand::Literal(literal) => {
-                                GraphSignatureOperand::Literal(literal.spec.clone())
-                            }
-                        })
-                        .collect(),
-                })
-                .collect(),
-        }
-    }
-
-    fn hash(&self, exports: &[ValueId], targets: &[ValueId]) -> Result<u64> {
-        hash_serializable(&GraphSignatureView {
-            inputs: self.inputs.as_slice(),
-            exports,
-            targets,
-            nodes: self.nodes.as_slice(),
-        })
-    }
-}
-
-#[derive(Serialize)]
-struct GraphSignatureView<'a> {
-    inputs: &'a [GraphSignatureInput],
-    exports: &'a [ValueId],
-    targets: &'a [ValueId],
-    nodes: &'a [GraphSignatureNode],
-}
-
-#[derive(Serialize)]
-struct GraphSignatureInput {
-    role: InputRole,
-    has_stable_id: bool,
-}
-
-#[derive(Serialize)]
-struct GraphSignatureNode {
-    value: ValueId,
-    op_kind: &'static str,
-    operands: Vec<GraphSignatureOperand>,
-}
-
-#[derive(Serialize)]
-enum GraphSignatureOperand {
-    Value(ValueId),
-    TupleElement { tuple: ValueId, index: usize },
-    Literal(TensorSpec),
-}
-
+/// Canonical reference to a value inside a [`PlanGraph`].
 #[derive(Clone, Copy)]
-struct SpecializationData {
-    specialization_hash: u64,
-    input_binding_hash: u64,
-    shape_hash: u64,
-    dtype_hash: u64,
-    layout_hash: u64,
-    literal_hash: u64,
-    kv_bucket_hash: u64,
-    backend_option_hash: u64,
+enum ValueRef {
+    Node(usize),
+    Input(usize),
+    /// Neither a pending node nor an input, for example an export that is already materialized.
+    External,
 }
 
-impl SpecializationData {
-    fn from_signature(backend: &str, signature: &SignatureData) -> Result<Self> {
-        let input_binding_hash = hash_serializable(
-            &signature
-                .inputs
-                .iter()
-                .map(|input| (input.role, input.stable_id))
-                .collect::<Vec<_>>(),
-        )?;
-        let shape_hash = hash_serializable(&ShapeSignature::from_signature(signature))?;
-        let dtype_hash = hash_serializable(&DTypeSignature::from_signature(signature))?;
-        let layout_hash = hash_serializable(&LayoutSignature::from_signature(signature))?;
-        let literal_hash = hash_serializable(&LiteralSignature::from_signature(signature))?;
-        let kv_bucket_hash = hash_serializable(&KvBucketSignature::from_signature(signature))?;
-        let op_hash = hash_serializable(
-            &signature
-                .nodes
-                .iter()
-                .map(|node| &node.op)
-                .collect::<Vec<_>>(),
-        )?;
-        let backend_option_hash = fnv1a_hash(backend.as_bytes());
-        let specialization_hash = hash_serializable(&[
-            op_hash,
-            input_binding_hash,
-            shape_hash,
-            dtype_hash,
-            layout_hash,
-            literal_hash,
-            kv_bucket_hash,
-            backend_option_hash,
-        ])?;
-        Ok(Self {
-            specialization_hash,
-            input_binding_hash,
-            shape_hash,
-            dtype_hash,
-            layout_hash,
-            literal_hash,
-            kv_bucket_hash,
-            backend_option_hash,
-        })
-    }
-}
-
-#[derive(Serialize)]
-struct ShapeSignature {
-    input_shapes: Vec<crate::backend::spec::Shape>,
-    output_shapes: Vec<crate::backend::spec::Shape>,
-    literal_shapes: Vec<crate::backend::spec::Shape>,
-}
-
-impl ShapeSignature {
-    fn from_signature(signature: &SignatureData) -> Self {
-        let mut literal_shapes = Vec::new();
-        for node in &signature.nodes {
-            for operand in &node.operands {
-                if let SignatureOperand::Literal(literal) = operand {
-                    literal_shapes.push(literal.spec.shape.clone());
-                }
-            }
-        }
-        Self {
-            input_shapes: signature
-                .inputs
-                .iter()
-                .map(|input| input.spec.shape.clone())
-                .collect(),
-            output_shapes: signature
-                .nodes
-                .iter()
-                .map(|node| node.spec.shape.clone())
-                .collect(),
-            literal_shapes,
+impl<F> PlanGraph<'_, F> {
+    fn value_ref(&self, value: ValueId) -> ValueRef {
+        if let Ok(index) = self.nodes.binary_search_by_key(&value.0, |v| v.0) {
+            ValueRef::Node(index)
+        } else if let Ok(index) = self.input_values.binary_search_by_key(&value.0, |v| v.0) {
+            ValueRef::Input(index)
+        } else {
+            ValueRef::External
         }
     }
 }
 
-#[derive(Serialize)]
-struct DTypeSignature {
-    input_dtypes: Vec<crate::backend::spec::DType>,
-    output_dtypes: Vec<crate::backend::spec::DType>,
-    literal_dtypes: Vec<crate::backend::spec::DType>,
+const PLAN_KEY_SEED: u64 = 0x5054_4952_706c_616e;
+
+/// Plan-key hasher: foldhash that keeps every write in stream order.
+///
+/// foldhash buffers integer writes but folds byte slices at once, so an integer write and a
+/// following byte write could swap places without a change in the hash. Only `write` is
+/// overridden, so integers also go through it as bytes.
+#[derive(Clone)]
+struct KeyHasher(foldhash::quality::FoldHasher);
+
+fn key_hasher() -> KeyHasher {
+    KeyHasher(foldhash::quality::FixedState::with_seed(PLAN_KEY_SEED).build_hasher())
 }
 
-impl DTypeSignature {
-    fn from_signature(signature: &SignatureData) -> Self {
-        let mut literal_dtypes = Vec::new();
-        for node in &signature.nodes {
-            for operand in &node.operands {
-                if let SignatureOperand::Literal(literal) = operand {
-                    literal_dtypes.push(literal.spec.dtype);
-                }
-            }
-        }
-        Self {
-            input_dtypes: signature
-                .inputs
-                .iter()
-                .map(|input| input.spec.dtype)
-                .collect(),
-            output_dtypes: signature.nodes.iter().map(|node| node.spec.dtype).collect(),
-            literal_dtypes,
-        }
+impl Hasher for KeyHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.write(bytes);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0.finish()
     }
 }
 
-#[derive(Serialize)]
-struct LayoutSignature {
-    transpose_perms: Vec<Vec<usize>>,
-    dot_dims: Vec<DotLayoutSignature>,
-}
-
-impl LayoutSignature {
-    fn from_signature(signature: &SignatureData) -> Self {
-        let mut transpose_perms = Vec::new();
-        let mut dot_dims = Vec::new();
-        for node in &signature.nodes {
-            match &node.op {
-                Operation::Transpose(spec) => transpose_perms.push(spec.perm.clone()),
-                Operation::DotGeneral(spec) => dot_dims.push(DotLayoutSignature {
-                    batch_lhs: spec.batch_lhs.clone(),
-                    batch_rhs: spec.batch_rhs.clone(),
-                    contract_lhs: spec.contract_lhs.clone(),
-                    contract_rhs: spec.contract_rhs.clone(),
-                }),
-                _ => {}
-            }
+fn write_ref(hasher: &mut KeyHasher, value: ValueRef) {
+    match value {
+        ValueRef::Node(index) => {
+            hasher.write_u8(1);
+            hasher.write_usize(index);
         }
-        Self {
-            transpose_perms,
-            dot_dims,
+        ValueRef::Input(index) => {
+            hasher.write_u8(2);
+            hasher.write_usize(index);
         }
+        ValueRef::External => hasher.write_u8(3),
     }
 }
 
-#[derive(Serialize)]
-struct DotLayoutSignature {
-    batch_lhs: Vec<usize>,
-    batch_rhs: Vec<usize>,
-    contract_lhs: Vec<usize>,
-    contract_rhs: Vec<usize>,
-}
-
-#[derive(Serialize)]
-struct LiteralSignature {
-    literals: Vec<SignatureLiteral>,
-}
-
-impl LiteralSignature {
-    fn from_signature(signature: &SignatureData) -> Self {
-        let mut literals = Vec::new();
-        for node in &signature.nodes {
-            for operand in &node.operands {
-                if let SignatureOperand::Literal(literal) = operand {
-                    literals.push(literal.clone());
-                }
-            }
+/// Sets bit `k` when a static dimension equals `2^k` and is at least 8. The result is the set of
+/// power-of-two buckets that a KV cache capacity can land in.
+fn bucket_mask(shape: &Shape) -> u64 {
+    shape.dims().iter().fold(0, |mask, dim| match dim {
+        Dimension::Static(value) if *value >= 8 && value.is_power_of_two() => {
+            mask | (1u64 << value.trailing_zeros())
         }
-        Self { literals }
-    }
+        _ => mask,
+    })
 }
 
-#[derive(Serialize)]
-struct KvBucketSignature {
-    buckets: Vec<usize>,
-}
-
-impl KvBucketSignature {
-    fn from_signature(signature: &SignatureData) -> Self {
-        let mut buckets = Vec::new();
-        for input in &signature.inputs {
-            collect_bucket_dims(input.spec.shape.dims(), &mut buckets);
-        }
-        for node in &signature.nodes {
-            collect_bucket_dims(node.spec.shape.dims(), &mut buckets);
-            for operand in &node.operands {
-                if let SignatureOperand::Literal(literal) = operand {
-                    collect_bucket_dims(literal.spec.shape.dims(), &mut buckets);
-                }
-            }
-        }
-        buckets.sort_unstable();
-        buckets.dedup();
-        Self { buckets }
+fn combine(parts: &[u64]) -> u64 {
+    let mut hasher = key_hasher();
+    for part in parts {
+        hasher.write_u64(*part);
     }
-}
-
-fn collect_bucket_dims(dims: &[crate::backend::spec::Dimension], out: &mut Vec<usize>) {
-    for dim in dims {
-        if let crate::backend::spec::Dimension::Static(value) = dim {
-            if *value >= 8 && value.is_power_of_two() {
-                out.push(*value);
-            }
-        }
-    }
-}
-
-struct Canonicalizer {
-    mapping: HashMap<ValueId, ValueId>,
-    next: u32,
-}
-
-impl Canonicalizer {
-    fn new() -> Self {
-        Canonicalizer {
-            mapping: HashMap::new(),
-            next: 0,
-        }
-    }
-
-    fn canon_value(&mut self, value: ValueId) -> ValueId {
-        *self.mapping.entry(value).or_insert_with(|| {
-            let v = self.next;
-            self.next += 1;
-            ValueId(v)
-        })
-    }
-
-    fn canon_operand(&mut self, operand: &Operand) -> SignatureOperand {
-        match operand {
-            Operand::Value(v) => SignatureOperand::Value(self.canon_value(*v)),
-            Operand::TupleElement { tuple, index } => SignatureOperand::TupleElement {
-                tuple: self.canon_value(*tuple),
-                index: *index,
-            },
-            Operand::Literal(lit) => SignatureOperand::Literal(Self::literal_signature(lit)),
-        }
-    }
-
-    fn literal_signature(lit: &TensorLiteral) -> SignatureLiteral {
-        SignatureLiteral {
-            spec: lit.spec.clone(),
-            byte_len: lit.bytes.len(),
-            byte_hash: fnv1a_hash(lit.bytes.as_ref()),
-        }
-    }
-
-    fn canonicalize(
-        inputs: &[InputSignature],
-        exports: &[ValueId],
-        targets: &[ValueId],
-        nodes: &[PlanNodeView<'_>],
-    ) -> SignatureData {
-        let mut canon = Canonicalizer::new();
-
-        let mut sig_nodes = Vec::with_capacity(nodes.len());
-        for node in nodes {
-            let value = canon.canon_value(node.value);
-            let operands = node
-                .operands
-                .iter()
-                .map(|op| canon.canon_operand(op))
-                .collect();
-            sig_nodes.push(SignatureNode {
-                value,
-                op: node.op.clone(),
-                operands,
-                spec: node.spec.clone(),
-            });
-        }
-
-        let exports = exports.iter().map(|v| canon.canon_value(*v)).collect();
-        let targets = targets.iter().map(|v| canon.canon_value(*v)).collect();
-        let mut signature_inputs: Vec<SignatureInput> = inputs
-            .iter()
-            .map(|input| SignatureInput {
-                role: input.role,
-                stable_id: input.stable_id,
-                spec: input.spec.clone(),
-            })
-            .collect();
-        canonicalize_signature_inputs(signature_inputs.as_mut_slice());
-
-        SignatureData {
-            inputs: signature_inputs,
-            exports,
-            targets,
-            nodes: sig_nodes,
-        }
-    }
-}
-
-fn canonicalize_signature_inputs(inputs: &mut [SignatureInput]) {
-    inputs.sort_by(|lhs, rhs| {
-        let lhs_key = (
-            input_role_key(lhs.role),
-            lhs.stable_id.unwrap_or(u128::MAX),
-            tensor_spec_sort_hash(&lhs.spec),
-        );
-        let rhs_key = (
-            input_role_key(rhs.role),
-            rhs.stable_id.unwrap_or(u128::MAX),
-            tensor_spec_sort_hash(&rhs.spec),
-        );
-        lhs_key.cmp(&rhs_key)
-    });
-}
-
-fn input_role_key(role: InputRole) -> u8 {
-    match role {
-        InputRole::Arg => 0,
-        InputRole::Param => 1,
-    }
-}
-
-fn tensor_spec_sort_hash(spec: &TensorSpec) -> u64 {
-    match bincode::serialize(spec) {
-        Ok(bytes) => fnv1a_hash(&bytes),
-        Err(_) => 0,
-    }
-}
-
-fn hash_serializable<T: Serialize>(value: &T) -> Result<u64> {
-    let bytes = bincode::serialize(value)?;
-    Ok(fnv1a_hash(&bytes))
-}
-
-pub(super) fn ensure_targets_sorted(targets: &mut Vec<ValueId>) {
-    targets.sort_by_key(|value| value.0);
-    targets.dedup();
+    hasher.finish()
 }
 
 pub(super) fn ensure_exports_sorted(exports: &mut Vec<ValueId>) {

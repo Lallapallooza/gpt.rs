@@ -4,21 +4,30 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use foldhash::fast::FixedState;
+
 use crate::backend::spec::{Operand, Operation, PortableBackend, TensorSpec, ValueId};
 use crate::params::{BaseParamId, ParamSource};
 use crate::tensor::InputRole;
+
+/// Hash map keyed by arena-internal ids. Keys are never attacker-controlled, so a fast fixed-seed
+/// hasher is safe.
+pub(super) type IdMap<K, V> = HashMap<K, V, FixedState>;
+
+pub(super) type ValueMap<V> = IdMap<ValueId, V>;
+pub(super) type ValueSet = HashSet<ValueId, FixedState>;
 
 /// Mutable graph storage protected by a mutex inside [`GraphArena`](super::arena::GraphArena).
 /// It tracks recorded nodes, insertion order, and imported parameters for the current arena.
 pub(super) struct GraphInner<B: PortableBackend + 'static> {
     pub(super) next_value: u32,
-    pub(super) nodes: HashMap<ValueId, NodeRecord<B>>,
+    pub(super) nodes: ValueMap<NodeRecord<B>>,
     pub(super) order: Vec<ValueId>,
     pub(super) parameters: Vec<ParameterRecord<B>>,
-    pub(super) parameter_by_value: HashMap<ValueId, usize>,
-    pub(super) parameter_lookup: HashMap<(InputRole, u128), ValueId>,
-    pub(super) param_sources: HashMap<u128, ParamSourceRecord<B>>,
-    pub(super) exports: HashSet<ValueId>,
+    pub(super) parameter_by_value: ValueMap<usize>,
+    pub(super) parameter_lookup: IdMap<(InputRole, u128), ValueId>,
+    pub(super) param_sources: IdMap<u128, ParamSourceRecord<B>>,
+    pub(super) exports: ValueSet,
     pub(super) version: u64,
 }
 
@@ -27,13 +36,13 @@ impl<B: PortableBackend + 'static> GraphInner<B> {
     pub(super) fn new() -> Self {
         GraphInner {
             next_value: 0,
-            nodes: HashMap::new(),
+            nodes: ValueMap::default(),
             order: Vec::new(),
             parameters: Vec::new(),
-            parameter_by_value: HashMap::new(),
-            parameter_lookup: HashMap::new(),
-            param_sources: HashMap::new(),
-            exports: HashSet::new(),
+            parameter_by_value: ValueMap::default(),
+            parameter_lookup: IdMap::default(),
+            param_sources: IdMap::default(),
+            exports: ValueSet::default(),
             version: 0,
         }
     }

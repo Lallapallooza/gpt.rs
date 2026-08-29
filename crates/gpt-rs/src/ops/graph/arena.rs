@@ -40,7 +40,7 @@
 //! This allows multiple operations to share graph state while invalidating stale caches
 //! automatically.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::{
     atomic::{AtomicUsize, Ordering as AtomicOrdering},
@@ -64,11 +64,11 @@ use crate::tensor::{DeviceTensor, InputRole};
 
 use super::builder::GraphBuilder;
 use super::plan::{
-    ensure_exports_sorted, ensure_parameters_sorted, ensure_targets_sorted, get_cached_program,
-    insert_cached_program, CacheMissReason, CachedPlan, InputSignature, ParameterSpec, PlanCache,
-    PlanKey, PlanNode, PlanNodeView, DEFAULT_PLAN_CACHE_CAPACITY,
+    ensure_exports_sorted, ensure_parameters_sorted, get_cached_program, insert_cached_program,
+    CacheMissReason, CachedPlan, InputSignature, ParameterSpec, PlanCache, PlanGraph, PlanKey,
+    PlanNode, PlanNodeView, DEFAULT_PLAN_CACHE_CAPACITY,
 };
-use super::state::{GraphInner, NodeState, ParameterRecord};
+use super::state::{GraphInner, NodeState, ParameterRecord, ValueSet};
 
 /// Central storage for lazy tensor graphs built on top of a single backend instance.
 pub struct GraphArena<B: PortableBackend + 'static> {
@@ -509,7 +509,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
         }
 
         let mut requested = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = ValueSet::default();
         {
             let _scope = crate::profiling::compile_scope("graph::prepare_plan.requested");
             for value in inner.exports.iter() {
@@ -544,8 +544,8 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
             return Ok(PrepareResult::AllReady(handles));
         }
 
-        let mut pending = HashSet::new();
-        let mut inputs = HashSet::new();
+        let mut pending = ValueSet::default();
+        let mut inputs = ValueSet::default();
         {
             let _scope = crate::profiling::compile_scope("graph::prepare_plan.dependency_closure");
             for value in &requested {
@@ -623,47 +623,29 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
         result_values.sort_by_key(|value| value.0);
         result_values.dedup();
 
-        let mut node_views = Vec::with_capacity(ordered.len());
-        {
-            let _scope = crate::profiling::compile_scope("graph::prepare_plan.node_views");
-            for value in &ordered {
-                let node = inner
-                    .nodes
-                    .get(value)
-                    .ok_or_else(|| anyhow!("missing node for value {:?}", value))?;
-                node_views.push(PlanNodeView::new(
-                    *value,
-                    &node.op,
-                    node.operands.as_slice(),
-                    &node.spec,
-                ));
-            }
-        }
-
         let mut exports: Vec<_> = inner.exports.iter().copied().collect();
         ensure_exports_sorted(&mut exports);
-
-        let mut signature_targets: Vec<_> = targets.to_vec();
-        ensure_targets_sorted(&mut signature_targets);
 
         // Plan cache keys intentionally ignore arena version so decode-style workloads can reuse
         // the same structural plan across successive graph mutations. Concrete ValueId bindings
         // are rebound per-context in `get_or_build_plan`.
-        let (key, compile_key) = {
+        let key = {
             let _scope = crate::profiling::compile_scope("graph::prepare_plan.key_hash");
-            PlanKey::new_pair_from_views(
-                self.backend.backend_name(),
-                0,
-                &input_signatures,
-                &exports,
-                &signature_targets,
-                node_views.as_slice(),
-            )?
+            let graph = PlanGraph {
+                inputs: &input_signatures,
+                input_values: &input_values,
+                nodes: &ordered,
+                node_view: |value: ValueId| {
+                    inner.nodes.get(&value).map(|node| {
+                        PlanNodeView::new(&node.op, node.operands.as_slice(), &node.spec)
+                    })
+                },
+            };
+            PlanKey::new(self.backend.backend_name(), 0, &graph)?
         };
 
         let context = PlanContext {
             key,
-            compile_key,
             ordered_values: ordered,
             input_signatures,
             parameter_specs,
@@ -676,17 +658,17 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
     }
 
     fn get_or_build_plan(&self, context: PlanContext) -> Result<(Arc<CachedPlan>, bool)> {
-        if let Some(plan) = self.plan_cache.get(&context.compile_key) {
-            crate::profiling::cache_event("plan_cache_hit");
-            self.record_plan_key(context.compile_key, false);
-            return self
-                .rebind_plan_for_context(plan, context)
-                .map(|plan| (plan, true));
+        if let Some(plan) = self.plan_cache.get(&context.key) {
+            if let Some(plan) = rebind_plan_for_context(&plan, &context)? {
+                crate::profiling::cache_event("plan_cache_hit");
+                self.record_plan_key(context.key, false);
+                return Ok((plan, true));
+            }
         }
         crate::profiling::cache_event("plan_cache_miss");
         if self.plan_cache.is_enabled() {
             crate::profiling::cache_event("plan_cache_miss_lookup");
-            let reason = self.record_plan_key(context.compile_key, true);
+            let reason = self.record_plan_key(context.key, true);
             emit_cache_miss_reason(CacheKind::Plan, reason);
         } else {
             crate::profiling::cache_event("plan_cache_miss_disabled");
@@ -704,60 +686,24 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
         Ok((plan, false))
     }
 
-    fn rebind_plan_for_context(
-        &self,
-        plan: Arc<CachedPlan>,
-        context: PlanContext,
-    ) -> Result<Arc<CachedPlan>> {
-        if plan.requested_outputs == context.outputs
-            && plan.exports == context.exports
-            && plan.parameter_specs.len() == context.parameter_specs.len()
-            && plan
-                .parameter_specs
-                .iter()
-                .zip(context.parameter_specs.iter())
-                .all(|(cached, current)| {
-                    cached.value == current.value && cached.spec == current.spec
-                })
-        {
-            return Ok(plan);
-        }
-
-        let (plan_parameter_specs, plan_parameter_values) = {
-            let _scope = crate::profiling::compile_scope("graph::bind_plan_inputs");
-            build_arg_bindings(&plan.inputs, &context.parameter_specs)?
-        };
-
-        Ok(Arc::new(CachedPlan::new(
-            context.key,
-            Arc::clone(&plan.program),
-            plan.program_cache_hit,
-            plan.inputs.clone(),
-            plan_parameter_specs,
-            plan_parameter_values,
-            context.outputs,
-            plan.program_outputs.clone(),
-            context.exports,
-        )))
-    }
-
     fn build_plan_from_context(&self, context: PlanContext) -> Result<Arc<CachedPlan>> {
         let PlanContext {
-            compile_key,
+            key,
             ordered_values,
             input_signatures,
             parameter_specs,
             outputs,
             exports,
             arena_version,
-            ..
         } = context;
 
-        let program_cache_key = compile_key.with_version(0);
+        let program_cache_key = key.with_version(0);
 
         let mut cached_program_outputs: Option<Vec<ValueId>> = None;
         if let Some(cached) = get_cached_program(&program_cache_key) {
-            if program_outputs_cover_requested(&cached.program_outputs, &outputs) {
+            let program_outputs =
+                values_at_ranks(&ordered_values, &parameter_specs, &cached.output_ranks)?;
+            if program_outputs_cover_requested(&program_outputs, &outputs) {
                 crate::profiling::cache_event("program_cache_hit");
                 self.record_program_key(program_cache_key, false);
                 let (plan_parameter_specs, plan_parameter_values) = {
@@ -766,19 +712,20 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
                 };
 
                 return Ok(Arc::new(CachedPlan::new(
-                    compile_key,
+                    key,
                     cached.program,
                     true,
                     cached.inputs,
                     plan_parameter_specs,
                     plan_parameter_values,
                     outputs,
-                    cached.program_outputs,
+                    program_outputs,
+                    cached.output_ranks,
                     exports,
                 )));
             }
             crate::profiling::cache_event("program_cache_output_coverage_miss");
-            cached_program_outputs = Some(cached.program_outputs);
+            cached_program_outputs = Some(program_outputs);
         }
         crate::profiling::cache_event("program_cache_miss");
         crate::profiling::cache_event("program_cache_miss_lookup");
@@ -902,14 +849,15 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
         };
 
         let program = Arc::new(Program::new("captured").with_functions(vec![function]));
+        let output_ranks = ranks_of(&ordered_values, &parameter_specs, &program_outputs)?;
         insert_cached_program(
             program_cache_key,
             Arc::clone(&program),
             inputs.clone(),
-            program_outputs.clone(),
+            output_ranks.clone(),
         );
         Ok(Arc::new(CachedPlan::new(
-            compile_key,
+            key,
             program,
             false,
             inputs,
@@ -917,6 +865,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
             plan_parameter_values,
             outputs,
             program_outputs,
+            output_ranks,
             exports,
         )))
     }
@@ -984,30 +933,32 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
         entry_inputs: Vec<B::TensorHandle>,
         plan_cache_hit: bool,
     ) -> Result<Vec<B::TensorHandle>> {
-        let trace_sink = trace::current_sink();
-        let trace_id = trace::next_trace_id();
-        let context = ProgramContext {
-            trace_id,
-            graph_id: self.id,
-            backend: self.backend.backend_name().to_string(),
-            plan_hash: plan.key.hash,
-            plan_graph_hash: plan.key.graph_hash,
-            plan_specialization_hash: plan.key.specialization_hash,
-            cache: ProgramCacheInfo {
-                plan_cache_hit,
-                program_cache_hit: plan.program_cache_hit,
-            },
-            targets: targets.to_vec(),
-            outputs: plan.requested_outputs.clone(),
-            exports: plan.exports.clone(),
-            timestamp: std::time::SystemTime::now(),
-            kind: ProgramKind::Materialize {
-                values: targets.to_vec(),
-            },
-        };
+        // Build the program context only when a trace sink will read it.
+        let traced = trace::current_sink().map(|sink| {
+            let context = ProgramContext {
+                trace_id: trace::next_trace_id(),
+                graph_id: self.id,
+                backend: self.backend.backend_name().to_string(),
+                plan_hash: plan.key.hash,
+                plan_graph_hash: plan.key.graph_hash,
+                plan_specialization_hash: plan.key.specialization_hash,
+                cache: ProgramCacheInfo {
+                    plan_cache_hit,
+                    program_cache_hit: plan.program_cache_hit,
+                },
+                targets: targets.to_vec(),
+                outputs: plan.requested_outputs.clone(),
+                exports: plan.exports.clone(),
+                timestamp: std::time::SystemTime::now(),
+                kind: ProgramKind::Materialize {
+                    values: targets.to_vec(),
+                },
+            };
+            (sink, context)
+        });
 
-        if let Some(ref sink) = trace_sink {
-            sink.before_program(&context, &plan.program);
+        if let Some((sink, context)) = &traced {
+            sink.before_program(context, &plan.program);
         }
 
         let start = Instant::now();
@@ -1016,9 +967,9 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
         match exec {
             Ok(mut produced) => {
                 if produced.len() != plan.program_outputs.len() {
-                    if let Some(ref sink) = trace_sink {
+                    if let Some((sink, context)) = &traced {
                         sink.after_program(
-                            &context,
+                            context,
                             &ProgramStats {
                                 duration: start.elapsed(),
                                 output_count: produced.len(),
@@ -1054,9 +1005,9 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
                     self.collect_target_handles(&inner, targets)?
                 };
 
-                if let Some(ref sink) = trace_sink {
+                if let Some((sink, context)) = &traced {
                     sink.after_program(
-                        &context,
+                        context,
                         &ProgramStats {
                             duration: start.elapsed(),
                             output_count: plan.program_outputs.len(),
@@ -1068,9 +1019,9 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
                 Ok(final_handles)
             }
             Err(err) => {
-                if let Some(ref sink) = trace_sink {
+                if let Some((sink, context)) = &traced {
                     sink.after_program(
-                        &context,
+                        context,
                         &ProgramStats {
                             duration: start.elapsed(),
                             output_count: 0,
@@ -1242,6 +1193,101 @@ fn emit_cache_miss_reason(kind: CacheKind, reason: CacheMissReason) {
     crate::profiling::cache_event(event);
 }
 
+/// Rebinds a cached plan to the values of `context`, whose graph has the same key. Programs address
+/// their outputs by node rank and bind parameters by position. Returns `None` when the cached
+/// program does not produce every requested output.
+fn rebind_plan_for_context(
+    plan: &Arc<CachedPlan>,
+    context: &PlanContext,
+) -> Result<Option<Arc<CachedPlan>>> {
+    let (nodes, params) = (&context.ordered_values, &context.parameter_specs);
+    if plan
+        .output_ranks
+        .iter()
+        .zip(&plan.program_outputs)
+        .all(|(&rank, value)| value_at_rank(nodes, params, rank) == Some(*value))
+        && plan.requested_outputs == context.outputs
+        && plan.exports == context.exports
+        && plan.parameter_specs.len() == context.parameter_specs.len()
+        && plan
+            .parameter_specs
+            .iter()
+            .zip(&context.parameter_specs)
+            .all(|(cached, current)| cached.value == current.value && cached.spec == current.spec)
+    {
+        return Ok(Some(Arc::clone(plan)));
+    }
+    let program_outputs = values_at_ranks(nodes, params, &plan.output_ranks)?;
+    if !program_outputs_cover_requested(&program_outputs, &context.outputs) {
+        return Ok(None);
+    }
+    let (parameter_specs, parameter_values) = {
+        let _scope = crate::profiling::compile_scope("graph::bind_plan_inputs");
+        build_arg_bindings(&plan.inputs, &context.parameter_specs)?
+    };
+    Ok(Some(Arc::new(CachedPlan::new(
+        context.key,
+        Arc::clone(&plan.program),
+        plan.program_cache_hit,
+        plan.inputs.clone(),
+        parameter_specs,
+        parameter_values,
+        context.outputs.clone(),
+        program_outputs,
+        plan.output_ranks.clone(),
+        context.exports.clone(),
+    ))))
+}
+
+/// Returns the rank of each program output. The rank of a pending node is its position in
+/// `context.ordered_values`. The rank of an input is the pending-node count plus its position among
+/// the parameters. A materialized value that is requested again passes straight through as a
+/// parameter.
+fn ranks_of(
+    context_nodes: &[ValueId],
+    params: &[ParameterSpec],
+    values: &[ValueId],
+) -> Result<Vec<usize>> {
+    values
+        .iter()
+        .map(|value| {
+            context_nodes
+                .binary_search_by_key(&value.0, |v| v.0)
+                .or_else(|_| {
+                    params
+                        .binary_search_by_key(&value.0, |param| param.value.0)
+                        .map(|index| context_nodes.len() + index)
+                })
+                .map_err(|_| anyhow!("program output {value:?} is neither a node nor an input"))
+        })
+        .collect()
+}
+
+fn value_at_rank(
+    context_nodes: &[ValueId],
+    params: &[ParameterSpec],
+    rank: usize,
+) -> Option<ValueId> {
+    match rank.checked_sub(context_nodes.len()) {
+        None => Some(context_nodes[rank]),
+        Some(index) => params.get(index).map(|param| param.value),
+    }
+}
+
+fn values_at_ranks(
+    context_nodes: &[ValueId],
+    params: &[ParameterSpec],
+    ranks: &[usize],
+) -> Result<Vec<ValueId>> {
+    ranks
+        .iter()
+        .map(|&rank| {
+            value_at_rank(context_nodes, params, rank)
+                .ok_or_else(|| anyhow!("program output rank {rank} is out of range"))
+        })
+        .collect()
+}
+
 fn program_outputs_cover_requested(
     program_outputs: &[ValueId],
     requested_outputs: &[ValueId],
@@ -1311,7 +1357,6 @@ fn build_arg_bindings(
 
 struct PlanContext {
     key: PlanKey,
-    compile_key: PlanKey,
     ordered_values: Vec<ValueId>,
     input_signatures: Vec<InputSignature>,
     parameter_specs: Vec<ParameterSpec>,
@@ -1450,8 +1495,8 @@ impl<B: PortableBackend + 'static> CompiledGraph<B> {
 fn collect_dependencies<B: PortableBackend + 'static>(
     inner: &GraphInner<B>,
     value: ValueId,
-    pending: &mut HashSet<ValueId>,
-    inputs: &mut HashSet<ValueId>,
+    pending: &mut ValueSet,
+    inputs: &mut ValueSet,
 ) -> Result<()> {
     if pending.contains(&value) || inputs.contains(&value) {
         return Ok(());

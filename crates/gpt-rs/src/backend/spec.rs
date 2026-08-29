@@ -244,8 +244,26 @@ pub enum Literal {
     Complex { re: f64, im: f64 },
 }
 
+/// Hashes floats by bit pattern, so `0.0` and `-0.0` hash differently although they compare equal.
+/// `Literal` is not `Eq`, so it is never used as a hash-map key.
+impl std::hash::Hash for Literal {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Literal::I1(value) => value.hash(state),
+            Literal::Signed(value) => value.hash(state),
+            Literal::Unsigned(value) => value.hash(state),
+            Literal::Float(value) => value.to_bits().hash(state),
+            Literal::Complex { re, im } => {
+                re.to_bits().hash(state);
+                im.to_bits().hash(state);
+            }
+        }
+    }
+}
+
 /// Dense literal tensor payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TensorLiteral {
     pub spec: TensorSpec,
     pub bytes: Arc<[u8]>,
@@ -401,7 +419,7 @@ pub enum SegmentReduceKind {
 }
 
 /// Fully describes a `dot_general` contraction.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DotGeneralSpec {
     pub batch_lhs: Vec<usize>,
     pub batch_rhs: Vec<usize>,
@@ -412,7 +430,7 @@ pub struct DotGeneralSpec {
 }
 
 /// Configuration shared by `reduce_sum`, `reduce_max`, and `reduce_min`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ReduceSpec {
     pub kind: ReduceKind,
     pub axes: Vec<usize>,
@@ -422,7 +440,7 @@ pub struct ReduceSpec {
 }
 
 /// Describes the `argmax` op.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ArgMaxSpec {
     pub axis: isize,
     pub keepdims: bool,
@@ -430,13 +448,13 @@ pub struct ArgMaxSpec {
 }
 
 /// Attribute payload for `compare`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CompareSpec {
     pub op: ComparisonOp,
 }
 
 /// Attribute payload for `cast`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CastSpec {
     pub dtype: DType,
 }
@@ -455,7 +473,7 @@ pub struct ReshapeSpec {
 }
 
 /// Permutation payload for `transpose`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TransposeSpec {
     pub perm: Vec<usize>,
 }
@@ -467,20 +485,20 @@ pub struct BroadcastToSpec {
 }
 
 /// Attribute payload for `slice`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SliceSpec {
     pub starts: Vec<usize>,
     pub sizes: Vec<usize>,
 }
 
 /// Attribute payload for `concat`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConcatSpec {
     pub axis: isize,
 }
 
 /// Attribute payload for `pad`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Hash, Serialize, Deserialize)]
 pub struct PadSpec {
     pub low: Vec<usize>,
     pub high: Vec<usize>,
@@ -489,13 +507,13 @@ pub struct PadSpec {
 }
 
 /// Attribute payload for `tile`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TileSpec {
     pub repeats: Vec<usize>,
 }
 
 /// Attribute payload for `iota`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IotaSpec {
     pub shape: Shape,
     pub dtype: DType,
@@ -503,13 +521,13 @@ pub struct IotaSpec {
 }
 
 /// Attribute payload for `gather`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GatherSpec {
     pub axis: isize,
 }
 
 /// Dimension numbers defining a `scatter_add`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ScatterSpec {
     pub update_window_dims: Vec<usize>,
     pub inserted_window_dims: Vec<usize>,
@@ -526,26 +544,26 @@ pub enum ScatterReduceKind {
 }
 
 /// Attribute payload for `scatter_reduce`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ScatterReduceSpec {
     pub axis: isize,
     pub reduce: ScatterReduceKind,
 }
 
 /// Attribute payload for `dynamic_slice`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DynamicSliceSpec {
     pub sizes: Vec<usize>,
 }
 
 /// Attribute payload for `dynamic_update_slice`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DynamicUpdateSliceSpec {
     pub sizes: Vec<usize>,
 }
 
 /// Attribute payload for `extract_patches`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Hash, Serialize, Deserialize)]
 pub struct ExtractPatchesSpec {
     pub window: Vec<usize>,
     pub strides: Vec<usize>,
@@ -559,21 +577,21 @@ pub struct ExtractPatchesSpec {
 pub struct RegionId(pub usize);
 
 /// Control-flow payload for `cond`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CondSpec {
     pub true_region: RegionId,
     pub false_region: RegionId,
 }
 
 /// Control-flow payload for `while`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WhileSpec {
     pub cond_region: RegionId,
     pub body_region: RegionId,
 }
 
 /// Control-flow payload for `scan`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ScanSpec {
     pub body_region: RegionId,
     pub carry_count: usize,
@@ -581,7 +599,7 @@ pub struct ScanSpec {
 }
 
 /// Attribute payload for `reduce_window`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ReduceWindowSpec {
     pub window_dims: Vec<usize>,
     pub strides: Vec<usize>,
@@ -593,21 +611,21 @@ pub struct ReduceWindowSpec {
 }
 
 /// Attribute payload for `rng_uniform`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RngUniformSpec {
     pub shape: Shape,
     pub dtype: DType,
 }
 
 /// Attribute payload for `rng_normal`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RngNormalSpec {
     pub shape: Shape,
     pub dtype: DType,
 }
 
 /// Attribute payload for `top_k`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TopKSpec {
     pub k: usize,
     pub axis: isize,
@@ -616,7 +634,7 @@ pub struct TopKSpec {
 }
 
 /// Attribute payload for segment reductions.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SegmentReduceSpec {
     pub kind: SegmentReduceKind,
     pub num_segments: usize,
@@ -626,21 +644,21 @@ pub struct SegmentReduceSpec {
 }
 
 /// Attribute payload for `quantize`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QuantizeSpec {
     pub output_dtype: DType,
     pub axis: Option<usize>,
 }
 
 /// Attribute payload for `dequantize`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DequantizeSpec {
     pub axis: Option<usize>,
     pub output_dtype: Option<DType>,
 }
 
 /// Attribute payload for `requantize`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RequantizeSpec {
     pub output_dtype: DType,
     pub axis: Option<usize>,
@@ -663,8 +681,31 @@ pub enum CustomCallAttr {
     StringArray(Vec<String>),
 }
 
+/// Hashes floats by bit pattern, so `0.0` and `-0.0` hash differently although they compare equal.
+/// `CustomCallAttr` is not `Eq`, so it is never used as a hash-map key.
+impl std::hash::Hash for CustomCallAttr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            CustomCallAttr::I64(value) => value.hash(state),
+            CustomCallAttr::F64(value) => value.to_bits().hash(state),
+            CustomCallAttr::Bool(value) => value.hash(state),
+            CustomCallAttr::String(value) => value.hash(state),
+            CustomCallAttr::I64Array(values) => values.hash(state),
+            CustomCallAttr::F64Array(values) => {
+                values.len().hash(state);
+                for value in values {
+                    value.to_bits().hash(state);
+                }
+            }
+            CustomCallAttr::BoolArray(values) => values.hash(state),
+            CustomCallAttr::StringArray(values) => values.hash(state),
+        }
+    }
+}
+
 /// Attribute payload for `custom_call`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Hash, Serialize, Deserialize)]
 pub struct CustomCallSpec {
     pub target: String,
     #[serde(default)]
@@ -691,7 +732,7 @@ pub enum Operand {
 }
 
 /// Declarative form of PTIR operations.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Hash, Serialize, Deserialize)]
 pub enum Operation {
     Constant(TensorLiteral),
     ElementwiseUnary(ElementwiseUnaryOp),

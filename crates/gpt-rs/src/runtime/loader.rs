@@ -11,6 +11,7 @@ use crate::model::registry as model_registry;
 use crate::model::ModelConfig;
 use crate::ops::functional::{build_registry, FunctionalOverrides};
 use crate::params::{param_key, BaseParamId, ModelNamespaceId, ParamSource};
+use crate::tensor::spec_utils::backend_dtype;
 use crate::tensor::DeviceTensor;
 
 use super::handle::{LoadedModel, ModelHandle};
@@ -216,9 +217,8 @@ fn prefetch_source_cache<B: PortableBackend + 'static>(
         if state.cache.get(base_id).is_some() {
             continue;
         }
-        let tensor = state.reader.get_by_base_id(base_id)?;
+        let handle = materialize_entry(backend.as_ref(), &state.reader, base_id)?;
         let bytes = state.entry_bytes.get(&base_id).copied().unwrap_or(0);
-        let handle = backend.materialize(TensorInit::Literal(tensor.to_literal()))?;
         state.cache.insert(base_id, bytes, handle);
     }
     Ok(())
@@ -231,13 +231,29 @@ impl<B: PortableBackend + 'static> ParamSource<B> for CheckpointParamSource<B> {
             return Ok(handle);
         }
 
-        let tensor = state.reader.get_by_base_id(base_id)?;
+        let handle = materialize_entry(self.backend.as_ref(), &state.reader, base_id)?;
         let bytes = state.entry_bytes.get(&base_id).copied().unwrap_or(0);
-        let literal = tensor.to_literal();
-        let handle = self.backend.materialize(TensorInit::Literal(literal))?;
         state.cache.insert(base_id, bytes, handle.clone());
         Ok(handle)
     }
+}
+
+/// Hands a checkpoint tensor to the backend as a view into the memory-mapped file, so backends
+/// that execute on host memory leave the weights in the OS page cache. Checkpoint payloads are
+/// little endian, so big-endian hosts get a decoded copy.
+fn materialize_entry<B: PortableBackend + 'static>(
+    backend: &B,
+    reader: &CheckpointReader,
+    base_id: BaseParamId,
+) -> Result<B::TensorHandle> {
+    let entry = reader.entry_by_base_id(base_id)?;
+    if cfg!(target_endian = "little") {
+        let spec =
+            crate::backend::ptir_utils::tensor_spec_static(backend_dtype(entry.dtype), &entry.dims);
+        return Ok(backend.materialize_external(spec, reader.entry_external_bytes(entry)?)?);
+    }
+    let literal = reader.get_entry(entry)?.to_literal();
+    Ok(backend.materialize(TensorInit::Literal(literal))?)
 }
 
 pub fn load_model<B: PortableBackend + 'static>(

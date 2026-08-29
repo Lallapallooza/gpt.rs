@@ -292,6 +292,57 @@ impl<'de> Deserialize<'de> for TensorLiteral {
     }
 }
 
+/// Read-only little-endian tensor bytes that another allocation owns, for example a memory-mapped
+/// checkpoint.
+#[derive(Clone)]
+pub struct ExternalBytes {
+    owner: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    offset: usize,
+    len: usize,
+}
+
+impl ExternalBytes {
+    /// Creates a view of `owner[offset..offset + len]`. Returns an error when the range does not
+    /// fit in `owner`.
+    pub fn new(
+        owner: Arc<dyn AsRef<[u8]> + Send + Sync>,
+        offset: usize,
+        len: usize,
+    ) -> BackendResult<Self> {
+        let total = (*owner).as_ref().len();
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| BackendError::execution("external byte range overflow"))?;
+        if end > total {
+            return Err(BackendError::execution(format!(
+                "external byte range {offset}..{end} exceeds owner length {total}"
+            )));
+        }
+        Ok(Self { owner, offset, len })
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &(*self.owner).as_ref()[self.offset..self.offset + self.len]
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl fmt::Debug for ExternalBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExternalBytes")
+            .field("offset", &self.offset)
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
 /// Initialization payload when materialising tensors on a backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TensorInit {
@@ -1311,6 +1362,22 @@ pub trait PortableBackend: Send + Sync {
 
     /// Materialises a tensor handle from host initialisation data.
     fn materialize(&self, init: TensorInit) -> BackendResult<Self::TensorHandle>;
+
+    /// Materialises a tensor from externally owned little-endian bytes.
+    ///
+    /// Backends that run directly on host memory may reference `bytes` without a copy, for example
+    /// to execute on a memory-mapped checkpoint. The default implementation copies the bytes into
+    /// a literal.
+    fn materialize_external(
+        &self,
+        spec: TensorSpec,
+        bytes: ExternalBytes,
+    ) -> BackendResult<Self::TensorHandle> {
+        self.materialize(TensorInit::Literal(TensorLiteral::new(
+            spec,
+            Arc::from(bytes.as_slice()),
+        )))
+    }
 
     /// Reads back a tensor handle into a dense literal (debug/development only).
     fn to_literal(&self, tensor: &Self::TensorHandle) -> BackendResult<TensorLiteral>;

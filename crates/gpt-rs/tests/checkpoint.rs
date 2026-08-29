@@ -123,7 +123,7 @@ fn checkpoint_reader_and_runtime_loader_work_for_small_gpt() -> Result<()> {
 
     CheckpointSaver::save(&checkpoint.path, &model)?;
 
-    let mut reader = CheckpointReader::open(&checkpoint.path)?;
+    let reader = CheckpointReader::open(&checkpoint.path)?;
     assert_eq!(reader.config().kind, "gpt");
 
     let mut expected = Vec::new();
@@ -140,7 +140,7 @@ fn checkpoint_reader_and_runtime_loader_work_for_small_gpt() -> Result<()> {
     }
 
     patch_checkpoint_reserved_byte(&checkpoint.path, 1)?;
-    let mut reader = CheckpointReader::open(&checkpoint.path)?;
+    let reader = CheckpointReader::open(&checkpoint.path)?;
     let from_disk = reader.get("tok_embeddings.weight")?;
     let expected_tok = expected
         .iter()

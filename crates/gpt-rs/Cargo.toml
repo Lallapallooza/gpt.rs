@@ -28,6 +28,7 @@ half = "2.6"
 once_cell = "1"
 linkme = "0.3"
 blake3 = "1.5"
+memmap2 = "0.9"
 
 [dev-dependencies]
 gpt-rs-backend-ref-cpu = { path = "../gpt-rs-backend-ref-cpu", version = "0.1.0" }

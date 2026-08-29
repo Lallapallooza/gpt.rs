@@ -11,7 +11,7 @@ fn load_gpt2_tokenizer() -> Tokenizer {
         .join("gpt2_tokenizer.json");
     let data = fs::read_to_string(path).expect("failed to read tokenizer config");
     let config = TokenizerConfig::from_json_str(&data).expect("invalid tokenizer config");
-    Tokenizer::from_config(config)
+    Tokenizer::from_config(config).expect("valid tokenizer config")
 }
 
 #[test]
@@ -19,7 +19,7 @@ fn tokenizer_roundtrip() {
     let tokenizer = load_gpt2_tokenizer();
 
     let text = "Hello rust";
-    let tokens = tokenizer.encode(text);
+    let tokens = tokenizer.encode(text).expect("encode");
     let decoded = tokenizer.decode(&tokens);
 
     assert_eq!(decoded, text);
@@ -45,28 +45,47 @@ fn tokenizer_config_parses_flat_schema() {
 fn tokenizer_config_parses_hf_tokenizer_json_schema() {
     let json = r#"
     {
-        "model": {
-            "type": "BPE",
-            "vocab": {"<unk>": 0, "H": 1, "i": 2},
-            "merges": [["H", "i"]],
-            "unk_token": null
-        },
         "added_tokens": [
-            {"id": 0, "content": "<unk>", "special": true}
-        ]
+            {"id": 3, "content": "<|endoftext|>", "single_word": false, "lstrip": false,
+             "rstrip": false, "normalized": true, "special": true}
+        ],
+        "normalizer": null,
+        "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true,
+                          "use_regex": true},
+        "post_processor": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": false,
+                           "use_regex": true},
+        "decoder": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true,
+                    "use_regex": true},
+        "model": {"dropout": null, "unk_token": null, "continuing_subword_prefix": "",
+                  "end_of_word_suffix": "", "fuse_unk": false,
+                  "vocab": {"H": 0, "i": 1, "Hi": 2}, "merges": ["H i"]}
     }
     "#;
     let cfg = TokenizerConfig::from_json_str(json).expect("hf schema should parse");
-    assert_eq!(cfg.vocab.get("i"), Some(&2));
     assert_eq!(cfg.merges, vec![("H".to_string(), "i".to_string())]);
-    assert_eq!(cfg.unk_token, "<unk>");
+    let tokenizer = Tokenizer::from_config(cfg).unwrap();
+    // `normalized` has no effect without a normalizer, so the added token still matches.
+    assert_eq!(tokenizer.encode("Hi<|endoftext|>").unwrap(), vec![2, 3]);
 }
 
 #[test]
 fn gpt2_encode_matches_python() {
     let tokenizer = load_gpt2_tokenizer();
-    assert_eq!(tokenizer.encode("Hello world"), vec![15496, 995]);
-    assert_eq!(tokenizer.encode(" Hello world"), vec![18435, 995]);
+    assert_eq!(tokenizer.encode("Hello world").unwrap(), vec![15496, 995]);
+    assert_eq!(tokenizer.encode(" Hello world").unwrap(), vec![18435, 995]);
+    // Whitespace runs leave their last space to the following word (`\s+(?!\S)`).
+    assert_eq!(
+        tokenizer.encode("Hello  world").unwrap(),
+        vec![15496, 220, 995]
+    );
+    assert_eq!(
+        tokenizer.encode("a   b\n\nc  ").unwrap(),
+        vec![64, 220, 220, 275, 198, 198, 66, 220, 220]
+    );
+    assert_eq!(
+        tokenizer.encode("it's  2026!").unwrap(),
+        vec![270, 338, 220, 1160, 2075, 0]
+    );
 }
 
 #[test]

@@ -370,7 +370,7 @@ fn load_tokenizer(path: impl AsRef<Path>) -> Result<Tokenizer> {
             path.display()
         )
     })?;
-    Ok(Tokenizer::from_config(cfg))
+    Tokenizer::from_config(cfg)
 }
 
 fn load_vision_input_tensor(args: &VisionInputArgs) -> Result<Tensor> {
@@ -634,7 +634,7 @@ fn run_generate<B: PortableBackend + 'static>(
     })?;
     let tokenizer = load_tokenizer(&args.tokenizer)?;
 
-    let prompt_tokens = tokenizer.encode(&args.prompt);
+    let prompt_tokens = tokenizer.encode(&args.prompt)?;
     ensure!(
         !prompt_tokens.is_empty(),
         "prompt produced an empty token sequence"
@@ -875,7 +875,7 @@ fn run_benchmark<B: PortableBackend + 'static>(
         )
     })?;
     let tokenizer = load_tokenizer(&args.tokenizer)?;
-    let prompt_tokens = tokenizer.encode(&args.prompt);
+    let prompt_tokens = tokenizer.encode(&args.prompt)?;
     ensure!(
         !prompt_tokens.is_empty(),
         "prompt produced an empty token sequence"
@@ -1323,7 +1323,7 @@ fn run_forward<B: PortableBackend + 'static>(
             .as_ref()
             .ok_or_else(|| anyhow!("--prompt requires --tokenizer"))?;
         let tokenizer = load_tokenizer(tokenizer_path)?;
-        let tokens = tokenizer.encode(prompt);
+        let tokens = tokenizer.encode(prompt)?;
         ensure!(
             !tokens.is_empty(),
             "prompt produced an empty token sequence"

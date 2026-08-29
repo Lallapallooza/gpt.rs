@@ -1,9 +1,9 @@
-use gpt_rs::tokenizer::{Tokenizer, TokenizerConfig};
+use gpt_rs::tokenizer::Tokenizer;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
-use std::path::PathBuf;
 
-/// GPT-style byte-pair encoding tokenizer
+/// Byte-level byte-pair encoding tokenizer. It reads GPT-2 flat configs and Hugging Face
+/// `tokenizer.json` files.
 #[pyclass(name = "Tokenizer")]
 pub struct PyTokenizer {
     inner: Tokenizer,
@@ -14,22 +14,21 @@ impl PyTokenizer {
     /// Load tokenizer from JSON config file
     #[staticmethod]
     fn from_file(path: String) -> PyResult<Self> {
-        let path_buf = PathBuf::from(path);
-        let file = std::fs::File::open(&path_buf)
-            .map_err(|e| PyIOError::new_err(format!("failed to open tokenizer file: {}", e)))?;
-
-        let config: TokenizerConfig = serde_json::from_reader(file).map_err(|e| {
-            PyValueError::new_err(format!("failed to parse tokenizer config: {}", e))
+        let inner = Tokenizer::from_file(&path).map_err(|e| {
+            if e.downcast_ref::<std::io::Error>().is_some() {
+                PyIOError::new_err(format!("{e:#}"))
+            } else {
+                PyValueError::new_err(format!("{e:#}"))
+            }
         })?;
-
-        Ok(PyTokenizer {
-            inner: Tokenizer::from_config(config),
-        })
+        Ok(PyTokenizer { inner })
     }
 
     /// Encode text to token IDs
-    fn encode(&self, text: String) -> Vec<usize> {
-        self.inner.encode(&text)
+    fn encode(&self, text: String) -> PyResult<Vec<usize>> {
+        self.inner
+            .encode(&text)
+            .map_err(|e| PyValueError::new_err(format!("{e:#}")))
     }
 
     /// Decode token IDs back to text

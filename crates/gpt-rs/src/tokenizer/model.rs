@@ -1,19 +1,30 @@
-//! High-level GPT-style tokenizer backed by byte pair encoding (BPE).
+//! Byte-level byte pair encoding (BPE) tokenizer.
 //!
-//! The model exposes a thin `Tokenizer` wrapper around the pre-trained vocabulary and merge
-//! tables shipped with GPT-2/GPT-3 style models. It mirrors the semantics of the original
-//! Python implementation while remaining dependency-free at runtime so the tokenizer can run
-//! inside inference and training binaries without Python bindings.
+//! [`Tokenizer`] implements the byte-level BPE scheme of GPT-2 and the Qwen family, with added
+//! tokens such as `<|im_start|>` matched verbatim. At load time, the tokenizer rejects a Hugging
+//! Face `tokenizer.json` that uses options outside this scheme.
 
 use super::bpe::{get_pairs, BpeMerges};
-use anyhow::{anyhow, ensure, Context, Result};
-use regex::Regex;
+use aho_corasick::{AhoCorasick, MatchKind};
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use fancy_regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
 
 /// Regular expression used by GPT-2 to chunk input text prior to BPE merges.
-const GPT2_PATTERN: &str = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+";
+const GPT2_PATTERN: &str =
+    r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
+
+/// Token that the tokenizer matches verbatim in the input text. Pre-tokenization and merges never
+/// split it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddedToken {
+    pub content: String,
+    pub id: usize,
+}
 
 /// Serializable tokenizer definition that mirrors the JSON schema exported by Python tools.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,9 +33,19 @@ pub struct TokenizerConfig {
     pub vocab: HashMap<String, usize>,
     /// Ordered list of merge operations; earlier entries represent higher merge priority.
     pub merges: Vec<(String, String)>,
-    /// Symbol to substitute when the tokenizer observes an unknown token at runtime.
+    /// Symbol that replaces pieces missing from the vocabulary. Byte-level vocabularies cover
+    /// every byte, so they never emit it.
     #[serde(default = "default_unk_token")]
     pub unk_token: String,
+    /// Pre-tokenization regex. The default is the GPT-2 pattern.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// When true, the tokenizer applies Unicode NFC normalization before pre-tokenization.
+    #[serde(default)]
+    pub normalize_nfc: bool,
+    /// Tokens matched verbatim before normalization and pre-tokenization.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added_tokens: Vec<AddedToken>,
 }
 
 /// Provides the default unknown token marker when a configuration omits the field.
@@ -32,102 +53,195 @@ fn default_unk_token() -> String {
     "<unk>".to_string()
 }
 
+/// The subset of a Hugging Face `tokenizer.json` that byte-level BPE needs. Serde rejects unknown
+/// normalizer, pre-tokenizer, and decoder types. [`HfTokenizerJson::into_config`] rejects options
+/// that change the encoding in ways that [`Tokenizer`] does not implement.
 #[derive(Debug, Deserialize)]
 struct HfTokenizerJson {
-    model: HfTokenizerModel,
+    model: HfBpe,
     #[serde(default)]
     added_tokens: Vec<HfAddedToken>,
+    normalizer: Option<HfNormalizer>,
+    pre_tokenizer: HfPreTokenizer,
+    decoder: HfDecoder,
 }
 
 #[derive(Debug, Deserialize)]
-struct HfTokenizerModel {
+struct HfBpe {
+    #[serde(rename = "type")]
+    kind: Option<String>,
     vocab: HashMap<String, usize>,
     merges: Vec<HfMergeEntry>,
-    #[serde(default)]
     unk_token: Option<String>,
+    dropout: Option<f64>,
+    continuing_subword_prefix: Option<String>,
+    end_of_word_suffix: Option<String>,
+    #[serde(default)]
+    byte_fallback: bool,
+    #[serde(default)]
+    ignore_merges: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct HfAddedToken {
     id: usize,
     content: String,
+    #[serde(default)]
+    normalized: bool,
+    #[serde(default)]
+    lstrip: bool,
+    #[serde(default)]
+    rstrip: bool,
+    #[serde(default)]
+    single_word: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum HfNormalizer {
+    #[serde(rename = "NFC")]
+    Nfc,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum HfPreTokenizer {
+    ByteLevel {
+        #[serde(default)]
+        add_prefix_space: bool,
+        #[serde(default = "default_true")]
+        use_regex: bool,
+    },
+    Split {
+        pattern: HfPattern,
+        behavior: String,
+        #[serde(default)]
+        invert: bool,
+    },
+    Sequence {
+        pretokenizers: Vec<HfPreTokenizer>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+enum HfPattern {
+    Regex(String),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum HfDecoder {
+    ByteLevel {},
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum HfMergeEntry {
     Pair([String; 2]),
-    PairTuple((String, String)),
     SpaceSeparated(String),
 }
 
-impl HfMergeEntry {
-    fn into_pair(self) -> Result<(String, String)> {
-        match self {
-            HfMergeEntry::Pair([left, right]) | HfMergeEntry::PairTuple((left, right)) => {
-                Ok((left, right))
-            }
-            HfMergeEntry::SpaceSeparated(raw) => {
-                let (left, right) = raw
-                    .split_once(' ')
-                    .ok_or_else(|| anyhow!("invalid BPE merge entry '{raw}'"))?;
-                Ok((left.to_string(), right.to_string()))
-            }
+impl HfTokenizerJson {
+    fn into_config(self) -> Result<TokenizerConfig> {
+        let HfTokenizerJson {
+            model,
+            added_tokens,
+            normalizer,
+            pre_tokenizer,
+            decoder: HfDecoder::ByteLevel {},
+        } = self;
+        if let Some(kind) = model.kind.as_deref() {
+            ensure!(kind == "BPE", "unsupported tokenizer model type '{kind}'");
         }
+        ensure!(
+            model.dropout.is_none()
+                && !model.byte_fallback
+                && !model.ignore_merges
+                && model
+                    .continuing_subword_prefix
+                    .as_deref()
+                    .unwrap_or("")
+                    .is_empty()
+                && model.end_of_word_suffix.as_deref().unwrap_or("").is_empty(),
+            "BPE dropout, byte_fallback, ignore_merges, and subword prefixes or suffixes are not supported"
+        );
+        // The tokenizer matches added tokens on the raw text. The raw text equals the normalized
+        // text only when there is no normalizer.
+        for token in &added_tokens {
+            ensure!(
+                !(token.lstrip
+                    || token.rstrip
+                    || token.single_word
+                    || (token.normalized && normalizer.is_some())),
+                "added token {:?} uses normalized, lstrip, rstrip, or single_word matching, which is not supported",
+                token.content
+            );
+        }
+        // Accept only two layouts. The GPT-2 layout is a ByteLevel with its own regex. The Qwen
+        // layout is a Split regex followed by a ByteLevel without a regex.
+        let pattern = match pre_tokenizer {
+            HfPreTokenizer::ByteLevel {
+                add_prefix_space: false,
+                use_regex: true,
+            } => None,
+            HfPreTokenizer::Sequence { pretokenizers } => match pretokenizers.as_slice() {
+                [HfPreTokenizer::Split {
+                    pattern: HfPattern::Regex(regex),
+                    behavior,
+                    invert: false,
+                }, HfPreTokenizer::ByteLevel {
+                    add_prefix_space: false,
+                    use_regex: false,
+                }] if behavior == "Isolated" => Some(regex.clone()),
+                other => bail!("unsupported pre-tokenizer sequence {other:?}"),
+            },
+            other => bail!("unsupported pre-tokenizer {other:?}"),
+        };
+        let merges = model
+            .merges
+            .into_iter()
+            .map(|entry| match entry {
+                HfMergeEntry::Pair([left, right]) => Ok((left, right)),
+                HfMergeEntry::SpaceSeparated(raw) => raw
+                    .split_once(' ')
+                    .map(|(left, right)| (left.to_string(), right.to_string()))
+                    .ok_or_else(|| anyhow!("invalid BPE merge entry '{raw}'")),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(TokenizerConfig {
+            vocab: model.vocab,
+            merges,
+            unk_token: model
+                .unk_token
+                .filter(|token| !token.is_empty())
+                .unwrap_or_else(default_unk_token),
+            pattern,
+            normalize_nfc: matches!(normalizer, Some(HfNormalizer::Nfc)),
+            added_tokens: added_tokens
+                .into_iter()
+                .map(|token| AddedToken {
+                    content: token.content,
+                    id: token.id,
+                })
+                .collect(),
+        })
     }
 }
 
 impl TokenizerConfig {
-    /// Parses either the flat gpt-rs tokenizer schema or Hugging Face `tokenizer.json`.
+    /// Parses the flat gpt-rs tokenizer schema, or a Hugging Face `tokenizer.json` of a byte-level
+    /// BPE model.
     pub fn from_json_str(data: &str) -> Result<Self> {
         if let Ok(cfg) = serde_json::from_str::<TokenizerConfig>(data) {
             return Ok(cfg);
         }
-
-        let hf: HfTokenizerJson =
-            serde_json::from_str(data).context("failed to parse Hugging Face tokenizer.json")?;
-        let HfTokenizerJson {
-            model:
-                HfTokenizerModel {
-                    vocab,
-                    merges,
-                    unk_token,
-                },
-            added_tokens,
-        } = hf;
-
-        let merges = merges
-            .into_iter()
-            .map(HfMergeEntry::into_pair)
-            .collect::<Result<Vec<_>>>()?;
-
-        let unk_token = unk_token
-            .filter(|token| !token.is_empty())
-            .or_else(|| {
-                added_tokens
-                    .iter()
-                    .find(|token| token.content == "<unk>")
-                    .map(|token| token.content.clone())
-            })
-            .or_else(|| {
-                added_tokens
-                    .iter()
-                    .find(|token| token.id == 0)
-                    .map(|token| token.content.clone())
-            })
-            .unwrap_or_else(|| "<unk>".to_string());
-
-        ensure!(
-            vocab.contains_key(&unk_token) || vocab.contains_key("<unk>"),
-            "tokenizer vocabulary is missing unknown token '{}'",
-            unk_token
-        );
-
-        Ok(Self {
-            vocab,
-            merges,
-            unk_token,
-        })
+        serde_json::from_str::<HfTokenizerJson>(data)
+            .context("failed to parse Hugging Face tokenizer.json")?
+            .into_config()
     }
 }
 
@@ -136,47 +250,91 @@ impl TokenizerConfig {
 pub struct Tokenizer {
     /// Forward mapping from token string to id.
     encoder: HashMap<String, usize>,
-    /// Reverse mapping from id to token string; preserves GPT-2 byte-level encoding.
-    decoder: Vec<String>,
+    /// Raw bytes of every token id. For an added token, the bytes are its UTF-8 content.
+    token_bytes: Vec<Vec<u8>>,
     /// Learned merge priorities wrapped in a `BpeMerges` helper.
     merges: BpeMerges,
-    /// Identifier of the unknown token used as a fallback during encoding and decoding.
-    unk_id: usize,
-    /// Lookup table translating raw bytes into printable Unicode code points.
-    byte_encoder: HashMap<u8, char>,
-    /// Reverse lookup used when reconstructing raw UTF-8 output.
-    byte_decoder: HashMap<char, u8>,
+    /// Id that replaces pieces missing from the vocabulary.
+    unk_id: Option<usize>,
+    /// Printable Unicode code point standing in for each raw byte.
+    byte_encoder: [char; 256],
     /// Cache for memoizing intermediate BPE results to avoid recomputing merges.
     cache: Mutex<HashMap<String, String>>,
     /// Compiled tokenization pattern applied before the BPE merge loop runs.
     pattern: Regex,
+    normalize_nfc: bool,
+    /// Leftmost-longest matcher over the added token contents.
+    added: AhoCorasick,
+    /// Token id of each `added` pattern.
+    added_ids: Vec<usize>,
 }
 
 impl Tokenizer {
-    /// Builds a tokenizer directly from a serialized [`TokenizerConfig`].
-    ///
-    /// The constructor assembles both encoder and decoder tables, resolves the unknown token
-    /// id, and prepares byte-level Unicode shims so tokenization stays faithful to the original
-    /// GPT-2 rules regardless of input UTF-8 sequences.
-    pub fn from_config(config: TokenizerConfig) -> Self {
+    /// Loads a tokenizer from a gpt-rs flat config or a Hugging Face `tokenizer.json`.
+    pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let data = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read tokenizer from {}", path.display()))?;
+        let config = TokenizerConfig::from_json_str(&data).with_context(|| {
+            format!(
+                "invalid tokenizer config in {}: expected the flat gpt-rs schema or a Hugging Face tokenizer.json",
+                path.display()
+            )
+        })?;
+        Self::from_config(config)
+    }
+
+    /// Builds a tokenizer from a serialized [`TokenizerConfig`].
+    pub fn from_config(config: TokenizerConfig) -> Result<Self> {
         let TokenizerConfig {
             vocab,
             merges,
             unk_token,
+            pattern,
+            normalize_nfc,
+            added_tokens,
         } = config;
 
-        let mut decoder = vec![String::new(); vocab.len()];
+        let max_id = vocab
+            .values()
+            .chain(added_tokens.iter().map(|token| &token.id))
+            .copied()
+            .max()
+            .ok_or_else(|| anyhow!("tokenizer vocabulary is empty"))?;
+        let byte_encoder = bytes_to_unicode();
+        let byte_decoder: HashMap<char, u8> = (0..=255u8)
+            .map(|b| (byte_encoder[usize::from(b)], b))
+            .collect();
+        let mut token_bytes = vec![Vec::new(); max_id + 1];
         for (token, &idx) in &vocab {
-            if idx < decoder.len() {
-                decoder[idx] = token.clone();
+            // Symbols outside the byte alphabet, such as a literal `<unk>`, decode as their UTF-8
+            // bytes.
+            let mut bytes = Vec::with_capacity(token.len());
+            for ch in token.chars() {
+                match byte_decoder.get(&ch) {
+                    Some(&b) => bytes.push(b),
+                    None => bytes.extend_from_slice(ch.encode_utf8(&mut [0u8; 4]).as_bytes()),
+                }
             }
+            token_bytes[idx] = bytes;
         }
+        let added_tokens: Vec<AddedToken> = added_tokens
+            .into_iter()
+            .filter(|token| !token.content.is_empty())
+            .collect();
+        for token in &added_tokens {
+            token_bytes[token.id] = token.content.as_bytes().to_vec();
+        }
+        let added = AhoCorasick::builder()
+            .match_kind(MatchKind::LeftmostLongest)
+            .build(added_tokens.iter().map(|token| &token.content))
+            .context("failed to build the added-token matcher")?;
+        let added_ids = added_tokens.iter().map(|token| token.id).collect();
 
         let unk_id = vocab
             .get(&unk_token)
             .copied()
-            .or_else(|| vocab.get("<unk>").copied())
-            .expect("missing unknown token in vocabulary");
+            .or_else(|| vocab.get("<unk>").copied());
 
         let ranks = merges
             .into_iter()
@@ -184,91 +342,103 @@ impl Tokenizer {
             .map(|(rank, (a, b))| ((a, b), rank))
             .collect();
 
-        let (byte_encoder, byte_decoder) = bytes_to_unicode();
-        let pattern = Regex::new(GPT2_PATTERN).expect("invalid GPT-2 tokenizer regex pattern");
+        let pattern_src = pattern.as_deref().unwrap_or(GPT2_PATTERN);
+        let pattern = Regex::new(pattern_src)
+            .with_context(|| format!("invalid pre-tokenization pattern {pattern_src:?}"))?;
 
-        Tokenizer {
+        Ok(Tokenizer {
             encoder: vocab,
-            decoder,
+            token_bytes,
             merges: BpeMerges::new(ranks),
             unk_id,
             byte_encoder,
-            byte_decoder,
             cache: Mutex::new(HashMap::new()),
             pattern,
-        }
+            normalize_nfc,
+            added,
+            added_ids,
+        })
     }
 
-    /// Encodes UTF-8 text into a sequence of token ids using GPT-2 compatible rules.
+    /// Encodes UTF-8 text into token ids, like Hugging Face
+    /// `encode(text, add_special_tokens=False)`. It does not apply post-processor templates, such
+    /// as BOS or EOS insertion.
     ///
-    /// Input is first segmented with the GPT-2 regex, then each segment is byte-encoded and
-    /// progressively merged using the stored BPE ranks. Unknown tokens fall back to the
-    /// configured `unk_id`, mirroring the behaviour of the reference implementation.
-    pub fn encode(&self, text: &str) -> Vec<usize> {
-        if text.is_empty() {
-            return Vec::new();
-        }
-
+    /// The tokenizer first matches added tokens, leftmost and longest first. Then it processes each
+    /// remaining span in these steps: NFC normalization when configured, a split with the
+    /// pre-tokenization pattern, byte encoding, and merges.
+    pub fn encode(&self, text: &str) -> Result<Vec<usize>> {
         let mut ids = Vec::new();
-        for mat in self.pattern.find_iter(text) {
-            let piece = mat.as_str();
-            if piece.is_empty() {
-                continue;
-            }
-            let transformed = self.byte_encode(piece);
-            let bpe_tokens = self.bpe(&transformed);
-            for token in bpe_tokens.split(' ') {
-                let id = self.encoder.get(token).copied().unwrap_or(self.unk_id);
-                ids.push(id);
-            }
+        let mut last = 0;
+        for mat in self.added.find_iter(text) {
+            self.encode_span(&text[last..mat.start()], &mut ids)?;
+            ids.push(self.added_ids[mat.pattern().as_usize()]);
+            last = mat.end();
         }
-        ids
+        self.encode_span(&text[last..], &mut ids)?;
+        Ok(ids)
     }
 
-    /// Decodes token ids back into human-readable text.
-    ///
-    /// The decoder mirrors the Python pipeline by concatenating token strings, mapping the
-    /// intermediate representation through the inverse byte lookup, and finally materializing
-    /// UTF-8 output. Any id outside the vocabulary produces the unknown token string.
-    pub fn decode(&self, tokens: &[usize]) -> String {
-        if tokens.is_empty() {
-            return String::new();
-        }
-
-        let mut text = String::new();
-        for &token in tokens {
-            let piece = self
-                .decoder
-                .get(token)
-                .cloned()
-                .unwrap_or_else(|| self.decoder[self.unk_id].clone());
-            text.push_str(&piece);
-        }
-
-        let mut bytes = Vec::with_capacity(text.len());
-        for ch in text.chars() {
-            if let Some(&b) = self.byte_decoder.get(&ch) {
-                bytes.push(b);
+    fn encode_span(&self, span: &str, ids: &mut Vec<usize>) -> Result<()> {
+        let normalized: Cow<'_, str> =
+            if self.normalize_nfc && is_nfc_quick(span.chars()) != IsNormalized::Yes {
+                Cow::Owned(span.nfc().collect())
             } else {
-                let mut buf = [0u8; 4];
-                let encoded = ch.encode_utf8(&mut buf);
-                bytes.extend_from_slice(encoded.as_bytes());
-            }
+                Cow::Borrowed(span)
+            };
+        // As in Hugging Face's `Isolated` split, text between matches is a piece of its own.
+        let mut last = 0;
+        for mat in self.pattern.find_iter(&normalized) {
+            let mat = mat.context("pre-tokenization regex failed")?;
+            self.encode_piece(&normalized[last..mat.start()], ids)?;
+            self.encode_piece(mat.as_str(), ids)?;
+            last = mat.end();
         }
-
-        String::from_utf8(bytes).unwrap_or_default()
+        self.encode_piece(&normalized[last..], ids)
     }
 
-    /// Returns the size of the vocabulary backing this tokenizer.
+    fn encode_piece(&self, piece: &str, ids: &mut Vec<usize>) -> Result<()> {
+        if piece.is_empty() {
+            return Ok(());
+        }
+        for token in self.bpe(&self.byte_encode(piece)).split(' ') {
+            let id = match self.encoder.get(token) {
+                Some(&id) => id,
+                None => self.unk_id.ok_or_else(|| {
+                    anyhow!("token {token:?} is not in the vocabulary and no unk token is set")
+                })?,
+            };
+            ids.push(id);
+        }
+        Ok(())
+    }
+
+    /// Returns the raw bytes that `token` represents. An added token yields its UTF-8 content. An
+    /// unknown id yields nothing.
+    pub fn token_bytes(&self, token: usize) -> &[u8] {
+        self.token_bytes.get(token).map_or(&[], Vec::as_slice)
+    }
+
+    /// Decodes token ids into text. Invalid UTF-8 sequences become U+FFFD.
+    pub fn decode(&self, tokens: &[usize]) -> String {
+        let bytes: Vec<u8> = tokens
+            .iter()
+            .flat_map(|&t| self.token_bytes(t))
+            .copied()
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Returns the number of token ids (vocabulary plus added tokens).
     pub fn vocab_size(&self) -> usize {
-        self.decoder.len()
+        self.token_bytes.len()
     }
 
     /// Applies the BPE merge loop to a byte-encoded token segment.
     ///
     /// Results are cached per input segment to amortize repeated work during long prompts.
-    /// The output mirrors the Python implementation by separating merged tokens with spaces
-    /// so the caller can map each piece into a vocabulary id.
+    /// The output separates merged tokens with spaces so the caller can map each piece into a
+    /// vocabulary id.
     fn bpe(&self, token: &str) -> String {
         if token.is_empty() {
             return String::new();
@@ -348,38 +518,83 @@ impl Tokenizer {
         result
     }
 
-    /// Converts a chunk of text into the intermediate Unicode alphabet used by GPT-2.
-    ///
-    /// This mapping ensures byte stability by projecting raw bytes into the 256..512
-    /// code-point range for bytes that do not map to printable ASCII characters.
+    /// Converts a chunk of text into the intermediate Unicode alphabet used by byte-level BPE.
     fn byte_encode(&self, text: &str) -> String {
-        text.as_bytes()
-            .iter()
-            .map(|b| self.byte_encoder.get(b).copied().unwrap_or(char::from(*b)))
+        text.bytes()
+            .map(|b| self.byte_encoder[usize::from(b)])
             .collect()
     }
 }
 
-/// Builds two synchronized lookup tables that map between raw bytes and the unicode alphabet
-/// expected by GPT-2 tokenization.
-fn bytes_to_unicode() -> (HashMap<u8, char>, HashMap<char, u8>) {
-    let mut bs: Vec<u8> = (33u8..=126).chain(161..=172).chain(174..=255).collect();
-    let mut cs: Vec<char> = bs.iter().map(|&b| b as char).collect();
-    let mut n: u32 = 0;
-    for b in 0u8..=255 {
-        if !bs.contains(&b) {
-            bs.push(b);
-            let ch = char::from_u32(256 + n).expect("unable to map byte to unicode");
-            cs.push(ch);
-            n += 1;
+/// Incremental detokenizer for streaming generation.
+///
+/// Byte-level tokens can end in the middle of a UTF-8 character. [`StreamDecoder::push`] returns
+/// only complete characters. It keeps the trailing partial sequence until later tokens complete it.
+#[derive(Debug, Default)]
+pub struct StreamDecoder {
+    pending: Vec<u8>,
+}
+
+impl StreamDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Appends `token` and returns the text that became complete.
+    pub fn push(&mut self, tokenizer: &Tokenizer, token: usize) -> String {
+        self.pending.extend_from_slice(tokenizer.token_bytes(token));
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(text) => {
+                    out.push_str(text);
+                    self.pending.clear();
+                    return out;
+                }
+                Err(err) => {
+                    let valid = err.valid_up_to();
+                    out.push_str(
+                        std::str::from_utf8(&self.pending[..valid]).expect("prefix is valid UTF-8"),
+                    );
+                    match err.error_len() {
+                        // Incomplete trailing sequence: wait for more bytes.
+                        None => {
+                            self.pending.drain(..valid);
+                            return out;
+                        }
+                        // Invalid sequence: emit a replacement character and continue.
+                        Some(bad) => {
+                            out.push(char::REPLACEMENT_CHARACTER);
+                            self.pending.drain(..valid + bad);
+                        }
+                    }
+                }
+            }
         }
     }
 
-    let mut encoder = HashMap::new();
-    let mut decoder = HashMap::new();
-    for (b, c) in bs.into_iter().zip(cs.into_iter()) {
-        encoder.insert(b, c);
-        decoder.insert(c, b);
+    /// Flushes the bytes that are still pending at the end of generation. Invalid bytes become
+    /// U+FFFD.
+    pub fn finish(&mut self) -> String {
+        let out = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        out
     }
-    (encoder, decoder)
+}
+
+/// Maps every byte to the printable Unicode alphabet of byte-level BPE. Printable Latin-1 bytes map
+/// to themselves. The other bytes map to consecutive code points from U+0100.
+fn bytes_to_unicode() -> [char; 256] {
+    let printable = |b: u8| matches!(b, 33..=126 | 161..=172 | 174..=255);
+    let mut table = ['\0'; 256];
+    let mut shifted = 0u32;
+    for b in 0..=255u8 {
+        table[usize::from(b)] = if printable(b) {
+            char::from(b)
+        } else {
+            shifted += 1;
+            char::from_u32(255 + shifted).expect("code points below U+0200 are valid")
+        };
+    }
+    table
 }

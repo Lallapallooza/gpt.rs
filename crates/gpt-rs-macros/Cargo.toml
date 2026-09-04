@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Proc macros for gpt-rs (PTIR patterns and capture helpers)."
+description = "Proc macros for gpt-rs (nn modules, functionals, and PTIR capture)."
 
 [lib]
 proc-macro = true

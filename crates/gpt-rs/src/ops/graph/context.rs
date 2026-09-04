@@ -5,11 +5,8 @@
 //!
 //! ## Usage Pattern
 //!
-//! The `capture_ptir!` macro can automatically resolve a graph arena from:
-//! 1. Explicit `graph = expr` parameter (highest priority)
-//! 2. Graph attached to input tensors
-//! 3. Thread-local default arena (via this module)
-//! 4. Create a new arena (lowest priority)
+//! [`capture!`](crate::capture) records into the default arena when none of its operands has a
+//! graph.
 //!
 //! ## Thread-Local Stack
 //!

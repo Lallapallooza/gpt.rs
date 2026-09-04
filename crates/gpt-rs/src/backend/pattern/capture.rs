@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
@@ -30,8 +29,11 @@ struct CaptureCallState {
     binds: Vec<BindRecord>,
 }
 
+/// Records the template of a capture site from its nodes, binds, and outputs (in order).
+pub type RecordPattern = fn(u32, &[CapturedNode], &[BindRecord], &[ValueId]);
+
 struct ActivePatternCapture {
-    record: fn(u32, &[CapturedNode], &[BindRecord], &dyn Any),
+    record: RecordPattern,
     is_site_captured: fn(u32) -> bool,
 }
 
@@ -41,14 +43,11 @@ thread_local! {
     static CAPTURE_CALL_STACK: RefCell<Vec<CaptureCallState>> = const { RefCell::new(Vec::new()) };
 }
 
-/// RAII guard that enables template capture for a `#[ptir_pattern]`-annotated function.
+/// RAII guard that enables template capture while a `#[functional]` runs.
 pub struct PatternCaptureGuard;
 
 impl PatternCaptureGuard {
-    pub fn push(
-        record: fn(u32, &[CapturedNode], &[BindRecord], &dyn Any),
-        is_site_captured: fn(u32) -> bool,
-    ) -> Self {
+    pub fn push(record: RecordPattern, is_site_captured: fn(u32) -> bool) -> Self {
         ACTIVE_PATTERN_STACK.with(|stack| {
             stack.borrow_mut().push(ActivePatternCapture {
                 record,
@@ -70,7 +69,7 @@ impl Drop for PatternCaptureGuard {
     }
 }
 
-/// RAII guard that sets a stable capture-site id for a `capture_ptir!` invocation.
+/// RAII guard that sets the capture-site id of a `capture!` in a `#[functional]`.
 pub struct PatternCaptureSiteGuard;
 
 impl PatternCaptureSiteGuard {
@@ -91,7 +90,7 @@ impl Drop for PatternCaptureSiteGuard {
     }
 }
 
-/// RAII guard that brackets a single `capture_ptir!` evaluation and collects emitted nodes.
+/// RAII guard that brackets a single `capture!` evaluation and collects emitted nodes.
 pub struct CaptureCallGuard {
     active: bool,
     finished: bool,
@@ -124,7 +123,7 @@ impl CaptureCallGuard {
         }
     }
 
-    pub fn finish(mut self, output: &dyn Any) {
+    pub fn finish(mut self, outputs: &[ValueId]) {
         if !self.active || self.finished {
             return;
         }
@@ -139,7 +138,7 @@ impl CaptureCallGuard {
                 .expect("pattern capture call stack underflow: unmatched finish")
         });
 
-        (record)(site, &state.nodes, &state.binds, output);
+        (record)(site, &state.nodes, &state.binds, outputs);
         self.finished = true;
     }
 }
@@ -198,18 +197,21 @@ pub struct BuiltTemplate {
     pub value_to_node: HashMap<ValueId, TemplateNodeId>,
 }
 
+/// Builds the template of the nodes that the capture `outputs` depend on. The first output is the
+/// output of the template. Matching starts at `anchor`.
 pub fn build_template(
     nodes: &[CapturedNode],
-    output: ValueId,
+    outputs: &[ValueId],
     anchor: ValueId,
 ) -> Option<BuiltTemplate> {
+    let output = *outputs.first()?;
     let mut index_of_value: HashMap<ValueId, usize> = HashMap::new();
     for (idx, node) in nodes.iter().enumerate() {
         index_of_value.insert(node.value, idx);
     }
 
     let mut reachable: HashSet<ValueId> = HashSet::new();
-    let mut worklist = vec![output];
+    let mut worklist = outputs.to_vec();
     while let Some(value) = worklist.pop() {
         let Some(&node_index) = index_of_value.get(&value) else {
             continue;

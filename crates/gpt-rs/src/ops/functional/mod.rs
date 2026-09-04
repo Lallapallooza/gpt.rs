@@ -1,66 +1,41 @@
 //! Backend-agnostic functional operators built on top of device tensors.
 //!
-//! Modules provide reusable attention, normalization, embedding, and elementwise routines that
-//! capture lazy graphs rather than executing eagerly. Callers can reach for these helpers or the
-//! [`DeviceTensorOps`] extension trait to write concise forward
-//! passes while staying compliant with backend restrictions.
+//! Each functional is a [`#[functional]`](crate::functional). It validates its inputs with the
+//! [`validate`] macros. It then captures PTIR with [`capture!`](crate::capture) into the lazy graph
+//! of its operands and returns lazy device tensors. The tensors carry the backend, so functionals
+//! take no backend argument: `functional::gelu(&x)`. The [`DeviceTensorOps`] extension trait
+//! offers the elementwise functionals as methods.
 //!
-//! ## Backend Parameter Convention
-//!
-//! Functions annotated with `#[support_runtime_overload]` accept a `_backend: &B` parameter
-//! as their first argument. **This parameter is required by the macro system** and is used for:
-//!
-//! 1. **Generic type resolution** - The macro generates a context struct that needs the backend type `B`
-//! 2. **Registry lookup** - When a custom implementation is registered, the macro uses this to
-//!    determine which backend's registry to consult
-//!
-//! The backend is **not directly used** in the function body because:
-//! - It's already embedded in the `DeviceTensor<B>` arguments (accessible via `.backend()`)
-//! - Validation ensures all tensors share the same backend instance
-//!
-//! **Example:**
-//! ```rust,ignore
-//! // The macro transforms this:
-//! #[support_runtime_overload]
-//! pub fn matmul<B: PortableBackend>(
-//!     _backend: &B,  // ← Required by macro, used for type resolution
-//!     a: &DeviceTensor<B>,
-//!     b: &DeviceTensor<B>,
-//! ) -> Result<DeviceTensor<B>>
-//!
-//! // Into wrapper code that checks registries and calls implementations
-//! ```
+//! To replace an op sequence with a faster kernel, a backend rewrites the pattern view that
+//! `#[functional]` generates for the functional. An example is `Conv2dPattern` for [`conv2d`].
 
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 pub mod activation;
 pub mod attention;
-pub(crate) mod common;
+#[doc(hidden)]
+pub mod capture;
 pub mod conv;
+pub mod elementwise;
 pub mod embedding;
 pub mod linalg;
 pub mod normalization;
 pub mod pooling;
-pub mod registry;
 pub mod rotary;
-pub mod runtime;
 pub mod shape;
 pub mod stochastic;
 pub mod tensor_ops;
-pub mod utils;
+pub mod validate;
 
 pub use activation::*;
 pub use attention::*;
-pub use common::{CaptureIntoDeviceTensor, DeviceTensorOps};
 pub use conv::*;
+pub use elementwise::*;
 pub use embedding::*;
 pub use linalg::*;
 pub use normalization::*;
 pub use pooling::*;
-pub use registry::*;
 pub use rotary::*;
-pub use runtime::*;
 pub use shape::*;
 pub use stochastic::*;
 pub use tensor_ops::*;
-pub use utils::{resolve_graph_from_tensors, tensor_spec_from_device};

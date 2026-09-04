@@ -14,7 +14,7 @@ fn cli_and_execution_conversion_paths_match() {
         Tensor::from_vec(Shape::new([2, 4]), vec![1.0f32; 8]).expect("input tensor"),
     )
     .expect("input upload");
-    let out = functional::softmax_last_dim(recorder.as_ref(), &input).expect("softmax");
+    let out = functional::softmax_last_dim(&input).expect("softmax");
     out.materialize().expect("materialize");
     let recorded = recorder.recorded_program_or_panic();
 

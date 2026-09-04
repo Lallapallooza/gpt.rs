@@ -1,5 +1,6 @@
 extern crate self as gpt_rs;
 
+pub use gpt_rs_macros::{capture, functional};
 pub use linkme;
 
 pub mod backend;

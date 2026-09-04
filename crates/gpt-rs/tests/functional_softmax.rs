@@ -4,7 +4,9 @@ use gpt_rs::backend::spec::{
     Dimension, ElementwiseBinaryOp, ElementwiseUnaryOp, Function, Operation, PortableBackend,
     ReduceKind,
 };
-use gpt_rs::nn::layers::AttentionConfig;
+use gpt_rs::module::Layer;
+use gpt_rs::nn::layers::{AttentionConfig, AttentionPositions, CausalSelfAttention};
+use gpt_rs::nn::LayerLoader;
 use gpt_rs::ops::functional;
 use gpt_rs::ops::functional::softmax_last_dim;
 use gpt_rs::tensor::{DeviceTensor, Shape as DeviceShape};
@@ -18,7 +20,7 @@ fn softmax_last_dim_uses_ptir_dsl() {
     let input =
         DeviceTensor::from_handle(Arc::clone(&backend), input_shape.clone(), DType::F32, ());
 
-    let result = softmax_last_dim(backend.as_ref(), &input).expect("softmax should succeed");
+    let result = softmax_last_dim(&input).expect("softmax should succeed");
     assert_eq!(result.shape(), &input_shape);
     assert_eq!(result.dtype(), DType::F32);
 
@@ -138,8 +140,7 @@ fn dropout_emits_rng_mask_sequence() {
     let backend = Arc::new(RecordingBackend::default());
     let input = make_tensor(&backend, &[2, 4]);
 
-    let dropped = functional::dropout(backend.as_ref(), &input, 0.25, true)
-        .expect("dropout capture should succeed");
+    let dropped = functional::dropout(&input, 0.25, true).expect("dropout capture should succeed");
     flush_tensor(&dropped);
 
     let function = recorded_entry_function(&backend);
@@ -172,7 +173,7 @@ fn matmul_emits_dot_general_instruction() {
     let lhs = make_tensor(&backend, &[2, 3]);
     let rhs = make_tensor(&backend, &[3, 4]);
 
-    let result = functional::matmul(backend.as_ref(), &lhs, &rhs).expect("matmul capture");
+    let result = functional::matmul(&lhs, &rhs).expect("matmul capture");
     flush_tensor(&result);
 
     let function = recorded_entry_function(&backend);
@@ -192,8 +193,7 @@ fn layer_norm_captures_reduction_chain() {
     let gamma = make_tensor(&backend, &[4]);
     let beta = make_tensor(&backend, &[4]);
 
-    let result = functional::layer_norm(backend.as_ref(), &x, &gamma, &beta, 1e-5)
-        .expect("layer norm capture");
+    let result = functional::layer_norm(&x, &gamma, &beta, 1e-5).expect("layer norm capture");
     // Capture the full program on the first materialization.
     flush_tensor(&result.output);
     let function = recorded_entry_function(&backend);
@@ -228,207 +228,98 @@ fn layer_norm_captures_reduction_chain() {
 }
 
 #[test]
-fn attention_records_context_and_cache_outputs() {
+fn attention_kv_cache_records_cache_update_dot_softmax_and_mask() {
     let backend = Arc::new(RecordingBackend::default());
-    let config = AttentionConfig::with_equal_heads(8, 2);
-    let qkv = make_tensor(&backend, &[2, config.total_projection_dim()]);
+    let (query_heads, kv_heads, head_dim, seq_len, capacity) = (4, 2, 8, 1, 8);
+    let q = make_tensor(&backend, &[query_heads, seq_len, head_dim]);
+    let k = make_tensor(&backend, &[kv_heads, seq_len, head_dim]);
+    let v = make_tensor(&backend, &[kv_heads, seq_len, head_dim]);
+    let cache = functional::DecodeKvCache::new(
+        make_tensor(&backend, &[kv_heads, capacity, head_dim]),
+        make_tensor(&backend, &[kv_heads, capacity, head_dim]),
+        0,
+    )
+    .expect("cache validated");
+    let update_starts = make_tensor_for_dtype(&backend, &[3], DType::I32);
 
-    let attention = functional::attention(backend.as_ref(), &config, &qkv, None)
-        .expect("attention capture succeeds");
+    let attention = functional::attention_kv_cache(&q, &k, &v, &cache, &update_starts)
+        .expect("kv-cache attention capture succeeds");
+
+    assert_eq!(
+        attention.output.shape().dims(),
+        &[seq_len, query_heads * head_dim],
+        "context rows hold every query head"
+    );
+    assert_eq!(
+        attention.cache.keys().shape().dims(),
+        &[kv_heads, capacity, head_dim],
+        "kv cache keeps its fixed capacity"
+    );
+    assert_eq!(attention.cache.len(), 1, "kv cache length increments");
+
     flush_tensor(&attention.output);
-    flush_tensor(attention.present.keys());
-    flush_tensor(attention.present.values());
 
     let function = recorded_entry_function(&backend);
+    let emits = |op: fn(&Operation) -> bool| function.body.iter().any(|inst| op(&inst.op));
     assert!(
-        function
-            .body
-            .iter()
-            .any(|inst| matches!(inst.op, Operation::DotGeneral(_))),
+        emits(|op| matches!(op, Operation::DynamicUpdateSlice(_))),
+        "kv-cache attention should write K/V via DynamicUpdateSlice"
+    );
+    assert!(
+        emits(|op| matches!(op, Operation::DotGeneral(_))),
         "attention should express dot products through DotGeneral ops"
     );
     assert!(
-        function
-            .body
-            .iter()
-            .any(|inst| matches!(inst.op, Operation::Reduce(_))),
+        emits(|op| matches!(op, Operation::Reduce(_))),
         "attention softmax path should rely on reductions"
     );
     assert!(
-        function
-            .body
-            .iter()
-            .any(|inst| matches!(inst.op, Operation::Select)),
+        emits(|op| matches!(op, Operation::Select)),
         "attention masking should leverage select operations"
     );
 }
 
 #[test]
-fn attention_cache_outputs_use_seq_len_only() {
+fn attention_layer_kv_cache_allows_wider_query_projection_than_embed_dim() {
     let backend = Arc::new(RecordingBackend::default());
-    let config = AttentionConfig::with_kv(8, 4, 2);
-    let existing_len = 3usize;
-    let seq_len = 2usize;
-
-    let qkv = make_tensor(&backend, &[seq_len, config.total_projection_dim()]);
-    let cache_keys = make_tensor_for_dtype(
-        &backend,
-        &[config.num_key_value_heads, existing_len, config.kv_head_dim],
-        DType::F32,
+    let config = AttentionConfig::with_projection_dims(12, 4, 2, 8).expect("valid config");
+    let (seq_len, capacity) = (3usize, 8usize);
+    let (embed, q_dim, kv_dim) = (
+        config.embed_dim,
+        config.query_dim(),
+        config.key_value_projection_dim(),
     );
-    let cache_values = make_tensor_for_dtype(
-        &backend,
-        &[config.num_key_value_heads, existing_len, config.kv_head_dim],
-        DType::F32,
-    );
-
-    let cache =
-        functional::AttentionCache::new(cache_keys, cache_values).expect("cache tensors validated");
-
-    let attention = functional::attention(backend.as_ref(), &config, &qkv, Some(&cache))
-        .expect("attention capture succeeds");
-
-    assert_eq!(
-        attention.output.shape().dims(),
-        &[seq_len, config.query_projection_dim()],
-        "output should cover only new tokens"
-    );
-    assert_eq!(
-        attention.present.keys().shape().dims(),
-        &[config.num_key_value_heads, seq_len, config.kv_head_dim],
-        "present cache should span the latest chunk"
-    );
-    assert_eq!(
-        attention.cache.keys().shape().dims(),
-        &[
-            config.num_key_value_heads,
-            existing_len + seq_len,
-            config.kv_head_dim
-        ],
-        "combined cache should append new tokens without padding"
-    );
-}
-
-#[test]
-fn attention_decode_cache_emits_dynamic_slice_ops() {
-    let backend = Arc::new(RecordingBackend::default());
-    let config = AttentionConfig::with_equal_heads(8, 2);
-    let seq_len = 1usize;
-    let capacity = 8usize;
-
-    let qkv = make_tensor(&backend, &[seq_len, config.total_projection_dim()]);
-    let cache_keys = make_tensor_for_dtype(
-        &backend,
-        &[config.num_key_value_heads, capacity, config.kv_head_dim],
-        DType::F32,
-    );
-    let cache_values = make_tensor_for_dtype(
-        &backend,
-        &[config.num_key_value_heads, capacity, config.kv_head_dim],
-        DType::F32,
-    );
-    let cache =
-        functional::DecodeKvCache::new(cache_keys, cache_values, 0).expect("cache validated");
-
-    let update_starts = make_tensor_for_dtype(&backend, &[3], DType::I32);
-    let query_start = make_tensor_for_dtype(&backend, &[1], DType::I32);
-
-    let attention = functional::attention_decode_cache(
-        backend.as_ref(),
-        &config,
-        &qkv,
-        &cache,
-        &update_starts,
-        &query_start,
+    let mut get = |name: &str| {
+        let dims = match name {
+            "attn.q_proj.weight" => [q_dim, embed],
+            "attn.k_proj.weight" | "attn.v_proj.weight" => [kv_dim, embed],
+            "attn.o_proj.weight" => [embed, q_dim],
+            _ => anyhow::bail!("unexpected parameter '{name}'"),
+        };
+        Ok(make_tensor(&backend, &dims))
+    };
+    let mut params = LayerLoader::new(Arc::clone(&backend), &mut get);
+    let layer = CausalSelfAttention::load(&mut params, "attn", config.clone())
+        .expect("attention layer init");
+    let kv_dims = [config.num_key_value_heads, capacity, config.head_dim];
+    let cache = functional::DecodeKvCache::new(
+        make_tensor(&backend, &kv_dims),
+        make_tensor(&backend, &kv_dims),
+        0,
     )
-    .expect("decode attention capture succeeds");
+    .expect("cache validated");
+    let x = make_tensor(&backend, &[seq_len, config.embed_dim]);
+    let positions = AttentionPositions {
+        update_starts: make_tensor_for_dtype(&backend, &[3], DType::I32),
+        rotary: None,
+    };
 
-    assert_eq!(
-        attention.output.shape().dims(),
-        &[seq_len, config.query_projection_dim()],
-        "decode attention output stays shape-stable"
-    );
-    assert_eq!(
-        attention.cache.keys().shape().dims(),
-        &[config.num_key_value_heads, capacity, config.kv_head_dim],
-        "decode cache keeps fixed capacity"
-    );
-    assert_eq!(attention.cache.len(), 1, "decode cache length increments");
-
-    flush_tensor(&attention.output);
-
-    let function = recorded_entry_function(&backend);
-    assert!(
-        function
-            .body
-            .iter()
-            .any(|inst| matches!(inst.op, Operation::DynamicUpdateSlice(_))),
-        "decode attention should write KV via DynamicUpdateSlice"
-    );
-    assert!(
-        function
-            .body
-            .iter()
-            .any(|inst| matches!(inst.op, Operation::DynamicSlice(_))),
-        "decode attention should derive the causal mask via DynamicSlice"
-    );
-}
-
-#[test]
-fn attention_allows_wider_query_projection_than_embed_dim() {
-    let backend = Arc::new(RecordingBackend::default());
-    let config = AttentionConfig::with_projection_dims(12, 4, 2, 8, 8);
-    let seq_len = 3usize;
-    let qkv = make_tensor(&backend, &[seq_len, config.total_projection_dim()]);
-
-    let attention = functional::attention(backend.as_ref(), &config, &qkv, None)
-        .expect("attention capture succeeds for asymmetric projection dims");
-    assert_eq!(
-        attention.output.shape().dims(),
-        &[seq_len, config.query_projection_dim()],
-        "attention output width must match query projection dim"
-    );
-    flush_tensor(&attention.output);
-}
-
-#[test]
-fn attention_decode_cache_allows_wider_query_projection_than_embed_dim() {
-    let backend = Arc::new(RecordingBackend::default());
-    let config = AttentionConfig::with_projection_dims(12, 4, 2, 8, 8);
-    let seq_len = 1usize;
-    let capacity = 8usize;
-    let qkv = make_tensor(&backend, &[seq_len, config.total_projection_dim()]);
-    let cache_keys = make_tensor_for_dtype(
-        &backend,
-        &[config.num_key_value_heads, capacity, config.kv_head_dim],
-        DType::F32,
-    );
-    let cache_values = make_tensor_for_dtype(
-        &backend,
-        &[config.num_key_value_heads, capacity, config.kv_head_dim],
-        DType::F32,
-    );
-    let cache =
-        functional::DecodeKvCache::new(cache_keys, cache_values, 0).expect("cache validated");
-    let update_starts = make_tensor_for_dtype(&backend, &[3], DType::I32);
-    let query_start = make_tensor_for_dtype(&backend, &[1], DType::I32);
-
-    let attention = functional::attention_decode_cache(
-        backend.as_ref(),
-        &config,
-        &qkv,
-        &cache,
-        &update_starts,
-        &query_start,
-    )
-    .expect("decode attention capture succeeds for asymmetric projection dims");
-    assert_eq!(
-        attention.output.shape().dims(),
-        &[seq_len, config.query_projection_dim()],
-        "decode attention output width must match query projection dim"
-    );
-    assert_eq!(attention.cache.len(), 1, "decode cache length increments");
-    flush_tensor(&attention.output);
+    let (output, cache) = layer
+        .call((&x, &cache, &positions))
+        .expect("kv-cache attention capture succeeds for asymmetric projection dims");
+    assert_eq!(output.shape().dims(), &[seq_len, config.embed_dim]);
+    assert_eq!(cache.len(), seq_len, "kv cache holds the new tokens");
+    flush_tensor(&output);
 }
 
 #[test]
@@ -437,11 +328,10 @@ fn embedding_rejects_rank2_indices() {
     let weight = make_tensor(&backend, &[4, 8]);
     let indices = make_tensor_for_dtype(&backend, &[2, 1], DType::I32);
 
-    let err = functional::embedding_lookup(backend.as_ref(), &weight, &indices).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("embedding indices must have rank 1"),
-        "unexpected error: {err:?}"
+    let err = functional::embedding_lookup(&weight, &indices).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "embedding_lookup: indices must have rank 1, got [2, 1]"
     );
 }
 

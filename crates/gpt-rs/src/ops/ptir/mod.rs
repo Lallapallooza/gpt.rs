@@ -10,7 +10,7 @@ pub use graph::{
 };
 pub use tensor::{tensor, TensorPlaceholder};
 
-use crate::backend::spec::PortableBackend;
+use crate::backend::spec::{DType, PortableBackend};
 
 /// Broadcasts a scalar literal to the provided shape within the PTIR DSL.
 pub(crate) fn scalar_broadcast<'ctx, 'gb, B: PortableBackend + 'static>(
@@ -19,6 +19,30 @@ pub(crate) fn scalar_broadcast<'ctx, 'gb, B: PortableBackend + 'static>(
     shape: &[usize],
 ) -> Tensor<'ctx, 'gb, B> {
     session.scalar(value).broadcast_to(shape.to_vec())
+}
+
+/// Builds an `[n, n]` lower-triangular selection: `inside` where `col <= row + diagonal`, and
+/// `outside` elsewhere. With `inside = 1` and `outside = 0`, this is
+/// `torch.tril(torch.ones(n, n), diagonal)`.
+pub(crate) fn tril_mask<'ctx, 'gb, B: PortableBackend + 'static>(
+    session: &PtirSession<'ctx, 'gb, B>,
+    n: usize,
+    diagonal: i64,
+    inside: f32,
+    outside: f32,
+) -> Tensor<'ctx, 'gb, B> {
+    // Row `i` and column `j` of the result read position `(i + r, j + c)` of a larger plane. So
+    // `row >= col` in that plane means `i + diagonal >= j`.
+    let (r, c) = (diagonal.max(0) as usize, (-diagonal).max(0) as usize);
+    let plane = [n + r, n + c];
+    let rows = session.iota(plane, 0, DType::Si32);
+    let keep = rows.greater_equal(&session.iota(plane, 1, DType::Si32));
+    Tensor::select(
+        &keep,
+        &scalar_broadcast(session, inside, &plane),
+        &scalar_broadcast(session, outside, &plane),
+    )
+    .slice(vec![r, c], vec![n, n])
 }
 
 /// Converts flexible operands into PTIR tensors.

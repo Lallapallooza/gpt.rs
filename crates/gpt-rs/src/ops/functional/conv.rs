@@ -4,26 +4,24 @@
 //! override or fuse these kernels (e.g., `extract_patches + dot_general` -> conv).
 
 use anyhow::{bail, ensure, Result};
-use gpt_rs_macros::{capture_ptir, ptir_pattern, support_runtime_overload};
 
 use crate::backend::spec::{ExtractPatchesSpec, Literal, PortableBackend};
-use crate::ops::functional::common::CaptureIntoDeviceTensor;
+use crate::ops::ptir::{axes_iter, DotAttrs, DotDims};
 use crate::tensor::DeviceTensor;
+use crate::{capture, functional};
 
 /// Semantic 2D convolution.
 ///
 /// - Activations are expected in NHWC ([N, H, W, C]) layout (the layout supported by
 ///   `extract_patches`).
 /// - Weights are expected in canonical OIHW ([C_out, C_in/groups, KH, KW]) layout.
-#[support_runtime_overload]
-#[ptir_pattern(target = "gpt_rs.conv2d_nhwc_f32")]
-pub fn conv2d<B: PortableBackend + 'static>(
-    _backend: &B,
-    x: &DeviceTensor<B>,
-    weight: &DeviceTensor<B>,
-    bias: Option<&DeviceTensor<B>>,
+#[functional]
+pub fn conv2d(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
     params: Conv2dParams2d,
-) -> Result<DeviceTensor<B>> {
+) -> Result<Tensor> {
     let _scope = crate::profiling::functional_scope(
         "gpt_rs::ops::functional::conv::conv2d",
         "extract_patches_dot_general",
@@ -52,140 +50,82 @@ pub fn conv2d<B: PortableBackend + 'static>(
         pad_value: Literal::Float(0.0),
     };
 
+    // Patches are [N, OH, OW, KH, KW, C_in]. The weight [C_out, C_in, KH, KW] contracts with them.
+    let dot_dims = DotDims::new(axes_iter([]), crate::axes!(3, 4, 5), crate::axes!(2, 3, 1));
     if groups == 1 {
-        let result = match bias {
-            Some(bias) => capture_ptir!({ x, weight, bias }, |_session| {
+        return match bias {
+            Some(bias) => capture!(|x, weight, bias| {
                 let patches = x.extract_patches(
-                    spec.window.clone(),
-                    spec.strides.clone(),
-                    spec.dilation.clone(),
-                    spec.padding.clone(),
-                    spec.pad_value.clone(),
+                    spec.window,
+                    spec.strides,
+                    spec.dilation,
+                    spec.padding,
+                    spec.pad_value,
                 );
-                let patches =
-                    patches.reshape(vec![n, out_h, out_w, kernel_h, kernel_w, c_in]);
-                let out = patches.dot_general(
-                    &weight,
-                    &crate::ops::ptir::DotDims::new(
-                        crate::ops::ptir::axes_iter([]),
-                        crate::axes!(3, 4, 5),
-                        crate::axes!(2, 3, 1),
-                    ),
-                    &crate::ops::ptir::DotAttrs::default(),
-                );
+                let patches = patches.reshape(vec![n, out_h, out_w, kernel_h, kernel_w, c_in]);
+                let out = patches.dot_general(&weight, &dot_dims, &DotAttrs::default());
                 let out = out + bias.broadcast_to(vec![n, out_h, out_w, c_out]);
-                Ok(out.id())
-            })?,
-            None => capture_ptir!({ x, weight }, |_session| {
+                out
+            }),
+            None => capture!(|x, weight| {
                 let patches = x.extract_patches(
-                    spec.window.clone(),
-                    spec.strides.clone(),
-                    spec.dilation.clone(),
-                    spec.padding.clone(),
-                    spec.pad_value.clone(),
+                    spec.window,
+                    spec.strides,
+                    spec.dilation,
+                    spec.padding,
+                    spec.pad_value,
                 );
-                let patches =
-                    patches.reshape(vec![n, out_h, out_w, kernel_h, kernel_w, c_in]);
-                let out = patches.dot_general(
-                    &weight,
-                    &crate::ops::ptir::DotDims::new(
-                        crate::ops::ptir::axes_iter([]),
-                        crate::axes!(3, 4, 5),
-                        crate::axes!(2, 3, 1),
-                    ),
-                    &crate::ops::ptir::DotAttrs::default(),
-                );
-                Ok(out.id())
-            })?,
-        }
-        .into_device_tensor()?;
-
-        return Ok(result);
+                let patches = patches.reshape(vec![n, out_h, out_w, kernel_h, kernel_w, c_in]);
+                let out = patches.dot_general(&weight, &dot_dims, &DotAttrs::default());
+                out
+            }),
+        };
     }
 
-    let result = match bias {
-        Some(bias) => capture_ptir!({ x, weight, bias }, |_session| {
+    // Grouped convolution: the patches [N, OH, OW, KH, KW, G, C_in/G] contract with the weight
+    // viewed as [G, C_out/G, C_in/G, KH, KW], batched over the groups.
+    let dot_dims = DotDims::new(
+        crate::axes!(5),
+        crate::axes!(3, 4, 6),
+        crate::axes!(3, 4, 2),
+    )
+    .with_rhs_batch(crate::axes!(0));
+    let patches_dims = vec![n, out_h, out_w, kernel_h, kernel_w, groups, c_in_per_group];
+    let weight_dims = vec![groups, c_out_per_group, c_in_per_group, kernel_h, kernel_w];
+    match bias {
+        Some(bias) => capture!(|x, weight, bias| {
             let patches = x.extract_patches(
-                spec.window.clone(),
-                spec.strides.clone(),
-                spec.dilation.clone(),
-                spec.padding.clone(),
-                spec.pad_value.clone(),
+                spec.window,
+                spec.strides,
+                spec.dilation,
+                spec.padding,
+                spec.pad_value,
             );
-            let patches = patches.reshape(vec![
-                n,
-                out_h,
-                out_w,
-                kernel_h,
-                kernel_w,
-                groups,
-                c_in_per_group,
-            ]);
-            let weight = weight.reshape(vec![
-                groups,
-                c_out_per_group,
-                c_in_per_group,
-                kernel_h,
-                kernel_w,
-            ]);
-            let out = patches.dot_general(
-                &weight,
-                &crate::ops::ptir::DotDims::new(
-                    crate::axes!(5),
-                    crate::axes!(3, 4, 6),
-                    crate::axes!(3, 4, 2),
-                )
-                .with_rhs_batch(crate::axes!(0)),
-                &crate::ops::ptir::DotAttrs::default(),
-            );
+            let patches = patches.reshape(patches_dims);
+            let weight = weight.reshape(weight_dims);
+            let out = patches.dot_general(&weight, &dot_dims, &DotAttrs::default());
             // dot_general yields shape [G, N, OH, OW, C_out/G] because batch dims come first.
             let out = out.transpose(vec![1, 2, 3, 0, 4]);
             let out = out.reshape(vec![n, out_h, out_w, c_out]);
             let out = out + bias.broadcast_to(vec![n, out_h, out_w, c_out]);
-            Ok(out.id())
-        })?,
-        None => capture_ptir!({ x, weight }, |_session| {
+            out
+        }),
+        None => capture!(|x, weight| {
             let patches = x.extract_patches(
-                spec.window.clone(),
-                spec.strides.clone(),
-                spec.dilation.clone(),
-                spec.padding.clone(),
-                spec.pad_value.clone(),
+                spec.window,
+                spec.strides,
+                spec.dilation,
+                spec.padding,
+                spec.pad_value,
             );
-            let patches = patches.reshape(vec![
-                n,
-                out_h,
-                out_w,
-                kernel_h,
-                kernel_w,
-                groups,
-                c_in_per_group,
-            ]);
-            let weight = weight.reshape(vec![
-                groups,
-                c_out_per_group,
-                c_in_per_group,
-                kernel_h,
-                kernel_w,
-            ]);
-            let out = patches.dot_general(
-                &weight,
-                &crate::ops::ptir::DotDims::new(
-                    crate::axes!(5),
-                    crate::axes!(3, 4, 6),
-                    crate::axes!(3, 4, 2),
-                )
-                .with_rhs_batch(crate::axes!(0)),
-                &crate::ops::ptir::DotAttrs::default(),
-            );
+            let patches = patches.reshape(patches_dims);
+            let weight = weight.reshape(weight_dims);
+            let out = patches.dot_general(&weight, &dot_dims, &DotAttrs::default());
             let out = out.transpose(vec![1, 2, 3, 0, 4]);
             let out = out.reshape(vec![n, out_h, out_w, c_out]);
-            Ok(out.id())
-        })?,
+            out
+        }),
     }
-    .into_device_tensor()?;
-
-    Ok(result)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -211,15 +151,6 @@ impl Padding2d {
     }
 }
 
-impl crate::ops::functional::runtime::CacheKeyArg for Padding2d {
-    fn add_to_cache_key(&self, builder: &mut crate::ops::functional::runtime::CacheKeyBuilder) {
-        builder.combine_hash(&self.top);
-        builder.combine_hash(&self.bottom);
-        builder.combine_hash(&self.left);
-        builder.combine_hash(&self.right);
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct Conv2dParams2d {
     pub kernel: [usize; 2],
@@ -229,16 +160,22 @@ pub struct Conv2dParams2d {
     pub groups: usize,
 }
 
-impl crate::ops::functional::runtime::CacheKeyArg for Conv2dParams2d {
-    fn add_to_cache_key(&self, builder: &mut crate::ops::functional::runtime::CacheKeyBuilder) {
-        builder.combine_hash(&self.kernel);
-        builder.combine_hash(&self.stride);
-        builder.combine_hash(&self.dilation);
-        builder.combine_hash(&self.padding.top);
-        builder.combine_hash(&self.padding.bottom);
-        builder.combine_hash(&self.padding.left);
-        builder.combine_hash(&self.padding.right);
-        builder.combine_hash(&self.groups);
+impl Conv2dParams2d {
+    /// Parameters for a square `kernel` with `stride` and `padding` on both axes, no dilation, and
+    /// one group.
+    pub fn square(kernel: usize, stride: usize, padding: usize) -> Self {
+        Self {
+            kernel: [kernel, kernel],
+            stride: [stride, stride],
+            dilation: [1, 1],
+            padding: Padding2d {
+                top: padding,
+                bottom: padding,
+                left: padding,
+                right: padding,
+            },
+            groups: 1,
+        }
     }
 }
 

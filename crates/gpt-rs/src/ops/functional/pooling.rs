@@ -1,30 +1,26 @@
 //! Pooling kernels implemented via portable graph capture.
 
 use anyhow::{ensure, Result};
-use gpt_rs_macros::{capture_ptir, ptir_pattern, support_runtime_overload};
 
-use crate::backend::spec::{PortableBackend, ReduceKind, ReduceWindowSpec};
-use crate::ops::functional::common::CaptureIntoDeviceTensor;
+use crate::backend::spec::{ReduceKind, ReduceWindowSpec};
 use crate::ops::functional::Padding2d;
-use crate::tensor::DeviceTensor;
+use crate::{capture, functional};
 
-/// Layout-agnostic max-pooling entrypoint.
-#[support_runtime_overload]
-#[ptir_pattern(target = "gpt_rs.max_pool2d")]
-pub fn max_pool2d<B: PortableBackend + 'static>(
-    _backend: &B,
-    x: &DeviceTensor<B>,
+/// 2D max pooling over NHWC activations (`[N, H, W, C]`).
+#[functional]
+pub fn max_pool2d(
+    x: &Tensor,
     window: [usize; 2],
     stride: [usize; 2],
     padding: Padding2d,
-) -> Result<DeviceTensor<B>> {
+) -> Result<Tensor> {
     let _scope = crate::profiling::functional_scope(
         "gpt_rs::ops::functional::pooling::max_pool2d",
         "reduce_window(max)",
     );
     ensure!(
         x.shape().rank() == 4,
-        "max_pool2d expects rank-4 NHWC input, got {:?}",
+        "{FUNCTIONAL}: x must be a rank-4 NHWC tensor, got {:?}",
         x.shape().dims()
     );
     let spec = ReduceWindowSpec {
@@ -41,50 +37,22 @@ pub fn max_pool2d<B: PortableBackend + 'static>(
         reduce: ReduceKind::Max,
         accum_dtype: None,
     };
-
-    capture_ptir!({ x }, |_session| {
-        let out = x.reduce_window(spec);
-        Ok(out.id())
-    })?
-    .into_device_tensor()
+    capture!(|x| x.reduce_window(spec))
 }
 
-#[support_runtime_overload]
-#[ptir_pattern(target = "gpt_rs.max_pool2d_nhwc")]
-pub fn max_pool2d_nhwc<B: PortableBackend + 'static>(
-    _backend: &B,
-    x: &DeviceTensor<B>,
-    window: [usize; 2],
-    stride: [usize; 2],
-    padding: Padding2d,
-) -> Result<DeviceTensor<B>> {
-    let _scope = crate::profiling::functional_scope(
-        "gpt_rs::ops::functional::pooling::max_pool2d_nhwc",
-        "reduce_window(max)",
-    );
+/// Global average pooling of NHWC activations (`[N, H, W, C]`) to `[N, C]`.
+#[functional]
+pub fn global_avg_pool2d(x: &Tensor) -> Result<Tensor> {
     ensure!(
         x.shape().rank() == 4,
-        "max_pool2d_nhwc expects rank-4 NHWC input, got {:?}",
+        "{FUNCTIONAL}: x must be a rank-4 NHWC tensor, got {:?}",
         x.shape().dims()
     );
-    let spec = ReduceWindowSpec {
-        window_dims: vec![1, window[0], window[1], 1],
-        strides: vec![1, stride[0], stride[1], 1],
-        padding: vec![
-            (0, 0),
-            (padding.top, padding.bottom),
-            (padding.left, padding.right),
-            (0, 0),
-        ],
-        base_dilation: vec![1, 1, 1, 1],
-        window_dilation: vec![1, 1, 1, 1],
-        reduce: ReduceKind::Max,
-        accum_dtype: None,
-    };
-
-    capture_ptir!({ x }, |_session| {
-        let out = x.reduce_window(spec);
-        Ok(out.id())
-    })?
-    .into_device_tensor()
+    let [n, h, w, c] = [0, 1, 2, 3].map(|axis| x.shape().dims()[axis]);
+    let denom = (h * w) as f32;
+    capture!(|x| {
+        let sum_h = x.reduce_sum(vec![1], true);
+        let sum_hw = sum_h.reduce_sum(vec![2], true);
+        sum_hw.div_scalar(denom).reshape(vec![n, c])
+    })
 }

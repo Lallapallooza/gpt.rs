@@ -4,53 +4,64 @@
 //! higher-level conveniences like bias addition.
 
 use anyhow::Result;
-use gpt_rs_macros::{capture_ptir, ptir_pattern, support_runtime_overload};
 
-use crate::backend::spec::PortableBackend;
-use crate::ops::functional::common::{
-    ensure_last_dim, ensure_rank, ensure_rank_at_least, ensure_same_backend, ensure_same_dtype,
-    CaptureIntoDeviceTensor,
+use crate::tensor::DType;
+use crate::{
+    capture, ensure_dtype, ensure_last_dim, ensure_rank, ensure_rank_at_least, ensure_same_backend,
+    ensure_same_dtype, functional,
 };
-use crate::tensor::DeviceTensor;
 
-struct AddBiasPlan {
-    output_shape: Vec<usize>,
-}
-
-/// Validates bias addition operands and captures broadcast metadata.
-///
-/// Ensures dtype/back-end match, enforces `[*, last_dim]` semantics, and records the axis used for
-/// broadcasting. Tested via the backend Torch parity suites (add_bias coverage).
-fn validate_add_bias<B: PortableBackend + 'static>(
-    x: &DeviceTensor<B>,
-    bias: &DeviceTensor<B>,
-) -> Result<AddBiasPlan> {
-    ensure_same_dtype("add_bias input", x, "bias", bias)?;
-    ensure_rank_at_least("add_bias input", x, 1)?;
-    ensure_rank("add_bias bias", bias, 1)?;
-    let bias_axis = x.shape().rank() - 1;
-    ensure_last_dim("add_bias bias", bias, x.shape().dims()[bias_axis])?;
-    ensure_same_backend("add_bias", x, bias)?;
-    Ok(AddBiasPlan {
-        output_shape: x.shape().dims().to_vec(),
+/// Adds a bias vector to the last dimension of `x`, broadcasting it over the other axes.
+#[functional]
+pub fn add_bias(x: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    ensure_same_dtype!(x, bias);
+    ensure_rank_at_least!(x, 1);
+    ensure_rank!(bias, 1);
+    let shape = x.shape().dims().to_vec();
+    ensure_last_dim!(bias, shape[shape.len() - 1]);
+    ensure_same_backend!(x, bias);
+    capture!(|x, bias| {
+        let bias_broadcast = bias.broadcast_to(shape);
+        x + bias_broadcast
     })
 }
 
-/// Adds a bias vector to the last dimension of `x`, broadcasting as needed.
-/// Steps: import operands, broadcast the bias across non-last axes, emit an elementwise add, and
-/// wrap the resulting value identifier into a lazy tensor.
-#[support_runtime_overload]
-#[ptir_pattern(target = "gpt_rs.add_bias")]
-pub fn add_bias<B: PortableBackend + 'static>(
-    _backend: &B,
-    x: &DeviceTensor<B>,
-    bias: &DeviceTensor<B>,
-) -> Result<DeviceTensor<B>> {
-    let plan = validate_add_bias(x, bias)?;
-    capture_ptir!({ x, bias }, |_session| {
-        let bias_broadcast = bias.broadcast_to(plan.output_shape.clone());
-        let out = x + bias_broadcast;
-        Ok(out.id())
-    })?
-    .into_device_tensor()
+/// Converts `x` to `dtype` with a PTIR `cast`. Float-to-float casts round to nearest even. Returns
+/// `x` unchanged when it already has the requested dtype.
+#[functional]
+pub fn cast(x: &Tensor, dtype: DType) -> Result<Tensor> {
+    if x.dtype() == dtype {
+        return Ok(x.clone());
+    }
+    let target = crate::tensor::spec_utils::backend_dtype(dtype);
+    capture!(|x| x.cast(target))
+}
+
+/// Multiplies `x` by a vector broadcast along its last dimension (`x * scale[None, ..., :]`).
+#[functional]
+pub fn mul_last_dim(x: &Tensor, scale: &Tensor) -> Result<Tensor> {
+    ensure_same_dtype!(x, scale);
+    ensure_rank_at_least!(x, 1);
+    ensure_rank!(scale, 1);
+    let shape = x.shape().dims().to_vec();
+    ensure_last_dim!(scale, shape[shape.len() - 1]);
+    ensure_same_backend!(x, scale);
+    capture!(|x, scale| {
+        let scale_broadcast = scale.broadcast_to(shape);
+        x * scale_broadcast
+    })
+}
+
+/// Elementwise `x + scalar` for f32 `x`.
+#[functional]
+pub fn add_scalar(x: &Tensor, scalar: f32) -> Result<Tensor> {
+    ensure_dtype!(x, F32);
+    capture!(|x| x.add_scalar(scalar))
+}
+
+/// Elementwise `exp(x)` for f32 `x`.
+#[functional]
+pub fn exp(x: &Tensor) -> Result<Tensor> {
+    ensure_dtype!(x, F32);
+    capture!(|x| x.exp())
 }

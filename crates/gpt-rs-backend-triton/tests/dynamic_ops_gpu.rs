@@ -1,20 +1,16 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use gpt_rs::ops::functional::CaptureIntoDeviceTensor;
+use gpt_rs::capture;
 use gpt_rs::tensor::{DeviceTensor, Shape, Tensor};
 use gpt_rs_backend_triton::TritonBackend;
-use gpt_rs_macros::capture_ptir;
 
 fn capture_dynamic_slice(
     input: &DeviceTensor<TritonBackend>,
     starts: &DeviceTensor<TritonBackend>,
     sizes: Vec<usize>,
 ) -> Result<DeviceTensor<TritonBackend>> {
-    capture_ptir!({ input, starts }, |_session| {
-        Ok(input.dynamic_slice(&starts, sizes.clone()).id())
-    })?
-    .into_device_tensor()
+    capture!(|input, starts| input.dynamic_slice(&starts, sizes))
 }
 
 fn capture_dynamic_update_slice(
@@ -23,12 +19,7 @@ fn capture_dynamic_update_slice(
     starts: &DeviceTensor<TritonBackend>,
     sizes: Vec<usize>,
 ) -> Result<DeviceTensor<TritonBackend>> {
-    capture_ptir!({ base, update, starts }, |_session| {
-        Ok(base
-            .dynamic_update_slice(&update, &starts, sizes.clone())
-            .id())
-    })?
-    .into_device_tensor()
+    capture!(|base, update, starts| base.dynamic_update_slice(&update, &starts, sizes))
 }
 
 #[test]

@@ -3,34 +3,27 @@
 //! At the moment the module focuses on matrix multiplication with support for batched inputs and
 //! appropriate validation around shapes, dtypes, and backend ownership.
 
-use anyhow::{bail, Result};
-use gpt_rs_macros::{capture_ptir, ptir_pattern, support_runtime_overload};
+use anyhow::{bail, ensure, Result};
 
-use crate::backend::spec::{PortableBackend, ValueId};
-use crate::ops::functional::common::{
-    ensure_same_backend, ensure_same_dtype, CaptureIntoDeviceTensor,
-};
+use crate::backend::spec::{DType, PortableBackend};
 use crate::ops::ptir::{self, DotAttrs, DotDims};
+use crate::tensor::spec_utils::backend_dtype;
 use crate::tensor::DeviceTensor;
+use crate::{
+    capture, ensure_dtype, ensure_rank, ensure_same_backend, ensure_same_dtype, functional,
+};
 
 struct MatmulPlan {
     dot_dims: DotDims,
     output_shape: Vec<usize>,
 }
 
-/// Validates shapes/dtypes for 2D and batched 3D matmul and derives the PTIR dot-general spec.
-///
-/// Guards dtype/back-end consistency, checks contraction axes, and bails on unsupported ranks.
-/// Tests: `functional_softmax.rs::matmul_emits_dot_general_instruction` plus Torch parity
-/// (workspace + backend suites).
-fn validate_matmul<B: PortableBackend + 'static>(
+/// Checks the ranks and contraction dimensions of a 2D or batched 3D matmul and derives the PTIR
+/// dot-general spec.
+fn matmul_plan<B: PortableBackend + 'static>(
     a: &DeviceTensor<B>,
     b: &DeviceTensor<B>,
 ) -> Result<MatmulPlan> {
-    ensure_same_dtype("matmul lhs", a, "rhs", b)?;
-
-    ensure_same_backend("matmul", a, b)?;
-
     let a_shape = a.shape();
     let b_shape = b.shape();
 
@@ -98,30 +91,51 @@ fn validate_matmul<B: PortableBackend + 'static>(
 }
 
 /// Performs matrix multiplication (or batched matmul) between `a` and `b`.
-/// Shape and dtype checks mirror the expectations of GPT projection layers while remaining
-/// portable across backends.
 ///
-/// Execution order:
-/// - verify that operand dtypes, backends, and contraction dimensions align with the requested variant;
-/// - derive the backend `DotGeneral` spec, including batch and contract axes;
-/// - import operands into the active graph arena (or spawn a new one) and emit the dot product node;
-/// - wrap the resulting value identifier in a [`DeviceTensor`] carrying the inferred shape and dtype.
-#[support_runtime_overload]
-#[ptir_pattern(target = "gpt_rs.matmul")]
-pub fn matmul<B: PortableBackend + 'static>(
-    _backend: &B,
-    a: &DeviceTensor<B>,
-    b: &DeviceTensor<B>,
-) -> Result<DeviceTensor<B>> {
-    let plan = validate_matmul(a, b)?;
-    let tensor = capture_ptir!({ a, b }, |_session| -> anyhow::Result<ValueId> {
-        let result = a.dot_general(&b, &plan.dot_dims, &DotAttrs::default());
-        Ok::<ValueId, anyhow::Error>(result.id())
-    })?
-    .into_device_tensor()?;
-
+/// Rank-2 operands multiply as `[m, k] x [k, n]`. Rank-3 operands multiply per batch, as
+/// `[b, m, k] x [b, k, n]`.
+#[functional]
+pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    ensure_same_dtype!(a, b);
+    ensure_same_backend!(a, b);
+    let plan = matmul_plan(a, b)?;
+    let tensor = capture!(|a, b| a.dot_general(&b, &plan.dot_dims, &DotAttrs::default()))?;
     debug_assert_eq!(tensor.shape().dims(), plan.output_shape.as_slice());
     debug_assert_eq!(tensor.dtype(), a.dtype());
-
     Ok(tensor)
+}
+
+/// PyTorch-style linear projection `y = x @ weight^T` with an f32 result. `weight` is stored as
+/// `[out_features, in_features]`.
+///
+/// The functional casts `weight` to the dtype of `x`, so a bf16 `x` rounds f32 and f16 weights to
+/// bf16. The products accumulate in f32. Backends can fuse the `cast` into the
+/// `dot_general` to read reduced-precision weights directly.
+#[functional]
+pub fn linear(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    ensure_same_backend!(x, weight);
+    ensure_rank!(x, 2);
+    ensure_rank!(weight, 2);
+    ensure_dtype!(x, F32 | BF16);
+    ensure_dtype!(weight, F32 | BF16 | F16);
+    let (in_features, weight_in) = (x.shape().dims()[1], weight.shape().dims()[1]);
+    ensure!(
+        in_features == weight_in,
+        "{FUNCTIONAL}: weight in_features {weight_in} must match x in_features {in_features}"
+    );
+    let cast_to = (weight.dtype() != x.dtype()).then(|| backend_dtype(x.dtype()));
+    capture!(|x, weight| {
+        let weight = match cast_to {
+            Some(dtype) => weight.cast(dtype),
+            None => weight,
+        };
+        x.dot_general(
+            &weight,
+            &DotDims::new(ptir::axes_iter([]), crate::axes!(1), crate::axes!(1)),
+            &DotAttrs {
+                accum_dtype: Some(DType::F32),
+                out_dtype: Some(DType::F32),
+            },
+        )
+    })
 }

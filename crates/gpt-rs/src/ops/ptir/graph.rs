@@ -11,7 +11,7 @@
 //! ```text
 //! Functional Ops (ops/functional/*)
 //!         |
-//!         | capture_ptir! macro
+//!         | capture! macro
 //!         v
 //! PTIR DSL (this module)
 //!         |
@@ -33,18 +33,14 @@
 //!
 //! ## Usage Pattern
 //!
-//! Functional operators use the `capture_ptir!` macro to create PTIR sessions:
+//! Functionals capture PTIR with the `capture!` macro. The macro imports device tensors into a
+//! session under their own names:
 //!
 //! ```rust,ignore
-//! capture_ptir! {
-//!     { x, y },  // Import device tensors as PTIR tensors
-//!     |session| {
-//!         // Build computation graph using PTIR DSL
-//!         let sum = x.try_add(&y)?;
-//!         let result = sum.sqrt();
-//!         Ok(result.id())  // Return the ValueId
-//!     }
-//! }
+//! capture!(|x, y| {
+//!     let sum = x.try_add(&y)?;
+//!     sum.sqrt()
+//! })
 //! ```
 //!
 //! The DSL provides methods like:
@@ -73,11 +69,11 @@ use half::{bf16, f16};
 
 use crate::backend::ptir_utils::tensor_spec_static as tensor_spec_from;
 use crate::backend::spec::{
-    BroadcastToSpec, CompareSpec, ComparisonOp, ConcatSpec, CustomCallAttr, CustomCallSpec, DType,
-    Dimension, DotGeneralSpec, DynamicSliceSpec, DynamicUpdateSliceSpec, ElementwiseBinaryOp,
-    ElementwiseUnaryOp, ExtractPatchesSpec, GatherSpec, IotaSpec, Literal, Operand, Operation,
-    PortableBackend, ReduceKind, ReduceSpec, ReduceWindowSpec, ReshapeDim, ReshapeSpec,
-    RngUniformSpec, SliceSpec, TensorLiteral, TensorSpec, TransposeSpec, ValueId,
+    BroadcastToSpec, CastSpec, CompareSpec, ComparisonOp, ConcatSpec, CustomCallAttr,
+    CustomCallSpec, DType, Dimension, DotGeneralSpec, DynamicSliceSpec, DynamicUpdateSliceSpec,
+    ElementwiseBinaryOp, ElementwiseUnaryOp, ExtractPatchesSpec, GatherSpec, IotaSpec, Literal,
+    Operand, Operation, PortableBackend, ReduceKind, ReduceSpec, ReduceWindowSpec, ReshapeDim,
+    ReshapeSpec, RngUniformSpec, SliceSpec, TensorLiteral, TensorSpec, TransposeSpec, ValueId,
 };
 use crate::backend::text_ir::{PtirSnippet, SnippetBindings, SnippetResult};
 use crate::ops::graph::GraphBuilder;
@@ -97,8 +93,8 @@ pub struct PtirGraph<'ctx, 'gb, B: PortableBackend + 'static> {
 
 /// Entry point for PTIR graph construction sessions.
 ///
-/// Created by the `capture_ptir!` macro, this session provides methods for importing
-/// device tensors, creating constants, and accessing the PTIR graph for snippet emission.
+/// The `capture!` macro creates this session. The session provides methods to import device
+/// tensors, create constants, and access the PTIR graph for snippet emission.
 /// Sessions use interior mutability (`Rc<RefCell<...>>`) to allow multiple tensor handles
 /// to reference the same graph within capture closures.
 #[derive(Clone)]
@@ -192,6 +188,12 @@ impl<'ctx, 'gb, B: PortableBackend + 'static> PtirSession<'ctx, 'gb, B> {
 
     pub fn graph(&self) -> Rc<RefCell<PtirGraph<'ctx, 'gb, B>>> {
         Rc::clone(&self.graph)
+    }
+
+    /// Marks `value` as a program output even when nothing reads it, so it can be materialised
+    /// later.
+    pub fn export(&self, value: Tensor<'ctx, 'gb, B>) {
+        self.graph.borrow_mut().ctx.export(value.value);
     }
 
     pub fn scalar(&self, value: f32) -> Tensor<'ctx, 'gb, B> {
@@ -1192,6 +1194,18 @@ impl<'ctx, 'gb, B: PortableBackend + 'static> PtirGraph<'ctx, 'gb, B> {
         Ok(self.register_value(name.map(|s| s.to_string()), output, result_spec))
     }
 
+    fn cast(&mut self, value: ValueId, dtype: DType, name: Option<&str>) -> Result<PtirValue> {
+        let value_meta = self.fetch_value(value)?;
+        let dims = value_meta.dims()?.to_vec();
+        let result_spec = tensor_spec_from(dtype, &dims);
+        let output = self.ctx.emit(
+            Operation::Cast(CastSpec { dtype }),
+            vec![Operand::Value(value)],
+            result_spec.clone(),
+        );
+        Ok(self.register_value(name.map(|s| s.to_string()), output, result_spec))
+    }
+
     fn take(&mut self, params: ValueId, indices: ValueId, name: Option<&str>) -> Result<PtirValue> {
         let params_meta = self.fetch_value(params)?;
         let indices_meta = self.fetch_value(indices)?;
@@ -1756,6 +1770,15 @@ impl<'ctx, 'gb, B: PortableBackend + 'static> Tensor<'ctx, 'gb, B> {
 
     pub fn select(predicate: &Self, when_true: &Self, when_false: &Self) -> Self {
         Self::unwrap(Self::try_select(predicate, when_true, when_false), "select")
+    }
+
+    pub fn try_cast(&self, dtype: DType) -> Result<Self> {
+        let result = self.with_graph_mut(|graph| graph.cast(self.value, dtype, None))?;
+        Ok(Tensor::from_parts(self.graph, result.id()))
+    }
+
+    pub fn cast(&self, dtype: DType) -> Self {
+        Self::unwrap(self.try_cast(dtype), "cast")
     }
 
     pub fn try_take(&self, indices: &Self) -> Result<Self> {

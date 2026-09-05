@@ -6,10 +6,10 @@ use gpt_rs::backend::spec::{
     BackendError, BackendResult, DecodeSampleRequest, Instruction, PortableBackend, Program,
     TensorInit, TensorLiteral,
 };
-use gpt_rs::inference::generate::Generator;
+use gpt_rs::inference::generate::{generate_tokens, GenerateConfig, Generator};
 use gpt_rs::inference::sampler::Sampler;
 use gpt_rs::inference::CausalLanguageModel;
-use gpt_rs::ops::functional::DecodeKvCache;
+use gpt_rs::inference::LayerCache;
 use gpt_rs::tensor::{Shape, Tensor};
 
 #[derive(Clone)]
@@ -57,6 +57,7 @@ impl PortableBackend for MockBackend {
 
 #[derive(Default, Clone, Copy)]
 struct CallCounts {
+    forward_calls: usize,
     decode_calls: usize,
     sample_next_calls: usize,
 }
@@ -93,6 +94,10 @@ impl CausalLanguageModel<MockBackend> for MockModel {
     }
 
     fn forward(&self, _tokens: &[usize]) -> Result<Tensor> {
+        self.calls
+            .lock()
+            .expect("call count mutex poisoned")
+            .forward_calls += 1;
         Self::logits()
     }
 
@@ -100,19 +105,8 @@ impl CausalLanguageModel<MockBackend> for MockModel {
         &self,
         _tokens: &[usize],
         _position_offset: usize,
-        _caches: &mut [Option<DecodeKvCache<MockBackend>>],
-    ) -> Result<Tensor> {
-        let mut calls = self.calls.lock().expect("call count mutex poisoned");
-        calls.decode_calls += 1;
-        Self::logits()
-    }
-
-    fn forward_with_decode_cache_with_capacity(
-        &self,
-        _tokens: &[usize],
-        _position_offset: usize,
-        _caches: &mut [Option<DecodeKvCache<MockBackend>>],
-        _capacity: usize,
+        _caches: &mut [Option<LayerCache<MockBackend>>],
+        _capacity: Option<usize>,
     ) -> Result<Tensor> {
         let mut calls = self.calls.lock().expect("call count mutex poisoned");
         calls.decode_calls += 1;
@@ -123,7 +117,8 @@ impl CausalLanguageModel<MockBackend> for MockModel {
         &self,
         _tokens: &[usize],
         _position_offset: usize,
-        _caches: &mut [Option<DecodeKvCache<MockBackend>>],
+        _caches: &mut [Option<LayerCache<MockBackend>>],
+        _capacity: Option<usize>,
         _request: DecodeSampleRequest,
     ) -> Result<Option<usize>> {
         let mut calls = self.calls.lock().expect("call count mutex poisoned");
@@ -142,7 +137,7 @@ impl CausalLanguageModel<MockBackend> for MockModel {
 fn generator_uses_pending_gpu_sample_for_final_step() -> Result<()> {
     let model = MockModel::new(vec![Some(1)]);
     let sampler = Sampler::new(0.0);
-    let mut generator = Generator::new(&model, &sampler, &[0], true)?;
+    let mut generator = Generator::new(&model, &sampler, &[0], true, None)?;
 
     let first = generator.step()?;
     let second = generator.step_final()?;
@@ -160,8 +155,7 @@ fn generator_uses_pending_gpu_sample_for_final_step() -> Result<()> {
 fn generator_uses_gpu_sample_with_fixed_kv_capacity() -> Result<()> {
     let model = MockModel::new(vec![Some(1)]);
     let sampler = Sampler::new(0.0);
-    let mut generator =
-        Generator::new_with_kv_cache_capacity(&model, &sampler, &[0], true, Some(8))?;
+    let mut generator = Generator::new(&model, &sampler, &[0], true, Some(8))?;
 
     let first = generator.step()?;
     let second = generator.step_final()?;
@@ -179,7 +173,7 @@ fn generator_uses_gpu_sample_with_fixed_kv_capacity() -> Result<()> {
 fn generator_falls_back_to_host_logits_when_gpu_sampling_unavailable() -> Result<()> {
     let model = MockModel::new(vec![None]);
     let sampler = Sampler::new(0.0);
-    let mut generator = Generator::new(&model, &sampler, &[0], true)?;
+    let mut generator = Generator::new(&model, &sampler, &[0], true, None)?;
 
     let _ = generator.step()?;
 
@@ -199,4 +193,52 @@ fn sampler_backend_decode_sampling_rejects_top_k() {
 
     let with_top_k = Sampler::new(0.8).with_top_k(40);
     assert!(!with_top_k.supports_backend_decode_sampling());
+}
+
+#[test]
+fn generator_stops_after_a_stop_token_without_another_forward() -> Result<()> {
+    for kv_cache in [true, false] {
+        let model = MockModel::new(vec![]);
+        let sampler = Sampler::new(0.0);
+        let mut generator =
+            Generator::new(&model, &sampler, &[0], kv_cache, None)?.with_stop_tokens(&[2]);
+        let after_prefill = model.calls();
+        assert_eq!(generator.step()?, 2);
+        assert!(generator.is_finished());
+        let calls = model.calls();
+        assert_eq!(calls.forward_calls, after_prefill.forward_calls);
+        assert_eq!(calls.decode_calls, after_prefill.decode_calls);
+        assert_eq!(calls.sample_next_calls, 0);
+        let err = generator
+            .step()
+            .expect_err("a step after a stop token must fail");
+        assert!(err.to_string().contains("finished"), "{err}");
+    }
+    Ok(())
+}
+
+#[test]
+fn generator_stops_on_a_backend_sampled_stop_token() -> Result<()> {
+    let model = MockModel::new(vec![Some(1)]);
+    let sampler = Sampler::new(0.0);
+    let mut generator = Generator::new(&model, &sampler, &[0], true, None)?.with_stop_tokens(&[1]);
+    assert_eq!(generator.step()?, 2);
+    assert!(!generator.is_finished());
+    assert_eq!(generator.step()?, 1);
+    assert!(generator.is_finished());
+    assert_eq!(model.calls().sample_next_calls, 1);
+    Ok(())
+}
+
+#[test]
+fn generate_tokens_keeps_the_stop_token_and_ends() -> Result<()> {
+    let model = MockModel::new(vec![]);
+    let sampler = Sampler::new(0.0);
+    let cfg = GenerateConfig {
+        max_new_tokens: 5,
+        stop_tokens: vec![2],
+        ..GenerateConfig::default()
+    };
+    assert_eq!(generate_tokens(&model, &[0], &sampler, cfg)?, [0, 2]);
+    Ok(())
 }

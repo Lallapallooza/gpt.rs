@@ -1,87 +1,22 @@
-//! Layer normalization wrapper backed by the functional portable implementation.
-//!
-//! Stores affine parameters on the backend and hands off the heavy lifting to portable
-//! `layer_norm`, returning convenient state objects for reuse.
+//! Layer normalization (PyTorch `nn.LayerNorm`) built on [`functional::layer_norm`].
 
-use crate::backend::spec::PortableBackend;
-use crate::module::{Module, ParamVisitor, ParamVisitorMut, TensorRole};
+use crate::nn;
 use crate::ops::functional;
-use crate::tensor::DeviceTensor;
 use anyhow::Result;
-use std::fmt;
-use std::sync::Arc;
 
-/// Layer normalization with learnable `gamma` and `beta` parameters.
-pub struct LayerNorm<B: PortableBackend + 'static> {
-    backend: Arc<B>,
-    pub gamma: DeviceTensor<B>,
-    pub beta: DeviceTensor<B>,
+/// Layer normalization with a learnable affine `weight` and `bias`.
+#[nn::module]
+pub struct LayerNorm {
+    pub weight: Tensor,
+    pub bias: Tensor,
+    #[module(config)]
     pub eps: f32,
 }
 
-impl<B: PortableBackend + 'static> LayerNorm<B> {
-    /// Uploads the affine parameters to the backend and stores the epsilon value.
-    pub fn new<G, T>(backend: Arc<B>, gamma: G, beta: T, eps: f32) -> Result<Self>
-    where
-        G: crate::tensor::IntoDeviceTensor<B>,
-        T: crate::tensor::IntoDeviceTensor<B>,
-    {
-        let gamma = gamma.into_device_tensor(&backend)?;
-        let beta = beta.into_device_tensor(&backend)?;
-        Ok(Self {
-            backend,
-            gamma,
-            beta,
-            eps,
-        })
-    }
-
-    /// Applies layer normalization without returning intermediate tensors.
-    #[deny(clippy::disallowed_methods, clippy::disallowed_types)]
-    pub fn forward(&self, x: &DeviceTensor<B>) -> Result<DeviceTensor<B>> {
-        let _prof_guard = crate::profiling::layer_scope("LayerNorm::forward");
-        let outputs =
-            functional::layer_norm(self.backend.as_ref(), x, &self.gamma, &self.beta, self.eps)?;
+#[nn::module]
+impl LayerNorm {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let outputs = functional::layer_norm(x, &self.weight, &self.bias, self.eps)?;
         Ok(outputs.output)
-    }
-
-    /// Returns the backend handle that owns the affine parameters.
-    pub fn backend(&self) -> Arc<B> {
-        Arc::clone(&self.backend)
-    }
-}
-
-impl<B: PortableBackend> Clone for LayerNorm<B> {
-    fn clone(&self) -> Self {
-        LayerNorm {
-            backend: Arc::clone(&self.backend),
-            gamma: self.gamma.clone(),
-            beta: self.beta.clone(),
-            eps: self.eps,
-        }
-    }
-}
-
-impl<B: PortableBackend> fmt::Debug for LayerNorm<B> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LayerNorm")
-            .field("gamma", &self.gamma)
-            .field("beta", &self.beta)
-            .field("eps", &self.eps)
-            .finish()
-    }
-}
-
-impl<B: PortableBackend + 'static> Module<B> for LayerNorm<B> {
-    fn visit_params(&self, v: &mut ParamVisitor<'_, B>) -> Result<()> {
-        v.param("gamma", TensorRole::Parameter, &self.gamma)?;
-        v.param("beta", TensorRole::Parameter, &self.beta)?;
-        Ok(())
-    }
-
-    fn visit_params_mut(&mut self, v: &mut ParamVisitorMut<'_, B>) -> Result<()> {
-        v.param("gamma", TensorRole::Parameter, &mut self.gamma)?;
-        v.param("beta", TensorRole::Parameter, &mut self.beta)?;
-        Ok(())
     }
 }

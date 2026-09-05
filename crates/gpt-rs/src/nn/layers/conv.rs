@@ -1,98 +1,48 @@
-//! Convolution layers used by image models (NHWC internal layout).
+//! Convolution layers: 2D image convolutions (NHWC internal layout) and the depthwise causal 1D
+//! convolution of linear attention.
 
-use std::sync::Arc;
+use anyhow::{bail, Result};
 
-use anyhow::{ensure, Result};
+use crate::nn;
+use crate::ops::functional::{causal_conv1d, conv2d, reshape, CausalConv1dResult, Conv2dParams2d};
 
-use crate::backend::spec::PortableBackend;
-use crate::module::{Module, ParamVisitor, ParamVisitorMut, TensorRole};
-use crate::ops::functional::{conv2d, Conv2dParams2d, Padding2d};
-use crate::tensor::DeviceTensor;
-
-#[derive(Clone)]
-pub struct Conv2d<B: PortableBackend + 'static> {
-    backend: Arc<B>,
-    weight: DeviceTensor<B>,
-    bias: Option<DeviceTensor<B>>,
-    params: Conv2dParams2d,
+/// 2D convolution (PyTorch `nn.Conv2d`) over NHWC inputs, with an OIHW `weight`
+/// (`[out_channels, in_channels / groups, kh, kw]`) and a `[out_channels]` `bias`.
+#[nn::module]
+pub struct Conv2d {
+    pub weight: Tensor,
+    pub bias: Tensor,
+    #[module(config)]
+    pub params: Conv2dParams2d,
 }
 
-impl<B: PortableBackend + 'static> Conv2d<B> {
-    pub fn backend(&self) -> Arc<B> {
-        Arc::clone(&self.backend)
+#[nn::module]
+impl Conv2d {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        conv2d(x, &self.weight, Some(&self.bias), self.params)
     }
+}
 
-    pub fn new(
-        backend: Arc<B>,
-        weight: DeviceTensor<B>,
-        bias: Option<DeviceTensor<B>>,
-        kernel: [usize; 2],
-        stride: [usize; 2],
-        dilation: [usize; 2],
-        padding: Padding2d,
-    ) -> Result<Self> {
-        Self::new_grouped(backend, weight, bias, kernel, stride, dilation, padding, 1)
-    }
+/// Depthwise causal 1D convolution with a `[channels, 1, kernel]` `weight`. It matches PyTorch
+/// `nn.Conv1d` with `groups = channels`, left padding `kernel - 1` and no bias. It carries its
+/// input window from one call to the next.
+#[nn::module]
+pub struct CausalConv1d {
+    pub weight: Tensor,
+}
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_grouped(
-        backend: Arc<B>,
-        weight: DeviceTensor<B>,
-        bias: Option<DeviceTensor<B>>,
-        kernel: [usize; 2],
-        stride: [usize; 2],
-        dilation: [usize; 2],
-        padding: Padding2d,
-        groups: usize,
-    ) -> Result<Self> {
-        ensure!(groups > 0, "conv2d groups must be > 0");
-
-        let weight = weight.as_param()?;
-        let bias = match bias {
-            Some(bias) => Some(bias.as_param()?),
-            None => None,
+#[nn::module]
+impl CausalConv1d {
+    /// Convolves `x` (`[T, channels]`) after the earlier inputs in `state`, a
+    /// `[kernel - 1, channels]` window (see [`causal_conv1d`]).
+    fn forward(&self, x: &Tensor, state: &Tensor) -> Result<CausalConv1dResult<B>> {
+        let [channels, _, kernel] = self.weight.shape().dims() else {
+            bail!(
+                "causal conv1d weight must be [channels, 1, kernel], got {:?}",
+                self.weight.shape().dims()
+            );
         };
-
-        Ok(Self {
-            backend,
-            weight,
-            bias,
-            params: Conv2dParams2d {
-                kernel,
-                stride,
-                dilation,
-                padding,
-                groups,
-            },
-        })
-    }
-
-    pub fn forward(&self, x: &DeviceTensor<B>) -> Result<DeviceTensor<B>> {
-        let _scope = crate::profiling::layer_scope("Conv2d::forward");
-        conv2d(
-            self.backend.as_ref(),
-            x,
-            &self.weight,
-            self.bias.as_ref(),
-            self.params,
-        )
-    }
-}
-
-impl<B: PortableBackend + 'static> Module<B> for Conv2d<B> {
-    fn visit_params(&self, v: &mut ParamVisitor<'_, B>) -> Result<()> {
-        v.param("weight", TensorRole::Parameter, &self.weight)?;
-        if let Some(bias) = &self.bias {
-            v.param("bias", TensorRole::Parameter, bias)?;
-        }
-        Ok(())
-    }
-
-    fn visit_params_mut(&mut self, v: &mut ParamVisitorMut<'_, B>) -> Result<()> {
-        v.param("weight", TensorRole::Parameter, &mut self.weight)?;
-        if let Some(bias) = &mut self.bias {
-            v.param("bias", TensorRole::Parameter, bias)?;
-        }
-        Ok(())
+        let weight = reshape(&self.weight, &[*channels, *kernel])?;
+        causal_conv1d(x, state, &weight)
     }
 }

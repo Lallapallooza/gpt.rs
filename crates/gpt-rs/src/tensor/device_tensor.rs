@@ -2,7 +2,7 @@
 
 use super::lazy_tensor::InputRole;
 use super::{lazy_tensor::LazyHandle, shape::Shape, spec_utils, DType, Tensor};
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{
@@ -186,6 +186,14 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
         self.handle.graph()
     }
 
+    /// Stops the owning graph from exporting this value. Use it for state that is being replaced,
+    /// so later plans do not compute a handle that nobody reads.
+    pub(crate) fn release_export(&self) {
+        if let Some((graph, value)) = self.graph_value() {
+            graph.unexport(value);
+        }
+    }
+
     /// Returns the graph arena and value identifier when the tensor is still lazy.
     pub(crate) fn graph_value(&self) -> Option<(Arc<GraphArena<B>>, ValueId)> {
         match &*self.handle {
@@ -350,7 +358,7 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
         for (_, (graph, entries)) in groups.into_iter() {
             let value_ids = entries.iter().map(|(_, value)| *value).collect::<Vec<_>>();
             let handles = graph.materialize_values(&value_ids)?;
-            for ((index, _), handle) in entries.into_iter().zip(handles.into_iter()) {
+            for ((index, _), handle) in entries.into_iter().zip(handles) {
                 results[index] = Some(handle);
             }
         }
@@ -397,52 +405,5 @@ impl<B: PortableBackend> fmt::Debug for DeviceTensor<B> {
             .field("shape", &self.shape.dims())
             .field("dtype", &self.dtype)
             .finish()
-    }
-}
-
-/// Helper trait for converting host values or existing device tensors into device tensors.
-pub trait IntoDeviceTensor<B: PortableBackend + 'static> {
-    /// Converts the value into a device tensor bound to the provided backend.
-    fn into_device_tensor(self, backend: &Arc<B>) -> Result<DeviceTensor<B>>;
-}
-
-/// Variant of [`IntoDeviceTensor`] that lifts optional values.
-pub trait IntoDeviceTensorOption<B: PortableBackend + 'static> {
-    /// Converts the option into a device tensor when present, otherwise returns `None`.
-    fn into_device_tensor_option(self, backend: &Arc<B>) -> Result<Option<DeviceTensor<B>>>;
-}
-
-impl<B, T> IntoDeviceTensorOption<B> for Option<T>
-where
-    B: PortableBackend + 'static,
-    T: IntoDeviceTensor<B>,
-{
-    fn into_device_tensor_option(self, backend: &Arc<B>) -> Result<Option<DeviceTensor<B>>> {
-        match self {
-            Some(value) => value.into_device_tensor(backend).map(Some),
-            None => Ok(None),
-        }
-    }
-}
-
-impl<B: PortableBackend + 'static> IntoDeviceTensor<B> for Tensor {
-    fn into_device_tensor(self, backend: &Arc<B>) -> Result<DeviceTensor<B>> {
-        DeviceTensor::from_host(Arc::clone(backend), self)
-    }
-}
-
-impl<B, T> IntoDeviceTensor<B> for T
-where
-    B: PortableBackend + 'static,
-    T: AsRef<DeviceTensor<B>>,
-{
-    fn into_device_tensor(self, backend: &Arc<B>) -> Result<DeviceTensor<B>> {
-        let dt = self.as_ref();
-        let tensor_backend = dt.backend();
-        ensure!(
-            Arc::ptr_eq(&tensor_backend, backend),
-            "device tensor backend mismatch",
-        );
-        Ok(dt.clone())
     }
 }

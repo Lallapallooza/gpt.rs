@@ -14,7 +14,7 @@ pub(crate) mod spec_utils;
 pub mod storage;
 
 pub use crate::ops::functional::DeviceTensorOps;
-pub use device_tensor::{DeviceTensor, IntoDeviceTensor, IntoDeviceTensorOption};
+pub use device_tensor::DeviceTensor;
 pub use dtype::DType;
 pub use host_tensor::Tensor;
 pub use lazy_tensor::InputRole;

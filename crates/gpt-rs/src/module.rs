@@ -152,7 +152,27 @@ impl<'a, B: PortableBackend + 'static> ParamVisitorMut<'a, B> {
     }
 }
 
+/// Parameters of a module, declared with [`crate::nn::module`].
 pub trait Module<B: PortableBackend + 'static> {
+    /// Name of the module type. The profiler uses it as the layer scope of the forward pass.
+    const NAME: &'static str;
+
     fn visit_params(&self, v: &mut ParamVisitor<'_, B>) -> Result<()>;
     fn visit_params_mut(&mut self, v: &mut ParamVisitorMut<'_, B>) -> Result<()>;
+}
+
+/// Forward pass of a module, like PyTorch `forward`. A [`crate::nn::module`] impl implements it.
+pub trait Layer<B: PortableBackend + 'static>: Module<B> {
+    /// Argument of [`Self::forward`], a tuple for several arguments.
+    type Args<'a>;
+    type Output;
+
+    fn forward(&self, args: Self::Args<'_>) -> Result<Self::Output>;
+
+    /// Runs [`Self::forward`] inside the profiler layer scope [`Module::NAME`], like PyTorch
+    /// `module(args)`.
+    fn call(&self, args: Self::Args<'_>) -> Result<Self::Output> {
+        let _scope = crate::profiling::layer_scope(Self::NAME);
+        self.forward(args)
+    }
 }

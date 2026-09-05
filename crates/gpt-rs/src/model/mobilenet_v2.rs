@@ -1,16 +1,13 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
-use gpt_rs_macros::capture_ptir;
 
 use crate::backend::spec::PortableBackend;
-use crate::module::{Module, ParamVisitor, ParamVisitorMut};
-use crate::nn::layers::Conv2d;
-use crate::nn::layers::Linear;
-use crate::ops::functional::common::CaptureIntoDeviceTensor;
-use crate::ops::functional::{relu6, reshape, transpose};
-use crate::tensor::{DeviceTensor, DeviceTensorOps, IntoDeviceTensor, Tensor};
+use crate::module::Layer;
+use crate::nn::layers::{Conv2d, Linear};
+use crate::nn::{self, LayerLoader};
+use crate::ops::functional::{global_avg_pool2d, relu6, transpose, Conv2dParams2d};
+use crate::tensor::{DeviceTensor, DeviceTensorOps};
 
 pub const KIND: &str = "mobilenet_v2";
 
@@ -27,458 +24,129 @@ impl Default for MobileNetV2Config {
 
 pub(crate) fn build_from_model_config<B: PortableBackend + 'static>(
     backend: Arc<B>,
-    _cfg: &super::ModelConfig,
+    cfg: &super::ModelConfig,
     get: &mut dyn FnMut(&str) -> Result<DeviceTensor<B>>,
 ) -> Result<Box<dyn crate::runtime::LoadedModel<B>>> {
-    Ok(Box::new(MobileNetV2::build_from_params(backend, get)?))
+    let config: MobileNetV2Config = serde_json::from_value(cfg.config.clone())
+        .map_err(|err| anyhow!("invalid {KIND} config: {err}"))?;
+    let mut params =
+        LayerLoader::new(backend, get).with_linear_input_dtype(cfg.runtime.matmul_input_dtype);
+    Ok(Box::new(MobileNetV2::load(&mut params, &config)?))
 }
 
-#[derive(Clone)]
-pub struct InvertedResidual<B: PortableBackend + 'static> {
-    backend: Arc<B>,
-    expand: Option<Conv2d<B>>,
-    depthwise: Conv2d<B>,
-    project: Conv2d<B>,
+/// Inverted residual block: torchvision `InvertedResidual` with its batch norms folded into the
+/// convolutions.
+#[nn::module]
+pub struct InvertedResidual {
+    expand: Option<Conv2d>,
+    depthwise: Conv2d,
+    project: Conv2d,
+    #[module(config)]
     use_res_connect: bool,
 }
 
-impl<B: PortableBackend + 'static> InvertedResidual<B> {
-    pub fn new(
-        backend: Arc<B>,
-        expand: Option<Conv2d<B>>,
-        depthwise: Conv2d<B>,
-        project: Conv2d<B>,
-        use_res_connect: bool,
-    ) -> Self {
-        Self {
-            backend,
-            expand,
-            depthwise,
-            project,
-            use_res_connect,
-        }
+#[nn::module]
+impl InvertedResidual {
+    pub fn load(
+        params: &mut LayerLoader<'_, B>,
+        prefix: &str,
+        in_channels: usize,
+        out_channels: usize,
+        expand_ratio: usize,
+        stride: usize,
+    ) -> Result<Self> {
+        let name = |conv: &str| format!("{prefix}.{conv}");
+        let hidden = in_channels * expand_ratio;
+        let pointwise = Conv2dParams2d::square(1, 1, 0);
+        let depthwise = Conv2dParams2d {
+            groups: hidden,
+            ..Conv2dParams2d::square(3, stride, 1)
+        };
+        Ok(Self {
+            expand: (expand_ratio != 1)
+                .then(|| params.conv2d(&name("expand"), in_channels, hidden, pointwise))
+                .transpose()?,
+            depthwise: params.conv2d(&name("depthwise"), hidden, hidden, depthwise)?,
+            project: params.conv2d(&name("project"), hidden, out_channels, pointwise)?,
+            use_res_connect: stride == 1 && in_channels == out_channels,
+        })
     }
 
-    pub fn forward(&self, x: &DeviceTensor<B>) -> Result<DeviceTensor<B>> {
-        let _scope = crate::profiling::layer_scope("MobileNetV2::InvertedResidual::forward");
-        let identity = x.clone();
-        let mut out = x.clone();
-
-        if let Some(expand) = &self.expand {
-            out = expand.forward(&out)?;
-            out = relu6(self.backend.as_ref(), &out)?;
-        }
-
-        out = self.depthwise.forward(&out)?;
-        out = relu6(self.backend.as_ref(), &out)?;
-
-        out = self.project.forward(&out)?;
-
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let hidden = match self.expand(x)? {
+            Some(expanded) => relu6(&expanded)?,
+            None => x.clone(),
+        };
+        let hidden = relu6(&self.depthwise(&hidden)?)?;
+        let out = self.project(&hidden)?;
         if self.use_res_connect {
-            out = out.add(&identity)?;
+            out.add(x)
+        } else {
+            Ok(out)
         }
-
-        Ok(out)
     }
 }
 
-impl<B: PortableBackend + 'static> Module<B> for InvertedResidual<B> {
-    fn visit_params(&self, v: &mut ParamVisitor<'_, B>) -> Result<()> {
-        if let Some(expand) = &self.expand {
-            v.scoped("expand", |v| expand.visit_params(v))?;
-        }
-        v.scoped("depthwise", |v| self.depthwise.visit_params(v))?;
-        v.scoped("project", |v| self.project.visit_params(v))?;
-        Ok(())
-    }
-
-    fn visit_params_mut(&mut self, v: &mut ParamVisitorMut<'_, B>) -> Result<()> {
-        if let Some(expand) = &mut self.expand {
-            v.scoped("expand", |v| expand.visit_params_mut(v))?;
-        }
-        v.scoped("depthwise", |v| self.depthwise.visit_params_mut(v))?;
-        v.scoped("project", |v| self.project.visit_params_mut(v))?;
-        Ok(())
-    }
+/// torchvision MobileNetV2 with its batch norms folded into the convolutions.
+#[nn::module]
+pub struct MobileNetV2 {
+    stem: Conv2d,
+    blocks: Vec<InvertedResidual>,
+    head: Conv2d,
+    classifier: Linear,
 }
 
-pub struct MobileNetV2<B: PortableBackend + 'static> {
-    backend: Arc<B>,
-    stem: Conv2d<B>,
-    blocks: Vec<InvertedResidual<B>>,
-    head: Conv2d<B>,
-    classifier: Linear<B>,
-}
+#[nn::module]
+impl MobileNetV2 {
+    pub fn load(params: &mut LayerLoader<'_, B>, config: &MobileNetV2Config) -> Result<Self> {
+        /// `(expand_ratio, out_channels, repeats, stride)` of each stage.
+        const SETTINGS: [(usize, usize, usize, usize); 7] = [
+            (1, 16, 1, 1),
+            (6, 24, 2, 2),
+            (6, 32, 3, 2),
+            (6, 64, 4, 2),
+            (6, 96, 3, 1),
+            (6, 160, 3, 2),
+            (6, 320, 1, 1),
+        ];
 
-impl<B: PortableBackend + 'static> MobileNetV2<B> {
-    pub fn new(
-        backend: Arc<B>,
-        stem: Conv2d<B>,
-        blocks: Vec<InvertedResidual<B>>,
-        head: Conv2d<B>,
-        classifier: Linear<B>,
-    ) -> Self {
-        Self {
-            backend,
+        let stem = params.conv2d("stem", 3, 32, Conv2dParams2d::square(3, 2, 1))?;
+        let mut blocks = Vec::new();
+        let mut in_channels = 32;
+        for (expand_ratio, out_channels, repeats, stage_stride) in SETTINGS {
+            for repeat in 0..repeats {
+                let stride = if repeat == 0 { stage_stride } else { 1 };
+                let prefix = format!("blocks.{}", blocks.len());
+                blocks.push(InvertedResidual::load(
+                    params,
+                    &prefix,
+                    in_channels,
+                    out_channels,
+                    expand_ratio,
+                    stride,
+                )?);
+                in_channels = out_channels;
+            }
+        }
+        Ok(Self {
             stem,
             blocks,
-            head,
-            classifier,
-        }
+            head: params.conv2d("head", in_channels, 1280, Conv2dParams2d::square(1, 1, 0))?,
+            classifier: params.linear("classifier", 1280, config.num_classes, true)?,
+        })
     }
 
-    pub fn forward(&self, input_nchw: &DeviceTensor<B>) -> Result<DeviceTensor<B>> {
-        let _scope = crate::profiling::layer_scope("MobileNetV2::forward");
-        let mut x = transpose(self.backend.as_ref(), input_nchw, &[0, 2, 3, 1])?;
-
-        x = self.stem.forward(&x)?;
-        x = relu6(self.backend.as_ref(), &x)?;
-
+    /// Class logits `[N, num_classes]` of NCHW images.
+    fn forward(&self, input_nchw: &Tensor) -> Result<Tensor> {
+        let x = transpose(input_nchw, &[0, 2, 3, 1])?;
+        let mut x = relu6(&self.stem(&x)?)?;
         for block in &self.blocks {
-            x = block.forward(&x)?;
+            x = block.call(&x)?;
         }
+        let x = relu6(&self.head(&x)?)?;
 
-        x = self.head.forward(&x)?;
-        x = relu6(self.backend.as_ref(), &x)?;
-
-        // Global average pool over H and W to [N, 1, 1, C].
-        let spatial_h = x.shape().dims()[1];
-        let spatial_w = x.shape().dims()[2];
-        let denom = (spatial_h * spatial_w) as f32;
-        x = capture_ptir!({ input = &x }, |_session| {
-            let sum_h = input.reduce_sum(vec![1], true);
-            let sum_hw = sum_h.reduce_sum(vec![2], true);
-            Ok(sum_hw.div_scalar(denom).id())
-        })?
-        .into_device_tensor()?;
-
-        let n = x.shape().dims()[0];
-        let c = x.shape().dims()[3];
-        x = reshape(self.backend.as_ref(), &x, &[n, c])?;
-
-        self.classifier.forward(&x)
-    }
-
-    pub fn backend(&self) -> Arc<B> {
-        Arc::clone(&self.backend)
-    }
-
-    pub fn build_from_params(
-        backend: Arc<B>,
-        mut get: impl FnMut(&str) -> Result<DeviceTensor<B>>,
-    ) -> Result<Self> {
-        let stem_weight = get("stem.weight")?;
-        let stem_bias = get("stem.bias")?;
-        let stem = Conv2d::new(
-            Arc::clone(&backend),
-            stem_weight,
-            Some(stem_bias),
-            [3, 3],
-            [2, 2],
-            [1, 1],
-            crate::ops::functional::Padding2d {
-                top: 1,
-                bottom: 1,
-                left: 1,
-                right: 1,
-            },
-        )?;
-
-        const SETTINGS: [(usize, usize, usize, usize); 7] = [
-            (1, 16, 1, 1),
-            (6, 24, 2, 2),
-            (6, 32, 3, 2),
-            (6, 64, 4, 2),
-            (6, 96, 3, 1),
-            (6, 160, 3, 2),
-            (6, 320, 1, 1),
-        ];
-
-        let mut blocks = Vec::new();
-        let mut input_channels = 32usize;
-        let mut block_idx = 0usize;
-
-        for (expand_ratio, out_channels, repeats, stage_stride) in SETTINGS {
-            for repeat_idx in 0..repeats {
-                let stride = if repeat_idx == 0 { stage_stride } else { 1 };
-                let _expanded = input_channels
-                    .checked_mul(expand_ratio)
-                    .ok_or_else(|| anyhow!("mobilenet expanded channel overflow"))?;
-
-                let expand = if expand_ratio != 1 {
-                    let w = get(&format!("blocks.{block_idx}.expand.weight"))?;
-                    let b = get(&format!("blocks.{block_idx}.expand.bias"))?;
-                    Some(Conv2d::new(
-                        Arc::clone(&backend),
-                        w,
-                        Some(b),
-                        [1, 1],
-                        [1, 1],
-                        [1, 1],
-                        crate::ops::functional::Padding2d::zero(),
-                    )?)
-                } else {
-                    None
-                };
-
-                let dw_weight = get(&format!("blocks.{block_idx}.depthwise.weight"))?;
-                let dw_bias = get(&format!("blocks.{block_idx}.depthwise.bias"))?;
-                let groups = dw_weight.shape().dims()[0];
-                let depthwise = Conv2d::new_grouped(
-                    Arc::clone(&backend),
-                    dw_weight,
-                    Some(dw_bias),
-                    [3, 3],
-                    [stride, stride],
-                    [1, 1],
-                    crate::ops::functional::Padding2d {
-                        top: 1,
-                        bottom: 1,
-                        left: 1,
-                        right: 1,
-                    },
-                    groups,
-                )?;
-
-                let proj_weight = get(&format!("blocks.{block_idx}.project.weight"))?;
-                let proj_bias = get(&format!("blocks.{block_idx}.project.bias"))?;
-                let project = Conv2d::new(
-                    Arc::clone(&backend),
-                    proj_weight,
-                    Some(proj_bias),
-                    [1, 1],
-                    [1, 1],
-                    [1, 1],
-                    crate::ops::functional::Padding2d::zero(),
-                )?;
-
-                let use_res_connect = stride == 1 && input_channels == out_channels;
-                blocks.push(InvertedResidual::new(
-                    Arc::clone(&backend),
-                    expand,
-                    depthwise,
-                    project,
-                    use_res_connect,
-                ));
-
-                input_channels = out_channels;
-                block_idx += 1;
-            }
-        }
-
-        let head_weight = get("head.weight")?;
-        let head_bias = get("head.bias")?;
-        let head = Conv2d::new(
-            Arc::clone(&backend),
-            head_weight,
-            Some(head_bias),
-            [1, 1],
-            [1, 1],
-            [1, 1],
-            crate::ops::functional::Padding2d::zero(),
-        )?;
-
-        let mut classifier_weight = get("classifier.weight")?;
-        let classifier_bias = get("classifier.bias")?;
-        let classifier_bias_len = classifier_bias.shape().dims()[0];
-        let classifier_weight_dims = classifier_weight.shape().dims();
-        if classifier_weight_dims.len() == 2 && classifier_weight_dims[0] == classifier_bias_len {
-            let stable_id = classifier_weight
-                .lazy_handle()
-                .id()
-                .ok_or_else(|| anyhow!("classifier.weight missing stable id"))?;
-            classifier_weight = transpose(backend.as_ref(), &classifier_weight, &[1, 0])?
-                .freeze()?
-                .as_param_with_id(stable_id)?;
-        }
-        let classifier = Linear::new(
-            Arc::clone(&backend),
-            classifier_weight,
-            Some(classifier_bias),
-        )?;
-
-        Ok(Self::new(backend, stem, blocks, head, classifier))
-    }
-
-    pub fn from_named_tensors(
-        backend: Arc<B>,
-        mut tensors: HashMap<String, Tensor>,
-    ) -> Result<Self> {
-        fn take(map: &mut HashMap<String, Tensor>, name: &str) -> Result<Tensor> {
-            map.remove(name)
-                .ok_or_else(|| anyhow!("missing tensor '{}' for MobileNetV2", name))
-        }
-
-        let stem_weight = take(&mut tensors, "stem.weight")?.into_device_tensor(&backend)?;
-        let stem_bias = take(&mut tensors, "stem.bias")?.into_device_tensor(&backend)?;
-        let stem = Conv2d::new(
-            Arc::clone(&backend),
-            stem_weight,
-            Some(stem_bias),
-            [3, 3],
-            [2, 2],
-            [1, 1],
-            crate::ops::functional::Padding2d {
-                top: 1,
-                bottom: 1,
-                left: 1,
-                right: 1,
-            },
-        )?;
-
-        const SETTINGS: [(usize, usize, usize, usize); 7] = [
-            (1, 16, 1, 1),
-            (6, 24, 2, 2),
-            (6, 32, 3, 2),
-            (6, 64, 4, 2),
-            (6, 96, 3, 1),
-            (6, 160, 3, 2),
-            (6, 320, 1, 1),
-        ];
-
-        let mut blocks = Vec::new();
-        let mut input_channels = 32usize;
-        let mut block_idx = 0usize;
-
-        for (expand_ratio, out_channels, repeats, stage_stride) in SETTINGS {
-            for repeat_idx in 0..repeats {
-                let stride = if repeat_idx == 0 { stage_stride } else { 1 };
-                let _expanded = input_channels
-                    .checked_mul(expand_ratio)
-                    .ok_or_else(|| anyhow!("mobilenet expanded channel overflow"))?;
-
-                let expand = if expand_ratio != 1 {
-                    let w = take(&mut tensors, &format!("blocks.{block_idx}.expand.weight"))?
-                        .into_device_tensor(&backend)?;
-                    let b = take(&mut tensors, &format!("blocks.{block_idx}.expand.bias"))?
-                        .into_device_tensor(&backend)?;
-                    Some(Conv2d::new(
-                        Arc::clone(&backend),
-                        w,
-                        Some(b),
-                        [1, 1],
-                        [1, 1],
-                        [1, 1],
-                        crate::ops::functional::Padding2d::zero(),
-                    )?)
-                } else {
-                    None
-                };
-
-                let dw_weight = take(
-                    &mut tensors,
-                    &format!("blocks.{block_idx}.depthwise.weight"),
-                )?
-                .into_device_tensor(&backend)?;
-                let dw_bias = take(&mut tensors, &format!("blocks.{block_idx}.depthwise.bias"))?
-                    .into_device_tensor(&backend)?;
-                let groups = dw_weight.shape().dims()[0];
-                let depthwise = Conv2d::new_grouped(
-                    Arc::clone(&backend),
-                    dw_weight,
-                    Some(dw_bias),
-                    [3, 3],
-                    [stride, stride],
-                    [1, 1],
-                    crate::ops::functional::Padding2d {
-                        top: 1,
-                        bottom: 1,
-                        left: 1,
-                        right: 1,
-                    },
-                    groups,
-                )?;
-
-                let proj_weight =
-                    take(&mut tensors, &format!("blocks.{block_idx}.project.weight"))?
-                        .into_device_tensor(&backend)?;
-                let proj_bias = take(&mut tensors, &format!("blocks.{block_idx}.project.bias"))?
-                    .into_device_tensor(&backend)?;
-                let project = Conv2d::new(
-                    Arc::clone(&backend),
-                    proj_weight,
-                    Some(proj_bias),
-                    [1, 1],
-                    [1, 1],
-                    [1, 1],
-                    crate::ops::functional::Padding2d::zero(),
-                )?;
-
-                let use_res_connect = stride == 1 && input_channels == out_channels;
-                blocks.push(InvertedResidual::new(
-                    Arc::clone(&backend),
-                    expand,
-                    depthwise,
-                    project,
-                    use_res_connect,
-                ));
-
-                input_channels = out_channels;
-                block_idx += 1;
-            }
-        }
-
-        let head_weight = take(&mut tensors, "head.weight")?.into_device_tensor(&backend)?;
-        let head_bias = take(&mut tensors, "head.bias")?.into_device_tensor(&backend)?;
-        let head = Conv2d::new(
-            Arc::clone(&backend),
-            head_weight,
-            Some(head_bias),
-            [1, 1],
-            [1, 1],
-            [1, 1],
-            crate::ops::functional::Padding2d::zero(),
-        )?;
-
-        let classifier_weight =
-            take(&mut tensors, "classifier.weight")?.into_device_tensor(&backend)?;
-        let classifier_bias =
-            take(&mut tensors, "classifier.bias")?.into_device_tensor(&backend)?;
-        let bias_len = classifier_bias.shape().dims()[0];
-        let weight_dims = classifier_weight.shape().dims();
-        let classifier_weight = if weight_dims.len() == 2 && weight_dims[0] == bias_len {
-            // Accept canonical Torch linear weights [O, I] and pack to gpt-rs layout [I, O].
-            transpose(backend.as_ref(), &classifier_weight, &[1, 0])?.freeze()?
-        } else {
-            classifier_weight
-        };
-        let classifier = Linear::new(
-            Arc::clone(&backend),
-            classifier_weight,
-            Some(classifier_bias),
-        )?;
-
-        Ok(MobileNetV2::new(backend, stem, blocks, head, classifier))
-    }
-}
-
-impl<B: PortableBackend + 'static> Module<B> for MobileNetV2<B> {
-    fn visit_params(&self, v: &mut ParamVisitor<'_, B>) -> Result<()> {
-        v.scoped("stem", |v| self.stem.visit_params(v))?;
-        v.scoped("blocks", |v| {
-            for (idx, block) in self.blocks.iter().enumerate() {
-                let name = idx.to_string();
-                v.scoped(&name, |v| block.visit_params(v))?;
-            }
-            Ok(())
-        })?;
-        v.scoped("head", |v| self.head.visit_params(v))?;
-        v.scoped("classifier", |v| self.classifier.visit_params(v))?;
-        Ok(())
-    }
-
-    fn visit_params_mut(&mut self, v: &mut ParamVisitorMut<'_, B>) -> Result<()> {
-        v.scoped("stem", |v| self.stem.visit_params_mut(v))?;
-        v.scoped("blocks", |v| {
-            for (idx, block) in self.blocks.iter_mut().enumerate() {
-                let name = idx.to_string();
-                v.scoped(&name, |v| block.visit_params_mut(v))?;
-            }
-            Ok(())
-        })?;
-        v.scoped("head", |v| self.head.visit_params_mut(v))?;
-        v.scoped("classifier", |v| self.classifier.visit_params_mut(v))?;
-        Ok(())
+        let x = global_avg_pool2d(&x)?;
+        self.classifier(&x)
     }
 }
 
@@ -493,7 +161,7 @@ impl<B: PortableBackend + 'static> crate::runtime::LoadedModel<B> for MobileNetV
     ) -> Result<crate::runtime::ModelOutput> {
         match input {
             crate::runtime::ModelInput::Vision(input) => Ok(crate::runtime::ModelOutput::Tensor(
-                MobileNetV2::forward(self, &input)?.to_host()?,
+                self.call(&input)?.to_host()?,
             )),
             crate::runtime::ModelInput::Tokens(_) => {
                 bail!("model '{KIND}' expects vision input, got token input")

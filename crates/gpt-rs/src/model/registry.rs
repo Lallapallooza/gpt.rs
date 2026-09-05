@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::backend::spec::PortableBackend;
+use crate::inference::decoder;
 use crate::runtime::LoadedModel;
 use crate::tensor::DeviceTensor;
 
@@ -31,11 +32,15 @@ pub fn model_factories<B: PortableBackend + 'static>() -> &'static [ModelFactory
     &[
         ModelFactory {
             kind: super::gpt::KIND,
-            build: super::gpt::build_from_model_config::<B>,
+            build: decoder::build_from_model_config::<B, super::gpt::GptConfig>,
         },
         ModelFactory {
             kind: super::ministral::KIND,
-            build: super::ministral::build_from_model_config::<B>,
+            build: decoder::build_from_model_config::<B, super::ministral::MinistralConfig>,
+        },
+        ModelFactory {
+            kind: super::qwen3_5::KIND,
+            build: decoder::build_from_model_config::<B, super::qwen3_5::Qwen35Config>,
         },
         ModelFactory {
             kind: super::resnet::KIND,

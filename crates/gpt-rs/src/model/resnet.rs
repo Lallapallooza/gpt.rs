@@ -1,16 +1,15 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
-use gpt_rs_macros::capture_ptir;
 
 use crate::backend::spec::PortableBackend;
-use crate::module::{Module, ParamVisitor, ParamVisitorMut};
-use crate::nn::layers::Conv2d;
-use crate::nn::layers::Linear;
-use crate::ops::functional::common::CaptureIntoDeviceTensor;
-use crate::ops::functional::{max_pool2d, relu, reshape, transpose, Padding2d};
-use crate::tensor::{DeviceTensor, DeviceTensorOps, IntoDeviceTensor, Tensor};
+use crate::module::Layer;
+use crate::nn::layers::{Conv2d, Linear};
+use crate::nn::{self, LayerLoader};
+use crate::ops::functional::{
+    global_avg_pool2d, max_pool2d, relu, transpose, Conv2dParams2d, Padding2d,
+};
+use crate::tensor::{DeviceTensor, DeviceTensorOps};
 
 pub const KIND: &str = "resnet34";
 
@@ -27,460 +26,115 @@ impl Default for ResNet34Config {
 
 pub(crate) fn build_from_model_config<B: PortableBackend + 'static>(
     backend: Arc<B>,
-    _cfg: &super::ModelConfig,
+    cfg: &super::ModelConfig,
     get: &mut dyn FnMut(&str) -> Result<DeviceTensor<B>>,
 ) -> Result<Box<dyn crate::runtime::LoadedModel<B>>> {
-    Ok(Box::new(ResNet34::build_from_params(backend, get)?))
+    let config: ResNet34Config = serde_json::from_value(cfg.config.clone())
+        .map_err(|err| anyhow!("invalid {KIND} config: {err}"))?;
+    let mut params =
+        LayerLoader::new(backend, get).with_linear_input_dtype(cfg.runtime.matmul_input_dtype);
+    Ok(Box::new(ResNet34::load(&mut params, &config)?))
 }
 
-#[derive(Clone)]
-pub struct BasicBlock<B: PortableBackend + 'static> {
-    backend: Arc<B>,
-    conv1: Conv2d<B>,
-    conv2: Conv2d<B>,
-    downsample: Option<Conv2d<B>>,
+/// Residual block of two 3x3 convolutions: torchvision `BasicBlock` with its batch norms folded
+/// into the convolutions.
+#[nn::module]
+pub struct BasicBlock {
+    conv1: Conv2d,
+    conv2: Conv2d,
+    downsample: Option<Conv2d>,
 }
 
-impl<B: PortableBackend + 'static> BasicBlock<B> {
-    pub fn new(
-        backend: Arc<B>,
-        conv1: Conv2d<B>,
-        conv2: Conv2d<B>,
-        downsample: Option<Conv2d<B>>,
-    ) -> Self {
-        Self {
-            backend,
-            conv1,
-            conv2,
-            downsample,
-        }
+#[nn::module]
+impl BasicBlock {
+    pub fn load(
+        params: &mut LayerLoader<'_, B>,
+        prefix: &str,
+        in_channels: usize,
+        out_channels: usize,
+        stride: usize,
+    ) -> Result<Self> {
+        let name = |conv: &str| format!("{prefix}.{conv}");
+        let conv1 = Conv2dParams2d::square(3, stride, 1);
+        let conv2 = Conv2dParams2d::square(3, 1, 1);
+        Ok(Self {
+            conv1: params.conv2d(&name("conv1"), in_channels, out_channels, conv1)?,
+            conv2: params.conv2d(&name("conv2"), out_channels, out_channels, conv2)?,
+            downsample: (stride != 1 || in_channels != out_channels)
+                .then(|| {
+                    let downsample = Conv2dParams2d::square(1, stride, 0);
+                    params.conv2d(&name("downsample"), in_channels, out_channels, downsample)
+                })
+                .transpose()?,
+        })
     }
 
-    pub fn forward(&self, x: &DeviceTensor<B>) -> Result<DeviceTensor<B>> {
-        let _scope = crate::profiling::layer_scope("ResNet::BasicBlock::forward");
-        let identity = if let Some(downsample) = &self.downsample {
-            downsample.forward(x)?
-        } else {
-            x.clone()
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let identity = self.downsample(x)?.unwrap_or_else(|| x.clone());
+        let out = relu(&self.conv1(x)?)?;
+        let out = self.conv2(&out)?.add(&identity)?;
+        relu(&out)
+    }
+}
+
+/// torchvision ResNet-34 with its batch norms folded into the convolutions.
+#[nn::module]
+pub struct ResNet34 {
+    conv1: Conv2d,
+    layer1: Vec<BasicBlock>,
+    layer2: Vec<BasicBlock>,
+    layer3: Vec<BasicBlock>,
+    layer4: Vec<BasicBlock>,
+    fc: Linear,
+}
+
+#[nn::module]
+impl ResNet34 {
+    pub fn load(params: &mut LayerLoader<'_, B>, config: &ResNet34Config) -> Result<Self> {
+        let conv1 = params.conv2d("conv1", 3, 64, Conv2dParams2d::square(7, 2, 3))?;
+        let mut in_channels = 64;
+        let mut stage = |stage: usize, out_channels: usize, blocks: usize| {
+            (0..blocks)
+                .map(|block| {
+                    let stride = if stage > 1 && block == 0 { 2 } else { 1 };
+                    let prefix = format!("layer{stage}.{block}");
+                    let block =
+                        BasicBlock::load(params, &prefix, in_channels, out_channels, stride);
+                    in_channels = out_channels;
+                    block
+                })
+                .collect::<Result<Vec<_>>>()
         };
-
-        let mut out = self.conv1.forward(x)?;
-        out = relu(self.backend.as_ref(), &out)?;
-        out = self.conv2.forward(&out)?;
-        out = out.add(&identity)?;
-        out = relu(self.backend.as_ref(), &out)?;
-        Ok(out)
-    }
-}
-
-impl<B: PortableBackend + 'static> Module<B> for BasicBlock<B> {
-    fn visit_params(&self, v: &mut ParamVisitor<'_, B>) -> Result<()> {
-        v.scoped("conv1", |v| self.conv1.visit_params(v))?;
-        v.scoped("conv2", |v| self.conv2.visit_params(v))?;
-        if let Some(downsample) = &self.downsample {
-            v.scoped("downsample", |v| downsample.visit_params(v))?;
-        }
-        Ok(())
-    }
-
-    fn visit_params_mut(&mut self, v: &mut ParamVisitorMut<'_, B>) -> Result<()> {
-        v.scoped("conv1", |v| self.conv1.visit_params_mut(v))?;
-        v.scoped("conv2", |v| self.conv2.visit_params_mut(v))?;
-        if let Some(downsample) = &mut self.downsample {
-            v.scoped("downsample", |v| downsample.visit_params_mut(v))?;
-        }
-        Ok(())
-    }
-}
-
-pub struct ResNet34<B: PortableBackend + 'static> {
-    backend: Arc<B>,
-    conv1: Conv2d<B>,
-    layer1: Vec<BasicBlock<B>>,
-    layer2: Vec<BasicBlock<B>>,
-    layer3: Vec<BasicBlock<B>>,
-    layer4: Vec<BasicBlock<B>>,
-    fc: Linear<B>,
-}
-
-impl<B: PortableBackend + 'static> ResNet34<B> {
-    pub fn new(
-        backend: Arc<B>,
-        conv1: Conv2d<B>,
-        layer1: Vec<BasicBlock<B>>,
-        layer2: Vec<BasicBlock<B>>,
-        layer3: Vec<BasicBlock<B>>,
-        layer4: Vec<BasicBlock<B>>,
-        fc: Linear<B>,
-    ) -> Self {
-        Self {
-            backend,
+        Ok(Self {
             conv1,
-            layer1,
-            layer2,
-            layer3,
-            layer4,
-            fc,
-        }
+            layer1: stage(1, 64, 3)?,
+            layer2: stage(2, 128, 4)?,
+            layer3: stage(3, 256, 6)?,
+            layer4: stage(4, 512, 3)?,
+            fc: params.linear("fc", 512, config.num_classes, true)?,
+        })
     }
 
-    pub fn forward(&self, input_nchw: &DeviceTensor<B>) -> Result<DeviceTensor<B>> {
-        let _scope = crate::profiling::layer_scope("ResNet34::forward");
-        let mut x = transpose(self.backend.as_ref(), input_nchw, &[0, 2, 3, 1])?;
-
-        x = self.conv1.forward(&x)?;
-        x = relu(self.backend.as_ref(), &x)?;
+    /// Class logits `[N, num_classes]` of NCHW images.
+    fn forward(&self, input_nchw: &Tensor) -> Result<Tensor> {
+        let x = transpose(input_nchw, &[0, 2, 3, 1])?;
+        let x = relu(&self.conv1(&x)?)?;
 
         // maxpool: 3x3 stride 2 padding 1 (NHWC).
-        x = max_pool2d(
-            self.backend.as_ref(),
-            &x,
-            [3, 3],
-            [2, 2],
-            Padding2d {
-                top: 1,
-                bottom: 1,
-                left: 1,
-                right: 1,
-            },
-        )?;
-
-        for block in &self.layer1 {
-            x = block.forward(&x)?;
-        }
-        for block in &self.layer2 {
-            x = block.forward(&x)?;
-        }
-        for block in &self.layer3 {
-            x = block.forward(&x)?;
-        }
-        for block in &self.layer4 {
-            x = block.forward(&x)?;
-        }
-
-        // Global average pool over H and W to [N, 1, 1, C].
-        let spatial_h = x.shape().dims()[1];
-        let spatial_w = x.shape().dims()[2];
-        let denom = (spatial_h * spatial_w) as f32;
-        x = capture_ptir!({ input = &x }, |_session| {
-            let sum_h = input.reduce_sum(vec![1], true);
-            let sum_hw = sum_h.reduce_sum(vec![2], true);
-            Ok(sum_hw.div_scalar(denom).id())
-        })?
-        .into_device_tensor()?;
-
-        let n = x.shape().dims()[0];
-        let c = x.shape().dims()[3];
-        x = reshape(self.backend.as_ref(), &x, &[n, c])?;
-
-        self.fc.forward(&x)
-    }
-
-    pub fn backend(&self) -> Arc<B> {
-        Arc::clone(&self.backend)
-    }
-
-    pub fn build_from_params(
-        backend: Arc<B>,
-        mut get: impl FnMut(&str) -> Result<DeviceTensor<B>>,
-    ) -> Result<Self> {
-        let conv1_weight = get("conv1.weight")?;
-        let conv1_bias = get("conv1.bias")?;
-        let conv1 = Conv2d::new(
-            Arc::clone(&backend),
-            conv1_weight,
-            Some(conv1_bias),
-            [7, 7],
-            [2, 2],
-            [1, 1],
-            Padding2d {
-                top: 3,
-                bottom: 3,
-                left: 3,
-                right: 3,
-            },
-        )?;
-
-        const STAGES: [(usize, usize); 4] = [(64, 3), (128, 4), (256, 6), (512, 3)];
-
-        let mut in_channels = 64usize;
-        let mut layers: [Vec<BasicBlock<B>>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-
-        for (stage_idx, (out_channels, blocks)) in STAGES.iter().copied().enumerate() {
-            let stage_num = stage_idx + 1;
-            for block_idx in 0..blocks {
-                let stride = if stage_idx == 0 {
-                    1usize
-                } else if block_idx == 0 {
-                    2usize
-                } else {
-                    1usize
-                };
-
-                let conv1_key = format!("layer{stage_num}.{block_idx}.conv1");
-                let conv2_key = format!("layer{stage_num}.{block_idx}.conv2");
-
-                let block_conv1_weight = get(&format!("{conv1_key}.weight"))?;
-                let block_conv1_bias = get(&format!("{conv1_key}.bias"))?;
-                let conv1 = Conv2d::new(
-                    Arc::clone(&backend),
-                    block_conv1_weight,
-                    Some(block_conv1_bias),
-                    [3, 3],
-                    [stride, stride],
-                    [1, 1],
-                    Padding2d {
-                        top: 1,
-                        bottom: 1,
-                        left: 1,
-                        right: 1,
-                    },
-                )?;
-
-                let block_conv2_weight = get(&format!("{conv2_key}.weight"))?;
-                let block_conv2_bias = get(&format!("{conv2_key}.bias"))?;
-                let conv2 = Conv2d::new(
-                    Arc::clone(&backend),
-                    block_conv2_weight,
-                    Some(block_conv2_bias),
-                    [3, 3],
-                    [1, 1],
-                    [1, 1],
-                    Padding2d {
-                        top: 1,
-                        bottom: 1,
-                        left: 1,
-                        right: 1,
-                    },
-                )?;
-
-                let downsample = if block_idx == 0 && (stride != 1 || in_channels != out_channels) {
-                    let ds_key = format!("layer{stage_num}.{block_idx}.downsample");
-                    let ds_weight = get(&format!("{ds_key}.weight"))?;
-                    let ds_bias = get(&format!("{ds_key}.bias"))?;
-                    Some(Conv2d::new(
-                        Arc::clone(&backend),
-                        ds_weight,
-                        Some(ds_bias),
-                        [1, 1],
-                        [stride, stride],
-                        [1, 1],
-                        Padding2d::zero(),
-                    )?)
-                } else {
-                    None
-                };
-
-                layers[stage_idx].push(BasicBlock::new(
-                    Arc::clone(&backend),
-                    conv1,
-                    conv2,
-                    downsample,
-                ));
-
-                in_channels = out_channels;
-            }
-        }
-
-        let mut fc_weight = get("fc.weight")?;
-        let fc_bias = get("fc.bias")?;
-        let fc_bias_len = fc_bias.shape().dims()[0];
-        let fc_weight_dims = fc_weight.shape().dims();
-        if fc_weight_dims.len() == 2 && fc_weight_dims[0] == fc_bias_len {
-            let stable_id = fc_weight
-                .lazy_handle()
-                .id()
-                .ok_or_else(|| anyhow!("fc.weight missing stable id"))?;
-            fc_weight = transpose(backend.as_ref(), &fc_weight, &[1, 0])?
-                .freeze()?
-                .as_param_with_id(stable_id)?;
-        }
-        let fc = Linear::new(Arc::clone(&backend), fc_weight, Some(fc_bias))?;
-
-        let [layer1, layer2, layer3, layer4] = layers;
-        Ok(Self::new(
-            backend, conv1, layer1, layer2, layer3, layer4, fc,
-        ))
-    }
-
-    pub fn from_named_tensors(
-        backend: Arc<B>,
-        mut tensors: HashMap<String, Tensor>,
-    ) -> Result<Self> {
-        fn take(map: &mut HashMap<String, Tensor>, name: &str) -> Result<Tensor> {
-            map.remove(name)
-                .ok_or_else(|| anyhow!("missing tensor '{}' for ResNet34", name))
-        }
-
-        let conv1_weight = take(&mut tensors, "conv1.weight")?.into_device_tensor(&backend)?;
-        let conv1_bias = take(&mut tensors, "conv1.bias")?.into_device_tensor(&backend)?;
-        let conv1 = Conv2d::new(
-            Arc::clone(&backend),
-            conv1_weight,
-            Some(conv1_bias),
-            [7, 7],
-            [2, 2],
-            [1, 1],
-            Padding2d {
-                top: 3,
-                bottom: 3,
-                left: 3,
-                right: 3,
-            },
-        )?;
-
-        const STAGES: [(usize, usize); 4] = [(64, 3), (128, 4), (256, 6), (512, 3)];
-
-        let mut in_channels = 64usize;
-        let mut layers: [Vec<BasicBlock<B>>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-
-        for (stage_idx, (out_channels, blocks)) in STAGES.iter().copied().enumerate() {
-            let stage_num = stage_idx + 1;
-            for block_idx in 0..blocks {
-                let stride = if stage_idx == 0 {
-                    1usize
-                } else if block_idx == 0 {
-                    2usize
-                } else {
-                    1usize
-                };
-
-                let conv1_key = format!("layer{stage_num}.{block_idx}.conv1");
-                let conv2_key = format!("layer{stage_num}.{block_idx}.conv2");
-
-                let block_conv1_weight = take(&mut tensors, &format!("{conv1_key}.weight"))?
-                    .into_device_tensor(&backend)?;
-                let block_conv1_bias = take(&mut tensors, &format!("{conv1_key}.bias"))?
-                    .into_device_tensor(&backend)?;
-                let conv1 = Conv2d::new(
-                    Arc::clone(&backend),
-                    block_conv1_weight,
-                    Some(block_conv1_bias),
-                    [3, 3],
-                    [stride, stride],
-                    [1, 1],
-                    Padding2d {
-                        top: 1,
-                        bottom: 1,
-                        left: 1,
-                        right: 1,
-                    },
-                )?;
-
-                let block_conv2_weight = take(&mut tensors, &format!("{conv2_key}.weight"))?
-                    .into_device_tensor(&backend)?;
-                let block_conv2_bias = take(&mut tensors, &format!("{conv2_key}.bias"))?
-                    .into_device_tensor(&backend)?;
-                let conv2 = Conv2d::new(
-                    Arc::clone(&backend),
-                    block_conv2_weight,
-                    Some(block_conv2_bias),
-                    [3, 3],
-                    [1, 1],
-                    [1, 1],
-                    Padding2d {
-                        top: 1,
-                        bottom: 1,
-                        left: 1,
-                        right: 1,
-                    },
-                )?;
-
-                let downsample = if block_idx == 0 && (stride != 1 || in_channels != out_channels) {
-                    let ds_key = format!("layer{stage_num}.{block_idx}.downsample");
-                    let ds_weight = take(&mut tensors, &format!("{ds_key}.weight"))?
-                        .into_device_tensor(&backend)?;
-                    let ds_bias = take(&mut tensors, &format!("{ds_key}.bias"))?
-                        .into_device_tensor(&backend)?;
-                    Some(Conv2d::new(
-                        Arc::clone(&backend),
-                        ds_weight,
-                        Some(ds_bias),
-                        [1, 1],
-                        [stride, stride],
-                        [1, 1],
-                        Padding2d::zero(),
-                    )?)
-                } else {
-                    None
-                };
-
-                layers[stage_idx].push(BasicBlock::new(
-                    Arc::clone(&backend),
-                    conv1,
-                    conv2,
-                    downsample,
-                ));
-
-                in_channels = out_channels;
-            }
-        }
-
-        let fc_weight = take(&mut tensors, "fc.weight")?.into_device_tensor(&backend)?;
-        let fc_bias = take(&mut tensors, "fc.bias")?.into_device_tensor(&backend)?;
-        let fc_bias_len = fc_bias.shape().dims()[0];
-        let fc_weight_dims = fc_weight.shape().dims();
-        let fc_weight = if fc_weight_dims.len() == 2 && fc_weight_dims[0] == fc_bias_len {
-            // Accept canonical Torch linear weights [O, I] and pack to gpt-rs layout [I, O].
-            transpose(backend.as_ref(), &fc_weight, &[1, 0])?.freeze()?
-        } else {
-            fc_weight
+        let padding = Padding2d {
+            top: 1,
+            bottom: 1,
+            left: 1,
+            right: 1,
         };
-        let fc = Linear::new(Arc::clone(&backend), fc_weight, Some(fc_bias))?;
-
-        let [layer1, layer2, layer3, layer4] = layers;
-        Ok(ResNet34::new(
-            backend, conv1, layer1, layer2, layer3, layer4, fc,
-        ))
-    }
-}
-
-impl<B: PortableBackend + 'static> Module<B> for ResNet34<B> {
-    fn visit_params(&self, v: &mut ParamVisitor<'_, B>) -> Result<()> {
-        v.scoped("conv1", |v| self.conv1.visit_params(v))?;
-
-        for (stage_idx, stage) in [&self.layer1, &self.layer2, &self.layer3, &self.layer4]
-            .into_iter()
-            .enumerate()
-        {
-            let stage_name = format!("layer{}", stage_idx + 1);
-            v.scoped(&stage_name, |v| {
-                for (block_idx, block) in stage.iter().enumerate() {
-                    let block_name = block_idx.to_string();
-                    v.scoped(&block_name, |v| block.visit_params(v))?;
-                }
-                Ok(())
-            })?;
+        let mut x = max_pool2d(&x, [3, 3], [2, 2], padding)?;
+        let stages = [&self.layer1, &self.layer2, &self.layer3, &self.layer4];
+        for block in stages.into_iter().flatten() {
+            x = block.call(&x)?;
         }
 
-        v.scoped("fc", |v| self.fc.visit_params(v))?;
-        Ok(())
-    }
-
-    fn visit_params_mut(&mut self, v: &mut ParamVisitorMut<'_, B>) -> Result<()> {
-        v.scoped("conv1", |v| self.conv1.visit_params_mut(v))?;
-
-        for (stage_idx, stage) in [
-            &mut self.layer1,
-            &mut self.layer2,
-            &mut self.layer3,
-            &mut self.layer4,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let stage_name = format!("layer{}", stage_idx + 1);
-            v.scoped(&stage_name, |v| {
-                for (block_idx, block) in stage.iter_mut().enumerate() {
-                    let block_name = block_idx.to_string();
-                    v.scoped(&block_name, |v| block.visit_params_mut(v))?;
-                }
-                Ok(())
-            })?;
-        }
-
-        v.scoped("fc", |v| self.fc.visit_params_mut(v))?;
-        Ok(())
+        let x = global_avg_pool2d(&x)?;
+        self.fc(&x)
     }
 }
 
@@ -495,7 +149,7 @@ impl<B: PortableBackend + 'static> crate::runtime::LoadedModel<B> for ResNet34<B
     ) -> Result<crate::runtime::ModelOutput> {
         match input {
             crate::runtime::ModelInput::Vision(input) => Ok(crate::runtime::ModelOutput::Tensor(
-                ResNet34::forward(self, &input)?.to_host()?,
+                self.call(&input)?.to_host()?,
             )),
             crate::runtime::ModelInput::Tokens(_) => {
                 bail!("model '{KIND}' expects vision input, got token input")

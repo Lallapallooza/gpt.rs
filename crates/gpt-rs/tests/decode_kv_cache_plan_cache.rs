@@ -4,6 +4,7 @@ use gpt_rs::backend::spec::Program;
 use gpt_rs::inference::generate::Generator;
 use gpt_rs::inference::sampler::Sampler;
 use gpt_rs::model::{Gpt, GptConfig};
+use gpt_rs::nn::ActivationFunction;
 use gpt_rs::ops::trace::{self, ExecutionTraceSink, ProgramContext, ProgramStats};
 use gpt_rs_backend_ref_cpu::CpuPortableBackend;
 use rand::rngs::StdRng;
@@ -27,12 +28,13 @@ fn decode_kv_cache_reuses_program_cache_in_lazy_mode() -> anyhow::Result<()> {
     let mut rng = StdRng::seed_from_u64(0);
     let config = GptConfig {
         vocab_size: 32,
-        context_length: 32,
-        embed_dim: 32,
-        num_layers: 2,
-        num_heads: 4,
-        mlp_ratio: 2,
-        dropout: 0.0,
+        n_positions: 32,
+        n_embd: 32,
+        n_layer: 2,
+        n_head: 4,
+        n_inner: Some(64),
+        layer_norm_epsilon: 1e-5,
+        activation_function: ActivationFunction::GeluTanh,
     };
     let model = Gpt::random(config, Arc::clone(&backend), &mut rng)?;
     let sampler = Sampler::new(0.0);
@@ -46,7 +48,7 @@ fn decode_kv_cache_reuses_program_cache_in_lazy_mode() -> anyhow::Result<()> {
     // Prompt length 4 ensures the decode cache bucket stays stable (8) after the first step,
     // so subsequent decode steps should reuse the cached program.
     let prompt = vec![1usize, 2, 3, 4];
-    let mut gen = Generator::new(&model, &sampler, &prompt, true)?;
+    let mut gen = Generator::new(&model, &sampler, &prompt, true, None)?;
     gen.step()?;
     gen.step()?;
     gen.step()?;

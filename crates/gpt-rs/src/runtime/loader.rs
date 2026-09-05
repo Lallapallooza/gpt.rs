@@ -8,11 +8,9 @@ use crate::backend::spec::{PortableBackend, TensorInit};
 use crate::checkpoint::{CheckpointReader, CheckpointTensorEntry};
 use crate::model::config::WeightStreamingConfig;
 use crate::model::registry as model_registry;
-use crate::model::ModelConfig;
-use crate::ops::functional::{build_registry, FunctionalOverrides};
 use crate::params::{param_key, BaseParamId, ModelNamespaceId, ParamSource};
 use crate::tensor::spec_utils::backend_dtype;
-use crate::tensor::DeviceTensor;
+use crate::tensor::{DType, DeviceTensor};
 
 use super::handle::{LoadedModel, ModelHandle};
 use super::namespace::next_namespace;
@@ -256,26 +254,42 @@ fn materialize_entry<B: PortableBackend + 'static>(
     Ok(backend.materialize(TensorInit::Literal(literal))?)
 }
 
+/// Caller-side options for [`load_model_with_options`].
+#[derive(Debug, Clone, Default)]
+pub struct LoadOptions {
+    /// Parameter namespace. `None` allocates a fresh one.
+    pub namespace: Option<ModelNamespaceId>,
+    /// Overrides `runtime.matmul_input_dtype` from the checkpoint config.
+    pub matmul_input_dtype: Option<DType>,
+}
+
 pub fn load_model<B: PortableBackend + 'static>(
     backend: Arc<B>,
     path: impl AsRef<Path>,
 ) -> Result<Box<dyn LoadedModel<B>>> {
-    load_model_with_namespace(backend, path, next_namespace())
+    Ok(Box::new(load_model_with_options(
+        backend,
+        path,
+        LoadOptions::default(),
+    )?))
 }
 
-pub fn load_model_with_namespace<B: PortableBackend + 'static>(
+pub fn load_model_with_options<B: PortableBackend + 'static>(
     backend: Arc<B>,
     path: impl AsRef<Path>,
-    namespace: ModelNamespaceId,
-) -> Result<Box<dyn LoadedModel<B>>> {
+    options: LoadOptions,
+) -> Result<ModelHandle<B>> {
+    let namespace = options.namespace.unwrap_or_else(next_namespace);
     let reader = CheckpointReader::open(&path)
         .with_context(|| format!("failed to open checkpoint {}", path.as_ref().display()))?;
-    let config = reader.config().clone();
+    let mut config = reader.config().clone();
+    if let Some(dtype) = options.matmul_input_dtype {
+        config.runtime.matmul_input_dtype = Some(dtype);
+    }
     let weight_streaming = &config.runtime.weight_streaming;
     validate_weight_streaming_config(weight_streaming)?;
     let streaming_enabled = weight_streaming_enabled(weight_streaming);
     let source_cache_cfg = source_cache_config(reader.entries(), weight_streaming);
-    let registry = build_registry::<B>(&functional_overrides_from_config(&config)?);
 
     let mut specs: HashMap<String, CheckpointTensorEntry> =
         HashMap::with_capacity(reader.entries().len());
@@ -321,15 +335,7 @@ pub fn load_model_with_namespace<B: PortableBackend + 'static>(
     let factory = model_registry::model_factory::<B>(kind)
         .ok_or_else(|| anyhow!("unsupported model kind '{kind}'"))?;
     let model = (factory)(backend, &config, &mut get)?;
-    Ok(Box::new(ModelHandle::new(model, registry)))
-}
-
-fn functional_overrides_from_config(cfg: &ModelConfig) -> Result<FunctionalOverrides> {
-    if !cfg.runtime.functional_overrides.is_empty() {
-        return Ok(cfg.runtime.functional_overrides.clone());
-    }
-
-    Ok(FunctionalOverrides::default())
+    Ok(ModelHandle::new(model, config.eos_token_ids))
 }
 
 fn weight_streaming_enabled(cfg: &WeightStreamingConfig) -> bool {
@@ -423,7 +429,7 @@ fn prefetch_block_base_ids(
 }
 
 fn block_layer_index(name: &str) -> Option<usize> {
-    let rest = name.strip_prefix("blocks.")?;
+    let rest = name.strip_prefix("model.layers.")?;
     let (layer_index, _) = rest.split_once('.')?;
     layer_index.parse::<usize>().ok()
 }

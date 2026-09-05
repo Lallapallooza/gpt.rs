@@ -10,9 +10,11 @@ use gpt_rs::backend::param_resolver::ParamResolver;
 use gpt_rs::backend::spec::{Instruction, PortableBackend, Program, TensorInit};
 use gpt_rs::model::config::{ModelRuntimeConfig, WeightStreamingConfig};
 use gpt_rs::model::{Gpt, GptConfig, ModelConfig};
+use gpt_rs::module::{Module, ParamVisitor, TensorRole};
+use gpt_rs::nn::ActivationFunction;
 use gpt_rs::params::base_param_id;
 use gpt_rs::runtime::{load_model, LoadedModel, ModelInput};
-use gpt_rs::tensor::Tensor;
+use gpt_rs::tensor::{DeviceTensor, Tensor};
 use gpt_rs_backend_ref_cpu::CpuPortableBackend;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -169,13 +171,14 @@ fn save_checkpoint_with_runtime(
     writer.write_all(&config_bytes)?;
 
     let mut params: Vec<(String, Tensor)> = Vec::new();
-    model.for_each_parameter(|name, tensor| {
+    let mut export = |name: &str, _: TensorRole, tensor: &DeviceTensor<CpuPortableBackend>| {
         let host = tensor
             .to_host()
             .with_context(|| format!("failed to export checkpoint tensor '{name}'"))?;
         params.push((name.to_string(), host));
         Ok(())
-    })?;
+    };
+    model.visit_params(&mut ParamVisitor::new(&mut export))?;
     params.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     let mut entries = Vec::with_capacity(params.len());
@@ -248,12 +251,13 @@ fn build_small_gpt() -> Result<Gpt<CpuPortableBackend>> {
     let mut rng = StdRng::seed_from_u64(7);
     let config = GptConfig {
         vocab_size: 32,
-        context_length: 16,
-        embed_dim: 8,
-        num_layers: 1,
-        num_heads: 2,
-        mlp_ratio: 2,
-        dropout: 0.0,
+        n_positions: 16,
+        n_embd: 8,
+        n_layer: 1,
+        n_head: 2,
+        n_inner: Some(16),
+        layer_norm_epsilon: 1e-5,
+        activation_function: ActivationFunction::GeluTanh,
     };
     Gpt::random(config, backend, &mut rng)
 }

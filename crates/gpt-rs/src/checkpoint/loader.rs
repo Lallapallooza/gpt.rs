@@ -1,8 +1,9 @@
 use crate::backend::spec::{ExternalBytes, PortableBackend};
 use crate::io::tensor_index::{decode_index, read_header, ByteReader};
 use crate::model::{Gpt, GptConfig, ModelConfig};
+use crate::nn::LayerLoader;
 use crate::params::{base_param_id, BaseParamId};
-use crate::tensor::{DType, Shape, Tensor};
+use crate::tensor::{DType, DeviceTensor, Shape, Tensor};
 use anyhow::{anyhow, bail, ensure, Result};
 use std::collections::HashMap;
 use std::fs::File;
@@ -140,7 +141,16 @@ impl LoadedCheckpoint {
         }
         let config: GptConfig = serde_json::from_value(self.config.config)
             .map_err(|err| anyhow!("invalid gpt config: {err}"))?;
-        Gpt::from_named_tensors(config, backend, self.tensors)
+        let mut tensors = self.tensors;
+        let mut get = |name: &str| -> Result<DeviceTensor<B>> {
+            let tensor = tensors
+                .remove(name)
+                .ok_or_else(|| anyhow!("missing tensor '{name}' in checkpoint"))?;
+            DeviceTensor::from_host(Arc::clone(&backend), tensor)
+        };
+        let mut params = LayerLoader::new(Arc::clone(&backend), &mut get)
+            .with_linear_input_dtype(self.config.runtime.matmul_input_dtype);
+        Gpt::build(config, &mut params)
     }
 }
 

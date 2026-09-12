@@ -65,6 +65,45 @@ impl TritonExecutor {
             return Ok(out);
         }
 
+        // Rank-2 linear layout: [M,K] · [N,K] => [M,N], a single-batch rhs-transposed GEMM.
+        if spec.batch_lhs.is_empty()
+            && spec.batch_rhs.is_empty()
+            && spec.contract_lhs.as_slice() == [1]
+            && spec.contract_rhs.as_slice() == [1]
+        {
+            let (Ok([m, k]), Ok([n, k_rhs]), Ok([out_m, out_n])) = (
+                <[usize; 2]>::try_from(lhs_dims.as_slice()),
+                <[usize; 2]>::try_from(rhs_dims.as_slice()),
+                <[usize; 2]>::try_from(out_dims.as_slice()),
+            ) else {
+                return Err(BackendError::execution(
+                    "dot_general rank-2 path expects rank-2 tensors",
+                ));
+            };
+            if k != k_rhs || out_m != m || out_n != n {
+                return Err(BackendError::execution(
+                    "dot_general shape mismatch for matrix multiplication [M,K] · [N,K]",
+                ));
+            }
+            let out = allocate_output_tensor(driver, out_spec, output)?;
+            let cfg = StridedBatchedGemmConfig {
+                m,
+                n,
+                k,
+                lhs_stride: m * k,
+                rhs_stride: n * k,
+                out_stride: m * n,
+                batches: 1,
+            };
+            cublas.sgemm_row_major_strided_batched_rhs_transposed(
+                &lhs.buffer,
+                &rhs.buffer,
+                &out.buffer,
+                cfg,
+            )?;
+            return Ok(out);
+        }
+
         // Batched rank-3 matrix multiplication: [B,M,K] · [B,K,N] => [B,M,N].
         if spec.batch_lhs.as_slice() == [0]
             && spec.batch_rhs.as_slice() == [0]
@@ -177,7 +216,7 @@ impl TritonExecutor {
         }
 
         Err(BackendError::execution(
-            "dot_general runtime supports rank-2 MxK·KxN and selected rank-3 batched variants",
+            "dot_general runtime supports rank-2 MxK·KxN, MxK·NxK and selected rank-3 batched variants",
         ))
     }
 }

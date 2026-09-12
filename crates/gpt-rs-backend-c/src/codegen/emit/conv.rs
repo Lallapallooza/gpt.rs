@@ -5,11 +5,11 @@ use gpt_rs::backend::spec::{
     CustomCallSpec, DType, ExtractPatchesSpec, Instruction, Operand, Operation, TensorSpec,
 };
 
-use super::super::profile::{backend_operation_label, emit_profiled_op, register_op_profile_unary};
+use super::super::profile::{backend_operation_label, bpack_cache_arg, register_op_profile_unary};
 use super::super::types::{MatmulCacheEntry, ValueInfo, ValueKey};
 use super::super::utils::{
-    dims_usize, emit_loops_with_indices, format_f32, linear_index_expr, literal_to_f32_scalar,
-    push_block,
+    dims_usize, emit_parallel_loops_with_indices, format_f32, linear_index_expr,
+    literal_to_f32_scalar, push_block,
 };
 use super::super::value_info::{
     ensure_dtype, operand_dtype, operand_expr, operand_input_index, operand_spec, output_info,
@@ -20,7 +20,7 @@ use super::{custom_call_attr_i64_array, EmitContext};
 pub(super) fn emit_instruction(
     inst: &Instruction,
     ctx: &mut EmitContext<'_>,
-) -> ConversionResult<bool> {
+) -> ConversionResult<Option<usize>> {
     let EmitContext {
         module,
         value_infos,
@@ -29,7 +29,7 @@ pub(super) fn emit_instruction(
         ..
     } = ctx;
 
-    match &inst.op {
+    let op_id = match &inst.op {
         Operation::ExtractPatches(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
@@ -43,21 +43,20 @@ pub(super) fn emit_instruction(
             let in_spec = operand_spec(&inst.operands[0], value_infos)?;
             let op_id = register_op_profile_unary(matmul_profile, label, &out_info.spec, &in_spec)?;
             let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_extract_patches(
-                    module,
-                    &out_info.var,
-                    &input,
-                    &out_info.spec,
-                    &in_spec,
-                    spec,
-                )
-            })?;
+            emit_extract_patches(
+                module,
+                &out_info.var,
+                &input,
+                &out_info.spec,
+                &in_spec,
+                spec,
+            )?;
+            op_id
         }
-        _ => return Ok(false),
-    }
+        _ => return Ok(None),
+    };
 
-    Ok(true)
+    Ok(Some(op_id))
 }
 
 fn emit_extract_patches(
@@ -95,7 +94,7 @@ fn emit_extract_patches(
     let pad_value = literal_to_f32_scalar(&spec.pad_value)?;
     let pad = format_f32(pad_value);
 
-    emit_loops_with_indices(module, &out_dims, 2, "o", |module, indices, indent| {
+    emit_parallel_loops_with_indices(module, &out_dims, 2, "o", |module, indices, indent| {
         let out_idx = linear_index_expr(&out_dims, indices);
         let patch_index = if indices.is_empty() {
             "0".to_string()
@@ -230,7 +229,7 @@ pub(super) fn emit_custom_call_conv2d(
     value_infos: &HashMap<ValueKey, ValueInfo>,
     literal_cache: &mut LiteralCache,
     op_id: usize,
-    mut matmul_caches: Option<&mut Vec<MatmulCacheEntry>>,
+    matmul_caches: Option<&mut Vec<MatmulCacheEntry>>,
 ) -> ConversionResult<()> {
     ensure_dtype(out_info.spec.dtype, DType::F32, "conv2d output must be f32")?;
     if operands.len() < 2 || operands.len() > 3 {
@@ -335,50 +334,22 @@ pub(super) fn emit_custom_call_conv2d(
         "#
     );
     push_block(module, 1, &header);
-    let weight_input_index = matmul_caches
-        .as_ref()
-        .and_then(|_| operand_input_index(&operands[1], value_infos));
-    let mut use_cache = false;
-    if let (Some(caches), Some(rhs_index)) = (matmul_caches.as_mut(), weight_input_index) {
-        (*caches).push(MatmulCacheEntry {
-            op_id,
-            rhs_index,
-            n: c_out,
-            k,
-        });
-        use_cache = true;
-    }
-
-    let call = if use_cache {
-        format!(
-            r#"
-                gpt_rs_c_conv2d_nhwc_f32_cached_b(
-                  in, w, b, out,
-                  {n}, {in_h}, {in_w}, {c_in},
-                  {out_h}, {out_w}, {c_out},
-                  {k_h}, {k_w},
-                  {stride_h}, {stride_w},
-                  {dilation_h}, {dilation_w},
-                  {pad_top}, {pad_left},
-                  &gpt_rs_bcache_{op_id}
-                );
-            "#
-        )
-    } else {
-        format!(
-            r#"
-                gpt_rs_c_conv2d_nhwc_f32(
-                  in, w, b, out,
-                  {n}, {in_h}, {in_w}, {c_in},
-                  {out_h}, {out_w}, {c_out},
-                  {k_h}, {k_w},
-                  {stride_h}, {stride_w},
-                  {dilation_h}, {dilation_w},
-                  {pad_top}, {pad_left}
-                );
-            "#
-        )
-    };
+    let weight_input = operand_input_index(&operands[1], value_infos);
+    let cache = bpack_cache_arg(matmul_caches, weight_input, op_id, c_out, k, c_out, 1);
+    let call = format!(
+        r#"
+            gpt_rs_c_conv2d_nhwc_f32(
+              in, w, b, out,
+              {n}, {in_h}, {in_w}, {c_in},
+              {out_h}, {out_w}, {c_out},
+              {k_h}, {k_w},
+              {stride_h}, {stride_w},
+              {dilation_h}, {dilation_w},
+              {pad_top}, {pad_left},
+              {cache}
+            );
+        "#
+    );
     push_block(module, 2, &call);
     push_block(module, 1, "}");
 

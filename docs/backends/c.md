@@ -37,6 +37,39 @@ The generated module is intentionally self-contained:
 Code generation lives in:
 - [../../crates/gpt-rs-backend-c/src/codegen/mod.rs](../../crates/gpt-rs-backend-c/src/codegen/mod.rs)
 
+Before emission, the backend pipeline ([../../crates/gpt-rs-backend-c/src/optimizer/](../../crates/gpt-rs-backend-c/src/optimizer/))
+applies these rewrites, among others:
+- Linear bf16 weights: the legalize stage rewrites `dot_general(x: f32 [m, k], cast(w: bf16 [n, k]))`
+  into a backend-private custom call. Its kernel reads the bf16 weights and widens them in registers,
+  so no f32 copy of the weights exists. See
+  [optimizer/linear.rs](../../crates/gpt-rs-backend-c/src/optimizer/linear.rs). bf16 x bf16 dots
+  in linear layout stay plain `dot_general`. Codegen has no kernel for other dots with bf16 operands
+  and rejects them.
+- Elementwise fusion: each fused kernel starts from the last op of a chain and absorbs its
+  single-use producers. The kernel reads `broadcast_to` and `slice` inputs in place and does not
+  materialise them. When the only user of a kernel is an f32 -> bf16 `cast`, the kernel writes bf16
+  directly.
+
+Emission then outlines each op into a `static` function, with the operands renamed to parameters,
+and deduplicates identical bodies. This keeps compile times low for deep models that repeat the same
+layers ([../../crates/gpt-rs-backend-c/src/codegen/outline.rs](../../crates/gpt-rs-backend-c/src/codegen/outline.rs)).
+
+## Kernels, threads, and compiler flags
+
+- Kernels live in [../../crates/gpt-rs-backend-c/src/kernels/](../../crates/gpt-rs-backend-c/src/kernels/).
+  Compiler flags and host defines live in `compiler_command()` and `host_defines()` in
+  [../../crates/gpt-rs-backend-c/src/lib.rs](../../crates/gpt-rs-backend-c/src/lib.rs).
+- `dot_kernel` in [codegen/emit/dot.rs](../../crates/gpt-rs-backend-c/src/codegen/emit/dot.rs) sends
+  each dot whose operands are both contiguous along K to
+  [kernels/linear.inc.c](../../crates/gpt-rs-backend-c/src/kernels/linear.inc.c). The exception is
+  an f32 dot with at least `LINEAR_PACK_MIN_ROWS` rows. It goes to the packed GEMM with every other
+  f32 dot, and the GEMM packing absorbs the operand strides.
+- Threads: the default is one thread per physical core. Each entry call sets the team size to
+  `GPTRS_NUM_THREADS`. A team with one thread per SMT sibling stalls at every barrier whenever
+  another process is runnable. `OMP_NUM_THREADS` overrides the default.
+- Numerics: the build does not use `-ffast-math`. The vectorised `expf`, `logf`, `tanhf` and `erff`
+  come from glibc's libmvec. They are accurate to within 4 ulp, but not correctly rounded.
+
 ## On-disk cache
 
 The cache directory defaults to a temp folder and can be overridden:
@@ -51,8 +84,9 @@ See `c_cache_dir()` and `CBackend::get_or_compile()` in
 
 ## Profiling (C backend)
 
-When `GPTRS_PROFILE_BACKEND=1`, the generated module exports per-op counters and the Rust runtime
-ingests them into the usual profiler tables.
+With `GPTRS_PROFILE_BACKEND=1`, the backend compiles the module with `-DGPTRS_C_PROFILE`. This wraps
+every op in `GPTRS_OP_BEGIN(id)` / `GPTRS_OP_END(id)` counters, and the Rust runtime ingests the
+counters into the usual profiler tables. Without the flag, the macros compile to nothing.
 
 - Enable: `GPTRS_PROFILE_BACKEND=1`
 - Implemented in: [../../crates/gpt-rs-backend-c/src/codegen/profile.rs](../../crates/gpt-rs-backend-c/src/codegen/profile.rs)

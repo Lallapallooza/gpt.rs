@@ -17,6 +17,9 @@ use crate::dtype::dtype_tag;
 pub(super) struct LiteralCache {
     next_id: usize,
     names: HashMap<LiteralKey, String>,
+    /// When set, this string collects the literal array definitions at file scope, not at their
+    /// first use, so outlined op functions can share them.
+    hoisted: Option<String>,
 }
 
 #[derive(Hash, PartialEq, Eq)]
@@ -27,6 +30,19 @@ struct LiteralKey {
 }
 
 impl LiteralCache {
+    /// Returns a cache that collects its literal arrays at file scope. Read them with
+    /// [`LiteralCache::take_hoisted`].
+    pub(super) fn hoisted() -> Self {
+        Self {
+            hoisted: Some(String::new()),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn take_hoisted(&mut self) -> String {
+        self.hoisted.take().unwrap_or_default()
+    }
+
     pub(super) fn get_or_emit(
         &mut self,
         literal: &TensorLiteral,
@@ -37,7 +53,11 @@ impl LiteralCache {
             return Ok(name.clone());
         }
         let lit_id = self.next_id;
-        let name = format!("kLit_{lit_id}");
+        let name = if self.hoisted.is_some() {
+            format!("kFileLit_{lit_id}")
+        } else {
+            format!("kLit_{lit_id}")
+        };
         self.next_id += 1;
         let values = literal_to_values(literal, None)?;
         let ctype = c_type(literal.spec.dtype)?;
@@ -47,7 +67,10 @@ impl LiteralCache {
                 static const {ctype} {name}[] = {{{values_str}}};
             "#
         );
-        push_block(module, 1, &block);
+        match self.hoisted.as_mut() {
+            Some(defs) => push_block(defs, 0, &block),
+            None => push_block(module, 1, &block),
+        }
         self.names.insert(key, name.clone());
         Ok(name)
     }
@@ -547,6 +570,16 @@ pub(super) fn literal_to_values(
                 values.push(i32::from_le_bytes(bytes).to_string());
             }
             Ok(values)
+        }
+        DType::Bf16 => {
+            if literal.bytes.len() != elem_count * 2 {
+                return Err(ConversionError::new("literal byte length mismatch"));
+            }
+            Ok(literal
+                .bytes
+                .chunks_exact(2)
+                .map(|chunk| format!("0x{:04x}u", u16::from_le_bytes([chunk[0], chunk[1]])))
+                .collect())
         }
         DType::I1 => {
             if literal.bytes.len() != elem_count {

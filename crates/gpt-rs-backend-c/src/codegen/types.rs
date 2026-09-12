@@ -36,6 +36,8 @@ pub(super) struct MatmulCacheEntry {
     pub(super) rhs_index: usize,
     pub(super) n: usize,
     pub(super) k: usize,
+    pub(super) sbk: usize,
+    pub(super) sbn: usize,
 }
 #[derive(Debug, Clone)]
 pub(super) struct ResultBinding {

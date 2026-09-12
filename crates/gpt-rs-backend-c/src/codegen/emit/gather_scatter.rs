@@ -4,11 +4,10 @@ use gpt_rs::backend::spec::{
     ScatterReduceKind, ScatterReduceSpec, ScatterSpec, TensorSpec,
 };
 
-use super::super::profile::{
-    backend_operation_label, emit_profiled_op, register_op_profile_generic,
-};
+use super::super::profile::{backend_operation_label, register_op_profile_generic};
 use super::super::utils::{
-    axis_index, dims_usize, emit_loops_with_indices, linear_index_expr, push_block,
+    axis_index, c_type, dims_usize, emit_loops_with_indices, emit_parallel_loops_with_indices,
+    ensure_copy_dtypes, linear_index_expr, push_block,
 };
 use super::super::value_info::{
     ensure_dtype, operand_dtype, operand_expr, operand_spec, operand_specs, output_info,
@@ -18,7 +17,7 @@ use super::EmitContext;
 pub(super) fn emit_instruction(
     inst: &Instruction,
     ctx: &mut EmitContext<'_>,
-) -> ConversionResult<bool> {
+) -> ConversionResult<Option<usize>> {
     let EmitContext {
         module,
         value_infos,
@@ -27,14 +26,13 @@ pub(super) fn emit_instruction(
         ..
     } = ctx;
 
-    match &inst.op {
+    let op_id = match &inst.op {
         Operation::Take => {
             let out_info = output_info(value_infos, inst.id)?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             let indices_dtype = operand_dtype(&inst.operands[1], value_infos)?;
-            ensure_dtype(input_dtype, DType::F32, "take input must be f32")?;
+            ensure_copy_dtypes("take", &[input_dtype], out_info.spec.dtype)?;
             ensure_dtype(indices_dtype, DType::Si32, "take indices must be si32")?;
-            ensure_dtype(out_info.spec.dtype, DType::F32, "take output must be f32")?;
             let label = backend_operation_label(&inst.op);
             let input_specs = operand_specs(&inst.operands, value_infos)?;
             let op_id =
@@ -43,25 +41,23 @@ pub(super) fn emit_instruction(
             let indices = operand_expr(&inst.operands[1], value_infos, module, literal_cache)?;
             let in_spec = operand_spec(&inst.operands[0], value_infos)?;
             let idx_spec = operand_spec(&inst.operands[1], value_infos)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_take(
-                    module,
-                    &out_info.var,
-                    &input,
-                    &indices,
-                    &out_info.spec,
-                    &in_spec,
-                    &idx_spec,
-                )
-            })?;
+            emit_take(
+                module,
+                &out_info.var,
+                &input,
+                &indices,
+                &out_info.spec,
+                &in_spec,
+                &idx_spec,
+            )?;
+            op_id
         }
         Operation::Gather(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             let indices_dtype = operand_dtype(&inst.operands[1], value_infos)?;
-            ensure_dtype(input_dtype, DType::F32, "gather input must be f32")?;
+            ensure_copy_dtypes("gather", &[input_dtype], out_info.spec.dtype)?;
             ensure_dtype(indices_dtype, DType::Si32, "gather indices must be si32")?;
-            ensure_dtype(out_info.spec.dtype, DType::F32, "gather output must be f32")?;
             let label = backend_operation_label(&inst.op);
             let input_specs = operand_specs(&inst.operands, value_infos)?;
             let op_id =
@@ -70,18 +66,17 @@ pub(super) fn emit_instruction(
             let indices = operand_expr(&inst.operands[1], value_infos, module, literal_cache)?;
             let in_spec = operand_spec(&inst.operands[0], value_infos)?;
             let idx_spec = operand_spec(&inst.operands[1], value_infos)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_gather(
-                    module,
-                    &out_info.var,
-                    &input,
-                    &indices,
-                    &out_info.spec,
-                    &in_spec,
-                    &idx_spec,
-                    spec,
-                )
-            })?;
+            emit_gather(
+                module,
+                &out_info.var,
+                &input,
+                &indices,
+                &out_info.spec,
+                &in_spec,
+                &idx_spec,
+                spec,
+            )?;
+            op_id
         }
         Operation::ScatterAdd(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
@@ -110,20 +105,19 @@ pub(super) fn emit_instruction(
             let x_spec = operand_spec(&inst.operands[0], value_infos)?;
             let idx_spec = operand_spec(&inst.operands[1], value_infos)?;
             let updates_spec = operand_spec(&inst.operands[2], value_infos)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_scatter_add(
-                    module,
-                    &out_info.var,
-                    &x,
-                    &indices,
-                    &updates,
-                    &out_info.spec,
-                    &x_spec,
-                    &idx_spec,
-                    &updates_spec,
-                    spec,
-                )
-            })?;
+            emit_scatter_add(
+                module,
+                &out_info.var,
+                &x,
+                &indices,
+                &updates,
+                &out_info.spec,
+                &x_spec,
+                &idx_spec,
+                &updates_spec,
+                spec,
+            )?;
+            op_id
         }
         Operation::ScatterReduce(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
@@ -156,39 +150,26 @@ pub(super) fn emit_instruction(
             let x_spec = operand_spec(&inst.operands[0], value_infos)?;
             let idx_spec = operand_spec(&inst.operands[1], value_infos)?;
             let updates_spec = operand_spec(&inst.operands[2], value_infos)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_scatter_reduce(
-                    module,
-                    &out_info.var,
-                    &x,
-                    &indices,
-                    &updates,
-                    &out_info.spec,
-                    &x_spec,
-                    &idx_spec,
-                    &updates_spec,
-                    spec,
-                )
-            })?;
+            emit_scatter_reduce(
+                module,
+                &out_info.var,
+                &x,
+                &indices,
+                &updates,
+                &out_info.spec,
+                &x_spec,
+                &idx_spec,
+                &updates_spec,
+                spec,
+            )?;
+            op_id
         }
         Operation::DynamicSlice(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             let start_dtype = operand_dtype(&inst.operands[1], value_infos)?;
-            match input_dtype {
-                DType::F32 | DType::Si32 | DType::I1 => {}
-                _ => {
-                    return Err(ConversionError::new(
-                        "dynamic_slice input must be f32, si32, or i1",
-                    ))
-                }
-            }
+            ensure_copy_dtypes("dynamic_slice", &[input_dtype], out_info.spec.dtype)?;
             ensure_dtype(start_dtype, DType::Si32, "dynamic_slice start must be si32")?;
-            ensure_dtype(
-                out_info.spec.dtype,
-                input_dtype,
-                "dynamic_slice output must match input dtype",
-            )?;
             let label = backend_operation_label(&inst.op);
             let input_specs = operand_specs(&inst.operands, value_infos)?;
             let op_id =
@@ -196,46 +177,32 @@ pub(super) fn emit_instruction(
             let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
             let start = operand_expr(&inst.operands[1], value_infos, module, literal_cache)?;
             let in_spec = operand_spec(&inst.operands[0], value_infos)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_dynamic_slice(
-                    module,
-                    &out_info.var,
-                    &input,
-                    &start,
-                    &out_info.spec,
-                    &in_spec,
-                    spec,
-                    input_dtype,
-                )
-            })?;
+            emit_dynamic_slice(
+                module,
+                &out_info.var,
+                &input,
+                &start,
+                &out_info.spec,
+                &in_spec,
+                spec,
+                input_dtype,
+            )?;
+            op_id
         }
         Operation::DynamicUpdateSlice(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             let update_dtype = operand_dtype(&inst.operands[1], value_infos)?;
             let start_dtype = operand_dtype(&inst.operands[2], value_infos)?;
-            match input_dtype {
-                DType::F32 | DType::Si32 | DType::I1 => {}
-                _ => {
-                    return Err(ConversionError::new(
-                        "dynamic_update_slice input must be f32, si32, or i1",
-                    ))
-                }
-            }
-            ensure_dtype(
-                update_dtype,
-                input_dtype,
-                "dynamic_update_slice update must match input dtype",
+            ensure_copy_dtypes(
+                "dynamic_update_slice",
+                &[input_dtype, update_dtype],
+                out_info.spec.dtype,
             )?;
             ensure_dtype(
                 start_dtype,
                 DType::Si32,
                 "dynamic_update_slice start must be si32",
-            )?;
-            ensure_dtype(
-                out_info.spec.dtype,
-                input_dtype,
-                "dynamic_update_slice output must match input dtype",
             )?;
             let label = backend_operation_label(&inst.op);
             let input_specs = operand_specs(&inst.operands, value_infos)?;
@@ -246,25 +213,24 @@ pub(super) fn emit_instruction(
             let start = operand_expr(&inst.operands[2], value_infos, module, literal_cache)?;
             let in_spec = operand_spec(&inst.operands[0], value_infos)?;
             let update_spec = operand_spec(&inst.operands[1], value_infos)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_dynamic_update_slice(
-                    module,
-                    &out_info.var,
-                    &input,
-                    &update,
-                    &start,
-                    &out_info.spec,
-                    &in_spec,
-                    &update_spec,
-                    spec,
-                    input_dtype,
-                )
-            })?;
+            emit_dynamic_update_slice(
+                module,
+                &out_info.var,
+                &input,
+                &update,
+                &start,
+                &out_info.spec,
+                &in_spec,
+                &update_spec,
+                spec,
+                input_dtype,
+            )?;
+            op_id
         }
-        _ => return Ok(false),
-    }
+        _ => return Ok(None),
+    };
 
-    Ok(true)
+    Ok(Some(op_id))
 }
 
 fn emit_take(
@@ -293,17 +259,18 @@ fn emit_take(
         return Err(ConversionError::new("take output shape mismatch"));
     }
     let axis_len = in_dims[0];
+    let ctype = c_type(out_spec.dtype)?;
 
     let block = format!(
         r#"
             {{
-              const float* input = (const float*){input};
+              const {ctype}* input = (const {ctype}*){input};
               const int32_t* indices = (const int32_t*){indices};
-              float* out = (float*){out};
+              {ctype}* out = ({ctype}*){out};
               for (size_t i = 0; i < {indices_count}; ++i) {{
                 int32_t idx = indices[i];
                 if (idx < 0 || idx >= {axis_len}) {{ return -5; }}
-                memcpy(out + i * {slice}, input + ((size_t)idx) * {slice}, {slice} * sizeof(float));
+                memcpy(out + i * {slice}, input + ((size_t)idx) * {slice}, {slice} * sizeof({ctype}));
               }}
             }}
         "#
@@ -380,16 +347,7 @@ fn emit_dynamic_slice(
         return Err(ConversionError::new("dynamic_slice output shape mismatch"));
     }
 
-    let ctype = match dtype {
-        DType::F32 => "float",
-        DType::Si32 => "int32_t",
-        DType::I1 => "uint8_t",
-        _ => {
-            return Err(ConversionError::new(
-                "dynamic_slice dtype must be f32, si32, or i1",
-            ))
-        }
-    };
+    let ctype = c_type(dtype)?;
     let header = format!(
         r#"
             {{
@@ -411,7 +369,7 @@ fn emit_dynamic_slice(
         push_block(module, 2, &block);
     }
 
-    emit_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
+    emit_parallel_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
         let mut in_indices = Vec::with_capacity(indices.len());
         for (axis, idx) in indices.iter().enumerate() {
             let start_axis = axis;
@@ -454,16 +412,7 @@ fn emit_dynamic_update_slice(
         ));
     }
 
-    let ctype = match dtype {
-        DType::F32 => "float",
-        DType::Si32 => "int32_t",
-        DType::I1 => "uint8_t",
-        _ => {
-            return Err(ConversionError::new(
-                "dynamic_update_slice dtype must be f32, si32, or i1",
-            ))
-        }
-    };
+    let ctype = c_type(dtype)?;
     let header = format!(
         r#"
             {{

@@ -61,8 +61,28 @@ pub(super) fn c_type(dtype: DType) -> ConversionResult<&'static str> {
         DType::F32 => Ok("float"),
         DType::Si32 => Ok("int32_t"),
         DType::I1 => Ok("uint8_t"),
+        // bfloat16 values are carried as raw bit patterns.
+        DType::Bf16 => Ok("uint16_t"),
         _ => Err(ConversionError::new("dtype not supported by C codegen")),
     }
+}
+
+/// Validates the operands of pure data-movement ops. These ops copy elements through `c_type`
+/// pointers, so they work for any representable dtype when the input and output dtypes agree.
+pub(super) fn ensure_copy_dtypes(
+    op: &str,
+    inputs: &[DType],
+    output: DType,
+) -> ConversionResult<()> {
+    c_type(output)?;
+    for dtype in inputs {
+        if *dtype != output {
+            return Err(ConversionError::new(format!(
+                "{op} operands must match the output dtype ({output:?}), got {dtype:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 pub(super) fn emit_memcpy(module: &mut String, out: &str, input: &str, byte_len: usize) {
     if out == input {
@@ -113,6 +133,106 @@ pub(super) fn linear_index_expr(dims: &[usize], indices: &[String]) -> String {
     }
     expr
 }
+/// Returns the `#pragma omp parallel for` line for `collapse` nested loops over `total`
+/// independent output elements. Returns `None` when the work is too small to pay for the fork/join.
+pub(super) fn omp_parallel_pragma(total: usize, collapse: usize) -> Option<String> {
+    if total < crate::kernels::PARALLEL_MIN_WORK || collapse == 0 {
+        return None;
+    }
+    let collapse = if collapse > 1 {
+        format!(" collapse({collapse})")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "#pragma omp parallel for{collapse} schedule(static)"
+    ))
+}
+
+// Threads also share long innermost loops, in chunks that are long enough to stay vectorised.
+const PARALLEL_INNER_CHUNK: usize = 2048;
+
+/// Like [`emit_loops_with_indices`], for loop nests whose iterations write distinct output
+/// elements, so they are safe to run concurrently. Never use it for reductions or scatters. The
+/// innermost loop is never collapsed, so the compiler can still vectorise it.
+pub(super) fn emit_parallel_loops_with_indices<F>(
+    module: &mut String,
+    dims: &[usize],
+    indent: usize,
+    prefix: &str,
+    body: F,
+) where
+    F: FnOnce(&mut String, &[String], usize),
+{
+    let total: usize = dims.iter().product();
+    let Some((&inner, outer)) = dims.split_last() else {
+        return emit_loops_with_indices(module, dims, indent, prefix, body);
+    };
+    let chunked = !outer.is_empty() && inner > PARALLEL_INNER_CHUNK;
+    let collapse = if outer.is_empty() {
+        1
+    } else {
+        outer.len() + usize::from(chunked)
+    };
+    let Some(pragma) = omp_parallel_pragma(total, collapse) else {
+        return emit_loops_with_indices(module, dims, indent, prefix, body);
+    };
+    push_line(module, indent, &pragma);
+    if !chunked {
+        return emit_loops_with_indices(module, dims, indent, prefix, body);
+    }
+    let idx = format!("{prefix}{}", dims.len() - 1);
+    let chunk = PARALLEL_INNER_CHUNK;
+    let chunk_loop = format!("for (size_t {idx}_c = 0; {idx}_c < {inner}; {idx}_c += {chunk}) {{");
+    let inner_loop = format!(
+        "for (size_t {idx} = {idx}_c; {idx} < GPTRS_MIN({idx}_c + {chunk}, {inner}); ++{idx}) {{"
+    );
+    emit_loops_with_indices(
+        module,
+        outer,
+        indent,
+        prefix,
+        |module, outer_indices, indent| {
+            push_line(module, indent, &chunk_loop);
+            push_line(module, indent + 1, &inner_loop);
+            let mut indices = outer_indices.to_vec();
+            indices.push(idx.clone());
+            body(module, &indices, indent + 2);
+            push_line(module, indent + 1, "}");
+            push_line(module, indent, "}");
+        },
+    );
+}
+
+/// Emits `for (size_t i = 0; i < elem_count; ++i) { body }` over flat buffers, split across
+/// threads when large. Each input binds to a `const <ctype>*` with the given name. `out` binds to
+/// a `<ctype>*` named `out`.
+pub(super) fn emit_flat_loop(
+    module: &mut String,
+    inputs: &[(&str, &str, &str)],
+    out: (&str, &str),
+    elem_count: usize,
+    body: &str,
+) {
+    let mut block = String::from("{\n");
+    for (ctype, name, expr) in inputs {
+        block.push_str(&format!(
+            "  const {ctype}* {name} = (const {ctype}*){expr};\n"
+        ));
+    }
+    let (out_ctype, out_var) = out;
+    block.push_str(&format!("  {out_ctype}* out = ({out_ctype}*){out_var};\n"));
+    if let Some(pragma) = omp_parallel_pragma(elem_count, 1) {
+        block.push_str(&format!("  {pragma}\n"));
+    }
+    block.push_str(&format!("  for (size_t i = 0; i < {elem_count}; ++i) {{\n"));
+    for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        block.push_str(&format!("    {line}\n"));
+    }
+    block.push_str("  }\n}");
+    push_block(module, 1, &block);
+}
+
 pub(super) fn emit_loops_with_indices<F>(
     module: &mut String,
     dims: &[usize],

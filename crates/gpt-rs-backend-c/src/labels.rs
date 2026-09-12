@@ -2,7 +2,9 @@ use gpt_rs::backend::spec::{
     ComparisonOp, ElementwiseBinaryOp, ElementwiseUnaryOp, Operation, ReduceKind,
 };
 
-use crate::targets::{TARGET_CONV2D_NHWC_F32_V1, TARGET_ELEMENTWISE_FUSED_F32_V1};
+use crate::targets::{
+    TARGET_CONV2D_NHWC_F32_V1, TARGET_ELEMENTWISE_FUSED, TARGET_LINEAR_NT_F32_BF16,
+};
 
 pub(crate) const LABEL_BACKEND_MATMUL: &str = "backend.matmul";
 pub(crate) const LABEL_BACKEND_DOT_GENERAL: &str = "backend.dot_general";
@@ -203,7 +205,8 @@ pub(crate) fn backend_operation_label(op: &Operation) -> &'static str {
         Operation::Requantize(_) => LABEL_BACKEND_REQUANTIZE,
         Operation::CustomCall(spec) => match spec.target.as_str() {
             TARGET_CONV2D_NHWC_F32_V1 => LABEL_BACKEND_CONV2D_NHWC,
-            TARGET_ELEMENTWISE_FUSED_F32_V1 => LABEL_BACKEND_ELEMENTWISE_FUSED,
+            TARGET_ELEMENTWISE_FUSED => LABEL_BACKEND_ELEMENTWISE_FUSED,
+            TARGET_LINEAR_NT_F32_BF16 => LABEL_BACKEND_DOT_GENERAL,
             _ => LABEL_BACKEND_CUSTOM_CALL,
         },
         _ => LABEL_BACKEND_OTHER,

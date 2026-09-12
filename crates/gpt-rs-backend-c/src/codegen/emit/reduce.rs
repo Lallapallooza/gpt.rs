@@ -5,12 +5,13 @@ use gpt_rs::backend::spec::{
 };
 
 use super::super::profile::{
-    backend_operation_label, emit_profiled_op, register_op_profile_generic,
-    register_op_profile_multi_output, register_op_profile_unary,
+    backend_operation_label, register_op_profile_generic, register_op_profile_multi_output,
+    register_op_profile_unary,
 };
 use super::super::types::ValueInfo;
 use super::super::utils::{
-    axis_index, dims_usize, emit_loops_with_indices, linear_index_expr, push_block,
+    axis_index, dims_usize, emit_loops_with_indices, emit_parallel_loops_with_indices,
+    linear_index_expr, push_block,
 };
 use super::super::value_info::{
     ensure_dtype, operand_dtype, operand_expr, operand_spec, operand_specs, output_info,
@@ -21,7 +22,7 @@ use super::EmitContext;
 pub(super) fn emit_instruction(
     inst: &Instruction,
     ctx: &mut EmitContext<'_>,
-) -> ConversionResult<bool> {
+) -> ConversionResult<Option<usize>> {
     let EmitContext {
         module,
         value_infos,
@@ -30,7 +31,7 @@ pub(super) fn emit_instruction(
         ..
     } = ctx;
 
-    match &inst.op {
+    let op_id = match &inst.op {
         Operation::Reduce(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
@@ -41,16 +42,15 @@ pub(super) fn emit_instruction(
             let op_id =
                 register_op_profile_unary(matmul_profile, label, &out_info.spec, &input_spec)?;
             let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_reduce(
-                    module,
-                    &out_info.var,
-                    &input,
-                    &out_info.spec,
-                    &input_spec,
-                    spec,
-                )
-            })?;
+            emit_reduce(
+                module,
+                &out_info.var,
+                &input,
+                &out_info.spec,
+                &input_spec,
+                spec,
+            )?;
+            op_id
         }
         Operation::ArgMax(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
@@ -66,16 +66,15 @@ pub(super) fn emit_instruction(
             let op_id =
                 register_op_profile_unary(matmul_profile, label, &out_info.spec, &input_spec)?;
             let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_argmax(
-                    module,
-                    &out_info.var,
-                    &input,
-                    &out_info.spec,
-                    &input_spec,
-                    spec,
-                )
-            })?;
+            emit_argmax(
+                module,
+                &out_info.var,
+                &input,
+                &out_info.spec,
+                &input_spec,
+                spec,
+            )?;
+            op_id
         }
         Operation::ReduceWindow(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
@@ -90,16 +89,15 @@ pub(super) fn emit_instruction(
             let in_spec = operand_spec(&inst.operands[0], value_infos)?;
             let op_id = register_op_profile_unary(matmul_profile, label, &out_info.spec, &in_spec)?;
             let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_reduce_window(
-                    module,
-                    &out_info.var,
-                    &input,
-                    &out_info.spec,
-                    &in_spec,
-                    spec,
-                )
-            })?;
+            emit_reduce_window(
+                module,
+                &out_info.var,
+                &input,
+                &out_info.spec,
+                &in_spec,
+                spec,
+            )?;
+            op_id
         }
         Operation::TopK(spec) => {
             let outputs = output_infos(value_infos, inst.id)?;
@@ -114,9 +112,8 @@ pub(super) fn emit_instruction(
                 register_op_profile_multi_output(matmul_profile, label, &outputs, &input_specs)?;
             let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
             let in_spec = operand_spec(&inst.operands[0], value_infos)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_topk(module, &input, &in_spec, outputs[0], outputs[1], spec)
-            })?;
+            emit_topk(module, &input, &in_spec, outputs[0], outputs[1], spec)?;
+            op_id
         }
         Operation::SegmentReduce(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
@@ -141,23 +138,22 @@ pub(super) fn emit_instruction(
             let indices = operand_expr(&inst.operands[1], value_infos, module, literal_cache)?;
             let in_spec = operand_spec(&inst.operands[0], value_infos)?;
             let idx_spec = operand_spec(&inst.operands[1], value_infos)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_segment_reduce(
-                    module,
-                    &out_info.var,
-                    &input,
-                    &indices,
-                    &out_info.spec,
-                    &in_spec,
-                    &idx_spec,
-                    spec,
-                )
-            })?;
+            emit_segment_reduce(
+                module,
+                &out_info.var,
+                &input,
+                &indices,
+                &out_info.spec,
+                &in_spec,
+                &idx_spec,
+                spec,
+            )?;
+            op_id
         }
-        _ => return Ok(false),
-    }
+        _ => return Ok(None),
+    };
 
-    Ok(true)
+    Ok(Some(op_id))
 }
 
 fn emit_reduce(
@@ -172,14 +168,11 @@ fn emit_reduce(
     let out_dims = dims_usize(out_spec)?;
     let rank = in_dims.len();
     let mut axes_set = vec![false; rank];
-    let mut reduce_axes = Vec::new();
     for axis in &spec.axes {
-        let idx = axis_index(*axis as isize, rank)?;
-        if !axes_set[idx] {
-            axes_set[idx] = true;
-            reduce_axes.push(idx);
-        }
+        axes_set[axis_index(*axis as isize, rank)?] = true;
     }
+    // Reduced axes in memory order, so the innermost loop walks the fastest-varying one.
+    let reduce_axes: Vec<usize> = (0..rank).filter(|axis| axes_set[*axis]).collect();
     let reduce_dims: Vec<usize> = reduce_axes.iter().map(|&i| in_dims[i]).collect();
     let mut input_axis_to_output = vec![None; rank];
     if spec.keepdims {
@@ -198,43 +191,68 @@ fn emit_reduce(
         }
     }
 
-    emit_loops_with_indices(module, &out_dims, 2, "o", |module, out_indices, indent| {
+    emit_parallel_loops_with_indices(module, &out_dims, 2, "o", |module, out_indices, indent| {
         let init = match spec.kind {
             ReduceKind::Sum => "0.0f",
             ReduceKind::Max => "-INFINITY",
             ReduceKind::Min => "INFINITY",
         };
         push_block(module, indent, &format!("float acc = {init};"));
-
-        emit_loops_with_indices(
-            module,
-            &reduce_dims,
-            indent,
-            "r",
-            |module, red_indices, indent| {
-                let mut in_indices = vec!["0".to_string(); rank];
-                for axis in 0..rank {
-                    if axes_set[axis] {
-                        let pos = reduce_axes.iter().position(|&a| a == axis).unwrap_or(0);
-                        in_indices[axis] = red_indices[pos].clone();
-                    } else {
-                        let out_pos = input_axis_to_output[axis].unwrap_or(0);
-                        in_indices[axis] = out_indices[out_pos].clone();
-                    }
+        let update = |module: &mut String, red_indices: &[String], indent: usize| {
+            let mut in_indices = vec!["0".to_string(); rank];
+            for axis in 0..rank {
+                if axes_set[axis] {
+                    let pos = reduce_axes.iter().position(|&a| a == axis).unwrap_or(0);
+                    in_indices[axis] = red_indices[pos].clone();
+                } else {
+                    let out_pos = input_axis_to_output[axis].unwrap_or(0);
+                    in_indices[axis] = out_indices[out_pos].clone();
                 }
-                let in_idx = linear_index_expr(&in_dims, &in_indices);
-                let update = match spec.kind {
-                    ReduceKind::Sum => format!("acc += {input}[{in_idx}];"),
-                    ReduceKind::Max => {
-                        format!("if ({input}[{in_idx}] > acc) acc = {input}[{in_idx}];")
+            }
+            let in_idx = linear_index_expr(&in_dims, &in_indices);
+            let update = match spec.kind {
+                ReduceKind::Sum => format!("acc += {input}[{in_idx}];"),
+                ReduceKind::Max => {
+                    format!("if ({input}[{in_idx}] > acc) acc = {input}[{in_idx}];")
+                }
+                ReduceKind::Min => {
+                    format!("if ({input}[{in_idx}] < acc) acc = {input}[{in_idx}];")
+                }
+            };
+            push_block(module, indent, &update);
+        };
+        match reduce_dims.split_last() {
+            None => update(module, &[], indent),
+            Some((&inner, outer)) => {
+                emit_loops_with_indices(module, outer, indent, "r", |module, outer_idx, indent| {
+                    // When the innermost reduced axis is contiguous, the compiler may reassociate
+                    // this one accumulator, so the loop vectorises. No other value in the module
+                    // is reassociated.
+                    if reduce_axes.last() == Some(&(rank - 1)) {
+                        let op = match spec.kind {
+                            ReduceKind::Sum => "+",
+                            ReduceKind::Max => "max",
+                            ReduceKind::Min => "min",
+                        };
+                        push_block(
+                            module,
+                            indent,
+                            &format!("#pragma omp simd reduction({op}:acc)"),
+                        );
                     }
-                    ReduceKind::Min => {
-                        format!("if ({input}[{in_idx}] < acc) acc = {input}[{in_idx}];")
-                    }
-                };
-                push_block(module, indent, &update);
-            },
-        );
+                    let r = format!("r{}", outer.len());
+                    push_block(
+                        module,
+                        indent,
+                        &format!("for (size_t {r} = 0; {r} < {inner}; ++{r}) {{"),
+                    );
+                    let mut red_indices = outer_idx.to_vec();
+                    red_indices.push(r);
+                    update(module, &red_indices, indent + 1);
+                    push_block(module, indent, "}");
+                });
+            }
+        }
 
         let out_idx = linear_index_expr(&out_dims, out_indices);
         push_block(module, indent, &format!("{out}[{out_idx}] = acc;"));
@@ -326,7 +344,7 @@ fn emit_reduce_window(
         ));
     }
 
-    emit_loops_with_indices(module, &out_dims, 2, "o", |module, out_indices, indent| {
+    emit_parallel_loops_with_indices(module, &out_dims, 2, "o", |module, out_indices, indent| {
         let init = match spec.reduce {
             ReduceKind::Sum => "0.0f",
             ReduceKind::Max => "-INFINITY",

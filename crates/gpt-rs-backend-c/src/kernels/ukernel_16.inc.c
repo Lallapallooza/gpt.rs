@@ -1,5 +1,6 @@
-static inline void gpt_rs_ukernel_1x16_zero(const float* ap, const float* bp, float* c,
-                                            size_t ldc, size_t kc) {
+#if GPTRS_HAS_AVX512
+static inline void gpt_rs_ukernel_1x16_zero(const float* ap, const float* bp, size_t b_stride,
+                                            float* c, size_t ldc, size_t kc) {
     __m512 c0 = _mm512_setzero_ps();
     const float* a0 = ap;
     for (size_t p = 0; p < kc; ++p) {
@@ -7,13 +8,13 @@ static inline void gpt_rs_ukernel_1x16_zero(const float* ap, const float* bp, fl
         const __m512 a = _mm512_set1_ps(*a0);
         c0 = _mm512_fmadd_ps(a, b0, c0);
         a0 += GPTRS_MR;
-        bp += GPTRS_NR;
+        bp += b_stride;
     }
     _mm512_storeu_ps(c, c0);
 }
 
-static inline void gpt_rs_ukernel_1x16_accum(const float* ap, const float* bp, float* c,
-                                             size_t ldc, size_t kc) {
+static inline void gpt_rs_ukernel_1x16_accum(const float* ap, const float* bp, size_t b_stride,
+                                             float* c, size_t ldc, size_t kc) {
     __m512 c0 = _mm512_loadu_ps(c);
     const float* a0 = ap;
     for (size_t p = 0; p < kc; ++p) {
@@ -21,13 +22,13 @@ static inline void gpt_rs_ukernel_1x16_accum(const float* ap, const float* bp, f
         const __m512 a = _mm512_set1_ps(*a0);
         c0 = _mm512_fmadd_ps(a, b0, c0);
         a0 += GPTRS_MR;
-        bp += GPTRS_NR;
+        bp += b_stride;
     }
     _mm512_storeu_ps(c, c0);
 }
 
-static inline void gpt_rs_ukernel_2x16_zero(const float* ap, const float* bp, float* c,
-                                            size_t ldc, size_t kc) {
+static inline void gpt_rs_ukernel_2x16_zero(const float* ap, const float* bp, size_t b_stride,
+                                            float* c, size_t ldc, size_t kc) {
     __m512 c0 = _mm512_setzero_ps();
     __m512 c1 = _mm512_setzero_ps();
     const float* a0 = ap;
@@ -40,14 +41,14 @@ static inline void gpt_rs_ukernel_2x16_zero(const float* ap, const float* bp, fl
         c1 = _mm512_fmadd_ps(va1, b0, c1);
         a0 += GPTRS_MR;
         a1 += GPTRS_MR;
-        bp += GPTRS_NR;
+        bp += b_stride;
     }
     _mm512_storeu_ps(c, c0);
     _mm512_storeu_ps(c + ldc, c1);
 }
 
-static inline void gpt_rs_ukernel_2x16_accum(const float* ap, const float* bp, float* c,
-                                             size_t ldc, size_t kc) {
+static inline void gpt_rs_ukernel_2x16_accum(const float* ap, const float* bp, size_t b_stride,
+                                             float* c, size_t ldc, size_t kc) {
     __m512 c0 = _mm512_loadu_ps(c);
     __m512 c1 = _mm512_loadu_ps(c + ldc);
     const float* a0 = ap;
@@ -60,14 +61,14 @@ static inline void gpt_rs_ukernel_2x16_accum(const float* ap, const float* bp, f
         c1 = _mm512_fmadd_ps(va1, b0, c1);
         a0 += GPTRS_MR;
         a1 += GPTRS_MR;
-        bp += GPTRS_NR;
+        bp += b_stride;
     }
     _mm512_storeu_ps(c, c0);
     _mm512_storeu_ps(c + ldc, c1);
 }
 
-static inline void gpt_rs_ukernel_4x16_zero(const float* ap, const float* bp, float* c,
-                                            size_t ldc, size_t kc) {
+static inline void gpt_rs_ukernel_4x16_zero(const float* ap, const float* bp, size_t b_stride,
+                                            float* c, size_t ldc, size_t kc) {
     __m512 c0 = _mm512_setzero_ps();
     __m512 c1 = _mm512_setzero_ps();
     __m512 c2 = _mm512_setzero_ps();
@@ -90,7 +91,7 @@ static inline void gpt_rs_ukernel_4x16_zero(const float* ap, const float* bp, fl
         a1 += GPTRS_MR;
         a2 += GPTRS_MR;
         a3 += GPTRS_MR;
-        bp += GPTRS_NR;
+        bp += b_stride;
     }
     _mm512_storeu_ps(c, c0);
     _mm512_storeu_ps(c + ldc, c1);
@@ -98,8 +99,8 @@ static inline void gpt_rs_ukernel_4x16_zero(const float* ap, const float* bp, fl
     _mm512_storeu_ps(c + 3 * ldc, c3);
 }
 
-static inline void gpt_rs_ukernel_4x16_accum(const float* ap, const float* bp, float* c,
-                                             size_t ldc, size_t kc) {
+static inline void gpt_rs_ukernel_4x16_accum(const float* ap, const float* bp, size_t b_stride,
+                                             float* c, size_t ldc, size_t kc) {
     __m512 c0 = _mm512_loadu_ps(c);
     __m512 c1 = _mm512_loadu_ps(c + ldc);
     __m512 c2 = _mm512_loadu_ps(c + 2 * ldc);
@@ -122,7 +123,7 @@ static inline void gpt_rs_ukernel_4x16_accum(const float* ap, const float* bp, f
         a1 += GPTRS_MR;
         a2 += GPTRS_MR;
         a3 += GPTRS_MR;
-        bp += GPTRS_NR;
+        bp += b_stride;
     }
     _mm512_storeu_ps(c, c0);
     _mm512_storeu_ps(c + ldc, c1);
@@ -130,8 +131,8 @@ static inline void gpt_rs_ukernel_4x16_accum(const float* ap, const float* bp, f
     _mm512_storeu_ps(c + 3 * ldc, c3);
 }
 
-static inline void gpt_rs_ukernel_6x16_zero(const float* ap, const float* bp, float* c,
-                                            size_t ldc, size_t kc) {
+static inline void gpt_rs_ukernel_6x16_zero(const float* ap, const float* bp, size_t b_stride,
+                                            float* c, size_t ldc, size_t kc) {
     __m512 c0 = _mm512_setzero_ps();
     __m512 c1 = _mm512_setzero_ps();
     __m512 c2 = _mm512_setzero_ps();
@@ -164,7 +165,7 @@ static inline void gpt_rs_ukernel_6x16_zero(const float* ap, const float* bp, fl
         a3 += GPTRS_MR;
         a4 += GPTRS_MR;
         a5 += GPTRS_MR;
-        bp += GPTRS_NR;
+        bp += b_stride;
     }
     _mm512_storeu_ps(c, c0);
     _mm512_storeu_ps(c + ldc, c1);
@@ -174,8 +175,8 @@ static inline void gpt_rs_ukernel_6x16_zero(const float* ap, const float* bp, fl
     _mm512_storeu_ps(c + 5 * ldc, c5);
 }
 
-static inline void gpt_rs_ukernel_6x16_accum(const float* ap, const float* bp, float* c,
-                                             size_t ldc, size_t kc) {
+static inline void gpt_rs_ukernel_6x16_accum(const float* ap, const float* bp, size_t b_stride,
+                                             float* c, size_t ldc, size_t kc) {
     __m512 c0 = _mm512_loadu_ps(c);
     __m512 c1 = _mm512_loadu_ps(c + ldc);
     __m512 c2 = _mm512_loadu_ps(c + 2 * ldc);
@@ -208,7 +209,7 @@ static inline void gpt_rs_ukernel_6x16_accum(const float* ap, const float* bp, f
         a3 += GPTRS_MR;
         a4 += GPTRS_MR;
         a5 += GPTRS_MR;
-        bp += GPTRS_NR;
+        bp += b_stride;
     }
     _mm512_storeu_ps(c, c0);
     _mm512_storeu_ps(c + ldc, c1);
@@ -218,8 +219,8 @@ static inline void gpt_rs_ukernel_6x16_accum(const float* ap, const float* bp, f
     _mm512_storeu_ps(c + 5 * ldc, c5);
 }
 
-static inline void gpt_rs_ukernel_6x16_bias(const float* ap, const float* bp, float* c,
-                                            size_t ldc, size_t kc, const float* bias) {
+static inline void gpt_rs_ukernel_6x16_bias(const float* ap, const float* bp, size_t b_stride,
+                                            float* c, size_t ldc, size_t kc, const float* bias) {
     const __m512 b = _mm512_loadu_ps(bias);
     __m512 c0 = b;
     __m512 c1 = b;
@@ -253,7 +254,7 @@ static inline void gpt_rs_ukernel_6x16_bias(const float* ap, const float* bp, fl
         a3 += GPTRS_MR;
         a4 += GPTRS_MR;
         a5 += GPTRS_MR;
-        bp += GPTRS_NR;
+        bp += b_stride;
     }
     _mm512_storeu_ps(c, c0);
     _mm512_storeu_ps(c + ldc, c1);
@@ -262,3 +263,4 @@ static inline void gpt_rs_ukernel_6x16_bias(const float* ap, const float* bp, fl
     _mm512_storeu_ps(c + 4 * ldc, c4);
     _mm512_storeu_ps(c + 5 * ldc, c5);
 }
+#endif

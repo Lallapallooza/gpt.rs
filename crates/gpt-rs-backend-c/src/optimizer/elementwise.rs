@@ -5,11 +5,12 @@ use gpt_rs::backend::{
     optimizer::{FunctionPass, OptimizeContext, PassResult},
     rewriter::ProgramRewriter,
     spec::{
-        CustomCallAttr, CustomCallSpec, DType, Function, Operand, Operation, ValueId, ValueType,
+        CastSpec, CustomCallAttr, CustomCallSpec, DType, Function, Operand, Operation, SliceSpec,
+        ValueId, ValueType,
     },
 };
 
-use crate::targets::{binary_code, unary_code, TARGET_ELEMENTWISE_FUSED_F32_V1};
+use crate::targets::{binary_code, fused_input_fits, unary_code, TARGET_ELEMENTWISE_FUSED};
 
 use super::utils::tensor_spec_of;
 
@@ -31,23 +32,19 @@ struct FusedNode {
     rhs: Option<FusedRef>,
 }
 
-struct FusionPlan {
-    inputs: Vec<Operand>,
-    nodes: Vec<FusedNode>,
+/// An input of a fused kernel. The kernel reads the operand broadcast into the output shape. When
+/// `starts` is set, the kernel reads it at an offset inside a same-rank source, which is an
+/// absorbed `slice`.
+#[derive(Clone)]
+struct FusedInput {
+    operand: Operand,
+    starts: Option<Vec<usize>>,
 }
 
-fn is_broadcastable(root_dims: &[usize], in_dims: &[usize]) -> bool {
-    if root_dims.len() < in_dims.len() {
-        return false;
-    }
-    let offset = root_dims.len() - in_dims.len();
-    for (idx, dim) in in_dims.iter().enumerate() {
-        let out_dim = root_dims[idx + offset];
-        if *dim != 1 && *dim != out_dim {
-            return false;
-        }
-    }
-    true
+struct FusionPlan {
+    inputs: Vec<FusedInput>,
+    nodes: Vec<FusedNode>,
+    removes_view: bool,
 }
 
 fn build_fusion_plan<'a, 'r>(
@@ -55,24 +52,28 @@ fn build_fusion_plan<'a, 'r>(
     root_inst: InstId,
     root_dims: &[usize],
 ) -> Option<FusionPlan> {
-    let mut inputs: Vec<Operand> = Vec::new();
-    let mut input_map: HashMap<ValueId, usize> = HashMap::new();
+    let mut inputs: Vec<FusedInput> = Vec::new();
+    let mut input_map: HashMap<(ValueId, Option<Vec<usize>>), usize> = HashMap::new();
     let mut nodes: Vec<FusedNode> = Vec::new();
     let mut memo: HashMap<ValueId, FusedRef> = HashMap::new();
     let mut visiting: HashSet<ValueId> = HashSet::new();
+    let mut fused_insts: HashSet<InstId> = HashSet::new();
+    let mut absorbed_views: Vec<ValueId> = Vec::new();
 
     struct CollectCtx<'a, 'r> {
         rewriter: &'a ProgramRewriter<'r>,
         root_dims: &'a [usize],
-        inputs: &'a mut Vec<Operand>,
-        input_map: &'a mut HashMap<ValueId, usize>,
+        inputs: &'a mut Vec<FusedInput>,
+        input_map: &'a mut HashMap<(ValueId, Option<Vec<usize>>), usize>,
         nodes: &'a mut Vec<FusedNode>,
         memo: &'a mut HashMap<ValueId, FusedRef>,
         visiting: &'a mut HashSet<ValueId>,
+        fused_insts: &'a mut HashSet<InstId>,
+        absorbed_views: &'a mut Vec<ValueId>,
     }
 
     fn add_input_value(ctx: &mut CollectCtx<'_, '_>, value: ValueId) -> Option<FusedRef> {
-        if let Some(idx) = ctx.input_map.get(&value).copied() {
+        if let Some(idx) = ctx.input_map.get(&(value, None)).copied() {
             return Some(FusedRef::Input(idx));
         }
         let spec = tensor_spec_of(ctx.rewriter, value)?;
@@ -80,12 +81,50 @@ fn build_fusion_plan<'a, 'r>(
             return None;
         }
         let dims = spec.shape.static_dims()?;
-        if !is_broadcastable(ctx.root_dims, &dims) {
+        if !fused_input_fits(ctx.root_dims, &dims, None) {
             return None;
         }
         let idx = ctx.inputs.len();
-        ctx.inputs.push(Operand::Value(value));
-        ctx.input_map.insert(value, idx);
+        ctx.inputs.push(FusedInput {
+            operand: Operand::Value(value),
+            starts: None,
+        });
+        ctx.input_map.insert((value, None), idx);
+        Some(FusedRef::Input(idx))
+    }
+
+    /// Reads the source of a `slice` at an offset instead of materialising the slice.
+    fn add_sliced_input(
+        ctx: &mut CollectCtx<'_, '_>,
+        slice_inst: InstId,
+        spec: &SliceSpec,
+    ) -> Option<FusedRef> {
+        if spec.sizes.as_slice() != ctx.root_dims {
+            return None;
+        }
+        let Some(Operand::Value(source)) = ctx.rewriter.operands(slice_inst).first().cloned()
+        else {
+            return None;
+        };
+        let source_spec = tensor_spec_of(ctx.rewriter, source)?;
+        if source_spec.dtype != DType::F32 {
+            return None;
+        }
+        let source_dims = source_spec.shape.static_dims()?;
+        if !fused_input_fits(ctx.root_dims, &source_dims, Some(&spec.starts)) {
+            return None;
+        }
+        ctx.absorbed_views.push(ctx.rewriter.value_of(slice_inst));
+        let key = (source, Some(spec.starts.clone()));
+        if let Some(idx) = ctx.input_map.get(&key).copied() {
+            return Some(FusedRef::Input(idx));
+        }
+        let idx = ctx.inputs.len();
+        ctx.inputs.push(FusedInput {
+            operand: Operand::Value(source),
+            starts: Some(spec.starts.clone()),
+        });
+        ctx.input_map.insert(key, idx);
         Some(FusedRef::Input(idx))
     }
 
@@ -97,11 +136,14 @@ fn build_fusion_plan<'a, 'r>(
                     return None;
                 }
                 let dims = literal.spec.shape.static_dims()?;
-                if !is_broadcastable(ctx.root_dims, &dims) {
+                if !fused_input_fits(ctx.root_dims, &dims, None) {
                     return None;
                 }
                 let idx = ctx.inputs.len();
-                ctx.inputs.push(operand);
+                ctx.inputs.push(FusedInput {
+                    operand,
+                    starts: None,
+                });
                 Some(FusedRef::Input(idx))
             }
             Operand::TupleElement { .. } => None,
@@ -133,15 +175,19 @@ fn build_fusion_plan<'a, 'r>(
             match ctx.rewriter.op(inst) {
                 Operation::ElementwiseUnary(op) => {
                     let spec = tensor_spec_of(ctx.rewriter, value)?;
-                    if spec.dtype != DType::F32
-                        || spec.shape.static_dims().as_deref() != Some(ctx.root_dims)
-                    {
+                    if spec.dtype != DType::F32 {
                         None
-                    } else if !force_fuse && ctx.rewriter.users_of(value).len() != 1 {
+                    } else if spec.shape.static_dims().as_deref() != Some(ctx.root_dims)
+                        || (!force_fuse && ctx.rewriter.users_of(value).len() != 1)
+                    {
+                        // The kernel reads smaller producers, such as per-row statistics, as
+                        // broadcast inputs. Values with other users are materialised once and
+                        // read as inputs.
                         add_input_operand(ctx, Operand::Value(value))
                     } else {
                         let operand = ctx.rewriter.operands(inst).first()?;
                         let lhs = collect_operand(operand, ctx)?;
+                        ctx.fused_insts.insert(inst);
                         let idx = ctx.nodes.len();
                         ctx.nodes.push(FusedNode {
                             kind: FusedKind::Unary,
@@ -154,16 +200,17 @@ fn build_fusion_plan<'a, 'r>(
                 }
                 Operation::ElementwiseBinary(op) => {
                     let spec = tensor_spec_of(ctx.rewriter, value)?;
-                    if spec.dtype != DType::F32
-                        || spec.shape.static_dims().as_deref() != Some(ctx.root_dims)
-                    {
+                    if spec.dtype != DType::F32 {
                         None
-                    } else if !force_fuse && ctx.rewriter.users_of(value).len() != 1 {
+                    } else if spec.shape.static_dims().as_deref() != Some(ctx.root_dims)
+                        || (!force_fuse && ctx.rewriter.users_of(value).len() != 1)
+                    {
                         add_input_operand(ctx, Operand::Value(value))
                     } else {
                         let operands = ctx.rewriter.operands(inst);
                         let lhs = collect_operand(operands.first()?, ctx)?;
                         let rhs = collect_operand(operands.get(1)?, ctx)?;
+                        ctx.fused_insts.insert(inst);
                         let idx = ctx.nodes.len();
                         ctx.nodes.push(FusedNode {
                             kind: FusedKind::Binary,
@@ -180,12 +227,23 @@ fn build_fusion_plan<'a, 'r>(
                         || spec.shape.static_dims().as_deref() != Some(ctx.root_dims)
                     {
                         None
-                    } else if ctx.rewriter.users_of(value).len() == 1 {
-                        let operand = ctx.rewriter.operands(inst).first()?;
-                        collect_operand(operand, ctx)
                     } else {
-                        add_input_operand(ctx, Operand::Value(value))
+                        // Reading the broadcast source in place never costs more than reading a
+                        // materialised copy. Other users keep the op alive if they need it.
+                        let operand = ctx.rewriter.operands(inst).first()?;
+                        match collect_operand(operand, ctx) {
+                            Some(fused) => {
+                                ctx.absorbed_views.push(value);
+                                Some(fused)
+                            }
+                            None => add_input_operand(ctx, Operand::Value(value)),
+                        }
                     }
+                }
+                Operation::Slice(spec) => {
+                    let spec = spec.clone();
+                    add_sliced_input(ctx, inst, &spec)
+                        .or_else(|| add_input_operand(ctx, Operand::Value(value)))
                 }
                 _ => add_input_operand(ctx, Operand::Value(value)),
             }
@@ -208,16 +266,64 @@ fn build_fusion_plan<'a, 'r>(
         nodes: &mut nodes,
         memo: &mut memo,
         visiting: &mut visiting,
+        fused_insts: &mut fused_insts,
+        absorbed_views: &mut absorbed_views,
     };
     let root_value = rewriter.value_of(root_inst);
     let root_idx = collect_value(root_value, &mut ctx, true)?;
     if matches!(root_idx, FusedRef::Input(_)) {
         return None;
     }
-    if nodes.len() < 2 {
-        return None;
+    let removes_view = absorbed_views.iter().any(|view| {
+        !rewriter.func.result_ids.contains(view)
+            && rewriter
+                .users_of(*view)
+                .iter()
+                .all(|user| fused_insts.contains(user))
+    });
+    Some(FusionPlan {
+        inputs,
+        nodes,
+        removes_view,
+    })
+}
+
+/// Erases `root` and, transitively, the elementwise producers that only fed it.
+fn erase_dead_fused_producers(rewriter: &mut ProgramRewriter<'_>, root: InstId) -> usize {
+    let mut erased = 0;
+    let mut worklist = vec![root];
+    while let Some(inst) = worklist.pop() {
+        if !rewriter.contains(inst) {
+            continue;
+        }
+        let value = rewriter.value_of(inst);
+        if !rewriter.users_of(value).is_empty() || rewriter.func.result_ids.contains(&value) {
+            continue;
+        }
+        if !matches!(
+            rewriter.op(inst),
+            Operation::ElementwiseUnary(_)
+                | Operation::ElementwiseBinary(_)
+                | Operation::BroadcastTo(_)
+                | Operation::Slice(_)
+        ) {
+            continue;
+        }
+        let producers: Vec<InstId> = rewriter
+            .operands(inst)
+            .iter()
+            .filter_map(|operand| match operand {
+                Operand::Value(value) => rewriter.inst_of(*value),
+                _ => None,
+            })
+            .collect();
+        rewriter
+            .erase_inst(inst)
+            .expect("a fused producer without users can be erased");
+        erased += 1;
+        worklist.extend(producers);
     }
-    Some(FusionPlan { inputs, nodes })
+    erased
 }
 
 pub struct CElementwiseFusionPass;
@@ -245,12 +351,20 @@ impl FunctionPass<crate::CBackend> for CElementwiseFusionPass {
 
         let mut changed = false;
         let mut rewrites = 0usize;
+        let mut erased = 0usize;
+        // Visit consumers before producers. Each fusion then starts from the last op of a chain
+        // and absorbs every single-use producer behind it.
         let insts = rewriter.insts_in_order();
-        for inst in insts {
+        for inst in insts.into_iter().rev() {
             if !rewriter.contains(inst) {
                 continue;
             }
             let root_value = rewriter.value_of(inst);
+            if rewriter.users_of(root_value).is_empty()
+                && !rewriter.func.result_ids.contains(&root_value)
+            {
+                continue;
+            }
             let root_spec = match tensor_spec_of(&rewriter, root_value) {
                 Some(spec) => spec,
                 None => continue,
@@ -267,9 +381,30 @@ impl FunctionPass<crate::CBackend> for CElementwiseFusionPass {
                 _ => continue,
             }
 
+            // A root whose only use is an f32 -> bf16 cast stores bf16 directly. Such a cast
+            // typically produces a bf16 matmul input.
+            let output_cast = match rewriter.users_of(root_value) {
+                [user]
+                    if !rewriter.func.result_ids.contains(&root_value)
+                        && matches!(
+                            rewriter.op(*user),
+                            Operation::Cast(CastSpec { dtype: DType::Bf16 })
+                        ) =>
+                {
+                    Some(*user)
+                }
+                _ => None,
+            };
+
             let Some(plan) = build_fusion_plan(&rewriter, inst, &root_dims) else {
                 continue;
             };
+            // A single op is worth rewriting only when it avoids materialising an intermediate.
+            // It does so when it reads through a broadcast or slice and makes that view dead, or
+            // when it writes through a narrowing cast.
+            if plan.nodes.len() < 2 && !plan.removes_view && output_cast.is_none() {
+                continue;
+            }
 
             let input_count = plan.inputs.len();
             let encode_ref = |reference: FusedRef| -> i64 {
@@ -298,32 +433,61 @@ impl FunctionPass<crate::CBackend> for CElementwiseFusionPass {
             attrs.insert("ops_code".into(), CustomCallAttr::I64Array(codes));
             attrs.insert("lhs".into(), CustomCallAttr::I64Array(lhs));
             attrs.insert("rhs".into(), CustomCallAttr::I64Array(rhs));
+            let slice_starts: Vec<i64> = plan
+                .inputs
+                .iter()
+                .map(|input| &input.starts)
+                .enumerate()
+                .filter_map(|(idx, starts)| starts.as_ref().map(|starts| (idx, starts)))
+                .flat_map(|(idx, starts)| {
+                    std::iter::once(idx as i64).chain(starts.iter().map(|start| *start as i64))
+                })
+                .collect();
+            if !slice_starts.is_empty() {
+                attrs.insert(
+                    "input_slice_starts".into(),
+                    CustomCallAttr::I64Array(slice_starts),
+                );
+            }
 
             let op = Operation::CustomCall(CustomCallSpec {
-                target: TARGET_ELEMENTWISE_FUSED_F32_V1.to_string(),
+                target: TARGET_ELEMENTWISE_FUSED.to_string(),
                 attrs,
             });
 
-            let output_ty = ValueType::Tensor(root_spec.clone());
-            let Ok((_new_inst, new_value)) =
-                rewriter.insert_before(inst, op, plan.inputs.clone(), output_ty)
-            else {
+            let mut output_spec = root_spec.clone();
+            if output_cast.is_some() {
+                output_spec.dtype = DType::Bf16;
+            }
+            let Ok((_new_inst, new_value)) = rewriter.insert_before(
+                inst,
+                op,
+                plan.inputs
+                    .iter()
+                    .map(|input| input.operand.clone())
+                    .collect(),
+                ValueType::Tensor(output_spec),
+            ) else {
                 continue;
             };
 
-            rewriter.replace_all_uses(root_value, new_value);
+            let replaced = match output_cast {
+                Some(cast) => rewriter.value_of(cast),
+                None => root_value,
+            };
+            rewriter.replace_all_uses(replaced, new_value);
             for result_id in &mut rewriter.func.result_ids {
-                if *result_id == root_value {
+                if *result_id == replaced {
                     *result_id = new_value;
                 }
             }
-            if let Some(old_inst) = rewriter.inst_of(root_value) {
-                if rewriter.users_of(root_value).is_empty() {
-                    rewriter
-                        .erase_inst(old_inst)
-                        .expect("c optimizer erase should succeed");
-                }
+            if let Some(cast) = output_cast {
+                rewriter
+                    .erase_inst(cast)
+                    .expect("absorbed output cast has no users left");
+                erased += 1;
             }
+            erased += erase_dead_fused_producers(&mut rewriter, inst);
 
             changed = true;
             rewrites += 1;
@@ -333,7 +497,7 @@ impl FunctionPass<crate::CBackend> for CElementwiseFusionPass {
             changed,
             iterations: 1,
             rewrites_applied: rewrites,
-            erased_insts: 0,
+            erased_insts: erased,
         }
     }
 }

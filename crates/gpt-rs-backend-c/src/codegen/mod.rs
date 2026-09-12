@@ -1,8 +1,11 @@
 mod emit;
+mod outline;
 mod profile;
 mod types;
 mod utils;
 mod value_info;
+
+use std::collections::HashMap;
 
 use gpt_rs::backend::conversion::{BufferPlan, ConversionError, ConversionResult};
 use gpt_rs::backend::spec::Program;
@@ -10,7 +13,8 @@ use gpt_rs::backend::spec::Program;
 use crate::dtype::dtype_tag_value;
 use crate::kernels;
 
-use self::emit::{emit_instructions, emit_region_function};
+use self::emit::{emit_instructions, emit_region_function, EntryEmit};
+use self::outline::Outliner;
 use self::profile::{emit_c_profile_metadata, emit_matmul_cache_metadata, OpProfile};
 use self::types::{MatmulCacheEntry, ValueKey, ValueStorage};
 use self::utils::{c_type, emit_value_array, push_block};
@@ -118,6 +122,7 @@ pub fn generate_c_module(
     let input_dims = emit_tensor_dims(&mut body, "kInputDims", &input_specs)?;
     let output_dims = emit_tensor_dims(&mut body, "kOutputDims", &output_specs)?;
 
+    let mut entry = String::new();
     let input_count = input_specs.len();
     let output_count = output_specs.len();
     let entry_header = format!(
@@ -129,16 +134,19 @@ pub fn generate_c_module(
               size_t output_count) {{
               if (input_count != {input_count}) {{ return -1; }}
               if (output_count != {output_count}) {{ return -1; }}
+            #if defined(_OPENMP) && defined(GPTRS_NUM_THREADS)
+              omp_set_num_threads(GPTRS_NUM_THREADS);
+            #endif
         "#
     );
-    push_block(&mut body, 0, &entry_header);
+    push_block(&mut entry, 0, &entry_header);
 
     for (index, dims_name) in input_dims.iter().enumerate() {
         let spec = &input_specs[index];
         let tag = dtype_tag_value(spec.dtype)?;
         let rank = spec.shape.rank();
         push_block(
-            &mut body,
+            &mut entry,
             1,
             &format!(
                 "if (!check_tensor(&inputs[{index}], {tag}, {rank}, {dims_name})) {{ return -2; }}"
@@ -150,7 +158,7 @@ pub fn generate_c_module(
         let tag = dtype_tag_value(spec.dtype)?;
         let rank = spec.shape.rank();
         push_block(
-            &mut body,
+            &mut entry,
             1,
             &format!(
                 "if (!check_tensor(&outputs[{index}], {tag}, {rank}, {dims_name})) {{ return -3; }}"
@@ -158,7 +166,8 @@ pub fn generate_c_module(
         );
     }
 
-    let mut literal_cache = LiteralCache::default();
+    let mut literal_cache = LiteralCache::hoisted();
+    let mut param_types = HashMap::new();
 
     let mut value_keys: Vec<ValueKey> = value_infos.keys().cloned().collect();
     value_keys.sort_by(|a, b| match a.value.0.cmp(&b.value.0) {
@@ -175,21 +184,25 @@ pub fn generate_c_module(
             continue;
         }
         let ctype = c_type(value_info.spec.dtype)?;
+        let param_type = match value_info.storage {
+            ValueStorage::Input { .. } | ValueStorage::Const => format!("const {ctype}*"),
+            _ => format!("{ctype}*"),
+        };
         match value_info.storage {
             ValueStorage::Input { index } => {
                 let var = &value_info.var;
                 push_block(
-                    &mut body,
+                    &mut entry,
                     1,
-                    &format!("const {ctype}* {var} = (const {ctype}*)inputs[{index}].data;"),
+                    &format!("{param_type} {var} = ({param_type})inputs[{index}].data;"),
                 );
             }
             ValueStorage::Output { index } => {
                 let var = &value_info.var;
                 push_block(
-                    &mut body,
+                    &mut entry,
                     1,
-                    &format!("{ctype}* {var} = ({ctype}*)outputs[{index}].data;"),
+                    &format!("{param_type} {var} = ({param_type})outputs[{index}].data;"),
                 );
             }
             ValueStorage::Temp { .. } => {
@@ -197,11 +210,11 @@ pub fn generate_c_module(
                 let byte_len = value_info.byte_len;
                 let block = format!(
                     r#"
-                        {ctype}* {var} = ({ctype}*)malloc({byte_len});
+                        {param_type} {var} = ({param_type})malloc({byte_len});
                         if (!{var}) {{ return -4; }}
                     "#
                 );
-                push_block(&mut body, 1, &block);
+                push_block(&mut entry, 1, &block);
             }
             ValueStorage::Const => {
                 let const_name = value_info.const_name.as_ref().expect("const name");
@@ -215,31 +228,37 @@ pub fn generate_c_module(
                 let block = format!(
                     r#"
                         static const {ctype} {const_name}[] = {{{values_str}}};
-                        const {ctype}* {var} = {const_name};
+                        {param_type} {var} = {const_name};
                     "#
                 );
-                push_block(&mut body, 1, &block);
+                push_block(&mut entry, 1, &block);
             }
             ValueStorage::Alias => {}
         }
+        param_types.insert(value_info.var.clone(), param_type);
     }
 
     if !value_infos.is_empty() {
-        body.push('\n');
+        entry.push('\n');
     }
 
+    let mut outliner = Outliner::new(param_types, &value_infos);
     emit_instructions(
-        &mut body,
+        &mut entry,
         &function.body,
         &value_infos,
         &mut literal_cache,
         program,
         &mut matmul_profile,
-        Some(&mut matmul_caches),
+        Some(EntryEmit {
+            matmul_caches: &mut matmul_caches,
+            outliner: &mut outliner,
+        }),
     )?;
+    let outlined_ops = outliner.finish();
 
     if !function.results.is_empty() {
-        body.push('\n');
+        entry.push('\n');
     }
 
     for (index, binding) in result_bindings.iter().enumerate() {
@@ -254,7 +273,7 @@ pub fn generate_c_module(
         let var = &info.var;
         let byte_len = info.byte_len;
         push_block(
-            &mut body,
+            &mut entry,
             1,
             &format!("memcpy(outputs[{index}].data, {var}, {byte_len});"),
         );
@@ -267,17 +286,19 @@ pub fn generate_c_module(
             && freed.insert(value_info.var.clone())
         {
             let var = &value_info.var;
-            push_block(&mut body, 1, &format!("free({var});"));
+            push_block(&mut entry, 1, &format!("free({var});"));
         }
     }
 
-    push_block(&mut body, 1, "return 0;");
-    push_block(&mut body, 0, "}");
-    body.push('\n');
+    push_block(&mut entry, 1, "return 0;");
+    push_block(&mut entry, 0, "}");
+    entry.push('\n');
 
     let profile_meta = emit_c_profile_metadata(&matmul_profile);
     let cache_meta = emit_matmul_cache_metadata(&matmul_caches, input_specs.len());
-    module = format!("{module}{profile_meta}{cache_meta}{body}");
+    let file_literals = literal_cache.take_hoisted();
+    module =
+        format!("{module}{profile_meta}{cache_meta}{body}{file_literals}{outlined_ops}{entry}");
 
     Ok(module)
 }

@@ -6,9 +6,7 @@ use gpt_rs::backend::spec::{
     WhileSpec,
 };
 
-use super::super::profile::{
-    backend_operation_label, emit_profiled_op, register_op_profile_multi_output, OpProfile,
-};
+use super::super::profile::{backend_operation_label, register_op_profile_multi_output, OpProfile};
 use super::super::types::{ValueInfo, ValueKey, ValueStorage};
 use super::super::utils::{c_type, dims_usize, emit_value_array, push_block};
 use super::super::value_info::{
@@ -21,7 +19,7 @@ use super::{emit_instructions, EmitContext};
 pub(super) fn emit_instruction(
     inst: &Instruction,
     ctx: &mut EmitContext<'_>,
-) -> ConversionResult<bool> {
+) -> ConversionResult<Option<usize>> {
     let EmitContext {
         module,
         value_infos,
@@ -31,7 +29,7 @@ pub(super) fn emit_instruction(
         ..
     } = ctx;
 
-    match &inst.op {
+    let op_id = match &inst.op {
         Operation::Cond(spec) => {
             let pred_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             ensure_dtype(pred_dtype, DType::I1, "cond predicate must be i1")?;
@@ -40,16 +38,15 @@ pub(super) fn emit_instruction(
             let input_specs = operand_specs(&inst.operands, value_infos)?;
             let op_id =
                 register_op_profile_multi_output(matmul_profile, label, &outputs, &input_specs)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_cond(
-                    module,
-                    spec,
-                    &inst.operands,
-                    outputs,
-                    value_infos,
-                    literal_cache,
-                )
-            })?;
+            emit_cond(
+                module,
+                spec,
+                &inst.operands,
+                outputs,
+                value_infos,
+                literal_cache,
+            )?;
+            op_id
         }
         Operation::While(spec) => {
             let label = backend_operation_label(&inst.op);
@@ -57,17 +54,16 @@ pub(super) fn emit_instruction(
             let input_specs = operand_specs(&inst.operands, value_infos)?;
             let op_id =
                 register_op_profile_multi_output(matmul_profile, label, &outputs, &input_specs)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_while(
-                    module,
-                    spec,
-                    &inst.operands,
-                    outputs,
-                    program,
-                    value_infos,
-                    literal_cache,
-                )
-            })?;
+            emit_while(
+                module,
+                spec,
+                &inst.operands,
+                outputs,
+                program,
+                value_infos,
+                literal_cache,
+            )?;
+            op_id
         }
         Operation::Scan(spec) => {
             let label = backend_operation_label(&inst.op);
@@ -75,22 +71,21 @@ pub(super) fn emit_instruction(
             let input_specs = operand_specs(&inst.operands, value_infos)?;
             let op_id =
                 register_op_profile_multi_output(matmul_profile, label, &outputs, &input_specs)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_scan(
-                    module,
-                    spec,
-                    &inst.operands,
-                    outputs,
-                    program,
-                    value_infos,
-                    literal_cache,
-                )
-            })?;
+            emit_scan(
+                module,
+                spec,
+                &inst.operands,
+                outputs,
+                program,
+                value_infos,
+                literal_cache,
+            )?;
+            op_id
         }
-        _ => return Ok(false),
-    }
+        _ => return Ok(None),
+    };
 
-    Ok(true)
+    Ok(Some(op_id))
 }
 
 fn region_fn_name(id: RegionId) -> String {

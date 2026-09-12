@@ -1,7 +1,41 @@
+//! Backend-private custom-call targets that C pipeline passes create and C codegen consumes.
+
 use gpt_rs::backend::spec::{ElementwiseBinaryOp, ElementwiseUnaryOp};
 
+/// NHWC f32 convolution over an im2col-shaped weight.
 pub const TARGET_CONV2D_NHWC_F32_V1: &str = "gpt_rs.c.conv2d.nhwc.f32.v1";
-pub const TARGET_ELEMENTWISE_FUSED_F32_V1: &str = "gpt_rs.c.fused_elementwise.f32.v1";
+/// Fused elementwise kernel with f32 inputs and an f32 or bf16 output. The kernel reads each input
+/// broadcast or at a slice offset.
+pub const TARGET_ELEMENTWISE_FUSED: &str = "gpt_rs.c.fused_elementwise.v2";
+/// Linear projection `x: f32 [M, K] . w: bf16 [N, K] -> f32 [M, N]`. The kernel widens the weight
+/// to f32 in registers.
+pub const TARGET_LINEAR_NT_F32_BF16: &str = "gpt_rs.c.linear_nt.f32_bf16.v1";
+
+/// Whether the kernel can read a fused elementwise input of shape `input` for every element of
+/// `out`. When `starts` is set, the input is an absorbed `slice`, and the kernel reads it at an
+/// offset inside a same-rank source. Otherwise the kernel broadcasts it right-aligned.
+pub fn fused_input_fits(out: &[usize], input: &[usize], starts: Option<&[usize]>) -> bool {
+    match starts {
+        Some(starts) => {
+            input.len() == out.len()
+                && starts.len() == out.len()
+                && starts
+                    .iter()
+                    .zip(out)
+                    .zip(input)
+                    .all(|((start, size), dim)| {
+                        start.checked_add(*size).is_some_and(|end| end <= *dim)
+                    })
+        }
+        None => {
+            input.len() <= out.len()
+                && input
+                    .iter()
+                    .zip(&out[out.len() - input.len()..])
+                    .all(|(dim, out_dim)| *dim == 1 || dim == out_dim)
+        }
+    }
+}
 
 pub fn unary_code(op: ElementwiseUnaryOp) -> i64 {
     match op {

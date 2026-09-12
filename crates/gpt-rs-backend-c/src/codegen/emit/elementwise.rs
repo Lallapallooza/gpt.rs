@@ -5,15 +5,16 @@ use gpt_rs::backend::spec::{
     ComparisonOp, DType, ElementwiseBinaryOp, ElementwiseUnaryOp, Instruction, Operand, Operation,
 };
 
-use crate::targets::{binary_expr_from_code, unary_expr_from_code};
+use crate::targets::{binary_expr_from_code, fused_input_fits, unary_expr_from_code};
 
 use super::super::profile::{
-    backend_operation_label, emit_profiled_op, register_op_profile_binary,
-    register_op_profile_generic, register_op_profile_unary,
+    backend_operation_label, register_op_profile_binary, register_op_profile_generic,
+    register_op_profile_unary,
 };
 use super::super::types::{ValueInfo, ValueKey};
 use super::super::utils::{
-    c_type, dims_usize, emit_loops_with_indices, emit_memcpy, linear_index_expr, push_block,
+    c_type, dims_usize, emit_flat_loop, emit_memcpy, emit_parallel_loops_with_indices,
+    linear_index_expr, push_block,
 };
 use super::super::value_info::LiteralCache;
 use super::super::value_info::{
@@ -24,7 +25,7 @@ use super::{custom_call_attr_i64_array, EmitContext};
 pub(super) fn emit_instruction(
     inst: &Instruction,
     ctx: &mut EmitContext<'_>,
-) -> ConversionResult<bool> {
+) -> ConversionResult<Option<usize>> {
     let EmitContext {
         module,
         value_infos,
@@ -33,7 +34,7 @@ pub(super) fn emit_instruction(
         ..
     } = ctx;
 
-    match &inst.op {
+    let op_id = match &inst.op {
         Operation::StopGradient => {
             let out_info = output_info(value_infos, inst.id)?;
             let label = backend_operation_label(&inst.op);
@@ -41,10 +42,8 @@ pub(super) fn emit_instruction(
             let op_id =
                 register_op_profile_unary(matmul_profile, label, &out_info.spec, &input_spec)?;
             let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_memcpy(module, &out_info.var, &input, out_info.byte_len);
-                Ok(())
-            })?;
+            emit_memcpy(module, &out_info.var, &input, out_info.byte_len);
+            op_id
         }
         Operation::ElementwiseUnary(op) => {
             let out_info = output_info(value_infos, inst.id)?;
@@ -64,9 +63,8 @@ pub(super) fn emit_instruction(
             let op_id =
                 register_op_profile_unary(matmul_profile, label, &out_info.spec, &input_spec)?;
             let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_unary(module, op, &out_info.var, &input, out_info.elem_count)
-            })?;
+            emit_unary(module, op, &out_info.var, &input, out_info.elem_count)?;
+            op_id
         }
         Operation::ElementwiseBinary(op) => {
             let out_info = output_info(value_infos, inst.id)?;
@@ -91,9 +89,8 @@ pub(super) fn emit_instruction(
             )?;
             let lhs = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
             let rhs = operand_expr(&inst.operands[1], value_infos, module, literal_cache)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_binary(module, op, &out_info.var, &lhs, &rhs, out_info.elem_count)
-            })?;
+            emit_binary(module, op, &out_info.var, &lhs, &rhs, out_info.elem_count)?;
+            op_id
         }
         Operation::Cast(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
@@ -108,16 +105,15 @@ pub(super) fn emit_instruction(
                     "cast output dtype does not match instruction type",
                 ));
             }
-            emit_profiled_op(module, op_id, |module| {
-                emit_cast(
-                    module,
-                    &out_info.var,
-                    &input,
-                    out_info.spec.dtype,
-                    input_dtype,
-                    out_info.elem_count,
-                )
-            })?;
+            emit_cast(
+                module,
+                &out_info.var,
+                &input,
+                out_info.spec.dtype,
+                input_dtype,
+                out_info.elem_count,
+            )?;
+            op_id
         }
         Operation::Compare(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
@@ -149,17 +145,16 @@ pub(super) fn emit_instruction(
             )?;
             let lhs = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
             let rhs = operand_expr(&inst.operands[1], value_infos, module, literal_cache)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_compare(
-                    module,
-                    spec,
-                    &out_info.var,
-                    &lhs,
-                    &rhs,
-                    out_info.elem_count,
-                    lhs_dtype,
-                )
-            })?;
+            emit_compare(
+                module,
+                spec,
+                &out_info.var,
+                &lhs,
+                &rhs,
+                out_info.elem_count,
+                lhs_dtype,
+            )?;
+            op_id
         }
         Operation::Select => {
             let out_info = output_info(value_infos, inst.id)?;
@@ -177,16 +172,15 @@ pub(super) fn emit_instruction(
             let pred = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
             let on_true = operand_expr(&inst.operands[1], value_infos, module, literal_cache)?;
             let on_false = operand_expr(&inst.operands[2], value_infos, module, literal_cache)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_select(
-                    module,
-                    &out_info.var,
-                    &pred,
-                    &on_true,
-                    &on_false,
-                    out_info.elem_count,
-                )
-            })?;
+            emit_select(
+                module,
+                &out_info.var,
+                &pred,
+                &on_true,
+                &on_false,
+                out_info.elem_count,
+            )?;
+            op_id
         }
         Operation::Quantize(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
@@ -201,16 +195,15 @@ pub(super) fn emit_instruction(
             let input_spec = operand_spec(&inst.operands[0], value_infos)?;
             let op_id =
                 register_op_profile_unary(matmul_profile, label, &out_info.spec, &input_spec)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_cast(
-                    module,
-                    &out_info.var,
-                    &input,
-                    out_info.spec.dtype,
-                    input_dtype,
-                    out_info.elem_count,
-                )
-            })?;
+            emit_cast(
+                module,
+                &out_info.var,
+                &input,
+                out_info.spec.dtype,
+                input_dtype,
+                out_info.elem_count,
+            )?;
+            op_id
         }
         Operation::Dequantize(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
@@ -226,16 +219,15 @@ pub(super) fn emit_instruction(
             let op_id =
                 register_op_profile_unary(matmul_profile, label, &out_info.spec, &input_spec)?;
             let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_cast(
-                    module,
-                    &out_info.var,
-                    &input,
-                    out_info.spec.dtype,
-                    input_dtype,
-                    out_info.elem_count,
-                )
-            })?;
+            emit_cast(
+                module,
+                &out_info.var,
+                &input,
+                out_info.spec.dtype,
+                input_dtype,
+                out_info.elem_count,
+            )?;
+            op_id
         }
         Operation::Requantize(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
@@ -250,20 +242,19 @@ pub(super) fn emit_instruction(
             let op_id =
                 register_op_profile_unary(matmul_profile, label, &out_info.spec, &input_spec)?;
             let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_cast(
-                    module,
-                    &out_info.var,
-                    &input,
-                    out_info.spec.dtype,
-                    input_dtype,
-                    out_info.elem_count,
-                )
-            })?;
+            emit_cast(
+                module,
+                &out_info.var,
+                &input,
+                out_info.spec.dtype,
+                input_dtype,
+                out_info.elem_count,
+            )?;
+            op_id
         }
-        _ => return Ok(false),
-    }
-    Ok(true)
+        _ => return Ok(None),
+    };
+    Ok(Some(op_id))
 }
 
 fn emit_unary(
@@ -283,18 +274,13 @@ fn emit_unary(
         ElementwiseUnaryOp::Rsqrt => "1.0f / sqrtf(src[i])",
         ElementwiseUnaryOp::Reciprocal => "1.0f / src[i]",
     };
-    let block = format!(
-        r#"
-            {{
-              const float* src = (const float*){input};
-              float* out = {out};
-              for (size_t i = 0; i < {elem_count}; ++i) {{
-                out[i] = {expr};
-              }}
-            }}
-        "#
+    emit_flat_loop(
+        module,
+        &[("float", "src", input)],
+        ("float", out),
+        elem_count,
+        &format!("out[i] = {expr};"),
     );
-    push_block(module, 1, &block);
     Ok(())
 }
 fn emit_binary(
@@ -313,19 +299,13 @@ fn emit_binary(
         ElementwiseBinaryOp::Maximum => "lhs_ptr[i] > rhs_ptr[i] ? lhs_ptr[i] : rhs_ptr[i]",
         ElementwiseBinaryOp::Minimum => "lhs_ptr[i] < rhs_ptr[i] ? lhs_ptr[i] : rhs_ptr[i]",
     };
-    let block = format!(
-        r#"
-            {{
-              const float* lhs_ptr = (const float*){lhs};
-              const float* rhs_ptr = (const float*){rhs};
-              float* out = {out};
-              for (size_t i = 0; i < {elem_count}; ++i) {{
-                out[i] = {expr};
-              }}
-            }}
-        "#
+    emit_flat_loop(
+        module,
+        &[("float", "lhs_ptr", lhs), ("float", "rhs_ptr", rhs)],
+        ("float", out),
+        elem_count,
+        &format!("out[i] = {expr};"),
     );
-    push_block(module, 1, &block);
     Ok(())
 }
 fn emit_cast(
@@ -379,23 +359,27 @@ fn emit_cast(
                 out[i] = in[i] ? 1 : 0;
             "#
         .to_string(),
+        (DType::Bf16, DType::F32) => r#"
+                out[i] = gpt_rs_bf16_to_f32(in[i]);
+            "#
+        .to_string(),
+        (DType::F32, DType::Bf16) => r#"
+                out[i] = gpt_rs_f32_to_bf16(in[i]);
+            "#
+        .to_string(),
         _ => {
             return Err(ConversionError::new(
                 "cast dtype combination not supported by C codegen",
             ));
         }
     };
-    let block = format!(
-        r#"
-            {{
-              const {in_ctype}* in = (const {in_ctype}*){input};
-              {out_ctype}* out = {out};
-              for (size_t i = 0; i < {elem_count}; ++i) {{
-{body}              }}
-            }}
-        "#
+    emit_flat_loop(
+        module,
+        &[(in_ctype, "in", input)],
+        (out_ctype, out),
+        elem_count,
+        &body,
     );
-    push_block(module, 1, &block);
     Ok(())
 }
 fn emit_compare(
@@ -425,19 +409,13 @@ fn emit_compare(
             ))
         }
     };
-    let block = format!(
-        r#"
-            {{
-              const {ctype}* lhs = (const {ctype}*){lhs};
-              const {ctype}* rhs = (const {ctype}*){rhs};
-              uint8_t* out = (uint8_t*){out};
-              for (size_t i = 0; i < {elem_count}; ++i) {{
-                out[i] = {expr} ? 1 : 0;
-              }}
-            }}
-        "#
+    emit_flat_loop(
+        module,
+        &[(ctype, "lhs", lhs), (ctype, "rhs", rhs)],
+        ("uint8_t", out),
+        elem_count,
+        &format!("out[i] = {expr} ? 1 : 0;"),
     );
-    push_block(module, 1, &block);
     Ok(())
 }
 fn emit_select(
@@ -448,20 +426,17 @@ fn emit_select(
     on_false: &str,
     elem_count: usize,
 ) -> ConversionResult<()> {
-    let block = format!(
-        r#"
-            {{
-              const uint8_t* pred = (const uint8_t*){pred};
-              const float* on_true = (const float*){on_true};
-              const float* on_false = (const float*){on_false};
-              float* out = (float*){out};
-              for (size_t i = 0; i < {elem_count}; ++i) {{
-                out[i] = pred[i] ? on_true[i] : on_false[i];
-              }}
-            }}
-        "#
+    emit_flat_loop(
+        module,
+        &[
+            ("uint8_t", "pred", pred),
+            ("float", "on_true", on_true),
+            ("float", "on_false", on_false),
+        ],
+        ("float", out),
+        elem_count,
+        "out[i] = pred[i] ? on_true[i] : on_false[i];",
     );
-    push_block(module, 1, &block);
     Ok(())
 }
 fn broadcast_index_expr(out_dims: &[usize], out_indices: &[String], in_dims: &[usize]) -> String {
@@ -477,6 +452,44 @@ fn broadcast_index_expr(out_dims: &[usize], out_indices: &[String], in_dims: &[u
     }
     linear_index_expr(&padded_in_dims, &in_indices)
 }
+/// Decodes the `input_slice_starts` attribute into per-input offsets. The attribute holds
+/// `[input, start_0, .., start_{rank-1}]` groups.
+fn fused_input_slice_starts(
+    spec: &gpt_rs::backend::spec::CustomCallSpec,
+    input_count: usize,
+    rank: usize,
+) -> ConversionResult<Vec<Option<Vec<usize>>>> {
+    let mut starts = vec![None; input_count];
+    if !spec.attrs.contains_key("input_slice_starts") {
+        return Ok(starts);
+    }
+    let flat = custom_call_attr_i64_array(spec, "input_slice_starts")?;
+    if flat.len() % (rank + 1) != 0 {
+        return Err(ConversionError::new(
+            "fused elementwise input_slice_starts length mismatch",
+        ));
+    }
+    for group in flat.chunks(rank + 1) {
+        let slot = usize::try_from(group[0])
+            .ok()
+            .and_then(|index| starts.get_mut(index))
+            .ok_or_else(|| ConversionError::new("fused elementwise sliced input out of range"))?;
+        if slot.is_some() {
+            return Err(ConversionError::new(format!(
+                "fused elementwise input {} has more than one slice offset",
+                group[0]
+            )));
+        }
+        let offsets = group[1..]
+            .iter()
+            .map(|start| usize::try_from(*start))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ConversionError::new("fused elementwise slice start is negative"))?;
+        *slot = Some(offsets);
+    }
+    Ok(starts)
+}
+
 pub(super) fn emit_custom_call_elementwise(
     module: &mut String,
     spec: &gpt_rs::backend::spec::CustomCallSpec,
@@ -485,11 +498,15 @@ pub(super) fn emit_custom_call_elementwise(
     value_infos: &HashMap<ValueKey, ValueInfo>,
     literal_cache: &mut LiteralCache,
 ) -> ConversionResult<()> {
-    ensure_dtype(
-        out_info.spec.dtype,
-        DType::F32,
-        "fused elementwise output must be f32",
-    )?;
+    let store_bf16 = match out_info.spec.dtype {
+        DType::F32 => false,
+        DType::Bf16 => true,
+        _ => {
+            return Err(ConversionError::new(
+                "fused elementwise output must be f32 or bf16",
+            ))
+        }
+    };
     let ops_kind = custom_call_attr_i64_array(spec, "ops_kind")?;
     let ops_code = custom_call_attr_i64_array(spec, "ops_code")?;
     let lhs = custom_call_attr_i64_array(spec, "lhs")?;
@@ -507,34 +524,26 @@ pub(super) fn emit_custom_call_elementwise(
     }
 
     let out_dims = dims_usize(&out_info.spec)?;
+    let slice_starts = fused_input_slice_starts(spec, operands.len(), out_dims.len())?;
 
     struct InputInfo {
         var: String,
         dims: Vec<usize>,
+        starts: Option<Vec<usize>>,
     }
 
     let mut inputs: Vec<InputInfo> = Vec::with_capacity(operands.len());
-    for operand in operands {
+    for (operand, starts) in operands.iter().zip(slice_starts) {
         let dtype = operand_dtype(operand, value_infos)?;
         ensure_dtype(dtype, DType::F32, "fused elementwise operand must be f32")?;
-        let spec = operand_spec(operand, value_infos)?;
-        let dims = dims_usize(&spec)?;
-        if out_dims.len() < dims.len() {
-            return Err(ConversionError::new(
-                "fused elementwise operand rank exceeds output rank",
-            ));
-        }
-        let offset = out_dims.len() - dims.len();
-        for (idx, dim) in dims.iter().enumerate() {
-            let out_dim = out_dims[idx + offset];
-            if *dim != 1 && *dim != out_dim {
-                return Err(ConversionError::new(
-                    "fused elementwise operand shape is not broadcastable",
-                ));
-            }
+        let dims = dims_usize(&operand_spec(operand, value_infos)?)?;
+        if !fused_input_fits(&out_dims, &dims, starts.as_deref()) {
+            return Err(ConversionError::new(format!(
+                "fused elementwise operand {dims:?} (slice starts {starts:?}) does not fit output {out_dims:?}"
+            )));
         }
         let var = operand_expr(operand, value_infos, module, literal_cache)?;
-        inputs.push(InputInfo { var, dims });
+        inputs.push(InputInfo { var, dims, starts });
     }
 
     let input_count = inputs.len() as i64;
@@ -581,6 +590,21 @@ pub(super) fn emit_custom_call_elementwise(
         node_exprs.push(expr);
     }
 
+    // When every input has the output's shape or holds one element, all inputs index like the
+    // output, so one flat loop is enough.
+    let flat = inputs.iter().all(|input| {
+        input.starts.is_none()
+            && (input.dims == out_dims || input.dims.iter().product::<usize>() == 1)
+    });
+    let out_dims = if flat {
+        for input in &mut inputs {
+            input.dims = vec![input.dims.iter().product()];
+        }
+        vec![out_info.elem_count]
+    } else {
+        out_dims
+    };
+
     let input_decls = inputs
         .iter()
         .enumerate()
@@ -601,14 +625,35 @@ pub(super) fn emit_custom_call_elementwise(
     if !input_decls.is_empty() {
         push_block(module, 2, &input_decls);
     }
-    push_block(module, 2, &format!("float* out = {out_var};"));
+    let out_type = c_type(out_info.spec.dtype)?;
+    push_block(
+        module,
+        2,
+        &format!("{out_type}* out = ({out_type}*){out_var};"),
+    );
 
-    emit_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
+    emit_parallel_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
         let input_lines = inputs
             .iter()
             .enumerate()
             .map(|(index, input)| {
-                let idx_expr = broadcast_index_expr(&out_dims, indices, &input.dims);
+                let idx_expr = match &input.starts {
+                    Some(starts) => {
+                        let shifted = indices
+                            .iter()
+                            .zip(starts)
+                            .map(|(idx, start)| {
+                                if *start == 0 {
+                                    idx.clone()
+                                } else {
+                                    format!("{start} + {idx}")
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        linear_index_expr(&input.dims, &shifted)
+                    }
+                    None => broadcast_index_expr(&out_dims, indices, &input.dims),
+                };
                 format!("float in{index}v = arg{index}[{idx_expr}];")
             })
             .collect::<Vec<_>>()
@@ -625,7 +670,12 @@ pub(super) fn emit_custom_call_elementwise(
 
         let out_idx = linear_index_expr(&out_dims, indices);
         let last = node_count - 1;
-        push_block(module, indent, &format!("out[{out_idx}] = t{last};"));
+        let result = if store_bf16 {
+            format!("gpt_rs_f32_to_bf16(t{last})")
+        } else {
+            format!("t{last}")
+        };
+        push_block(module, indent, &format!("out[{out_idx}] = {result};"));
     });
 
     push_block(module, 1, "}");

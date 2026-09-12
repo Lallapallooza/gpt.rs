@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
 use std::time::Duration;
 
@@ -23,8 +23,8 @@ use gpt_rs::backend::optimizer::{
 use gpt_rs::backend::param_resolver::{InMemoryParamResolver, ParamResolver};
 use gpt_rs::backend::registry::register_portable_backend;
 use gpt_rs::backend::spec::{
-    BackendError, BackendResult, DType, Dimension, PortableBackend, Program, Shape, TensorInit,
-    TensorLiteral, TensorSpec, ValueType,
+    BackendError, BackendResult, DType, Dimension, ExternalBytes, PortableBackend, Program, Shape,
+    TensorInit, TensorLiteral, TensorSpec, ValueType,
 };
 use gpt_rs::tensor::InputRole;
 use libloading::Library;
@@ -166,6 +166,14 @@ impl PortableBackend for CBackend {
             TensorInit::Literal(literal) => CTensor::from_literal(literal),
             TensorInit::Zeroed(spec) => CTensor::zeroed(spec),
         }
+    }
+
+    fn materialize_external(
+        &self,
+        spec: TensorSpec,
+        bytes: ExternalBytes,
+    ) -> BackendResult<Self::TensorHandle> {
+        CTensor::from_external(spec, bytes)
     }
 
     fn to_literal(&self, tensor: &Self::TensorHandle) -> BackendResult<TensorLiteral> {
@@ -336,7 +344,7 @@ fn c_legality_spec() -> LegalitySpec {
             OperationKind::Requantize,
             OperationKind::CustomCall,
         ])
-        .allow_dtypes([DType::F32, DType::Si32, DType::I1])
+        .allow_dtypes([DType::F32, DType::Si32, DType::I1, DType::Bf16])
         .with_dynamic_dims(false)
 }
 
@@ -433,11 +441,29 @@ impl CompiledModule {
     }
 }
 
+/// Backing bytes of a C backend tensor.
+#[derive(Clone)]
+enum CStorage {
+    /// Heap buffer owned by the backend.
+    Owned(Arc<Vec<u8>>),
+    /// Read-only view into memory owned elsewhere, such as a memory-mapped checkpoint.
+    External(ExternalBytes),
+}
+
+impl CStorage {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            CStorage::Owned(data) => data.as_slice(),
+            CStorage::External(bytes) => bytes.as_slice(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct CTensor {
     spec: TensorSpec,
     dims: Vec<i64>,
-    data: Arc<Vec<u8>>,
+    data: CStorage,
 }
 
 impl CTensor {
@@ -446,26 +472,43 @@ impl CTensor {
         Ok(Self {
             spec: literal.spec.clone(),
             dims,
-            data: Arc::new(literal.bytes.as_ref().to_vec()),
+            data: CStorage::Owned(Arc::new(literal.bytes.as_ref().to_vec())),
         })
+    }
+
+    fn from_external(spec: TensorSpec, bytes: ExternalBytes) -> BackendResult<Self> {
+        let dims = static_dims(&spec.shape)?;
+        let byte_len = tensor_byte_len(&spec)?;
+        if bytes.len() != byte_len {
+            return Err(BackendError::execution(format!(
+                "external tensor has {} bytes, expected {byte_len}",
+                bytes.len()
+            )));
+        }
+        // Kernels read elements through typed pointers, so a misaligned view is copied.
+        let align = dtype_size(spec.dtype)?;
+        let data = if (bytes.as_slice().as_ptr() as usize).is_multiple_of(align) {
+            CStorage::External(bytes)
+        } else {
+            CStorage::Owned(Arc::new(bytes.as_slice().to_vec()))
+        };
+        Ok(Self { spec, dims, data })
     }
 
     fn zeroed(spec: TensorSpec) -> BackendResult<Self> {
         let dims = static_dims(&spec.shape)?;
-        let byte_len = element_count(&dims)?
-            .checked_mul(dtype_size(spec.dtype)?)
-            .ok_or_else(|| BackendError::execution("tensor byte size overflow"))?;
+        let byte_len = tensor_byte_len(&spec)?;
         Ok(Self {
             spec,
             dims,
-            data: Arc::new(vec![0u8; byte_len]),
+            data: CStorage::Owned(Arc::new(vec![0u8; byte_len])),
         })
     }
 
     fn to_literal(&self) -> BackendResult<TensorLiteral> {
         Ok(TensorLiteral::new(
             self.spec.clone(),
-            Arc::<[u8]>::from(self.data.as_ref().clone()),
+            Arc::<[u8]>::from(self.data.as_slice()),
         ))
     }
 
@@ -474,12 +517,15 @@ impl CTensor {
             dtype: dtype_tag(self.spec.dtype).unwrap_or(0),
             rank: self.dims.len() as u32,
             dims: self.dims.as_ptr(),
-            data: self.data.as_ptr() as *mut c_void,
+            data: self.data.as_slice().as_ptr() as *mut c_void,
         }
     }
 
     fn as_ptir_tensor_mut(&mut self) -> PtirTensor {
-        let data = Arc::make_mut(&mut self.data);
+        let data = match &mut self.data {
+            CStorage::Owned(data) => Arc::make_mut(data),
+            CStorage::External(_) => unreachable!("outputs are allocated by the backend"),
+        };
         PtirTensor {
             dtype: dtype_tag(self.spec.dtype).unwrap_or(0),
             rank: self.dims.len() as u32,
@@ -550,10 +596,8 @@ impl CBackend {
 
         if !lib_path.exists() {
             gpt_rs::profiling::cache_event("c_backend.module_miss_disk");
-            std::fs::write(&src_path, &converted.module)
-                .map_err(|err| BackendError::execution(err.to_string()))?;
             let _compile_scope = gpt_rs::profiling::compile_scope("c_backend.compile");
-            compile_c(&src_path, &lib_path)?;
+            compile_c(&src_path, &converted.module, &lib_path)?;
         } else {
             gpt_rs::profiling::cache_event("c_backend.module_hit_disk");
         }
@@ -562,13 +606,11 @@ impl CBackend {
         let lib = match unsafe { Library::new(&lib_path) } {
             Ok(lib) => lib,
             Err(_err) => {
-                // A partially written shared library can happen if multiple threads compile the same
-                // fingerprint concurrently. Retry a single time after forcing a recompile.
+                // A cached library can be corrupt, for example after a crash during an earlier
+                // write. Recompile it once and retry the load.
                 let _ = std::fs::remove_file(&lib_path);
-                std::fs::write(&src_path, &converted.module)
-                    .map_err(|err| BackendError::execution(err.to_string()))?;
                 let _compile_scope = gpt_rs::profiling::compile_scope("c_backend.compile");
-                compile_c(&src_path, &lib_path)?;
+                compile_c(&src_path, &converted.module, &lib_path)?;
                 unsafe { Library::new(&lib_path) }
                     .map_err(|err| BackendError::execution(err.to_string()))?
             }
@@ -726,17 +768,9 @@ fn static_dims(shape: &Shape) -> BackendResult<Vec<i64>> {
     Ok(dims)
 }
 
-fn element_count(dims: &[i64]) -> BackendResult<usize> {
-    let mut count = 1usize;
-    for dim in dims {
-        if *dim <= 0 {
-            return Err(BackendError::execution("invalid dimension"));
-        }
-        count = count
-            .checked_mul(*dim as usize)
-            .ok_or_else(|| BackendError::execution("dimension overflow"))?;
-    }
-    Ok(count)
+fn tensor_byte_len(spec: &TensorSpec) -> BackendResult<usize> {
+    spec.byte_len()
+        .ok_or_else(|| BackendError::execution("tensor byte size is unknown or overflows"))
 }
 
 fn dtype_size(dtype: DType) -> BackendResult<usize> {
@@ -763,17 +797,6 @@ fn c_profile_enabled() -> bool {
     }
 }
 
-fn c_accelerated_kernels_supported() -> bool {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("fma")
-    }
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    {
-        false
-    }
-}
-
 fn c_cache_debug_enabled() -> bool {
     match std::env::var("GPTRS_C_CACHE_DEBUG") {
         Ok(value) if !value.trim().is_empty() => parse_bool(&value),
@@ -792,11 +815,13 @@ fn cache_fingerprint(key: &ConversionCacheKey, converted: &ConvertedIr) -> u64 {
     let mut hasher = FingerprintHasher::new();
     hasher.write(key);
     hasher.write(&converted.module);
-    hasher.write_u8(if c_accelerated_kernels_supported() {
-        1
-    } else {
-        0
-    });
+    hasher.write_u8(u8::from(c_profile_enabled()));
+    let command = compiler_command();
+    hasher.write(&command.compiler);
+    hasher.write(&command.flags);
+    hasher.write(&command.version);
+    hasher.write(&command.host_cpu);
+    hasher.write(&command.host_defines);
     hasher.finish()
 }
 
@@ -816,35 +841,157 @@ fn lib_ext() -> &'static str {
     }
 }
 
-fn compile_c(src: &Path, out: &Path) -> BackendResult<()> {
+/// Compiler, flags and host identity for generated modules. All of it is part of the cache
+/// fingerprint, because modules are built for the host CPU (`-march=native`).
+struct CompilerCommand {
+    compiler: String,
+    flags: Vec<&'static str>,
+    version: String,
+    host_cpu: String,
+    host_defines: Vec<String>,
+}
+
+fn compiler_command() -> &'static CompilerCommand {
+    static COMMAND: OnceLock<CompilerCommand> = OnceLock::new();
+    COMMAND.get_or_init(|| {
+        let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+        let version = compiler_version(&compiler);
+        let mut flags = Vec::new();
+        if cfg!(target_os = "macos") {
+            flags.push("-dynamiclib");
+        } else {
+            flags.extend(["-shared", "-fPIC"]);
+        }
+        flags.push("-O3");
+        if !cfg!(target_os = "windows") {
+            flags.push("-march=native");
+            // No -ffast-math and no cross-op FMA contraction, so fused kernels round like the
+            // unfused ops. Vector math comes from libmvec.
+            flags.extend([
+                "-ffp-contract=off",
+                "-fno-math-errno",
+                "-fno-trapping-math",
+                "-fomit-frame-pointer",
+            ]);
+            if cfg!(all(
+                target_os = "linux",
+                target_env = "gnu",
+                target_arch = "x86_64"
+            )) && version.contains("clang")
+            {
+                flags.push("-fveclib=libmvec");
+            }
+        }
+        if compiler_accepts(&compiler, "-fopenmp") {
+            flags.push("-fopenmp");
+        } else if compiler_accepts(&compiler, "-fopenmp-simd") {
+            flags.push("-fopenmp-simd");
+        }
+        CompilerCommand {
+            compiler,
+            flags,
+            version,
+            host_cpu: host_cpu_signature(),
+            host_defines: host_defines(),
+        }
+    })
+}
+
+fn compiler_version(compiler: &str) -> String {
+    Command::new(compiler)
+        .arg("--version")
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+fn compiler_accepts(compiler: &str, flag: &str) -> bool {
+    let dir = std::env::temp_dir().join(format!("gpt_rs_c_probe_{}", std::process::id()));
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let src = dir.join("probe.c");
+    let out = dir.join(format!("probe{}", lib_ext()));
+    let ok = std::fs::write(&src, "int gpt_rs_c_probe(void) { return 0; }\n").is_ok()
+        && Command::new(compiler)
+            .args(if cfg!(target_os = "macos") {
+                &["-dynamiclib"][..]
+            } else {
+                &["-shared", "-fPIC"][..]
+            })
+            .arg(flag)
+            .arg("-o")
+            .arg(&out)
+            .arg(&src)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+    let _ = std::fs::remove_dir_all(&dir);
+    ok
+}
+
+fn host_defines() -> Vec<String> {
+    let mut defines = Vec::new();
+    if std::env::var_os("OMP_NUM_THREADS").is_none() {
+        // One thread per physical core: a team that also uses SMT siblings stalls at every
+        // barrier whenever another process is runnable.
+        let allowed = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let threads = num_cpus::get_physical().clamp(1, allowed);
+        defines.push(format!("-DGPTRS_NUM_THREADS={threads}"));
+    }
+    if let Some(bytes) = l2_cache_bytes() {
+        defines.push(format!("-DGPTRS_L2_BYTES={bytes}"));
+    }
+    defines
+}
+
+fn l2_cache_bytes() -> Option<usize> {
+    let caches = std::fs::read_dir("/sys/devices/system/cpu/cpu0/cache").ok()?;
+    caches.flatten().find_map(|entry| {
+        let read = |name: &str| std::fs::read_to_string(entry.path().join(name)).ok();
+        if read("level")?.trim() != "2" || read("type")?.trim() == "Instruction" {
+            return None;
+        }
+        let size = read("size")?;
+        let size = size.trim();
+        let (digits, unit) = match size.strip_suffix('K') {
+            Some(digits) => (digits, 1 << 10),
+            None => match size.strip_suffix('M') {
+                Some(digits) => (digits, 1 << 20),
+                None => (size, 1),
+            },
+        };
+        digits.parse::<usize>().ok().map(|n| n * unit)
+    })
+}
+
+fn host_cpu_signature() -> String {
+    let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") else {
+        return String::new();
+    };
+    cpuinfo
+        .lines()
+        .filter(|line| {
+            let key = line.split(':').next().unwrap_or("").trim();
+            key == "model name" || key == "flags" || key == "Features"
+        })
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Compiles `source` into `out` and leaves the source at `src`. Each thread writes its own
+/// temporary files and renames them into place, so no compiler reads a half-written file.
+fn compile_c(src: &Path, source: &str, out: &Path) -> BackendResult<()> {
     static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-    let mut cmd = Command::new(&compiler);
-    if cfg!(target_os = "macos") {
-        cmd.arg("-dynamiclib");
-    } else {
-        cmd.arg("-shared").arg("-fPIC");
+    let command = compiler_command();
+    let mut cmd = Command::new(&command.compiler);
+    cmd.args(&command.flags);
+    if c_profile_enabled() {
+        cmd.arg("-DGPTRS_C_PROFILE");
     }
-    cmd.arg("-O3");
-    if !cfg!(target_os = "windows") {
-        cmd.arg("-march=native");
-    }
-    if !cfg!(target_os = "windows") && c_accelerated_kernels_supported() {
-        cmd.arg("-mavx512f");
-        cmd.arg("-mfma");
-    } else if !cfg!(target_os = "windows") {
-        // Build baseline C kernels when AVX512/FMA are unavailable.
-        cmd.arg("-mno-avx512f");
-        cmd.arg("-mno-fma");
-    }
-    if !cfg!(target_os = "windows") {
-        cmd.arg("-ffast-math");
-        cmd.arg("-fno-math-errno");
-        cmd.arg("-fno-trapping-math");
-        cmd.arg("-fomit-frame-pointer");
-    }
-    cmd.arg("-DGPTRS_C_PROFILE");
+    cmd.args(&command.host_defines);
     let pid = std::process::id();
     let nonce = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp_out = out.with_file_name(format!(
@@ -855,15 +1002,17 @@ fn compile_c(src: &Path, out: &Path) -> BackendResult<()> {
         pid,
         nonce
     ));
-    cmd.arg("-o").arg(&tmp_out).arg(src);
+    let tmp_src = src.with_extension(format!("tmp.{pid}.{nonce}.c"));
+    std::fs::write(&tmp_src, source).map_err(|err| BackendError::execution(err.to_string()))?;
+    cmd.arg("-o").arg(&tmp_out).arg(&tmp_src);
 
     if !cfg!(target_os = "windows") {
         cmd.arg("-lm");
     }
 
-    let output = cmd
-        .output()
-        .map_err(|err| BackendError::execution(err.to_string()))?;
+    let output = cmd.output();
+    let _ = std::fs::rename(&tmp_src, src);
+    let output = output.map_err(|err| BackendError::execution(err.to_string()))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(BackendError::execution(format!(

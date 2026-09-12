@@ -3,9 +3,7 @@ use gpt_rs::backend::spec::{
     DType, Instruction, Operation, RngNormalSpec, RngUniformSpec, TensorSpec,
 };
 
-use super::super::profile::{
-    backend_operation_label, emit_profiled_op, register_op_profile_generic,
-};
+use super::super::profile::{backend_operation_label, register_op_profile_generic};
 use super::super::utils::{dims_usize, emit_loops_with_indices, linear_index_expr, push_block};
 use super::super::value_info::{ensure_dtype, output_info};
 use super::EmitContext;
@@ -13,7 +11,7 @@ use super::EmitContext;
 pub(super) fn emit_instruction(
     inst: &Instruction,
     ctx: &mut EmitContext<'_>,
-) -> ConversionResult<bool> {
+) -> ConversionResult<Option<usize>> {
     let EmitContext {
         module,
         value_infos,
@@ -21,7 +19,7 @@ pub(super) fn emit_instruction(
         ..
     } = ctx;
 
-    match &inst.op {
+    let op_id = match &inst.op {
         Operation::RngUniform(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
             ensure_dtype(
@@ -31,9 +29,8 @@ pub(super) fn emit_instruction(
             )?;
             let label = backend_operation_label(&inst.op);
             let op_id = register_op_profile_generic(matmul_profile, label, &out_info.spec, &[])?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_rng_uniform(module, &out_info.var, &out_info.spec, spec)
-            })?;
+            emit_rng_uniform(module, &out_info.var, &out_info.spec, spec)?;
+            op_id
         }
         Operation::RngNormal(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
@@ -44,14 +41,13 @@ pub(super) fn emit_instruction(
             )?;
             let label = backend_operation_label(&inst.op);
             let op_id = register_op_profile_generic(matmul_profile, label, &out_info.spec, &[])?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_rng_normal(module, &out_info.var, &out_info.spec, spec)
-            })?;
+            emit_rng_normal(module, &out_info.var, &out_info.spec, spec)?;
+            op_id
         }
-        _ => return Ok(false),
-    }
+        _ => return Ok(None),
+    };
 
-    Ok(true)
+    Ok(Some(op_id))
 }
 
 fn emit_rng_uniform(

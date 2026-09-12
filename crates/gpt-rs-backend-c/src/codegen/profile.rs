@@ -33,25 +33,28 @@ pub(super) fn saturating_u64_from_u128(value: u128) -> u64 {
         value as u64
     }
 }
-pub(super) fn matmul_work_stats(batch: usize, m: usize, n: usize, k: usize) -> WorkStats {
+pub(super) fn matmul_work_stats(
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs_elem_bytes: usize,
+    rhs_elem_bytes: usize,
+) -> WorkStats {
     let batch = batch as u128;
     let m = m as u128;
     let n = n as u128;
     let k = k as u128;
     let elements = saturating_u64_from_u128(batch.saturating_mul(m).saturating_mul(n));
-    let bytes_per_elem = 4u128;
     let lhs_bytes = batch
         .saturating_mul(m)
         .saturating_mul(k)
-        .saturating_mul(bytes_per_elem);
+        .saturating_mul(lhs_elem_bytes as u128);
     let rhs_bytes = batch
         .saturating_mul(k)
         .saturating_mul(n)
-        .saturating_mul(bytes_per_elem);
-    let out_bytes = batch
-        .saturating_mul(m)
-        .saturating_mul(n)
-        .saturating_mul(bytes_per_elem);
+        .saturating_mul(rhs_elem_bytes as u128);
+    let out_bytes = batch.saturating_mul(m).saturating_mul(n).saturating_mul(4);
     let flops = batch
         .saturating_mul(m)
         .saturating_mul(n)
@@ -210,6 +213,30 @@ pub(super) fn emit_c_profile_metadata(profile: &OpProfile) -> String {
     push_block(&mut out, 0, &helpers);
     out
 }
+/// Returns the C argument for the packed copy of b that op `op_id` keeps. When `caches` is given
+/// and b is the entry input `rhs_index`, this registers a cache. Otherwise it returns `NULL`.
+pub(super) fn bpack_cache_arg(
+    caches: Option<&mut Vec<MatmulCacheEntry>>,
+    rhs_index: Option<usize>,
+    op_id: usize,
+    n: usize,
+    k: usize,
+    sbk: usize,
+    sbn: usize,
+) -> String {
+    let (Some(caches), Some(rhs_index)) = (caches, rhs_index) else {
+        return "NULL".to_string();
+    };
+    caches.push(MatmulCacheEntry {
+        op_id,
+        rhs_index,
+        n,
+        k,
+        sbk,
+        sbn,
+    });
+    format!("&gpt_rs_bcache_{op_id}")
+}
 pub(super) fn emit_matmul_cache_metadata(
     entries: &[MatmulCacheEntry],
     input_count: usize,
@@ -235,16 +262,20 @@ pub(super) fn emit_matmul_cache_metadata(
     );
     push_block(&mut out, 0, &header);
     for entry in entries {
-        let op_id = entry.op_id;
-        let rhs_index = entry.rhs_index;
-        let n = entry.n;
-        let k = entry.k;
+        let MatmulCacheEntry {
+            op_id,
+            rhs_index,
+            n,
+            k,
+            sbk,
+            sbn,
+        } = *entry;
         let block = format!(
             r#"
                 {{
                   const float* b = (const float*)inputs[{rhs_index}].data;
                   if (b) {{
-                    gpt_rs_bpack_cache_prepare(&gpt_rs_bcache_{op_id}, b, {n}, {k});
+                    gpt_rs_bpack_cache_prepare(&gpt_rs_bcache_{op_id}, b, {n}, {k}, {sbk}, {sbn});
                   }}
                 }}
             "#
@@ -393,45 +424,4 @@ pub(super) fn register_op_profile_multi_output(
         alloc_count: 0,
     };
     Ok(profile.register(label, signature, work))
-}
-pub(super) fn emit_profile_begin(module: &mut String, op_id: usize) {
-    let block = format!(
-        r#"
-            #if defined(GPTRS_C_PROFILE)
-            uint64_t gpt_rs_op_start_{op_id} = 0;
-            if (gpt_rs_c_profile_on()) {{
-              gpt_rs_op_start_{op_id} = gpt_rs_c_now_ns();
-            }}
-            #endif
-        "#
-    );
-    push_block(module, 0, &block);
-}
-pub(super) fn emit_profile_end(module: &mut String, op_id: usize) {
-    let block = format!(
-        r#"
-            #if defined(GPTRS_C_PROFILE)
-            if (gpt_rs_c_profile_on()) {{
-              uint64_t gpt_rs_op_end_{op_id} = gpt_rs_c_now_ns();
-              gpt_rs_c_prof_op_ns[{op_id}] += gpt_rs_op_end_{op_id} - gpt_rs_op_start_{op_id};
-              gpt_rs_c_prof_op_calls[{op_id}] += 1;
-            }}
-            #endif
-        "#
-    );
-    push_block(module, 0, &block);
-}
-
-pub(super) fn emit_profiled_op<F>(
-    module: &mut String,
-    op_id: usize,
-    emit: F,
-) -> ConversionResult<()>
-where
-    F: FnOnce(&mut String) -> ConversionResult<()>,
-{
-    emit_profile_begin(module, op_id);
-    emit(module)?;
-    emit_profile_end(module, op_id);
-    Ok(())
 }

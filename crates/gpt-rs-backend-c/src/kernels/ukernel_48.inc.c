@@ -1,3 +1,4 @@
+#if GPTRS_HAS_AVX512
 static inline void gpt_rs_ukernel_6x48_zero(const float* ap,
                                             const float* bp0,
                                             const float* bp1,
@@ -274,3 +275,4 @@ static inline void gpt_rs_ukernel_6x48_bias(const float* ap,
     _mm512_storeu_ps(c + 5 * ldc + 16, c51);
     _mm512_storeu_ps(c + 5 * ldc + 32, c52);
 }
+#endif

@@ -7,13 +7,12 @@ use gpt_rs::backend::spec::{
 };
 
 use super::super::profile::{
-    backend_operation_label, emit_profiled_op, register_op_profile_generic,
-    register_op_profile_unary,
+    backend_operation_label, register_op_profile_generic, register_op_profile_unary,
 };
 use super::super::types::{ValueInfo, ValueKey};
 use super::super::utils::{
-    axis_index, dims_usize, emit_loops_with_indices, emit_memcpy, format_f32, linear_index_expr,
-    literal_to_f32_scalar, push_block,
+    axis_index, dims_usize, emit_memcpy, emit_parallel_loops_with_indices, ensure_copy_dtypes,
+    format_f32, linear_index_expr, literal_to_f32_scalar, push_block,
 };
 use super::super::value_info::{
     ensure_dtype, operand_dtype, operand_elem_count, operand_expr, operand_spec, operand_specs,
@@ -24,7 +23,7 @@ use super::EmitContext;
 pub(super) fn emit_instruction(
     inst: &Instruction,
     ctx: &mut EmitContext<'_>,
-) -> ConversionResult<bool> {
+) -> ConversionResult<Option<usize>> {
     let EmitContext {
         module,
         value_infos,
@@ -33,7 +32,7 @@ pub(super) fn emit_instruction(
         ..
     } = ctx;
 
-    match &inst.op {
+    let op_id = match &inst.op {
         Operation::Reshape(_spec) => {
             let out_info = output_info(value_infos, inst.id)?;
             let label = backend_operation_label(&inst.op);
@@ -45,102 +44,79 @@ pub(super) fn emit_instruction(
             if out_info.elem_count != in_elem {
                 return Err(ConversionError::new("reshape element count mismatch"));
             }
-            emit_profiled_op(module, op_id, |module| {
-                emit_memcpy(module, &out_info.var, &input, out_info.byte_len);
-                Ok(())
-            })?;
+            emit_memcpy(module, &out_info.var, &input, out_info.byte_len);
+            op_id
         }
         Operation::BroadcastTo(_spec) => {
             let out_info = output_info(value_infos, inst.id)?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
-            match input_dtype {
-                DType::F32 | DType::Si32 | DType::I1 => {}
-                _ => {
-                    return Err(ConversionError::new(
-                        "broadcast input must be f32, si32, or i1",
-                    ))
-                }
-            }
-            ensure_dtype(
-                out_info.spec.dtype,
-                input_dtype,
-                "broadcast output must match input dtype",
-            )?;
+            ensure_copy_dtypes("broadcast", &[input_dtype], out_info.spec.dtype)?;
             let label = backend_operation_label(&inst.op);
             let input_spec = operand_spec(&inst.operands[0], value_infos)?;
             let op_id =
                 register_op_profile_unary(matmul_profile, label, &out_info.spec, &input_spec)?;
             let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_broadcast(module, &out_info.var, &input, &out_info.spec, &input_spec)
-            })?;
+            emit_broadcast(module, &out_info.var, &input, &out_info.spec, &input_spec)?;
+            op_id
         }
         Operation::Transpose(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
-            ensure_dtype(input_dtype, DType::F32, "transpose input must be f32")?;
-            ensure_dtype(
-                out_info.spec.dtype,
-                DType::F32,
-                "transpose output must be f32",
-            )?;
+            ensure_copy_dtypes("transpose", &[input_dtype], out_info.spec.dtype)?;
             let label = backend_operation_label(&inst.op);
             let in_spec = operand_spec(&inst.operands[0], value_infos)?;
             let op_id = register_op_profile_unary(matmul_profile, label, &out_info.spec, &in_spec)?;
             let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_transpose(
-                    module,
-                    &out_info.var,
-                    &input,
-                    &out_info.spec,
-                    &in_spec,
-                    spec,
-                )
-            })?;
+            emit_transpose(
+                module,
+                &out_info.var,
+                &input,
+                &out_info.spec,
+                &in_spec,
+                spec,
+            )?;
+            op_id
         }
         Operation::Slice(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
-            ensure_dtype(input_dtype, DType::F32, "slice input must be f32")?;
-            ensure_dtype(out_info.spec.dtype, DType::F32, "slice output must be f32")?;
+            ensure_copy_dtypes("slice", &[input_dtype], out_info.spec.dtype)?;
             let label = backend_operation_label(&inst.op);
             let in_spec = operand_spec(&inst.operands[0], value_infos)?;
             let op_id = register_op_profile_unary(matmul_profile, label, &out_info.spec, &in_spec)?;
             let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_slice(
-                    module,
-                    &out_info.var,
-                    &input,
-                    &out_info.spec,
-                    &in_spec,
-                    spec,
-                )
-            })?;
+            emit_slice(
+                module,
+                &out_info.var,
+                &input,
+                &out_info.spec,
+                &in_spec,
+                spec,
+            )?;
+            op_id
         }
         Operation::Concat(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
-            for operand in &inst.operands {
-                let dtype = operand_dtype(operand, value_infos)?;
-                ensure_dtype(dtype, DType::F32, "concat operands must be f32")?;
-            }
-            ensure_dtype(out_info.spec.dtype, DType::F32, "concat output must be f32")?;
+            let dtypes = inst
+                .operands
+                .iter()
+                .map(|operand| operand_dtype(operand, value_infos))
+                .collect::<ConversionResult<Vec<_>>>()?;
+            ensure_copy_dtypes("concat", &dtypes, out_info.spec.dtype)?;
             let label = backend_operation_label(&inst.op);
             let input_specs = operand_specs(&inst.operands, value_infos)?;
             let op_id =
                 register_op_profile_generic(matmul_profile, label, &out_info.spec, &input_specs)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_concat(
-                    module,
-                    &out_info.var,
-                    &out_info.spec,
-                    &inst.operands,
-                    spec,
-                    value_infos,
-                    literal_cache,
-                )
-            })?;
+            emit_concat(
+                module,
+                &out_info.var,
+                &out_info.spec,
+                &inst.operands,
+                spec,
+                value_infos,
+                literal_cache,
+            )?;
+            op_id
         }
         Operation::Pad(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
@@ -152,51 +128,47 @@ pub(super) fn emit_instruction(
             let op_id =
                 register_op_profile_unary(matmul_profile, label, &out_info.spec, &input_spec)?;
             let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_pad(
-                    module,
-                    &out_info.var,
-                    &input,
-                    &out_info.spec,
-                    &input_spec,
-                    spec,
-                )
-            })?;
+            emit_pad(
+                module,
+                &out_info.var,
+                &input,
+                &out_info.spec,
+                &input_spec,
+                spec,
+            )?;
+            op_id
         }
         Operation::Tile(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
-            ensure_dtype(input_dtype, DType::F32, "tile input must be f32")?;
-            ensure_dtype(out_info.spec.dtype, DType::F32, "tile output must be f32")?;
+            ensure_copy_dtypes("tile", &[input_dtype], out_info.spec.dtype)?;
             let label = backend_operation_label(&inst.op);
             let input_spec = operand_spec(&inst.operands[0], value_infos)?;
             let op_id =
                 register_op_profile_unary(matmul_profile, label, &out_info.spec, &input_spec)?;
             let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_tile(
-                    module,
-                    &out_info.var,
-                    &input,
-                    &out_info.spec,
-                    &input_spec,
-                    spec,
-                )
-            })?;
+            emit_tile(
+                module,
+                &out_info.var,
+                &input,
+                &out_info.spec,
+                &input_spec,
+                spec,
+            )?;
+            op_id
         }
         Operation::Iota(spec) => {
             let out_info = output_info(value_infos, inst.id)?;
             ensure_dtype(out_info.spec.dtype, DType::Si32, "iota output must be si32")?;
             let label = backend_operation_label(&inst.op);
             let op_id = register_op_profile_generic(matmul_profile, label, &out_info.spec, &[])?;
-            emit_profiled_op(module, op_id, |module| {
-                emit_iota(module, &out_info.var, &out_info.spec, spec)
-            })?;
+            emit_iota(module, &out_info.var, &out_info.spec, spec)?;
+            op_id
         }
-        _ => return Ok(false),
-    }
+        _ => return Ok(None),
+    };
 
-    Ok(true)
+    Ok(Some(op_id))
 }
 
 fn emit_broadcast(
@@ -216,7 +188,7 @@ fn emit_broadcast(
     let mut padded_in_dims = vec![1usize; out_dims.len() - in_dims.len()];
     padded_in_dims.extend(in_dims);
 
-    emit_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
+    emit_parallel_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
         let mut in_indices = Vec::with_capacity(indices.len());
         for (idx, dim) in padded_in_dims.iter().enumerate() {
             if *dim == 1 {
@@ -249,7 +221,7 @@ fn emit_transpose(
         return Err(ConversionError::new("transpose rank mismatch"));
     }
 
-    emit_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
+    emit_parallel_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
         let mut in_indices = vec!["0".to_string(); in_dims.len()];
         for (out_axis, in_axis) in spec.perm.iter().enumerate() {
             if *in_axis >= in_indices.len() {
@@ -280,7 +252,7 @@ fn emit_slice(
     if spec.starts.len() != out_dims.len() || spec.sizes.len() != out_dims.len() {
         return Err(ConversionError::new("slice spec rank mismatch"));
     }
-    emit_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
+    emit_parallel_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
         let mut in_indices = Vec::with_capacity(indices.len());
         for (idx, start) in spec.starts.iter().enumerate() {
             let base = start;
@@ -339,7 +311,7 @@ fn emit_concat(
         ));
     }
 
-    emit_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
+    emit_parallel_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
         let out_idx = linear_index_expr(&out_dims, indices);
         let axis_idx = &indices[axis];
         for (op_idx, (input, in_dims)) in operand_exprs.iter().zip(operand_dims.iter()).enumerate()
@@ -398,7 +370,7 @@ fn emit_pad(
     let pad_value = literal_to_f32_scalar(&spec.pad_value)?;
     let pad = format_f32(pad_value);
 
-    emit_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
+    emit_parallel_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
         push_block(module, indent, "int in_bounds = 1;");
         let mut in_indices: Vec<String> = Vec::with_capacity(indices.len());
         for (axis, idx) in indices.iter().enumerate() {
@@ -453,7 +425,7 @@ fn emit_tile(
     if spec.repeats.len() != out_dims.len() || in_dims.len() != out_dims.len() {
         return Err(ConversionError::new("tile rank mismatch"));
     }
-    emit_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
+    emit_parallel_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
         let mut in_indices = Vec::with_capacity(indices.len());
         for (axis, idx) in indices.iter().enumerate() {
             let dim = in_dims[axis];
@@ -482,7 +454,7 @@ fn emit_iota(
         DType::Si32 => "int32_t",
         _ => return Err(ConversionError::new("iota output must be f32 or si32")),
     };
-    emit_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
+    emit_parallel_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
         let out_idx = linear_index_expr(&out_dims, indices);
         let axis_idx = &indices[axis];
         push_block(

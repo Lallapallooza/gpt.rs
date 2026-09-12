@@ -2843,6 +2843,25 @@ fn try_dot_general(
         ));
     }
 
+    // Linear layout `x [M, K] . w [N, K]`: a single-batch rhs-transposed matmul.
+    if lhs_dims.len() == 2
+        && rhs_dims.len() == 2
+        && out_dims.len() == 2
+        && spec.batch_lhs.is_empty()
+        && spec.batch_rhs.is_empty()
+        && spec.contract_lhs.as_slice() == [1]
+        && spec.contract_rhs.as_slice() == [1]
+    {
+        return Some(dot_general_batched_rhs_transposed(
+            lhs_values,
+            rhs_values,
+            &[1, lhs_dims[0], lhs_dims[1]],
+            &[1, rhs_dims[0], rhs_dims[1]],
+            &[1, out_dims[0], out_dims[1]],
+            output_spec,
+        ));
+    }
+
     if lhs_dims.len() == 3
         && rhs_dims.len() == 3
         && spec.batch_lhs.as_slice() == [0]

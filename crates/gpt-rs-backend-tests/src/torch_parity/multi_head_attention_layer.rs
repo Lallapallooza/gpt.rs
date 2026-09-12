@@ -1,49 +1,104 @@
 use std::sync::Arc;
 
 use gpt_rs::backend::spec::PortableBackend;
-use gpt_rs::nn::layers::{AttentionConfig, CausalSelfAttention};
-use gpt_rs::ops::functional;
-use gpt_rs::tensor::{DeviceTensor, Tensor};
-use tch::{Kind, Tensor as TchTensor};
+use gpt_rs::module::Layer;
+use gpt_rs::nn::layers::{
+    AttentionConfig, AttentionPositions, CausalSelfAttention, RmsNormConfig, RopeConfig,
+    RopeScaling, RotaryEmbedding,
+};
+use tch::{Device, Kind, Tensor as TchTensor};
 
 use super::common::*;
 
+const ROPE_THETA: f32 = 10_000.0;
+
+/// Host weights of a [`CausalSelfAttention`] layer.
+struct HostAttention {
+    q: HostLinear,
+    k: HostLinear,
+    v: HostLinear,
+    o: HostLinear,
+    /// `(q_norm weight, k_norm weight)`, each `[head_dim]`.
+    qk_norm: Option<(Vec<f32>, Vec<f32>)>,
+}
+
+fn rms_norm_reference(x: &TchTensor, weight: &[f32], norm: RmsNormConfig) -> TchTensor {
+    let weight = tch_tensor_from_vec(&[weight.len()], weight);
+    let scale = if norm.unit_offset {
+        weight + 1.0
+    } else {
+        weight
+    };
+    let mean_square = (x * x).mean_dim(Some([-1i64].as_slice()), true, Kind::Float);
+    x * (mean_square + norm.eps as f64).rsqrt() * scale
+}
+
+fn rope(rotary_dim: usize) -> RopeConfig {
+    RopeConfig {
+        rotary_dim,
+        theta: ROPE_THETA,
+        scaling: RopeScaling::None,
+    }
+}
+
+/// Hugging Face `apply_rotary_pos_emb` on the leading `rotary_dim` channels of `x`, a
+/// `[heads, T, head_dim]` tensor, at positions `0..T`.
+fn rope_reference(x: &TchTensor, rotary_dim: usize) -> TchTensor {
+    let size = x.size();
+    let (seq, head_dim, rotary) = (size[1], size[2], rotary_dim as i64);
+    let exponent = TchTensor::arange_start_step(0, rotary, 2, (Kind::Float, Device::Cpu)) / rotary;
+    let inv_freq = (exponent * (ROPE_THETA as f64).ln()).exp().reciprocal();
+    let freqs =
+        TchTensor::arange(seq, (Kind::Float, Device::Cpu)).unsqueeze(1) * inv_freq.unsqueeze(0);
+    let emb = TchTensor::cat(&[&freqs, &freqs], 1);
+    let (cos, sin) = (emb.cos(), emb.sin());
+    let x_rot = x.narrow(2, 0, rotary);
+    let half = rotary / 2;
+    let rotate_half = TchTensor::cat(&[-x_rot.narrow(2, half, half), x_rot.narrow(2, 0, half)], 2);
+    let rotated = &x_rot * &cos + rotate_half * &sin;
+    TchTensor::cat(&[rotated, x.narrow(2, rotary, head_dim - rotary)], 2)
+}
+
 fn attention_reference(
     input: &TchTensor,
-    w_qkv: &TchTensor,
-    b_qkv: Option<&TchTensor>,
-    w_out: &TchTensor,
-    b_out: Option<&TchTensor>,
+    weights: &HostAttention,
     config: &AttentionConfig,
 ) -> TchTensor {
     let seq_len = input.size()[0];
-    let embed_dim = input.size()[1];
-    let qkv = if let Some(bias) = b_qkv {
-        input.matmul(w_qkv) + bias.unsqueeze(0)
-    } else {
-        input.matmul(w_qkv)
-    };
-    let q_proj_dim = config.query_projection_dim() as i64;
-    let kv_proj_dim = config.key_value_projection_dim() as i64;
-    let q = qkv.narrow(1, 0, q_proj_dim);
-    let k = qkv.narrow(1, q_proj_dim, kv_proj_dim);
-    let v = qkv.narrow(1, q_proj_dim + kv_proj_dim, kv_proj_dim);
-
     let num_heads = config.num_heads() as i64;
     let kv_heads = config.num_key_value_heads as i64;
-    let head_dim = q_proj_dim / num_heads;
-    let kv_head_dim = kv_proj_dim / kv_heads;
-    assert_eq!(head_dim, kv_head_dim, "reference assumes shared head dim");
+    let head_dim = config.head_dim as i64;
     let group_size = num_heads / kv_heads;
-    let q = q.reshape([seq_len, num_heads, head_dim]).transpose(0, 1);
-    let k = k
-        .reshape([seq_len, kv_heads, kv_head_dim])
-        .transpose(0, 1)
-        .repeat_interleave_self_int(group_size, 0, None::<i64>);
-    let v = v
-        .reshape([seq_len, kv_heads, kv_head_dim])
-        .transpose(0, 1)
-        .repeat_interleave_self_int(group_size, 0, None::<i64>);
+
+    let q_width = if config.output_gate {
+        2 * head_dim
+    } else {
+        head_dim
+    };
+    let q_and_gate = weights
+        .q
+        .torch(input)
+        .reshape([seq_len, num_heads, q_width]);
+    let mut q = q_and_gate.narrow(2, 0, head_dim);
+    let mut k = weights
+        .k
+        .torch(input)
+        .reshape([seq_len, kv_heads, head_dim]);
+    let v = weights
+        .v
+        .torch(input)
+        .reshape([seq_len, kv_heads, head_dim]);
+    if let (Some(norm), Some((q_weight, k_weight))) = (config.qk_norm, &weights.qk_norm) {
+        q = rms_norm_reference(&q, q_weight, norm);
+        k = rms_norm_reference(&k, k_weight, norm);
+    }
+    let (mut q, mut k, v) = (q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1));
+    if let Some(rope) = config.rope {
+        q = rope_reference(&q, rope.rotary_dim);
+        k = rope_reference(&k, rope.rotary_dim);
+    }
+    let k = k.repeat_interleave_self_int(group_size, 0, None::<i64>);
+    let v = v.repeat_interleave_self_int(group_size, 0, None::<i64>);
 
     let scale = (head_dim as f64).sqrt();
     let scores = q.matmul(&k.transpose(-2, -1)) / scale;
@@ -52,452 +107,126 @@ fn attention_reference(
         .logical_not();
     let masked = scores.masked_fill(&causal_mask, f64::NEG_INFINITY);
     let attn = masked.softmax(-1, Kind::Float);
-    let context = attn
+    let mut context = attn
         .matmul(&v)
         .transpose(0, 1)
-        .reshape([seq_len, embed_dim]);
-
-    let mut output = context.matmul(w_out);
-    if let Some(bias) = b_out {
-        output += bias.unsqueeze(0);
+        .reshape([seq_len, num_heads * head_dim]);
+    if config.output_gate {
+        let gate = q_and_gate
+            .narrow(2, head_dim, head_dim)
+            .reshape([seq_len, num_heads * head_dim]);
+        context *= gate.sigmoid();
     }
-    output
+    weights.o.torch(&context)
 }
 
-fn build_attention_layer<B: PortableBackend + 'static>(
+/// Runs `prefill_len` tokens as one chunk into a fresh cache, then `decode_steps` single tokens,
+/// and compares every output row with full-sequence Torch attention.
+fn run_attention_case<B: PortableBackend + 'static>(
     backend: &Arc<B>,
     config: AttentionConfig,
-    w_qkv: Tensor,
-    w_out: Tensor,
-    b_qkv: Option<Tensor>,
-    b_out: Option<Tensor>,
-) -> CausalSelfAttention<B> {
-    CausalSelfAttention::new(Arc::clone(backend), config, w_qkv, w_out, b_qkv, b_out).unwrap()
-}
-
-fn run_mha_case<B: PortableBackend + 'static>(
-    backend: &Arc<B>,
-    seq_len: usize,
-    embed_dim: usize,
-    num_heads: usize,
-    num_kv_heads: usize,
-    seed: u64,
-    bias: bool,
-) {
-    let mut rng = seeded_rng(seed);
-    let config = if num_heads == num_kv_heads {
-        AttentionConfig::with_equal_heads(embed_dim, num_heads)
-    } else {
-        AttentionConfig::with_kv(embed_dim, num_heads, num_kv_heads)
-    };
-    let total_dim = config.total_projection_dim();
-
-    let input_host = tensor_from_vec(
-        &[seq_len, embed_dim],
-        random_vec(&mut rng, seq_len * embed_dim),
-    );
-    let w_qkv_host = tensor_from_vec(
-        &[embed_dim, total_dim],
-        random_vec(&mut rng, embed_dim * total_dim),
-    );
-    let w_out_host = tensor_from_vec(
-        &[embed_dim, embed_dim],
-        random_vec(&mut rng, embed_dim * embed_dim),
-    );
-    let b_qkv_host = if bias {
-        Some(tensor_from_vec(
-            &[total_dim],
-            random_vec(&mut rng, total_dim),
-        ))
-    } else {
-        None
-    };
-    let b_out_host = if bias {
-        Some(tensor_from_vec(
-            &[embed_dim],
-            random_vec(&mut rng, embed_dim),
-        ))
-    } else {
-        None
-    };
-
-    let expected = timed_torch(|| {
-        let input_tch = tch_tensor_from_vec(&[seq_len, embed_dim], input_host.data());
-        let w_qkv_tch = tch_tensor_from_vec(&[embed_dim, total_dim], w_qkv_host.data());
-        let w_out_tch = tch_tensor_from_vec(&[embed_dim, embed_dim], w_out_host.data());
-        let b_qkv_tch = b_qkv_host
-            .as_ref()
-            .map(|b| tch_tensor_from_vec(&[total_dim], b.data()));
-        let b_out_tch = b_out_host
-            .as_ref()
-            .map(|b| tch_tensor_from_vec(&[embed_dim], b.data()));
-        tensor_to_vec(&attention_reference(
-            &input_tch,
-            &w_qkv_tch,
-            b_qkv_tch.as_ref(),
-            &w_out_tch,
-            b_out_tch.as_ref(),
-            &config,
-        ))
-    });
-
-    let output_host = timed_gpt(|| {
-        let layer = build_attention_layer(
-            backend,
-            config.clone(),
-            w_qkv_host.clone(),
-            w_out_host.clone(),
-            b_qkv_host.clone(),
-            b_out_host.clone(),
-        );
-
-        let input_device =
-            DeviceTensor::from_host(Arc::clone(backend), input_host.clone()).unwrap();
-        let output_device = layer.forward(&input_device).unwrap();
-        output_device.to_host().unwrap()
-    });
-
-    assert_close(&expected, output_host.data());
-}
-
-fn run_mha_prefill_decode_case<B: PortableBackend + 'static>(
-    backend: &Arc<B>,
-    prefill_len: usize,
-    decode_steps: usize,
-    embed_dim: usize,
-    num_heads: usize,
-    num_kv_heads: usize,
+    (prefill_len, decode_steps): (usize, usize),
     seed: u64,
 ) {
     let mut rng = seeded_rng(seed);
     let total_seq = prefill_len + decode_steps;
-    let config = if num_heads == num_kv_heads {
-        AttentionConfig::with_equal_heads(embed_dim, num_heads)
-    } else {
-        AttentionConfig::with_kv(embed_dim, num_heads, num_kv_heads)
-    };
-    let total_dim = config.total_projection_dim();
+    let (embed_dim, kv_dim, bias) = (
+        config.embed_dim,
+        config.key_value_projection_dim(),
+        config.bias,
+    );
 
-    let input_host = tensor_from_vec(
-        &[total_seq, embed_dim],
-        random_vec(&mut rng, total_seq * embed_dim),
-    );
-    let w_qkv_host = tensor_from_vec(
-        &[embed_dim, total_dim],
-        random_vec(&mut rng, embed_dim * total_dim),
-    );
-    let b_qkv_host = tensor_from_vec(&[total_dim], random_vec(&mut rng, total_dim));
-    let w_out_host = tensor_from_vec(
-        &[embed_dim, embed_dim],
-        random_vec(&mut rng, embed_dim * embed_dim),
-    );
-    let b_out_host = tensor_from_vec(&[embed_dim], random_vec(&mut rng, embed_dim));
+    let input = random_vec(&mut rng, total_seq * embed_dim);
+    let weights = HostAttention {
+        q: HostLinear::random(&mut rng, embed_dim, config.query_projection_dim(), bias),
+        k: HostLinear::random(&mut rng, embed_dim, kv_dim, bias),
+        v: HostLinear::random(&mut rng, embed_dim, kv_dim, bias),
+        o: HostLinear::random(&mut rng, config.query_dim(), embed_dim, bias),
+        qk_norm: config.qk_norm.map(|_| {
+            let d = config.head_dim;
+            let mut weight = || random_vec_range(&mut rng, d, 0.5, 1.5);
+            (weight(), weight())
+        }),
+    };
 
     let expected = timed_torch(|| {
-        let input_tch = tch_tensor_from_vec(&[total_seq, embed_dim], input_host.data());
-        let w_qkv_tch = tch_tensor_from_vec(&[embed_dim, total_dim], w_qkv_host.data());
-        let b_qkv_tch = tch_tensor_from_vec(&[total_dim], b_qkv_host.data());
-        let w_out_tch = tch_tensor_from_vec(&[embed_dim, embed_dim], w_out_host.data());
-        let b_out_tch = tch_tensor_from_vec(&[embed_dim], b_out_host.data());
         tensor_to_vec(&attention_reference(
-            &input_tch,
-            &w_qkv_tch,
-            Some(&b_qkv_tch),
-            &w_out_tch,
-            Some(&b_out_tch),
+            &tch_tensor_from_vec(&[total_seq, embed_dim], &input),
+            &weights,
             &config,
         ))
     });
 
     timed_gpt(|| {
-        let layer = build_attention_layer(
-            backend,
-            config.clone(),
-            w_qkv_host.clone(),
-            w_out_host.clone(),
-            Some(b_qkv_host.clone()),
-            Some(b_out_host.clone()),
-        );
-
-        let prefill_input = tensor_from_vec(
-            &[prefill_len, embed_dim],
-            input_host.data()[0..prefill_len * embed_dim].to_vec(),
-        );
-        let prefill_device = DeviceTensor::from_host(Arc::clone(backend), prefill_input).unwrap();
-        let (_prefill_out, mut cache) = layer.forward_with_cache(&prefill_device, None).unwrap();
-
-        for step in 0..decode_steps {
-            let start = (prefill_len + step) * embed_dim;
-            let end = start + embed_dim;
-            let token = tensor_from_vec(&[1, embed_dim], input_host.data()[start..end].to_vec());
-            let token_device = DeviceTensor::from_host(Arc::clone(backend), token).unwrap();
-            let (output, next_cache) = layer
-                .forward_with_cache(&token_device, Some(&cache))
-                .unwrap();
-
-            let output_host = output.to_host().unwrap();
-            assert_close(&expected[start..end], output_host.data());
-            cache = next_cache;
+        let mut tensors = [
+            weights.q.tensors("attn.q_proj"),
+            weights.k.tensors("attn.k_proj"),
+            weights.v.tensors("attn.v_proj"),
+            weights.o.tensors("attn.o_proj"),
+        ]
+        .concat();
+        if let Some((q_weight, k_weight)) = &weights.qk_norm {
+            for (name, weight) in [
+                ("attn.q_norm.weight", q_weight),
+                ("attn.k_norm.weight", k_weight),
+            ] {
+                tensors.push((
+                    name.to_string(),
+                    tensor_from_vec(&[weight.len()], weight.clone()),
+                ));
+            }
         }
+        let layer = load_layer(backend, tensors, |p| {
+            CausalSelfAttention::load(p, "attn", config.clone())
+        })
+        .unwrap();
+        let rotary = config.rope.map(|rope| RotaryEmbedding::new(rope).unwrap());
+        let mut cache = layer.empty_cache(backend, total_seq).unwrap();
+        let mut position = 0;
+        for len in std::iter::once(prefill_len).chain(std::iter::repeat_n(1, decode_steps)) {
+            let rows = position * embed_dim..(position + len) * embed_dim;
+            let x = device_tensor_from_data(backend, &[len, embed_dim], &input[rows.clone()]);
+            let positions =
+                AttentionPositions::new(backend, position, len, rotary.as_ref()).unwrap();
+            let (output, next_cache) = layer.call((&x, &cache, &positions)).unwrap();
+            assert_close(&expected[rows], &to_host_vec(&output));
+            cache = next_cache;
+            position += len;
+        }
+        assert_eq!(cache.len(), total_seq);
     });
 }
 
-pub fn multi_head_attention_matches_torch_with_bias<B: PortableBackend + 'static>(
+/// Plain multi- or grouped-query attention, as in GPT-2.
+fn run_mha_case<B: PortableBackend + 'static>(
     backend: &Arc<B>,
+    steps: (usize, usize),
+    (embed_dim, num_heads, num_kv_heads): (usize, usize, usize),
+    seed: u64,
+    bias: bool,
 ) {
-    let mut rng = seeded_rng(0xA57A);
-    let seq_len = 5;
-    let embed_dim = 8;
-    let num_heads = 4;
-
-    let input_host = tensor_from_vec(
-        &[seq_len, embed_dim],
-        random_vec(&mut rng, seq_len * embed_dim),
-    );
-    let w_qkv_host = tensor_from_vec(
-        &[embed_dim, 3 * embed_dim],
-        random_vec(&mut rng, embed_dim * 3 * embed_dim),
-    );
-    let b_qkv_host = tensor_from_vec(&[3 * embed_dim], random_vec(&mut rng, 3 * embed_dim));
-    let w_out_host = tensor_from_vec(
-        &[embed_dim, embed_dim],
-        random_vec(&mut rng, embed_dim * embed_dim),
-    );
-    let b_out_host = tensor_from_vec(&[embed_dim], random_vec(&mut rng, embed_dim));
-
-    let config = AttentionConfig::with_equal_heads(embed_dim, num_heads);
-    let expected = timed_torch(|| {
-        let input_tch = tch_tensor_from_vec(&[seq_len, embed_dim], input_host.data());
-        let w_qkv_tch = tch_tensor_from_vec(&[embed_dim, 3 * embed_dim], w_qkv_host.data());
-        let b_qkv_tch = tch_tensor_from_vec(&[3 * embed_dim], b_qkv_host.data());
-        let w_out_tch = tch_tensor_from_vec(&[embed_dim, embed_dim], w_out_host.data());
-        let b_out_tch = tch_tensor_from_vec(&[embed_dim], b_out_host.data());
-        tensor_to_vec(&attention_reference(
-            &input_tch,
-            &w_qkv_tch,
-            Some(&b_qkv_tch),
-            &w_out_tch,
-            Some(&b_out_tch),
-            &config,
-        ))
-    });
-
-    let output_host = timed_gpt(|| {
-        let layer = build_attention_layer(
-            backend,
-            config.clone(),
-            w_qkv_host.clone(),
-            w_out_host.clone(),
-            Some(b_qkv_host.clone()),
-            Some(b_out_host.clone()),
-        );
-
-        let input_device =
-            DeviceTensor::from_host(Arc::clone(backend), input_host.clone()).unwrap();
-        let output_device = layer.forward(&input_device).unwrap();
-        output_device.to_host().unwrap()
-    });
-
-    assert_close(&expected, output_host.data());
-}
-
-pub fn multi_head_attention_matches_torch_grouped<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    let mut rng = seeded_rng(0xC0FE);
-    let seq_len = 4;
-    let embed_dim = 8;
-    let num_heads = 4;
-    let num_kv_heads = 2;
-
-    let config = AttentionConfig::with_kv(embed_dim, num_heads, num_kv_heads);
-    let total_dim = config.total_projection_dim();
-
-    let input_host = tensor_from_vec(
-        &[seq_len, embed_dim],
-        random_vec(&mut rng, seq_len * embed_dim),
-    );
-    let w_qkv_host = tensor_from_vec(
-        &[embed_dim, total_dim],
-        random_vec(&mut rng, embed_dim * total_dim),
-    );
-    let b_qkv_host = tensor_from_vec(&[total_dim], random_vec(&mut rng, total_dim));
-    let w_out_host = tensor_from_vec(
-        &[embed_dim, embed_dim],
-        random_vec(&mut rng, embed_dim * embed_dim),
-    );
-    let b_out_host = tensor_from_vec(&[embed_dim], random_vec(&mut rng, embed_dim));
-
-    let expected = timed_torch(|| {
-        let input_tch = tch_tensor_from_vec(&[seq_len, embed_dim], input_host.data());
-        let w_qkv_tch = tch_tensor_from_vec(&[embed_dim, total_dim], w_qkv_host.data());
-        let b_qkv_tch = tch_tensor_from_vec(&[total_dim], b_qkv_host.data());
-        let w_out_tch = tch_tensor_from_vec(&[embed_dim, embed_dim], w_out_host.data());
-        let b_out_tch = tch_tensor_from_vec(&[embed_dim], b_out_host.data());
-        tensor_to_vec(&attention_reference(
-            &input_tch,
-            &w_qkv_tch,
-            Some(&b_qkv_tch),
-            &w_out_tch,
-            Some(&b_out_tch),
-            &config,
-        ))
-    });
-
-    let output_host = timed_gpt(|| {
-        let layer = build_attention_layer(
-            backend,
-            config.clone(),
-            w_qkv_host.clone(),
-            w_out_host.clone(),
-            Some(b_qkv_host.clone()),
-            Some(b_out_host.clone()),
-        );
-
-        let input_device =
-            DeviceTensor::from_host(Arc::clone(backend), input_host.clone()).unwrap();
-        let (output_device, state) = layer.forward_with_cache(&input_device, None).unwrap();
-        let output_host = output_device.to_host().unwrap();
-
-        assert_eq!(
-            state.keys().shape().dims(),
-            &[config.num_key_value_heads, seq_len, config.kv_head_dim]
-        );
-
-        let last_token_host = tensor_from_vec(
-            &[1, embed_dim],
-            input_host.data()[embed_dim * (seq_len - 1)..].to_vec(),
-        );
-        let last_token_device =
-            DeviceTensor::from_host(Arc::clone(backend), last_token_host).unwrap();
-        let (_, second_state) = layer
-            .forward_with_cache(&last_token_device, Some(&state))
-            .unwrap();
-        assert_eq!(second_state.len(), seq_len + 1);
-
-        output_host
-    });
-
-    assert_close(&expected, output_host.data());
+    let config = AttentionConfig::with_kv(embed_dim, num_heads, num_kv_heads)
+        .unwrap()
+        .with_bias(bias);
+    run_attention_case(backend, config, steps, seed);
 }
 
 pub fn multi_head_attention_matches_torch_without_bias<B: PortableBackend + 'static>(
     backend: &Arc<B>,
 ) {
-    let mut rng = seeded_rng(0xDEAD);
-    let seq_len = 3;
-    let embed_dim = 6;
-    let num_heads = 3;
-    let config = AttentionConfig::with_equal_heads(embed_dim, num_heads);
-
-    let input_host = tensor_from_vec(
-        &[seq_len, embed_dim],
-        random_vec(&mut rng, seq_len * embed_dim),
-    );
-    let w_qkv_host = tensor_from_vec(
-        &[embed_dim, 3 * embed_dim],
-        random_vec(&mut rng, embed_dim * 3 * embed_dim),
-    );
-    let w_out_host = tensor_from_vec(
-        &[embed_dim, embed_dim],
-        random_vec(&mut rng, embed_dim * embed_dim),
-    );
-
-    let expected = timed_torch(|| {
-        let input_tch = tch_tensor_from_vec(&[seq_len, embed_dim], input_host.data());
-        let w_qkv_tch = tch_tensor_from_vec(&[embed_dim, 3 * embed_dim], w_qkv_host.data());
-        let w_out_tch = tch_tensor_from_vec(&[embed_dim, embed_dim], w_out_host.data());
-        tensor_to_vec(&attention_reference(
-            &input_tch, &w_qkv_tch, None, &w_out_tch, None, &config,
-        ))
-    });
-
-    let output_host = timed_gpt(|| {
-        let layer = build_attention_layer(
-            backend,
-            config.clone(),
-            w_qkv_host.clone(),
-            w_out_host.clone(),
-            Option::<Tensor>::None,
-            Option::<Tensor>::None,
-        );
-
-        let input_device =
-            DeviceTensor::from_host(Arc::clone(backend), input_host.clone()).unwrap();
-        let output_device = layer.forward(&input_device).unwrap();
-        output_device.to_host().unwrap()
-    });
-
-    assert_close(&expected, output_host.data());
-}
-
-pub fn multi_head_attention_state_records_context<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    let mut rng = seeded_rng(0xFACE);
-    let seq_len = 4;
-    let embed_dim = 8;
-    let num_heads = 2;
-    let config = AttentionConfig::with_equal_heads(embed_dim, num_heads);
-
-    let input_host = tensor_from_vec(
-        &[seq_len, embed_dim],
-        random_vec(&mut rng, seq_len * embed_dim),
-    );
-    let w_qkv_host = tensor_from_vec(
-        &[embed_dim, 3 * embed_dim],
-        random_vec(&mut rng, embed_dim * 3 * embed_dim),
-    );
-    let b_qkv_host = tensor_from_vec(&[3 * embed_dim], random_vec(&mut rng, 3 * embed_dim));
-    let w_out_host = tensor_from_vec(
-        &[embed_dim, embed_dim],
-        random_vec(&mut rng, embed_dim * embed_dim),
-    );
-    let b_out_host = tensor_from_vec(&[embed_dim], random_vec(&mut rng, embed_dim));
-
-    let expected = timed_torch(|| {
-        let input_tch = tch_tensor_from_vec(&[seq_len, embed_dim], input_host.data());
-        let w_qkv_tch = tch_tensor_from_vec(&[embed_dim, 3 * embed_dim], w_qkv_host.data());
-        let b_qkv_tch = tch_tensor_from_vec(&[3 * embed_dim], b_qkv_host.data());
-        tensor_to_vec(&attention_reference(
-            &input_tch,
-            &w_qkv_tch,
-            Some(&b_qkv_tch),
-            &TchTensor::eye(embed_dim as i64, (Kind::Float, input_tch.device())),
-            None,
-            &config,
-        ))
-    });
-
-    let context_host = timed_gpt(|| {
-        let layer = build_attention_layer(
-            backend,
-            config.clone(),
-            w_qkv_host.clone(),
-            w_out_host.clone(),
-            Some(b_qkv_host.clone()),
-            Some(b_out_host.clone()),
-        );
-
-        let input_device =
-            DeviceTensor::from_host(Arc::clone(backend), input_host.clone()).unwrap();
-        let qkv = layer.proj_qkv.forward(&input_device).unwrap();
-        let functional::AttentionComputation {
-            output: attention_context,
-            ..
-        } = functional::attention(backend.as_ref(), &config, &qkv, None).unwrap();
-        attention_context.to_host().unwrap()
-    });
-
-    assert_close(&expected, context_host.data());
+    run_mha_case(backend, (3, 0), (6, 3, 3), 0xDEAD, false);
 }
 
 pub fn multi_head_attention_seq1_embed32_heads4_bias_matches_torch<B: PortableBackend + 'static>(
     backend: &Arc<B>,
 ) {
-    run_mha_case(backend, 1, 32, 4, 4, 0xA500, true);
+    run_mha_case(backend, (1, 0), (32, 4, 4), 0xA500, true);
 }
 
 pub fn multi_head_attention_seq8_embed32_heads4_bias_matches_torch<B: PortableBackend + 'static>(
     backend: &Arc<B>,
 ) {
-    run_mha_case(backend, 8, 32, 4, 4, 0xA501, true);
+    run_mha_case(backend, (8, 0), (32, 4, 4), 0xA501, true);
 }
 
 pub fn multi_head_attention_seq8_embed32_heads8_kv1_bias_matches_torch<
@@ -505,7 +234,7 @@ pub fn multi_head_attention_seq8_embed32_heads8_kv1_bias_matches_torch<
 >(
     backend: &Arc<B>,
 ) {
-    run_mha_case(backend, 8, 32, 8, 1, 0xA502, true);
+    run_mha_case(backend, (8, 0), (32, 8, 1), 0xA502, true);
 }
 
 pub fn multi_head_attention_seq8_embed32_heads8_kv2_bias_matches_torch<
@@ -513,7 +242,7 @@ pub fn multi_head_attention_seq8_embed32_heads8_kv2_bias_matches_torch<
 >(
     backend: &Arc<B>,
 ) {
-    run_mha_case(backend, 8, 32, 8, 2, 0xA503, true);
+    run_mha_case(backend, (8, 0), (32, 8, 2), 0xA503, true);
 }
 
 pub fn multi_head_attention_head_dim1_embed8_heads8_bias_matches_torch<
@@ -521,19 +250,70 @@ pub fn multi_head_attention_head_dim1_embed8_heads8_bias_matches_torch<
 >(
     backend: &Arc<B>,
 ) {
-    run_mha_case(backend, 4, 8, 8, 8, 0xA504, true);
+    run_mha_case(backend, (4, 0), (8, 8, 8), 0xA504, true);
 }
 
-pub fn multi_head_attention_prefill4_decode3_matches_full_concat<B: PortableBackend + 'static>(
+pub fn multi_head_attention_prefill4_decode3_matches_full_sequence<B: PortableBackend + 'static>(
     backend: &Arc<B>,
 ) {
-    run_mha_prefill_decode_case(backend, 4, 3, 32, 4, 4, 0xA505);
+    run_mha_case(backend, (4, 3), (32, 4, 4), 0xA505, true);
 }
 
-pub fn multi_head_attention_prefill4_decode3_grouped_kv2_matches_full_concat<
+pub fn multi_head_attention_prefill4_decode3_grouped_kv2_matches_full_sequence<
     B: PortableBackend + 'static,
 >(
     backend: &Arc<B>,
 ) {
-    run_mha_prefill_decode_case(backend, 4, 3, 32, 8, 2, 0xA506);
+    run_mha_case(backend, (4, 3), (32, 8, 2), 0xA506, true);
+}
+
+pub fn attention_full_rotary_grouped_kv2_prefill4_decode3_matches_torch<
+    B: PortableBackend + 'static,
+>(
+    backend: &Arc<B>,
+) {
+    let config = AttentionConfig::with_kv(32, 4, 2)
+        .unwrap()
+        .with_rope(rope(8))
+        .unwrap();
+    run_attention_case(backend, config, (4, 3), 0xA507);
+}
+
+pub fn attention_qk_norm_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    let config = AttentionConfig::with_kv(32, 4, 4)
+        .unwrap()
+        .with_qk_norm(RmsNormConfig {
+            eps: 1e-6,
+            unit_offset: false,
+        });
+    run_attention_case(backend, config, (6, 0), 0xA508);
+}
+
+pub fn attention_output_gate_grouped_kv2_prefill5_decode2_matches_torch<
+    B: PortableBackend + 'static,
+>(
+    backend: &Arc<B>,
+) {
+    let config = AttentionConfig::with_kv(32, 4, 2)
+        .unwrap()
+        .with_bias(true)
+        .with_output_gate();
+    run_attention_case(backend, config, (5, 2), 0xA509);
+}
+
+pub fn attention_partial_rotary_qk_norm_output_gate_prefill5_decode3_matches_torch<
+    B: PortableBackend + 'static,
+>(
+    backend: &Arc<B>,
+) {
+    let config = AttentionConfig::with_projection_dims(24, 4, 2, 8)
+        .unwrap()
+        .with_qk_norm(RmsNormConfig {
+            eps: 1e-6,
+            unit_offset: true,
+        })
+        .with_rope(rope(4))
+        .unwrap()
+        .with_output_gate();
+    run_attention_case(backend, config, (5, 3), 0xA50A);
 }

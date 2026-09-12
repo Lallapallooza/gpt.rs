@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use gpt_rs::backend::spec::PortableBackend;
-use gpt_rs::ops::functional::{self, RopeConfig, RopeScaling};
-use gpt_rs::tensor::DeviceTensor;
+use gpt_rs::nn::{RopeConfig, RopeScaling, RotaryEmbedding};
+use gpt_rs::ops::functional;
 use tch::{Device, Kind, Tensor as TchTensor};
 
 use super::common::*;
@@ -50,29 +50,27 @@ fn run_rope_case<B: PortableBackend + 'static>(
     let x_len = num_heads * seq_len * head_dim;
     let x_data = random_vec(&mut rng, x_len);
 
-    let cache = functional::rotary_cos_sin_cache(
-        seq_len,
-        RopeConfig {
-            rotary_dim,
-            theta: 10_000.0,
-            scaling: RopeScaling::None,
-        },
-    )
-    .unwrap();
+    let rope = RopeConfig {
+        rotary_dim,
+        theta: 10_000.0,
+        scaling: RopeScaling::None,
+    };
+    let (cos, sin) = RotaryEmbedding::new(rope)
+        .unwrap()
+        .tables(backend, 0, seq_len)
+        .unwrap();
     let half = rotary_dim / 2;
 
     let expected = timed_torch(|| {
         let x_t = tch_tensor_from_vec(&[num_heads, seq_len, head_dim], &x_data);
-        let cos_t = tch_tensor_from_vec(&[seq_len, half], cache.cos.data());
-        let sin_t = tch_tensor_from_vec(&[seq_len, half], cache.sin.data());
+        let cos_t = tch_tensor_from_vec(&[seq_len, half], &to_host_vec(&cos));
+        let sin_t = tch_tensor_from_vec(&[seq_len, half], &to_host_vec(&sin));
         tensor_to_vec(&rope_reference(&x_t, &cos_t, &sin_t))
     });
 
     let actual = timed_gpt(|| {
         let x = device_tensor_from_data(backend, &[num_heads, seq_len, head_dim], &x_data);
-        let cos = DeviceTensor::from_host(Arc::clone(backend), cache.cos.clone()).unwrap();
-        let sin = DeviceTensor::from_host(Arc::clone(backend), cache.sin.clone()).unwrap();
-        let out = functional::apply_rope(backend.as_ref(), &x, &cos, &sin).unwrap();
+        let out = functional::apply_rope(&x, &cos, &sin).unwrap();
         to_host_vec(&out)
     });
 
@@ -92,7 +90,7 @@ pub fn rope_apply_rejects_sequence_mismatch<B: PortableBackend + 'static>(backen
         let x = device_tensor_from_data(backend, &[2, 8, 16], &[0.0; 2 * 8 * 16]);
         let cos = device_tensor_from_data(backend, &[7, 8], &[0.0; 7 * 8]);
         let sin = device_tensor_from_data(backend, &[7, 8], &[0.0; 7 * 8]);
-        match functional::apply_rope(backend.as_ref(), &x, &cos, &sin) {
+        match functional::apply_rope(&x, &cos, &sin) {
             Ok(_) => panic!("apply_rope should reject sequence mismatch"),
             Err(err) => err,
         }
@@ -104,35 +102,42 @@ pub fn rope_apply_rejects_sequence_mismatch<B: PortableBackend + 'static>(backen
     );
 }
 
-pub fn rope_cache_yarn_scaling_matches_formula<B: PortableBackend + 'static>(_backend: &Arc<B>) {
+pub fn rope_cache_yarn_scaling_matches_formula<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    yarn_tables_match_formula(backend, Some(1.35), Some(0.75));
+    yarn_tables_match_formula(backend, Some(1.35), None);
+}
+
+fn yarn_tables_match_formula<B: PortableBackend + 'static>(
+    backend: &Arc<B>,
+    mscale: Option<f32>,
+    mscale_all_dim: Option<f32>,
+) {
     let seq_len = 12usize;
     let rotary_dim = 16usize;
     let half = rotary_dim / 2;
     let theta = 10_000.0f32;
     let factor = 8.0f32;
-    let mscale = 1.35f32;
-    let mscale_all_dim = 0.75f32;
     let beta_fast = 32.0f32;
     let beta_slow = 1.0f32;
     let original_max_position_embeddings = 2_048usize;
 
-    let cache = functional::rotary_cos_sin_cache(
-        seq_len,
-        RopeConfig {
-            rotary_dim,
-            theta,
-            scaling: RopeScaling::Yarn {
-                factor,
-                mscale: Some(mscale),
-                mscale_all_dim: Some(mscale_all_dim),
-                beta_fast: Some(beta_fast),
-                beta_slow: Some(beta_slow),
-                original_max_position_embeddings: Some(original_max_position_embeddings),
-                truncate: true,
-            },
+    let rope = RopeConfig {
+        rotary_dim,
+        theta,
+        scaling: RopeScaling::Yarn {
+            factor,
+            mscale,
+            mscale_all_dim,
+            beta_fast: Some(beta_fast),
+            beta_slow: Some(beta_slow),
+            original_max_position_embeddings,
+            truncate: true,
         },
-    )
-    .unwrap();
+    };
+    let (cos, sin) = RotaryEmbedding::new(rope)
+        .unwrap()
+        .tables(backend, 0, seq_len)
+        .unwrap();
 
     let (expected_cos, expected_sin) = timed_torch(|| {
         let get_mscale = |scale: f64, mscale: f64| {
@@ -142,8 +147,12 @@ pub fn rope_cache_yarn_scaling_matches_formula<B: PortableBackend + 'static>(_ba
                 0.1 * mscale * scale.ln() + 1.0
             }
         };
-        let attention_factor = get_mscale(factor as f64, mscale as f64)
-            / get_mscale(factor as f64, mscale_all_dim as f64);
+        let attention_factor = match (mscale, mscale_all_dim) {
+            (Some(ms), Some(ms_all)) => {
+                get_mscale(factor as f64, ms as f64) / get_mscale(factor as f64, ms_all as f64)
+            }
+            _ => get_mscale(factor as f64, 1.0),
+        };
 
         let find_correction_dim = |num_rotations: f64| {
             (rotary_dim as f64
@@ -179,6 +188,6 @@ pub fn rope_cache_yarn_scaling_matches_formula<B: PortableBackend + 'static>(_ba
         (tensor_to_vec(&cos), tensor_to_vec(&sin))
     });
 
-    assert_close(&expected_cos, cache.cos.data());
-    assert_close(&expected_sin, cache.sin.data());
+    assert_close(&expected_cos, &to_host_vec(&cos));
+    assert_close(&expected_sin, &to_host_vec(&sin));
 }

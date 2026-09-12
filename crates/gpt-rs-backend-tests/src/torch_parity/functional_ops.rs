@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use gpt_rs::backend::spec::PortableBackend;
-use gpt_rs::nn::layers::AttentionConfig;
+use gpt_rs::module::Layer;
 use gpt_rs::ops::functional::{self, LayerNormResult, RmsNormResult};
+use gpt_rs::tensor::DType;
 use tch::{Kind, Tensor as TchTensor};
 
 use super::common::*;
@@ -37,7 +38,7 @@ fn softmax_case<B: PortableBackend + 'static>(
 
     let actual = timed_gpt(|| {
         let device = device_tensor_from_data(backend, shape, data);
-        let result = functional::softmax_last_dim(backend.as_ref(), &device).unwrap();
+        let result = functional::softmax_last_dim(&device).unwrap();
         to_host_vec(&result)
     });
 
@@ -48,15 +49,28 @@ fn softmax_case<B: PortableBackend + 'static>(
 }
 
 fn gelu_case<B: PortableBackend + 'static>(backend: &Arc<B>, shape: &[usize], data: &[f32]) {
+    gelu_approximate_case(backend, shape, data, "none");
+}
+
+fn gelu_approximate_case<B: PortableBackend + 'static>(
+    backend: &Arc<B>,
+    shape: &[usize],
+    data: &[f32],
+    approximate: &str,
+) {
     let expected = timed_torch(|| {
-        let expected_tensor = tch_tensor_from_vec(shape, data).gelu("none");
+        let expected_tensor = tch_tensor_from_vec(shape, data).gelu(approximate);
         tensor_to_vec(&expected_tensor)
     });
 
     let actual = timed_gpt(|| {
         let device = device_tensor_from_data(backend, shape, data);
-        let result = functional::gelu(backend.as_ref(), &device).unwrap();
-        to_host_vec(&result)
+        let result = match approximate {
+            "none" => functional::gelu(&device),
+            "tanh" => functional::gelu_tanh(&device),
+            other => panic!("unsupported gelu approximation {other}"),
+        };
+        to_host_vec(&result.unwrap())
     });
 
     assert_close(&expected, &actual);
@@ -70,7 +84,7 @@ fn silu_case<B: PortableBackend + 'static>(backend: &Arc<B>, shape: &[usize], da
 
     let actual = timed_gpt(|| {
         let device = device_tensor_from_data(backend, shape, data);
-        let result = functional::silu(backend.as_ref(), &device).unwrap();
+        let result = functional::silu(&device).unwrap();
         to_host_vec(&result)
     });
 
@@ -93,7 +107,7 @@ fn swiglu_case<B: PortableBackend + 'static>(
     let actual = timed_gpt(|| {
         let gate = device_tensor_from_data(backend, shape, gate_data);
         let up = device_tensor_from_data(backend, shape, up_data);
-        let result = functional::swiglu(backend.as_ref(), &gate, &up).unwrap();
+        let result = functional::swiglu(&gate, &up).unwrap();
         to_host_vec(&result)
     });
 
@@ -122,7 +136,7 @@ fn add_bias_case<B: PortableBackend + 'static>(
     let actual = timed_gpt(|| {
         let x = device_tensor_from_data(backend, shape, x_data);
         let bias_dev = device_tensor_from_data(backend, &[bias_len], bias);
-        let result = functional::add_bias(backend.as_ref(), &x, &bias_dev).unwrap();
+        let result = functional::add_bias(&x, &bias_dev).unwrap();
         to_host_vec(&result)
     });
 
@@ -149,8 +163,7 @@ fn layer_norm_case<B: PortableBackend + 'static>(
             normalized,
             mean,
             inv_std,
-        } = functional::layer_norm(backend.as_ref(), &x, &gamma_dev, &beta_dev, eps as f32)
-            .unwrap();
+        } = functional::layer_norm(&x, &gamma_dev, &beta_dev, eps as f32).unwrap();
 
         (
             to_host_vec(&output),
@@ -211,7 +224,7 @@ fn rms_norm_case<B: PortableBackend + 'static>(
             output,
             normalized,
             inv_rms,
-        } = functional::rms_norm(backend.as_ref(), &x, &gamma_dev, eps as f32).unwrap();
+        } = functional::rms_norm(&x, &gamma_dev, eps as f32).unwrap();
 
         (
             to_host_vec(&output),
@@ -263,7 +276,7 @@ pub fn softmax_last_dim_matches_torch<B: PortableBackend + 'static>(backend: &Ar
 
     let actual = timed_gpt(|| {
         let device = device_tensor_from_data(backend, &shape, &data);
-        let result = functional::softmax_last_dim(backend.as_ref(), &device).unwrap();
+        let result = functional::softmax_last_dim(&device).unwrap();
         to_host_vec(&result)
     });
 
@@ -275,19 +288,20 @@ pub fn gelu_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
     let shape = vector_shape();
     let len: usize = shape.iter().product();
     let data = random_vec(&mut rng, len);
+    gelu_case(backend, &shape, &data);
+}
 
-    let expected = timed_torch(|| {
-        let expected_tensor = tch_tensor_from_vec(&shape, &data).gelu("none");
-        tensor_to_vec(&expected_tensor)
-    });
+pub fn gelu_tanh_matches_torch_3d_2x3x8<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    let mut rng = seeded_rng(47);
+    let shape = [2usize, 3usize, 8usize];
+    let data = random_vec(&mut rng, shape.iter().product());
+    gelu_approximate_case(backend, &shape, &data, "tanh");
+}
 
-    let actual = timed_gpt(|| {
-        let device = device_tensor_from_data(backend, &shape, &data);
-        let result = functional::gelu(backend.as_ref(), &device).unwrap();
-        to_host_vec(&result)
-    });
-
-    assert_close(&expected, &actual);
+pub fn gelu_tanh_extreme_inputs_match_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    let mut rng = seeded_rng(48);
+    let data = random_vec_range(&mut rng, 256, -10.0, 10.0);
+    gelu_approximate_case(backend, &[256], &data, "tanh");
 }
 
 pub fn silu_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
@@ -319,7 +333,7 @@ pub fn swiglu_rejects_shape_mismatch<B: PortableBackend + 'static>(backend: &Arc
     let err = timed_gpt(|| {
         let gate = device_tensor_from_data(backend, &[2, 8], &[0.0; 16]);
         let up = device_tensor_from_data(backend, &[2, 7], &[0.0; 14]);
-        match functional::swiglu(backend.as_ref(), &gate, &up) {
+        match functional::swiglu(&gate, &up) {
             Ok(_) => panic!("swiglu should reject shape mismatch"),
             Err(err) => err,
         }
@@ -355,7 +369,7 @@ pub fn add_bias_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
         let x = device_tensor_from_data(backend, &shape, &data);
         let bias_dev = device_tensor_from_data(backend, &[bias_len], &bias);
 
-        let result = functional::add_bias(backend.as_ref(), &x, &bias_dev).unwrap();
+        let result = functional::add_bias(&x, &bias_dev).unwrap();
         to_host_vec(&result)
     });
 
@@ -366,7 +380,7 @@ pub fn add_bias_rejects_mismatched_dimension<B: PortableBackend + 'static>(backe
     let err = timed_gpt(|| {
         let x = device_tensor_from_data(backend, &matrix_shape(), &[0.0; 12]);
         let bias = device_tensor_from_data(backend, &[5], &[0.0; 5]);
-        functional::add_bias(backend.as_ref(), &x, &bias).unwrap_err()
+        functional::add_bias(&x, &bias).unwrap_err()
     });
     assert!(
         err.to_string().contains("last dimension"),
@@ -396,8 +410,7 @@ pub fn layer_norm_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) 
             normalized,
             mean,
             inv_std,
-        } = functional::layer_norm(backend.as_ref(), &x, &gamma_dev, &beta_dev, eps as f32)
-            .unwrap();
+        } = functional::layer_norm(&x, &gamma_dev, &beta_dev, eps as f32).unwrap();
 
         (
             to_host_vec(&output),
@@ -456,7 +469,7 @@ pub fn rms_norm_rejects_gamma_mismatch<B: PortableBackend + 'static>(backend: &A
     let err = timed_gpt(|| {
         let x = device_tensor_from_data(backend, &layer_norm_shape(), &[0.0; 24]);
         let gamma = device_tensor_from_data(backend, &[3], &[1.0; 3]);
-        match functional::rms_norm(backend.as_ref(), &x, &gamma, 1e-5) {
+        match functional::rms_norm(&x, &gamma, 1e-5) {
             Ok(_) => panic!("rms_norm should reject gamma shape mismatch"),
             Err(err) => err,
         }
@@ -606,7 +619,7 @@ pub fn add_bias_rejects_mismatched_dimension_3d<B: PortableBackend + 'static>(ba
     let err = timed_gpt(|| {
         let x = device_tensor_from_data(backend, &[2, 5, 8], &[0.0; 80]);
         let bias = device_tensor_from_data(backend, &[7], &[0.0; 7]);
-        functional::add_bias(backend.as_ref(), &x, &bias).unwrap_err()
+        functional::add_bias(&x, &bias).unwrap_err()
     });
     assert!(err.to_string().contains("last dimension"));
 }
@@ -676,7 +689,7 @@ pub fn layer_norm_rejects_gamma_mismatch<B: PortableBackend + 'static>(backend: 
         let x = device_tensor_from_data(backend, &[2, 3, 8], &[0.0; 48]);
         let gamma = device_tensor_from_data(backend, &[7], &[0.0; 7]);
         let beta = device_tensor_from_data(backend, &[8], &[0.0; 8]);
-        functional::layer_norm(backend.as_ref(), &x, &gamma, &beta, 1e-5)
+        functional::layer_norm(&x, &gamma, &beta, 1e-5)
     });
     assert!(err.is_err());
     if let Err(err) = err {
@@ -702,38 +715,11 @@ pub fn matmul_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
     let actual = timed_gpt(|| {
         let lhs = device_tensor_from_data(backend, &lhs_shape, &lhs_data);
         let rhs = device_tensor_from_data(backend, &rhs_shape, &rhs_data);
-        let result = functional::matmul(backend.as_ref(), &lhs, &rhs).unwrap();
+        let result = functional::matmul(&lhs, &rhs).unwrap();
         to_host_vec(&result)
     });
 
     assert_close(&expected, &actual);
-}
-
-pub fn attention_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    let mut rng = seeded_rng(23);
-    let config = AttentionConfig::with_equal_heads(8, 2);
-    let seq_len = 2usize;
-    let shape = [seq_len, config.total_projection_dim()];
-    let len: usize = shape.iter().product();
-    let data = random_vec(&mut rng, len);
-
-    let (actual_context, actual_keys, actual_values) = timed_gpt(|| {
-        let qkv = device_tensor_from_data(backend, &shape, &data);
-        let attention = functional::attention(backend.as_ref(), &config, &qkv, None).unwrap();
-        let actual_context = to_host_vec(&attention.output);
-        let actual_keys = to_host_vec(attention.cache.keys());
-        let actual_values = to_host_vec(attention.cache.values());
-        (actual_context, actual_keys, actual_values)
-    });
-
-    let (expected_context, expected_keys, expected_values) = timed_torch(|| {
-        let qkv_tensor = tch_tensor_from_vec(&shape, &data);
-        reference_attention(&config, &qkv_tensor)
-    });
-
-    assert_close(&expected_context, &actual_context);
-    assert_close(&expected_keys, &actual_keys);
-    assert_close(&expected_values, &actual_values);
 }
 
 trait VarDimLastExt {
@@ -747,69 +733,177 @@ impl VarDimLastExt for TchTensor {
     }
 }
 
-fn reference_attention(
-    config: &AttentionConfig,
-    qkv: &TchTensor,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    let seq_len = qkv.size()[0];
-    let q_proj = config.query_projection_dim() as i64;
-    let kv_proj = config.key_value_projection_dim() as i64;
-    let num_query_heads = config.num_query_heads as i64;
-    let num_kv_heads = config.num_key_value_heads as i64;
-    let head_dim = config.head_dim as i64;
-    let kv_head_dim = config.kv_head_dim as i64;
-    let kv_group_size = config.kv_group_size() as i64;
+fn bf16_round(values: &[f32]) -> Vec<f32> {
+    let rounded = tch_tensor_from_vec(&[values.len()], values)
+        .to_kind(Kind::BFloat16)
+        .to_kind(Kind::Float);
+    tensor_to_vec(&rounded)
+}
 
-    let q_slice = qkv.narrow(1, 0, q_proj);
-    let k_slice = qkv.narrow(1, q_proj, kv_proj);
-    let v_slice = qkv.narrow(1, q_proj + kv_proj, kv_proj);
+// ---------------------------------------------------------------------------------------------
+// linear and cast
+// ---------------------------------------------------------------------------------------------
 
-    let q_heads = q_slice
-        .reshape([seq_len, num_query_heads, head_dim])
-        .permute([1, 0, 2]);
-    let k_cache = k_slice
-        .reshape([seq_len, num_kv_heads, kv_head_dim])
-        .permute([1, 0, 2]);
-    let v_cache = v_slice
-        .reshape([seq_len, num_kv_heads, kv_head_dim])
-        .permute([1, 0, 2]);
+/// `nn::Linear` against `x @ w^T`, with `w` stored as `weight_dtype`. With `bf16_inputs`, the
+/// layer rounds its input to bf16 and still accumulates in f32, and the reference does the same.
+fn run_linear_case<B: PortableBackend + 'static>(
+    backend: &Arc<B>,
+    (rows, out_features, in_features): (usize, usize, usize),
+    weight_dtype: DType,
+    bf16_inputs: bool,
+    seed: u64,
+) {
+    let mut rng = seeded_rng(seed);
+    let x = random_vec(&mut rng, rows * in_features);
+    let raw_w = random_vec(&mut rng, out_features * in_features);
+    // The reference sees exactly the weight values gpt-rs stores.
+    let w = match weight_dtype {
+        DType::BF16 => bf16_round(&raw_w),
+        _ => raw_w,
+    };
 
-    let k_grouped = k_cache
-        .transpose(1, 2)
-        .reshape([num_kv_heads, 1, kv_head_dim, seq_len])
-        .expand([num_kv_heads, kv_group_size, kv_head_dim, seq_len], true)
-        .reshape([num_query_heads, kv_head_dim, seq_len]);
-    let v_grouped = v_cache
-        .reshape([num_kv_heads, 1, seq_len, kv_head_dim])
-        .expand([num_kv_heads, kv_group_size, seq_len, kv_head_dim], true)
-        .reshape([num_query_heads, seq_len, kv_head_dim]);
+    let expected = timed_torch(|| {
+        let x_ref = if bf16_inputs {
+            bf16_round(&x)
+        } else {
+            x.clone()
+        };
+        let x_t = tch_tensor_from_vec(&[rows, in_features], &x_ref);
+        let w_t = tch_tensor_from_vec(&[out_features, in_features], &w);
+        tensor_to_vec(&x_t.matmul(&w_t.transpose(0, 1)))
+    });
 
-    let scale = (config.head_dim as f64).sqrt();
-    let scores = (q_heads.bmm(&k_grouped)) / scale;
+    let actual = timed_gpt(|| {
+        let x_d = device_tensor_from_data(backend, &[rows, in_features], &x);
+        let w = crate::tensor_as(&[out_features, in_features], &w, weight_dtype);
+        let mut layer = load_layer(backend, [("proj.weight".to_string(), w)], |p| {
+            p.linear("proj", in_features, out_features, false)
+        })
+        .unwrap();
+        layer.input_dtype = bf16_inputs.then_some(DType::BF16);
+        let y = layer.call(&x_d).unwrap();
+        assert_eq!(y.shape().dims(), [rows, out_features]);
+        assert_eq!(y.dtype(), DType::F32);
+        to_host_vec(&y)
+    });
 
-    let allowed = TchTensor::ones([seq_len, seq_len], (Kind::Float, qkv.device())).tril(0);
-    let disallowed = TchTensor::ones_like(&allowed) - &allowed;
-    let mask = disallowed
-        .unsqueeze(0)
-        .expand([num_query_heads, seq_len, seq_len], true)
-        * -1e9f64;
-    let masked = scores + mask;
+    assert_close(&expected, &actual);
+}
 
-    let (max_scores, _) = masked.max_dim(-1, true);
-    let stabilized = masked - max_scores;
-    let exp_scores = stabilized.exp();
-    let sum_axes = [-1i64];
-    let sum_scores = exp_scores.sum_dim_intlist(&sum_axes[..], true, Kind::Float);
-    let softmax = exp_scores / sum_scores;
+/// One row, odd `out_features` and `in_features`.
+pub fn linear_bf16_weight_rows1_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    run_linear_case(backend, (1, 33, 65), DType::BF16, false, 0x1101);
+}
 
-    let context = softmax.bmm(&v_grouped);
-    let context_out = context
-        .permute([1, 0, 2])
-        .reshape([seq_len, config.embed_dim as i64]);
+/// K spans several blocks and the activations are large.
+pub fn linear_bf16_weight_rows64_in2100_matches_torch<B: PortableBackend + 'static>(
+    backend: &Arc<B>,
+) {
+    run_linear_case(backend, (64, 20, 2100), DType::BF16, false, 0x1118);
+}
 
-    (
-        tensor_to_vec(&context_out),
-        tensor_to_vec(&k_cache),
-        tensor_to_vec(&v_cache),
-    )
+/// Odd rows, `out_features` and `in_features`.
+pub fn linear_f32_weight_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    run_linear_case(backend, (7, 19, 23), DType::F32, false, 0x1104);
+}
+
+/// One row, odd `out_features` and `in_features`.
+pub fn linear_bf16_inputs_rows1_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    run_linear_case(backend, (1, 33, 65), DType::BF16, true, 0x1114);
+}
+
+/// Prefill-sized, with no dimension a multiple of 8 and K spanning several blocks.
+pub fn linear_bf16_inputs_rows141_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    run_linear_case(backend, (141, 72, 1100), DType::BF16, true, 0x1117);
+}
+
+/// Prefill-sized, with large activations and an odd K that spans several blocks and leaves no
+/// bf16 pairs.
+pub fn linear_bf16_inputs_rows130_odd_in2049_matches_torch<B: PortableBackend + 'static>(
+    backend: &Arc<B>,
+) {
+    run_linear_case(backend, (130, 40, 2049), DType::BF16, true, 0x1119);
+}
+
+pub fn cast_f32_bf16_roundtrip_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    let mut rng = seeded_rng(0x1105);
+    let mut values = random_vec_range(&mut rng, 61, -300.0, 300.0);
+    // Exercise round-to-nearest-even ties and the extremes of the bf16 range.
+    values.extend_from_slice(&[
+        1.0 + 1.0 / 256.0,
+        1.0 + 3.0 / 256.0,
+        -(1.0 + 1.0 / 256.0),
+        3.389e38,
+        -3.389e38,
+        1e-40,
+        0.0,
+    ]);
+    let expected = timed_torch(|| bf16_round(&values));
+    let actual = timed_gpt(|| {
+        let x = device_tensor_from_data(backend, &[values.len()], &values);
+        let narrowed = functional::cast(&x, DType::BF16).unwrap();
+        assert_eq!(narrowed.dtype(), DType::BF16);
+        let widened = functional::cast(&narrowed, DType::F32).unwrap();
+        to_host_vec(&widened)
+    });
+    assert_close_tol(&expected, &actual, 0.0, 0.0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// elementwise
+// ---------------------------------------------------------------------------------------------
+
+pub fn sigmoid_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    let mut rng = seeded_rng(0x1106);
+    let mut values = random_vec_range(&mut rng, 4 * 29, -12.0, 12.0);
+    values[0] = -80.0;
+    values[1] = 80.0;
+    let expected = timed_torch(|| tensor_to_vec(&tch_tensor_from_vec(&[4, 29], &values).sigmoid()));
+    let actual = timed_gpt(|| {
+        let x = device_tensor_from_data(backend, &[4, 29], &values);
+        to_host_vec(&functional::sigmoid(&x).unwrap())
+    });
+    assert_close(&expected, &actual);
+}
+
+pub fn softplus_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    let mut rng = seeded_rng(0x1107);
+    let mut values = random_vec_range(&mut rng, 3 * 40, -30.0, 30.0);
+    values[..6].copy_from_slice(&[-90.0, -20.5, 0.0, 19.9, 20.1, 95.0]);
+    let expected =
+        timed_torch(|| tensor_to_vec(&tch_tensor_from_vec(&[3, 40], &values).softplus()));
+    let actual = timed_gpt(|| {
+        let x = device_tensor_from_data(backend, &[3, 40], &values);
+        to_host_vec(&functional::softplus(&x).unwrap())
+    });
+    assert_close(&expected, &actual);
+}
+
+pub fn exp_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    let mut rng = seeded_rng(0x1109);
+    let mut values = random_vec_range(&mut rng, 2 * 33, -20.0, 20.0);
+    values[..3].copy_from_slice(&[-100.0, 0.0, 80.0]);
+    let expected = timed_torch(|| tensor_to_vec(&tch_tensor_from_vec(&[2, 33], &values).exp()));
+    let actual = timed_gpt(|| {
+        let x = device_tensor_from_data(backend, &[2, 33], &values);
+        to_host_vec(&functional::exp(&x).unwrap())
+    });
+    assert_close(&expected, &actual);
+}
+
+pub fn mul_last_dim_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    let mut rng = seeded_rng(0x1108);
+    let x = random_vec(&mut rng, 5 * 3 * 7);
+    let s = random_vec(&mut rng, 7);
+    let expected = timed_torch(|| {
+        let x_t = tch_tensor_from_vec(&[5, 3, 7], &x);
+        let s_t = tch_tensor_from_vec(&[7], &s);
+        tensor_to_vec(&(x_t * s_t))
+    });
+    let actual = timed_gpt(|| {
+        let x_d = device_tensor_from_data(backend, &[5, 3, 7], &x);
+        let s_d = device_tensor_from_data(backend, &[7], &s);
+        to_host_vec(&functional::mul_last_dim(&x_d, &s_d).unwrap())
+    });
+    assert_close(&expected, &actual);
 }

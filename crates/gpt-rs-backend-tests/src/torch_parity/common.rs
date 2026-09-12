@@ -4,12 +4,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use gpt_rs::backend::spec::PortableBackend;
+use gpt_rs::nn::layers::{Embedding, LayerNorm, Linear, RmsNorm, RmsNormConfig};
 use gpt_rs::tensor::{DeviceTensor, Shape, Tensor};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::Deserialize;
 use tch::Tensor as TchTensor;
 
 use super::harness;
+pub use crate::load_layer;
 
 pub const ATOL: f64 = 5e-4;
 pub const RTOL: f64 = 1e-4;
@@ -267,6 +269,15 @@ pub fn device_tensor_from_data<B: PortableBackend + 'static>(
     DeviceTensor::from_host(Arc::clone(backend), tensor_from_vec(shape, data.to_vec())).unwrap()
 }
 
+/// `[0, position, 0]`: the KV-cache write offset of `functional::attention_kv_cache`.
+pub fn kv_cache_update_starts<B: PortableBackend + 'static>(
+    backend: &Arc<B>,
+    position: usize,
+) -> DeviceTensor<B> {
+    let starts = Tensor::from_i32(Shape::new([3]), vec![0, position as i32, 0]).unwrap();
+    DeviceTensor::from_host(Arc::clone(backend), starts).unwrap()
+}
+
 pub fn tch_tensor_from_vec(shape: &[usize], data: &[f32]) -> TchTensor {
     let dims: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
     TchTensor::from_slice(data).reshape(dims.as_slice())
@@ -316,4 +327,95 @@ pub fn timed_torch<T, F: FnOnce() -> T>(f: F) -> T {
 
 pub fn timed_gpt<T, F: FnOnce() -> T>(f: F) -> T {
     harness::timed_gpt(f)
+}
+
+/// Host weights of a `Linear`: an `[out, in]` weight and an optional bias.
+pub struct HostLinear {
+    in_features: usize,
+    out_features: usize,
+    weight: Tensor,
+    bias: Option<Tensor>,
+}
+
+impl HostLinear {
+    pub fn random(rng: &mut StdRng, in_features: usize, out_features: usize, bias: bool) -> Self {
+        let weight = tensor_from_vec(
+            &[out_features, in_features],
+            random_vec(rng, out_features * in_features),
+        );
+        let bias = bias.then(|| tensor_from_vec(&[out_features], random_vec(rng, out_features)));
+        Self {
+            in_features,
+            out_features,
+            weight,
+            bias,
+        }
+    }
+
+    pub fn tensors(&self, prefix: &str) -> Vec<(String, Tensor)> {
+        let weight = (format!("{prefix}.weight"), self.weight.clone());
+        let bias = self
+            .bias
+            .as_ref()
+            .map(|bias| (format!("{prefix}.bias"), bias.clone()));
+        std::iter::once(weight).chain(bias).collect()
+    }
+
+    pub fn layer<B: PortableBackend + 'static>(&self, backend: &Arc<B>) -> Linear<B> {
+        let (in_features, out_features) = (self.in_features, self.out_features);
+        let bias = self.bias.is_some();
+        load_layer(backend, self.tensors("proj"), |p| {
+            p.linear("proj", in_features, out_features, bias)
+        })
+        .unwrap()
+    }
+
+    pub fn torch(&self, input: &TchTensor) -> TchTensor {
+        let weight =
+            tch_tensor_from_vec(&[self.out_features, self.in_features], self.weight.data());
+        let bias = self
+            .bias
+            .as_ref()
+            .map(|b| tch_tensor_from_vec(&[self.out_features], b.data()));
+        input.linear(&weight, bias.as_ref())
+    }
+}
+
+pub fn embedding_layer<B: PortableBackend + 'static>(
+    backend: &Arc<B>,
+    weight: Tensor,
+) -> Embedding<B> {
+    let &[num_embeddings, dim] = weight.shape().dims() else {
+        panic!("embedding table must be 2D");
+    };
+    load_layer(backend, [("embed.weight".to_string(), weight)], |p| {
+        p.embedding("embed", num_embeddings, dim)
+    })
+    .unwrap()
+}
+
+pub fn layer_norm_layer<B: PortableBackend + 'static>(
+    backend: &Arc<B>,
+    weight: Tensor,
+    bias: Tensor,
+    eps: f32,
+) -> LayerNorm<B> {
+    let dim = weight.shape().dims()[0];
+    let tensors = [
+        ("norm.weight".to_string(), weight),
+        ("norm.bias".to_string(), bias),
+    ];
+    load_layer(backend, tensors, |p| p.layer_norm("norm", dim, eps)).unwrap()
+}
+
+pub fn rms_norm_layer<B: PortableBackend + 'static>(
+    backend: &Arc<B>,
+    weight: Tensor,
+    config: RmsNormConfig,
+) -> RmsNorm<B> {
+    let dim = weight.shape().dims()[0];
+    load_layer(backend, [("norm.weight".to_string(), weight)], |p| {
+        p.rms_norm("norm", dim, config)
+    })
+    .unwrap()
 }

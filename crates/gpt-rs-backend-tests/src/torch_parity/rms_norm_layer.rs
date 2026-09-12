@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use gpt_rs::backend::spec::PortableBackend;
-use gpt_rs::nn::layers::RmsNorm;
+use gpt_rs::module::Layer;
+use gpt_rs::nn::layers::RmsNormConfig;
 use gpt_rs::tensor::{DeviceTensor, Shape, Tensor};
 use tch::{Kind, Tensor as TchTensor};
 
@@ -28,6 +29,7 @@ fn run_rms_norm_case<B: PortableBackend + 'static>(
     eps: f64,
     seed: u64,
     input_override: Option<Vec<f32>>,
+    unit_offset: bool,
 ) {
     let mut rng = seeded_rng(seed);
     let len: usize = shape.iter().product();
@@ -41,15 +43,22 @@ fn run_rms_norm_case<B: PortableBackend + 'static>(
 
     let expected = timed_torch(|| {
         let input_tch = tch_tensor_from_vec(shape, input_host.data());
-        let gamma_tch = tch_tensor_from_vec(&[feature_dim], gamma_host.data());
+        let mut gamma_tch = tch_tensor_from_vec(&[feature_dim], gamma_host.data());
+        if unit_offset {
+            gamma_tch += 1.0;
+        }
         tensor_to_vec(&rms_norm_reference(&input_tch, &gamma_tch, eps))
     });
 
     let output_host = timed_gpt(|| {
-        let layer = RmsNorm::new(Arc::clone(backend), gamma_host.clone(), eps as f32).unwrap();
+        let config = RmsNormConfig {
+            eps: eps as f32,
+            unit_offset,
+        };
+        let layer = rms_norm_layer(backend, gamma_host.clone(), config);
         let input_device =
             DeviceTensor::from_host(Arc::clone(backend), input_host.clone()).unwrap();
-        let output_device = layer.forward(&input_device).unwrap();
+        let output_device = layer.call(&input_device).unwrap();
         output_device.to_host().unwrap()
     });
 
@@ -57,15 +66,27 @@ fn run_rms_norm_case<B: PortableBackend + 'static>(
 }
 
 pub fn rms_norm_layer_matches_torch_basic<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    run_rms_norm_case(backend, &[4, 17], 1e-5, 0xCA71_u64, None);
+    run_rms_norm_case(backend, &[4, 17], 1e-5, 0xCA71_u64, None, false);
 }
 
 pub fn rms_norm_layer_matches_torch_seq_batch<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    run_rms_norm_case(backend, &[2, 5, 32], 1e-5, 0xCA72_u64, None);
+    run_rms_norm_case(backend, &[2, 5, 32], 1e-5, 0xCA72_u64, None, false);
 }
 
 pub fn rms_norm_layer_matches_torch_constant_input<B: PortableBackend + 'static>(backend: &Arc<B>) {
     let shape = [3usize, 7usize, 19usize];
     let len: usize = shape.iter().product();
-    run_rms_norm_case(backend, &shape, 1e-5, 0xCA73_u64, Some(const_vec(len, 0.5)));
+    run_rms_norm_case(
+        backend,
+        &shape,
+        1e-5,
+        0xCA73_u64,
+        Some(const_vec(len, 0.5)),
+        false,
+    );
+}
+
+pub fn rms_norm_layer_unit_offset_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    // Zero-centred weight: the scale is `1 + weight`.
+    run_rms_norm_case(backend, &[3, 4, 16], 1e-6, 0xCA74_u64, None, true);
 }

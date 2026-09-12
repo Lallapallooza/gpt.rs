@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use gpt_rs::backend::spec::PortableBackend;
+use gpt_rs::capture;
+use gpt_rs::ops::ptir::{axes_iter, DotAttrs, DotDims};
 use gpt_rs::tensor::DeviceTensorOps;
 
 use super::common::*;
@@ -112,6 +114,102 @@ bmm_case!(
     &[3, 33, 65],
     &[3, 65, 31],
     21
+);
+bmm_case!(
+    batched_matmul_matches_torch_b2_6x40_40x150,
+    &[2, 6, 40],
+    &[2, 40, 150],
+    23
+);
+
+/// Batched `dot_general` of `[batch, *, *]` operands with batch axis 0 and the contraction axes
+/// `(contract_lhs, contract_rhs)`.
+fn run_batched_dot_case<B: PortableBackend + 'static>(
+    backend: &Arc<B>,
+    lhs_shape: &[usize],
+    rhs_shape: &[usize],
+    contract: (usize, usize),
+    seed: u64,
+) {
+    let mut rng = seeded_rng(seed);
+    let lhs_data = random_vec(&mut rng, lhs_shape.iter().product());
+    let rhs_data = random_vec(&mut rng, rhs_shape.iter().product());
+
+    let expected = timed_torch(|| {
+        // Move each contraction axis next to the other operand's free axis, then bmm.
+        let lhs_t = tch_tensor_from_vec(lhs_shape, &lhs_data);
+        let rhs_t = tch_tensor_from_vec(rhs_shape, &rhs_data);
+        let lhs_t = if contract.0 == 1 {
+            lhs_t.transpose(1, 2)
+        } else {
+            lhs_t
+        };
+        let rhs_t = if contract.1 == 2 {
+            rhs_t.transpose(1, 2)
+        } else {
+            rhs_t
+        };
+        tensor_to_vec(&lhs_t.bmm(&rhs_t).contiguous())
+    });
+
+    let actual = timed_gpt(|| -> anyhow::Result<Vec<f32>> {
+        let lhs_dev = device_tensor_from_data(backend, lhs_shape, &lhs_data);
+        let rhs_dev = device_tensor_from_data(backend, rhs_shape, &rhs_data);
+        let dims = DotDims::new(
+            axes_iter([0]),
+            axes_iter([contract.0]),
+            axes_iter([contract.1]),
+        );
+        let out = capture!(|lhs_dev, rhs_dev| lhs_dev.dot_general(
+            &rhs_dev,
+            &dims,
+            &DotAttrs::default()
+        ))?;
+        Ok(to_host_vec(&out))
+    })
+    .unwrap();
+
+    assert_close(&expected, &actual);
+}
+
+macro_rules! batched_dot_case {
+    ($name:ident, $lhs:expr, $rhs:expr, $contract:expr, $seed:expr) => {
+        pub fn $name<B: PortableBackend + 'static>(backend: &Arc<B>) {
+            run_batched_dot_case(backend, $lhs, $rhs, $contract, $seed);
+        }
+    };
+}
+
+// `q . k^T` form, contracting the last axis of both: odd row, column and contraction sizes, a
+// contraction long enough to span several blocks, and enough rows for a blocked GEMM.
+batched_dot_case!(
+    batched_dot_nt_matches_torch_b2_m5,
+    &[2, 5, 37],
+    &[2, 13, 37],
+    (2, 2),
+    32
+);
+batched_dot_case!(
+    batched_dot_nt_matches_torch_b2_m5_k1100,
+    &[2, 5, 1100],
+    &[2, 7, 1100],
+    (2, 2),
+    33
+);
+batched_dot_case!(
+    batched_dot_nt_matches_torch_b2_m70,
+    &[2, 70, 37],
+    &[2, 13, 37],
+    (2, 2),
+    35
+);
+// `k^T . v` form, contracting the middle axis of both.
+batched_dot_case!(
+    batched_dot_tn_matches_torch_b2_m3,
+    &[2, 19, 3],
+    &[2, 19, 21],
+    (1, 1),
+    34
 );
 
 pub fn matmul_rejects_inner_dim_mismatch<B: PortableBackend + 'static>(backend: &Arc<B>) {

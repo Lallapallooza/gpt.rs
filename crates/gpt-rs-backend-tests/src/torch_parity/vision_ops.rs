@@ -77,9 +77,9 @@ fn run_conv2d_case<B: PortableBackend + 'static>(
             groups,
         };
         let y = if bias {
-            functional::conv2d(backend.as_ref(), &x, &w, Some(&bias_dev), params).unwrap()
+            functional::conv2d(&x, &w, Some(&bias_dev), params).unwrap()
         } else {
-            functional::conv2d(backend.as_ref(), &x, &w, None, params).unwrap()
+            functional::conv2d(&x, &w, None, params).unwrap()
         };
         to_host_vec(&y)
     });
@@ -119,7 +119,7 @@ fn run_max_pool_case<B: PortableBackend + 'static>(
 
     let actual = timed_gpt(|| {
         let x = device_tensor_from_data(backend, &[n, h, w, c], &x_data);
-        let y = functional::max_pool2d_nhwc(backend.as_ref(), &x, window, stride, padding).unwrap();
+        let y = functional::max_pool2d(&x, window, stride, padding).unwrap();
         to_host_vec(&y)
     });
 
@@ -170,7 +170,7 @@ pub fn conv2d_nhwc_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>)
         let bias = device_tensor_from_data(backend, &[c_out], &bias_data);
 
         let params = conv_params(kernel, stride, padding);
-        let y = functional::conv2d(backend.as_ref(), &x, &w, Some(&bias), params).unwrap();
+        let y = functional::conv2d(&x, &w, Some(&bias), params).unwrap();
         to_host_vec(&y)
     });
 
@@ -221,7 +221,7 @@ pub fn conv2d_nhwc_kernel3_stride1_matches_torch<B: PortableBackend + 'static>(b
         let bias = device_tensor_from_data(backend, &[c_out], &bias_data);
 
         let params = conv_params(kernel, stride, padding);
-        let y = functional::conv2d(backend.as_ref(), &x, &w, Some(&bias), params).unwrap();
+        let y = functional::conv2d(&x, &w, Some(&bias), params).unwrap();
         to_host_vec(&y)
     });
 
@@ -271,7 +271,7 @@ pub fn conv2d_nhwc_kernel7_matches_torch<B: PortableBackend + 'static>(backend: 
         let bias = device_tensor_from_data(backend, &[c_out], &bias_data);
 
         let params = conv_params(kernel, stride, padding);
-        let y = functional::conv2d(backend.as_ref(), &x, &w, Some(&bias), params).unwrap();
+        let y = functional::conv2d(&x, &w, Some(&bias), params).unwrap();
         to_host_vec(&y)
     });
 
@@ -316,7 +316,7 @@ pub fn conv2d_nhwc_kernel1_stride2_matches_torch<B: PortableBackend + 'static>(b
         let bias = device_tensor_from_data(backend, &[c_out], &bias_data);
 
         let params = conv_params(kernel, stride, padding);
-        let y = functional::conv2d(backend.as_ref(), &x, &w, Some(&bias), params).unwrap();
+        let y = functional::conv2d(&x, &w, Some(&bias), params).unwrap();
         to_host_vec(&y)
     });
 
@@ -354,7 +354,7 @@ pub fn conv2d_nhwc_kernel1_stride1_matches_torch<B: PortableBackend + 'static>(b
         let bias = device_tensor_from_data(backend, &[c_out], &bias_data);
 
         let params = conv_params(kernel, stride, padding);
-        let y = functional::conv2d(backend.as_ref(), &x, &w, Some(&bias), params).unwrap();
+        let y = functional::conv2d(&x, &w, Some(&bias), params).unwrap();
         to_host_vec(&y)
     });
 
@@ -401,7 +401,7 @@ pub fn conv2d_nhwc_kernel1_stride2_resnet_matches_torch<B: PortableBackend + 'st
         let bias = device_tensor_from_data(backend, &[c_out], &bias_data);
 
         let params = conv_params(kernel, stride, padding);
-        let y = functional::conv2d(backend.as_ref(), &x, &w, Some(&bias), params).unwrap();
+        let y = functional::conv2d(&x, &w, Some(&bias), params).unwrap();
         to_host_vec(&y)
     });
 
@@ -453,7 +453,7 @@ pub fn conv2d_nhwc_kernel3_stride1_resnet_matches_torch<B: PortableBackend + 'st
         let bias = device_tensor_from_data(backend, &[c_out], &bias_data);
 
         let params = conv_params(kernel, stride, padding);
-        let y = functional::conv2d(backend.as_ref(), &x, &w, Some(&bias), params).unwrap();
+        let y = functional::conv2d(&x, &w, Some(&bias), params).unwrap();
         to_host_vec(&y)
     });
 
@@ -505,7 +505,7 @@ pub fn conv2d_nhwc_kernel7_stride2_resnet_matches_torch<B: PortableBackend + 'st
         let bias = device_tensor_from_data(backend, &[c_out], &bias_data);
 
         let params = conv_params(kernel, stride, padding);
-        let y = functional::conv2d(backend.as_ref(), &x, &w, Some(&bias), params).unwrap();
+        let y = functional::conv2d(&x, &w, Some(&bias), params).unwrap();
         to_host_vec(&y)
     });
 
@@ -557,7 +557,7 @@ pub fn depthwise_conv2d_nhwc_matches_torch<B: PortableBackend + 'static>(backend
             groups: c,
             ..conv_params(kernel, stride, padding)
         };
-        let y = functional::conv2d(backend.as_ref(), &x, &w, Some(&bias), params).unwrap();
+        let y = functional::conv2d(&x, &w, Some(&bias), params).unwrap();
         to_host_vec(&y)
     });
 
@@ -609,7 +609,7 @@ pub fn depthwise_conv2d_nhwc_stride2_matches_torch<B: PortableBackend + 'static>
             groups: c,
             ..conv_params(kernel, stride, padding)
         };
-        let y = functional::conv2d(backend.as_ref(), &x, &w, Some(&bias), params).unwrap();
+        let y = functional::conv2d(&x, &w, Some(&bias), params).unwrap();
         to_host_vec(&y)
     });
 
@@ -647,7 +647,7 @@ pub fn max_pool2d_nhwc_matches_torch<B: PortableBackend + 'static>(backend: &Arc
 
     let actual = timed_gpt(|| {
         let x = device_tensor_from_data(backend, &[n, h, w, c], &x_data);
-        let y = functional::max_pool2d_nhwc(backend.as_ref(), &x, window, stride, padding).unwrap();
+        let y = functional::max_pool2d(&x, window, stride, padding).unwrap();
         to_host_vec(&y)
     });
 
@@ -667,7 +667,26 @@ pub fn relu6_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
 
     let actual = timed_gpt(|| {
         let x = device_tensor_from_data(backend, &shape, &x_data);
-        let y = functional::relu6(backend.as_ref(), &x).unwrap();
+        let y = functional::relu6(&x).unwrap();
+        to_host_vec(&y)
+    });
+
+    assert_close(&expected, &actual);
+}
+
+pub fn global_avg_pool2d_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    let mut rng = seeded_rng(110);
+    let shape = [2usize, 5, 7, 6];
+    let x_data = random_vec(&mut rng, shape.iter().product());
+    let expected = timed_torch(|| {
+        let x_t = tch_permute(&tch_tensor_from_vec(&shape, &x_data), &[0, 3, 1, 2]);
+        tensor_to_vec(&x_t.adaptive_avg_pool2d([1, 1]).flatten(1, -1).contiguous())
+    });
+
+    let actual = timed_gpt(|| {
+        let x = device_tensor_from_data(backend, &shape, &x_data);
+        let y = functional::global_avg_pool2d(&x).unwrap();
+        assert_eq!(y.shape().dims(), [2, 6]);
         to_host_vec(&y)
     });
 
@@ -887,7 +906,7 @@ pub fn relu6_edge_values_matches_torch<B: PortableBackend + 'static>(backend: &A
 
     let actual = timed_gpt(|| {
         let x = device_tensor_from_data(backend, &shape, &values);
-        let y = functional::relu6(backend.as_ref(), &x).unwrap();
+        let y = functional::relu6(&x).unwrap();
         to_host_vec(&y)
     });
 

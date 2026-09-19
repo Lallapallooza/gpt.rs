@@ -22,10 +22,12 @@ def _load_default_exporters() -> None:
         return
     from .specs.gpt2 import GPT2Exporter
     from .specs.ministral import MinistralExporter
+    from .specs.qwen3_5 import Qwen35Exporter
     from .specs.vision import build_vision_exporters
 
     register_exporter(GPT2Exporter())
     register_exporter(MinistralExporter())
+    register_exporter(Qwen35Exporter())
     for exporter in build_vision_exporters():
         register_exporter(exporter)
     _LOADED = True

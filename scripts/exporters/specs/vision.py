@@ -9,6 +9,7 @@ import numpy as np
 from gptrs_eval.checkpoint import save as save_checkpoint
 from gptrs_eval.weights import build_mobilenet_v2_weights, build_resnet34_weights
 
+from ..pipeline import missing_outputs
 from ..types import (
     ArtifactDefaults,
     EvalCaseRegistration,
@@ -76,9 +77,7 @@ class VisionExporter:
         )
 
     def validate(self, request: ExportRequest) -> list[str]:
-        if request.checkpoint_out.exists():
-            return []
-        return [f"missing checkpoint: {request.checkpoint_out}"]
+        return missing_outputs(request)
 
 
 def build_vision_exporters() -> List[VisionExporter]:

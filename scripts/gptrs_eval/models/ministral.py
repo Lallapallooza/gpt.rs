@@ -2,49 +2,18 @@ from __future__ import annotations
 
 import argparse
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, cast
 
 import numpy as np
 
-from ..core import CliRunResult, RunConfig
-from ..gptrs_py import debug_context
+from ..core import CliRunResult, RunConfig, as_path, encode_prompt, resolve_torch_dtype
+from ..gptrs_py import debug_context, load_gpt_rs
 from ..registry import get_case_default_params
 from ..runner import validation_result
 
 _DEFAULT_MODEL_ID = "mistralai/Ministral-3-3B-Instruct-2512"
-
-
-def _as_path(value: Any, fallback: Path) -> Path:
-    if value is None:
-        return fallback
-    if isinstance(value, Path):
-        return value
-    return Path(str(value))
-
-
-def _resolve_torch_dtype(name: str) -> Any:
-    import torch
-
-    mapping: Dict[str, Any] = {
-        "auto": "auto",
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "float32": torch.float32,
-    }
-    if name not in mapping:
-        known = ", ".join(sorted(mapping.keys()))
-        raise ValueError(f"unsupported torch dtype {name!r}; expected one of: {known}")
-    return mapping[name]
-
-
-def _encode_prompt(tokenizer: Any, prompt: str, max_prompt_tokens: int) -> List[int]:
-    prompt_tokens = [int(tok) for tok in tokenizer.encode(prompt, add_special_tokens=False)]
-    if max_prompt_tokens > 0 and len(prompt_tokens) > max_prompt_tokens:
-        prompt_tokens = prompt_tokens[-max_prompt_tokens:]
-    if not prompt_tokens:
-        raise ValueError("prompt produced zero tokens; provide a non-empty prompt")
-    return prompt_tokens
 
 
 class MinistralCase:
@@ -57,7 +26,7 @@ class MinistralCase:
         defaults = get_case_default_params(self.name)
         prompt_default = str(defaults.get("prompt", "Hello"))
         torch_model_default = str(defaults.get("torch_model", _DEFAULT_MODEL_ID))
-        checkpoint_default = _as_path(
+        checkpoint_default = as_path(
             defaults.get("checkpoint"),
             Path("checkpoints/ministral_3_3b_instruct_2512.bin"),
         )
@@ -113,28 +82,21 @@ class MinistralCase:
             help="Allow loading Hugging Face model/tokenizer with remote code (default: false).",
         )
 
-    def _build_gpt_rs(self, cfg: RunConfig) -> Any:
-        try:
-            import gpt_rs
-        except ImportError as err:
-            raise SystemExit(
-                "gpt_rs not installed. Install via:\n"
-                "  pip install maturin\n"
-                "  cd crates/gpt-rs-py && maturin develop --release --features faer\n"
-            ) from err
+    def _tokenizer(self, cfg: RunConfig) -> Any:
+        from transformers import AutoTokenizer
 
-        gpt = cast(Any, gpt_rs)
-        gpt.set_backend(cfg.backend)
-        checkpoint = Path(cfg.params["checkpoint"])
-        return gpt.load_model(str(checkpoint))
+        return AutoTokenizer.from_pretrained(
+            str(cfg.params.get("torch_model", _DEFAULT_MODEL_ID)),
+            trust_remote_code=bool(cfg.params.get("trust_remote_code", False)),
+        )
 
     def _build_hf(self, cfg: RunConfig) -> Tuple[Any, Any]:
         import torch
-        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoConfig, AutoModelForCausalLM
 
         torch_model_id = str(cfg.params.get("torch_model", _DEFAULT_MODEL_ID))
         trust_remote_code = bool(cfg.params.get("trust_remote_code", False))
-        torch_dtype = _resolve_torch_dtype(str(cfg.params.get("torch_dtype", "float32")))
+        torch_dtype = resolve_torch_dtype(str(cfg.params.get("torch_dtype", "float32")))
 
         model_kwargs: Dict[str, Any] = {"trust_remote_code": trust_remote_code}
         if torch_dtype != "auto":
@@ -161,11 +123,7 @@ class MinistralCase:
             # Enforce float32 explicitly when requested for deterministic parity checks.
             torch_model = torch_model.to(dtype=torch.float32)
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            torch_model_id,
-            trust_remote_code=trust_remote_code,
-        )
-        return tokenizer, torch_model
+        return self._tokenizer(cfg), torch_model
 
     def validate(self, cfg: RunConfig):
         import torch
@@ -176,10 +134,10 @@ class MinistralCase:
         prompt = str(cfg.params.get("prompt", "Hello"))
         generate_tokens = int(cfg.params.get("generate_tokens", 0))
         max_prompt_tokens = int(cfg.params.get("max_prompt_tokens", 64))
-        rs_model = self._build_gpt_rs(cfg)
+        rs_model = load_gpt_rs(cfg)
         tokenizer, torch_model = self._build_hf(cfg)
 
-        prompt_tokens = _encode_prompt(tokenizer, prompt, max_prompt_tokens)
+        prompt_tokens = encode_prompt(tokenizer, prompt, max_prompt_tokens)
 
         def hf_logits(tokens: List[int]) -> np.ndarray:
             input_ids = torch.tensor(tokens, dtype=torch.long, device=cfg.torch_device).unsqueeze(0)
@@ -223,18 +181,8 @@ class MinistralCase:
             extra=extra,
         )
 
-        ok = bool(ok_steps == generate_tokens) and (extra["hf_top1"] == extra["gpt_rs_top1"])
-        if ok == res.ok:
-            return res
-        return res.__class__(
-            model=res.model,
-            ok=ok,
-            torch_shape=res.torch_shape,
-            gptrs_shape=res.gptrs_shape,
-            max_abs_diff=res.max_abs_diff,
-            mean_abs_diff=res.mean_abs_diff,
-            extra=res.extra,
-        )
+        ok = ok_steps == generate_tokens and extra["hf_top1"] == extra["gpt_rs_top1"]
+        return replace(res, ok=ok, extra={**res.extra, "allclose": res.ok})
 
     def bench(self, cfg: RunConfig):  # pragma: no cover - not part of current milestone
         raise SystemExit(f"bench workload is not implemented for model {self.name!r}")
@@ -245,10 +193,10 @@ class MinistralCase:
         temperature = float(cfg.params.get("temperature", 0.8))
         max_tokens = int(cfg.params.get("max_tokens", 128))
 
-        rs_model = self._build_gpt_rs(cfg)
-        tokenizer, _torch_model = self._build_hf(cfg)
+        rs_model = load_gpt_rs(cfg)
+        tokenizer = self._tokenizer(cfg)
 
-        prompt_tokens = _encode_prompt(tokenizer, prompt, max_prompt_tokens)
+        prompt_tokens = encode_prompt(tokenizer, prompt, max_prompt_tokens)
 
         t0 = time.perf_counter()
         with debug_context(cfg.params):

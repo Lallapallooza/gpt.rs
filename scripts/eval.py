@@ -136,7 +136,13 @@ def _add_base_args(parser: argparse.ArgumentParser, *, include_hidden: bool) -> 
     parser.add_argument("--warmup", type=int, default=1, help="Warmup iterations for bench")
     parser.add_argument("--iters", type=int, default=3, help="Measured iterations for bench")
     parser.add_argument(
-        "--threads", type=int, nargs="+", default=[1], help="Thread counts to bench"
+        "--threads",
+        type=int,
+        nargs="+",
+        default=[1],
+        help="Thread counts to bench (default: 1). Each bench run sets OMP_NUM_THREADS, "
+        "MKL_NUM_THREADS and RAYON_NUM_THREADS to the count. validate and run keep the "
+        "inherited environment.",
     )
     parser.add_argument(
         "--dump-dir",

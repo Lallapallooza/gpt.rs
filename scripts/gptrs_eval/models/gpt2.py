@@ -2,22 +2,15 @@ from __future__ import annotations
 
 import argparse
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, cast
 
 import numpy as np
 
-from ..core import BenchResult, CliRunResult, RunConfig
-from ..gptrs_py import debug_context
+from ..core import BenchResult, CliRunResult, RunConfig, as_path
+from ..gptrs_py import debug_context, gpt_rs_module, load_gpt_rs
 from ..runner import bench_stats, time_many, validation_result
-
-
-def _as_path(value: Any, fallback: Path) -> Path:
-    if value is None:
-        return fallback
-    if isinstance(value, Path):
-        return value
-    return Path(str(value))
 
 
 class Gpt2Case:
@@ -32,8 +25,8 @@ class Gpt2Case:
         defaults: Dict[str, Any] = get_case_default_params(self.name)
         prompt_default = str(defaults.get("prompt", "Hello"))
         torch_model_default = str(defaults.get("torch_model", "gpt2"))
-        checkpoint_default = _as_path(defaults.get("checkpoint"), Path("checkpoints/gpt2.bin"))
-        tokenizer_default = _as_path(defaults.get("tokenizer"), Path("configs/gpt2_tokenizer.json"))
+        checkpoint_default = as_path(defaults.get("checkpoint"), Path("checkpoints/gpt2.bin"))
+        tokenizer_default = as_path(defaults.get("tokenizer"), Path("configs/gpt2_tokenizer.json"))
 
         parser.add_argument("--prompt", default=prompt_default, help="Prompt text.")
         parser.add_argument(
@@ -86,24 +79,8 @@ class Gpt2Case:
         )
 
     def _build_gpt_rs(self, cfg: RunConfig) -> Tuple[Any, Any]:
-        try:
-            import gpt_rs
-        except ImportError as err:
-            raise SystemExit(
-                "gpt_rs not installed. Install via:\n"
-                "  pip install maturin\n"
-                "  cd crates/gpt-rs-py && maturin develop --release --features faer\n"
-            ) from err
-
-        gpt = cast(Any, gpt_rs)
-        gpt.set_backend(cfg.backend)
-
-        tokenizer_path = Path(cfg.params["tokenizer"])
-        checkpoint = Path(cfg.params["checkpoint"])
-
-        tokenizer = gpt.Tokenizer.from_file(str(tokenizer_path))
-        model = gpt.load_model(str(checkpoint))
-        return tokenizer, model
+        tokenizer = gpt_rs_module().Tokenizer.from_file(str(cfg.params["tokenizer"]))
+        return tokenizer, load_gpt_rs(cfg)
 
     def validate(self, cfg: RunConfig):
         import torch
@@ -161,20 +138,8 @@ class Gpt2Case:
             atol=cfg.atol,
             extra=extra,
         )
-        ok = bool(ok_steps == generate_tokens) and (
-            int(np.argmax(hf_row)) == int(np.argmax(rs_row))
-        )
-        if ok == res.ok:
-            return res
-        return res.__class__(
-            model=res.model,
-            ok=ok,
-            torch_shape=res.torch_shape,
-            gptrs_shape=res.gptrs_shape,
-            max_abs_diff=res.max_abs_diff,
-            mean_abs_diff=res.mean_abs_diff,
-            extra=res.extra,
-        )
+        ok = ok_steps == generate_tokens and extra["hf_top1"] == extra["gpt_rs_top1"]
+        return replace(res, ok=ok, extra={**res.extra, "allclose": res.ok})
 
     def bench(self, cfg: RunConfig) -> BenchResult:
         import torch
@@ -222,6 +187,7 @@ class Gpt2Case:
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=max_tokens,
+                min_new_tokens=max_tokens,
                 pad_token_id=pad_token_id,
             )
             torch_sync()
@@ -232,6 +198,7 @@ class Gpt2Case:
                 max_tokens,
                 temperature=1.0,
                 kv_cache=kv_cache,
+                ignore_eos=True,
             )
             _ = int(out_tokens[-1])
 

@@ -3,12 +3,15 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, Mapping, Tuple, cast
+from typing import Any, Dict, List, Mapping, Tuple, cast
 
 import numpy as np
 
+from gptrs_eval.checkpoint import hf_eos_token_ids, hf_text_tensor_names
 from gptrs_eval.checkpoint import save as save_checkpoint
+from gptrs_eval.core import resolve_torch_dtype
 
+from ..pipeline import missing_outputs
 from ..types import (
     ArtifactDefaults,
     EvalCaseRegistration,
@@ -29,268 +32,17 @@ def _to_numpy_f32(tensor: Any) -> np.ndarray:
     return tensor.detach().to(torch.float32).cpu().numpy()
 
 
-def _state_tensor(state: Mapping[str, Any], key: str) -> Any:
-    if key not in state:
-        raise KeyError(f"missing tensor in state dict: {key}")
-    return state[key]
-
-
-def _resolve_torch_dtype(name: str) -> Any:
-    import torch
-
-    mapping: Dict[str, Any] = {
-        "auto": "auto",
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "float32": torch.float32,
-    }
-    if name not in mapping:
-        known = ", ".join(sorted(mapping.keys()))
-        raise ValueError(f"unsupported --torch-dtype {name!r}; expected one of: {known}")
-    return mapping[name]
-
-
-def _rope_scaling_from_hf(cfg: Any) -> Dict[str, Any]:
-    raw = getattr(cfg, "rope_parameters", None)
-    if raw is None:
-        raw = getattr(cfg, "rope_scaling", None)
-    if raw is None:
-        return {"kind": "none"}
-
-    rope_scaling: Mapping[str, Any]
-    if isinstance(raw, dict):
-        rope_scaling = raw
-    elif hasattr(raw, "to_dict"):
-        rope_scaling = raw.to_dict()
-    else:
-        raise ValueError(f"unsupported rope_scaling payload type: {type(raw)!r}")
-
-    rope_type = str(rope_scaling.get("rope_type", rope_scaling.get("type", "none"))).lower()
-    if rope_type in {"none", ""}:
-        return {"kind": "none"}
-
-    factor_value = rope_scaling.get("factor")
-    if factor_value is None:
-        factor_value = 1.0
-    factor = float(factor_value)
-    if rope_type == "linear":
-        return {"kind": "linear", "factor": factor}
-    if rope_type == "yarn":
-        out: Dict[str, Any] = {"kind": "yarn", "factor": factor}
-
-        original_max = rope_scaling.get("original_max_position_embeddings")
-        if original_max is None:
-            raise ValueError(
-                "Ministral Yarn rope parameters require original_max_position_embeddings"
-            )
-        out["original_max_position_embeddings"] = int(original_max)
-
-        for key in ("mscale", "mscale_all_dim", "beta_fast", "beta_slow"):
-            value = rope_scaling.get(key)
-            if value is not None:
-                out[key] = float(value)
-
-        truncate_value = rope_scaling.get("truncate")
-        if truncate_value is not None:
-            out["truncate"] = bool(truncate_value)
-        return out
-    raise ValueError(f"unsupported rope scaling type for Ministral exporter: {rope_type!r}")
-
-
-def _rope_theta_from_hf(cfg: Any) -> float:
-    theta = getattr(cfg, "rope_theta", None)
-    if theta is not None:
-        return float(theta)
-
-    rope_parameters = getattr(cfg, "rope_parameters", None)
-    if isinstance(rope_parameters, dict):
-        rope_theta = rope_parameters.get("rope_theta")
-        if rope_theta is not None:
-            return float(rope_theta)
-
-    rope_scaling = getattr(cfg, "rope_scaling", None)
-    if isinstance(rope_scaling, dict):
-        rope_theta = rope_scaling.get("rope_theta")
-        if rope_theta is not None:
-            return float(rope_theta)
-
-    return 10_000.0
-
-
-def _rotary_dim_from_hf(cfg: Any) -> int:
-    hidden_size = int(cfg.hidden_size)
-    num_heads = int(cfg.num_attention_heads)
-    if hidden_size % num_heads != 0:
-        raise ValueError(
-            "invalid attention dimensions: "
-            f"hidden_size={hidden_size} is not divisible by num_heads={num_heads}"
-        )
-
-    head_dim = int(getattr(cfg, "head_dim", hidden_size // num_heads))
-    partial_rotary = float(getattr(cfg, "partial_rotary_factor", 1.0))
-
-    rotary_dim = int(round(head_dim * partial_rotary))
-    rotary_dim = min(head_dim, max(2, rotary_dim))
-    if rotary_dim % 2 != 0:
-        rotary_dim -= 1
-    if rotary_dim <= 0:
-        raise ValueError(f"derived rotary_dim is invalid: {rotary_dim}")
-    return rotary_dim
-
-
-def _context_length_from_hf(cfg: Any) -> int:
-    if hasattr(cfg, "max_position_embeddings"):
-        return int(cfg.max_position_embeddings)
-    if hasattr(cfg, "max_seq_len"):
-        return int(cfg.max_seq_len)
-    return 2048
-
-
-def _text_config(cfg: Any) -> Any:
-    text_cfg = getattr(cfg, "text_config", None)
-    if text_cfg is not None:
-        return text_cfg
-    return cfg
-
-
-def _text_state_prefix(state: Mapping[str, Any]) -> str:
-    candidates = ("model.language_model", "model", "language_model")
-    for prefix in candidates:
-        probe = f"{prefix}.layers.0.self_attn.q_proj.weight"
-        if probe in state:
-            return prefix
-    known = ", ".join(sorted(k for k in state.keys() if ".layers." in k)[:8])
-    raise KeyError(
-        "unable to locate text transformer prefix in state dict; "
-        f"checked {candidates}, sample layer keys: {known}"
-    )
-
-
 def _collect_checkpoint(model: Any) -> Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
-    import torch
+    """The Hugging Face text config and the text-decoder tensors as f32, under text-model names."""
 
-    cfg = model.config
-    text_cfg = _text_config(cfg)
+    text_cfg = getattr(model.config, "text_config", None) or model.config
     state = model.state_dict()
-    text_prefix = _text_state_prefix(state)
-
-    embed_dim = int(text_cfg.hidden_size)
-    num_layers = int(text_cfg.num_hidden_layers)
-    num_heads = int(text_cfg.num_attention_heads)
-    num_kv_heads_cfg = int(getattr(text_cfg, "num_key_value_heads", num_heads))
-    mlp_hidden_dim = int(text_cfg.intermediate_size)
-    vocab_size = int(text_cfg.vocab_size)
-    context_length = _context_length_from_hf(text_cfg)
-
-    if embed_dim % num_heads != 0:
-        raise ValueError(
-            "invalid attention dimensions: "
-            f"hidden_size={embed_dim} is not divisible by num_heads={num_heads}"
-        )
-    if num_heads % num_kv_heads_cfg != 0:
-        raise ValueError(
-            "invalid grouped-query attention dimensions: "
-            f"num_heads={num_heads} is not divisible by num_kv_heads={num_kv_heads_cfg}"
-        )
-
-    q_proj0 = _state_tensor(state, f"{text_prefix}.layers.0.self_attn.q_proj.weight").t()
-    k_proj0 = _state_tensor(state, f"{text_prefix}.layers.0.self_attn.k_proj.weight").t()
-    q_proj_dim = int(q_proj0.shape[1])
-    if q_proj_dim % num_heads != 0:
-        raise ValueError(
-            "invalid query projection width: "
-            f"q_proj_dim={q_proj_dim} is not divisible by num_heads={num_heads}"
-        )
-    head_dim = q_proj_dim // num_heads
-    kv_dim = int(k_proj0.shape[1])
-    if kv_dim % head_dim != 0:
-        raise ValueError(
-            f"invalid key projection width: kv_dim={kv_dim} is not divisible by head_dim={head_dim}"
-        )
-    num_kv_heads = kv_dim // head_dim
-    qkv_dim = q_proj_dim + kv_dim + kv_dim
-
-    tensors: Dict[str, np.ndarray] = {}
-    add_tensor = tensors.__setitem__
-
-    add_tensor(
-        "tok_embeddings.weight",
-        _to_numpy_f32(_state_tensor(state, f"{text_prefix}.embed_tokens.weight")),
-    )
-
-    for i in range(num_layers):
-        prefix = f"{text_prefix}.layers.{i}"
-
-        q_proj = _state_tensor(state, f"{prefix}.self_attn.q_proj.weight").t()
-        k_proj = _state_tensor(state, f"{prefix}.self_attn.k_proj.weight").t()
-        v_proj = _state_tensor(state, f"{prefix}.self_attn.v_proj.weight").t()
-        if int(q_proj.shape[1]) != q_proj_dim:
-            raise ValueError(
-                f"inconsistent query projection width at layer {i}: "
-                f"expected {q_proj_dim}, got {int(q_proj.shape[1])}"
-            )
-        if int(k_proj.shape[1]) != kv_dim or int(v_proj.shape[1]) != kv_dim:
-            raise ValueError(
-                "inconsistent kv projection width at layer "
-                f"{i}: expected {kv_dim}, got k={int(k_proj.shape[1])}, v={int(v_proj.shape[1])}"
-            )
-        packed_qkv = torch.cat((q_proj, k_proj, v_proj), dim=1)
-        if tuple(packed_qkv.shape) != (embed_dim, qkv_dim):
-            raise ValueError(
-                f"layer {i} packed qkv shape mismatch: expected {(embed_dim, qkv_dim)}, "
-                f"got {tuple(packed_qkv.shape)}"
-            )
-        add_tensor(f"blocks.{i}.attention.w_qkv", _to_numpy_f32(packed_qkv))
-
-        add_tensor(
-            f"blocks.{i}.attention.w_out",
-            _to_numpy_f32(_state_tensor(state, f"{prefix}.self_attn.o_proj.weight").t()),
-        )
-        add_tensor(
-            f"blocks.{i}.feed_forward.w_gate",
-            _to_numpy_f32(_state_tensor(state, f"{prefix}.mlp.gate_proj.weight").t()),
-        )
-        add_tensor(
-            f"blocks.{i}.feed_forward.w_up",
-            _to_numpy_f32(_state_tensor(state, f"{prefix}.mlp.up_proj.weight").t()),
-        )
-        add_tensor(
-            f"blocks.{i}.feed_forward.w_down",
-            _to_numpy_f32(_state_tensor(state, f"{prefix}.mlp.down_proj.weight").t()),
-        )
-        add_tensor(
-            f"blocks.{i}.norm_1.gamma",
-            _to_numpy_f32(_state_tensor(state, f"{prefix}.input_layernorm.weight")),
-        )
-        add_tensor(
-            f"blocks.{i}.norm_2.gamma",
-            _to_numpy_f32(_state_tensor(state, f"{prefix}.post_attention_layernorm.weight")),
-        )
-
-    add_tensor(
-        "final_norm.gamma", _to_numpy_f32(_state_tensor(state, f"{text_prefix}.norm.weight"))
-    )
-    lm_head_weight = state.get("lm_head.weight")
-    if lm_head_weight is None:
-        lm_head_weight = _state_tensor(state, f"{text_prefix}.embed_tokens.weight")
-    add_tensor("lm_head", _to_numpy_f32(lm_head_weight.t()))
-
-    model_config = {
-        "vocab_size": vocab_size,
-        "context_length": context_length,
-        "embed_dim": embed_dim,
-        "num_layers": num_layers,
-        "num_heads": num_heads,
-        "num_kv_heads": num_kv_heads,
-        "head_dim": head_dim,
-        "kv_head_dim": head_dim,
-        "mlp_hidden_dim": mlp_hidden_dim,
-        "rms_norm_eps": float(getattr(text_cfg, "rms_norm_eps", 1e-5)),
-        "rope_theta": _rope_theta_from_hf(text_cfg),
-        "rotary_dim": _rotary_dim_from_hf(text_cfg),
-        "rope_scaling": _rope_scaling_from_hf(text_cfg),
-    }
-    return model_config, tensors
+    names = hf_text_tensor_names(state.keys())
+    if "lm_head.weight" not in names:
+        # Tied output projection.
+        names["lm_head.weight"] = names["model.embed_tokens.weight"]
+    tensors = {name: _to_numpy_f32(state[src]) for name, src in names.items()}
+    return text_cfg.to_dict(), tensors
 
 
 def _load_model_and_tokenizer(
@@ -302,7 +54,7 @@ def _load_model_and_tokenizer(
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     kwargs: Dict[str, Any] = {"trust_remote_code": trust_remote_code}
-    dtype = _resolve_torch_dtype(torch_dtype_name)
+    dtype = resolve_torch_dtype(torch_dtype_name)
     if dtype != "auto":
         kwargs["torch_dtype"] = dtype
 
@@ -334,8 +86,11 @@ def _write_checkpoint(
     path: Path,
     config: Dict[str, Any],
     tensors: Mapping[str, np.ndarray],
+    eos_token_ids: List[int],
 ) -> None:
-    save_checkpoint(path, kind="ministral", config=config, tensors=tensors)
+    save_checkpoint(
+        path, kind="ministral", config=config, tensors=tensors, eos_token_ids=eos_token_ids
+    )
 
 
 class MinistralExporter:
@@ -413,7 +168,11 @@ class MinistralExporter:
 
         config_out.write_text(json.dumps(model_config, indent=2), encoding="utf-8")
         _export_hf_tokenizer_json(tokenizer, tokenizer_out)
-        _write_checkpoint(request.checkpoint_out, model_config, tensors)
+        hf_config = model.config.to_dict()
+        eos_token_ids = hf_eos_token_ids(
+            model.generation_config.to_dict(), hf_config, hf_config.get("text_config")
+        )
+        _write_checkpoint(request.checkpoint_out, model_config, tensors, eos_token_ids)
 
         return ExportResult(
             exporter=self.info.name,
@@ -431,15 +190,4 @@ class MinistralExporter:
         )
 
     def validate(self, request: ExportRequest) -> list[str]:
-        errors: list[str] = []
-        if not request.checkpoint_out.exists():
-            errors.append(f"missing checkpoint: {request.checkpoint_out}")
-        if request.config_out is None:
-            errors.append("missing config output path")
-        elif not request.config_out.exists():
-            errors.append(f"missing config: {request.config_out}")
-        if request.tokenizer_out is None:
-            errors.append("missing tokenizer output path")
-        elif not request.tokenizer_out.exists():
-            errors.append(f"missing tokenizer: {request.tokenizer_out}")
-        return errors
+        return missing_outputs(request)

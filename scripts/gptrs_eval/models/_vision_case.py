@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 
 from ..core import BenchResult, CliRunResult, RunConfig
-from ..gptrs_py import debug_context
+from ..gptrs_py import debug_context, load_gpt_rs
 from ..runner import bench_stats, time_many, validation_result
 
 
@@ -65,23 +65,8 @@ class VisionCaseBase:
         except ImportError as err:
             raise SystemExit("torchvision is required (pip install torchvision).") from err
 
-        try:
-            import gpt_rs
-        except ImportError as err:
-            raise SystemExit(
-                "gpt_rs not installed. Install via:\n"
-                "  pip install maturin\n"
-                "  cd crates/gpt-rs-py && maturin develop --release --features faer\n"
-            ) from err
-
-        gpt_rs.set_backend(cfg.backend)
-
-        torch_model = self._build_torch_model(tvm).eval()
-        checkpoint = cfg.params.get("checkpoint")
-        if checkpoint is None:
-            raise SystemExit("missing --checkpoint")
-        model_gpt = gpt_rs.load_model(str(checkpoint))
-        return torch_model, model_gpt
+        model_gpt = load_gpt_rs(cfg)
+        return self._build_torch_model(tvm).eval(), model_gpt
 
     def validate(self, cfg: RunConfig):
         import torch

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
-from typing import Any, Sequence
+from typing import Any
 
 from .core import BenchResult, OutputFormat, ValidationResult
 
@@ -22,8 +23,19 @@ def dumps_json(results: Sequence[Any]) -> str:
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
+def _scalars(extra: Mapping[str, Any]) -> str:
+    """`key=value` pairs for the scalar entries of an `extra` mapping."""
+    parts = []
+    for key, value in extra.items():
+        if isinstance(value, float):
+            parts.append(f"{key}={value:.6g}")
+        elif isinstance(value, (bool, int, str)):
+            parts.append(f"{key}={value}")
+    return " ".join(parts)
+
+
 def print_validation(res: ValidationResult) -> None:
-    print(f"model={res.model} allclose={res.ok}")
+    print(f"model={res.model} ok={res.ok}")
     print(f"max_abs_diff={res.max_abs_diff:.6e} mean_abs_diff={res.mean_abs_diff:.6e}")
     if res.extra:
         print(f"extra={res.extra}")
@@ -46,6 +58,11 @@ def print_bench(results: Sequence[BenchResult], fmt: OutputFormat) -> None:
 
     # table-ish
     for r in results:
-        print(f"model={r.model} threads={r.threads} units={r.units_per_iter} {r.unit_label}/iter")
-        print(f"  gpt-rs: mean_s={r.gptrs.mean_s:.6f} {r.unit_label}/s={r.gptrs.units_per_s:.2f}")
-        print(f"  torch:  mean_s={r.torch.mean_s:.6f} {r.unit_label}/s={r.torch.units_per_s:.2f}")
+        header = f"model={r.model} threads={r.threads} units={r.units_per_iter} {r.unit_label}/iter"
+        print(f"{header} {_scalars(r.extra)}".rstrip())
+        for label, stats in (("gpt-rs:", r.gptrs), ("torch: ", r.torch)):
+            line = (
+                f"  {label} {stats.impl} mean_s={stats.mean_s:.6f} "
+                f"{r.unit_label}/s={stats.units_per_s:.2f} {_scalars(stats.extra)}"
+            )
+            print(line.rstrip())

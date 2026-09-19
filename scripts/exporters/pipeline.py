@@ -63,3 +63,14 @@ def run_export(exporter: ExporterSpec, request: ExportRequest) -> ExportResult:
 
 def run_validation(exporter: ExporterSpec, request: ExportRequest) -> list[str]:
     return exporter.validate(request)
+
+
+def missing_outputs(request: ExportRequest) -> list[str]:
+    outputs = {
+        "checkpoint": request.checkpoint_out,
+        "config": request.config_out,
+        "tokenizer": request.tokenizer_out,
+    }
+    return [
+        f"missing {kind}: {path}" for kind, path in outputs.items() if path and not path.exists()
+    ]

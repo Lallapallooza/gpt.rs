@@ -50,10 +50,18 @@ def time_many(
     return times
 
 
-def bench_stats(times_s: List[float], *, units_per_iter: float, impl: str) -> BenchStats:
+def bench_stats(
+    times_s: List[float],
+    *,
+    units_per_iter: float,
+    impl: str,
+    extra: dict[str, Any] | None = None,
+) -> BenchStats:
     mean_s = statistics.mean(times_s) if times_s else float("inf")
     units_per_s = (units_per_iter / mean_s) if mean_s > 0 else 0.0
-    return BenchStats(impl=impl, times_s=times_s, mean_s=mean_s, units_per_s=units_per_s)
+    return BenchStats(
+        impl=impl, times_s=times_s, mean_s=mean_s, units_per_s=units_per_s, extra=extra or {}
+    )
 
 
 def validation_result(

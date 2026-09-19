@@ -4,7 +4,43 @@ import contextlib
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterator, Optional
+
+if TYPE_CHECKING:
+    from .core import RunConfig
+
+_BUILD_HINT = (
+    "gpt_rs is not installed. Build it with:\n"
+    "  uv run python scripts/rebuild_py.py --features faer\n"
+    "(add conversion-c for --backend c, profiler for --profile)."
+)
+
+
+def gpt_rs_module() -> Any:
+    """Imports the `gpt_rs` extension, exiting with a build hint when it is missing."""
+    try:
+        import gpt_rs  # type: ignore[import-not-found]
+    except ImportError as err:
+        raise SystemExit(_BUILD_HINT) from err
+    return gpt_rs
+
+
+def load_gpt_rs(cfg: RunConfig, **kwargs: Any) -> Any:
+    """Loads `cfg.params["checkpoint"]` on `cfg.backend`."""
+    module = gpt_rs_module()
+    module.set_backend(cfg.backend)
+    checkpoint = cfg.params.get("checkpoint")
+    if checkpoint is None:
+        raise SystemExit("missing --checkpoint")
+    return module.load_model(str(checkpoint), **kwargs)
+
+
+def _no_profile_report(module: Any) -> str:
+    return (
+        "profiling is enabled but no report is available. gpt_rs "
+        f"(imported from {getattr(module, '__file__', '<unknown>')}) lacks profiler support. "
+        "Rebuild with `uv run python scripts/rebuild_py.py --features faer,profiler`."
+    )
 
 
 @contextlib.contextmanager
@@ -52,9 +88,8 @@ def debug_context(params: Dict[str, Any]) -> Iterator["DebugHooks"]:
                     dump_enabled = True
                 except Exception:
                     print(
-                        "dump_dir requested but gpt_rs.set_dump_dir is unavailable; rebuild gpt_rs "
-                        "(e.g. `cd crates/gpt-rs-py && maturin develop --release --features faer "
-                        "--skip-install`).",
+                        "dump_dir requested but gpt_rs.set_dump_dir is unavailable. Rebuild gpt_rs "
+                        "with `uv run python scripts/rebuild_py.py --features faer`.",
                         file=sys.stderr,
                     )
 
@@ -91,14 +126,7 @@ def debug_context(params: Dict[str, Any]) -> Iterator["DebugHooks"]:
                     else:
                         print(json_report, file=sys.stderr)
                 else:
-                    print(
-                        "profiling enabled but no report available; "
-                        "rebuild/install gpt_rs with profiler support "
-                        f"(imported from {getattr(gpt_rs, '__file__', '<unknown>')}); "
-                        "try: `cd crates/gpt-rs-py && maturin develop --release --features faer,profiler` "
-                        "(omit `--skip-install` unless you also set `PYTHONPATH=crates/gpt-rs-py`).",
-                        file=sys.stderr,
-                    )
+                    print(_no_profile_report(gpt_rs), file=sys.stderr)
             elif profile_tables:
                 try:
                     report = gpt_rs.profiling_take_report()
@@ -107,14 +135,7 @@ def debug_context(params: Dict[str, Any]) -> Iterator["DebugHooks"]:
                 if report:
                     print(report, file=sys.stderr)
                 else:
-                    print(
-                        "profiling enabled but no report available; "
-                        "rebuild/install gpt_rs with profiler support "
-                        f"(imported from {getattr(gpt_rs, '__file__', '<unknown>')}); "
-                        "try: `cd crates/gpt-rs-py && maturin develop --release --features faer,profiler` "
-                        "(omit `--skip-install` unless you also set `PYTHONPATH=crates/gpt-rs-py`).",
-                        file=sys.stderr,
-                    )
+                    print(_no_profile_report(gpt_rs), file=sys.stderr)
 
             if profile_trace:
                 try:

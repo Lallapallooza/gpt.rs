@@ -235,6 +235,23 @@ uv run python scripts/eval.py --model ministral_3_3b_instruct_2512 --workload va
 uv run python scripts/eval.py --suite scripts/eval_suites/vision.json
 ```
 
+Qwen3.5 models, for example `Qwen/Qwen3.8-27B`, mix Gated DeltaNet and gated attention layers.
+The exporter writes their weight matrices as bf16. `--backend c` needs the extension built with
+`conversion-c` (`uv run python scripts/rebuild_py.py --features faer,conversion-c`):
+
+```bash
+uv run python scripts/export.py export --exporter qwen3_8_27b \
+  --checkpoint-out checkpoints/qwen3_8_27b.bin \
+  --config-out configs/qwen3_8_27b_model.json \
+  --tokenizer-out configs/qwen3_8_27b_tokenizer.json
+uv run python scripts/eval.py --model qwen3_8_27b --workload validate --backend c \
+  --checkpoint checkpoints/qwen3_8_27b.bin --prompt-tokens 300 --generate-tokens 3
+uv run python scripts/eval.py --model qwen3_8_27b --workload bench --backend c --threads 8 \
+  --matmul-input-dtype bf16 --prompt-tokens 256 --bench-tokens 8
+```
+
+See `uv run python scripts/eval.py --help` for the remaining flags.
+
 ### Dumps + profiling
 
 Notes:
@@ -300,7 +317,6 @@ cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- generate \
   --temperature 0.8 \
   --checkpoint checkpoints/gpt2.bin \
   --tokenizer configs/gpt2_tokenizer.json \
-  --kv-cache \
   --dump-dir dumps/gpt2_ptir \
   --dump-mode compile \
   --profile

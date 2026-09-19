@@ -294,7 +294,8 @@ Output dim order:
 
 Numeric:
 
-- Multiply in input dtype, accumulate in `accum_dtype` (or default), cast to `out_dtype` (or default).
+- Form products and accumulate in `accum_dtype` (or default), then cast to `out_dtype` (or default).
+  So products of narrower inputs are exact, for example bf16 x bf16 with f32 accumulation.
 
 ### Shape and layout ops
 

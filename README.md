@@ -54,7 +54,7 @@ GPTRS_C_CACHE_DIR=./.cache/gpt_rs_c_backend uv run python scripts/eval.py \
 
 - **Capability-based runtime**: `runtime::load_model` returns a dynamic model handle; the CLI runs `generate` / `forward` without hardcoding model kinds. See [docs/runtime.md](docs/runtime.md).
 - **Parameter streaming + stable ids**: checkpoint-backed `ParamSource` loads weights on demand; backends can memoize derived parameter formats by stable id. See [docs/howto.md](docs/howto.md) and [docs/formats.md](docs/formats.md).
-- **Backend rewrites**: pattern-driven PTIR rewrites via `#[ptir_pattern]` views and backend optimizer passes. See [docs/backend_optimizer.md](docs/backend_optimizer.md) (and [crates/gpt-rs-backend-c/src/optimizer/conv2d.rs](crates/gpt-rs-backend-c/src/optimizer/conv2d.rs) for a real example).
+- **Backend rewrites**: backend optimizer passes rewrite PTIR by matching the pattern views that `#[functional]` generates. See [docs/backend_optimizer.md](docs/backend_optimizer.md) (and [crates/gpt-rs-backend-c/src/optimizer/conv2d.rs](crates/gpt-rs-backend-c/src/optimizer/conv2d.rs) for a real example).
 - **Correctness tooling**: Torch parity at the kernel level and end-to-end model baselines via Python runners. See [docs/testing.md](docs/testing.md).
 - **Debuggability**: PTIR dumps (`--dump-dir`), profiling (`--profile` with `-F gpt-rs/profiler`), and eager debugging (`GPTRS_EAGER=1`).
 
@@ -63,7 +63,7 @@ GPTRS_C_CACHE_DIR=./.cache/gpt_rs_c_backend uv run python scripts/eval.py \
 Start here:
 - [docs/README.md](docs/README.md) (doc index + policy)
 - [docs/howto.md](docs/howto.md) (add models/layers/functionals/backends)
-- [docs/runtime.md](docs/runtime.md) (loader, capability dispatch, overrides)
+- [docs/runtime.md](docs/runtime.md) (loader, capability dispatch)
 - [docs/testing.md](docs/testing.md) (Torch parity + dumps/profiling + Python baselines)
 - [docs/formats.md](docs/formats.md) (checkpoint + tensor archive formats)
 
@@ -72,7 +72,7 @@ Reference:
 - [docs/backend.md](docs/backend.md) (PTIR backend contract, ptir.v0.4)
 - [docs/backend_optimizer.md](docs/backend_optimizer.md) (optimizer pipeline + patterns)
 - [docs/ops.md](docs/ops.md) (PTIR capture/graphs/execution)
-- [docs/frontend.md](docs/frontend.md) (frontend layering + runtime overrides)
+- [docs/frontend.md](docs/frontend.md) (frontend layering)
 
 Scripts:
 - [scripts/README.md](scripts/README.md) (Python utilities: export + eval)
@@ -101,7 +101,7 @@ Tooling / interop:
 - [ ] PyTorch importer
 
 Models:
-- [ ] Qwen
+- [x] Qwen3.5
 - [ ] Llama
 - [ ] DeepSeek
 - [ ] GPT-OSS
@@ -135,9 +135,8 @@ inputs (tokens / images)
    nn::layers::* (Linear, LayerNorm, Attention, Conv2d, ...)
         |
         v
-ops::functional::* (matmul, layer_norm, conv2d_nhwc, ...)
-        |                  \
-        |                   +-- runtime overrides (FunctionalRegistry / FunctionalOverrides)
+ops::functional::* (matmul, layer_norm, conv2d, ...)
+        |
         v
 backend::spec::PortableBackend (dot_general, reduce_window, gather, elementwise, ...)
         |
@@ -171,8 +170,7 @@ cargo run --release -p gpt-rs-cli -- generate \
   --tokenizer configs/ministral_3_3b_instruct_2512_tokenizer.json \
   --prompt "Hello" \
   --max-tokens 32 \
-  --backend faer \
-  --kv-cache
+  --backend faer
 
 # validate Ministral checkpoint against Torch
 uv run python scripts/eval.py --model ministral_3_3b_instruct_2512 --workload validate \
@@ -224,7 +222,7 @@ Torch parity tests live under `crates/gpt-rs-backend-tests/src/torch_parity/` an
 
 ## Status
 
-Forward inference for causal LMs (`gpt`, `ministral`) and image classification models
+Forward inference for causal LMs (`gpt`, `ministral`, `qwen3_5`) and image classification models
 (`resnet34`, `mobilenet_v2`) is implemented, with portable PTIR kernels and Torch baselines
 for correctness.
 

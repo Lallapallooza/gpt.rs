@@ -12,8 +12,8 @@ Doc policy:
 
 ## Code orientation
 - [architecture.md](architecture.md): crate/module layout and data flow.
-- [runtime.md](runtime.md): checkpoint loading, capability dispatch, runtime overrides.
-- [frontend.md](frontend.md): models/layers/functionals/backends + runtime overrides.
+- [runtime.md](runtime.md): checkpoint loading, capability dispatch.
+- [frontend.md](frontend.md): models/layers/functionals/backends.
 - [code_map.md](code_map.md): where the functional/capture plumbing lives.
 
 ## Reference

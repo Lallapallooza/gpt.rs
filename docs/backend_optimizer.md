@@ -50,8 +50,10 @@ Most canonicalization/simplification passes are pattern-driven:
 - `OpRewritePattern<V>`: typed pattern operating on a view `V`
 - `V: OperationView`: typed extractor for a specific op shape (matcher + field access)
 
-Operation views live under `crates/gpt-rs/src/backend/pattern/` and are generated from `#[ptir_pattern]`
-annotations. Use:
+Single-op views (`AddOpView`, `DotGeneralOpView`, ...) live under `crates/gpt-rs/src/backend/pattern/`.
+Every `#[functional]` also generates a view of its whole lowering. For example, `conv2d` generates
+`Conv2dPattern` with the target `gpt_rs.conv2d`. The view has one field for each value that a `let`
+names in the `capture!` body. Use:
 
 ```bash
 cargo run -p gpt-rs-cli -- patterns
@@ -74,7 +76,8 @@ Pick the smallest unit that fits:
 
 Checklist:
 
-1. Add/extend an operation view (via `#[ptir_pattern]`) if needed.
+1. In the functional's `capture!` body, name each op that the rewrite reads with `let`. The generated
+   view then has these ops as fields. Alternatively, add a single-op view.
 2. Implement `OpRewritePattern<View>` and return `true` only when you actually mutate IR.
 3. Wire the pattern into a pass under `crates/gpt-rs/src/backend/passes/`.
 4. Register the pass in `crates/gpt-rs/src/backend/pipeline.rs` (or a backend-specific pipeline hook).

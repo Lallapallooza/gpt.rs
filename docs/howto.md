@@ -10,43 +10,87 @@ If anything here stops matching the code, fix it or delete it.
 Goal: make `runtime::load_model(backend, checkpoint_path)` construct your model from a self-describing
 checkpoint (`GPTRSCHK`) and expose it through the dynamic capability API used by `gpt-rs-cli`.
 
-Checklist:
+A decoder-only text model only describes its structure:
+
+1. Add `crates/gpt-rs/src/model/<your_model>.rs` with the config struct and
+   `pub type YourModel<B> = CausalDecoder<B, YourConfig>` (see `model/ministral.rs`). The config
+   struct holds the keys of the Hugging Face text config that the model reads, under their Hugging
+   Face names.
+2. Implement `inference::decoder::DecoderConfig` for the config: `KIND` and `layout()`. `layout()`
+   validates the config and returns a `DecoderLayout`. To add a new kind of mixer, MLP or norm, add a
+   variant to the enums in `nn/layers/decoder_block.rs`.
+3. Register `decoder::build_from_model_config::<B, YourConfig>` in `model/registry.rs`.
+4. Add the exporter and baseline as in step 6 below.
+
+`CausalDecoder` implements the rest.
+
+Other models follow the full checklist:
 
 1. Add `crates/gpt-rs/src/model/<your_model>.rs`.
-   - Keep the config struct in the same file (see `model/gpt.rs`, `model/resnet.rs`).
-2. Implement the model struct as `struct YourModel<B: PortableBackend> { ... }`.
-   - Store `Arc<B>` and submodules/layers.
+   - Keep the config struct in the same file (see `model/resnet.rs`).
+2. Declare the model and its blocks as `#[nn::module]` structs whose fields are sublayers (see
+   "Write a layer" below). Mirror the module tree of the source framework, so that the field names
+   are the parameter names.
    - Use NHWC/NCHW conventions explicitly (see "Layouts" below).
-3. Implement `Module<B>` for parameter enumeration:
-   - `visit_params` / `visit_params_mut` must produce stable ASCII parameter names.
-   - Use `ParamVisitor::scoped("path", |v| ...)` to build hierarchical names.
-4. Add a builder that loads tensors by name:
-   - Pattern: `fn build_from_params(backend, get: &mut dyn FnMut(&str) -> Result<DeviceTensor<B>>)`.
-   - `get("path.to.weight")?` returns a lazily-loaded param tensor when loaded from a checkpoint.
-5. Implement `runtime::LoadedModel<B>` for your model:
+3. Add `load(params: &mut nn::LayerLoader<'_, B>, ...)` builders that load each block under its
+   prefix:
+   - `nn::LayerLoader` checks shapes and applies `runtime.matmul_input_dtype`. A loader from `LayerLoader::random` initialises the parameters
+     randomly.
+   - Name parameters after the modules of the source framework
+     ([formats.md](formats.md#parameter-names-and-layouts)).
+   - The registry factory receives `get: &mut dyn FnMut(&str) -> Result<DeviceTensor<B>>`. It returns
+     a lazily loaded parameter tensor for each checkpoint name. Wrap it in `LayerLoader::new`.
+4. Implement `runtime::LoadedModel<B>` for your model:
    - `kind()` must match `ModelConfig.kind` stored in the checkpoint.
-   - `forward(ModelInput)` returns `ModelOutput`.
+   - `forward(ModelInput)` returns `ModelOutput`. Run the model with `Layer::call`.
    - If applicable, expose capabilities:
      - Causal LM generation: return `Some(self)` from `as_causal_lm()`.
-6. Register the model factory:
-   - Today this is a list in `crates/gpt-rs/src/runtime/mod.rs` (`model_factories()`).
-7. Add a checkpoint exporter and baseline:
+5. Register the model factory:
+   - Add it to `model_factories()` in `crates/gpt-rs/src/model/registry.rs`.
+6. Add a checkpoint exporter and baseline:
    - For Torch models, add/update a spec under `scripts/exporters/specs/` and wire eval metadata.
    - Ensure `scripts/eval.py --model <kind> --workload validate` can run end-to-end.
 
 ## Write a layer
 
-Goal: a reusable module that owns parameters and calls portable functionals.
+Goal: a reusable module that owns parameters and calls portable functionals. A layer is a struct
+and an impl that holds its `forward`. Mark both with `#[nn::module]` (see
+`crates/gpt-rs/src/nn/layers/feed_forward.rs` and the macro's documentation):
 
-Rules of thumb (see `crates/gpt-rs/src/nn/layers/linear.rs`):
+```rust
+#[nn::module]
+pub struct FeedForward {
+    pub up_proj: Linear,
+    pub activation: Activation,
+    pub down_proj: Linear,
+}
 
-- Store parameters as `DeviceTensor<B>` (usually created via `.as_param()?` / `.as_buffer()?`).
-- Keep `Arc<B>` in the layer for:
-  - calling non-method functionals that still take `&_backend` (e.g. `functional::relu(backend, ...)`)
-  - profiling scopes
-- Use `DeviceTensorOps` for math (`x.matmul(&w)?`, `x.add(&y)?`, ...).
+#[nn::module]
+impl FeedForward {
+    pub fn load(params: &mut LayerLoader<'_, B>, prefix: &str, /* dims */) -> Result<Self> { ... }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let up = self.up_proj(x)?;
+        let act = self.activation(&up)?;
+        self.down_proj(&act)
+    }
+}
+```
+
+- The macro adds the backend parameter `B`. Write sublayer fields without it. `Tensor` is
+  `DeviceTensor<B>`. Mark plain data (dimensions, epsilons, configs) with `#[module(config)]`.
+- Field names are the parameter names, because the macro generates `Module<B>`. Mirror the module
+  tree of the source framework. Use `#[module(rename = "A_log")]` only for names that do not follow Rust's
+  snake_case field naming.
+- Call a sublayer field as a method: `self.up_proj(x)`. When its `forward` takes several arguments,
+  pass a tuple: `self.self_attn((x, cache, positions))`. The call runs inside the profiler scope of
+  the sublayer. Run `Vec` elements and enum variants with `layer.call(args)` (`module::Layer`).
+- Call functionals with tensors only (`functional::gelu(&x)`). The tensors carry the backend.
+- Build layers only through `load` functions and `nn::LayerLoader`, including in tests
+  (`gpt_rs_backend_tests::load_layer`).
+- Use `DeviceTensorOps` for math (`x.add(&y)?`, ...) and `nn::Linear` for projections (PyTorch
+  `[out_features, in_features]` weights).
 - Avoid host materialization in forward paths (no `.to_host()?` inside layers).
-- Implement `Module<B>` so parameters can be bound to stable ids (`params::bind_namespace`).
 
 ## Write a functional (portable kernel)
 
@@ -54,12 +98,16 @@ Goal: a backend-agnostic op that validates inputs and captures PTIR.
 
 Pattern (see `crates/gpt-rs/src/ops/functional/*`):
 
-1. Validate with shared helpers in `ops/functional/common.rs`:
-   - dtype/rank/shape/backend checks (`ensure_same_dtype`, `ensure_rank`, ...)
-2. Capture with `capture_ptir!` and return a `DeviceTensor<B>` via `CaptureIntoDeviceTensor`.
-3. Annotate the public entry point:
-   - `#[support_runtime_overload]` so the runtime can swap/benchmark implementations.
-   - `#[ptir_pattern(...)]` if you want backends to match this lowering as a pattern.
+1. Declare it with `#[functional]`. `Tensor` is `DeviceTensor<B>`, and the functional takes no
+   backend argument.
+2. Validate with the validation macros (`ensure_rank!`, `ensure_dtype!`, `ensure_same_shape!`, ...).
+   For other checks, use `ensure!` with a message that starts with `{FUNCTIONAL}: `.
+3. Capture with `capture!(|x, y| body)`. The body returns the PTIR tensor (or a tuple), and
+   `capture!` returns the lazy `DeviceTensor`(s). Name the session (`capture!(session, |x| ...)`)
+   when the body needs constants or `session.export(value)`. `export` keeps a value that has no
+   reader, like an updated cache.
+4. Name each op that a backend rewrite needs with `let`. These ops become fields of the generated
+   pattern view.
 
 Testing expectations:
 
@@ -67,21 +115,13 @@ Testing expectations:
 - Add numerical parity under `crates/gpt-rs-backend-tests/src/torch_parity/` when changing math.
   (See [docs/testing.md](testing.md).)
 
-## Override a functional (custom kernel without touching model code)
+## Speed up a functional (custom kernel without touching model code)
 
-There are two routes:
-
-1. Backend-side rewrite (recommended for "fused kernel" work):
-   - Add optimizer passes in your backend crate via `PortableBackend::pipeline()`.
-   - Match portable lowerings using `#[ptir_pattern]`-generated views (example: C backend conv2d pass in
-     `crates/gpt-rs-backend-c/src/optimizer/conv2d.rs` uses `ops::functional::conv::Conv2dPattern`).
-   - Replace the matched subgraph with a `CustomCall` or a different PTIR sequence.
-
-2. Runtime functional registry (useful for algorithmic variants):
-   - `#[support_runtime_overload]` functionals are dispatched through `FunctionalRegistry<B>`.
-   - `ModelConfig.runtime.functional_overrides` can force or benchmark per-op policies.
-   - Override syntax lives in `crates/gpt-rs/src/ops/functional/registry.rs`:
-     - `"force=<impl_name>"` or `"benchmark(cache=<N>)"`.
+- Add optimizer passes in your backend crate via `PortableBackend::pipeline()`.
+- Match portable lowerings with the pattern views that `#[functional]` generates. For example, the C
+  backend conv2d pass in `crates/gpt-rs-backend-c/src/optimizer/conv2d.rs` uses
+  `ops::functional::conv::Conv2dPattern`.
+- Replace the matched subgraph with a `CustomCall` or a different PTIR sequence.
 
 ## Implement a new backend
 

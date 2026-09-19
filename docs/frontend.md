@@ -4,7 +4,7 @@ The gpt.rs "frontend" is the portion of the stack that *defines computation* wit
 particular kernel implementation:
 
 - **Models** (`gpt_rs::model::*`) compose layers into end-to-end networks.
-- **Layers** (`gpt_rs::nn::layers::*`) own parameters and control flow and expose ergonomic `forward` helpers.
+- **Layers** (`gpt_rs::nn::layers::*`) own parameters and control flow in their `forward` (`nn::module`).
 - **Functionals** (`gpt_rs::ops::functional::*`) implement portable math that captures PTIR graphs.
 - **Backends** (`gpt_rs::backend::spec::PortableBackend`) execute PTIR programs.
 
@@ -20,52 +20,56 @@ exposes optional "capabilities" like `CausalLanguageModel` (generation) or visio
 
 ## Layers
 
-Layers live in `crates/gpt-rs/src/nn/layers/` and typically contain:
+Layers live in `crates/gpt-rs/src/nn/layers/` and are declared with `#[nn::module]` (see
+[howto.md](howto.md#write-a-layer)). A layer is a struct and an impl. The struct holds sublayers,
+parameter tensors (`DeviceTensor<B>`) and plain configuration. The impl holds the layer's `forward`,
+which does lightweight validation and orchestration. The macro makes the layer generic over the
+backend `B: PortableBackend` and implements two traits:
 
-- `Arc<B>` for some backend `B: PortableBackend`
-- parameter tensors (`DeviceTensor<B>`) and buffers
-- lightweight validation + orchestration logic
+- `Module` (`crates/gpt-rs/src/module.rs`) enumerates and updates parameters by stable name.
+  Checkpoint tooling builds on it.
+- `Layer`, whose `call` runs `forward` inside the profiler's layer scope, named after the type. A
+  parent calls a sublayer field as a method of the same name.
 
-Layers also implement the small `Module` trait (`crates/gpt-rs/src/module.rs`) so parameters can be
-enumerated/updated by stable name (this is what checkpoint tooling and future training utilities build on).
-
-Automatic differentiation is not implemented yet; some layers expose `*_with_state` helpers that return
-the minimal forward state that a future derivative pass would need.
+Layers hold no backend handle, and functionals take none. The tensors carry the backend.
 
 ## Functionals (portable kernels)
 
-Functionals live in `crates/gpt-rs/src/ops/functional/`. They follow a consistent pattern:
+Functionals live in `crates/gpt-rs/src/ops/functional/`, each declared with `#[functional]`:
 
-- validate inputs (dtype/shape/backend invariants)
-- capture PTIR graphs via `capture_ptir!` / `PtirSession`
-- return `DeviceTensor<B>` results (often lazily executed by the backend)
+```rust
+#[functional]
+pub fn gelu(x: &Tensor) -> Result<Tensor> {
+    ensure_rank_at_least!(x, 1);
+    capture!(|x| {
+        let half = 0.5f32 * x;
+        let erf = ptir::erf(x / ptir::sqrt(2.0f32));
+        half * (1.0f32 + erf)
+    })
+}
+```
 
-Most public functionals are annotated with `#[support_runtime_overload]`, which wires them into the runtime
-registry/override system.
+- The validation macros (`ensure_rank!`, `ensure_dtype!`, `ensure_same_shape!`, ...) check the inputs.
+  Their errors name the functional and the argument, for example `gelu: x must have rank >= 1, got []`.
+- `capture!` records the PTIR of the body into the lazy graph of the operands and returns lazy
+  `DeviceTensor<B>`s.
+- The attribute adds the backend generic `B`. Tensors carry the backend, so callers write
+  `functional::gelu(&x)`. The attribute also generates the pattern view `GeluPattern`, which backends
+  rewrite to faster kernels.
+
+The macros are documented on their definitions (`crates/gpt-rs-macros/src/lib.rs`,
+`crates/gpt-rs/src/ops/functional/validate.rs`).
 
 ### `DeviceTensorOps`
 
 `DeviceTensorOps` is an extension trait implemented for `DeviceTensor<B>`. It provides method syntax like
-`a.matmul(&b)?` while still routing through the functional implementations (so layers stay backend-agnostic).
+`a.matmul(&b)?` over the functionals, so layers stay backend-agnostic.
 
-## Runtime overrides (swapping implementations)
+### Faster implementations
 
-A `FunctionalRegistry<B>` selects an implementation per functional family (portable reference by default).
-
-There are two supported override routes:
-
-1. **From checkpoint config**: `ModelConfig.runtime.functional_overrides` can request specific implementations
-   by name; `runtime::load_model` installs a registry configured by those overrides.
-2. **Programmatic**: callers can build a registry and install it for a scope:
-
-```rust
-let registry = std::sync::Arc::new(gpt_rs::ops::functional::FunctionalRegistry::<B>::default());
-let _guard = gpt_rs::ops::functional::runtime::push_registry(registry);
-// run model forward here
-```
-
-If you are adding a new overrideable functional family, keep the contract strict: validate shape/dtype in the
-portable path, and ensure custom implementations only use backend primitives (so correctness tooling still applies).
+A functional has one implementation: its portable PTIR. Backends make it fast by rewriting the captured
+ops. For example, a backend can lower `Conv2dPattern` to its own convolution kernel. See
+[backend_optimizer.md](backend_optimizer.md).
 
 ## Backends
 

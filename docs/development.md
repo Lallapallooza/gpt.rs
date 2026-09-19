@@ -15,6 +15,9 @@ C backend only:
 - `GPTRS_C_CACHE_DIR=/path`: override the on-disk cache directory used by the C backend.
 - `GPTRS_C_CACHE_DEBUG=1`: enables extra cache/debug logging in the C backend.
 - `GPTRS_PROFILE_BACKEND=1`: enables C backend profiling counters (requires building with C backend support).
+- `OMP_NUM_THREADS=N`: OpenMP team size for generated modules (default: one thread per physical core
+  that the process can use).
+- `CC`: C compiler used for generated modules (default `cc`).
 
 Torch parity harness:
 

@@ -9,51 +9,40 @@ design docs; it just tells you "where to look".
 - `crates/gpt-rs/src/ops/ptir/`: PTIR DSL (typed builder API).
 - `crates/gpt-rs/src/ops/graph/`: graph arena + plan cache + optimizer hooks.
 - `crates/gpt-rs/src/backend/`: PTIR spec + backend hook points.
-- `crates/gpt-rs/src/nn/layers/`: layers built from functionals.
-- `crates/gpt-rs/src/model/`: model assemblies (GPT, ResNet, MobileNetV2).
+- `crates/gpt-rs/src/nn/layers/`: layers built from functionals. Each layer is declared with
+  `#[nn::module]` (`crates/gpt-rs-macros/src/nn_module.rs`) and built by `nn::LayerLoader`
+  (`nn/loader.rs`). The `Module` and `Layer` traits live in `crates/gpt-rs/src/module.rs`.
+- `crates/gpt-rs/src/model/`: model configs and assemblies. `registry.rs` maps each checkpoint
+  `kind` to its builder.
+- `crates/gpt-rs/src/inference/`: the shared causal decoder (`decoder.rs`), KV caches, generation
+  and sampling.
 - `crates/gpt-rs/src/runtime/`: checkpoint loading + model capability adapters.
 
 ## Core data flow (portable op)
 
 ```
-DeviceTensorOps method           support_runtime_overload wrapper
-         |                                   |
-         v                                   v
-  capture_ptir! helper (common.rs) --> GraphArena::capture --> PtirSession graph nodes
-         |                                   |
-         v                                   v
-CaptureIntoDeviceTensor -------> DeviceTensor::from_lazy (spec inferred from arena)
+functional::foo(&x) / x.add(&y)       (#[functional], DeviceTensorOps)
+         |
+         v
+  validation macros (ensure_rank!, ensure_dtype!, ...)
+         |
+         v
+  capture!(|x| ...) --> GraphArena::capture --> PtirSession graph nodes
+         |
+         v
+  lazy DeviceTensor(s) (DeviceTensor::from_lazy, spec inferred from the arena)
 ```
 In practice:
-- layers use `DeviceTensorOps` for ergonomic math
+- layers call functionals and use `DeviceTensorOps` for elementwise math
 - functionals validate and capture PTIR
 - the graph arena caches plans and runs the optimizer passes before backend execution
 
 ## Functional layer notes
 
-Most contributors touch:
-- `crates/gpt-rs/src/ops/functional/common.rs`: validation helpers + `DeviceTensorOps`
-- `crates/gpt-rs/src/ops/functional/registry.rs`: runtime dispatch and overrides
-- `crates/gpt-rs/src/ops/functional/runtime.rs`: thread-local registry stack
-
-## Runtime Dispatch Sketch
-```
-call functional::foo(...) --> support_runtime_overload --> runtime::with_registry
-                                     |                                |
-                                     v                                v
-                        registry::FunctionalRegistry ----> selected implementation
-```
-- Registries select implementations based on `FunctionalOverrides` and per-op support predicates.
-
-## Capture Macro Guide
-- Prefer `capture_ptir!({ bindings }, |session| { expression })` to build portable graphs; the macro performs
-  all imports upfront, instantiates a `PtirSession`, and returns whichever value the closure produced alongside
-  the active `GraphArena`. User code can destructure directly with `let (graph, value) = capture_ptir!(...) ?;`.
-- Each functional follows a `validate_*`/`capture_*` pattern: validation helpers reuse `common.rs`
-  utilities to check dtype/rank/shape/backend and derive metadata (axes, gather specs, cache lengths),
-  while capture helpers focus purely on PTIR emission. Public entry points chain validation then
-  capture to keep responsibilities separate.
-- Multi-output captures (e.g., `layer_norm`) can return tuples from the closure and destructure with
-  `let (graph, (a, b, c)) = capture_ptir!(...) ?;`, avoiding separate macro variants.
-- Supply `graph = existing_graph;` when reusing a preallocated arena (e.g., embedding lookups that stitch
-  into an existing capture); otherwise the macro resolves or allocates a graph from the tensors.
+- `#[functional]` and `capture!` are documented on their definitions in
+  `crates/gpt-rs-macros/src/lib.rs`. The validation macros are documented in
+  `crates/gpt-rs/src/ops/functional/validate.rs`.
+- Each `#[functional]` also generates a pattern view, for example `GeluPattern` for `gelu` with the
+  target `gpt_rs.gelu`. Backends match these views with `OpRewritePattern<View>` and rewrite them to
+  faster kernels. See [backend_optimizer.md](backend_optimizer.md). `gpt-rs-cli patterns` lists the
+  views.

@@ -10,7 +10,7 @@ At a glance:
 - **Backends** (`gpt_rs::backend::spec::PortableBackend`) execute PTIR programs (faer, ref-cpu, ...).
 - **Runtime** (`gpt_rs::runtime::load_model`) loads a self-describing checkpoint into a dynamic model handle.
 
-For the layering model and runtime functional overrides, see [frontend.md](frontend.md).
+For the layering model, see [frontend.md](frontend.md).
 
 ## Project layout
 
@@ -30,7 +30,7 @@ Core modules (inside `crates/gpt-rs/src/`):
 - `backend`: PTIR backend contract + hook points (profiling/debug wrappers).
 - `nn`: parameterized layers composed from functionals.
 - `model`: concrete model assemblies (and any model-specific helpers).
-- `runtime`: model loading, model capability adapters (causal LM), and functional override plumbing.
+- `runtime`: model loading and model capability adapters (causal LM).
 - `inference`: sampling + incremental generation (`Generator`).
 - `tokenizer`: encode/decode and tokenizer config.
 

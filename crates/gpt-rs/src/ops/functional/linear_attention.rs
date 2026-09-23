@@ -275,12 +275,43 @@ fn batched_matmul<'ctx, 'gb, B: PortableBackend + 'static>(
     )
 }
 
+/// `[l, l]` mask of the lower-left `b x b` block inside each `2b x 2b` diagonal block.
+///
+/// Built at a size that `2b` divides, as `eye(m) (x) [[0, 0], [1, 0]] (x) ones(b, b)`, then cut to
+/// `l`. The leading block of a product of lower-triangular matrices is the product of their leading
+/// blocks, so the doubling with the cut mask is also exact when `l` is not a power of two.
+fn off_diagonal_block_mask<'ctx, 'gb, B: PortableBackend + 'static>(
+    tril: &impl Fn(usize, i64, f32, f32) -> ptir::Tensor<'ctx, 'gb, B>,
+    l: usize,
+    b: usize,
+) -> ptir::Tensor<'ctx, 'gb, B> {
+    let m = l.div_ceil(2 * b);
+    let n = 2 * b * m;
+    let lower = tril(m, 0, 1.0, 0.0);
+    let eye = lower * lower.transpose(vec![1, 0]);
+    let plane = vec![m, 2, b, m, 2, b];
+    let blocks = eye
+        .reshape(vec![m, 1, 1, m, 1, 1])
+        .broadcast_to(plane.clone());
+    let lower_left = tril(2, -1, 1.0, 0.0)
+        .reshape(vec![1, 2, 1, 1, 2, 1])
+        .broadcast_to(plane);
+    (blocks * lower_left)
+        .reshape(vec![n, n])
+        .slice(vec![0, 0], vec![l, l])
+}
+
 /// Chunked (WY-form) gated delta rule built from core PTIR ops.
 ///
 /// Take a chunk of length `L` with cumulative log-decays `G`. The intra-chunk system is
 /// `(I + A) X = B`, with the strictly lower-triangular `A_ij = beta_i (k_i . k_j) exp(G_i - G_j)`.
-/// The function solves it with `(I + A)^-1 = prod_m (I + (-A)^(2^m))`. This is exact because `A`
-/// is nilpotent. Returns the outputs as `[Hv, T, Dv]` and the final state.
+/// The function inverts `I + A` by doubling the block size: if `P` inverts the `b x b` diagonal
+/// blocks, `P - P (A * M_b) P` inverts the `2b x 2b` ones, where `M_b` is
+/// [`off_diagonal_block_mask`]. The diagonal blocks of every `P` equal those of the true inverse,
+/// and its other entries are zero, so `P` never holds entries larger than the inverse's. Powers of
+/// `A` would grow: when keys repeat, their entries reach binomial coefficients that cancel, and
+/// f32 loses most of the precision.
+/// Returns the outputs as `[Hv, T, Dv]` and the final state.
 fn gated_delta_rule_chunked<'ctx, 'gb, B: PortableBackend + 'static>(
     tril: impl Fn(usize, i64, f32, f32) -> ptir::Tensor<'ctx, 'gb, B>,
     plan: DeltaRulePlan,
@@ -347,17 +378,20 @@ fn gated_delta_rule_chunked<'ctx, 'gb, B: PortableBackend + 'static>(
         let beta_col = bc.reshape(vec![hv, l, 1]);
         let kk = batched_matmul(&kc, &kc, 2, 2);
         let a = kk * decay * beta_col.broadcast_to(vec![hv, l, l]) * strict;
-        let neg_a = a * -1.0f32;
         let eye = (lower * upper)
             .reshape(vec![1, l, l])
             .broadcast_to(vec![hv, l, l]);
-        let mut inv = eye + neg_a;
-        let mut power = neg_a;
-        let mut covered = 2usize;
-        while covered < l {
-            power = batched_matmul(&power, &power, 2, 1);
-            inv = batched_matmul(&inv, &(eye + power), 2, 1);
-            covered *= 2;
+        let off_diagonal_block = |b: usize| {
+            off_diagonal_block_mask(&tril, l, b)
+                .reshape(vec![1, l, l])
+                .broadcast_to(vec![hv, l, l])
+        };
+        let mut inv = eye - a * off_diagonal_block(1);
+        let mut block = 2usize;
+        while block < l {
+            let coupling = a * off_diagonal_block(block);
+            inv = inv - batched_matmul(&batched_matmul(&inv, &coupling, 2, 1), &inv, 2, 1);
+            block *= 2;
         }
 
         let exp_cum = cum.exp().reshape(vec![hv, l, 1]);

@@ -107,6 +107,18 @@ impl DeltaRuleInputs {
         self
     }
 
+    /// Keys repeat every `period` tokens, as in a repeated prompt. With slow decay, the powers of
+    /// the strictly lower intra-chunk matrix `A` then reach large entries that cancel in the
+    /// inverse of `I + A`.
+    fn with_repeated_keys(mut self, period: usize) -> Self {
+        let row = self.key_heads * self.key_dim;
+        for t in period..self.seq {
+            self.k
+                .copy_within((t - period) * row..(t - period + 1) * row, t * row);
+        }
+        self
+    }
+
     fn random(
         seq: usize,
         key_heads: usize,
@@ -264,5 +276,16 @@ pub fn gated_delta_rule_slow_decay_two_chunks_matches_torch<B: PortableBackend +
     run_delta_rule_case(
         backend,
         DeltaRuleInputs::random(128, 1, 2, 16, 5, false, 0x1122).with_slow_decay(0x1123),
+    );
+}
+
+pub fn gated_delta_rule_repeated_keys_matches_torch<B: PortableBackend + 'static>(
+    backend: &Arc<B>,
+) {
+    run_delta_rule_case(
+        backend,
+        DeltaRuleInputs::random(64, 1, 2, 16, 5, true, 0x1124)
+            .with_slow_decay(0x1125)
+            .with_repeated_keys(2),
     );
 }

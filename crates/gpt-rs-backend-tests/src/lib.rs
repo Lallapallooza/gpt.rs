@@ -325,6 +325,7 @@ macro_rules! define_backend_tests {
             parity_test!(torch_gated_delta_rule_prefill_with_state_matches_torch, linear_attention::gated_delta_rule_prefill_with_state_matches_torch);
             parity_test!(torch_gated_delta_rule_multi_chunk_matches_torch, linear_attention::gated_delta_rule_multi_chunk_matches_torch);
             parity_test!(torch_gated_delta_rule_slow_decay_two_chunks_matches_torch, linear_attention::gated_delta_rule_slow_decay_two_chunks_matches_torch);
+            parity_test!(torch_gated_delta_rule_repeated_keys_matches_torch, linear_attention::gated_delta_rule_repeated_keys_matches_torch);
             parity_test!(torch_attention_kv_cache_prefill_matches_torch, attention::attention_kv_cache_prefill_matches_torch);
             parity_test!(torch_attention_kv_cache_multi_query_full_prefill_matches_torch, attention::attention_kv_cache_multi_query_full_prefill_matches_torch);
             parity_test!(torch_attention_kv_cache_decode_step_matches_torch, attention::attention_kv_cache_decode_step_matches_torch);

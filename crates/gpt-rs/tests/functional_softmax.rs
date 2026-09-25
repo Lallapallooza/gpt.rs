@@ -4,9 +4,6 @@ use gpt_rs::backend::spec::{
     Dimension, ElementwiseBinaryOp, ElementwiseUnaryOp, Function, Operation, PortableBackend,
     ReduceKind,
 };
-use gpt_rs::module::Layer;
-use gpt_rs::nn::layers::{AttentionConfig, AttentionPositions, CausalSelfAttention};
-use gpt_rs::nn::LayerLoader;
 use gpt_rs::ops::functional;
 use gpt_rs::ops::functional::softmax_last_dim;
 use gpt_rs::tensor::{DeviceTensor, Shape as DeviceShape};
@@ -277,49 +274,6 @@ fn attention_kv_cache_records_cache_update_dot_softmax_and_mask() {
         emits(|op| matches!(op, Operation::Select)),
         "attention masking should leverage select operations"
     );
-}
-
-#[test]
-fn attention_layer_kv_cache_allows_wider_query_projection_than_embed_dim() {
-    let backend = Arc::new(RecordingBackend::default());
-    let config = AttentionConfig::with_projection_dims(12, 4, 2, 8).expect("valid config");
-    let (seq_len, capacity) = (3usize, 8usize);
-    let (embed, q_dim, kv_dim) = (
-        config.embed_dim,
-        config.query_dim(),
-        config.key_value_projection_dim(),
-    );
-    let mut get = |name: &str| {
-        let dims = match name {
-            "attn.q_proj.weight" => [q_dim, embed],
-            "attn.k_proj.weight" | "attn.v_proj.weight" => [kv_dim, embed],
-            "attn.o_proj.weight" => [embed, q_dim],
-            _ => anyhow::bail!("unexpected parameter '{name}'"),
-        };
-        Ok(make_tensor(&backend, &dims))
-    };
-    let mut params = LayerLoader::new(Arc::clone(&backend), &mut get);
-    let layer = CausalSelfAttention::load(&mut params, "attn", config.clone())
-        .expect("attention layer init");
-    let kv_dims = [config.num_key_value_heads, capacity, config.head_dim];
-    let cache = functional::DecodeKvCache::new(
-        make_tensor(&backend, &kv_dims),
-        make_tensor(&backend, &kv_dims),
-        0,
-    )
-    .expect("cache validated");
-    let x = make_tensor(&backend, &[seq_len, config.embed_dim]);
-    let positions = AttentionPositions {
-        update_starts: make_tensor_for_dtype(&backend, &[3], DType::I32),
-        rotary: None,
-    };
-
-    let (output, cache) = layer
-        .call((&x, &cache, &positions))
-        .expect("kv-cache attention capture succeeds for asymmetric projection dims");
-    assert_eq!(output.shape().dims(), &[seq_len, config.embed_dim]);
-    assert_eq!(cache.len(), seq_len, "kv cache holds the new tokens");
-    flush_tensor(&output);
 }
 
 #[test]

@@ -212,7 +212,6 @@ Notes:
 ```bash
 cargo test  # workspace unit + integration tests (no Torch)
 
-cargo test -p gpt-rs-backend-faer --test backend_suite  # backend smoke tests
 cargo test -p gpt-rs-backend-faer --features torch --test backend_suite -- --nocapture  # Torch parity + timings (libtorch via tch)
 cargo test -p gpt-rs --features torch --test torch_parity  # smaller parity set (ref-cpu backend)
 ```

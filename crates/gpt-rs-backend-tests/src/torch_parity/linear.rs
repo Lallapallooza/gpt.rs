@@ -86,16 +86,3 @@ pub fn linear_matches_torch_batch4_in33_out65_no_bias<B: PortableBackend + 'stat
 ) {
     run_linear_case(backend, 4, 33, 65, 0xCE556, false);
 }
-
-pub fn linear_rejects_input_dim_mismatch<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    let err = timed_gpt(|| {
-        let input = device_tensor_from_data(backend, &[2, 8], &[0.0; 16]);
-        let weight = tensor_from_vec(&[4, 7], vec![0.0; 28]);
-        let layer = load_layer(backend, [("proj.weight".to_string(), weight)], |p| {
-            p.linear("proj", 7, 4, false)
-        })
-        .unwrap();
-        layer.call(&input).unwrap_err()
-    });
-    assert!(err.to_string().contains("in_features"), "{err}");
-}

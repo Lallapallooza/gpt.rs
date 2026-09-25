@@ -48,7 +48,6 @@ The shared backend test harness is the crate:
 
 It contains:
 
-- `src/smoke.rs`: quick sanity tests (shapes, basic execution, etc.)
 - `src/torch_parity/`: numerical parity tests against Torch (via `tch`)
 - `src/lib.rs`: the `define_backend_tests!` macro that wires everything together
 
@@ -94,17 +93,9 @@ pub fn some_op_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
 
 ### How to run them
 
-By default, backend suites run **smoke tests only**. Torch parity tests are
-behind the `torch` feature (to avoid pulling `tch`/libtorch into every
-`cargo test`).
-
-Smoke tests (no Torch):
-
-```bash
-cargo test -p gpt-rs-backend-faer --test backend_suite
-```
-
-Torch parity (smoke + parity):
+Backend suites hold Torch parity tests only. The `torch` feature gates them,
+so a plain `cargo test` does not build `tch` or libtorch. Without the feature,
+a backend suite runs 0 tests.
 
 ```bash
 cargo test -p gpt-rs-backend-faer --features torch --test backend_suite

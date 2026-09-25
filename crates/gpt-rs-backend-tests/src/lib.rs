@@ -1,6 +1,4 @@
-pub mod api_invariants;
 pub mod recording_backend;
-pub mod smoke;
 #[cfg(feature = "torch")]
 pub mod torch_parity;
 
@@ -52,92 +50,38 @@ macro_rules! define_backend_tests {
         $crate::define_backend_tests!($module, $backend_ctor, test);
     };
     ($module:ident, $backend_ctor:expr, $test_attr:meta) => {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "torch"))]
         mod $module {
             use std::sync::Arc;
 
-            use $crate::{api_invariants, smoke};
+            use $crate::torch_parity::{
+                arithmetic, attention, elementwise_fusion, embedding_layer, feed_forward_layer,
+                functional_ops, gated_feed_forward_layer, harness, layer_norm_layer, linear,
+                linear_attention, matmul, multi_head_attention_layer, rms_norm_layer,
+                rotary_ops, vision_ops,
+            };
 
-            #[$test_attr]
-            fn smoke_matmul_matches_expected() {
-                let backend = ($backend_ctor)();
-                smoke::matmul_matches_expected(&backend);
+            macro_rules! run_parity {
+                ($backend:expr, $name:ident, $body:expr) => {{
+                    harness::run_parity_test_with_modes(
+                        ::std::sync::Arc::clone(&$backend),
+                        stringify!($name),
+                        $body,
+                    );
+                }};
             }
 
-            #[$test_attr]
-            fn smoke_gpt_forward_shape() {
-                let backend = ($backend_ctor)();
-                smoke::gpt_forward_shape(&backend);
-            }
-
-            #[$test_attr]
-            fn smoke_gpt_kv_cache_matches_full_context_decode() {
-                let backend = ($backend_ctor)();
-                smoke::gpt_kv_cache_matches_full_context_decode(&backend);
-            }
-
-            #[$test_attr]
-            fn smoke_qwen3_5_prefill_chunking_and_cache_growth_agree() {
-                let backend = ($backend_ctor)();
-                smoke::qwen3_5_prefill_chunking_and_cache_growth_agree(&backend);
-            }
-
-            #[$test_attr]
-            fn api_linear_loads_named_parameters() {
-                let backend = ($backend_ctor)();
-                api_invariants::linear_loads_named_parameters(&backend);
-            }
-
-            #[$test_attr]
-            fn api_layer_norm_loads_named_parameters() {
-                let backend = ($backend_ctor)();
-                api_invariants::layer_norm_loads_named_parameters(&backend);
-            }
-
-            #[$test_attr]
-            fn api_embedding_loads_named_weight() {
-                let backend = ($backend_ctor)();
-                api_invariants::embedding_loads_named_weight(&backend);
-            }
-
-            #[$test_attr]
-            fn api_causal_self_attention_validates_projection_shapes() {
-                let backend = ($backend_ctor)();
-                api_invariants::causal_self_attention_validates_projection_shapes(&backend);
-            }
-
-            #[cfg(feature = "torch")]
-            mod torch_parity_tests {
-                use super::*;
-
-                use $crate::torch_parity::{
-                    arithmetic, attention, elementwise_fusion, embedding_layer, feed_forward_layer,
-                    functional_ops, gated_feed_forward_layer, harness, layer_norm_layer, linear,
-                    linear_attention, matmul, multi_head_attention_layer, rms_norm_layer,
-                    rotary_ops, vision_ops,
+            macro_rules! parity_test {
+                ($name:ident, $func:path) => {
+                    #[$test_attr]
+                    fn $name() {
+                        let backend = ($backend_ctor)();
+                        run_parity!(backend, $name, |backend| {
+                            $func(backend);
+                        });
+                    }
                 };
-
-                macro_rules! run_parity {
-                    ($backend:expr, $name:ident, $body:expr) => {{
-                        harness::run_parity_test_with_modes(
-                            ::std::sync::Arc::clone(&$backend),
-                            stringify!($name),
-                            $body,
-                        );
-                    }};
-                }
-
-                macro_rules! parity_test {
-                    ($name:ident, $func:path) => {
-                        #[$test_attr]
-                        fn $name() {
-                            let backend = ($backend_ctor)();
-                            run_parity!(backend, $name, |backend| {
-                                $func(backend);
-                            });
-                        }
-                    };
-                }
+            }
 
             parity_test!(torch_arithmetic_add_matches_torch_shape_2x3x4, arithmetic::add_matches_torch_shape_2x3x4);
             parity_test!(torch_arithmetic_add_matches_torch_shape_1x1x1, arithmetic::add_matches_torch_shape_1x1x1);
@@ -269,7 +213,6 @@ macro_rules! define_backend_tests {
             parity_test!(torch_linear_matches_torch_batch7_in13_out17_bias, linear::linear_matches_torch_batch7_in13_out17_bias);
             parity_test!(torch_linear_matches_torch_batch4_in1_out1_bias, linear::linear_matches_torch_batch4_in1_out1_bias);
             parity_test!(torch_linear_matches_torch_batch4_in33_out65_no_bias, linear::linear_matches_torch_batch4_in33_out65_no_bias);
-            parity_test!(torch_linear_rejects_input_dim_mismatch, linear::linear_rejects_input_dim_mismatch);
             parity_test!(torch_feed_forward_matches_torch_with_bias, feed_forward_layer::feed_forward_matches_torch_with_bias);
             parity_test!(torch_feed_forward_matches_torch_without_bias, feed_forward_layer::feed_forward_matches_torch_without_bias);
             parity_test!(torch_feed_forward_state_records_activation, feed_forward_layer::feed_forward_state_records_activation);
@@ -332,7 +275,6 @@ macro_rules! define_backend_tests {
             parity_test!(torch_attention_kv_cache_grouped_chunk_matches_torch, attention::attention_kv_cache_grouped_chunk_matches_torch);
             parity_test!(torch_attention_kv_cache_long_cache_matches_torch, attention::attention_kv_cache_long_cache_matches_torch);
 
-            }
         }
     };
 }

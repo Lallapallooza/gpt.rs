@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, List, Literal, Tuple
+from typing import Any, Literal
 
 Workload = Literal["validate", "bench", "run", "all"]
 OutputFormat = Literal["table", "json", "csv"]
@@ -19,27 +18,27 @@ class RunConfig:
     warmup: int = 1
     iters: int = 3
     threads: int = 1
-    params: Dict[str, Any] = field(default_factory=dict)
+    params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class ValidationResult:
     model: str
     ok: bool
-    torch_shape: Tuple[int, ...]
-    gptrs_shape: Tuple[int, ...]
+    torch_shape: tuple[int, ...]
+    gptrs_shape: tuple[int, ...]
     max_abs_diff: float
     mean_abs_diff: float
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class BenchStats:
     impl: str
-    times_s: List[float]
+    times_s: list[float]
     mean_s: float
     units_per_s: float
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -50,7 +49,7 @@ class BenchResult:
     units_per_iter: float
     gptrs: BenchStats
     torch: BenchStats
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -59,17 +58,10 @@ class CliRunResult:
     impl: str
     exit_code: int
     wall_s: float
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
-def as_path(value: Any, fallback: Path) -> Path:
-    """A case default as a Path, or `fallback` when it is None."""
-    if value is None:
-        return fallback
-    return value if isinstance(value, Path) else Path(str(value))
-
-
-def encode_prompt(tokenizer: Any, text: str, max_prompt_tokens: int) -> List[int]:
+def encode_prompt(tokenizer: Any, text: str, max_prompt_tokens: int) -> list[int]:
     """Encodes `text` without special tokens and keeps the last `max_prompt_tokens` ids.
 
     0 keeps all of them.

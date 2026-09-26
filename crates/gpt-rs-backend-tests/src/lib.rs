@@ -4,27 +4,27 @@ pub mod torch_parity;
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use gpt_rs::backend::spec::PortableBackend;
-use gpt_rs::nn::LayerLoader;
+use gpt_rs::nn::Params;
 use gpt_rs::tensor::{DType, DeviceTensor, Shape, Tensor};
 
-/// Builds a layer with `build`, passing it a [`LayerLoader`] over the host `tensors`, which are
-/// keyed by parameter path.
+/// Builds a layer with `build`, passing it [`Params`] over the host `tensors`, which are keyed by
+/// parameter path.
 pub fn load_layer<B: PortableBackend + 'static, L>(
     backend: &Arc<B>,
     tensors: impl IntoIterator<Item = (String, Tensor)>,
-    build: impl FnOnce(&mut LayerLoader<'_, B>) -> Result<L>,
+    build: impl FnOnce(&mut Params<'_, B>) -> Result<L>,
 ) -> Result<L> {
     let tensors: Vec<(String, Tensor)> = tensors.into_iter().collect();
     let mut get = |name: &str| {
-        let (_, tensor) = tensors
+        tensors
             .iter()
             .find(|(candidate, _)| candidate == name)
-            .ok_or_else(|| anyhow!("missing tensor '{name}'"))?;
-        DeviceTensor::from_host(Arc::clone(backend), tensor.clone())
+            .map(|(_, tensor)| DeviceTensor::from_host(Arc::clone(backend), tensor.clone()))
+            .transpose()
     };
-    build(&mut LayerLoader::new(Arc::clone(backend), &mut get))
+    build(&mut Params::new(Arc::clone(backend), &mut get))
 }
 
 /// Host tensor holding `data` rounded to nearest-even in the floating `dtype`.
@@ -55,10 +55,10 @@ macro_rules! define_backend_tests {
             use std::sync::Arc;
 
             use $crate::torch_parity::{
-                arithmetic, attention, elementwise_fusion, embedding_layer, feed_forward_layer,
+                arithmetic, attention, conv1d_layer, elementwise_fusion, embedding_layer,
                 functional_ops, gated_feed_forward_layer, harness, layer_norm_layer, linear,
                 linear_attention, matmul, multi_head_attention_layer, rms_norm_layer,
-                rotary_ops, vision_ops,
+                rotary_ops, vision_layers, vision_ops,
             };
 
             macro_rules! run_parity {
@@ -206,6 +206,10 @@ macro_rules! define_backend_tests {
             parity_test!(torch_vision_depthwise_conv2d_nhwc_k5_s2_p2_n1_h15_w17_c8, vision_ops::depthwise_conv2d_nhwc_k5_s2_p2_n1_h15_w17_c8);
             parity_test!(torch_vision_max_pool2d_nhwc_w2_s2_p0_n1_h8_w8_c3, vision_ops::max_pool2d_nhwc_w2_s2_p0_n1_h8_w8_c3);
             parity_test!(torch_vision_relu6_edge_values_matches_torch, vision_ops::relu6_edge_values_matches_torch);
+            parity_test!(torch_vision_batch_norm2d_matches_torch, vision_layers::batch_norm2d_matches_torch);
+            parity_test!(torch_vision_conv2d_batch_norm_relu_matches_torch, vision_layers::conv2d_batch_norm_relu_matches_torch);
+            parity_test!(torch_vision_conv2d_tf_padding_stride2_matches_torch, vision_layers::conv2d_tf_padding_stride2_matches_torch);
+            parity_test!(torch_vision_conv2d_tf_padding_dilated_matches_torch, vision_layers::conv2d_tf_padding_dilated_matches_torch);
             parity_test!(torch_linear_matches_torch_with_bias, linear::linear_matches_torch_with_bias);
             parity_test!(torch_linear_matches_torch_without_bias, linear::linear_matches_torch_without_bias);
             parity_test!(torch_linear_matches_torch_batch1_in5_out3_bias, linear::linear_matches_torch_batch1_in5_out3_bias);
@@ -213,16 +217,10 @@ macro_rules! define_backend_tests {
             parity_test!(torch_linear_matches_torch_batch7_in13_out17_bias, linear::linear_matches_torch_batch7_in13_out17_bias);
             parity_test!(torch_linear_matches_torch_batch4_in1_out1_bias, linear::linear_matches_torch_batch4_in1_out1_bias);
             parity_test!(torch_linear_matches_torch_batch4_in33_out65_no_bias, linear::linear_matches_torch_batch4_in33_out65_no_bias);
-            parity_test!(torch_feed_forward_matches_torch_with_bias, feed_forward_layer::feed_forward_matches_torch_with_bias);
-            parity_test!(torch_feed_forward_matches_torch_without_bias, feed_forward_layer::feed_forward_matches_torch_without_bias);
-            parity_test!(torch_feed_forward_state_records_activation, feed_forward_layer::feed_forward_state_records_activation);
-            parity_test!(torch_feed_forward_matches_torch_batch1_embed32_hidden128_bias, feed_forward_layer::feed_forward_matches_torch_batch1_embed32_hidden128_bias);
-            parity_test!(torch_feed_forward_matches_torch_batch4_embed64_hidden256_bias, feed_forward_layer::feed_forward_matches_torch_batch4_embed64_hidden256_bias);
-            parity_test!(torch_feed_forward_matches_torch_batch7_embed13_hidden31_no_bias, feed_forward_layer::feed_forward_matches_torch_batch7_embed13_hidden31_no_bias);
-            parity_test!(torch_feed_forward_state_records_activation_batch4_embed32_hidden128, feed_forward_layer::feed_forward_state_records_activation_batch4_embed32_hidden128);
-            parity_test!(torch_feed_forward_state_records_activation_extreme_inputs, feed_forward_layer::feed_forward_state_records_activation_extreme_inputs);
-            parity_test!(torch_feed_forward_gelu_tanh_matches_torch, feed_forward_layer::feed_forward_gelu_tanh_matches_torch);
-            parity_test!(torch_feed_forward_gelu_tanh_activation_extreme_inputs, feed_forward_layer::feed_forward_gelu_tanh_activation_extreme_inputs);
+            parity_test!(torch_conv1d_matches_torch, conv1d_layer::conv1d_matches_torch);
+            parity_test!(torch_conv1d_matches_torch_batch1_in32_out96, conv1d_layer::conv1d_matches_torch_batch1_in32_out96);
+            parity_test!(torch_conv1d_matches_torch_batch7_in13_out17, conv1d_layer::conv1d_matches_torch_batch7_in13_out17);
+            parity_test!(torch_conv1d_matches_torch_square_batch64_in64_out64, conv1d_layer::conv1d_matches_torch_square_batch64_in64_out64);
             parity_test!(torch_gated_feed_forward_matches_torch_with_bias, gated_feed_forward_layer::gated_feed_forward_matches_torch_with_bias);
             parity_test!(torch_gated_feed_forward_matches_torch_without_bias, gated_feed_forward_layer::gated_feed_forward_matches_torch_without_bias);
             parity_test!(torch_gated_feed_forward_matches_torch_batch4_embed64_hidden256_bias, gated_feed_forward_layer::gated_feed_forward_matches_torch_batch4_embed64_hidden256_bias);
@@ -274,7 +272,6 @@ macro_rules! define_backend_tests {
             parity_test!(torch_attention_kv_cache_decode_step_matches_torch, attention::attention_kv_cache_decode_step_matches_torch);
             parity_test!(torch_attention_kv_cache_grouped_chunk_matches_torch, attention::attention_kv_cache_grouped_chunk_matches_torch);
             parity_test!(torch_attention_kv_cache_long_cache_matches_torch, attention::attention_kv_cache_long_cache_matches_torch);
-
         }
     };
 }

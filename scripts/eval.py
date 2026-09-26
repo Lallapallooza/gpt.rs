@@ -15,8 +15,9 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any
 
 
 def _set_thread_env(threads: int) -> None:
@@ -37,7 +38,7 @@ def _json_sanitize(obj: Any) -> Any:
     return obj
 
 
-def _load_suite(path: Path) -> Dict[str, Any]:
+def _load_suite(path: Path) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8")
     if path.suffix.lower() in {".yaml", ".yml"}:
         try:
@@ -52,7 +53,7 @@ def _load_suite(path: Path) -> Dict[str, Any]:
     return data
 
 
-def _bench_child(cfg_dict: Dict[str, Any]) -> int:
+def _bench_child(cfg_dict: dict[str, Any]) -> int:
     from gptrs_eval.core import RunConfig
     from gptrs_eval.registry import get_case
     from gptrs_eval.report import dumps_json
@@ -77,7 +78,7 @@ def _bench_child(cfg_dict: Dict[str, Any]) -> int:
     return 0
 
 
-def _spawn_bench(cfg_dict: Dict[str, Any]) -> Dict[str, Any]:
+def _spawn_bench(cfg_dict: dict[str, Any]) -> dict[str, Any]:
     cmd = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -94,7 +95,7 @@ def _spawn_bench(cfg_dict: Dict[str, Any]) -> Dict[str, Any]:
     return payload[0]
 
 
-def _bench_result_from_dict(d: Dict[str, Any]) -> Any:
+def _bench_result_from_dict(d: dict[str, Any]) -> Any:
     from gptrs_eval.core import BenchResult, BenchStats
 
     return BenchResult(
@@ -197,7 +198,7 @@ def _build_full_parser(model: str) -> argparse.ArgumentParser:
     return parser
 
 
-def _namespace_to_cfg_dict(args: argparse.Namespace) -> Tuple[Dict[str, Any], List[int]]:
+def _namespace_to_cfg_dict(args: argparse.Namespace) -> tuple[dict[str, Any], list[int]]:
     raw = vars(args).copy()
     model = raw.pop("model")
     if not isinstance(model, str) or not model:
@@ -208,7 +209,7 @@ def _namespace_to_cfg_dict(args: argparse.Namespace) -> Tuple[Dict[str, Any], Li
         threads_list = [1]
     threads_list = [int(x) for x in threads_list]
 
-    cfg: Dict[str, Any] = {
+    cfg: dict[str, Any] = {
         "model": model,
         "backend": raw.pop("backend"),
         "torch_device": raw.pop("torch_device"),
@@ -232,7 +233,7 @@ def _namespace_to_cfg_dict(args: argparse.Namespace) -> Tuple[Dict[str, Any], Li
     return cfg, threads_list
 
 
-def _run_case(cfg_dict: Dict[str, Any], threads_list: List[int], workload: str) -> List[Any]:
+def _run_case(cfg_dict: dict[str, Any], threads_list: list[int], workload: str) -> list[Any]:
     from gptrs_eval.core import RunConfig
     from gptrs_eval.registry import get_case
 
@@ -242,13 +243,13 @@ def _run_case(cfg_dict: Dict[str, Any], threads_list: List[int], workload: str) 
     else:
         workloads = [workload]
 
-    results: List[Any] = []
+    results: list[Any] = []
     for w in workloads:
         if w == "bench":
             # Optional token sweep for GPT-style models.
             bench_tokens = cfg_dict.get("params", {}).get("bench_tokens")
             if isinstance(bench_tokens, list):
-                tokens_list: List[Optional[int]] = [int(x) for x in bench_tokens]
+                tokens_list: list[int | None] = [int(x) for x in bench_tokens]
             elif bench_tokens is None:
                 tokens_list = [None]
             else:
@@ -288,11 +289,11 @@ def _run_case(cfg_dict: Dict[str, Any], threads_list: List[int], workload: str) 
     return results
 
 
-def _print_results(results: List[Any], *, fmt: str) -> None:
+def _print_results(results: list[Any], *, fmt: str) -> None:
     from gptrs_eval.core import BenchResult, CliRunResult, ValidationResult
     from gptrs_eval.report import print_bench, print_validation
 
-    bench: List[BenchResult] = []
+    bench: list[BenchResult] = []
     for r in results:
         if isinstance(r, ValidationResult):
             print_validation(r)
@@ -307,7 +308,7 @@ def _print_results(results: List[Any], *, fmt: str) -> None:
         print_bench(bench, fmt=fmt)  # type: ignore[arg-type]
 
 
-def _all_ok(results: List[Any]) -> bool:
+def _all_ok(results: list[Any]) -> bool:
     from gptrs_eval.core import CliRunResult, ValidationResult
 
     ok = True
@@ -319,7 +320,8 @@ def _all_ok(results: List[Any]) -> bool:
     return ok
 
 
-def _run_suite(path: Path, *, fmt: str, json_out: Optional[Path]) -> int:
+def _run_suite(path: Path, *, fmt: str, json_out: Path | None) -> int:
+    from gptrs_eval.registry import get_case_default_params
     from gptrs_eval.report import dumps_json
 
     suite = _load_suite(path)
@@ -328,7 +330,7 @@ def _run_suite(path: Path, *, fmt: str, json_out: Optional[Path]) -> int:
     if not isinstance(runs, list):
         raise SystemExit("suite.runs must be a list")
 
-    results: List[Any] = []
+    results: list[Any] = []
     for run in runs:
         if not isinstance(run, dict):
             raise SystemExit("each suite run must be a mapping")
@@ -339,7 +341,7 @@ def _run_suite(path: Path, *, fmt: str, json_out: Optional[Path]) -> int:
         workload = run.get("workload", "all")
         workloads = workload if isinstance(workload, list) else [workload]
 
-        cfg: Dict[str, Any] = dict(defaults)
+        cfg: dict[str, Any] = dict(defaults)
         cfg.update({k: v for k, v in run.items() if k not in {"params", "workload"}})
         cfg["model"] = model
 
@@ -352,7 +354,8 @@ def _run_suite(path: Path, *, fmt: str, json_out: Optional[Path]) -> int:
         cfg.setdefault("iters", 3)
         cfg.setdefault("threads", [1])
 
-        cfg["params"] = dict(defaults.get("params", {}))
+        cfg["params"] = get_case_default_params(model)
+        cfg["params"].update(defaults.get("params", {}))
         params_override = run.get("params", {})
         if isinstance(params_override, dict):
             cfg["params"].update(params_override)
@@ -383,7 +386,7 @@ def _run_suite(path: Path, *, fmt: str, json_out: Optional[Path]) -> int:
     return 0 if _all_ok(results) else 1
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     pre = argparse.ArgumentParser(add_help=False)
     _add_base_args(pre, include_hidden=True)
     args0, _unknown = pre.parse_known_args(list(argv) if argv is not None else None)

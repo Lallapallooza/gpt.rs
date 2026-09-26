@@ -3,7 +3,7 @@
 //! Computes `down_proj(silu(gate_proj(x)) * up_proj(x))`.
 
 use super::linear::Linear;
-use crate::nn::{self, LayerLoader};
+use crate::nn::{self, Params};
 use crate::ops::functional;
 use anyhow::Result;
 
@@ -17,20 +17,11 @@ pub struct GatedFeedForward {
 
 #[nn::module]
 impl GatedFeedForward {
-    pub fn load(
-        params: &mut LayerLoader<'_, B>,
-        prefix: &str,
-        dim: usize,
-        hidden_dim: usize,
-        bias: bool,
-    ) -> Result<Self> {
-        let mut linear = |name: &str, in_features: usize, out_features: usize| {
-            params.linear(&format!("{prefix}.{name}"), in_features, out_features, bias)
-        };
+    pub fn new(p: &mut Params<B>) -> Result<Self> {
         Ok(Self {
-            gate_proj: linear("gate_proj", dim, hidden_dim)?,
-            up_proj: linear("up_proj", dim, hidden_dim)?,
-            down_proj: linear("down_proj", hidden_dim, dim)?,
+            gate_proj: Linear::new(p)?,
+            up_proj: Linear::new(p)?,
+            down_proj: Linear::new(p)?,
         })
     }
 

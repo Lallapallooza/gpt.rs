@@ -263,22 +263,40 @@ impl PyLoadedModel {
     }
 }
 
-#[pyfunction(signature = (checkpoint, *, backend=None, matmul_input_dtype=None))]
+/// Loads the Hugging Face model directory `checkpoint`. `config_overrides` replaces keys of the
+/// model config (the text config of a multimodal checkpoint).
+#[pyfunction(signature = (checkpoint, *, backend=None, matmul_input_dtype=None, config_overrides=None))]
 pub fn load_model(
+    py: Python<'_>,
     checkpoint: String,
     backend: Option<String>,
     matmul_input_dtype: Option<String>,
+    config_overrides: Option<Bound<'_, PyDict>>,
 ) -> PyResult<PyLoadedModel> {
     if let Some(name) = backend.as_deref() {
         crate::backend::set_backend(name)?;
     }
+    let config_overrides = match config_overrides {
+        Some(overrides) => {
+            let json: String = py
+                .import_bound("json")?
+                .call_method1("dumps", (overrides,))?
+                .extract()?;
+            serde_json::from_str(&json).map_err(|e| PyValueError::new_err(e.to_string()))?
+        }
+        None => serde_json::Map::new(),
+    };
     let options = gpt_rs::runtime::LoadOptions {
         namespace: None,
-        matmul_input_dtype: matmul_input_dtype
-            .as_deref()
-            .map(str::parse::<gpt_rs::DType>)
-            .transpose()
-            .map_err(|e| PyValueError::new_err(format!("{e:#}")))?,
+        runtime: gpt_rs::model::config::ModelRuntimeConfig {
+            matmul_input_dtype: matmul_input_dtype
+                .as_deref()
+                .map(str::parse::<gpt_rs::DType>)
+                .transpose()
+                .map_err(|e| PyValueError::new_err(format!("{e:#}")))?,
+            ..Default::default()
+        },
+        config_overrides,
     };
 
     let erased = crate::backend::create_current_backend()?;

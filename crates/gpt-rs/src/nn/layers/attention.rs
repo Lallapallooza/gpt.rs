@@ -2,7 +2,7 @@ use super::linear::Linear;
 use super::rms_norm::{RmsNorm, RmsNormConfig};
 use super::rotary_embedding::{RopeConfig, RotaryEmbedding};
 use crate::backend::spec::PortableBackend;
-use crate::nn::{self, LayerLoader};
+use crate::nn::{self, Params};
 use crate::ops::functional::{self, DecodeKvCache, DeviceTensorOps};
 use crate::tensor::DeviceTensor;
 use anyhow::{bail, ensure, Result};
@@ -21,7 +21,6 @@ pub struct AttentionConfig {
     pub num_query_heads: usize,
     pub num_key_value_heads: usize,
     pub head_dim: usize,
-    pub bias: bool,
     /// RMSNorm over each query and key head (`q_norm`, `k_norm`), before the rotary embedding.
     pub qk_norm: Option<RmsNormConfig>,
     pub rope: Option<RopeConfig>,
@@ -81,17 +80,10 @@ impl AttentionConfig {
             num_query_heads,
             num_key_value_heads,
             head_dim,
-            bias: false,
             qk_norm: None,
             rope: None,
             output_gate: false,
         })
-    }
-
-    /// Sets whether the projections have biases.
-    pub fn with_bias(mut self, bias: bool) -> Self {
-        self.bias = bias;
-        self
     }
 
     /// Normalises each query and key head (see [`Self::qk_norm`]).
@@ -137,6 +129,15 @@ impl AttentionConfig {
     pub fn key_value_projection_dim(&self) -> usize {
         self.num_key_value_heads * self.head_dim
     }
+
+    /// Empty KV cache on `backend` with room for `capacity` positions.
+    pub fn empty_cache<B: PortableBackend + 'static>(
+        &self,
+        backend: &Arc<B>,
+        capacity: usize,
+    ) -> Result<DecodeKvCache<B>> {
+        DecodeKvCache::zeros(backend, self.num_key_value_heads, capacity, self.head_dim)
+    }
 }
 
 /// Inputs shared by every attention layer for `T` new tokens at positions `position..position + T`.
@@ -180,38 +181,21 @@ pub struct CausalSelfAttention {
 
 #[nn::module]
 impl CausalSelfAttention {
-    pub fn load(
-        params: &mut LayerLoader<'_, B>,
-        prefix: &str,
-        config: AttentionConfig,
-    ) -> Result<Self> {
-        let (embed, kv_dim) = (config.embed_dim, config.key_value_projection_dim());
-        let mut linear = |name: &str, in_features: usize, out_features: usize| {
-            params.linear(
-                &format!("{prefix}.{name}"),
-                in_features,
-                out_features,
-                config.bias,
-            )
-        };
-        let q_proj = linear("q_proj", embed, config.query_projection_dim())?;
-        let k_proj = linear("k_proj", embed, kv_dim)?;
-        let v_proj = linear("v_proj", embed, kv_dim)?;
-        let o_proj = linear("o_proj", config.query_dim(), embed)?;
-        let mut norm = |name: &str| {
-            config
-                .qk_norm
-                .map(|norm| params.rms_norm(&format!("{prefix}.{name}"), config.head_dim, norm))
-                .transpose()
-        };
+    pub fn new(p: &mut Params<B>, config: AttentionConfig) -> Result<Self> {
         Ok(Self {
-            q_norm: norm("q_norm")?,
-            k_norm: norm("k_norm")?,
+            q_proj: Linear::new(p)?,
+            k_proj: Linear::new(p)?,
+            v_proj: Linear::new(p)?,
+            o_proj: Linear::new(p)?,
+            q_norm: config
+                .qk_norm
+                .map(|norm| RmsNorm::new(p, norm))
+                .transpose()?,
+            k_norm: config
+                .qk_norm
+                .map(|norm| RmsNorm::new(p, norm))
+                .transpose()?,
             config,
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
         })
     }
 
@@ -245,40 +229,46 @@ impl CausalSelfAttention {
         let q = self.q_norm(&q)?.unwrap_or(q);
         let k = self.k_norm(&k)?.unwrap_or(k);
 
-        let heads_first = |y: &Tensor| functional::transpose(y, &[1, 0, 2]);
-        let (mut q, mut k, v) = (heads_first(&q)?, heads_first(&k)?, heads_first(&v)?);
-        match (&cfg.rope, &positions.rotary) {
-            (Some(RopeConfig { rotary_dim, .. }), Some((cos, sin))) => {
-                ensure!(
-                    cos.shape().dims() == [t, rotary_dim / 2],
-                    "rotary tables have shape {:?}, expected [{t}, {}]",
-                    cos.shape().dims(),
-                    rotary_dim / 2
-                );
-                q = functional::apply_rope(&q, cos, sin)?;
-                k = functional::apply_rope(&k, cos, sin)?;
-            }
-            (None, None) => {}
-            (Some(_), None) => bail!("rotary attention needs rotary tables in its positions"),
-            (None, Some(_)) => bail!("attention without rotary embedding got rotary tables"),
-        }
-
-        let functional::DecodeAttentionComputation { output, cache } =
-            functional::attention_kv_cache(&q, &k, &v, cache, &positions.update_starts)?;
+        let (output, cache) = cached_attention(cfg, &q, &k, &v, cache, positions)?;
         let output = match gate {
             Some(gate) => output.mul(&functional::sigmoid(&gate)?)?,
             None => output,
         };
         Ok((self.o_proj(&output)?, cache))
     }
+}
 
-    /// Empty KV cache of this layer on `backend` with room for `capacity` positions.
-    pub fn empty_cache(&self, backend: &Arc<B>, capacity: usize) -> Result<DecodeKvCache<B>> {
-        DecodeKvCache::zeros(
-            backend,
-            self.config.num_key_value_heads,
-            capacity,
-            self.config.head_dim,
-        )
+/// Causal attention of the query heads `q` (`[T, num_query_heads, head_dim]`) at `positions`. The
+/// keys and values are `cache` followed by `k` and `v` (`[T, num_key_value_heads, head_dim]`). The
+/// rotary embedding of `config` applies to `q` and `k`. Returns the output `[T, query_dim]` and
+/// the cache extended by `k` and `v` (see [`functional::attention_kv_cache`]).
+pub fn cached_attention<B: PortableBackend + 'static>(
+    config: &AttentionConfig,
+    q: &DeviceTensor<B>,
+    k: &DeviceTensor<B>,
+    v: &DeviceTensor<B>,
+    cache: &DecodeKvCache<B>,
+    positions: &AttentionPositions<B>,
+) -> Result<(DeviceTensor<B>, DecodeKvCache<B>)> {
+    let t = q.shape().dims()[0];
+    let heads_first = |y: &DeviceTensor<B>| functional::transpose(y, &[1, 0, 2]);
+    let (mut q, mut k, v) = (heads_first(q)?, heads_first(k)?, heads_first(v)?);
+    match (&config.rope, &positions.rotary) {
+        (Some(RopeConfig { rotary_dim, .. }), Some((cos, sin))) => {
+            ensure!(
+                cos.shape().dims() == [t, rotary_dim / 2],
+                "rotary tables have shape {:?}, expected [{t}, {}]",
+                cos.shape().dims(),
+                rotary_dim / 2
+            );
+            q = functional::apply_rope(&q, cos, sin)?;
+            k = functional::apply_rope(&k, cos, sin)?;
+        }
+        (None, None) => {}
+        (Some(_), None) => bail!("rotary attention needs rotary tables in its positions"),
+        (None, Some(_)) => bail!("attention without rotary embedding got rotary tables"),
     }
+    let functional::DecodeAttentionComputation { output, cache } =
+        functional::attention_kv_cache(&q, &k, &v, cache, &positions.update_starts)?;
+    Ok((output, cache))
 }

@@ -260,26 +260,41 @@ fn expand_struct(mut item: ItemStruct) -> Result<TokenStream> {
         quote!(#(#visit_mut)*),
         visited.is_empty(),
     );
-    let calls: Vec<_> = visited.iter().filter_map(call_method).collect();
-    let calls = (!calls.is_empty()).then(|| {
-        quote! {
-            impl #impl_generics #ident #ty_generics #where_clause {
-                #(#calls)*
-            }
-        }
+    let calls = visited.iter().filter_map(call_method);
+    let paths = visited.iter().filter(|field| !field.flatten).map(|field| {
+        let key = LitStr::new(&field.ident.to_string(), field.ident.span());
+        let name = &field.name;
+        quote!(#key => ::core::option::Option::Some(#name),)
     });
     Ok(quote! {
         #item
         #module
-        #calls
+        impl #impl_generics #ident #ty_generics #where_clause {
+            #(#calls)*
+
+            /// The path segment that constructors enter for `field`, or `None` when it adds none.
+            #[doc(hidden)]
+            #[allow(dead_code)]
+            fn __nn_field_path(field: &str) -> ::core::option::Option<&'static str> {
+                match field {
+                    #(#paths)*
+                    _ => ::core::option::Option::None,
+                }
+            }
+        }
     })
 }
 
 fn expand_enum(mut item: ItemEnum) -> Result<TokenStream> {
     let mut visit = Vec::new();
     let mut visit_mut = Vec::new();
+    let mut paths = Vec::new();
     for variant in item.variants.iter_mut() {
         let options = Options::take(&mut variant.attrs)?;
+        if let Some(name) = &options.rename {
+            let key = LitStr::new(&variant.ident.to_string(), variant.ident.span());
+            paths.push(quote!(#key => ::core::option::Option::Some(#name),));
+        }
         if options.config || options.flatten {
             return Err(Error::new(
                 variant.ident.span(),
@@ -327,9 +342,22 @@ fn expand_enum(mut item: ItemEnum) -> Result<TokenStream> {
         quote!(match self { #(#visit_mut)* }?;),
         false,
     );
+    let ident = &item.ident;
+    let (impl_generics, ty_generics, where_clause) = item.generics.split_for_impl();
     Ok(quote! {
         #item
         #module
+        impl #impl_generics #ident #ty_generics #where_clause {
+            /// The path segment that constructors enter for `variant`, or `None` when it adds none.
+            #[doc(hidden)]
+            #[allow(dead_code)]
+            fn __nn_variant_path(variant: &str) -> ::core::option::Option<&'static str> {
+                match variant {
+                    #(#paths)*
+                    _ => ::core::option::Option::None,
+                }
+            }
+        }
     })
 }
 
@@ -495,6 +523,7 @@ fn expand_impl(mut item: ItemImpl) -> Result<TokenStream> {
         .segments
         .last_mut()
         .expect("paths are non-empty");
+    let self_ident = last.ident.clone();
     match &mut last.arguments {
         PathArguments::None => last.arguments = PathArguments::AngleBracketed(parse_quote!(<B>)),
         PathArguments::AngleBracketed(args) => {
@@ -511,26 +540,130 @@ fn expand_impl(mut item: ItemImpl) -> Result<TokenStream> {
     }
     add_backend_param(&mut item.generics, "#[nn::module]")?;
     TensorSugar.visit_item_impl_mut(&mut item);
+    for impl_item in &mut item.items {
+        if let ImplItem::Fn(function) = impl_item {
+            if let Some(params) = params_argument(&function.sig) {
+                ScopeFields {
+                    params,
+                    self_ident: self_ident.clone(),
+                }
+                .visit_block_mut(&mut function.block);
+            }
+        }
+    }
 
     let position = item
         .items
         .iter()
-        .position(|item| matches!(item, ImplItem::Fn(f) if f.sig.ident == "forward"))
-        .ok_or_else(|| {
-            Error::new(
-                item.self_ty.span(),
-                "a #[nn::module] impl must define the module's `fn forward`",
-            )
-        })?;
-    let ImplItem::Fn(forward) = item.items.remove(position) else {
-        unreachable!("position found a fn");
+        .position(|item| matches!(item, ImplItem::Fn(f) if f.sig.ident == "forward"));
+    let layer = match position {
+        Some(position) => {
+            let ImplItem::Fn(forward) = item.items.remove(position) else {
+                unreachable!("position found a fn");
+            };
+            Some(layer_impl(&item, forward)?)
+        }
+        None => None,
     };
-    let layer = layer_impl(&item, forward)?;
     let inherent = (!item.items.is_empty()).then(|| item.to_token_stream());
     Ok(quote! {
         #layer
         #inherent
     })
+}
+
+/// The identifier of a `name: &mut Params<..>` argument of `sig`.
+fn params_argument(sig: &syn::Signature) -> Option<syn::Ident> {
+    sig.inputs.iter().find_map(|input| {
+        let FnArg::Typed(input) = input else {
+            return None;
+        };
+        let (Pat::Ident(pat), Type::Reference(reference)) = (&*input.pat, &*input.ty) else {
+            return None;
+        };
+        let Type::Path(path) = &*reference.elem else {
+            return None;
+        };
+        let last = path.path.segments.last()?;
+        (reference.mutability.is_some() && last.ident == "Params").then(|| pat.ident.clone())
+    })
+}
+
+/// Wraps each field initializer of a `Self { .. }` literal, and each `Self::Variant(..)` payload,
+/// that reads the params argument, so that it runs inside that field's or variant's parameter path.
+struct ScopeFields {
+    params: syn::Ident,
+    self_ident: syn::Ident,
+}
+
+impl ScopeFields {
+    fn is_self(&self, path: &syn::Path) -> bool {
+        path.segments.len() == 1
+            && (path.segments[0].ident == "Self" || path.segments[0].ident == self.self_ident)
+    }
+
+    /// Whether `expr` names the params argument, so it can read parameters.
+    fn reads_params(&self, expr: &Expr) -> bool {
+        fn mentions(tokens: TokenStream, ident: &syn::Ident) -> bool {
+            tokens.into_iter().any(|token| match token {
+                proc_macro2::TokenTree::Ident(found) => found == *ident,
+                proc_macro2::TokenTree::Group(group) => mentions(group.stream(), ident),
+                _ => false,
+            })
+        }
+        mentions(expr.to_token_stream(), &self.params)
+    }
+
+    fn scoped(&self, expr: &Expr, segment: TokenStream) -> Expr {
+        let params = &self.params;
+        parse_quote!({
+            let mut __nn_scope = ::gpt_rs::nn::Params::__enter(#params, #segment);
+            let #params = ::core::ops::DerefMut::deref_mut(&mut __nn_scope);
+            #expr
+        })
+    }
+}
+
+impl VisitMut for ScopeFields {
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        visit_mut::visit_expr_mut(self, expr);
+        match expr {
+            Expr::Struct(literal) if self.is_self(&literal.path) => {
+                for field in literal.fields.iter_mut() {
+                    let syn::Member::Named(name) = &field.member else {
+                        continue;
+                    };
+                    if field.colon_token.is_none() || !self.reads_params(&field.expr) {
+                        continue;
+                    }
+                    let key = LitStr::new(&name.to_string(), name.span());
+                    field.expr = self.scoped(&field.expr, quote!(Self::__nn_field_path(#key)));
+                }
+            }
+            Expr::Call(call) if call.args.len() == 1 => {
+                let Expr::Path(func) = &*call.func else {
+                    return;
+                };
+                let segments = &func.path.segments;
+                let variant = match segments.iter().collect::<Vec<_>>().as_slice() {
+                    [owner, variant]
+                        if (owner.ident == "Self" || owner.ident == self.self_ident)
+                            && variant.ident.to_string().starts_with(char::is_uppercase) =>
+                    {
+                        variant.ident.clone()
+                    }
+                    _ => return,
+                };
+                if !self.reads_params(&call.args[0]) {
+                    return;
+                }
+                let key = LitStr::new(&variant.to_string(), variant.span());
+                let payload = call.args[0].clone();
+                call.args[0] = self.scoped(&payload, quote!(Self::__nn_variant_path(#key)));
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Generates `Layer<B>` of the module from its `forward`.

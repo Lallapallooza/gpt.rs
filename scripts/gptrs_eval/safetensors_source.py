@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 
 def resolve_model_dir(model_id: str) -> Path:
@@ -16,7 +16,7 @@ def resolve_model_dir(model_id: str) -> Path:
     return Path(
         snapshot_download(
             model_id,
-            allow_patterns=["*.json", "*.safetensors", "*.jinja", "*.txt"],
+            allow_patterns=["*.json", "model*.safetensors", "*.jinja", "*.txt"],
         )
     )
 
@@ -29,7 +29,7 @@ class SafetensorsSource:
         index_path = model_dir / "model.safetensors.index.json"
         if index_path.exists():
             weight_map = json.loads(index_path.read_text(encoding="utf-8"))["weight_map"]
-            self.weight_map: Dict[str, str] = {str(k): str(v) for k, v in weight_map.items()}
+            self.weight_map: dict[str, str] = {str(k): str(v) for k, v in weight_map.items()}
         else:
             single = model_dir / "model.safetensors"
             if not single.exists():
@@ -38,7 +38,7 @@ class SafetensorsSource:
 
             with safe_open(str(single), framework="pt") as handle:
                 self.weight_map = {str(k): single.name for k in handle.keys()}
-        self._handles: Dict[str, Any] = {}
+        self._handles: dict[str, Any] = {}
 
     def _handle(self, filename: str) -> Any:
         handle = self._handles.get(filename)

@@ -14,7 +14,7 @@ use super::ModelConfig;
 pub type BuildFn<B> = fn(
     Arc<B>,
     &ModelConfig,
-    &mut dyn FnMut(&str) -> Result<DeviceTensor<B>>,
+    &mut dyn FnMut(&str) -> Result<Option<DeviceTensor<B>>>,
 ) -> Result<Box<dyn LoadedModel<B>>>;
 
 #[derive(Clone, Copy)]

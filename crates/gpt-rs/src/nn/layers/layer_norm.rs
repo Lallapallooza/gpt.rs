@@ -1,6 +1,6 @@
 //! Layer normalization (PyTorch `nn.LayerNorm`) built on [`functional::layer_norm`].
 
-use crate::nn;
+use crate::nn::{self, Params};
 use crate::ops::functional;
 use anyhow::Result;
 
@@ -15,6 +15,14 @@ pub struct LayerNorm {
 
 #[nn::module]
 impl LayerNorm {
+    pub fn new(p: &mut Params<B>, eps: f32) -> Result<Self> {
+        Ok(Self {
+            weight: p.param()?,
+            bias: p.param()?,
+            eps,
+        })
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let outputs = functional::layer_norm(x, &self.weight, &self.bias, self.eps)?;
         Ok(outputs.output)

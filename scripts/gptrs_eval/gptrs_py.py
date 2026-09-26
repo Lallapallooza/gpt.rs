@@ -3,8 +3,11 @@ from __future__ import annotations
 import contextlib
 import os
 import sys
+from collections.abc import Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterator, Optional
+from typing import TYPE_CHECKING, Any
+
+from .safetensors_source import resolve_model_dir
 
 if TYPE_CHECKING:
     from .core import RunConfig
@@ -26,13 +29,15 @@ def gpt_rs_module() -> Any:
 
 
 def load_gpt_rs(cfg: RunConfig, **kwargs: Any) -> Any:
-    """Loads `cfg.params["checkpoint"]` on `cfg.backend`."""
+    """Loads the Hugging Face model `cfg.params["hf_model"]` on `cfg.backend`."""
     module = gpt_rs_module()
     module.set_backend(cfg.backend)
-    checkpoint = cfg.params.get("checkpoint")
-    if checkpoint is None:
-        raise SystemExit("missing --checkpoint")
-    return module.load_model(str(checkpoint), **kwargs)
+    return module.load_model(str(hf_model_dir(cfg)), **kwargs)
+
+
+def hf_model_dir(cfg: RunConfig) -> Path:
+    """The local directory of `cfg.params["hf_model"]`, a Hugging Face model id or directory."""
+    return resolve_model_dir(str(cfg.params["hf_model"]))
 
 
 def _no_profile_report(module: Any) -> str:
@@ -44,7 +49,7 @@ def _no_profile_report(module: Any) -> str:
 
 
 @contextlib.contextmanager
-def debug_context(params: Dict[str, Any]) -> Iterator["DebugHooks"]:
+def debug_context(params: dict[str, Any]) -> Iterator[DebugHooks]:
     """Optional dump/profiling hooks for the gpt_rs Python extension.
 
     Supported params:
@@ -172,7 +177,7 @@ def debug_context(params: Dict[str, Any]) -> Iterator["DebugHooks"]:
 
 
 class DebugHooks:
-    def __init__(self, gpt_rs_mod: Optional[Any], *, profile: bool) -> None:
+    def __init__(self, gpt_rs_mod: Any | None, *, profile: bool) -> None:
         self._gpt_rs = gpt_rs_mod
         self.profile = bool(profile)
 

@@ -7,34 +7,43 @@ mod pattern;
 
 /// Declares a neural-network module in the style of a PyTorch `nn.Module`.
 ///
-/// The macro is re-exported as `gpt_rs::nn::module`. Apply it to the struct (or enum) and to the
-/// impl that holds its `forward`:
+/// The macro is re-exported as `gpt_rs::nn::module`. Apply it to the struct (or enum) and to its
+/// impls:
 ///
 /// ```ignore
 /// #[nn::module]
-/// pub struct FeedForward {
-///     up_proj: Linear,
-///     activation: Activation,
-///     down_proj: Linear,
+/// pub struct Gpt2Mlp {
+///     c_fc: Conv1D,
+///     act: Activation,
+///     c_proj: Conv1D,
 /// }
 ///
 /// #[nn::module]
-/// impl FeedForward {
+/// impl Gpt2Mlp {
+///     fn new(p: &mut Params<B>, config: &GptConfig) -> Result<Self> {
+///         Ok(Self {
+///             c_fc: Conv1D::new(p)?,
+///             act: config.activation_function.layer(),
+///             c_proj: Conv1D::new(p)?,
+///         })
+///     }
+///
 ///     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-///         let up = self.up_proj(x)?;
-///         let act = self.activation(&up)?;
-///         self.down_proj(&act)
+///         let hidden = self.c_fc(x)?;
+///         let hidden = self.act(&hidden)?;
+///         self.c_proj(&hidden)
 ///     }
 /// }
 /// ```
 ///
 /// # Backend
 ///
-/// The macro adds the backend type parameter `B: PortableBackend + 'static` to both items, before
-/// any other type parameter (`FeedForward<B>`). Every field is backend-generic unless it has
-/// `#[module(config)]`:
+/// The macro adds the backend type parameter `B: PortableBackend + 'static` to the type and to each
+/// of its impls, before any other type parameter (`Gpt2Mlp<B>`). Every field is backend-generic
+/// unless it has `#[module(config)]`:
 /// - Write a sublayer type without generic arguments. The macro adds `<B>`, also inside
-///   `Option<_>` and `Vec<_>`, so `Linear` becomes `Linear<B>`.
+///   `Option<_>` and `Vec<_>`, so `Linear` becomes `Linear<B>` and the associated type
+///   `C::Model` becomes `C::Model<B>`.
 /// - A `Tensor` field is a parameter of type `DeviceTensor<B>`.
 ///
 /// `Tensor` also means `DeviceTensor<B>` in `config` fields and in the impl. Other backend-generic
@@ -57,9 +66,19 @@ mod pattern;
 /// variant, under its `#[module(rename = ...)]` if it has one. A `rename` takes any `&str`
 /// expression, such as a string literal or a constant.
 ///
+/// # Construction
+///
+/// In an impl function that takes a `&mut Params<..>` argument (`gpt_rs::nn::Params`, `p` below),
+/// each field initializer of a `Self { .. }` literal that uses `p` runs with `p` inside that
+/// field's parameter path. So does the payload of a `Self::Variant(..)`. This is the same path
+/// that the visitors use. A tensor field reads its tensor with `p.param()`, whose shape comes from
+/// the checkpoint. `p.each(items, |p, item| ..)` builds a `Vec<_>`. A sublayer built outside such
+/// an initializer reads from the enclosing path, so build each one inside its field, or enter a
+/// path explicitly with `p.scoped(..)`.
+///
 /// # Forward and sublayer calls
 ///
-/// The impl's `fn forward(&self, a: A, ...) -> Result<T>` implements `Layer<B>` with
+/// An impl's `fn forward(&self, a: A, ...) -> Result<T>` implements `Layer<B>` with
 /// `Output = T` and `Args<'a> = A`. With several arguments, `Args` is the tuple `(A, ...)`.
 /// Elided lifetimes become `'a`. The other items of the impl stay inherent.
 ///

@@ -11,7 +11,7 @@ use anyhow::{ensure, Result};
 use super::conv::CausalConv1d;
 use super::linear::Linear;
 use super::rms_norm::{RmsNorm, RmsNormConfig};
-use crate::nn::{self, LayerLoader};
+use crate::nn::{self, Params};
 use crate::ops::functional::{self, DeviceTensorOps, LinearAttentionCache};
 
 /// Head layout and convolution size of a [`GatedDeltaNet`].
@@ -73,32 +73,22 @@ pub struct GatedDeltaNet {
 
 #[nn::module]
 impl GatedDeltaNet {
-    pub fn load(
-        params: &mut LayerLoader<'_, B>,
-        prefix: &str,
-        config: GatedDeltaNetConfig,
-    ) -> Result<Self> {
+    pub fn new(p: &mut Params<B>, config: GatedDeltaNetConfig) -> Result<Self> {
         config.validate()?;
-        let name = |leaf: &str| format!("{prefix}.{leaf}");
-        let (hidden, hv) = (config.embed_dim, config.num_value_heads);
-        let (conv_dim, value_dim) = (config.conv_dim(), config.value_dim());
-        let conv_shape = [conv_dim, 1, config.conv_kernel_dim];
         let norm = RmsNormConfig {
             eps: config.rms_norm_eps,
             unit_offset: false,
         };
         Ok(Self {
-            in_proj_qkv: params.linear(&name("in_proj_qkv"), hidden, conv_dim, false)?,
-            in_proj_z: params.linear(&name("in_proj_z"), hidden, value_dim, false)?,
-            in_proj_b: params.linear(&name("in_proj_b"), hidden, hv, false)?,
-            in_proj_a: params.linear(&name("in_proj_a"), hidden, hv, false)?,
-            conv1d: CausalConv1d {
-                weight: params.tensor(&name("conv1d.weight"), &conv_shape)?,
-            },
-            dt_bias: params.tensor(&name("dt_bias"), &[hv])?,
-            a_log: params.tensor(&name("A_log"), &[hv])?,
-            norm: params.rms_norm(&name("norm"), config.value_head_dim, norm)?,
-            out_proj: params.linear(&name("out_proj"), value_dim, hidden, false)?,
+            in_proj_qkv: Linear::new(p)?,
+            in_proj_z: Linear::new(p)?,
+            in_proj_b: Linear::new(p)?,
+            in_proj_a: Linear::new(p)?,
+            conv1d: CausalConv1d::new(p)?,
+            dt_bias: p.param()?,
+            a_log: p.param()?,
+            norm: RmsNorm::new(p, norm)?,
+            out_proj: Linear::new(p)?,
             config,
         })
     }

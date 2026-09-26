@@ -5,12 +5,12 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, ensure, Context, Result};
 
 use crate::backend::spec::{PortableBackend, TensorInit};
-use crate::checkpoint::{CheckpointReader, CheckpointTensorEntry};
-use crate::model::config::WeightStreamingConfig;
+use crate::checkpoint::{self, Checkpoint, TensorEntry};
+use crate::model::config::{ModelRuntimeConfig, WeightStreamingConfig};
 use crate::model::registry as model_registry;
-use crate::params::{param_key, BaseParamId, ModelNamespaceId, ParamSource};
+use crate::params::{base_param_id, param_key, BaseParamId, ModelNamespaceId, ParamSource};
 use crate::tensor::spec_utils::backend_dtype;
-use crate::tensor::{DType, DeviceTensor};
+use crate::tensor::{DeviceTensor, Shape, Tensor};
 
 use super::handle::{LoadedModel, ModelHandle};
 use super::namespace::next_namespace;
@@ -161,25 +161,30 @@ impl<H: Clone> ParamHandleCache<H> {
 }
 
 struct CheckpointParamState<B: PortableBackend + 'static> {
-    reader: CheckpointReader,
-    entry_bytes: HashMap<BaseParamId, u64>,
+    checkpoint: Box<dyn Checkpoint>,
+    indices: HashMap<BaseParamId, usize>,
     cache: ParamHandleCache<B::TensorHandle>,
+}
+
+impl<B: PortableBackend + 'static> CheckpointParamState<B> {
+    fn index(&self, base_id: BaseParamId) -> Result<usize> {
+        self.indices
+            .get(&base_id)
+            .copied()
+            .ok_or_else(|| anyhow!("tensor id {base_id:?} not found in checkpoint"))
+    }
 }
 
 impl<B: PortableBackend + 'static> CheckpointParamSource<B> {
     fn new(
         backend: Arc<B>,
-        reader: CheckpointReader,
+        checkpoint: Box<dyn Checkpoint>,
+        indices: HashMap<BaseParamId, usize>,
         cache_cfg: SourceCacheConfig,
     ) -> Result<Self> {
-        let mut entry_bytes: HashMap<BaseParamId, u64> =
-            HashMap::with_capacity(reader.entries().len());
-        for entry in reader.entries() {
-            entry_bytes.insert(entry.base_id, entry.len);
-        }
         let mut state = CheckpointParamState {
-            reader,
-            entry_bytes,
+            checkpoint,
+            indices,
             cache: ParamHandleCache::new(cache_cfg),
         };
         prefetch_source_cache(&backend, &mut state)?;
@@ -198,25 +203,15 @@ fn prefetch_source_cache<B: PortableBackend + 'static>(
         return Ok(());
     }
 
-    let prefetched_ids: Vec<BaseParamId> = state
-        .reader
-        .entries()
-        .iter()
-        .filter_map(|entry| {
-            state
-                .cache
-                .cfg
-                .prefetch_base_ids
-                .contains(&entry.base_id)
-                .then_some(entry.base_id)
-        })
-        .collect();
+    let prefetched_ids: Vec<BaseParamId> =
+        state.cache.cfg.prefetch_base_ids.iter().copied().collect();
     for base_id in prefetched_ids {
         if state.cache.get(base_id).is_some() {
             continue;
         }
-        let handle = materialize_entry(backend.as_ref(), &state.reader, base_id)?;
-        let bytes = state.entry_bytes.get(&base_id).copied().unwrap_or(0);
+        let index = state.index(base_id)?;
+        let handle = materialize_entry(backend.as_ref(), state.checkpoint.as_ref(), index)?;
+        let bytes = state.checkpoint.tensors()[index].byte_len() as u64;
         state.cache.insert(base_id, bytes, handle);
     }
     Ok(())
@@ -229,8 +224,9 @@ impl<B: PortableBackend + 'static> ParamSource<B> for CheckpointParamSource<B> {
             return Ok(handle);
         }
 
-        let handle = materialize_entry(self.backend.as_ref(), &state.reader, base_id)?;
-        let bytes = state.entry_bytes.get(&base_id).copied().unwrap_or(0);
+        let index = state.index(base_id)?;
+        let handle = materialize_entry(self.backend.as_ref(), state.checkpoint.as_ref(), index)?;
+        let bytes = state.checkpoint.tensors()[index].byte_len() as u64;
         state.cache.insert(base_id, bytes, handle.clone());
         Ok(handle)
     }
@@ -241,17 +237,24 @@ impl<B: PortableBackend + 'static> ParamSource<B> for CheckpointParamSource<B> {
 /// little endian, so big-endian hosts get a decoded copy.
 fn materialize_entry<B: PortableBackend + 'static>(
     backend: &B,
-    reader: &CheckpointReader,
-    base_id: BaseParamId,
+    checkpoint: &dyn Checkpoint,
+    index: usize,
 ) -> Result<B::TensorHandle> {
-    let entry = reader.entry_by_base_id(base_id)?;
+    let entry = &checkpoint.tensors()[index];
+    let bytes = checkpoint
+        .bytes(index)
+        .with_context(|| format!("failed to read tensor '{}'", entry.name))?;
     if cfg!(target_endian = "little") {
         let spec =
             crate::backend::ptir_utils::tensor_spec_static(backend_dtype(entry.dtype), &entry.dims);
-        return Ok(backend.materialize_external(spec, reader.entry_external_bytes(entry)?)?);
+        return Ok(backend.materialize_external(spec, bytes)?);
     }
-    let literal = reader.get_entry(entry)?.to_literal();
-    Ok(backend.materialize(TensorInit::Literal(literal))?)
+    let host = Tensor::from_le_bytes(
+        Shape::new(entry.dims.clone()),
+        entry.dtype,
+        bytes.as_slice(),
+    )?;
+    Ok(backend.materialize(TensorInit::Literal(host.to_literal()))?)
 }
 
 /// Caller-side options for [`load_model_with_options`].
@@ -259,8 +262,12 @@ fn materialize_entry<B: PortableBackend + 'static>(
 pub struct LoadOptions {
     /// Parameter namespace. `None` allocates a fresh one.
     pub namespace: Option<ModelNamespaceId>,
-    /// Overrides `runtime.matmul_input_dtype` from the checkpoint config.
-    pub matmul_input_dtype: Option<DType>,
+    /// How the runtime executes the model (see [`ModelRuntimeConfig`]).
+    pub runtime: ModelRuntimeConfig,
+    /// Keys that replace those of the model config (the text config of a multimodal checkpoint).
+    /// For example, `num_hidden_layers` loads only the first layers of a Ministral or Qwen3.5
+    /// checkpoint.
+    pub config_overrides: serde_json::Map<String, serde_json::Value>,
 }
 
 pub fn load_model<B: PortableBackend + 'static>(
@@ -280,55 +287,64 @@ pub fn load_model_with_options<B: PortableBackend + 'static>(
     options: LoadOptions,
 ) -> Result<ModelHandle<B>> {
     let namespace = options.namespace.unwrap_or_else(next_namespace);
-    let reader = CheckpointReader::open(&path)
+    let checkpoint = checkpoint::open(&path)
         .with_context(|| format!("failed to open checkpoint {}", path.as_ref().display()))?;
-    let mut config = reader.config().clone();
-    if let Some(dtype) = options.matmul_input_dtype {
-        config.runtime.matmul_input_dtype = Some(dtype);
+    let mut config = checkpoint.config().clone();
+    config.runtime = options.runtime;
+    if !options.config_overrides.is_empty() {
+        let fields = config
+            .config
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("model config is not a JSON object"))?;
+        fields.extend(options.config_overrides);
     }
     let weight_streaming = &config.runtime.weight_streaming;
     validate_weight_streaming_config(weight_streaming)?;
     let streaming_enabled = weight_streaming_enabled(weight_streaming);
-    let source_cache_cfg = source_cache_config(reader.entries(), weight_streaming);
 
-    let mut specs: HashMap<String, CheckpointTensorEntry> =
-        HashMap::with_capacity(reader.entries().len());
-    for entry in reader.entries().iter() {
-        specs.insert(entry.name.clone(), entry.clone());
+    let mut specs: Specs = HashMap::with_capacity(checkpoint.tensors().len());
+    let mut indices = HashMap::with_capacity(checkpoint.tensors().len());
+    for (index, entry) in checkpoint.tensors().iter().enumerate() {
+        let base_id = base_param_id(&entry.name)?;
+        indices.insert(base_id, index);
+        specs.insert(entry.name.clone(), (base_id, entry.clone()));
     }
+    let source_cache_cfg = source_cache_config(&specs, weight_streaming);
 
     let source: Arc<dyn ParamSource<B>> = Arc::new(CheckpointParamSource::new(
         Arc::clone(&backend),
-        reader,
+        checkpoint,
+        indices,
         source_cache_cfg,
     )?);
 
     let backend_for_params = Arc::clone(&backend);
     let source_for_params = Arc::clone(&source);
-    let mut get = move |name: &str| -> Result<DeviceTensor<B>> {
-        let spec = specs
-            .get(name)
-            .ok_or_else(|| anyhow!("missing tensor '{}' in checkpoint", name))?;
-        let key = param_key(namespace, spec.base_id);
-        let shape = crate::tensor::Shape::new(spec.dims.clone());
+    let mut get = move |name: &str| -> Result<Option<DeviceTensor<B>>> {
+        let Some((base_id, spec)) = specs.get(name) else {
+            return Ok(None);
+        };
+        let key = param_key(namespace, *base_id);
+        let shape = Shape::new(spec.dims.clone());
         if !streaming_enabled {
-            let handle = source_for_params.load(spec.base_id)?;
+            let handle = source_for_params.load(*base_id)?;
             return DeviceTensor::from_handle(
                 Arc::clone(&backend_for_params),
                 shape,
                 spec.dtype,
                 handle,
             )
-            .as_param_with_id(key.0);
+            .as_param_with_id(key.0)
+            .map(Some);
         }
-        Ok(DeviceTensor::lazy_param(
+        Ok(Some(DeviceTensor::lazy_param(
             Arc::clone(&backend_for_params),
             shape,
             spec.dtype,
             key.0,
-            spec.base_id,
+            *base_id,
             Arc::clone(&source_for_params),
-        ))
+        )))
     };
 
     let kind = config.kind.as_str();
@@ -362,15 +378,15 @@ fn validate_weight_streaming_config(cfg: &WeightStreamingConfig) -> Result<()> {
     Ok(())
 }
 
-fn effective_device_budget_bytes(
-    entries: &[CheckpointTensorEntry],
-    cfg: &WeightStreamingConfig,
-) -> Option<u64> {
+/// Each parameter's base id and entry, by name.
+type Specs = HashMap<String, (BaseParamId, TensorEntry)>;
+
+fn effective_device_budget_bytes(specs: &Specs, cfg: &WeightStreamingConfig) -> Option<u64> {
     let mut budget = cfg.device_budget_bytes;
     if let Some(percent) = cfg.device_weights_percent {
-        let total_bytes = entries
-            .iter()
-            .fold(0u64, |acc, entry| acc.saturating_add(entry.len));
+        let total_bytes = specs.values().fold(0u64, |acc, (_, entry)| {
+            acc.saturating_add(entry.byte_len() as u64)
+        });
         let percent_budget = if percent >= 1.0 {
             total_bytes
         } else if percent <= 0.0 {
@@ -386,17 +402,14 @@ fn effective_device_budget_bytes(
     budget
 }
 
-fn source_cache_config(
-    entries: &[CheckpointTensorEntry],
-    cfg: &WeightStreamingConfig,
-) -> SourceCacheConfig {
+fn source_cache_config(specs: &Specs, cfg: &WeightStreamingConfig) -> SourceCacheConfig {
     if !weight_streaming_enabled(cfg) {
         return SourceCacheConfig::default();
     }
 
-    let budget_bytes = effective_cache_budget_bytes(entries, cfg);
+    let budget_bytes = effective_cache_budget_bytes(specs, cfg);
     let small_param_persist_threshold = cfg.small_param_persist_threshold;
-    let prefetch_base_ids = prefetch_block_base_ids(entries, cfg.prefetch_layers);
+    let prefetch_base_ids = prefetch_block_base_ids(specs, cfg.prefetch_layers);
     let enabled = budget_bytes.is_some()
         || small_param_persist_threshold.is_some()
         || !prefetch_base_ids.is_empty();
@@ -408,37 +421,32 @@ fn source_cache_config(
     }
 }
 
-fn prefetch_block_base_ids(
-    entries: &[CheckpointTensorEntry],
-    prefetch_layers: Option<usize>,
-) -> HashSet<BaseParamId> {
+fn prefetch_block_base_ids(specs: &Specs, prefetch_layers: Option<usize>) -> HashSet<BaseParamId> {
     let Some(layer_limit) = prefetch_layers else {
         return HashSet::new();
     };
     if layer_limit == 0 {
         return HashSet::new();
     }
-    entries
+    specs
         .iter()
-        .filter_map(|entry| {
-            block_layer_index(&entry.name)
+        .filter_map(|(name, (base_id, _))| {
+            block_layer_index(name)
                 .filter(|layer| *layer < layer_limit)
-                .map(|_| entry.base_id)
+                .map(|_| *base_id)
         })
         .collect()
 }
 
+/// First numeric path segment of `name`. For decoder parameters this is the layer index
+/// (`model.layers.3...`, `transformer.h.3...`).
 fn block_layer_index(name: &str) -> Option<usize> {
-    let rest = name.strip_prefix("model.layers.")?;
-    let (layer_index, _) = rest.split_once('.')?;
-    layer_index.parse::<usize>().ok()
+    name.split('.')
+        .find_map(|segment| segment.parse::<usize>().ok())
 }
 
-fn effective_cache_budget_bytes(
-    entries: &[CheckpointTensorEntry],
-    cfg: &WeightStreamingConfig,
-) -> Option<u64> {
-    let device_budget = effective_device_budget_bytes(entries, cfg);
+fn effective_cache_budget_bytes(specs: &Specs, cfg: &WeightStreamingConfig) -> Option<u64> {
+    let device_budget = effective_device_budget_bytes(specs, cfg);
     match (device_budget, cfg.cache_budget_cap_bytes) {
         (Some(device), Some(host)) => Some(device.min(host)),
         (Some(device), None) => Some(device),

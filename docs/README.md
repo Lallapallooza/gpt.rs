@@ -21,5 +21,6 @@ Doc policy:
 - [backend.md](backend.md): PTIR backend contract (ptir.v0.4). Treat as a spec.
 - [ops.md](ops.md): ops/capture/graph execution architecture (implementation-oriented).
 - [backend_optimizer.md](backend_optimizer.md): PTIR rewrite/optimizer architecture (implementation-oriented).
-- [formats.md](formats.md): file formats (`GPTRSCHK` checkpoints, `GPTRSTEN` tensor archives).
+- [formats.md](formats.md): checkpoints (Hugging Face model directories) and safetensors tensor
+  files.
 - [development.md](development.md): env vars and local development notes.

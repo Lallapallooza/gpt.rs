@@ -1,144 +1,299 @@
+//! ResNet image classifier (`transformers` `ResNetForImageClassification`).
+//!
+//! NCHW pixels -> NHWC -> `embedder` \[7x7/2 conv layer -> 3x3/2 max pool\] -> `encoder.stages` x
+//! `layers` x \[`layer` conv layers + `shortcut` -> `activation`\] -> global average pool ->
+//! `classifier`.
+//!
+//! A conv layer ([`ResNetConvLayer`]) is a bias-free convolution, a [`BatchNorm2d`] and an
+//! optional activation. A basic layer runs two 3x3 conv layers. A bottleneck layer runs 1x1, 3x3
+//! and 1x1 conv layers. The shortcut, when the checkpoint has one, is a 1x1 conv layer without
+//! activation, and the input otherwise. The first layer of each stage after the first halves the
+//! resolution. With `downsample_in_first_stage`, the first stage does too.
+
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, ensure, Result};
 
 use crate::backend::spec::PortableBackend;
 use crate::module::Layer;
-use crate::nn::layers::{Conv2d, Linear};
-use crate::nn::{self, LayerLoader};
-use crate::ops::functional::{
-    global_avg_pool2d, max_pool2d, relu, transpose, Conv2dParams2d, Padding2d,
-};
+use crate::nn::layers::{Activation, ActivationFunction, BatchNorm2d, Conv2d, ConvPadding, Linear};
+use crate::nn::{self, Params};
+use crate::ops::functional::{global_avg_pool2d, max_pool2d, transpose, Padding2d};
 use crate::tensor::{DeviceTensor, DeviceTensorOps};
 
-pub const KIND: &str = "resnet34";
+pub const KIND: &str = "resnet";
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ResNet34Config {
-    pub num_classes: usize,
+/// `transformers` keeps the `nn.BatchNorm2d` default.
+const BATCH_NORM_EPS: f32 = 1e-5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResNetLayerType {
+    Basic,
+    Bottleneck,
 }
 
-impl Default for ResNet34Config {
+/// The keys of a Hugging Face `ResNetConfig` that the model reads, with its defaults. Channel
+/// counts come from the checkpoint.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ResNetConfig {
+    pub depths: Vec<usize>,
+    pub layer_type: ResNetLayerType,
+    pub hidden_act: ActivationFunction,
+    pub downsample_in_first_stage: bool,
+    pub downsample_in_bottleneck: bool,
+}
+
+impl Default for ResNetConfig {
     fn default() -> Self {
-        Self { num_classes: 1000 }
+        Self {
+            depths: vec![3, 4, 6, 3],
+            layer_type: ResNetLayerType::Bottleneck,
+            hidden_act: ActivationFunction::Relu,
+            downsample_in_first_stage: false,
+            downsample_in_bottleneck: false,
+        }
     }
 }
 
 pub(crate) fn build_from_model_config<B: PortableBackend + 'static>(
     backend: Arc<B>,
     cfg: &super::ModelConfig,
-    get: &mut dyn FnMut(&str) -> Result<DeviceTensor<B>>,
+    get: &mut dyn FnMut(&str) -> Result<Option<DeviceTensor<B>>>,
 ) -> Result<Box<dyn crate::runtime::LoadedModel<B>>> {
-    let config: ResNet34Config = serde_json::from_value(cfg.config.clone())
+    let config: ResNetConfig = serde_json::from_value(cfg.config.clone())
         .map_err(|err| anyhow!("invalid {KIND} config: {err}"))?;
     let mut params =
-        LayerLoader::new(backend, get).with_linear_input_dtype(cfg.runtime.matmul_input_dtype);
-    Ok(Box::new(ResNet34::load(&mut params, &config)?))
+        Params::new(backend, get).with_linear_input_dtype(cfg.runtime.matmul_input_dtype);
+    Ok(Box::new(ResNet::new(&mut params, &config)?))
 }
 
-/// Residual block of two 3x3 convolutions: torchvision `BasicBlock` with its batch norms folded
-/// into the convolutions.
+/// Bias-free convolution with centered padding, batch norm, then an optional activation.
 #[nn::module]
-pub struct BasicBlock {
-    conv1: Conv2d,
-    conv2: Conv2d,
-    downsample: Option<Conv2d>,
+pub struct ResNetConvLayer {
+    convolution: Conv2d,
+    normalization: BatchNorm2d,
+    activation: Option<Activation>,
 }
 
 #[nn::module]
-impl BasicBlock {
-    pub fn load(
-        params: &mut LayerLoader<'_, B>,
-        prefix: &str,
-        in_channels: usize,
-        out_channels: usize,
+impl ResNetConvLayer {
+    fn new(
+        p: &mut Params<B>,
         stride: usize,
+        activation: Option<ActivationFunction>,
     ) -> Result<Self> {
-        let name = |conv: &str| format!("{prefix}.{conv}");
-        let conv1 = Conv2dParams2d::square(3, stride, 1);
-        let conv2 = Conv2dParams2d::square(3, 1, 1);
         Ok(Self {
-            conv1: params.conv2d(&name("conv1"), in_channels, out_channels, conv1)?,
-            conv2: params.conv2d(&name("conv2"), out_channels, out_channels, conv2)?,
-            downsample: (stride != 1 || in_channels != out_channels)
-                .then(|| {
-                    let downsample = Conv2dParams2d::square(1, stride, 0);
-                    params.conv2d(&name("downsample"), in_channels, out_channels, downsample)
-                })
-                .transpose()?,
+            convolution: Conv2d::new(p, stride, 1, ConvPadding::Centered)?,
+            normalization: BatchNorm2d::new(p, BATCH_NORM_EPS)?,
+            activation: activation.map(ActivationFunction::layer),
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let identity = self.downsample(x)?.unwrap_or_else(|| x.clone());
-        let out = relu(&self.conv1(x)?)?;
-        let out = self.conv2(&out)?.add(&identity)?;
-        relu(&out)
+        let x = self.convolution(x)?;
+        let x = self.normalization(&x)?;
+        Ok(self.activation(&x)?.unwrap_or(x))
     }
 }
 
-/// torchvision ResNet-34 with its batch norms folded into the convolutions.
+/// Residual layer: `ResNetBasicLayer` or `ResNetBottleNeckLayer`, which differ only in their conv
+/// layers.
 #[nn::module]
-pub struct ResNet34 {
-    conv1: Conv2d,
-    layer1: Vec<BasicBlock>,
-    layer2: Vec<BasicBlock>,
-    layer3: Vec<BasicBlock>,
-    layer4: Vec<BasicBlock>,
-    fc: Linear,
+pub struct ResNetLayer {
+    shortcut: Option<ResNetConvLayer>,
+    layer: Vec<ResNetConvLayer>,
+    activation: Activation,
 }
 
 #[nn::module]
-impl ResNet34 {
-    pub fn load(params: &mut LayerLoader<'_, B>, config: &ResNet34Config) -> Result<Self> {
-        let conv1 = params.conv2d("conv1", 3, 64, Conv2dParams2d::square(7, 2, 3))?;
-        let mut in_channels = 64;
-        let mut stage = |stage: usize, out_channels: usize, blocks: usize| {
-            (0..blocks)
-                .map(|block| {
-                    let stride = if stage > 1 && block == 0 { 2 } else { 1 };
-                    let prefix = format!("layer{stage}.{block}");
-                    let block =
-                        BasicBlock::load(params, &prefix, in_channels, out_channels, stride);
-                    in_channels = out_channels;
-                    block
-                })
-                .collect::<Result<Vec<_>>>()
+impl ResNetLayer {
+    fn new(p: &mut Params<B>, config: &ResNetConfig, stride: usize) -> Result<Self> {
+        // `transformers` builds the inner conv layers with its default `relu`, not `hidden_act`.
+        let relu = Some(ActivationFunction::Relu);
+        let convs = match config.layer_type {
+            ResNetLayerType::Basic => vec![(stride, relu), (1, None)],
+            ResNetLayerType::Bottleneck if config.downsample_in_bottleneck => {
+                vec![(stride, relu), (1, relu), (1, None)]
+            }
+            ResNetLayerType::Bottleneck => vec![(1, relu), (stride, relu), (1, None)],
         };
         Ok(Self {
-            conv1,
-            layer1: stage(1, 64, 3)?,
-            layer2: stage(2, 128, 4)?,
-            layer3: stage(3, 256, 6)?,
-            layer4: stage(4, 512, 3)?,
-            fc: params.linear("fc", 512, config.num_classes, true)?,
+            shortcut: p.optional(|p| ResNetConvLayer::new(p, stride, None))?,
+            layer: p.each(convs, |p, (stride, activation)| {
+                ResNetConvLayer::new(p, stride, activation)
+            })?,
+            activation: config.hidden_act.layer(),
         })
     }
 
-    /// Class logits `[N, num_classes]` of NCHW images.
-    fn forward(&self, input_nchw: &Tensor) -> Result<Tensor> {
-        let x = transpose(input_nchw, &[0, 2, 3, 1])?;
-        let x = relu(&self.conv1(&x)?)?;
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let residual = self.shortcut(x)?.unwrap_or_else(|| x.clone());
+        let mut hidden = x.clone();
+        for conv in &self.layer {
+            hidden = conv.call(&hidden)?;
+        }
+        self.activation(&hidden.add(&residual)?)
+    }
+}
 
-        // maxpool: 3x3 stride 2 padding 1 (NHWC).
+/// Layers at one resolution. The first one may downsample.
+#[nn::module]
+pub struct ResNetStage {
+    layers: Vec<ResNetLayer>,
+}
+
+#[nn::module]
+impl ResNetStage {
+    fn new(p: &mut Params<B>, config: &ResNetConfig, stride: usize, depth: usize) -> Result<Self> {
+        let strides = std::iter::once(stride)
+            .chain(std::iter::repeat(1))
+            .take(depth);
+        Ok(Self {
+            layers: p.each(strides, |p, stride| ResNetLayer::new(p, config, stride))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut x = x.clone();
+        for layer in &self.layers {
+            x = layer.call(&x)?;
+        }
+        Ok(x)
+    }
+}
+
+/// The stages. Each stage after the first halves the resolution, and with
+/// `downsample_in_first_stage` the first one does too.
+#[nn::module]
+pub struct ResNetEncoder {
+    stages: Vec<ResNetStage>,
+}
+
+#[nn::module]
+impl ResNetEncoder {
+    fn new(p: &mut Params<B>, config: &ResNetConfig) -> Result<Self> {
+        ensure!(!config.depths.is_empty(), "{KIND} config has no stages");
+        let first_stride = if config.downsample_in_first_stage {
+            2
+        } else {
+            1
+        };
+        let strides = std::iter::once(first_stride).chain(std::iter::repeat(2));
+        Ok(Self {
+            stages: p.each(strides.zip(&config.depths), |p, (stride, &depth)| {
+                ResNetStage::new(p, config, stride, depth)
+            })?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut x = x.clone();
+        for stage in &self.stages {
+            x = stage.call(&x)?;
+        }
+        Ok(x)
+    }
+}
+
+/// The stem: a 7x7 stride-2 conv layer, then a 3x3 stride-2 max pool.
+#[nn::module]
+pub struct ResNetEmbeddings {
+    embedder: ResNetConvLayer,
+}
+
+#[nn::module]
+impl ResNetEmbeddings {
+    fn new(p: &mut Params<B>, config: &ResNetConfig) -> Result<Self> {
+        Ok(Self {
+            embedder: ResNetConvLayer::new(p, 2, Some(config.hidden_act))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x = self.embedder(x)?;
         let padding = Padding2d {
             top: 1,
             bottom: 1,
             left: 1,
             right: 1,
         };
-        let mut x = max_pool2d(&x, [3, 3], [2, 2], padding)?;
-        let stages = [&self.layer1, &self.layer2, &self.layer3, &self.layer4];
-        for block in stages.into_iter().flatten() {
-            x = block.call(&x)?;
-        }
-
-        let x = global_avg_pool2d(&x)?;
-        self.fc(&x)
+        max_pool2d(&x, [3, 3], [2, 2], padding)
     }
 }
 
-impl<B: PortableBackend + 'static> crate::runtime::LoadedModel<B> for ResNet34<B> {
+/// ResNet without its classifier.
+#[nn::module]
+pub struct ResNetModel {
+    embedder: ResNetEmbeddings,
+    encoder: ResNetEncoder,
+}
+
+#[nn::module]
+impl ResNetModel {
+    fn new(p: &mut Params<B>, config: &ResNetConfig) -> Result<Self> {
+        Ok(Self {
+            embedder: ResNetEmbeddings::new(p, config)?,
+            encoder: ResNetEncoder::new(p, config)?,
+        })
+    }
+
+    /// Pooled features `[N, channels]` of NCHW images.
+    fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
+        let x = transpose(pixel_values, &[0, 2, 3, 1])?;
+        let x = self.embedder(&x)?;
+        let x = self.encoder(&x)?;
+        global_avg_pool2d(&x)
+    }
+}
+
+/// The classification head, `nn.Sequential(nn.Flatten(), nn.Linear(..))` in `transformers`. The
+/// pooled features are already flat.
+#[nn::module]
+pub struct ResNetClassifier {
+    #[module(rename = "1")]
+    linear: Linear,
+}
+
+#[nn::module]
+impl ResNetClassifier {
+    fn new(p: &mut Params<B>) -> Result<Self> {
+        Ok(Self {
+            linear: Linear::new(p)?,
+        })
+    }
+
+    fn forward(&self, pooled: &Tensor) -> Result<Tensor> {
+        self.linear(pooled)
+    }
+}
+
+/// ResNet image classifier.
+#[nn::module]
+pub struct ResNet {
+    resnet: ResNetModel,
+    classifier: Option<ResNetClassifier>,
+}
+
+#[nn::module]
+impl ResNet {
+    pub fn new(p: &mut Params<B>, config: &ResNetConfig) -> Result<Self> {
+        Ok(Self {
+            resnet: ResNetModel::new(p, config)?,
+            classifier: p.optional(ResNetClassifier::new)?,
+        })
+    }
+
+    /// Class logits `[N, num_labels]` of NCHW images, or the pooled features when the checkpoint
+    /// has no classifier.
+    fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
+        let pooled = self.resnet(pixel_values)?;
+        Ok(self.classifier(&pooled)?.unwrap_or(pooled))
+    }
+}
+
+impl<B: PortableBackend + 'static> crate::runtime::LoadedModel<B> for ResNet<B> {
     fn kind(&self) -> &str {
         KIND
     }

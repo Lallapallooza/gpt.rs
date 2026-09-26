@@ -3,13 +3,12 @@ from __future__ import annotations
 import argparse
 import time
 from dataclasses import replace
-from pathlib import Path
-from typing import Any, Dict, List, Tuple, cast
+from typing import Any, cast
 
 import numpy as np
 
-from ..core import BenchResult, CliRunResult, RunConfig, as_path
-from ..gptrs_py import debug_context, gpt_rs_module, load_gpt_rs
+from ..core import BenchResult, CliRunResult, RunConfig
+from ..gptrs_py import debug_context, gpt_rs_module, hf_model_dir, load_gpt_rs
 from ..runner import bench_stats, time_many, validation_result
 
 
@@ -22,17 +21,14 @@ class Gpt2Case:
     def add_cli_args(self, parser: argparse.ArgumentParser) -> None:
         from ..registry import get_case_default_params
 
-        defaults: Dict[str, Any] = get_case_default_params(self.name)
-        prompt_default = str(defaults.get("prompt", "Hello"))
-        torch_model_default = str(defaults.get("torch_model", "gpt2"))
-        checkpoint_default = as_path(defaults.get("checkpoint"), Path("checkpoints/gpt2.bin"))
-        tokenizer_default = as_path(defaults.get("tokenizer"), Path("configs/gpt2_tokenizer.json"))
-
-        parser.add_argument("--prompt", default=prompt_default, help="Prompt text.")
+        defaults: dict[str, Any] = get_case_default_params(self.name)
         parser.add_argument(
-            "--torch-model",
-            default=torch_model_default,
-            help="HF model id for torch baseline.",
+            "--prompt", default=str(defaults.get("prompt", "Hello")), help="Prompt text."
+        )
+        parser.add_argument(
+            "--hf-model",
+            default=str(defaults.get("hf_model", "gpt2")),
+            help="Hugging Face model id or local directory, loaded by gpt-rs and by Torch.",
         )
         parser.add_argument(
             "--temperature",
@@ -45,18 +41,6 @@ class Gpt2Case:
             type=int,
             default=128,
             help="Max tokens for gpt-rs run (default: 128).",
-        )
-        parser.add_argument(
-            "--checkpoint",
-            type=Path,
-            default=checkpoint_default,
-            help="Checkpoint path.",
-        )
-        parser.add_argument(
-            "--tokenizer",
-            type=Path,
-            default=tokenizer_default,
-            help="Tokenizer JSON.",
         )
         parser.add_argument(
             "--generate-tokens",
@@ -78,9 +62,9 @@ class Gpt2Case:
             help="Enable kv-cache for gpt-rs bench (default: true).",
         )
 
-    def _build_gpt_rs(self, cfg: RunConfig) -> Tuple[Any, Any]:
-        tokenizer = gpt_rs_module().Tokenizer.from_file(str(cfg.params["tokenizer"]))
-        return tokenizer, load_gpt_rs(cfg)
+    def _build_gpt_rs(self, cfg: RunConfig) -> tuple[Any, Any]:
+        tokenizer_path = hf_model_dir(cfg) / "tokenizer.json"
+        return gpt_rs_module().Tokenizer.from_file(str(tokenizer_path)), load_gpt_rs(cfg)
 
     def validate(self, cfg: RunConfig):
         import torch
@@ -90,15 +74,14 @@ class Gpt2Case:
         torch.manual_seed(cfg.seed)
 
         prompt = str(cfg.params.get("prompt", "Hello"))
-        torch_model_id = str(cfg.params.get("torch_model", "gpt2"))
         generate_tokens = int(cfg.params.get("generate_tokens", 0))
 
         rs_tokenizer, rs_model = self._build_gpt_rs(cfg)
-        prompt_tokens: List[int] = list(rs_tokenizer.encode(prompt))
+        prompt_tokens: list[int] = list(rs_tokenizer.encode(prompt))
 
-        torch_model = GPT2LMHeadModel.from_pretrained(torch_model_id).eval()
+        torch_model = GPT2LMHeadModel.from_pretrained(hf_model_dir(cfg)).eval()
 
-        def hf_logits(tokens: List[int]) -> np.ndarray:
+        def hf_logits(tokens: list[int]) -> np.ndarray:
             input_ids = torch.tensor(tokens, dtype=torch.long).unsqueeze(0)
             with torch.no_grad():
                 out = torch_model(input_ids=input_ids)
@@ -146,7 +129,6 @@ class Gpt2Case:
         from transformers import AutoModelForCausalLM
 
         prompt = str(cfg.params.get("prompt", "Hello"))
-        torch_model_id = str(cfg.params.get("torch_model", "gpt2"))
         torch_device = str(cfg.torch_device)
         kv_cache = bool(cfg.params.get("kv_cache", True))
         max_tokens = int(cfg.params.get("bench_tokens", 64))
@@ -168,9 +150,9 @@ class Gpt2Case:
             )
 
         rs_tokenizer, rs_model = self._build_gpt_rs(cfg)
-        prompt_tokens: List[int] = list(rs_tokenizer.encode(prompt))
+        prompt_tokens: list[int] = list(rs_tokenizer.encode(prompt))
 
-        torch_model = cast(Any, AutoModelForCausalLM.from_pretrained(torch_model_id))
+        torch_model = cast(Any, AutoModelForCausalLM.from_pretrained(hf_model_dir(cfg)))
         torch_model = torch_model.to(device).eval()
         input_ids = torch.tensor(prompt_tokens, dtype=torch.long, device=device).unsqueeze(0)
         attention_mask = torch.ones_like(input_ids)
@@ -229,7 +211,9 @@ class Gpt2Case:
             unit_label="tokens",
             units_per_iter=units,
             gptrs=bench_stats(gptrs_times, units_per_iter=units, impl=f"gpt-rs/{cfg.backend}"),
-            torch=bench_stats(torch_times, units_per_iter=units, impl=f"torch:{torch_model_id}"),
+            torch=bench_stats(
+                torch_times, units_per_iter=units, impl=f"torch:{cfg.params['hf_model']}"
+            ),
         )
 
     def run(self, cfg: RunConfig) -> CliRunResult:
@@ -239,7 +223,7 @@ class Gpt2Case:
         kv_cache = bool(cfg.params.get("kv_cache", True))
 
         rs_tokenizer, rs_model = self._build_gpt_rs(cfg)
-        prompt_tokens: List[int] = list(rs_tokenizer.encode(prompt))
+        prompt_tokens: list[int] = list(rs_tokenizer.encode(prompt))
 
         t0 = time.perf_counter()
         with debug_context(cfg.params):

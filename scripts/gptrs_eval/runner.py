@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import statistics
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 
@@ -11,7 +12,7 @@ from .core import BenchStats, ValidationResult
 
 def validate_arrays(
     torch_np: np.ndarray, gptrs_np: np.ndarray, rtol: float, atol: float
-) -> Tuple[bool, float, float]:
+) -> tuple[bool, float, float]:
     if torch_np.shape != gptrs_np.shape:
         return False, float("inf"), float("inf")
     diff = np.abs(torch_np - gptrs_np)
@@ -26,11 +27,11 @@ def time_many(
     *,
     warmup: int,
     iters: int,
-    before_warmup: Optional[Callable[[], Any]] = None,
-    after_warmup: Optional[Callable[[], Any]] = None,
-    before_iters: Optional[Callable[[], Any]] = None,
-    after_iters: Optional[Callable[[], Any]] = None,
-) -> List[float]:
+    before_warmup: Callable[[], Any] | None = None,
+    after_warmup: Callable[[], Any] | None = None,
+    before_iters: Callable[[], Any] | None = None,
+    after_iters: Callable[[], Any] | None = None,
+) -> list[float]:
     if warmup > 0 and before_warmup is not None:
         before_warmup()
     for _ in range(warmup):
@@ -40,7 +41,7 @@ def time_many(
 
     if before_iters is not None:
         before_iters()
-    times: List[float] = []
+    times: list[float] = []
     for _ in range(iters):
         t0 = time.perf_counter()
         run_once()
@@ -51,7 +52,7 @@ def time_many(
 
 
 def bench_stats(
-    times_s: List[float],
+    times_s: list[float],
     *,
     units_per_iter: float,
     impl: str,
@@ -71,7 +72,7 @@ def validation_result(
     gptrs_np: np.ndarray,
     rtol: float,
     atol: float,
-    extra: Optional[Dict[str, Any]] = None,
+    extra: dict[str, Any] | None = None,
 ) -> ValidationResult:
     ok, max_abs, mean_abs = validate_arrays(torch_np, gptrs_np, rtol=rtol, atol=atol)
     return ValidationResult(

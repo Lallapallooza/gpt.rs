@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use gpt_rs::backend::spec::PortableBackend;
 use gpt_rs::module::Layer;
+use gpt_rs::nn::layers::Linear;
 use gpt_rs::tensor::DeviceTensor;
 
 use super::common::*;
@@ -42,10 +43,7 @@ fn run_linear_case<B: PortableBackend + 'static>(
                 .clone()
                 .map(|bias| ("proj.bias".to_string(), bias)),
         );
-        let layer = load_layer(backend, tensors, |p| {
-            p.linear("proj", in_features, out_features, bias)
-        })
-        .unwrap();
+        let layer = load_layer(backend, tensors, |p| p.scoped("proj", Linear::new)).unwrap();
         let input_device =
             DeviceTensor::from_host(Arc::clone(backend), input_host.clone()).unwrap();
         let output = layer.call(&input_device).unwrap();

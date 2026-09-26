@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 
 from ..core import BenchResult, CliRunResult, RunConfig
-from ..gptrs_py import debug_context, load_gpt_rs
+from ..gptrs_py import debug_context, hf_model_dir, load_gpt_rs
 from ..runner import bench_stats, time_many, validation_result
 
 
@@ -17,30 +17,14 @@ def torch_to_numpy(x: Any) -> np.ndarray:
 
 class VisionCaseBase:
     name: str
-    torch_impl_label: str
-    checkpoint_default: Any = None
 
     def supported_workloads(self) -> list[str]:
         return ["validate", "bench", "run"]
 
-    def _default_checkpoint(self) -> Any:
-        from pathlib import Path
-
+    def add_cli_args(self, parser: argparse.ArgumentParser) -> None:
         from ..registry import get_case_default_params
 
         defaults = get_case_default_params(self.name)
-        value = defaults.get("checkpoint")
-        if value is not None:
-            if isinstance(value, Path):
-                return value
-            return Path(str(value))
-        if self.checkpoint_default is not None:
-            return self.checkpoint_default
-        return Path(f"checkpoints/{self.name}.bin")
-
-    def add_cli_args(self, parser: argparse.ArgumentParser) -> None:
-        from pathlib import Path
-
         parser.add_argument("--batch", type=int, default=1, help="Batch size (default: 1)")
         parser.add_argument(
             "--image-size",
@@ -48,25 +32,26 @@ class VisionCaseBase:
             default=224,
             help="Input image size H=W (default: 224)",
         )
-        default_ckpt = self._default_checkpoint()
         parser.add_argument(
-            "--checkpoint",
-            type=Path,
-            default=default_ckpt,
-            help="Checkpoint path.",
+            "--hf-model",
+            default=defaults.get("hf_model"),
+            help="Hugging Face model id or local directory, loaded by gpt-rs and by Torch",
         )
 
-    def _build_torch_model(self, tvm: Any) -> Any:
-        raise NotImplementedError
+    def _torch_impl_label(self, cfg: RunConfig) -> str:
+        return f"transformers:{cfg.params['hf_model']}"
+
+    def _build_torch_model(self, cfg: RunConfig) -> Any:
+        import torch
+        from transformers import AutoModelForImageClassification
+
+        model = AutoModelForImageClassification.from_pretrained(
+            str(hf_model_dir(cfg)), dtype=torch.float32
+        )
+        return model.eval()
 
     def _build_models(self, cfg: RunConfig) -> tuple[Any, Any]:
-        try:
-            from torchvision import models as tvm  # type: ignore[import-not-found, import-untyped]
-        except ImportError as err:
-            raise SystemExit("torchvision is required (pip install torchvision).") from err
-
-        model_gpt = load_gpt_rs(cfg)
-        return self._build_torch_model(tvm).eval(), model_gpt
+        return self._build_torch_model(cfg), load_gpt_rs(cfg)
 
     def validate(self, cfg: RunConfig):
         import torch
@@ -83,7 +68,7 @@ class VisionCaseBase:
         x_torch = torch.from_numpy(x)
 
         with torch.no_grad():
-            torch_logits = torch_to_numpy(torch_model(x_torch))
+            torch_logits = torch_to_numpy(torch_model(pixel_values=x_torch).logits)
 
         with debug_context(cfg.params):
             gpt_logits = model_gpt.forward_vision(x).astype(np.float32, copy=False)
@@ -128,7 +113,7 @@ class VisionCaseBase:
 
         def run_torch_once() -> None:
             with torch.no_grad():
-                out = torch_model(x_torch)
+                out = torch_model(pixel_values=x_torch).logits
             _ = float(out.reshape(-1)[0].item())
 
         def run_gptrs_once() -> None:
@@ -154,7 +139,7 @@ class VisionCaseBase:
             unit_label="images",
             units_per_iter=units,
             gptrs=bench_stats(gptrs_times, units_per_iter=units, impl=f"gpt-rs/{cfg.backend}"),
-            torch=bench_stats(torch_times, units_per_iter=units, impl=self.torch_impl_label),
+            torch=bench_stats(torch_times, units_per_iter=units, impl=self._torch_impl_label(cfg)),
         )
 
     def run(self, cfg: RunConfig) -> CliRunResult:
@@ -163,7 +148,7 @@ class VisionCaseBase:
         np.random.seed(cfg.seed)
         torch.manual_seed(cfg.seed)
 
-        _torch_model, model_gpt = self._build_models(cfg)
+        model_gpt = load_gpt_rs(cfg)
 
         batch = int(cfg.params.get("batch", 1))
         image_size = int(cfg.params.get("image_size", 224))

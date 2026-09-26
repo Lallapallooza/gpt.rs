@@ -5,7 +5,8 @@ use gpt_rs::backend::spec::Program;
 use gpt_rs::backend::text_ir::parse_program;
 use gpt_rs::inference::generate::Generator;
 use gpt_rs::inference::sampler::Sampler;
-use gpt_rs::io::tensor_archive::TensorArchive;
+use gpt_rs::io::safetensors;
+use gpt_rs::model::config::ModelRuntimeConfig;
 use gpt_rs::ops::trace::{self, FileTraceOptions, FileTraceSink, ProgramDumpFilter};
 use gpt_rs::params::ModelNamespaceId;
 use gpt_rs::profiling;
@@ -20,7 +21,6 @@ use gpt_rs_backend_faer::FaerCpuBackend;
 use gpt_rs_backend_triton::TritonBackend;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
-use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -47,10 +47,21 @@ fn load_checkpoint<B: PortableBackend + 'static>(
 ) -> Result<ModelHandle<B>> {
     let options = runtime::LoadOptions {
         namespace: Some(model_namespace_for_backend(backend.as_ref())),
-        matmul_input_dtype: load.matmul_input_dtype,
+        runtime: ModelRuntimeConfig {
+            matmul_input_dtype: load.matmul_input_dtype,
+            ..ModelRuntimeConfig::default()
+        },
+        ..runtime::LoadOptions::default()
     };
     runtime::load_model_with_options(Arc::clone(backend), checkpoint, options)
         .with_context(|| format!("failed to load checkpoint {}", checkpoint.display()))
+}
+
+/// Loads `tokenizer`, or else the `tokenizer.json` of the model directory `checkpoint`.
+fn load_tokenizer(checkpoint: &Path, tokenizer: Option<&Path>) -> Result<Tokenizer> {
+    let path = tokenizer.map_or_else(|| checkpoint.join("tokenizer.json"), Path::to_path_buf);
+    Tokenizer::from_file(&path)
+        .with_context(|| format!("failed to load tokenizer {}", path.display()))
 }
 
 fn install_dump_sink(path: &Path, dump_mode: DumpMode) -> Result<trace::TraceGuard> {
@@ -185,8 +196,7 @@ enum Command {
 /// Checkpoint loading options shared by every command that loads a model.
 #[derive(ClapArgs, Clone)]
 struct LoadArgs {
-    /// Input dtype of the projection matmuls (f32 or bf16). Overrides the checkpoint runtime
-    /// config.
+    /// Input dtype of the projection matmuls (f32 or bf16).
     #[arg(long, value_name = "DTYPE")]
     matmul_input_dtype: Option<gpt_rs::DType>,
 }
@@ -194,14 +204,16 @@ struct LoadArgs {
 /// Model, prompt and sampling options of the causal generation commands.
 #[derive(ClapArgs, Clone)]
 struct CausalArgs {
-    #[arg(long, default_value = "checkpoints/gpt2.bin")]
+    /// Hugging Face model directory.
+    #[arg(long)]
     checkpoint: PathBuf,
 
     #[command(flatten)]
     load: LoadArgs,
 
-    #[arg(long, default_value = "configs/gpt2_tokenizer.json")]
-    tokenizer: PathBuf,
+    /// Tokenizer (`tokenizer.json`) [default: tokenizer.json in the model directory].
+    #[arg(long)]
+    tokenizer: Option<PathBuf>,
 
     #[arg(long, default_value = "Hello")]
     prompt: String,
@@ -253,7 +265,7 @@ impl CausalArgs {
                 )
             })?
             .context_length();
-        let tokenizer = Tokenizer::from_file(&self.tokenizer)?;
+        let tokenizer = load_tokenizer(&self.checkpoint, self.tokenizer.as_deref())?;
         let prompt_tokens = tokenizer.encode(&self.prompt)?;
         ensure!(
             !prompt_tokens.is_empty(),
@@ -375,6 +387,7 @@ struct BenchmarkArgs {
 
 #[derive(ClapArgs, Clone)]
 struct VisionInputArgs {
+    /// Safetensors file that holds the input tensor (`--input-key`).
     #[arg(long)]
     input: Option<PathBuf>,
 
@@ -394,18 +407,19 @@ struct VisionInputArgs {
 
 #[derive(ClapArgs, Clone)]
 struct ForwardArgs {
-    /// Model checkpoint (self-describing `GPTRSCHK`).
+    /// Hugging Face model directory.
     #[arg(long)]
     checkpoint: PathBuf,
 
     #[command(flatten)]
     load: LoadArgs,
 
-    /// Tokenizer config to use with `--prompt`.
+    /// Tokenizer (`tokenizer.json`) for `--prompt` [default: tokenizer.json in the model
+    /// directory].
     #[arg(long)]
     tokenizer: Option<PathBuf>,
 
-    /// Text prompt (requires `--tokenizer`).
+    /// Text prompt.
     #[arg(long)]
     prompt: Option<String>,
 
@@ -416,7 +430,7 @@ struct ForwardArgs {
     #[command(flatten)]
     vision: VisionInputArgs,
 
-    /// Optional output tensor archive path for logits ("logits" tensor).
+    /// Safetensors file to write the logits to (tensor "logits").
     #[arg(long)]
     out: Option<PathBuf>,
 }
@@ -449,10 +463,10 @@ struct PatternsArgs {
 
 fn load_vision_input_tensor(args: &VisionInputArgs) -> Result<Tensor> {
     if let Some(path) = args.input.as_ref() {
-        let tensors = TensorArchive::load(path)?;
+        let tensors = safetensors::load(path)?;
         let input = tensors.get(&args.input_key).ok_or_else(|| {
             anyhow!(
-                "input archive {} missing tensor '{}'",
+                "input file {} has no tensor '{}'",
                 path.display(),
                 args.input_key
             )
@@ -1193,11 +1207,7 @@ fn run_forward<B: PortableBackend + 'static>(
     }
 
     let input = if let Some(prompt) = args.prompt.as_ref() {
-        let tokenizer_path = args
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| anyhow!("--prompt requires --tokenizer"))?;
-        let tokenizer = Tokenizer::from_file(tokenizer_path)?;
+        let tokenizer = load_tokenizer(&args.checkpoint, args.tokenizer.as_deref())?;
         let tokens = tokenizer.encode(prompt)?;
         ensure!(
             !tokens.is_empty(),
@@ -1244,10 +1254,8 @@ fn run_forward<B: PortableBackend + 'static>(
     eprintln!("wall_s={:.3}", elapsed.as_secs_f64());
 
     if let Some(out) = args.out.as_ref() {
-        let mut map = HashMap::new();
-        map.insert("logits".to_string(), host);
-        TensorArchive::save(out, &map)
-            .with_context(|| format!("failed to write output archive {}", out.display()))?;
+        safetensors::save(out, [("logits", &host)])
+            .with_context(|| "failed to write output tensors")?;
     }
 
     Ok(())

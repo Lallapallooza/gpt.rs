@@ -362,10 +362,8 @@ impl HostLinear {
     }
 
     pub fn layer<B: PortableBackend + 'static>(&self, backend: &Arc<B>) -> Linear<B> {
-        let (in_features, out_features) = (self.in_features, self.out_features);
-        let bias = self.bias.is_some();
         load_layer(backend, self.tensors("proj"), |p| {
-            p.linear("proj", in_features, out_features, bias)
+            p.scoped("proj", Linear::new)
         })
         .unwrap()
     }
@@ -381,15 +379,50 @@ impl HostLinear {
     }
 }
 
+/// Host weights of a `Conv1D`: an `[in, out]` weight and a bias.
+pub struct HostConv1D {
+    in_features: usize,
+    out_features: usize,
+    weight: Tensor,
+    bias: Tensor,
+}
+
+impl HostConv1D {
+    pub fn random(rng: &mut StdRng, in_features: usize, out_features: usize) -> Self {
+        let weight = tensor_from_vec(
+            &[in_features, out_features],
+            random_vec(rng, in_features * out_features),
+        );
+        let bias = tensor_from_vec(&[out_features], random_vec(rng, out_features));
+        Self {
+            in_features,
+            out_features,
+            weight,
+            bias,
+        }
+    }
+
+    pub fn tensors(&self, prefix: &str) -> Vec<(String, Tensor)> {
+        vec![
+            (format!("{prefix}.weight"), self.weight.clone()),
+            (format!("{prefix}.bias"), self.bias.clone()),
+        ]
+    }
+
+    pub fn torch(&self, input: &TchTensor) -> TchTensor {
+        let weight =
+            tch_tensor_from_vec(&[self.in_features, self.out_features], self.weight.data());
+        let bias = tch_tensor_from_vec(&[self.out_features], self.bias.data());
+        bias.addmm(input, &weight)
+    }
+}
+
 pub fn embedding_layer<B: PortableBackend + 'static>(
     backend: &Arc<B>,
     weight: Tensor,
 ) -> Embedding<B> {
-    let &[num_embeddings, dim] = weight.shape().dims() else {
-        panic!("embedding table must be 2D");
-    };
     load_layer(backend, [("embed.weight".to_string(), weight)], |p| {
-        p.embedding("embed", num_embeddings, dim)
+        p.scoped("embed", Embedding::new)
     })
     .unwrap()
 }
@@ -400,12 +433,14 @@ pub fn layer_norm_layer<B: PortableBackend + 'static>(
     bias: Tensor,
     eps: f32,
 ) -> LayerNorm<B> {
-    let dim = weight.shape().dims()[0];
     let tensors = [
         ("norm.weight".to_string(), weight),
         ("norm.bias".to_string(), bias),
     ];
-    load_layer(backend, tensors, |p| p.layer_norm("norm", dim, eps)).unwrap()
+    load_layer(backend, tensors, |p| {
+        p.scoped("norm", |p| LayerNorm::new(p, eps))
+    })
+    .unwrap()
 }
 
 pub fn rms_norm_layer<B: PortableBackend + 'static>(
@@ -413,9 +448,8 @@ pub fn rms_norm_layer<B: PortableBackend + 'static>(
     weight: Tensor,
     config: RmsNormConfig,
 ) -> RmsNorm<B> {
-    let dim = weight.shape().dims()[0];
     load_layer(backend, [("norm.weight".to_string(), weight)], |p| {
-        p.rms_norm("norm", dim, config)
+        p.scoped("norm", |p| RmsNorm::new(p, config))
     })
     .unwrap()
 }

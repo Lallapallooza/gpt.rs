@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use gpt_rs::backend::spec::PortableBackend;
 use gpt_rs::module::Layer;
+use gpt_rs::nn::layers::Linear;
 use gpt_rs::ops::functional::{self, LayerNormResult, RmsNormResult};
 use gpt_rs::tensor::DType;
 use tch::{Kind, Tensor as TchTensor};
@@ -777,7 +778,7 @@ fn run_linear_case<B: PortableBackend + 'static>(
         let x_d = device_tensor_from_data(backend, &[rows, in_features], &x);
         let w = crate::tensor_as(&[out_features, in_features], &w, weight_dtype);
         let mut layer = load_layer(backend, [("proj.weight".to_string(), w)], |p| {
-            p.linear("proj", in_features, out_features, false)
+            p.scoped("proj", Linear::new)
         })
         .unwrap();
         layer.input_dtype = bf16_inputs.then_some(DType::BF16);

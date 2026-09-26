@@ -16,7 +16,7 @@ Each category answers a different question:
 
 - **"Does capture/validation behave correctly?"** -> `crates/gpt-rs/tests/`
 - **"Do backend kernels produce the same numbers as Torch?"** -> backend suites
-- **"Do full models match torchvision/HF end-to-end?"** -> Python scripts
+- **"Do full models match Hugging Face end-to-end?"** -> Python scripts
 
 ## 1) gpt-rs crate tests (PTIR inspection)
 
@@ -170,8 +170,8 @@ Example:
   "default": { "atol": 5e-4, "rtol": 1e-4 },
   "rules": [
     { "backend": "faer", "atol": 1.5e-3, "rtol": 2e-4 },
-    { "test": "torch_feed_forward_*", "atol": 1.5e-3 },
-    { "backend": "faer", "test": "torch_feed_forward_*", "atol": 2e-3, "rtol": 2e-4 }
+    { "test": "torch_attention_kv_cache_*", "atol": 1.5e-3 },
+    { "backend": "faer", "test": "torch_attention_kv_cache_*", "atol": 2e-3, "rtol": 2e-4 }
   ]
 }
 ```
@@ -197,7 +197,7 @@ source of truth.
 
 ## 3) Python model validation scripts
 
-For end-to-end model checks (e.g., torchvision ResNet/MobileNet), use the
+For end-to-end model checks against Hugging Face `transformers`, use the
 scripts under `scripts/`. These are intentionally *not* part of `cargo test`,
 because they depend on Python packages, the `gpt_rs` Python bindings, and external model downloads.
 
@@ -209,8 +209,8 @@ uv pip install maturin
 cd crates/gpt-rs-py && uv run maturin develop --release --features faer && cd ../..
 ```
 
-The canonical entrypoint is `scripts/eval.py`, which runs both gpt-rs and a
-Torch baseline for:
+The canonical entrypoint is `scripts/eval.py`, which runs both gpt-rs and a Torch baseline on the
+same Hugging Face checkpoint (`--hf-model`, a Hub id or a local directory) for:
 
 - `validate`: compare logits
 - `bench`: compare throughput/latency
@@ -220,23 +220,18 @@ Examples:
 ```bash
 uv run python scripts/eval.py --model resnet34 --workload validate
 uv run python scripts/eval.py --model gpt2 --workload bench --threads 1 4 --bench-tokens 1 64
-uv run python scripts/eval.py --model ministral_3_3b_instruct_2512 --workload validate \
-  --checkpoint checkpoints/ministral_3_3b_instruct_2512.bin \
-  --torch-model mistralai/Ministral-3-3B-Instruct-2512
+uv run python scripts/eval.py --model ministral_3_3b_instruct_2512 --workload validate
 uv run python scripts/eval.py --suite scripts/eval_suites/vision.json
 ```
 
 Qwen3.5 models, for example `Qwen/Qwen3.8-27B`, mix Gated DeltaNet and gated attention layers.
-The exporter writes their weight matrices as bf16. `--backend c` needs the extension built with
-`conversion-c` (`uv run python scripts/rebuild_py.py --features faer,conversion-c`):
+`--num-layers N` runs only the first N decoder layers in gpt-rs and in the Torch baseline.
+`--backend c` needs the extension built with `conversion-c`
+(`uv run python scripts/rebuild_py.py --features faer,conversion-c`):
 
 ```bash
-uv run python scripts/export.py export --exporter qwen3_8_27b \
-  --checkpoint-out checkpoints/qwen3_8_27b.bin \
-  --config-out configs/qwen3_8_27b_model.json \
-  --tokenizer-out configs/qwen3_8_27b_tokenizer.json
 uv run python scripts/eval.py --model qwen3_8_27b --workload validate --backend c \
-  --checkpoint checkpoints/qwen3_8_27b.bin --prompt-tokens 300 --generate-tokens 3
+  --prompt-tokens 300 --generate-tokens 3
 uv run python scripts/eval.py --model qwen3_8_27b --workload bench --backend c --threads 8 \
   --matmul-input-dtype bf16 --prompt-tokens 256 --bench-tokens 8
 ```
@@ -268,7 +263,6 @@ Notes:
   #   cd crates/gpt-rs-py && uv run maturin develop --release --features faer,profiler
   uv run python scripts/eval.py --model gpt2 --workload run \
     --prompt "Hi" --max-tokens 128 --temperature 0.8 \
-    --checkpoint checkpoints/gpt2.bin --tokenizer configs/gpt2_tokenizer.json \
     --backend faer --kv-cache \
     --dump-dir dumps/gpt2_ptir_new_e --dump-mode all \
     --profile
@@ -278,8 +272,8 @@ Legacy wrapper scripts have been removed; use `scripts/eval.py` directly with
 `--workload validate|bench|run`.
 
 For Ministral text runs, `scripts/eval.py --model ministral_3_3b_instruct_2512 --workload run`
-uses the Hugging Face tokenizer (not `gpt_rs.Tokenizer.from_file`) and can decode generated output
-without converting to the GPT-2 tokenizer format.
+tokenizes with the checkpoint's `transformers` `AutoTokenizer`, because `gpt_rs.Tokenizer` does not
+support the `ignore_merges` option that its `tokenizer.json` sets.
 
 ### Debugging knobs (env vars)
 
@@ -299,6 +293,9 @@ with the same debugging hooks:
 - `--profile` to print gpt-rs profiler tables
 - `--backend` (or `GPTRS_BACKEND`) to choose a backend (default: `faer`)
 
+`--checkpoint` takes a local Hugging Face model directory, for example one fetched with
+`uv run hf download gpt2 --local-dir checkpoints/gpt2 --include "*.json" --include "model*.safetensors"`.
+
 ### Text generation (any causal LM)
 
 ```bash
@@ -306,8 +303,7 @@ cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- generate \
   --prompt "Hi" \
   --max-tokens 128 \
   --temperature 0.8 \
-  --checkpoint checkpoints/gpt2.bin \
-  --tokenizer configs/gpt2_tokenizer.json \
+  --checkpoint checkpoints/gpt2 \
   --dump-dir dumps/gpt2_ptir \
   --dump-mode compile \
   --profile
@@ -315,20 +311,11 @@ cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- generate \
 
 ### Forward pass (vision models today)
 
-First export weights from Torch into a gpt.rs checkpoint:
+Download the checkpoint and run the model. The CLI generates a deterministic random input unless
+you pass `--input`, a safetensors file:
 
 ```bash
-uv run python scripts/export.py export --exporter ministral_3_3b_instruct_2512 \
-  --checkpoint-out checkpoints/ministral_3_3b_instruct_2512.bin \
-  --config-out configs/ministral_3_3b_instruct_2512_model.json \
-  --tokenizer-out configs/ministral_3_3b_instruct_2512_tokenizer.json
-uv run python scripts/export.py export --exporter resnet34 --checkpoint-out checkpoints/resnet34.bin
-uv run python scripts/export.py export --exporter mobilenet_v2 --checkpoint-out checkpoints/mobilenet_v2.bin
-```
-
-Then run the model (generates a deterministic random input unless you pass `--input`):
-
-```bash
-cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- forward --checkpoint checkpoints/resnet34.bin --profile
-cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- forward --checkpoint checkpoints/mobilenet_v2.bin --profile
+uv run hf download microsoft/resnet-34 --local-dir checkpoints/resnet-34 \
+  --include "*.json" --include "model*.safetensors"
+cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- forward --checkpoint checkpoints/resnet-34 --profile
 ```

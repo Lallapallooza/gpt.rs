@@ -1,83 +1,72 @@
-# File formats: checkpoints and tensor archives
+# File formats: checkpoints and tensor files
 
-This repo uses two small, indexed binary formats:
-
-- **Checkpoint**: `GPTRSCHK` (model config + tensors, random-access by name/id)
-- **Tensor archive**: `GPTRSTEN` (named tensor bundle for inputs/outputs/traces)
+gpt.rs reads Hugging Face model directories as they are published, with no conversion step, and
+uses safetensors for every other tensor file.
 
 Source of truth is the code:
-- Checkpoints: `crates/gpt-rs/src/checkpoint/*` and `scripts/gptrs_eval/checkpoint.py`
-- Tensor archives: `crates/gpt-rs/src/io/tensor_archive.rs`
-- Shared index and payload layout: `crates/gpt-rs/src/io/tensor_index.rs`
+- Checkpoint readers: `crates/gpt-rs/src/checkpoint/` (the `Checkpoint` trait and
+  `checkpoint::open`)
+- Safetensors reading and writing: `crates/gpt-rs/src/io/safetensors.rs`
 
-## Checkpoint (`GPTRSCHK`, v2)
+## Checkpoints: Hugging Face model directories
 
-High-level layout:
+`runtime::load_model(backend, model_dir)` loads a directory with:
 
-```
-magic[8] = "GPTRSCHK"
-version[u32] = 2
-config_len[u32]
-config_json[config_len]
-index_len[u32]
-index_bytes[index_len]
-data_bytes[...]
-```
+- `config.json`. Its `model_type` (the `text_config` one for a multimodal checkpoint) is the model
+  kind that picks the Rust model in `crates/gpt-rs/src/model/registry.rs`. The loader passes the
+  config to that model, which reads only the keys that its config struct declares.
+- `model.safetensors`, or the shards that `model.safetensors.index.json` lists. The loader ignores
+  other weight files, such as Mistral's `consolidated.safetensors`.
+- `generation_config.json` (optional). Its `eos_token_id` values end generation, as do those of
+  `config.json`.
 
-### `config_json`
+`gpt-rs-cli` reads `tokenizer.json` from the model directory by default. The CLI and
+`gpt_rs.Tokenizer` read byte-level BPE files such as GPT-2's and Qwen's, but not Ministral's.
 
-JSON object matching `crates/gpt-rs/src/model/config.rs::ModelConfig`:
+`uv run hf download <repo> --include "*.json" --include "model*.safetensors"` or
+`huggingface_hub.snapshot_download` fetches such a directory.
 
-- `kind`: string (e.g. `"gpt"`, `"ministral"`, `"resnet34"`)
-- `config`: model-specific JSON payload. For the decoder models, this is the Hugging Face text config,
-  which multimodal checkpoints nest under `text_config`. The model reads only the keys that its
-  config struct declares.
-- `runtime` (optional): runtime-only knobs, `ModelRuntimeConfig` in the same file. See
-  [runtime.md](runtime.md).
-- `eos_token_ids` (optional): token ids that end a generated sequence. The Python exporters write the
-  Hugging Face `eos_token_id` values here.
+### How tensors load
 
-### `index_bytes`
+- Tensors keep their Hugging Face names. A decoder model also finds tensors saved without its
+  `DecoderConfig::BASE_MODEL_PREFIX` (GPT-2's `transformer`), as `transformers` does.
+- A multimodal checkpoint loads as its text model. The vision tower is not loaded. The text model
+  is:
+  - the `text_config`, with the top-level `tie_word_embeddings` when the text config has none;
+  - the text decoder's tensors, renamed from `model.language_model.` or `language_model.model.` to
+    `model.`;
+  - `lm_head.weight`.
+- 2-D float tensors (projection and embedding matrices) keep their stored dtype. Other float tensors
+  load as f32. FP8 (`F8_E4M3`) weights with a per-tensor `<name>_scale_inv` are dequantized to the
+  dtype of the scale, as `transformers` does. An FP8 scale of another shape is a load error. The
+  `activation_scale` tensors are not loaded. Tensors in dtypes the runtime does not have, such as
+  BatchNorm's int64 `num_batches_tracked`, are not loaded.
+- Tensors stored in their load dtype reach the backend as views of the memory-mapped file. A backend
+  that runs on host memory may use them without a copy (`PortableBackend::materialize_external`).
+  Converted tensors are copies.
 
-Little-endian binary index enabling random access:
+`load_model_with_options` also takes runtime settings and config overrides
+([runtime.md](runtime.md)).
 
-```
-tensor_count[u32]
-repeat tensor_count times:
-  name_len[u32]
-  name_bytes[name_len]          // UTF-8; parameter naming rules enforce ASCII in Rust module traversal
-  stored_base_id[u128]          // may be 0 (meaning "not stored"; loader computes from name)
-  rank[u32]
-  dims[rank * u64]
-  dtype_tag[u32]
-  reserved[u8]
-  offset_abs[u64]
-  byte_len[u64]
-```
+### Adding a format
 
-The Rust loader computes `BaseParamId` from the name (and validates `stored_base_id` if it is non-zero).
-Readers ignore `reserved`. The Python writer stores a `requires_grad` flag there.
+A format implements `checkpoint::Checkpoint`: the model config (Hugging Face `model_type`, config,
+and end-of-sequence ids), the tensors under their Hugging Face names, and each tensor's
+little-endian bytes in its load dtype. Add the reader to `checkpoint::open`. A format whose names or
+config keys differ from Hugging Face's (for example GGUF) maps them in its reader, so models see
+only Hugging Face names.
 
-### `data_bytes`
+## Parameter names and layouts
 
-Raw tensor payloads:
+The Rust modules mirror the Hugging Face modules, so parameter names are the module paths that
+`Module::visit_params` yields and match the checkpoint names (see "How tensors load"). `nn::Linear`
+is PyTorch's `nn.Linear`: `weight: [out_features, in_features]`, `y = x @ weight^T + bias`.
+`nn::Conv1D` is GPT-2's `Conv1D`: `weight: [in_features, out_features]`, `y = x @ weight + bias`.
+The language-model head reuses the token embedding weight when `tie_word_embeddings` is true. When
+`config.json` omits the key, the default of the Hugging Face config class applies (true for
+`GPT2Config`).
 
-- Little-endian, row-major (C-order) bytes for the tensor's logical shape.
-- `dtype_tag`: `0 = f32`, `1 = f16`, `2 = bf16`, `3 = i32` (`crates/gpt-rs/src/tensor/dtype.rs`).
-- Both writers align every payload to 64 bytes. They write `<path>.tmp` and then rename it over
-  `path`, so processes that memory-mapped the previous file keep a valid mapping.
-- Readers check each entry's byte length against its shape and dtype, and its range against the file
-  size.
-
-### Parameter names and layouts
-
-Checkpoints mirror the Hugging Face text models. Tensor names are the module paths that
-`Module::visit_params` yields. Projections use the PyTorch `nn.Linear` layout
-`weight: [out_features, in_features]`, and `nn::Linear` computes `x @ weight^T + bias`. Exporters
-copy tensors unchanged apart from dtype. They strip multimodal prefixes (`model.language_model.`
-becomes `model.`). They always write `lm_head.weight`, also for tied embeddings.
-
-The decoder models (`gpt`, `ministral`, `qwen3_5`) share the Llama-style names:
+The Ministral and Qwen3.5 decoders share the Llama-style names:
 
 | Tensor | Shape |
 |---|---|
@@ -89,13 +78,9 @@ The decoder models (`gpt`, `ministral`, `qwen3_5`) share the Llama-style names:
 | `model.norm.weight` | `[hidden]` |
 | `lm_head.weight` | `[vocab, hidden]` |
 
-- `gpt` (GPT-2): LayerNorms and every projection also have a `.bias`. The learned positions are
-  `model.embed_positions.weight` (`[context, hidden]`). The MLP is not gated and has only
-  `mlp.up_proj` and `mlp.down_proj`. The config's `activation_function` is the Hugging Face name of
-  the MLP activation. The exporter transposes GPT-2's `Conv1D` weights, which GPT-2 stores as
-  `[in, out]`, and splits the fused `attn.c_attn` into `q_proj`, `k_proj` and `v_proj`.
-- `ministral`: RMSNorm scales, no biases.
-- `qwen3_5`: RMSNorm weights are zero-centred, and the graph computes the scale `1 + weight`.
+- `ministral3`: RMSNorm scales, no biases.
+- `qwen3_5_text`: RMSNorm weights are zero-centred, and the graph computes the scale `1 + weight`.
+  The model builds one layer for each of the first `num_hidden_layers` entries of `layer_types`.
   Full-attention layers add `self_attn.q_norm` and `self_attn.k_norm`, and their `q_proj` emits
   `[query, gate]` per head. Linear-attention layers have these tensors under `linear_attn.`:
   - the projections `in_proj_qkv`, `in_proj_z`, `in_proj_b`, `in_proj_a` and `out_proj`
@@ -104,47 +89,22 @@ The decoder models (`gpt`, `ministral`, `qwen3_5`) share the Llama-style names:
   - `A_log` (the graph computes the decay `-exp(A_log)`)
   - `norm.weight` (a plain RMSNorm scale)
 
-  The exporter stores matrices as bf16 (`--weight-dtype`) and every other tensor as f32.
+GPT-2 (`gpt2`) has the `GPT2LMHeadModel` modules `transformer.wte`, `transformer.wpe`,
+`transformer.h.{i}.{ln_1,attn.c_attn,attn.c_proj,ln_2,mlp.c_fc,mlp.c_proj}`, and `transformer.ln_f`.
+Each has a `.weight` and a `.bias`, except `wte` and `wpe`, which have only a `.weight`.
+`attn.c_attn` projects to the fused `[query, key, value]`.
 
-The vision models keep the torchvision names, with BatchNorm folded into the convolutions. Their
-`fc` / `classifier` weights use the same `[out, in]` layout.
+The vision models (`resnet`, `mobilenet_v2`) have the names of `ResNetForImageClassification` and
+`MobileNetV2ForImageClassification`. Convolutions keep the PyTorch `[out, in / groups, kh, kw]`
+layout. BatchNorm loads its `weight`, `bias`, `running_mean`, and `running_var`.
 
-## Tensor archive (`GPTRSTEN`, v2)
+## Tensor files
 
-Tensor archives are used for:
+The CLI reads vision inputs (`gpt-rs-cli forward --input ... --input-key input`) and writes logits
+(`--out`) as safetensors, which `safetensors.numpy.load_file` and `safetensors.torch.load_file`
+read.
 
-- CLI vision inputs (`gpt-rs-cli forward --input ... --input-key input`)
-- Optional CLI logits output (`gpt-rs-cli forward --out ...`)
-
-Layout:
-
-```
-magic[8] = "GPTRSTEN"
-version[u32] = 2
-index_len[u32]
-index_bytes[index_len]
-data_bytes[...]
-```
-
-Index entry layout is the checkpoint format *without* config/base_id:
-
-```
-tensor_count[u32]
-repeat tensor_count times:
-  name_len[u32]
-  name_bytes[name_len]
-  rank[u32]
-  dims[rank * u64]
-  dtype_tag[u32]
-  reserved[u8]
-  offset_abs[u64]
-  byte_len[u64]
-```
-
-Tensor archives share these rules with checkpoints: the dtype tags, the 64-byte payload alignment,
-the write-then-rename, and the reader checks.
-
-## Parameter identity and streaming (why it stays flexible)
+## Parameter identity and streaming
 
 Key ideas (see `crates/gpt-rs/src/params.rs`):
 
@@ -155,7 +115,9 @@ Key ideas (see `crates/gpt-rs/src/params.rs`):
 
 Streaming path:
 
-- `runtime::load_model` wraps checkpoint tensors as `DeviceTensor::lazy_param(...)`, storing:
+- With weight streaming on (`LoadOptions.runtime.weight_streaming`),
+  `runtime::load_model_with_options` wraps checkpoint tensors as `DeviceTensor::lazy_param(...)`,
+  storing:
   - `base_id` (for loading bytes) and
   - `stable_id` (the `ParamKey`, used for caching and backend resolvers).
 - When a param is first needed, the tensor's `ParamSource<B>` loads it by `BaseParamId`.

@@ -5,6 +5,7 @@ use gpt_rs::backend::pattern::OperationView;
 use gpt_rs::backend::rewriter::ProgramRewriter;
 use gpt_rs::backend::spec::{Function, Operation, Program};
 use gpt_rs::module::Layer;
+use gpt_rs::nn::layers::{LayerNorm, Linear};
 use gpt_rs::ops::functional;
 use gpt_rs::ops::functional::activation::SoftmaxLastDimPattern;
 use gpt_rs::tensor::{DeviceTensor, Shape, Tensor};
@@ -24,7 +25,7 @@ fn linear_forward_lowers_to_dot_bias_custom_call() {
         ("fc.bias".to_string(), Tensor::zeros(Shape::new([4]))),
     ];
     let linear =
-        load_layer(&backend, tensors, |p| p.linear("fc", 3, 4, true)).expect("linear init");
+        load_layer(&backend, tensors, |p| p.scoped("fc", Linear::new)).expect("linear init");
     let input = DeviceTensor::from_host(
         Arc::clone(&backend),
         Tensor::from_vec(Shape::new([2, 3]), vec![1.0; 6]).expect("input tensor"),
@@ -94,8 +95,10 @@ fn layer_norm_lowers_to_layer_norm_custom_call() {
         ("norm.weight".to_string(), Tensor::ones(Shape::new([4]))),
         ("norm.bias".to_string(), Tensor::zeros(Shape::new([4]))),
     ];
-    let layer_norm =
-        load_layer(&backend, tensors, |p| p.layer_norm("norm", 4, 1e-5)).expect("layer norm init");
+    let layer_norm = load_layer(&backend, tensors, |p| {
+        p.scoped("norm", |p| LayerNorm::new(p, 1e-5))
+    })
+    .expect("layer norm init");
     let input = DeviceTensor::from_host(
         Arc::clone(&backend),
         Tensor::from_vec(Shape::new([2, 4]), vec![0.25; 8]).expect("input tensor"),

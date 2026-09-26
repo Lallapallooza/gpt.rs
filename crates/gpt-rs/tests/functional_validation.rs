@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use gpt_rs::ops::functional::{self, DecodeKvCache};
+use gpt_rs::ops::functional::{self, DecodeKvCache, WeightLayout};
 use gpt_rs::tensor::{DType, DeviceTensor, Shape, Tensor};
 use gpt_rs_backend_ref_cpu::CpuPortableBackend;
 use gpt_rs_backend_tests::tensor_as;
@@ -65,8 +65,31 @@ fn linear_rejects_in_features_mismatch() {
     let x = filled(&backend, &[2, 4], 0.0);
     let host = tensor_as(&[3, 5], &[0.0; 15], DType::BF16);
     let w = DeviceTensor::from_host(Arc::clone(&backend), host).unwrap();
-    let err = functional::linear(&x, &w).expect_err("mismatched in_features must be rejected");
+    let err = functional::linear(&x, &w, WeightLayout::OutIn)
+        .expect_err("mismatched in_features must be rejected");
     assert!(err.to_string().contains("in_features"), "{err}");
+}
+
+#[test]
+fn linear_in_out_contracts_the_first_weight_axis() {
+    let backend = Arc::new(CpuPortableBackend::new());
+    let tensor = |dims: [usize; 2], data: Vec<f32>| {
+        let host = Tensor::from_vec(Shape::new(dims), data).unwrap();
+        DeviceTensor::from_host(Arc::clone(&backend), host).unwrap()
+    };
+    let x = tensor([2, 4], (1..=8).map(|v| v as f32).collect());
+    let w = tensor([4, 3], (1..=12).map(|v| v as f32).collect());
+    let y = functional::linear(&x, &w, WeightLayout::InOut).unwrap();
+    let y = y.to_host().unwrap();
+    assert_eq!(y.shape().dims(), [2, 3]);
+    // x @ w with w row-major [in, out], computed by hand.
+    assert_eq!(y.data(), [70.0, 80.0, 90.0, 158.0, 184.0, 210.0]);
+    let err = functional::linear(&x, &w, WeightLayout::OutIn)
+        .expect_err("an [in, out] weight read as [out, in] must be rejected");
+    assert_eq!(
+        err.to_string(),
+        "linear: weight in_features 3 must match x in_features 4"
+    );
 }
 
 fn error_of<T>(result: anyhow::Result<T>) -> String {
@@ -88,11 +111,19 @@ fn validation_messages_name_the_functional_and_the_argument() {
     let indices = DeviceTensor::from_host(Arc::clone(&backend), indices).unwrap();
 
     assert_eq!(
-        error_of(functional::linear(&f32(&[4]), &f32(&[3, 4]))),
+        error_of(functional::linear(
+            &f32(&[4]),
+            &f32(&[3, 4]),
+            WeightLayout::OutIn
+        )),
         "linear: x must have rank 2, got [4]"
     );
     assert_eq!(
-        error_of(functional::linear(&indices, &f32(&[3, 4]))),
+        error_of(functional::linear(
+            &indices,
+            &f32(&[3, 4]),
+            WeightLayout::OutIn
+        )),
         "linear: x must have dtype F32 | BF16, got I32"
     );
     assert_eq!(
@@ -109,5 +140,22 @@ fn validation_messages_name_the_functional_and_the_argument() {
     assert_eq!(
         error_of(functional::add_bias(&f32(&[2, 4]), &f32(&[5]))),
         "add_bias: bias must have last dimension 4, got [5]"
+    );
+}
+
+#[test]
+fn batch_norm_rejects_statistics_of_another_channel_count() {
+    let backend = Arc::new(CpuPortableBackend::new());
+    let f32 = |shape: &[usize]| filled(&backend, shape, 0.5);
+    assert_eq!(
+        error_of(functional::batch_norm(
+            &f32(&[1, 2, 2, 4]),
+            &f32(&[4]),
+            &f32(&[4]),
+            &f32(&[4]),
+            &f32(&[3]),
+            1e-5,
+        )),
+        "batch_norm: running_var must have last dimension 4, got [3]"
     );
 }

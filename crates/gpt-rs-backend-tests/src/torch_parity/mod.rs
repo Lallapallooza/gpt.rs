@@ -1,9 +1,9 @@
 pub mod arithmetic;
 pub mod attention;
 pub mod common;
+pub mod conv1d_layer;
 pub mod elementwise_fusion;
 pub mod embedding_layer;
-pub mod feed_forward_layer;
 pub mod functional_ops;
 pub mod gated_feed_forward_layer;
 pub mod harness;
@@ -14,4 +14,5 @@ pub mod matmul;
 pub mod multi_head_attention_layer;
 pub mod rms_norm_layer;
 pub mod rotary_ops;
+pub mod vision_layers;
 pub mod vision_ops;

@@ -7,8 +7,10 @@ If anything here stops matching the code, fix it or delete it.
 
 ## Add a model (checkpoint-loadable)
 
-Goal: make `runtime::load_model(backend, checkpoint_path)` construct your model from a self-describing
-checkpoint (`GPTRSCHK`) and expose it through the dynamic capability API used by `gpt-rs-cli`.
+Goal: make `runtime::load_model(backend, model_dir)` construct your model from its Hugging Face
+model directory and expose it through the dynamic capability API used by `gpt-rs-cli`. The model's
+`KIND` is the Hugging Face `model_type`, and its parameter names are the Hugging Face names, so the
+published checkpoint loads unchanged.
 
 A decoder-only text model only describes its structure:
 
@@ -16,11 +18,18 @@ A decoder-only text model only describes its structure:
    `pub type YourModel<B> = CausalDecoder<B, YourConfig>` (see `model/ministral.rs`). The config
    struct holds the keys of the Hugging Face text config that the model reads, under their Hugging
    Face names.
-2. Implement `inference::decoder::DecoderConfig` for the config: `KIND` and `layout()`. `layout()`
-   validates the config and returns a `DecoderLayout`. To add a new kind of mixer, MLP or norm, add a
-   variant to the enums in `nn/layers/decoder_block.rs`.
+2. Implement `inference::decoder::DecoderConfig` for the config: `KIND`, `BASE_MODEL_PREFIX`,
+   `context_length`, `tie_word_embeddings`, the base model type `Model`, and `base_model`, which
+   builds it.
+   - A Llama-style decoder uses `DecoderModel` and builds it from the `DecoderLayout` that the
+     config returns after validation (see `MinistralConfig::layout`). To add a new kind of token
+     mixer, add it to `MixerConfig` and `Mixer` in `nn/layers/decoder_block.rs`, with their match
+     arms.
+   - A model with another Hugging Face module tree declares that tree as `#[nn::module]` structs
+     (see "Write a layer" below) and implements `inference::decoder::BaseModel` for its base model
+     (see `model/gpt.rs`).
 3. Register `decoder::build_from_model_config::<B, YourConfig>` in `model/registry.rs`.
-4. Add the exporter and baseline as in step 6 below.
+4. Add the eval case as in step 6 below.
 
 `CausalDecoder` implements the rest.
 
@@ -32,47 +41,62 @@ Other models follow the full checklist:
    "Write a layer" below). Mirror the module tree of the source framework, so that the field names
    are the parameter names.
    - Use NHWC/NCHW conventions explicitly (see "Layouts" below).
-3. Add `load(params: &mut nn::LayerLoader<'_, B>, ...)` builders that load each block under its
-   prefix:
-   - `nn::LayerLoader` checks shapes and applies `runtime.matmul_input_dtype`. A loader from `LayerLoader::random` initialises the parameters
-     randomly.
+3. Give each block a constructor `new(p: &mut nn::Params<B>, ...)` in its `#[nn::module]` impl:
+   - Each field initializer of a `Self { .. }` literal reads its tensors under the field's name.
+     For the field `up_proj` of a block at `model.layers.0.mlp`, `Linear::new(p)?` reads
+     `model.layers.0.mlp.up_proj.weight`.
+   - Shapes come from the checkpoint. Pass only what the tensors do not hold, such as a stride or
+     an epsilon.
+   - `p.optional(build)` builds a sublayer that the checkpoint may leave out. `p.each(items, build)`
+     builds the entries of a `ModuleList`.
    - Name parameters after the modules of the source framework
      ([formats.md](formats.md#parameter-names-and-layouts)).
-   - The registry factory receives `get: &mut dyn FnMut(&str) -> Result<DeviceTensor<B>>`. It returns
-     a lazily loaded parameter tensor for each checkpoint name. Wrap it in `LayerLoader::new`.
+   - The registry factory receives `get: &mut dyn FnMut(&str) -> Result<Option<DeviceTensor<B>>>`.
+     `get` returns the parameter tensor of a checkpoint name, or `None` when the checkpoint has no
+     such tensor. Wrap it in `Params::new`, and pass `runtime.matmul_input_dtype` to
+     `with_linear_input_dtype`.
 4. Implement `runtime::LoadedModel<B>` for your model:
-   - `kind()` must match `ModelConfig.kind` stored in the checkpoint.
+   - `kind()` must match the checkpoint's `model_type`.
    - `forward(ModelInput)` returns `ModelOutput`. Run the model with `Layer::call`.
    - If applicable, expose capabilities:
      - Causal LM generation: return `Some(self)` from `as_causal_lm()`.
 5. Register the model factory:
    - Add it to `model_factories()` in `crates/gpt-rs/src/model/registry.rs`.
-6. Add a checkpoint exporter and baseline:
-   - For Torch models, add/update a spec under `scripts/exporters/specs/` and wire eval metadata.
-   - Ensure `scripts/eval.py --model <kind> --workload validate` can run end-to-end.
+6. Add an eval case:
+   - Add a case class under `scripts/gptrs_eval/models/`.
+   - List it in `scripts/gptrs_eval/registry.py`, with its Hugging Face repo as the `hf_model`
+     default.
+   - Ensure `scripts/eval.py --model <case> --workload validate` can run end-to-end.
 
 ## Write a layer
 
 Goal: a reusable module that owns parameters and calls portable functionals. A layer is a struct
 and an impl that holds its `forward`. Mark both with `#[nn::module]` (see
-`crates/gpt-rs/src/nn/layers/feed_forward.rs` and the macro's documentation):
+`crates/gpt-rs/src/nn/layers/gated_feed_forward.rs` and the macro's documentation):
 
 ```rust
 #[nn::module]
-pub struct FeedForward {
+pub struct GatedFeedForward {
+    pub gate_proj: Linear,
     pub up_proj: Linear,
-    pub activation: Activation,
     pub down_proj: Linear,
 }
 
 #[nn::module]
-impl FeedForward {
-    pub fn load(params: &mut LayerLoader<'_, B>, prefix: &str, /* dims */) -> Result<Self> { ... }
+impl GatedFeedForward {
+    pub fn new(p: &mut Params<B>) -> Result<Self> {
+        Ok(Self {
+            gate_proj: Linear::new(p)?,
+            up_proj: Linear::new(p)?,
+            down_proj: Linear::new(p)?,
+        })
+    }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let gate = self.gate_proj(x)?;
         let up = self.up_proj(x)?;
-        let act = self.activation(&up)?;
-        self.down_proj(&act)
+        let hidden = functional::swiglu(&gate, &up)?;
+        self.down_proj(&hidden)
     }
 }
 ```
@@ -86,10 +110,11 @@ impl FeedForward {
   pass a tuple: `self.self_attn((x, cache, positions))`. The call runs inside the profiler scope of
   the sublayer. Run `Vec` elements and enum variants with `layer.call(args)` (`module::Layer`).
 - Call functionals with tensors only (`functional::gelu(&x)`). The tensors carry the backend.
-- Build layers only through `load` functions and `nn::LayerLoader`, including in tests
+- Build layers only through their constructors and `nn::Params`, including in tests
   (`gpt_rs_backend_tests::load_layer`).
 - Use `DeviceTensorOps` for math (`x.add(&y)?`, ...) and `nn::Linear` for projections (PyTorch
-  `[out_features, in_features]` weights).
+  `[out_features, in_features]` weights), or `nn::Conv1D` where the source module is a
+  `transformers` `Conv1D` (`[in_features, out_features]` weights).
 - Avoid host materialization in forward paths (no `.to_host()?` inside layers).
 
 ## Write a functional (portable kernel)
@@ -153,7 +178,9 @@ Key types live in `crates/gpt-rs/src/params.rs`:
 
 What makes it "streaming":
 
-- `runtime::load_model` builds `DeviceTensor::lazy_param(...)` handles for checkpoint weights.
+- With weight streaming on (`LoadOptions.runtime.weight_streaming`),
+  `runtime::load_model_with_options` builds `DeviceTensor::lazy_param(...)` handles for checkpoint
+  weights.
 - The underlying `ParamSource` (e.g. checkpoint reader) only loads a tensor when the backend needs it.
 - Backends can cache derived formats (packed weights, layouts) in `PortableBackend::param_resolver()`,
   keyed by the stable param id, without leaking backend-specific code into models.

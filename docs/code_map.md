@@ -10,8 +10,9 @@ design docs; it just tells you "where to look".
 - `crates/gpt-rs/src/ops/graph/`: graph arena + plan cache + optimizer hooks.
 - `crates/gpt-rs/src/backend/`: PTIR spec + backend hook points.
 - `crates/gpt-rs/src/nn/layers/`: layers built from functionals. Each layer is declared with
-  `#[nn::module]` (`crates/gpt-rs-macros/src/nn_module.rs`) and built by `nn::LayerLoader`
-  (`nn/loader.rs`). The `Module` and `Layer` traits live in `crates/gpt-rs/src/module.rs`.
+  `#[nn::module]` (`crates/gpt-rs-macros/src/nn_module.rs`) and built from checkpoint tensors
+  through `nn::Params` (`nn/params.rs`). The `Module` and `Layer` traits live in
+  `crates/gpt-rs/src/module.rs`.
 - `crates/gpt-rs/src/model/`: model configs and assemblies. `registry.rs` maps each checkpoint
   `kind` to its builder.
 - `crates/gpt-rs/src/inference/`: the shared causal decoder (`decoder.rs`), KV caches, generation

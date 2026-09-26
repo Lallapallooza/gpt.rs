@@ -3,13 +3,12 @@ from __future__ import annotations
 import argparse
 import time
 from dataclasses import replace
-from pathlib import Path
-from typing import Any, Dict, List, Tuple, cast
+from typing import Any, cast
 
 import numpy as np
 
-from ..core import CliRunResult, RunConfig, as_path, encode_prompt, resolve_torch_dtype
-from ..gptrs_py import debug_context, load_gpt_rs
+from ..core import CliRunResult, RunConfig, encode_prompt, resolve_torch_dtype
+from ..gptrs_py import debug_context, hf_model_dir, load_gpt_rs
 from ..registry import get_case_default_params
 from ..runner import validation_result
 
@@ -25,25 +24,14 @@ class MinistralCase:
     def add_cli_args(self, parser: argparse.ArgumentParser) -> None:
         defaults = get_case_default_params(self.name)
         prompt_default = str(defaults.get("prompt", "Hello"))
-        torch_model_default = str(defaults.get("torch_model", _DEFAULT_MODEL_ID))
-        checkpoint_default = as_path(
-            defaults.get("checkpoint"),
-            Path("checkpoints/ministral_3_3b_instruct_2512.bin"),
-        )
         trust_remote_code_default = bool(defaults.get("trust_remote_code", False))
         torch_dtype_default = str(defaults.get("torch_dtype", "float32"))
 
         parser.add_argument("--prompt", default=prompt_default, help="Prompt text.")
         parser.add_argument(
-            "--torch-model",
-            default=torch_model_default,
-            help="Hugging Face model id for Torch baseline/tokenizer.",
-        )
-        parser.add_argument(
-            "--checkpoint",
-            type=Path,
-            default=checkpoint_default,
-            help="Checkpoint path.",
+            "--hf-model",
+            default=str(defaults.get("hf_model", _DEFAULT_MODEL_ID)),
+            help="Hugging Face model id or local directory, loaded by gpt-rs and by Torch.",
         )
         parser.add_argument(
             "--max-prompt-tokens",
@@ -86,35 +74,35 @@ class MinistralCase:
         from transformers import AutoTokenizer
 
         return AutoTokenizer.from_pretrained(
-            str(cfg.params.get("torch_model", _DEFAULT_MODEL_ID)),
+            hf_model_dir(cfg),
             trust_remote_code=bool(cfg.params.get("trust_remote_code", False)),
         )
 
-    def _build_hf(self, cfg: RunConfig) -> Tuple[Any, Any]:
+    def _build_hf(self, cfg: RunConfig) -> tuple[Any, Any]:
         import torch
         from transformers import AutoConfig, AutoModelForCausalLM
 
-        torch_model_id = str(cfg.params.get("torch_model", _DEFAULT_MODEL_ID))
+        model_dir = hf_model_dir(cfg)
         trust_remote_code = bool(cfg.params.get("trust_remote_code", False))
         torch_dtype = resolve_torch_dtype(str(cfg.params.get("torch_dtype", "float32")))
 
-        model_kwargs: Dict[str, Any] = {"trust_remote_code": trust_remote_code}
+        model_kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code}
         if torch_dtype != "auto":
             model_kwargs["torch_dtype"] = torch_dtype
 
-        config = AutoConfig.from_pretrained(torch_model_id, trust_remote_code=trust_remote_code)
+        config = AutoConfig.from_pretrained(model_dir, trust_remote_code=trust_remote_code)
         model_type = str(getattr(config, "model_type", "")).lower()
         if model_type == "mistral3":
             from transformers import Mistral3ForConditionalGeneration
 
             torch_model = cast(
                 Any,
-                Mistral3ForConditionalGeneration.from_pretrained(torch_model_id, **model_kwargs),
+                Mistral3ForConditionalGeneration.from_pretrained(model_dir, **model_kwargs),
             )
         else:
             torch_model = cast(
                 Any,
-                AutoModelForCausalLM.from_pretrained(torch_model_id, **model_kwargs),
+                AutoModelForCausalLM.from_pretrained(model_dir, **model_kwargs),
             )
         torch_model.eval()
         torch_model.to(cfg.torch_device)
@@ -139,7 +127,7 @@ class MinistralCase:
 
         prompt_tokens = encode_prompt(tokenizer, prompt, max_prompt_tokens)
 
-        def hf_logits(tokens: List[int]) -> np.ndarray:
+        def hf_logits(tokens: list[int]) -> np.ndarray:
             input_ids = torch.tensor(tokens, dtype=torch.long, device=cfg.torch_device).unsqueeze(0)
             with torch.no_grad():
                 out = torch_model(input_ids=input_ids)
@@ -170,7 +158,7 @@ class MinistralCase:
             "requested_generate_tokens": generate_tokens,
             "hf_top1": int(np.argmax(hf_row)),
             "gpt_rs_top1": int(np.argmax(rs_row)),
-            "torch_model": str(cfg.params.get("torch_model", _DEFAULT_MODEL_ID)),
+            "hf_model": str(cfg.params["hf_model"]),
         }
         res = validation_result(
             model=self.name,

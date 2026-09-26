@@ -40,7 +40,7 @@ fn run_gated_feed_forward_case<B: PortableBackend + 'static>(
             down.tensors("mlp.down_proj"),
         ];
         let layer = load_layer(backend, tensors.concat(), |p| {
-            GatedFeedForward::load(p, "mlp", embed_dim, hidden_dim, bias)
+            p.scoped("mlp", GatedFeedForward::new)
         })
         .unwrap();
         let input = device_tensor_from_data(backend, &[batch, embed_dim], &input);

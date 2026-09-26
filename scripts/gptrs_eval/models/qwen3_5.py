@@ -6,26 +6,25 @@ import json
 import statistics
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
-from ..checkpoint import hf_text_tensor_names, read_config
 from ..core import (
     BenchResult,
     BenchStats,
     CliRunResult,
     RunConfig,
     ValidationResult,
-    as_path,
     encode_prompt,
 )
-from ..gptrs_py import debug_context, gpt_rs_module, load_gpt_rs
+from ..gptrs_py import debug_context, gpt_rs_module, hf_model_dir, load_gpt_rs
 from ..registry import get_case_default_params
 from ..runner import bench_stats, time_many, validation_result
-from ..safetensors_source import SafetensorsSource, resolve_model_dir
+from ..safetensors_source import SafetensorsSource
 
 _DEFAULT_MODEL_ID = "Qwen/Qwen3.8-27B"
 _DEFAULT_MAX_REL_DIFF = 1e-3
@@ -40,7 +39,7 @@ def _hf_text_config(model_dir: Path, num_layers: int) -> Any:
     cfg = Qwen3_5TextConfig(**text)
     if num_layers > cfg.num_hidden_layers:
         raise ValueError(
-            f"checkpoint has {num_layers} layers, but the HF model has {cfg.num_hidden_layers}"
+            f"requested {num_layers} layers, but the HF model has {cfg.num_hidden_layers}"
         )
     cfg.num_hidden_layers = num_layers
     cfg.layer_types = list(cfg.layer_types or ())[:num_layers]
@@ -55,7 +54,7 @@ def hf_reference_logits(model_dir: Path, tokens: list[int], num_layers: int) -> 
 
     Each `Qwen3_5DecoderLayer` is built on the meta device, filled from the safetensors shards,
     applied and released, so only one layer's float32 weights are in memory at a time.
-    `num_layers` truncates the decoder stack to match truncated gpt-rs exports.
+    `num_layers` truncates the decoder stack.
     """
 
     import torch
@@ -68,11 +67,12 @@ def hf_reference_logits(model_dir: Path, tokens: list[int], num_layers: int) -> 
     dtype = torch.float32
     cfg = _hf_text_config(model_dir, num_layers)
     source = SafetensorsSource(model_dir)
-    names = hf_text_tensor_names(source.weight_map)
+    # Multimodal checkpoints keep the text decoder under `model.language_model.`.
+    prefix = "model.language_model." if "model.language_model.norm.weight" in source else "model."
 
     with torch.no_grad():
         ids = torch.tensor(tokens, dtype=torch.long)
-        embed = source.get(names["model.embed_tokens.weight"])
+        embed = source.get(f"{prefix}embed_tokens.weight")
         hidden = embed.index_select(0, ids).to(dtype).unsqueeze(0)
         del embed
         positions = torch.arange(len(tokens), dtype=torch.long).unsqueeze(0)
@@ -83,7 +83,7 @@ def hf_reference_logits(model_dir: Path, tokens: list[int], num_layers: int) -> 
             with torch.device("meta"):
                 layer = Qwen3_5DecoderLayer(cfg, layer_idx)
             weights = {
-                name: source.get(names[f"model.layers.{layer_idx}.{name}"]).to(dtype)
+                name: source.get(f"{prefix}layers.{layer_idx}.{name}").to(dtype)
                 for name in layer.state_dict()
             }
             layer.load_state_dict(weights, strict=True, assign=True)
@@ -97,11 +97,11 @@ def hf_reference_logits(model_dir: Path, tokens: list[int], num_layers: int) -> 
             del layer, weights
 
         norm = Qwen3_5RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
-        norm.load_state_dict({"weight": source.get(names["model.norm.weight"]).to(dtype)})
+        norm.load_state_dict({"weight": source.get(f"{prefix}norm.weight").to(dtype)})
         normed = norm(hidden)[0]
 
         tied = bool(cfg.tie_word_embeddings)
-        lm_head = source.get(names["model.embed_tokens.weight" if tied else "lm_head.weight"])
+        lm_head = source.get(f"{prefix}embed_tokens.weight" if tied else "lm_head.weight")
         rows: list[Any] = []
         block = 16384
         for start in range(0, lm_head.shape[0], block):
@@ -169,14 +169,16 @@ class Qwen35Case:
         defaults = get_case_default_params(self.name)
         parser.add_argument("--prompt", default=str(defaults.get("prompt", "Hello")))
         parser.add_argument(
-            "--torch-model",
-            default=str(defaults.get("torch_model", _DEFAULT_MODEL_ID)),
-            help="Hugging Face model id or local directory (reference weights and tokenizer).",
+            "--hf-model",
+            default=str(defaults.get("hf_model", _DEFAULT_MODEL_ID)),
+            help="Hugging Face model id or local directory, loaded by gpt-rs and by the reference.",
         )
         parser.add_argument(
-            "--checkpoint",
-            type=Path,
-            default=as_path(defaults.get("checkpoint"), Path("checkpoints/qwen3_8_27b.bin")),
+            "--num-layers",
+            type=int,
+            default=0,
+            help="Run only the first N decoder layers, in gpt-rs and in the reference "
+            "(default: 0 = all).",
         )
         parser.add_argument(
             "--max-prompt-tokens",
@@ -215,8 +217,7 @@ class Qwen35Case:
             "--matmul-input-dtype",
             choices=["f32", "bf16"],
             default=None,
-            help="gpt-rs projection matmul input precision (default: the checkpoint runtime "
-            "config, else f32).",
+            help="gpt-rs projection matmul input precision (default: f32).",
         )
         parser.add_argument(
             "--max-rel-diff",
@@ -236,13 +237,19 @@ class Qwen35Case:
         )
 
     def _gpt_rs_model(self, cfg: RunConfig) -> Any:
-        return load_gpt_rs(cfg, matmul_input_dtype=cfg.params.get("matmul_input_dtype"))
+        return load_gpt_rs(
+            cfg,
+            matmul_input_dtype=cfg.params.get("matmul_input_dtype"),
+            config_overrides={"num_hidden_layers": self._num_layers(cfg)},
+        )
 
     def _num_layers(self, cfg: RunConfig) -> int:
-        header = read_config(Path(cfg.params["checkpoint"]))
-        if header.get("kind") != "qwen3_5":
-            raise ValueError(f"checkpoint kind {header.get('kind')!r} is not qwen3_5")
-        return len(header["config"]["layer_types"])
+        """`--num-layers`, or every layer of the checkpoint."""
+        requested = int(cfg.params.get("num_layers") or 0)
+        if requested > 0:
+            return requested
+        raw = json.loads((hf_model_dir(cfg) / "config.json").read_text(encoding="utf-8"))
+        return int(raw.get("text_config", raw)["num_hidden_layers"])
 
     def _prompt(self, cfg: RunConfig, model_dir: Path) -> tuple[Any, str, list[int]]:
         """HF tokenizer, the prompt text, chat-templated when requested, and the prompt ids."""
@@ -264,7 +271,7 @@ class Qwen35Case:
 
     def validate(self, cfg: RunConfig) -> ValidationResult:
         """Compares logits, greedy continuation and tokenizer with the streamed float32 HF reference."""
-        model_dir = resolve_model_dir(str(cfg.params["torch_model"]))
+        model_dir = hf_model_dir(cfg)
         num_layers = self._num_layers(cfg)
         tokenizer, text, tokens = self._prompt(cfg, model_dir)
         chat_text = _prompt_text(tokenizer, str(cfg.params["prompt"]), chat=True)
@@ -340,7 +347,7 @@ class Qwen35Case:
         from torch._dynamo.utils import counters
         from transformers import Qwen3_5ForCausalLM
 
-        model_dir = resolve_model_dir(str(cfg.params["torch_model"]))
+        model_dir = hf_model_dir(cfg)
         num_layers = self._num_layers(cfg)
         _, _, tokens = self._prompt(cfg, model_dir)
         steps = int(cfg.params.get("bench_tokens", 32))
@@ -426,12 +433,12 @@ class Qwen35Case:
                 "prompt_len": len(tokens),
                 "bench_tokens": steps,
                 "num_layers": num_layers,
-                "matmul_input_dtype": cfg.params.get("matmul_input_dtype") or "checkpoint",
+                "matmul_input_dtype": cfg.params.get("matmul_input_dtype") or "f32",
             },
         )
 
     def run(self, cfg: RunConfig) -> CliRunResult:
-        tokenizer, _, tokens = self._prompt(cfg, resolve_model_dir(str(cfg.params["torch_model"])))
+        tokenizer, _, tokens = self._prompt(cfg, hf_model_dir(cfg))
         rs_model = self._gpt_rs_model(cfg)
         max_tokens = int(cfg.params.get("max_tokens", 64))
         temperature = float(cfg.params.get("temperature", 0.0))

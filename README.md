@@ -32,18 +32,7 @@ uv pip install maturin
 uv --project "$(pwd)" --directory "$(pwd)/crates/gpt-rs-py" run \
   maturin develop --release --features conversion-c
 
-# Export fresh v2 checkpoints:
-uv run python scripts/export.py export --exporter gpt2 \
-  --checkpoint-out checkpoints/gpt2.bin \
-  --config-out configs/gpt2_model.json --tokenizer-out configs/gpt2_tokenizer.json
-uv run python scripts/export.py export --exporter ministral_3_3b_instruct_2512 \
-  --checkpoint-out checkpoints/ministral_3_3b_instruct_2512.bin \
-  --config-out configs/ministral_3_3b_instruct_2512_model.json \
-  --tokenizer-out configs/ministral_3_3b_instruct_2512_tokenizer.json
-uv run python scripts/export.py export --exporter resnet34 --checkpoint-out checkpoints/resnet34.bin
-uv run python scripts/export.py export --exporter mobilenet_v2 --checkpoint-out checkpoints/mobilenet_v2.bin
-
-# Bench:
+# Bench (gpt.rs and Torch load the same Hugging Face checkpoints):
 GPTRS_C_CACHE_DIR=./.cache/gpt_rs_c_backend uv run python scripts/eval.py \
   --model resnet34 --workload bench --backend c --threads 1 --warmup 1 --iters 2 --batch 1 --image-size 224
 GPTRS_C_CACHE_DIR=./.cache/gpt_rs_c_backend uv run python scripts/eval.py \
@@ -65,7 +54,7 @@ Start here:
 - [docs/howto.md](docs/howto.md) (add models/layers/functionals/backends)
 - [docs/runtime.md](docs/runtime.md) (loader, capability dispatch)
 - [docs/testing.md](docs/testing.md) (Torch parity + dumps/profiling + Python baselines)
-- [docs/formats.md](docs/formats.md) (checkpoint + tensor archive formats)
+- [docs/formats.md](docs/formats.md) (Hugging Face checkpoints + safetensors tensor files)
 
 Reference:
 - [docs/backends/README.md](docs/backends/README.md) (how each backend works: ref-cpu, faer, c)
@@ -75,7 +64,7 @@ Reference:
 - [docs/frontend.md](docs/frontend.md) (frontend layering)
 
 Scripts:
-- [scripts/README.md](scripts/README.md) (Python utilities: export + eval)
+- [scripts/README.md](scripts/README.md) (Python utilities: eval against Torch)
 
 ## Roadmap (TODO)
 
@@ -121,7 +110,7 @@ Misc
 - `crates/gpt-rs-cli`: model runner CLI (`generate` / `forward`) with dump/profile hooks.
 - `crates/gpt-rs-backend-*`: backend implementations (faer, ref-cpu, optional C backend).
 - `crates/gpt-rs-backend-tests`: backend suite + Torch parity harness (via `tch` / libtorch).
-- `scripts/`: Python baselines and exporters (`scripts/eval.py`, `scripts/export.py`).
+- `scripts/`: Python baselines against Torch (`scripts/eval.py`).
 
 ## Architecture (high level)
 
@@ -129,7 +118,7 @@ Misc
 inputs (tokens / images)
         |
         v
-  model::* (Gpt, ResNet34, MobileNetV2, ...)
+  model::* (Gpt, ResNet, MobileNetV2, ...)
         |
         v
    nn::layers::* (Linear, LayerNorm, Attention, Conv2d, ...)
@@ -153,37 +142,26 @@ cargo build
 # explore the CLI surface
 cargo run -p gpt-rs-cli -- --help
 
-# run GPT-2 generation (checkpoint + tokenizer)
-# export the checkpoint/tokenizer with: `uv run python scripts/export.py export --exporter gpt2 --help`
-cargo run --release -p gpt-rs-cli -- generate --prompt "Hello" --max-tokens 64 \
-  --checkpoint checkpoints/gpt2.bin --tokenizer configs/gpt2_tokenizer.json
-
-# export Ministral artifacts (checkpoint + config + HF tokenizer json)
-uv run python scripts/export.py export --exporter ministral_3_3b_instruct_2512 \
-  --checkpoint-out checkpoints/ministral_3_3b_instruct_2512.bin \
-  --config-out configs/ministral_3_3b_instruct_2512_model.json \
-  --tokenizer-out configs/ministral_3_3b_instruct_2512_tokenizer.json
-
-# run Ministral generation in pure Rust CLI (release build)
-cargo run --release -p gpt-rs-cli -- generate \
-  --checkpoint checkpoints/ministral_3_3b_instruct_2512.bin \
-  --tokenizer configs/ministral_3_3b_instruct_2512_tokenizer.json \
-  --prompt "Hello" \
-  --max-tokens 32 \
-  --backend faer
-
-# validate Ministral checkpoint against Torch
-uv run python scripts/eval.py --model ministral_3_3b_instruct_2512 --workload validate \
-  --checkpoint checkpoints/ministral_3_3b_instruct_2512.bin \
-  --torch-model mistralai/Ministral-3-3B-Instruct-2512
-
-# export torchvision weights (gpt.rs checkpoint)
+# download Hugging Face checkpoints, which gpt.rs loads as published
 uv sync
-uv run python scripts/export.py export --exporter resnet34 --checkpoint-out checkpoints/resnet34.bin
-uv run python scripts/export.py export --exporter mobilenet_v2 --checkpoint-out checkpoints/mobilenet_v2.bin
+uv run hf download gpt2 --local-dir checkpoints/gpt2 \
+  --include "*.json" --include "model*.safetensors"
+uv run hf download mistralai/Ministral-3-3B-Instruct-2512 \
+  --local-dir checkpoints/ministral-3-3b --include "*.json" --include "model*.safetensors"
+uv run hf download microsoft/resnet-34 --local-dir checkpoints/resnet-34 \
+  --include "*.json" --include "model*.safetensors"
+
+# run generation (the tokenizer defaults to the model directory's tokenizer.json)
+cargo run --release -p gpt-rs-cli -- generate --prompt "Hello" --max-tokens 64 \
+  --checkpoint checkpoints/gpt2
+
+# the CLI cannot read Ministral's tokenizer.json, so validate Ministral against Torch with
+# scripts/eval.py on the local copy
+uv run python scripts/eval.py --model ministral_3_3b_instruct_2512 --workload validate \
+  --hf-model checkpoints/ministral-3-3b
 
 # run an image model (deterministic random input by default)
-cargo run --release -p gpt-rs-cli -- forward --checkpoint checkpoints/resnet34.bin
+cargo run --release -p gpt-rs-cli -- forward --checkpoint checkpoints/resnet-34
 ```
 
 ## Torch Baselines (Python)
@@ -197,9 +175,7 @@ cd crates/gpt-rs-py && uv run maturin develop --release --features faer && cd ..
 
 uv run python scripts/eval.py --model resnet34 --workload validate
 uv run python scripts/eval.py --model gpt2 --workload bench --threads 1 4 --bench-tokens 1 64
-uv run python scripts/eval.py --model ministral_3_3b_instruct_2512 --workload validate \
-  --checkpoint checkpoints/ministral_3_3b_instruct_2512.bin \
-  --torch-model mistralai/Ministral-3-3B-Instruct-2512
+uv run python scripts/eval.py --model ministral_3_3b_instruct_2512 --workload validate
 ```
 
 Notes:
@@ -221,8 +197,8 @@ Torch parity tests live under `crates/gpt-rs-backend-tests/src/torch_parity/` an
 
 ## Status
 
-Forward inference for causal LMs (`gpt`, `ministral`, `qwen3_5`) and image classification models
-(`resnet34`, `mobilenet_v2`) is implemented, with portable PTIR kernels and Torch baselines
+Forward inference for causal LMs (`gpt2`, `ministral3`, `qwen3_5_text`) and image classification
+models (`resnet`, `mobilenet_v2`) is implemented, with portable PTIR kernels and Torch baselines
 for correctness.
 
 The functional layer exposes portable math (elementwise ops, matmul, normalization, attention, conv/pool) via the

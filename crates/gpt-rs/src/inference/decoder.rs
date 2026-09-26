@@ -1,14 +1,13 @@
 //! The decoder-only causal language model that every text model uses.
 //!
-//! A model contributes only its configuration ([`DecoderConfig`]). This module implements
-//! prefill, decoding and cache management once for all models. The modules mirror the Hugging
-//! Face `*ForCausalLM` tree, which names the parameters and the module outputs that
-//! [`crate::nn::capture`] records.
+//! A model contributes its configuration ([`DecoderConfig`]) and its base model ([`BaseModel`]).
+//! [`CausalDecoder`] adds the `lm_head` and implements prefill, decoding and cache management once
+//! for all models. The modules mirror the Hugging Face `*ForCausalLM` tree, which names the
+//! parameters and the module outputs that [`crate::nn::capture`] records.
 
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, ensure, Result};
-use rand::RngCore;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -17,14 +16,14 @@ use crate::backend::spec::{DecodeSampleRequest, PortableBackend};
 use crate::model::ModelConfig;
 use crate::module::Layer;
 use crate::nn::{
-    self, capture, AttentionPositions, DecoderBlock, Embedding, LayerLoader, Linear, MixerConfig,
-    MlpConfig, Norm, NormConfig, RotaryEmbedding,
+    self, capture, AttentionPositions, DecoderBlock, Embedding, Linear, MixerConfig, Params,
+    RmsNorm, RmsNormConfig, RotaryEmbedding,
 };
 use crate::ops::functional::slice_along_axis;
 use crate::ops::graph::context::{current_arena, push_default_arena};
 use crate::ops::graph::GraphArena;
 use crate::runtime::{LoadedModel, ModelInput, ModelOutput};
-use crate::tensor::{DeviceTensor, DeviceTensorOps, Shape, Tensor};
+use crate::tensor::{DeviceTensor, Shape, Tensor};
 
 /// Largest number of prompt tokens processed by one compiled forward program.
 ///
@@ -33,57 +32,100 @@ use crate::tensor::{DeviceTensor, DeviceTensorOps, Shape, Tensor};
 /// the attention scores and activations that one program holds.
 pub const PREFILL_CHUNK: usize = 256;
 
-/// Structure of a [`CausalDecoder`].
-#[derive(Debug, Clone)]
-pub struct DecoderLayout {
-    pub vocab_size: usize,
-    pub context_length: usize,
-    pub embed_dim: usize,
-    pub learned_positions: bool,
-    /// The two norms of each layer and `model.norm`.
-    pub norm: NormConfig,
-    /// Token mixer of each layer. The attention layers share one rotary embedding.
-    pub mixers: Vec<MixerConfig>,
-    pub mlp: MlpConfig,
+/// The base model of a [`CausalDecoder`]: the module tree from the token embeddings to the final
+/// norm, like a Hugging Face `*Model`. Its forward returns the final hidden states
+/// `[T, hidden_size]` of `tokens` at `position` and replaces the cache of each layer in `caches`
+/// with the cache after `tokens`.
+pub trait BaseModel<B: PortableBackend + 'static>:
+    for<'a> Layer<
+        B,
+        Args<'a> = (&'a [usize], usize, &'a mut [LayerCache<B>]),
+        Output = DeviceTensor<B>,
+    > + Send
+{
+    /// The token embedding, which a tied `lm_head` shares.
+    fn input_embeddings(&self) -> &Embedding<B>;
+
+    fn num_layers(&self) -> usize;
+
+    /// Empty caches of every layer on `backend`, with room for `capacity` positions.
+    fn empty_caches(&self, backend: &Arc<B>, capacity: usize) -> Result<Vec<LayerCache<B>>>;
 }
 
-/// Checkpoint configuration of a decoder model: its model kind and the layout it describes.
+/// Checkpoint configuration of a decoder model: its model kind and its base model.
 pub trait DecoderConfig: Serialize + DeserializeOwned + Send + 'static {
     const KIND: &'static str;
+    /// Module name of the base model in the `*ForCausalLM` tree, the `base_model_prefix` of
+    /// `transformers`.
+    const BASE_MODEL_PREFIX: &'static str;
 
-    /// Validates the configuration and maps it to the decoder structure.
-    fn layout(&self) -> Result<DecoderLayout>;
+    type Model<B: PortableBackend + 'static>: BaseModel<B>;
+
+    fn context_length(&self) -> usize;
+
+    fn tie_word_embeddings(&self) -> bool;
+
+    /// Validates the configuration and builds the base model.
+    fn base_model<B: PortableBackend + 'static>(&self, p: &mut Params<B>)
+        -> Result<Self::Model<B>>;
 }
 
 /// Decoder-only causal language model configured by `C`, laid out like a Hugging Face
-/// `*ForCausalLM`: the decoder `model` and the `lm_head` projection.
+/// `*ForCausalLM`: the base model, named [`DecoderConfig::BASE_MODEL_PREFIX`], and the `lm_head`
+/// projection.
 #[nn::module]
-pub struct CausalDecoder<C> {
+pub struct CausalDecoder<C: DecoderConfig> {
     #[module(config)]
     pub config: C,
     #[module(config)]
     vocab_size: usize,
     #[module(config)]
     context_length: usize,
-    pub model: DecoderModel,
+    #[module(rename = C::BASE_MODEL_PREFIX)]
+    pub base_model: C::Model,
     pub lm_head: Linear,
 }
 
-/// The decoder of a [`CausalDecoder`], the Hugging Face `model` module.
+/// Structure of a [`DecoderModel`].
+#[derive(Debug, Clone)]
+pub struct DecoderLayout {
+    /// The two norms of each layer and the final `norm`.
+    pub norm: RmsNormConfig,
+    /// Token mixer of each layer. The attention layers share one rotary embedding.
+    pub mixers: Vec<MixerConfig>,
+}
+
+/// Base model of the Llama-style decoders, the Hugging Face `model` module.
 #[nn::module]
 pub struct DecoderModel {
     pub embed_tokens: Embedding,
-    pub embed_positions: Option<Embedding>,
     pub layers: Vec<DecoderBlock>,
-    pub norm: Norm,
+    pub norm: RmsNorm,
     #[module(config)]
     pub rotary_emb: Option<RotaryEmbedding>,
 }
 
 #[nn::module]
 impl DecoderModel {
-    /// Returns the final hidden states `[T, embed_dim]` of `tokens` at `position` and updates
-    /// `caches`, one per layer.
+    pub fn new(p: &mut Params<B>, layout: DecoderLayout) -> Result<Self> {
+        let DecoderLayout { norm, mixers } = layout;
+        let mut ropes = mixers.iter().filter_map(|mixer| match mixer {
+            MixerConfig::Attention(attention) => Some(attention.rope),
+            MixerConfig::LinearAttention(_) => None,
+        });
+        let rope = ropes.next().flatten();
+        ensure!(
+            ropes.all(|other| other == rope),
+            "attention layers must share one rotary embedding"
+        );
+        Ok(Self {
+            embed_tokens: Embedding::new(p)?,
+            layers: p.each(&mixers, |p, mixer| DecoderBlock::new(p, norm, mixer))?,
+            norm: RmsNorm::new(p, norm)?,
+            rotary_emb: rope.map(RotaryEmbedding::new).transpose()?,
+        })
+    }
+
     fn forward(
         &self,
         tokens: &[usize],
@@ -91,7 +133,9 @@ impl DecoderModel {
         caches: &mut [LayerCache<B>],
     ) -> Result<Tensor> {
         let backend = self.embed_tokens.weight.backend();
-        let mut hidden = self.embed(&backend, tokens, position)?;
+        let token_indices = index_tensor(&backend, tokens.iter().copied())?;
+        let mut hidden = self.embed_tokens(&token_indices)?;
+        capture::record("embed_tokens", &hidden)?;
         let rotary = self.rotary_emb.as_ref();
         let positions = AttentionPositions::new(&backend, position, tokens.len(), rotary)?;
         for (layer, (block, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate() {
@@ -105,22 +149,22 @@ impl DecoderModel {
         capture::record("norm", &normed)?;
         Ok(normed)
     }
+}
 
-    /// Token embeddings of `tokens` at `position`, plus learned position embeddings when the
-    /// model has them.
-    fn embed(&self, backend: &Arc<B>, tokens: &[usize], position: usize) -> Result<Tensor> {
-        let token_indices = index_tensor(backend, tokens.iter().copied())?;
-        let Some(embed_positions) = &self.embed_positions else {
-            let hidden = self.embed_tokens(&token_indices)?;
-            capture::record("embed_tokens", &hidden)?;
-            return Ok(hidden);
-        };
-        let position_indices = index_tensor(backend, position..position + tokens.len())?;
-        let positions = embed_positions.call(&position_indices)?;
-        let hidden = self.embed_tokens(&token_indices)?;
-        capture::record("embed_tokens", &hidden)?;
-        capture::record("embed_positions", &positions)?;
-        hidden.add(&positions)
+impl<B: PortableBackend + 'static> BaseModel<B> for DecoderModel<B> {
+    fn input_embeddings(&self) -> &Embedding<B> {
+        &self.embed_tokens
+    }
+
+    fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn empty_caches(&self, backend: &Arc<B>, capacity: usize) -> Result<Vec<LayerCache<B>>> {
+        self.layers
+            .iter()
+            .map(|block| block.mixer.empty_cache(backend, capacity))
+            .collect()
     }
 }
 
@@ -128,74 +172,47 @@ impl DecoderModel {
 pub(crate) fn build_from_model_config<B: PortableBackend + 'static, C: DecoderConfig>(
     backend: Arc<B>,
     cfg: &ModelConfig,
-    get: &mut dyn FnMut(&str) -> Result<DeviceTensor<B>>,
+    get: &mut dyn FnMut(&str) -> Result<Option<DeviceTensor<B>>>,
 ) -> Result<Box<dyn LoadedModel<B>>> {
     let config: C = serde_json::from_value(cfg.config.clone())
         .map_err(|err| anyhow!("invalid {} config: {err}", C::KIND))?;
-    let mut params =
-        LayerLoader::new(backend, get).with_linear_input_dtype(cfg.runtime.matmul_input_dtype);
-    Ok(Box::new(CausalDecoder::build(config, &mut params)?))
+    let mut params = Params::new(backend, get)
+        .with_linear_input_dtype(cfg.runtime.matmul_input_dtype)
+        .with_base_model_prefix(C::BASE_MODEL_PREFIX);
+    Ok(Box::new(CausalDecoder::new(&mut params, config)?))
 }
 
-impl<B: PortableBackend + 'static, C: DecoderConfig> CausalDecoder<B, C> {
-    /// Randomly initialised model (see [`LayerLoader::random`]).
-    pub fn random(config: C, backend: Arc<B>, rng: &mut dyn RngCore) -> Result<Self> {
-        Self::build(config, &mut LayerLoader::random(backend, rng))
-    }
-
-    pub fn build(config: C, params: &mut LayerLoader<'_, B>) -> Result<Self> {
-        let DecoderLayout {
-            vocab_size,
-            context_length,
-            embed_dim: dim,
-            learned_positions,
-            norm,
-            mixers,
-            mlp,
-        } = config.layout()?;
-        let mut ropes = mixers.iter().filter_map(|mixer| match mixer {
-            MixerConfig::Attention(attention) => Some(attention.rope),
-            MixerConfig::LinearAttention(_) => None,
-        });
-        let rope = ropes.next().flatten();
-        ensure!(
-            ropes.all(|other| other == rope),
-            "attention layers must share one rotary embedding"
-        );
-        let layers = mixers
-            .iter()
-            .enumerate()
-            .map(|(layer, mixer)| {
-                let prefix = format!("model.layers.{layer}");
-                DecoderBlock::load(params, &prefix, dim, norm, mixer, mlp)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let embed_tokens = params.embedding("model.embed_tokens", vocab_size, dim)?;
-        let embed_positions = learned_positions
-            .then(|| params.embedding("model.embed_positions", context_length, dim))
-            .transpose()?;
-        let model = DecoderModel {
-            embed_tokens,
-            embed_positions,
-            layers,
-            norm: norm.load(params, "model.norm", dim)?,
-            rotary_emb: rope.map(RotaryEmbedding::new).transpose()?,
+#[nn::module]
+impl<C: DecoderConfig> CausalDecoder<C> {
+    pub fn new(p: &mut Params<B>, config: C) -> Result<Self> {
+        // A tied `lm_head` shares the token embedding, so the base model comes first.
+        let base_model = p.scoped(C::BASE_MODEL_PREFIX, |p| config.base_model(p))?;
+        let embeddings = &base_model.input_embeddings().weight;
+        let &[vocab_size, _] = embeddings.shape().dims() else {
+            bail!(
+                "token embeddings must be [vocab_size, hidden_size], got {:?}",
+                embeddings.shape().dims()
+            );
         };
         Ok(Self {
+            lm_head: if config.tie_word_embeddings() {
+                Linear::tied(embeddings, p.linear_input_dtype())
+            } else {
+                Linear::new(p)?
+            },
             vocab_size,
-            context_length,
-            model,
-            lm_head: params.linear("lm_head", dim, vocab_size, false)?,
+            context_length: config.context_length(),
+            base_model,
             config,
         })
     }
 }
 
-impl<B: PortableBackend + 'static, C> CausalDecoder<B, C> {
+impl<B: PortableBackend + 'static, C: DecoderConfig> CausalDecoder<B, C> {
     /// Full-sequence logits `[T, vocab]`, computed as a prefill into fresh caches.
     pub fn forward(&self, tokens: &[usize]) -> Result<Tensor> {
         let mut logits = Vec::with_capacity(tokens.len() * self.vocab_size);
-        let mut slots = vec![None; self.model.layers.len()];
+        let mut slots = vec![None; self.base_model.num_layers()];
         let on_logits = |chunk: DeviceTensor<B>| {
             logits.extend_from_slice(chunk.to_host()?.data());
             Ok(())
@@ -251,8 +268,8 @@ impl<B: PortableBackend + 'static, C> CausalDecoder<B, C> {
             let len = (tokens.len() - start).min(PREFILL_CHUNK);
             let chunk = &tokens[start..start + len];
             let hidden = {
-                let _scope = capture::scope(format_args!("model"));
-                self.model((chunk, position_offset + start, &mut caches))?
+                let _scope = capture::scope(format_args!("{}", C::BASE_MODEL_PREFIX));
+                self.base_model((chunk, position_offset + start, &mut caches))?
             };
             start += len;
             if start == tokens.len() {
@@ -301,11 +318,10 @@ impl<B: PortableBackend + 'static, C> CausalDecoder<B, C> {
         position_offset: usize,
         capacity: usize,
     ) -> Result<Vec<LayerCache<B>>> {
-        let layers = &self.model.layers;
+        let num_layers = self.base_model.num_layers();
         ensure!(
-            slots.len() == layers.len(),
-            "expected {} cache slots (one per layer), got {}",
-            layers.len(),
+            slots.len() == num_layers,
+            "expected {num_layers} cache slots (one per layer), got {}",
             slots.len()
         );
         if slots.iter().all(Option::is_none) {
@@ -314,10 +330,7 @@ impl<B: PortableBackend + 'static, C> CausalDecoder<B, C> {
                 "empty caches require position offset 0 (got {position_offset})"
             );
             let backend = self.lm_head.weight.backend();
-            return layers
-                .iter()
-                .map(|block| block.mixer.empty_cache(&backend, capacity))
-                .collect();
+            return self.base_model.empty_caches(&backend, capacity);
         }
         slots
             .iter()
@@ -352,13 +365,15 @@ impl<B: PortableBackend + 'static, C> CausalDecoder<B, C> {
     }
 }
 
-impl<B: PortableBackend + 'static, C> CausalLanguageModel<B> for CausalDecoder<B, C> {
+impl<B: PortableBackend + 'static, C: DecoderConfig> CausalLanguageModel<B>
+    for CausalDecoder<B, C>
+{
     fn context_length(&self) -> usize {
         self.context_length
     }
 
     fn num_layers(&self) -> usize {
-        self.model.layers.len()
+        self.base_model.num_layers()
     }
 
     fn forward(&self, tokens: &[usize]) -> Result<Tensor> {

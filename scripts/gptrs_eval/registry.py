@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import importlib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Protocol, Type
+from typing import Any, Protocol
 
 from .core import BenchResult, RunConfig, ValidationResult
 
@@ -10,7 +11,7 @@ from .core import BenchResult, RunConfig, ValidationResult
 class ModelCase(Protocol):
     name: str
 
-    def supported_workloads(self) -> List[str]: ...
+    def supported_workloads(self) -> list[str]: ...
 
     def add_cli_args(self, parser: Any) -> None: ...
 
@@ -28,58 +29,45 @@ class CaseSpec:
     default_params: Mapping[str, Any] = field(default_factory=dict)
 
 
-_FALLBACK_CASES: Dict[str, CaseSpec] = {
-    "resnet34": CaseSpec("gptrs_eval.models.resnet34", "ResNet34Case"),
-    "mobilenet_v2": CaseSpec("gptrs_eval.models.mobilenet_v2", "MobileNetV2Case"),
-    "gpt2": CaseSpec("gptrs_eval.models.gpt2", "Gpt2Case"),
+_CASES: dict[str, CaseSpec] = {
+    "gpt2": CaseSpec("gptrs_eval.models.gpt2", "Gpt2Case", {"hf_model": "gpt2", "prompt": "Hello"}),
+    "ministral_3_3b_instruct_2512": CaseSpec(
+        "gptrs_eval.models.ministral",
+        "MinistralCase",
+        {"hf_model": "mistralai/Ministral-3-3B-Instruct-2512", "prompt": "Hello"},
+    ),
+    "qwen3_8_27b": CaseSpec(
+        "gptrs_eval.models.qwen3_5",
+        "Qwen35Case",
+        {"hf_model": "Qwen/Qwen3.8-27B", "prompt": "The capital of France is"},
+    ),
+    "resnet34": CaseSpec(
+        "gptrs_eval.models.resnet34", "ResNet34Case", {"hf_model": "microsoft/resnet-34"}
+    ),
+    "mobilenet_v2": CaseSpec(
+        "gptrs_eval.models.mobilenet_v2",
+        "MobileNetV2Case",
+        {"hf_model": "google/mobilenet_v2_1.0_224"},
+    ),
 }
-_CASES: Dict[str, CaseSpec] | None = None
 
 
-def _load_cases() -> Dict[str, CaseSpec]:
-    cases = dict(_FALLBACK_CASES)
-    try:
-        from exporters import iter_exporter_infos
-
-        for info in iter_exporter_infos():
-            eval_case = info.eval_case
-            if eval_case is None:
-                continue
-            cases[str(eval_case.model_name)] = CaseSpec(
-                module=str(eval_case.module),
-                cls=str(eval_case.cls),
-                default_params=dict(eval_case.default_params),
-            )
-    except Exception:
-        # Keep static fallback registry when exporter metadata cannot be loaded.
-        pass
-    return cases
+def list_models() -> list[str]:
+    return sorted(_CASES)
 
 
-def _case_specs() -> Dict[str, CaseSpec]:
-    global _CASES
-    if _CASES is None:
-        _CASES = _load_cases()
-    return _CASES
-
-
-def list_models() -> List[str]:
-    return sorted(_case_specs().keys())
-
-
-def get_case_default_params(name: str) -> Dict[str, Any]:
-    spec = _case_specs().get(name)
+def get_case_default_params(name: str) -> dict[str, Any]:
+    spec = _CASES.get(name)
     if spec is None:
         return {}
     return dict(spec.default_params)
 
 
 def get_case(name: str) -> ModelCase:
-    cases = _case_specs()
-    if name not in cases:
-        known = ", ".join(sorted(cases.keys()))
+    if name not in _CASES:
+        known = ", ".join(sorted(_CASES))
         raise KeyError(f"unknown model case: {name!r}. known models: {known}")
-    spec = cases[name]
+    spec = _CASES[name]
     mod = importlib.import_module(spec.module)
-    case_cls: Type[ModelCase] = getattr(mod, spec.cls)
+    case_cls: type[ModelCase] = getattr(mod, spec.cls)
     return case_cls()

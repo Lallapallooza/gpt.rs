@@ -128,3 +128,41 @@ pub fn rms_norm(x: &Tensor, gamma: &Tensor, eps: f32) -> Result<RmsNormResult<B>
         inv_rms,
     })
 }
+
+/// Applies batch normalization with fixed statistics (PyTorch `BatchNorm` in eval mode) per channel
+/// of the last tensor dimension, the channel axis of channels-last activations.
+///
+/// The captured graph computes `x * scale + shift` with the per-channel
+/// `scale = weight * rsqrt(running_var + eps)` and `shift = bias - running_mean * scale`, which
+/// depend on parameters only, so the optimizer can fold them into parameters.
+#[functional]
+pub fn batch_norm(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    running_mean: &Tensor,
+    running_var: &Tensor,
+    eps: f32,
+) -> Result<Tensor> {
+    ensure_same_dtype!(x, weight, bias, running_mean, running_var);
+    ensure_dtype!(x, F32);
+    ensure_rank_at_least!(x, 1);
+    ensure_same_backend!(x, weight, bias, running_mean, running_var);
+    let input_shape = x.shape().dims().to_vec();
+    let channels = input_shape[input_shape.len() - 1];
+    ensure_rank!(weight, 1);
+    ensure_rank!(bias, 1);
+    ensure_rank!(running_mean, 1);
+    ensure_rank!(running_var, 1);
+    ensure_last_dim!(weight, channels);
+    ensure_last_dim!(bias, channels);
+    ensure_last_dim!(running_mean, channels);
+    ensure_last_dim!(running_var, channels);
+
+    capture!(session, |x, weight, bias, running_mean, running_var| {
+        let var_eps = running_var + scalar_broadcast(&session, eps, &[channels]);
+        let scale = weight * var_eps.rsqrt();
+        let shift = bias - running_mean * scale;
+        x * scale.broadcast_to(input_shape.clone()) + shift.broadcast_to(input_shape)
+    })
+}

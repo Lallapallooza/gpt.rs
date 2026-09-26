@@ -9,27 +9,32 @@ Source of truth: `crates/gpt-rs/src/runtime/` and `crates/gpt-rs-cli/src/main.rs
 
 The canonical loader is:
 
-- `gpt_rs::runtime::load_model(backend, checkpoint_path) -> Box<dyn LoadedModel<B>>`
+- `gpt_rs::runtime::load_model(backend, model_dir) -> Box<dyn LoadedModel<B>>`
 
 The loader:
 
-1. Opens a self-describing checkpoint (`GPTRSCHK`) and reads `ModelConfig` + tensor index.
+1. Opens the checkpoint, a Hugging Face model directory ([formats.md](formats.md)), and reads its
+   `ModelConfig`: the kind (`model_type`), the config, and the end-of-sequence ids.
 2. Creates a checkpoint-backed `ParamSource<B>` for random-access parameter loads.
-3. Builds a `get(name)` closure that returns `DeviceTensor::lazy_param(...)` for each parameter.
+3. Builds a `get(name)` closure. It returns a loaded tensor, or a `DeviceTensor::lazy_param(...)`
+   when weight streaming is on, and `None` for a name the checkpoint does not have.
 4. Selects a model factory by `ModelConfig.kind` and constructs the model using `get(name)`. Models
-   build their layers through `nn::LayerLoader`, which checks the shape of every tensor. For names
-   and layouts, see [formats.md](formats.md#parameter-names-and-layouts).
+   build their layers through `nn::Params`, which reads each tensor by its parameter name. Shapes
+   come from the checkpoint, and the functionals check them when the model runs. For names and
+   layouts, see [formats.md](formats.md#parameter-names-and-layouts).
 5. Wraps the model in `ModelHandle<B>` with the checkpoint's `eos_token_ids`.
 
 `load_model_with_options(backend, path, options)` is the general form. `LoadOptions` in
-`crates/gpt-rs/src/runtime/loader.rs` documents the options, among them a `matmul_input_dtype` that
-overrides `runtime.matmul_input_dtype` from the checkpoint.
+`crates/gpt-rs/src/runtime/loader.rs` holds the parameter namespace, the runtime settings
+(`ModelRuntimeConfig`: weight streaming and `matmul_input_dtype`), and config keys that replace the
+checkpoint's. The keys are those of the model's config struct, so `num_hidden_layers` truncates a
+Ministral or Qwen3.5 model and `n_layer` truncates a GPT-2 model.
 
-Every model passes `matmul_input_dtype` to its `nn::Linear` layers at build time. With `bf16`, each
-layer casts its input to bf16 before `functional::linear`, which multiplies with f32 accumulation and
-f32 outputs. Norms, attention and the recurrent state stay in f32. These numerics differ from a
-PyTorch bf16 model, which also rounds matmul outputs and residuals to bf16. The default keeps
-activations in f32 and widens bf16 weights exactly.
+`nn::Params` passes `matmul_input_dtype` to every projection layer (`nn::Linear`, `nn::Conv1D`)
+it builds. With `bf16`, each layer casts its input to bf16 before `functional::linear`, which
+multiplies with f32 accumulation and f32 outputs. Norms, attention and the recurrent state stay
+in f32. These numerics differ from a PyTorch bf16 model, which also rounds matmul outputs and
+residuals to bf16. The default keeps activations in f32 and widens bf16 weights exactly.
 
 ## Dynamic model interface (`LoadedModel`)
 
@@ -46,8 +51,9 @@ cache for attention layers, and convolution and recurrent state for linear-atten
 `forward_with_decode_cache` returns logits `[1, vocab]` for the last position of each call. `forward`
 returns logits `[T, vocab]` for every position. It computes them as a prefill into fresh caches.
 
-End-of-sequence tokens are checkpoint metadata, not a model capability. Exporters write the Hugging
-Face `eos_token_id` values as the top-level `ModelConfig.eos_token_ids`, and
+End-of-sequence tokens are checkpoint metadata, not a model capability. The checkpoint reader stores
+the `eos_token_id` values of `generation_config.json` and `config.json` in
+`ModelConfig.eos_token_ids`, and
 `ModelHandle::eos_token_ids()` returns them. `gpt-rs-cli generate` and the Python `generate_tokens`
 stop after one of these tokens. `--ignore-eos` and `ignore_eos=True` turn this off.
 
@@ -61,16 +67,23 @@ See:
 ## Decoder models (`CausalDecoder`)
 
 Every text model is an `inference::decoder::CausalDecoder<B, C>`. Its config type `C` holds the keys
-of the Hugging Face text config that the model reads. `C` implements `DecoderConfig`: the checkpoint
-`KIND` and `layout()`, which validates the config and describes the decoder's layers.
+of the Hugging Face text config that the model reads, and implements `DecoderConfig`
+(`inference/decoder.rs`).
 
-`nn::AttentionConfig` configures every attention variant in one place. The attention layers share
-one rotary embedding.
+Like a Hugging Face `*ForCausalLM`, `CausalDecoder` holds the base model, under `BASE_MODEL_PREFIX`,
+and `lm_head`. The base model implements `BaseModel`: its forward runs the tokens at a position
+through the embeddings, the layers, and the final norm. It also updates one cache per layer.
 
-Like a Hugging Face `*ForCausalLM`, `CausalDecoder` holds the decoder `model` and `lm_head`. The
-`model` holds `nn::DecoderBlock` layers. Each block is a pre-norm residual block with a token mixer,
-`self_attn` or `linear_attn`, and a plain or gated MLP. `CausalDecoder` implements `LoadedModel`,
-`CausalLanguageModel` and `Module` once for all decoder models.
+The Llama-style decoders (Ministral, Qwen3.5) share `DecoderModel`, the `model` module. Each of its
+`nn::DecoderBlock` layers is a pre-norm residual block with a token mixer (`self_attn` or
+`linear_attn`) and a gated MLP. GPT-2 uses `model::gpt::Gpt2Model` (Hugging Face `GPT2Model`) under
+`transformer`. `CausalDecoder` implements `LoadedModel`, `CausalLanguageModel` and `Module` once for
+all decoder models.
+
+`nn::AttentionConfig` configures every softmax attention variant in one place. The attention layers
+share `nn::cached_attention`, which applies the config's rotary embedding, if it has one, and
+attends over the KV cache. They differ in their projections, and `CausalSelfAttention` adds the
+optional q/k norms and output gate.
 
 Every call runs its tokens in chunks of at most `PREFILL_CHUNK` tokens. The decoder captures
 each chunk into one graph arena: the caller's default arena when one is installed, otherwise a fresh

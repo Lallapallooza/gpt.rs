@@ -1,6 +1,6 @@
 //! RMS normalization built on [`functional::rms_norm`].
 
-use crate::nn;
+use crate::nn::{self, Params};
 use crate::ops::functional;
 use anyhow::Result;
 
@@ -25,6 +25,14 @@ pub struct RmsNorm {
 
 #[nn::module]
 impl RmsNorm {
+    pub fn new(p: &mut Params<B>, config: RmsNormConfig) -> Result<Self> {
+        Ok(Self {
+            weight: p.param()?,
+            eps: config.eps,
+            unit_offset: config.unit_offset,
+        })
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let scale = if self.unit_offset {
             functional::add_scalar(&self.weight, 1.0)?

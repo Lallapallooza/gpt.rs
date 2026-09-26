@@ -1,46 +1,14 @@
-use std::fs;
-use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+mod checkpoint_support;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{ensure, Result};
 use gpt_rs::backend::param_resolver::ParamResolver;
 use gpt_rs::backend::spec::{Instruction, PortableBackend, Program, TensorInit};
 use gpt_rs::model::config::{ModelRuntimeConfig, WeightStreamingConfig};
-use gpt_rs::model::{Gpt, GptConfig, ModelConfig};
-use gpt_rs::module::{Module, ParamVisitor, TensorRole};
-use gpt_rs::nn::ActivationFunction;
-use gpt_rs::params::base_param_id;
-use gpt_rs::runtime::{load_model, LoadedModel, ModelInput};
-use gpt_rs::tensor::{DeviceTensor, Tensor};
+use gpt_rs::runtime::{load_model_with_options, LoadOptions, LoadedModel, ModelInput};
 use gpt_rs_backend_ref_cpu::CpuPortableBackend;
-use rand::rngs::StdRng;
-use rand::SeedableRng;
-
-const MAGIC: &[u8; 8] = b"GPTRSCHK";
-const VERSION_V2: u32 = 2;
-
-fn unique_path(prefix: &str, ext: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_nanos();
-    path.push(format!("{prefix}_{nanos}.{ext}"));
-    path
-}
-
-struct TempFile {
-    path: PathBuf,
-}
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
 
 #[derive(Clone)]
 struct CountingMaterializeBackend {
@@ -104,182 +72,21 @@ impl PortableBackend for CountingMaterializeBackend {
     }
 }
 
-struct IndexEntry {
-    name: String,
-    base_id: u128,
-    dims: Vec<u64>,
-    dtype_tag: u32,
-    offset_rel: u64,
-    len: u64,
-}
-
-fn push_u32(dst: &mut Vec<u8>, value: u32) {
-    dst.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_u64(dst: &mut Vec<u8>, value: u64) {
-    dst.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_u128(dst: &mut Vec<u8>, value: u128) {
-    dst.extend_from_slice(&value.to_le_bytes());
-}
-
-fn build_index_bytes(entries: &[IndexEntry], data_start: u64) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    push_u32(&mut out, entries.len() as u32);
-    for entry in entries {
-        let name_bytes = entry.name.as_bytes();
-        push_u32(&mut out, name_bytes.len() as u32);
-        out.extend_from_slice(name_bytes);
-        push_u128(&mut out, entry.base_id);
-
-        push_u32(&mut out, entry.dims.len() as u32);
-        for dim in &entry.dims {
-            push_u64(&mut out, *dim);
-        }
-
-        push_u32(&mut out, entry.dtype_tag);
-        out.push(0u8);
-
-        let offset = data_start
-            .checked_add(entry.offset_rel)
-            .context("checkpoint offset overflow")?;
-        push_u64(&mut out, offset);
-        push_u64(&mut out, entry.len);
-    }
-    Ok(out)
-}
-
-fn save_checkpoint_with_runtime(
-    path: &Path,
-    model: &Gpt<CpuPortableBackend>,
-    runtime: ModelRuntimeConfig,
-) -> Result<()> {
-    let file = std::fs::File::create(path)?;
-    let mut writer = BufWriter::new(file);
-    writer.write_all(MAGIC)?;
-    writer.write_all(&VERSION_V2.to_le_bytes())?;
-
-    let config = ModelConfig::new_with_runtime(
-        "gpt",
-        serde_json::to_value(&model.config).context("serialize gpt config")?,
-        runtime,
-    );
-    let config_bytes = serde_json::to_vec(&config)?;
-    writer.write_all(&(config_bytes.len() as u32).to_le_bytes())?;
-    writer.write_all(&config_bytes)?;
-
-    let mut params: Vec<(String, Tensor)> = Vec::new();
-    let mut export = |name: &str, _: TensorRole, tensor: &DeviceTensor<CpuPortableBackend>| {
-        let host = tensor
-            .to_host()
-            .with_context(|| format!("failed to export checkpoint tensor '{name}'"))?;
-        params.push((name.to_string(), host));
-        Ok(())
-    };
-    model.visit_params(&mut ParamVisitor::new(&mut export))?;
-    params.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-    let mut entries = Vec::with_capacity(params.len());
-    let mut running_offset = 0u64;
-    for (name, tensor) in &params {
-        let base_id = base_param_id(name)?.0;
-        let dims: Vec<u64> = tensor.shape().dims().iter().map(|d| *d as u64).collect();
-        let dtype = tensor.dtype();
-        let len = match dtype {
-            gpt_rs::tensor::DType::F32 => (tensor.data().len() * dtype.size_in_bytes()) as u64,
-            gpt_rs::tensor::DType::I32 => (tensor.data_i32().len() * dtype.size_in_bytes()) as u64,
-            gpt_rs::tensor::DType::F16 | gpt_rs::tensor::DType::BF16 => {
-                anyhow::bail!("checkpoint dtype {:?} is not supported yet", dtype)
-            }
-        };
-        entries.push(IndexEntry {
-            name: name.clone(),
-            base_id,
-            dims,
-            dtype_tag: dtype.tag(),
-            offset_rel: running_offset,
-            len,
-        });
-        running_offset = running_offset
-            .checked_add(len)
-            .context("checkpoint data offset overflow")?;
-    }
-
-    let index_rel = build_index_bytes(&entries, 0)?;
-    ensure!(
-        index_rel.len() <= u32::MAX as usize,
-        "checkpoint index too large"
-    );
-    let index_len = index_rel.len() as u32;
-
-    let data_start = (MAGIC.len() + 4 + 4 + config_bytes.len() + 4 + index_len as usize) as u64;
-    let index_abs = build_index_bytes(&entries, data_start)?;
-    ensure!(
-        index_abs.len() == index_rel.len(),
-        "checkpoint index length mismatch after offset fixup"
-    );
-
-    writer.write_all(&index_len.to_le_bytes())?;
-    writer.write_all(&index_abs)?;
-
-    for (_name, tensor) in params {
-        match tensor.dtype() {
-            gpt_rs::tensor::DType::F32 => {
-                for &value in tensor.data() {
-                    writer.write_all(&value.to_le_bytes())?;
-                }
-            }
-            gpt_rs::tensor::DType::I32 => {
-                for &value in tensor.data_i32() {
-                    writer.write_all(&value.to_le_bytes())?;
-                }
-            }
-            gpt_rs::tensor::DType::F16 | gpt_rs::tensor::DType::BF16 => {
-                anyhow::bail!("checkpoint dtype {:?} is not supported yet", tensor.dtype())
-            }
-        }
-    }
-
-    writer.flush()?;
-    Ok(())
-}
-
-fn build_small_gpt() -> Result<Gpt<CpuPortableBackend>> {
-    let backend = Arc::new(CpuPortableBackend::new());
-    let mut rng = StdRng::seed_from_u64(7);
-    let config = GptConfig {
-        vocab_size: 32,
-        n_positions: 16,
-        n_embd: 8,
-        n_layer: 1,
-        n_head: 2,
-        n_inner: Some(16),
-        layer_norm_epsilon: 1e-5,
-        activation_function: ActivationFunction::GeluTanh,
-    };
-    Gpt::random(config, backend, &mut rng)
-}
-
 fn run_case(weight_streaming: WeightStreamingConfig) -> Result<(usize, usize)> {
-    let model = build_small_gpt()?;
-    let runtime = ModelRuntimeConfig {
-        weight_streaming,
-        ..ModelRuntimeConfig::default()
-    };
-
-    let checkpoint = TempFile {
-        path: unique_path("gpt_rs_runtime_streaming_case", "bin"),
-    };
-    save_checkpoint_with_runtime(&checkpoint.path, &model, runtime)?;
-
+    let checkpoint = checkpoint_support::gpt2()?;
     let backend = Arc::new(CountingMaterializeBackend::new());
-    let mut loaded = load_model(Arc::clone(&backend), &checkpoint.path)?;
+    let options = LoadOptions {
+        runtime: ModelRuntimeConfig {
+            weight_streaming,
+            ..ModelRuntimeConfig::default()
+        },
+        ..LoadOptions::default()
+    };
+    let mut loaded = load_model_with_options(Arc::clone(&backend), &checkpoint.path, options)?;
     let tokens = vec![1usize, 2, 3, 4];
 
-    let first = forward_delta(loaded.as_mut(), &backend, &tokens)?;
-    let second = forward_delta(loaded.as_mut(), &backend, &tokens)?;
+    let first = forward_delta(&mut loaded, &backend, &tokens)?;
+    let second = forward_delta(&mut loaded, &backend, &tokens)?;
     Ok((first, second))
 }
 

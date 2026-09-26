@@ -1,45 +1,44 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple, cast
+from collections.abc import Iterable
+from typing import Any, cast
 
 import numpy as np
 import torch
 
 from gptrs_eval.core import encode_prompt, resolve_torch_dtype
+from gptrs_eval.safetensors_source import resolve_model_dir
 
 
-def _build_hf(args: argparse.Namespace) -> Tuple[Any, Any]:
+def _build_hf(args: argparse.Namespace) -> tuple[Any, Any]:
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-    torch_model_id = str(args.torch_model)
+    model_dir = resolve_model_dir(str(args.hf_model))
     trust_remote_code = bool(args.trust_remote_code)
     torch_dtype = resolve_torch_dtype(str(args.torch_dtype))
 
-    model_kwargs: Dict[str, Any] = {"trust_remote_code": trust_remote_code}
+    model_kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code}
     if torch_dtype != "auto":
         model_kwargs["torch_dtype"] = torch_dtype
 
-    config = AutoConfig.from_pretrained(torch_model_id, trust_remote_code=trust_remote_code)
+    config = AutoConfig.from_pretrained(model_dir, trust_remote_code=trust_remote_code)
     model_type = str(getattr(config, "model_type", "")).lower()
     if model_type == "mistral3":
         from transformers import Mistral3ForConditionalGeneration
 
         torch_model = cast(
             Any,
-            Mistral3ForConditionalGeneration.from_pretrained(torch_model_id, **model_kwargs),
+            Mistral3ForConditionalGeneration.from_pretrained(model_dir, **model_kwargs),
         )
     else:
-        torch_model = cast(
-            Any, AutoModelForCausalLM.from_pretrained(torch_model_id, **model_kwargs)
-        )
+        torch_model = cast(Any, AutoModelForCausalLM.from_pretrained(model_dir, **model_kwargs))
 
     torch_model.eval()
     torch_model.to(args.torch_device)
     if bool(args.force_float32):
         torch_model = torch_model.to(dtype=torch.float32)
-    tokenizer = AutoTokenizer.from_pretrained(torch_model_id, trust_remote_code=trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=trust_remote_code)
     return tokenizer, torch_model
 
 
@@ -47,7 +46,7 @@ def _build_gpt_rs(args: argparse.Namespace) -> Any:
     import gpt_rs
 
     gpt_rs.set_backend(str(args.backend))
-    return gpt_rs.load_model(str(args.checkpoint))
+    return gpt_rs.load_model(str(resolve_model_dir(str(args.hf_model))))
 
 
 def _to_np_f32(tensor: Any) -> np.ndarray:
@@ -57,20 +56,20 @@ def _to_np_f32(tensor: Any) -> np.ndarray:
 
 
 def _collect_hf_activations(
-    torch_model: Any, tokens: List[int], device: str, names: Iterable[str]
-) -> Dict[str, np.ndarray]:
+    torch_model: Any, tokens: list[int], device: str, names: Iterable[str]
+) -> dict[str, np.ndarray]:
     """Outputs of the Hugging Face modules whose paths are the gpt-rs activation names."""
 
     wanted = set(names)
-    activations: Dict[str, np.ndarray] = {}
-    handles: List[Any] = []
+    activations: dict[str, np.ndarray] = {}
+    handles: list[Any] = []
     for module_name, module in torch_model.named_modules():
         # Multimodal checkpoints nest the text model under `model.language_model.`.
         name = module_name.replace("model.language_model.", "model.", 1)
         if name not in wanted:
             continue
 
-        def hook(_module: Any, _inputs: Tuple[Any, ...], output: Any, name: str = name) -> None:
+        def hook(_module: Any, _inputs: tuple[Any, ...], output: Any, name: str = name) -> None:
             value = output[0] if isinstance(output, tuple) else output
             activations[name] = _to_np_f32(value[0])
 
@@ -84,7 +83,7 @@ def _collect_hf_activations(
     return activations
 
 
-def _collect_gpt_rs_activations(rs_model: Any, tokens: List[int]) -> Dict[str, np.ndarray]:
+def _collect_gpt_rs_activations(rs_model: Any, tokens: list[int]) -> dict[str, np.ndarray]:
     return {
         str(item["name"]): np.asarray(item["tensor"], dtype=np.float32)
         for item in rs_model.debug_token_activations(tokens)
@@ -92,8 +91,8 @@ def _collect_gpt_rs_activations(rs_model: Any, tokens: List[int]) -> Dict[str, n
 
 
 def _print_report(
-    hf_acts: Dict[str, np.ndarray],
-    rs_acts: Dict[str, np.ndarray],
+    hf_acts: dict[str, np.ndarray],
+    rs_acts: dict[str, np.ndarray],
     *,
     rtol: float,
     atol: float,
@@ -136,15 +135,9 @@ def main() -> int:
         description="Layer-by-layer Torch vs gpt-rs parity for Ministral."
     )
     parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        default=Path("checkpoints/ministral_3_3b_instruct_2512.bin"),
-        help="gpt-rs checkpoint path",
-    )
-    parser.add_argument(
-        "--torch-model",
+        "--hf-model",
         default="mistralai/Ministral-3-3B-Instruct-2512",
-        help="Torch/HF model id",
+        help="Hugging Face model id or local directory, loaded by gpt-rs and by Torch",
     )
     parser.add_argument("--backend", default="faer", help="gpt-rs backend")
     parser.add_argument("--torch-device", default="cpu", help="Torch device")

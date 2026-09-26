@@ -4,27 +4,20 @@ Small, maintained Python utilities for gpt.rs.
 
 ## Canonical entrypoints
 
-- `scripts/eval.py`: Torch-baselined validate / bench / run runner.
-- `scripts/export.py`: Unified metadata-driven exporter CLI (`list`, `inspect`, `export`, `validate`).
+- `scripts/eval.py`: Torch-baselined validate / bench / run runner. gpt-rs and Torch load the same
+  Hugging Face checkpoint (`--hf-model`, a Hub id or a local directory).
 - `scripts/rebuild_py.py`: Rebuild/install the `gpt_rs` Python bindings via `uv` + `maturin`.
 
 ## Common commands
 
 ```bash
-# discover available exporters
-uv run python scripts/export.py list
+# list the eval cases
+uv run python scripts/eval.py --list-models
 
-# inspect Ministral exporter metadata/default artifacts
-uv run python scripts/export.py inspect --exporter ministral_3_3b_instruct_2512 --format json
+# validate Ministral against Torch
+uv run python scripts/eval.py --model ministral_3_3b_instruct_2512 --workload validate
 
-# export Ministral artifacts (checkpoint + config + HF tokenizer json)
-uv run python scripts/export.py export --exporter ministral_3_3b_instruct_2512 \
-  --checkpoint-out checkpoints/ministral_3_3b_instruct_2512.bin \
-  --config-out configs/ministral_3_3b_instruct_2512_model.json \
-  --tokenizer-out configs/ministral_3_3b_instruct_2512_tokenizer.json
-
-# run Torch parity validation for the exported checkpoint
+# the same, on a local copy of the checkpoint
 uv run python scripts/eval.py --model ministral_3_3b_instruct_2512 --workload validate \
-  --checkpoint checkpoints/ministral_3_3b_instruct_2512.bin \
-  --torch-model mistralai/Ministral-3-3B-Instruct-2512
+  --hf-model checkpoints/ministral-3-3b
 ```

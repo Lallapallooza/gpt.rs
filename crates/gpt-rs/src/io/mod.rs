@@ -1,2 +1,1 @@
-pub mod tensor_archive;
-pub(crate) mod tensor_index;
+pub mod safetensors;

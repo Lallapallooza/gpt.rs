@@ -4,11 +4,12 @@ gpt.rs is a Rust workspace for experimenting with a portable tensor IR (PTIR) an
 models/layers built on top of it.
 
 At a glance:
-- **Models** (`gpt_rs::model::*`) wire blocks together (GPT-2, ResNet34, MobileNetV2, ...).
+- **Models** (`gpt_rs::model::*`) wire blocks together (GPT-2, ResNet, MobileNetV2, ...).
 - **Layers** (`gpt_rs::nn::layers::*`) own parameters and orchestration (`forward`, cache plumbing, shape checks).
 - **Functionals** (`gpt_rs::ops::functional::*`) are portable kernels that validate inputs and capture PTIR graphs.
 - **Backends** (`gpt_rs::backend::spec::PortableBackend`) execute PTIR programs (faer, ref-cpu, ...).
-- **Runtime** (`gpt_rs::runtime::load_model`) loads a self-describing checkpoint into a dynamic model handle.
+- **Runtime** (`gpt_rs::runtime::load_model`) loads a Hugging Face model directory into a dynamic
+  model handle.
 
 For the layering model, see [frontend.md](frontend.md).
 
@@ -25,7 +26,8 @@ Core modules (inside `crates/gpt-rs/src/`):
 - `tensor`: host `Tensor` and device `DeviceTensor<B>` (shape/dtype tracking, lazy handles, materialization).
 - `module`: a small `Module` trait for enumerating/updating parameters by stable name.
 - `params`: parameter identity (`u128` ids) and streaming sources for lazy param loading.
-- `checkpoint`: self-describing model checkpoints (`GPTRSCHK`) and tensor archive IO.
+- `checkpoint`: checkpoint readers (Hugging Face model directories) behind the `Checkpoint` trait.
+- `io`: safetensors reading and writing.
 - `ops`: PTIR DSL (`ops/ptir`), graph arena (`ops/graph`), functional kernels, trace/dump sinks.
 - `backend`: PTIR backend contract + hook points (profiling/debug wrappers).
 - `nn`: parameterized layers composed from functionals.

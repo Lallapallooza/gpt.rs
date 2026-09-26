@@ -125,16 +125,13 @@ fn attention_reference(
 fn run_attention_case<B: PortableBackend + 'static>(
     backend: &Arc<B>,
     config: AttentionConfig,
+    bias: bool,
     (prefill_len, decode_steps): (usize, usize),
     seed: u64,
 ) {
     let mut rng = seeded_rng(seed);
     let total_seq = prefill_len + decode_steps;
-    let (embed_dim, kv_dim, bias) = (
-        config.embed_dim,
-        config.key_value_projection_dim(),
-        config.bias,
-    );
+    let (embed_dim, kv_dim) = (config.embed_dim, config.key_value_projection_dim());
 
     let input = random_vec(&mut rng, total_seq * embed_dim);
     let weights = HostAttention {
@@ -177,11 +174,11 @@ fn run_attention_case<B: PortableBackend + 'static>(
             }
         }
         let layer = load_layer(backend, tensors, |p| {
-            CausalSelfAttention::load(p, "attn", config.clone())
+            p.scoped("attn", |p| CausalSelfAttention::new(p, config.clone()))
         })
         .unwrap();
         let rotary = config.rope.map(|rope| RotaryEmbedding::new(rope).unwrap());
-        let mut cache = layer.empty_cache(backend, total_seq).unwrap();
+        let mut cache = layer.config.empty_cache(backend, total_seq).unwrap();
         let mut position = 0;
         for len in std::iter::once(prefill_len).chain(std::iter::repeat_n(1, decode_steps)) {
             let rows = position * embed_dim..(position + len) * embed_dim;
@@ -197,7 +194,7 @@ fn run_attention_case<B: PortableBackend + 'static>(
     });
 }
 
-/// Plain multi- or grouped-query attention, as in GPT-2.
+/// Plain multi- or grouped-query attention.
 fn run_mha_case<B: PortableBackend + 'static>(
     backend: &Arc<B>,
     steps: (usize, usize),
@@ -205,10 +202,8 @@ fn run_mha_case<B: PortableBackend + 'static>(
     seed: u64,
     bias: bool,
 ) {
-    let config = AttentionConfig::with_kv(embed_dim, num_heads, num_kv_heads)
-        .unwrap()
-        .with_bias(bias);
-    run_attention_case(backend, config, steps, seed);
+    let config = AttentionConfig::with_kv(embed_dim, num_heads, num_kv_heads).unwrap();
+    run_attention_case(backend, config, bias, steps, seed);
 }
 
 pub fn multi_head_attention_matches_torch_without_bias<B: PortableBackend + 'static>(
@@ -276,7 +271,7 @@ pub fn attention_full_rotary_grouped_kv2_prefill4_decode3_matches_torch<
         .unwrap()
         .with_rope(rope(8))
         .unwrap();
-    run_attention_case(backend, config, (4, 3), 0xA507);
+    run_attention_case(backend, config, false, (4, 3), 0xA507);
 }
 
 pub fn attention_qk_norm_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
@@ -286,7 +281,7 @@ pub fn attention_qk_norm_matches_torch<B: PortableBackend + 'static>(backend: &A
             eps: 1e-6,
             unit_offset: false,
         });
-    run_attention_case(backend, config, (6, 0), 0xA508);
+    run_attention_case(backend, config, false, (6, 0), 0xA508);
 }
 
 pub fn attention_output_gate_grouped_kv2_prefill5_decode2_matches_torch<
@@ -296,9 +291,8 @@ pub fn attention_output_gate_grouped_kv2_prefill5_decode2_matches_torch<
 ) {
     let config = AttentionConfig::with_kv(32, 4, 2)
         .unwrap()
-        .with_bias(true)
         .with_output_gate();
-    run_attention_case(backend, config, (5, 2), 0xA509);
+    run_attention_case(backend, config, true, (5, 2), 0xA509);
 }
 
 pub fn attention_partial_rotary_qk_norm_output_gate_prefill5_decode3_matches_torch<
@@ -315,5 +309,5 @@ pub fn attention_partial_rotary_qk_norm_output_gate_prefill5_decode3_matches_tor
         .with_rope(rope(4))
         .unwrap()
         .with_output_gate();
-    run_attention_case(backend, config, (5, 3), 0xA50A);
+    run_attention_case(backend, config, false, (5, 3), 0xA50A);
 }

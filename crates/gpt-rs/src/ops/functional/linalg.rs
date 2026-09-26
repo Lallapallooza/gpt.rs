@@ -105,20 +105,33 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     Ok(tensor)
 }
 
-/// PyTorch-style linear projection `y = x @ weight^T` with an f32 result. `weight` is stored as
-/// `[out_features, in_features]`.
+/// Layout of the weight of a [`linear`] projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightLayout {
+    /// `[out_features, in_features]`, like PyTorch `nn.Linear`.
+    OutIn,
+    /// `[in_features, out_features]`, like `transformers`' `Conv1D`.
+    InOut,
+}
+
+/// Linear projection of `x` (`[N, in_features]`) to `[N, out_features]` with an f32 result:
+/// `x @ weight^T` for [`WeightLayout::OutIn`], `x @ weight` for [`WeightLayout::InOut`].
 ///
 /// The functional casts `weight` to the dtype of `x`, so a bf16 `x` rounds f32 and f16 weights to
 /// bf16. The products accumulate in f32. Backends can fuse the `cast` into the
 /// `dot_general` to read reduced-precision weights directly.
 #[functional]
-pub fn linear(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+pub fn linear(x: &Tensor, weight: &Tensor, layout: WeightLayout) -> Result<Tensor> {
     ensure_same_backend!(x, weight);
     ensure_rank!(x, 2);
     ensure_rank!(weight, 2);
     ensure_dtype!(x, F32 | BF16);
     ensure_dtype!(weight, F32 | BF16 | F16);
-    let (in_features, weight_in) = (x.shape().dims()[1], weight.shape().dims()[1]);
+    let weight_in_axis = match layout {
+        WeightLayout::OutIn => 1,
+        WeightLayout::InOut => 0,
+    };
+    let (in_features, weight_in) = (x.shape().dims()[1], weight.shape().dims()[weight_in_axis]);
     ensure!(
         in_features == weight_in,
         "{FUNCTIONAL}: weight in_features {weight_in} must match x in_features {in_features}"
@@ -131,7 +144,11 @@ pub fn linear(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
         };
         x.dot_general(
             &weight,
-            &DotDims::new(ptir::axes_iter([]), crate::axes!(1), crate::axes!(1)),
+            &DotDims::new(
+                ptir::axes_iter([]),
+                crate::axes!(1),
+                crate::axes!(weight_in_axis),
+            ),
             &DotAttrs {
                 accum_dtype: Some(DType::F32),
                 out_dtype: Some(DType::F32),

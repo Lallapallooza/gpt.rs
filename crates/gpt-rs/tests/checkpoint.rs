@@ -1,192 +1,244 @@
-use std::collections::HashMap;
+mod checkpoint_support;
+
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{ensure, Result};
-use gpt_rs::checkpoint::{CheckpointReader, CheckpointSaver};
-use gpt_rs::io::tensor_archive::TensorArchive;
-use gpt_rs::model::{Gpt, GptConfig};
-use gpt_rs::module::{Module, ParamVisitor, TensorRole};
-use gpt_rs::nn::ActivationFunction;
-use gpt_rs::runtime::{load_model_with_options, LoadOptions, LoadedModel, ModelInput, ModelOutput};
-use gpt_rs::tensor::{DType, DeviceTensor, Shape, Tensor};
+use anyhow::Result;
+use gpt_rs::checkpoint;
+use gpt_rs::io::safetensors;
+use gpt_rs::runtime::{load_model_with_options, LoadOptions, LoadedModel};
+use gpt_rs::tensor::{DType, Shape, Tensor};
 use gpt_rs_backend_ref_cpu::CpuPortableBackend;
-use gpt_rs_backend_tests::tensor_as;
-use rand::rngs::StdRng;
-use rand::SeedableRng;
+use serde_json::json;
 
-fn unique_path(prefix: &str, ext: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_nanos();
-    path.push(format!("{prefix}_{nanos}.{ext}"));
-    path
-}
+use checkpoint_support::TempDir;
 
-struct TempFile {
-    path: PathBuf,
-}
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn assert_tensor_bytes_eq(a: &Tensor, b: &Tensor) {
-    assert_eq!(a.dtype(), b.dtype());
-    assert_eq!(a.shape().dims(), b.shape().dims());
-    assert_eq!(a.to_le_bytes(), b.to_le_bytes());
-}
-
-fn small_gpt(backend: &Arc<CpuPortableBackend>) -> Result<Gpt<CpuPortableBackend>> {
-    let config = GptConfig {
-        vocab_size: 32,
-        n_positions: 16,
-        n_embd: 8,
-        n_layer: 1,
-        n_head: 2,
-        n_inner: Some(16),
-        layer_norm_epsilon: 1e-5,
-        activation_function: ActivationFunction::GeluTanh,
-    };
-    Gpt::random(config, Arc::clone(backend), &mut StdRng::seed_from_u64(11))
-}
-
-#[test]
-fn checkpoint_reader_and_runtime_loader_work_for_small_gpt() -> Result<()> {
-    let backend = Arc::new(CpuPortableBackend::new());
-    let model = small_gpt(&backend)?;
-
-    let tokens = vec![1usize, 2, 3, 4];
-    let baseline = model.forward(&tokens)?;
-
-    let checkpoint = TempFile {
-        path: unique_path("gpt_rs_checkpoint_test", "bin"),
-    };
-
-    CheckpointSaver::save(&checkpoint.path, &model)?;
-
-    let reader = CheckpointReader::open(&checkpoint.path)?;
-    assert_eq!(reader.config().kind, "gpt");
-    assert!(reader.entries().iter().all(|entry| entry.offset % 64 == 0));
-
-    let mut expected = Vec::new();
-    let mut collect = |name: &str, _: TensorRole, tensor: &DeviceTensor<CpuPortableBackend>| {
-        expected.push((name.to_string(), tensor.to_host()?));
-        Ok(())
-    };
-    model.visit_params(&mut ParamVisitor::new(&mut collect))?;
-
-    for (name, expected_tensor) in &expected {
-        let from_name = reader.get(name)?;
-        assert_tensor_bytes_eq(&from_name, expected_tensor);
-        let from_id = reader.get_by_base_id(gpt_rs::params::base_param_id(name)?)?;
-        assert_tensor_bytes_eq(&from_id, expected_tensor);
-    }
-
-    let mut loaded = gpt_rs::runtime::load_model(Arc::clone(&backend), &checkpoint.path)?;
-    let output = loaded.forward(ModelInput::Tokens(tokens))?;
-    let ModelOutput::Tensor(loaded_out) = output;
-
-    ensure!(
-        loaded_out.shape().dims() == baseline.shape().dims(),
-        "loaded output shape mismatch"
-    );
-    let a = loaded_out.data();
-    let b = baseline.data();
-    ensure!(a.len() == b.len(), "loaded output length mismatch");
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        ensure!((x - y).abs() < 1e-6, "loaded output differs from baseline");
-    }
-
-    Ok(())
-}
-
-#[test]
-fn load_option_matmul_input_dtype_rounds_projection_inputs() -> Result<()> {
-    let backend = Arc::new(CpuPortableBackend::new());
-    let checkpoint = TempFile {
-        path: unique_path("gpt_rs_checkpoint_bf16_inputs", "bin"),
-    };
-    CheckpointSaver::save(&checkpoint.path, &small_gpt(&backend)?)?;
-
-    let logits = |matmul_input_dtype| -> Result<Vec<f32>> {
-        let options = LoadOptions {
-            namespace: None,
-            matmul_input_dtype,
-        };
-        let mut model = load_model_with_options(Arc::clone(&backend), &checkpoint.path, options)?;
-        let ModelOutput::Tensor(out) = model.forward(ModelInput::Tokens(vec![1, 2, 3, 4]))?;
-        Ok(out.data().to_vec())
-    };
-    let (f32_inputs, bf16_inputs) = (logits(None)?, logits(Some(DType::BF16))?);
-    ensure!(
-        f32_inputs != bf16_inputs,
-        "bf16 inputs left the logits unchanged"
-    );
-    let scale = f32_inputs.iter().fold(0f32, |m, v| m.max(v.abs()));
-    for (a, b) in f32_inputs.iter().zip(&bf16_inputs) {
-        ensure!(
-            (a - b).abs() <= 1e-2 * scale,
-            "logit {a} differs from {b} by more than bf16 rounding"
+/// Writes a safetensors file of `(name, dtype, dims, payload)` tensors, for dtypes that host
+/// tensors cannot hold.
+fn write_raw_safetensors(path: &Path, tensors: &[(&str, &str, Vec<usize>, Vec<u8>)]) -> Result<()> {
+    let mut header = serde_json::Map::new();
+    let mut data = Vec::new();
+    for (name, dtype, dims, payload) in tensors {
+        let start = data.len();
+        data.extend_from_slice(payload);
+        header.insert(
+            name.to_string(),
+            json!({"dtype": dtype, "shape": dims, "data_offsets": [start, data.len()]}),
         );
     }
+    let mut header = serde_json::to_vec(&header)?;
+    header.resize(header.len().next_multiple_of(8), b' ');
+    let mut file = (header.len() as u64).to_le_bytes().to_vec();
+    file.extend_from_slice(&header);
+    file.extend_from_slice(&data);
+    Ok(fs::write(path, file)?)
+}
+
+#[test]
+fn sharded_directory_reads_the_tensors_of_every_shard() -> Result<()> {
+    let single = checkpoint_support::gpt2()?;
+    let tensors: BTreeMap<String, Tensor> =
+        safetensors::load(single.path.join("model.safetensors"))?
+            .into_iter()
+            .collect();
+    let sharded = TempDir::new("gpt_rs_hf_sharded");
+    fs::copy(
+        single.path.join("config.json"),
+        sharded.path.join("config.json"),
+    )?;
+    let mut weight_map = serde_json::Map::new();
+    let names: Vec<&String> = tensors.keys().collect();
+    let (first, second) = names.split_at(names.len() / 2);
+    for (shard, names) in [
+        ("model-00001-of-00002.safetensors", first),
+        ("model-00002-of-00002.safetensors", second),
+    ] {
+        safetensors::save(
+            sharded.path.join(shard),
+            names.iter().map(|name| (name.as_str(), &tensors[*name])),
+        )?;
+        for name in names {
+            weight_map.insert(name.to_string(), shard.into());
+        }
+    }
+    fs::write(
+        sharded.path.join("model.safetensors.index.json"),
+        serde_json::to_vec(&json!({"metadata": {}, "weight_map": weight_map}))?,
+    )?;
+
+    let checkpoint = checkpoint::open(&sharded.path)?;
+    let read = checkpoint
+        .tensors()
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            Ok((
+                entry.name.clone(),
+                checkpoint.bytes(index)?.as_slice().to_vec(),
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let written: BTreeMap<String, Vec<u8>> = tensors
+        .iter()
+        .map(|(name, tensor)| (name.clone(), tensor.to_le_bytes().to_vec()))
+        .collect();
+    assert_eq!(read, written);
     Ok(())
 }
 
 #[test]
-fn truncated_or_corrupted_checkpoints_are_rejected() -> Result<()> {
+fn config_overrides_replace_checkpoint_config_fields() -> Result<()> {
+    let checkpoint = checkpoint_support::gpt2()?;
+    let options = LoadOptions {
+        config_overrides: json!({"n_layer": 1})
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        ..LoadOptions::default()
+    };
     let backend = Arc::new(CpuPortableBackend::new());
-    let checkpoint = TempFile {
-        path: unique_path("gpt_rs_checkpoint_truncated", "bin"),
-    };
-    CheckpointSaver::save(&checkpoint.path, &small_gpt(&backend)?)?;
-    let bytes = fs::read(&checkpoint.path)?;
+    let loaded = load_model_with_options(backend, &checkpoint.path, options)?;
+    let causal = loaded.as_causal_lm().expect("gpt2 is a causal LM");
+    assert_eq!(causal.num_layers(), 1);
+    Ok(())
+}
 
-    let broken = TempFile {
-        path: unique_path("gpt_rs_checkpoint_broken", "bin"),
+#[test]
+fn multimodal_fp8_checkpoint_opens_as_its_text_model() -> Result<()> {
+    let dir = TempDir::new("gpt_rs_hf_multimodal");
+    fs::write(
+        dir.path.join("config.json"),
+        serde_json::to_vec(&json!({
+            "model_type": "mistral3",
+            "tie_word_embeddings": true,
+            "text_config": {"model_type": "ministral3", "eos_token_id": 3},
+        }))?,
+    )?;
+    fs::write(
+        dir.path.join("generation_config.json"),
+        serde_json::to_vec(&json!({"eos_token_id": [2, 3]}))?,
+    )?;
+    let bf16 = |values: &[f32]| -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect()
     };
-    fs::write(&broken.path, &bytes[..bytes.len() - 1])?;
-    let err = CheckpointReader::open(&broken.path)
+    // 0x38 is 1.0 and 0x40 is 2.0 in float8_e4m3fn.
+    write_raw_safetensors(
+        &dir.path.join("model.safetensors"),
+        &[
+            (
+                "model.language_model.embed_tokens.weight",
+                "BF16",
+                vec![2, 2],
+                bf16(&[1.0, 2.0, 3.0, 4.0]),
+            ),
+            (
+                "model.language_model.layers.0.mlp.up_proj.weight",
+                "F8_E4M3",
+                vec![2, 2],
+                vec![0x38, 0x40, 0x38, 0x40],
+            ),
+            (
+                "model.language_model.layers.0.mlp.up_proj.weight_scale_inv",
+                "BF16",
+                vec![],
+                bf16(&[0.5]),
+            ),
+            (
+                "model.language_model.layers.0.mlp.up_proj.activation_scale",
+                "BF16",
+                vec![],
+                bf16(&[1.0]),
+            ),
+            (
+                "model.language_model.norm.weight",
+                "BF16",
+                vec![2],
+                bf16(&[1.5, 2.5]),
+            ),
+            (
+                "model.vision_tower.patch_conv.weight",
+                "BF16",
+                vec![2],
+                bf16(&[0.0, 0.0]),
+            ),
+            (
+                "lm_head.weight",
+                "BF16",
+                vec![2, 2],
+                bf16(&[1.0, 2.0, 3.0, 4.0]),
+            ),
+        ],
+    )?;
+
+    let checkpoint = checkpoint::open(&dir.path)?;
+    let config = checkpoint.config();
+    assert_eq!(config.kind, "ministral3");
+    assert_eq!(config.eos_token_ids, vec![2, 3]);
+    assert_eq!(config.config["tie_word_embeddings"], json!(true));
+
+    let read = |name: &str| -> Result<Tensor> {
+        let index = checkpoint
+            .tensors()
+            .iter()
+            .position(|entry| entry.name == name)
+            .ok_or_else(|| anyhow::anyhow!("no tensor {name}"))?;
+        let entry = &checkpoint.tensors()[index];
+        Tensor::from_le_bytes(
+            Shape::new(entry.dims.clone()),
+            entry.dtype,
+            checkpoint.bytes(index)?.as_slice(),
+        )
+    };
+    let mut names: Vec<&str> = checkpoint
+        .tensors()
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "lm_head.weight",
+            "model.embed_tokens.weight",
+            "model.layers.0.mlp.up_proj.weight",
+            "model.norm.weight",
+        ]
+    );
+    let up_proj = read("model.layers.0.mlp.up_proj.weight")?;
+    assert_eq!(up_proj.dtype(), DType::BF16);
+    assert_eq!(
+        up_proj.to_le_bytes(),
+        bf16(&[0.5, 1.0, 0.5, 1.0]).as_slice()
+    );
+    let norm = read("model.norm.weight")?;
+    assert_eq!(norm.dtype(), DType::F32);
+    assert_eq!(norm.data(), [1.5, 2.5]);
+    Ok(())
+}
+
+#[test]
+fn truncated_or_missing_weights_are_rejected() -> Result<()> {
+    let checkpoint = checkpoint_support::gpt2()?;
+    let weights = checkpoint.path.join("model.safetensors");
+    let bytes = fs::read(&weights)?;
+    fs::write(&weights, &bytes[..bytes.len() - 1])?;
+    let err = checkpoint::open(&checkpoint.path)
         .err()
         .expect("a truncated payload must be rejected");
-    assert!(format!("{err:#}").contains("exceeds file size"), "{err:#}");
+    assert!(
+        format!("{err:#}").contains("invalid safetensors file"),
+        "{err:#}"
+    );
 
-    let mut corrupted = bytes.clone();
-    corrupted[0] = b'X';
-    fs::write(&broken.path, &corrupted)?;
-    let err = CheckpointReader::open(&broken.path)
+    fs::remove_file(&weights)?;
+    let err = checkpoint::open(&checkpoint.path)
         .err()
-        .expect("a bad magic number must be rejected");
-    assert!(format!("{err:#}").contains("header"), "{err:#}");
-    Ok(())
-}
-
-#[test]
-fn tensor_archive_round_trips_every_dtype() -> Result<()> {
-    let values = [1.0f32, -2.5, 3.25, 0.0, 1e-3, -7.0];
-    let tensors: HashMap<String, Tensor> = [
-        ("a.f32", tensor_as(&[2, 3], &values, DType::F32)),
-        ("b.bf16", tensor_as(&[3], &values[..3], DType::BF16)),
-        ("c.f16", tensor_as(&[5], &values[..5], DType::F16)),
-        ("d.i32", Tensor::from_i32(Shape::new([2]), vec![-4, 9])?),
-    ]
-    .into_iter()
-    .map(|(name, tensor)| (name.to_string(), tensor))
-    .collect();
-    let archive = TempFile {
-        path: unique_path("gpt_rs_tensor_archive", "bin"),
-    };
-    TensorArchive::save(&archive.path, &tensors)?;
-    let loaded = TensorArchive::load(&archive.path)?;
-    assert_eq!(loaded.len(), tensors.len());
-    for (name, tensor) in &tensors {
-        assert_tensor_bytes_eq(&loaded[name], tensor);
-    }
+        .expect("a directory without weights must be rejected");
+    assert!(format!("{err:#}").contains("model.safetensors"), "{err:#}");
     Ok(())
 }

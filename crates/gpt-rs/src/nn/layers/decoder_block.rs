@@ -1,56 +1,16 @@
-//! Pre-norm decoder block shared by every causal decoder: `h = x + mixer(norm1(x))`,
+//! Pre-norm decoder layer of the Llama-style decoders: `h = x + mixer(norm1(x))`,
 //! `out = h + mlp(norm2(h))`.
 
 use std::sync::Arc;
 
 use super::attention::{AttentionConfig, AttentionPositions, CausalSelfAttention};
-use super::feed_forward::{ActivationFunction, FeedForward};
 use super::gated_delta_net::{GatedDeltaNet, GatedDeltaNetConfig};
 use super::gated_feed_forward::GatedFeedForward;
-use super::layer_norm::LayerNorm;
 use super::rms_norm::{RmsNorm, RmsNormConfig};
-use crate::backend::spec::PortableBackend;
 use crate::inference::LayerCache;
-use crate::nn::{self, capture, LayerLoader};
+use crate::nn::{self, capture, Params};
 use crate::ops::functional::DeviceTensorOps;
 use anyhow::{bail, Result};
-
-/// Normalisation of the residual stream in a decoder.
-#[derive(Debug, Clone, Copy)]
-pub enum NormConfig {
-    LayerNorm { eps: f32 },
-    RmsNorm(RmsNormConfig),
-}
-
-impl NormConfig {
-    pub fn load<B: PortableBackend + 'static>(
-        self,
-        params: &mut LayerLoader<'_, B>,
-        prefix: &str,
-        dim: usize,
-    ) -> Result<Norm<B>> {
-        Ok(match self {
-            NormConfig::LayerNorm { eps } => Norm::LayerNorm(params.layer_norm(prefix, dim, eps)?),
-            NormConfig::RmsNorm(config) => Norm::RmsNorm(params.rms_norm(prefix, dim, config)?),
-        })
-    }
-}
-
-#[nn::module]
-pub enum Norm {
-    LayerNorm(LayerNorm),
-    RmsNorm(RmsNorm),
-}
-
-#[nn::module]
-impl Norm {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        match self {
-            Norm::LayerNorm(norm) => norm.call(x),
-            Norm::RmsNorm(norm) => norm.call(x),
-        }
-    }
-}
 
 /// Hugging Face module names of the token mixers inside a decoder layer.
 const SELF_ATTN: &str = "self_attn";
@@ -65,25 +25,6 @@ pub enum MixerConfig {
     LinearAttention(GatedDeltaNetConfig),
 }
 
-impl MixerConfig {
-    fn load<B: PortableBackend + 'static>(
-        &self,
-        params: &mut LayerLoader<'_, B>,
-        layer: &str,
-    ) -> Result<Mixer<B>> {
-        Ok(match self {
-            MixerConfig::Attention(config) => {
-                let prefix = format!("{layer}.{SELF_ATTN}");
-                Mixer::Attention(CausalSelfAttention::load(params, &prefix, config.clone())?)
-            }
-            MixerConfig::LinearAttention(config) => {
-                let prefix = format!("{layer}.{LINEAR_ATTN}");
-                Mixer::LinearAttention(GatedDeltaNet::load(params, &prefix, config.clone())?)
-            }
-        })
-    }
-}
-
 /// Token mixer of a decoder layer, named by its Hugging Face module.
 #[nn::module]
 pub enum Mixer {
@@ -95,6 +36,17 @@ pub enum Mixer {
 
 #[nn::module]
 impl Mixer {
+    pub fn new(p: &mut Params<B>, config: &MixerConfig) -> Result<Self> {
+        Ok(match config {
+            MixerConfig::Attention(config) => {
+                Self::Attention(CausalSelfAttention::new(p, config.clone())?)
+            }
+            MixerConfig::LinearAttention(config) => {
+                Self::LinearAttention(GatedDeltaNet::new(p, config.clone())?)
+            }
+        })
+    }
+
     /// Hugging Face module name of the mixer inside its decoder layer.
     pub fn name(&self) -> &'static str {
         match self {
@@ -129,6 +81,7 @@ impl Mixer {
     pub fn empty_cache(&self, backend: &Arc<B>, capacity: usize) -> Result<LayerCache<B>> {
         match self {
             Mixer::Attention(attn) => attn
+                .config
                 .empty_cache(backend, capacity)
                 .map(LayerCache::Attention),
             Mixer::LinearAttention(lin) => {
@@ -138,87 +91,25 @@ impl Mixer {
     }
 }
 
-/// Feed-forward network of a decoder layer (`mlp`).
-#[derive(Debug, Clone, Copy)]
-pub enum MlpConfig {
-    /// `down_proj(activation(up_proj(x)))`, with biases when `bias` is set.
-    FeedForward {
-        hidden_dim: usize,
-        activation: ActivationFunction,
-        bias: bool,
-    },
-    /// `down_proj(silu(gate_proj(x)) * up_proj(x))`, without biases.
-    Gated { hidden_dim: usize },
-}
-
-impl MlpConfig {
-    fn load<B: PortableBackend + 'static>(
-        self,
-        params: &mut LayerLoader<'_, B>,
-        prefix: &str,
-        dim: usize,
-    ) -> Result<Mlp<B>> {
-        Ok(match self {
-            MlpConfig::FeedForward {
-                hidden_dim,
-                activation,
-                bias,
-            } => Mlp::FeedForward(FeedForward::load(
-                params, prefix, dim, hidden_dim, activation, bias,
-            )?),
-            MlpConfig::Gated { hidden_dim } => Mlp::Gated(GatedFeedForward::load(
-                params, prefix, dim, hidden_dim, false,
-            )?),
-        })
-    }
-}
-
-#[nn::module]
-pub enum Mlp {
-    FeedForward(FeedForward),
-    Gated(GatedFeedForward),
-}
-
-#[nn::module]
-impl Mlp {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        match self {
-            Mlp::FeedForward(mlp) => mlp.call(x),
-            Mlp::Gated(mlp) => mlp.call(x),
-        }
-    }
-}
-
 /// Pre-norm residual decoder layer.
 #[nn::module]
 pub struct DecoderBlock {
-    pub input_layernorm: Norm,
+    pub input_layernorm: RmsNorm,
     /// Its parameters are under the mixer's own name ([`Mixer::name`]).
     #[module(flatten)]
     pub mixer: Mixer,
-    pub post_attention_layernorm: Norm,
-    pub mlp: Mlp,
+    pub post_attention_layernorm: RmsNorm,
+    pub mlp: GatedFeedForward,
 }
 
 #[nn::module]
 impl DecoderBlock {
-    pub fn load(
-        params: &mut LayerLoader<'_, B>,
-        prefix: &str,
-        dim: usize,
-        norm: NormConfig,
-        mixer: &MixerConfig,
-        mlp: MlpConfig,
-    ) -> Result<Self> {
+    pub fn new(p: &mut Params<B>, norm: RmsNormConfig, mixer: &MixerConfig) -> Result<Self> {
         Ok(Self {
-            input_layernorm: norm.load(params, &format!("{prefix}.input_layernorm"), dim)?,
-            mixer: mixer.load(params, prefix)?,
-            post_attention_layernorm: norm.load(
-                params,
-                &format!("{prefix}.post_attention_layernorm"),
-                dim,
-            )?,
-            mlp: mlp.load(params, &format!("{prefix}.mlp"), dim)?,
+            input_layernorm: RmsNorm::new(p, norm)?,
+            mixer: Mixer::new(p, mixer)?,
+            post_attention_layernorm: RmsNorm::new(p, norm)?,
+            mlp: GatedFeedForward::new(p)?,
         })
     }
 

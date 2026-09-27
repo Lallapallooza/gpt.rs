@@ -1,5 +1,17 @@
 # Development notes
 
+## Checks
+
+`.pre-commit-config.yaml` holds every lint, format, and type check, and the Conventional Commits
+message check. The Python tools run from the `uv.lock` environment. CI's `lint` job runs the same
+hooks, except the commit-message check.
+
+```bash
+uv sync --extra dev
+uv run --extra dev pre-commit install         # run the checks on every commit
+uv run --extra dev pre-commit run --all-files # run them on the whole tree
+```
+
 ## Environment variables
 
 Common:

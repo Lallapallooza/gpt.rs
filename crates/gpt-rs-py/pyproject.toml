@@ -44,17 +44,3 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-
-[tool.mypy]
-python_version = "3.9"
-strict = true
-warn_return_any = true
-warn_unused_configs = true
-
-[tool.ruff]
-line-length = 100
-target-version = "py39"
-
-[tool.ruff.lint]
-select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "T20", "SIM"]
-ignore = []

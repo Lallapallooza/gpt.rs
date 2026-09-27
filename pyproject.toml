@@ -1,7 +1,7 @@
 [project]
 name = "gptrs-tools"
 version = "0.1.0"
-description = "Helper scripts for exporting and validating GPT-2 checkpoints for gpt.rs."
+description = "Helper scripts for validating gpt.rs models against Torch."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -10,7 +10,6 @@ dependencies = [
     "numpy>=1.24,<3",
     "safetensors>=0.4.3,<1",
     "torch>=2.3.0,<3",
-    "torchvision>=0.18,<1",
     "transformers>=5.2,<6",
 ]
 
@@ -18,25 +17,27 @@ dependencies = [
 dev = [
     "ruff>=0.5",
     "mypy>=1.8",
+    "basedpyright>=1.31",
     "pre-commit>=3.7",
     "commitizen>=3.30",
 ]
 
 [tool.ruff]
-target-version = "py39"
 line-length = 100
 src = ["scripts"]
+# The bindings support Python 3.9 (their requires-python).
+per-file-target-version = { "crates/gpt-rs-py/**" = "py39" }
 
 [tool.ruff.lint]
-extend-select = ["B", "C4", "I"]
-ignore = ["E203"]
+# Listed in full, so a change to ruff's default rule set does not change the checks.
+select = ["E4", "E7", "E9", "F", "B", "C4", "I", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
 "crates/gpt-rs-py/examples/*.py" = ["T201"]
 "crates/gpt-rs-py/test_install.py" = ["T201"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.10"
 files = ["scripts"]
 warn_unused_configs = true
 warn_unreachable = true
@@ -46,6 +47,12 @@ exclude = ["crates/gpt-rs-py/"]
 [[tool.mypy.overrides]]
 module = ["torch.*", "transformers.*", "numpy.*", "gpt_rs.*", "pytest.*", "scipy.*"]
 ignore_missing_imports = true
+
+[tool.basedpyright]
+include = ["scripts"]
+extraPaths = ["scripts"]
+pythonVersion = "3.10"
+typeCheckingMode = "standard"
 
 [tool.commitizen]
 name = "cz_conventional_commits"

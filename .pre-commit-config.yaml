@@ -1,3 +1,5 @@
+# `pre-commit install` installs both the checks and the commit-message hook.
+default_install_hook_types: [pre-commit, commit-msg]
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
@@ -8,23 +10,32 @@ repos:
       - id: check-yaml
       - id: check-json
       - id: check-toml
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.13.2
-    hooks:
-      - id: ruff
-        args: ["--fix", "--exit-non-zero-on-fix", "--config=pyproject.toml"]
-      - id: ruff-format
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.18.2
-    hooks:
-      - id: mypy
-        args: ["--config-file=pyproject.toml"]
-        additional_dependencies:
-          - numpy
-          - torch
-          - transformers
+  # The Python tools run from the project environment, so uv.lock pins their versions and the type
+  # checkers see the installed packages.
   - repo: local
     hooks:
+      - id: ruff
+        name: ruff
+        entry: uv run --extra dev ruff check --fix --exit-non-zero-on-fix
+        language: system
+        types_or: [python, pyi]
+      - id: ruff-format
+        name: ruff format
+        entry: uv run --extra dev ruff format
+        language: system
+        types_or: [python, pyi]
+      - id: mypy
+        name: mypy
+        entry: uv run --extra dev mypy
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
+      - id: basedpyright
+        name: basedpyright
+        entry: uv run --extra dev basedpyright
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
       - id: cargo-fmt
         name: cargo fmt
         entry: cargo fmt --all -- --check

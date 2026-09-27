@@ -27,21 +27,6 @@ fn tokenizer_roundtrip() {
 }
 
 #[test]
-fn tokenizer_config_parses_flat_schema() {
-    let json = r#"
-    {
-        "vocab": {"<unk>": 0, "H": 1, "i": 2},
-        "merges": [["H", "i"]],
-        "unk_token": "<unk>"
-    }
-    "#;
-    let cfg = TokenizerConfig::from_json_str(json).expect("flat schema should parse");
-    assert_eq!(cfg.vocab.get("H"), Some(&1));
-    assert_eq!(cfg.merges, vec![("H".to_string(), "i".to_string())]);
-    assert_eq!(cfg.unk_token, "<unk>");
-}
-
-#[test]
 fn tokenizer_config_parses_hf_tokenizer_json_schema() {
     let json = r#"
     {

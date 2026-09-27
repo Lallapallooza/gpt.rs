@@ -2,8 +2,7 @@ use gpt_rs::tokenizer::Tokenizer;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 
-/// Byte-level byte-pair encoding tokenizer. It reads GPT-2 flat configs and Hugging Face
-/// `tokenizer.json` files.
+/// Byte-level byte-pair encoding tokenizer read from a Hugging Face `tokenizer.json`.
 #[pyclass(name = "Tokenizer")]
 pub struct PyTokenizer {
     inner: Tokenizer,
@@ -11,7 +10,7 @@ pub struct PyTokenizer {
 
 #[pymethods]
 impl PyTokenizer {
-    /// Load tokenizer from JSON config file
+    /// Load a tokenizer from a Hugging Face `tokenizer.json`
     #[staticmethod]
     fn from_file(path: String) -> PyResult<Self> {
         let inner = Tokenizer::from_file(&path).map_err(|e| {

@@ -8,7 +8,7 @@ use super::bpe::{get_pairs, BpeMerges};
 use aho_corasick::{AhoCorasick, MatchKind};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use fancy_regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -20,14 +20,14 @@ const GPT2_PATTERN: &str =
 
 /// Token that the tokenizer matches verbatim in the input text. Pre-tokenization and merges never
 /// split it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddedToken {
     pub content: String,
     pub id: usize,
 }
 
-/// Serializable tokenizer definition that mirrors the JSON schema exported by Python tools.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Tokenizer definition read from a Hugging Face `tokenizer.json`.
+#[derive(Debug, Clone)]
 pub struct TokenizerConfig {
     /// Maps string tokens to their integer ids as learned during tokenizer training.
     pub vocab: HashMap<String, usize>,
@@ -35,20 +35,16 @@ pub struct TokenizerConfig {
     pub merges: Vec<(String, String)>,
     /// Symbol that replaces pieces missing from the vocabulary. Byte-level vocabularies cover
     /// every byte, so they never emit it.
-    #[serde(default = "default_unk_token")]
     pub unk_token: String,
     /// Pre-tokenization regex. The default is the GPT-2 pattern.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
     /// When true, the tokenizer applies Unicode NFC normalization before pre-tokenization.
-    #[serde(default)]
     pub normalize_nfc: bool,
     /// Tokens matched verbatim before normalization and pre-tokenization.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub added_tokens: Vec<AddedToken>,
 }
 
-/// Provides the default unknown token marker when a configuration omits the field.
+/// The unknown token to use when `tokenizer.json` names none or an empty one.
 fn default_unk_token() -> String {
     "<unk>".to_string()
 }
@@ -233,12 +229,8 @@ impl HfTokenizerJson {
 }
 
 impl TokenizerConfig {
-    /// Parses the flat gpt-rs tokenizer schema, or a Hugging Face `tokenizer.json` of a byte-level
-    /// BPE model.
+    /// Parses a Hugging Face `tokenizer.json` of a byte-level BPE model.
     pub fn from_json_str(data: &str) -> Result<Self> {
-        if let Ok(cfg) = serde_json::from_str::<TokenizerConfig>(data) {
-            return Ok(cfg);
-        }
         serde_json::from_str::<HfTokenizerJson>(data)
             .context("failed to parse Hugging Face tokenizer.json")?
             .into_config()
@@ -270,21 +262,17 @@ pub struct Tokenizer {
 }
 
 impl Tokenizer {
-    /// Loads a tokenizer from a gpt-rs flat config or a Hugging Face `tokenizer.json`.
+    /// Loads a tokenizer from a Hugging Face `tokenizer.json`.
     pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let path = path.as_ref();
         let data = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read tokenizer from {}", path.display()))?;
-        let config = TokenizerConfig::from_json_str(&data).with_context(|| {
-            format!(
-                "invalid tokenizer config in {}: expected the flat gpt-rs schema or a Hugging Face tokenizer.json",
-                path.display()
-            )
-        })?;
+        let config = TokenizerConfig::from_json_str(&data)
+            .with_context(|| format!("invalid tokenizer.json in {}", path.display()))?;
         Self::from_config(config)
     }
 
-    /// Builds a tokenizer from a serialized [`TokenizerConfig`].
+    /// Builds a tokenizer from a [`TokenizerConfig`].
     pub fn from_config(config: TokenizerConfig) -> Result<Self> {
         let TokenizerConfig {
             vocab,

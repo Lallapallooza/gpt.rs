@@ -206,7 +206,7 @@ Prerequisites (once per checkout):
 ```bash
 uv sync
 uv pip install maturin
-cd crates/gpt-rs-py && uv run maturin develop --release --features faer && cd ../..
+uv run python scripts/rebuild_py.py --features faer
 ```
 
 The canonical entrypoint is `scripts/eval.py`, which runs both gpt-rs and a Torch baseline on the
@@ -253,14 +253,14 @@ Notes:
 - Print profiler tables from Python (requires `gpt_rs` built with profiler support):
   ```bash
   # Rebuild python extension with profiler enabled:
-  #   cd crates/gpt-rs-py && uv run maturin develop --release --features faer,profiler
+  #   uv run python scripts/rebuild_py.py --features faer,profiler
   uv run python scripts/eval.py --model resnet34 --workload run --profile
   ```
 
 - Dump + profile a GPT-2 generation run (Python extension):
   ```bash
   # Rebuild python extension with profiler enabled:
-  #   cd crates/gpt-rs-py && uv run maturin develop --release --features faer,profiler
+  #   uv run python scripts/rebuild_py.py --features faer,profiler
   uv run python scripts/eval.py --model gpt2 --workload run \
     --prompt "Hi" --max-tokens 128 --temperature 0.8 \
     --backend faer --kv-cache \

@@ -20,9 +20,8 @@ def test_import():
         return True
     except ImportError as e:
         print(f"✗ Failed to import gpt_rs: {e}")
-        print("\nTo install, run:")
-        print("  cd crates/gpt-rs-py")
-        print("  maturin develop")
+        print("\nTo install, run from the repository root:")
+        print("  uv run python scripts/rebuild_py.py --features faer")
         return False
 
 

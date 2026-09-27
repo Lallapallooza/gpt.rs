@@ -171,7 +171,7 @@ The canonical entrypoint is `scripts/eval.py` (validate / bench) which runs both
 ```bash
 uv sync
 uv pip install maturin
-cd crates/gpt-rs-py && uv run maturin develop --release --features faer && cd ../..
+uv run python scripts/rebuild_py.py --features faer
 
 uv run python scripts/eval.py --model resnet34 --workload validate
 uv run python scripts/eval.py --model gpt2 --workload bench --threads 1 4 --bench-tokens 1 64

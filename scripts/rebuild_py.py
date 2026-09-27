@@ -4,7 +4,7 @@
 This is a small convenience wrapper around the documented flow:
   uv sync
   uv pip install maturin
-  cd crates/gpt-rs-py && uv run maturin develop --release --features faer && cd ../..
+  uv --project "$(pwd)" --directory crates/gpt-rs-py run maturin develop --release --features faer
 
 Examples:
   uv run python scripts/rebuild_py.py --sync
@@ -17,8 +17,8 @@ from __future__ import annotations
 import argparse
 import shutil
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
-from typing import List, Optional, Sequence
 
 
 def _repo_root() -> Path:
@@ -29,7 +29,7 @@ def _python_crate_dir(root: Path) -> Path:
     return root / "crates" / "gpt-rs-py"
 
 
-def _which(prog: str) -> Optional[str]:
+def _which(prog: str) -> str | None:
     return shutil.which(prog)
 
 
@@ -38,9 +38,9 @@ def _run(cmd: Sequence[str], *, cwd: Path) -> None:
     subprocess.run(list(cmd), cwd=str(cwd), check=True)
 
 
-def _split_features(raw: str) -> List[str]:
+def _split_features(raw: str) -> list[str]:
     parts = [p for p in raw.replace(",", " ").split() if p]
-    out: List[str] = []
+    out: list[str] = []
     seen = set()
     for item in parts:
         if item in seen:
@@ -50,7 +50,7 @@ def _split_features(raw: str) -> List[str]:
     return out
 
 
-def parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Rebuild gpt_rs Python bindings via uv+maturin.")
     parser.add_argument(
         "--sync",
@@ -84,7 +84,7 @@ def parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
 
     root = _repo_root()
@@ -97,7 +97,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "uv not found in PATH. Install uv, or run manually:\n"
             "  uv sync\n"
             "  uv pip install maturin\n"
-            "  cd crates/gpt-rs-py && uv run maturin develop --release --features faer\n"
+            '  uv --project "$(pwd)" --directory crates/gpt-rs-py run maturin develop --release '
+            "--features faer\n"
         )
 
     if args.sync:
@@ -106,7 +107,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.install_maturin:
         _run(["uv", "pip", "install", "maturin"], cwd=root)
 
-    cmd = ["uv", "run", "maturin", "develop"]
+    # From the crate directory, uv would use the crate's own `pyproject.toml` and `.venv`.
+    # `--project` makes uv use the repository environment.
+    cmd = ["uv", "--project", str(root), "run", "maturin", "develop"]
     if bool(args.release):
         cmd.append("--release")
 

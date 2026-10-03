@@ -445,7 +445,7 @@ impl CompiledModule {
 #[derive(Clone)]
 enum CStorage {
     /// Heap buffer owned by the backend.
-    Owned(Arc<Vec<u8>>),
+    Owned(Arc<LineAlignedBytes>),
     /// Read-only view into memory owned elsewhere, such as a memory-mapped checkpoint.
     External(ExternalBytes),
 }
@@ -456,6 +456,43 @@ impl CStorage {
             CStorage::Owned(data) => data.as_slice(),
             CStorage::External(bytes) => bytes.as_slice(),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct CacheLine([u8; 64]);
+
+/// Heap bytes that start on a 64-byte cache line. A vector load of up to 64 bytes at an offset that
+/// is a multiple of 64 bytes stays in one cache line.
+#[derive(Clone)]
+struct LineAlignedBytes {
+    lines: Vec<CacheLine>,
+    len: usize,
+}
+
+impl LineAlignedBytes {
+    fn zeroed(len: usize) -> Self {
+        Self {
+            lines: vec![CacheLine([0; 64]); len.div_ceil(64)],
+            len,
+        }
+    }
+
+    fn copy_of(bytes: &[u8]) -> Self {
+        let mut out = Self::zeroed(bytes.len());
+        out.as_mut_slice().copy_from_slice(bytes);
+        out
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: `lines` holds at least `len` initialized bytes, and `CacheLine` is plain bytes.
+        unsafe { std::slice::from_raw_parts(self.lines.as_ptr().cast(), self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: as in `as_slice`, and `&mut self` makes the borrow unique.
+        unsafe { std::slice::from_raw_parts_mut(self.lines.as_mut_ptr().cast(), self.len) }
     }
 }
 
@@ -472,7 +509,7 @@ impl CTensor {
         Ok(Self {
             spec: literal.spec.clone(),
             dims,
-            data: CStorage::Owned(Arc::new(literal.bytes.as_ref().to_vec())),
+            data: CStorage::Owned(Arc::new(LineAlignedBytes::copy_of(literal.bytes.as_ref()))),
         })
     }
 
@@ -490,7 +527,7 @@ impl CTensor {
         let data = if (bytes.as_slice().as_ptr() as usize).is_multiple_of(align) {
             CStorage::External(bytes)
         } else {
-            CStorage::Owned(Arc::new(bytes.as_slice().to_vec()))
+            CStorage::Owned(Arc::new(LineAlignedBytes::copy_of(bytes.as_slice())))
         };
         Ok(Self { spec, dims, data })
     }
@@ -501,7 +538,7 @@ impl CTensor {
         Ok(Self {
             spec,
             dims,
-            data: CStorage::Owned(Arc::new(vec![0u8; byte_len])),
+            data: CStorage::Owned(Arc::new(LineAlignedBytes::zeroed(byte_len))),
         })
     }
 
@@ -523,7 +560,7 @@ impl CTensor {
 
     fn as_ptir_tensor_mut(&mut self) -> PtirTensor {
         let data = match &mut self.data {
-            CStorage::Owned(data) => Arc::make_mut(data),
+            CStorage::Owned(data) => Arc::make_mut(data).as_mut_slice(),
             CStorage::External(_) => unreachable!("outputs are allocated by the backend"),
         };
         PtirTensor {

@@ -123,30 +123,62 @@ static inline void gpt_rs_compute_block(const float* apack, const float* b, size
 }
 
 /*
- * One row of a (m == 1): c[j] = bias[j] + sum_p a[p * sak] * b[p * sbk + j] for
- * j < nc <= GPTRS_PANEL_N.
+ * One row of a (m == 1): c[j] = bias[j] + sum_p a[p * sak] * b[p * sbk + j] for j < nc, with b
+ * contiguous along j.
  *
- * Each element of b is used once, so the kernel streams rows of b in place and does not pack them.
+ * Each element of b is used once, so the kernel reads b in place. It adds four rows of b per pass
+ * over c and reads each row segment in address order. The caller passes at most GPTRS_GEMV_NC
+ * columns, so c stays in L1.
  */
-static inline void gpt_rs_gemv_f32_cols(const float* a, size_t sak, const float* b, size_t sbk,
+static inline void gpt_rs_gemv_f32_rows(const float* a, size_t sak, const float* b, size_t sbk,
                                         float* c, size_t nc, size_t k, const float* bias) {
-    enum { V = GPTRS_PANEL_N / 16 };
-    __mmask16 mask[V];
-    __m512 acc[V];
-    for (int v = 0; v < V; ++v) {
-        const size_t j = (size_t)v * 16;
-        mask[v] = (__mmask16)gpt_rs_tail_mask(nc > j ? nc - j : 0);
-        acc[v] = bias ? _mm512_maskz_loadu_ps(mask[v], bias + j) : _mm512_setzero_ps();
+    const size_t full = nc / 16 * 16;
+    const __mmask16 tail = (__mmask16)gpt_rs_tail_mask(nc - full);
+    for (size_t j = 0; j < full; j += 16) {
+        _mm512_storeu_ps(c + j, bias ? _mm512_loadu_ps(bias + j) : _mm512_setzero_ps());
     }
-    for (size_t p = 0; p < k; ++p) {
-        const __m512 av = _mm512_set1_ps(a[p * sak]);
-        for (int v = 0; v < V; ++v) {
-            const __m512 bv = _mm512_maskz_loadu_ps(mask[v], b + p * sbk + (size_t)v * 16);
-            acc[v] = _mm512_fmadd_ps(av, bv, acc[v]);
+    if (tail) {
+        _mm512_mask_storeu_ps(c + full, tail,
+                              bias ? _mm512_maskz_loadu_ps(tail, bias + full) : _mm512_setzero_ps());
+    }
+    size_t p = 0;
+    for (; p + 4 <= k; p += 4) {
+        const __m512 a0 = _mm512_set1_ps(a[p * sak]);
+        const __m512 a1 = _mm512_set1_ps(a[(p + 1) * sak]);
+        const __m512 a2 = _mm512_set1_ps(a[(p + 2) * sak]);
+        const __m512 a3 = _mm512_set1_ps(a[(p + 3) * sak]);
+        const float* b0 = b + p * sbk;
+        const float* b1 = b0 + sbk;
+        const float* b2 = b1 + sbk;
+        const float* b3 = b2 + sbk;
+        for (size_t j = 0; j < full; j += 16) {
+            __m512 acc = _mm512_fmadd_ps(a0, _mm512_loadu_ps(b0 + j), _mm512_loadu_ps(c + j));
+            acc = _mm512_fmadd_ps(a1, _mm512_loadu_ps(b1 + j), acc);
+            acc = _mm512_fmadd_ps(a2, _mm512_loadu_ps(b2 + j), acc);
+            acc = _mm512_fmadd_ps(a3, _mm512_loadu_ps(b3 + j), acc);
+            _mm512_storeu_ps(c + j, acc);
+        }
+        if (tail) {
+            __m512 acc = _mm512_maskz_loadu_ps(tail, c + full);
+            acc = _mm512_fmadd_ps(a0, _mm512_maskz_loadu_ps(tail, b0 + full), acc);
+            acc = _mm512_fmadd_ps(a1, _mm512_maskz_loadu_ps(tail, b1 + full), acc);
+            acc = _mm512_fmadd_ps(a2, _mm512_maskz_loadu_ps(tail, b2 + full), acc);
+            acc = _mm512_fmadd_ps(a3, _mm512_maskz_loadu_ps(tail, b3 + full), acc);
+            _mm512_mask_storeu_ps(c + full, tail, acc);
         }
     }
-    for (int v = 0; v < V; ++v) {
-        _mm512_mask_storeu_ps(c + (size_t)v * 16, mask[v], acc[v]);
+    for (; p < k; ++p) {
+        const __m512 av = _mm512_set1_ps(a[p * sak]);
+        const float* bp = b + p * sbk;
+        for (size_t j = 0; j < full; j += 16) {
+            _mm512_storeu_ps(c + j,
+                             _mm512_fmadd_ps(av, _mm512_loadu_ps(bp + j), _mm512_loadu_ps(c + j)));
+        }
+        if (tail) {
+            const __m512 acc = _mm512_fmadd_ps(av, _mm512_maskz_loadu_ps(tail, bp + full),
+                                               _mm512_maskz_loadu_ps(tail, c + full));
+            _mm512_mask_storeu_ps(c + full, tail, acc);
+        }
     }
 }
 #endif

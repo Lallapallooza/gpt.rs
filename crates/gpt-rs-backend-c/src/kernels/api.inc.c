@@ -37,16 +37,19 @@ static inline void gpt_rs_c_matmul_f32(
     }
 
     /* A single row of a reuses no element of b, so the kernel reads unit-stride rows of b in
-     * place. */
+     * place. The threads split the columns, in blocks whose outputs fit in L1. */
     if (m == 1 && sbn == 1) {
-        const size_t chunks = (n + GPTRS_PANEL_N - 1) / GPTRS_PANEL_N;
-        #pragma omp parallel for schedule(static) if (batch * n * k >= GPTRS_PARALLEL_MIN_WORK)
+        const int parallel = batch * n * k >= GPTRS_PARALLEL_MIN_WORK;
+        const size_t threads = parallel ? (size_t)gpt_rs_c_team_size() : 1;
+        const size_t share = ((n + threads - 1) / threads + 15) / 16 * 16;
+        const size_t nb = GPTRS_MIN(GPTRS_GEMV_NC, share);
+        const size_t chunks = (n + nb - 1) / nb;
+        #pragma omp parallel for schedule(static) if (parallel)
         for (size_t t = 0; t < batch * chunks; ++t) {
             const size_t bi = t / chunks;
-            const size_t j0 = t % chunks * GPTRS_PANEL_N;
-            gpt_rs_gemv_f32_cols(a + bi * sab, sak, b + bi * sbb + j0, sbk, c + bi * n + j0,
-                                 GPTRS_MIN((size_t)GPTRS_PANEL_N, n - j0), k,
-                                 bias ? bias + j0 : NULL);
+            const size_t j0 = t % chunks * nb;
+            gpt_rs_gemv_f32_rows(a + bi * sab, sak, b + bi * sbb + j0, sbk, c + bi * n + j0,
+                                 GPTRS_MIN(nb, n - j0), k, bias ? bias + j0 : NULL);
         }
         return;
     }

@@ -219,6 +219,7 @@ macro_rules! define_backend_tests {
             parity_test!(torch_linear_matches_torch_batch4_in33_out65_no_bias, linear::linear_matches_torch_batch4_in33_out65_no_bias);
             parity_test!(torch_conv1d_matches_torch, conv1d_layer::conv1d_matches_torch);
             parity_test!(torch_conv1d_matches_torch_batch1_in32_out96, conv1d_layer::conv1d_matches_torch_batch1_in32_out96);
+            parity_test!(torch_conv1d_matches_torch_batch1_in37_out3105, conv1d_layer::conv1d_matches_torch_batch1_in37_out3105);
             parity_test!(torch_conv1d_matches_torch_batch7_in13_out17, conv1d_layer::conv1d_matches_torch_batch7_in13_out17);
             parity_test!(torch_conv1d_matches_torch_square_batch64_in64_out64, conv1d_layer::conv1d_matches_torch_square_batch64_in64_out64);
             parity_test!(torch_gated_feed_forward_matches_torch_with_bias, gated_feed_forward_layer::gated_feed_forward_matches_torch_with_bias);

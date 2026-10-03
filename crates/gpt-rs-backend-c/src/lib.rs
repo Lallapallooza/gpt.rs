@@ -939,17 +939,20 @@ fn host_defines() -> Vec<String> {
         let threads = num_cpus::get_physical().clamp(1, allowed);
         defines.push(format!("-DGPTRS_NUM_THREADS={threads}"));
     }
-    if let Some(bytes) = l2_cache_bytes() {
-        defines.push(format!("-DGPTRS_L2_BYTES={bytes}"));
+    for level in [1, 2] {
+        if let Some(bytes) = data_cache_bytes(level) {
+            defines.push(format!("-DGPTRS_L{level}_BYTES={bytes}"));
+        }
     }
     defines
 }
 
-fn l2_cache_bytes() -> Option<usize> {
+/// Size of the level `level` data or unified cache of the first core.
+fn data_cache_bytes(level: u32) -> Option<usize> {
     let caches = std::fs::read_dir("/sys/devices/system/cpu/cpu0/cache").ok()?;
     caches.flatten().find_map(|entry| {
         let read = |name: &str| std::fs::read_to_string(entry.path().join(name)).ok();
-        if read("level")?.trim() != "2" || read("type")?.trim() == "Instruction" {
+        if read("level")?.trim() != level.to_string() || read("type")?.trim() == "Instruction" {
             return None;
         }
         let size = read("size")?;

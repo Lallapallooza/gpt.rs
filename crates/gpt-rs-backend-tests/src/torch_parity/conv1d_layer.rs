@@ -40,6 +40,10 @@ pub fn conv1d_matches_torch_batch1_in32_out96<B: PortableBackend + 'static>(back
     run_conv1d_case(backend, (1, 32, 96), 0xC1D1);
 }
 
+pub fn conv1d_matches_torch_batch1_in37_out3105<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    run_conv1d_case(backend, (1, 37, 3105), 0xC1D4);
+}
+
 pub fn conv1d_matches_torch_batch7_in13_out17<B: PortableBackend + 'static>(backend: &Arc<B>) {
     run_conv1d_case(backend, (7, 13, 17), 0xC1D2);
 }

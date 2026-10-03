@@ -65,10 +65,18 @@ static inline int gpt_rs_c_team_size(void) {
  * shared panels. */
 #define GPTRS_TASKS_PER_THREAD ((size_t)2)
 
-/* Per-core L2 cache size. The host passes it as -DGPTRS_L2_BYTES. It is 1 MiB when unknown. */
+/* Per-core L1 data and L2 cache sizes. The host passes them as -DGPTRS_L1_BYTES and
+ * -DGPTRS_L2_BYTES. They are 32 KiB and 1 MiB when unknown. */
+#if !defined(GPTRS_L1_BYTES)
+#define GPTRS_L1_BYTES (32 << 10)
+#endif
 #if !defined(GPTRS_L2_BYTES)
 #define GPTRS_L2_BYTES (1 << 20)
 #endif
+
+/* Output columns of one single-row matmul task. They fill a quarter of L1, so they stay in L1
+ * while the four rows of b stream through it. */
+#define GPTRS_GEMV_NC ((size_t)GPTRS_L1_BYTES / 4 / sizeof(float) / 16 * 16)
 
 #if defined(__GNUC__)
 #define GPTRS_NOINLINE __attribute__((noinline))

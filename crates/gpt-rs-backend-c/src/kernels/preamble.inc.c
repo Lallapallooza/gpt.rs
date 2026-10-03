@@ -78,6 +78,8 @@ static inline int gpt_rs_c_team_size(void) {
  * while the four rows of b stream through it. */
 #define GPTRS_GEMV_NC ((size_t)GPTRS_L1_BYTES / 4 / sizeof(float) / 16 * 16)
 
+/* Keeps a function out of line, so it gets its own register allocation. A function with a large
+ * register tile spills that tile to the stack when it is inlined into a loop. */
 #if defined(__GNUC__)
 #define GPTRS_NOINLINE __attribute__((noinline))
 #else

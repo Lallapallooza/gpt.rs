@@ -1,14 +1,14 @@
 #if GPTRS_HAS_AVX512
-static inline void gpt_rs_ukernel_masked(const float* ap,
-                                         const float* bp,
-                                         size_t b_stride,
-                                         float* c,
-                                         size_t ldc,
-                                         size_t kc,
-                                         size_t mr,
-                                         size_t nr,
-                                         const float* bias,
-                                         int init_mode) {
+static GPTRS_NOINLINE void gpt_rs_ukernel_masked(const float* ap,
+                                                 const float* bp,
+                                                 size_t b_stride,
+                                                 float* c,
+                                                 size_t ldc,
+                                                 size_t kc,
+                                                 size_t mr,
+                                                 size_t nr,
+                                                 const float* bias,
+                                                 int init_mode) {
     const __mmask16 mask = (__mmask16)gpt_rs_tail_mask(nr);
     for (size_t i = 0; i < mr; ++i) {
         __m512 acc;

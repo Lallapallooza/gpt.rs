@@ -9,9 +9,9 @@ use gpt_rs::backend::param_resolver::InMemoryParamResolver;
 use gpt_rs::backend::param_resolver::ParamResolver;
 use gpt_rs::backend::rewriter::ProgramRewriter;
 use gpt_rs::backend::spec::{
-    BroadcastToSpec, Dimension, ElementwiseUnaryOp, Function, Instruction, Operand, Operation,
-    PortableBackend, Program, ReduceSpec, ReshapeDim, ReshapeSpec, Shape, SliceSpec, TensorInit,
-    TensorLiteral, TensorSpec, TransposeSpec, ValueId, ValueType,
+    BroadcastToSpec, DType, Dimension, DotGeneralSpec, ElementwiseUnaryOp, Function, Instruction,
+    Operand, Operation, PortableBackend, Program, ReduceSpec, ReshapeDim, ReshapeSpec, Shape,
+    SliceSpec, TensorInit, TensorLiteral, TensorSpec, TransposeSpec, ValueId, ValueType,
 };
 use gpt_rs::tensor::InputRole;
 
@@ -93,12 +93,15 @@ pub fn load_cases(fixture_rel: &str) -> Vec<Case> {
     cases
 }
 
+/// Runs `passes` on the case input and compares the output with `EXPECTED`. An empty `EXPECTED`
+/// means the passes must leave the input unchanged.
 pub fn run_case_with_passes<B: PortableBackend + 'static>(
     backend: &B,
     passes: &[&dyn FunctionPass<B>],
     case: &Case,
 ) {
     let mut prog = parse_program(&case.input);
+    let input = prog.to_text();
     let func = prog
         .functions
         .get_mut(0)
@@ -117,7 +120,12 @@ pub fn run_case_with_passes<B: PortableBackend + 'static>(
         changed |= res.changed;
     }
 
-    assert!(changed, "pass must change IR for {}", case.name);
+    let expected = if case.expected.trim().is_empty() {
+        input.as_str()
+    } else {
+        assert!(changed, "pass must change IR for {}", case.name);
+        case.expected.as_str()
+    };
     assert!(
         ProgramRewriter::new(func).expect("index").verify(),
         "SSA verification failed for {}",
@@ -126,7 +134,7 @@ pub fn run_case_with_passes<B: PortableBackend + 'static>(
     let out = prog.to_text();
     assert_eq!(
         out.trim(),
-        case.expected.trim(),
+        expected.trim(),
         "output mismatch for {}",
         case.name
     );
@@ -368,6 +376,22 @@ fn parse_op(name: &str, op_repr: &str) -> Operation {
             let starts = extract_usize_list(op_repr, "starts");
             let sizes = extract_usize_list(op_repr, "sizes");
             Operation::Slice(SliceSpec { starts, sizes })
+        }
+        "DotGeneral" => {
+            let dtype = |key: &str| {
+                let (_, rest) = op_repr.split_once(key)?;
+                rest.trim_start_matches(": ")
+                    .starts_with("Some(F32)")
+                    .then_some(DType::F32)
+            };
+            Operation::DotGeneral(DotGeneralSpec {
+                batch_lhs: extract_usize_list(op_repr, "batch_lhs"),
+                batch_rhs: extract_usize_list(op_repr, "batch_rhs"),
+                contract_lhs: extract_usize_list(op_repr, "contract_lhs"),
+                contract_rhs: extract_usize_list(op_repr, "contract_rhs"),
+                accum_dtype: dtype("accum_dtype"),
+                out_dtype: dtype("out_dtype"),
+            })
         }
         "BroadcastTo" => {
             let result_shape = extract_usize_list(op_repr, "result_shape");

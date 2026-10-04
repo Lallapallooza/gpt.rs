@@ -7,8 +7,9 @@ use std::time::SystemTime;
 use crate::backend::optimizer::{FunctionPass, OptimizeContext, Optimizer, PassResult};
 use crate::backend::passes::{
     BroadcastCanonicalizationPass, CastCanonicalizationPass, CommonSubexpressionEliminationPass,
-    DeadCodeEliminationPass, ElementwiseSimplificationPass, ParamOnlyFoldToParamPass,
-    ReshapeCanonicalizationPass, SliceCanonicalizationPass, TransposeCanonicalizationPass,
+    DeadCodeEliminationPass, DotScaleFoldPass, ElementwiseSimplificationPass,
+    ParamOnlyFoldToParamPass, ReshapeCanonicalizationPass, SliceCanonicalizationPass,
+    TransposeCanonicalizationPass,
 };
 use crate::backend::spec::{Function, PortableBackend, Program};
 use crate::ops::trace::{emit_pass_event, OptimizerPassStats, PassEvent, PassEventKind};
@@ -88,6 +89,9 @@ impl<B: PortableBackend + 'static> PipelineOptimizer<B> {
 
         builder.fixed_point(pre_iters, |p| {
             canonicalize(p);
+            // Runs before the backend lowers dots into kernels and before the parameter fold folds
+            // the scaled weights.
+            p.pass(Arc::new(DotScaleFoldPass::default()));
         });
 
         if let Some(pipeline) = backend_pipeline.as_ref() {

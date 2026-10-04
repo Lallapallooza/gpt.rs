@@ -32,7 +32,8 @@ All passes implement:
 
 The default optimizer is `PipelineOptimizer<B>`, which runs:
 
-- a bounded fixed-point loop of canonicalization/simplification passes
+- a bounded fixed-point loop of canonicalization/simplification passes, plus `DotScaleFoldPass`,
+  which moves a static scale of a `dot_general` result into its static weight
 - backend-specific hooks (optional)
 - param-only hoisting (`ParamOnlyFoldToParamPass`): some values that the rest of the function reads
   depend only on parameters and literals, and on at least one parameter. The pass caches each of

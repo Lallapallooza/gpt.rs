@@ -4,6 +4,7 @@ mod broadcast_canonicalization;
 mod cast_canonicalization;
 mod cse;
 mod dce;
+mod dot_scale_fold;
 mod elementwise_dag_fusion;
 mod elementwise_simplification;
 mod fusion_hints;
@@ -19,6 +20,7 @@ pub use broadcast_canonicalization::{
 pub use cast_canonicalization::{CastCanonicalizationPass, EliminateRedundantCast};
 pub use cse::CommonSubexpressionEliminationPass;
 pub use dce::DeadCodeEliminationPass;
+pub use dot_scale_fold::DotScaleFoldPass;
 pub use elementwise_dag_fusion::ElementwiseDagFusionPass;
 pub use elementwise_simplification::ElementwiseSimplificationPass;
 pub use fusion_hints::FusionHintPass;

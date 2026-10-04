@@ -21,8 +21,8 @@ Single-thread CPU numbers from `scripts/eval.py --workload bench --backend c` on
 
 | Workload | gpt.rs | torch | Speedup |
 | --- | ---: | ---: | ---: |
-| ResNet34 (batch=1, image=224) | 29.93 images/s | 28.20 images/s | 1.06x |
-| GPT-2 (generate 64 tokens) | 74.71 tokens/s | 46.16 tokens/s | 1.62x |
+| ResNet34 (batch=1, image=224) | 25.10 images/s | 23.32 images/s | 1.08x |
+| GPT-2 (generate 64 tokens) | 86.20 tokens/s | 49.31 tokens/s | 1.75x |
 
 Reproduce (C backend):
 ```bash

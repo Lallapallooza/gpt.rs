@@ -34,7 +34,9 @@ The default optimizer is `PipelineOptimizer<B>`, which runs:
 
 - a bounded fixed-point loop of canonicalization/simplification passes
 - backend-specific hooks (optional)
-- param-only hoisting (`ParamOnlyFoldToParamPass`)
+- param-only hoisting (`ParamOnlyFoldToParamPass`): some values that the rest of the function reads
+  depend only on parameters and literals, and on at least one parameter. The pass caches each of
+  them as a derived parameter. For a broadcast of such a value, it caches the broadcast operand.
 - another bounded fixed-point cleanup loop (including `CommonSubexpressionEliminationPass` and `DeadCodeEliminationPass`)
 
 Tuning/debug knobs:

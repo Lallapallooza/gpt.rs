@@ -4,9 +4,12 @@ use anyhow::{anyhow, bail, Result};
 
 use crate::backend::optimizer::{FunctionPass, OptimizeContext, PassResult};
 use crate::backend::spec::{
-    Function, Operand, PortableBackend, Program, ProgramBuilder, TensorLiteral, ValueId, ValueType,
+    Function, Operand, Operation, PortableBackend, Program, ProgramBuilder, TensorLiteral, ValueId,
+    ValueType,
 };
 use crate::tensor::InputRole;
+
+use super::static_values::static_values;
 
 #[derive(Default)]
 pub struct ParamOnlyFoldToParamPass;
@@ -30,13 +33,11 @@ impl<B: PortableBackend + 'static> FunctionPass<B> for ParamOnlyFoldToParamPass 
         loop {
             let def_map = build_def_map(function);
             let type_map = build_type_map(function);
-            let mut memo_static: HashMap<ValueId, bool> = HashMap::new();
+            let statics = static_values(function, cx);
 
             let mut dynamic_users: HashSet<ValueId> = HashSet::new();
             for inst in &function.body {
-                let value_static =
-                    is_static_value(function, cx, &def_map, &mut memo_static, inst.id);
-                if value_static {
+                if statics.contains(&inst.id) {
                     continue;
                 }
                 for operand in &inst.operands {
@@ -54,11 +55,16 @@ impl<B: PortableBackend + 'static> FunctionPass<B> for ParamOnlyFoldToParamPass 
 
             let mut targets: Vec<ValueId> = Vec::new();
             for inst in &function.body {
-                if !is_static_value(function, cx, &def_map, &mut memo_static, inst.id) {
+                if !statics.contains(&inst.id) {
                     continue;
                 }
-                if dynamic_users.contains(&inst.id) || function.result_ids.contains(&inst.id) {
-                    targets.push(inst.id);
+                if !dynamic_users.contains(&inst.id) && !function.result_ids.contains(&inst.id) {
+                    continue;
+                }
+                if let Some(target) = fold_root(function, &def_map, inst.id) {
+                    if !targets.contains(&target) {
+                        targets.push(target);
+                    }
                 }
             }
 
@@ -77,7 +83,9 @@ impl<B: PortableBackend + 'static> FunctionPass<B> for ParamOnlyFoldToParamPass 
                     continue;
                 };
 
-                if desc.leaf_param_stable_ids.len() != 1 {
+                // A subgraph without parameters depends only on literals and the program's shapes.
+                // Caching it would add a cache entry for every new shape.
+                if desc.leaf_param_stable_ids.is_empty() {
                     continue;
                 }
 
@@ -85,7 +93,6 @@ impl<B: PortableBackend + 'static> FunctionPass<B> for ParamOnlyFoldToParamPass 
                     continue;
                 };
 
-                let leaf_stable_id = desc.leaf_param_stable_ids[0];
                 let dag_hash = dag_hash_value(function, cx, &def_map, &type_map, target);
                 let derived_id = derived_param_id(cx.backend().backend_name(), dag_hash, &desc);
                 let failure_key = failure_cache_key(cx.backend().backend_name(), dag_hash);
@@ -99,17 +106,20 @@ impl<B: PortableBackend + 'static> FunctionPass<B> for ParamOnlyFoldToParamPass 
                 } else {
                     crate::profiling::cache_event("param_resolver_derived_miss");
 
-                    let leaf_handle = match params.get(leaf_stable_id) {
-                        Some(handle) => {
-                            crate::profiling::cache_event("param_resolver_leaf_hit");
-                            handle
-                        }
-                        None => {
+                    let mut leaf_handles = Vec::with_capacity(desc.leaf_param_ids.len());
+                    for leaf in &desc.leaf_param_ids {
+                        let handle = cx.entry().stable_id_of(*leaf).and_then(|id| params.get(id));
+                        let Some(handle) = handle else {
                             crate::profiling::cache_event("param_resolver_leaf_miss");
-                            cx.record_failed_fold_key(failure_key);
-                            continue;
-                        }
-                    };
+                            break;
+                        };
+                        crate::profiling::cache_event("param_resolver_leaf_hit");
+                        leaf_handles.push(handle);
+                    }
+                    if leaf_handles.len() != desc.leaf_param_ids.len() {
+                        cx.record_failed_fold_key(failure_key);
+                        continue;
+                    }
 
                     let subgraph = match build_subgraph_program(
                         function,
@@ -126,7 +136,7 @@ impl<B: PortableBackend + 'static> FunctionPass<B> for ParamOnlyFoldToParamPass 
                     };
 
                     let _suspend = crate::profiling::suspend();
-                    let outputs = cx.backend().run_program(&subgraph, &[leaf_handle]);
+                    let outputs = cx.backend().run_program(&subgraph, &leaf_handles);
                     let mut outputs = match outputs {
                         Ok(v) => v,
                         Err(_) => {
@@ -171,6 +181,25 @@ impl<B: PortableBackend + 'static> FunctionPass<B> for ParamOnlyFoldToParamPass 
     }
 }
 
+/// Returns the value that the pass folds for `value`: `value` itself, or the source of the
+/// broadcasts that produce it. The cached value then has the shape of the broadcast operand, not of
+/// the activation. Returns `None` when that source is a function input, such as a parameter.
+fn fold_root(
+    function: &Function,
+    def_map: &HashMap<ValueId, usize>,
+    value: ValueId,
+) -> Option<ValueId> {
+    let mut value = value;
+    while let Some(&idx) = def_map.get(&value) {
+        let inst = &function.body[idx];
+        match (&inst.op, inst.operands.as_slice()) {
+            (Operation::BroadcastTo(_), [Operand::Value(source)]) => value = *source,
+            _ => return Some(value),
+        }
+    }
+    None
+}
+
 struct StaticSubgraphDesc {
     leaf_param_ids: Vec<ValueId>,
     leaf_param_stable_ids: Vec<u128>,
@@ -199,50 +228,6 @@ fn build_type_map(function: &Function) -> HashMap<ValueId, ValueType> {
         types.insert(inst.id, inst.output.clone());
     }
     types
-}
-
-fn is_static_value<B: PortableBackend + 'static>(
-    function: &Function,
-    cx: &OptimizeContext<'_, B>,
-    def_map: &HashMap<ValueId, usize>,
-    memo: &mut HashMap<ValueId, bool>,
-    value: ValueId,
-) -> bool {
-    if let Some(flag) = memo.get(&value).copied() {
-        return flag;
-    }
-
-    if function.parameter_ids.contains(&value) {
-        let flag = cx.entry().role_of(value) == Some(InputRole::Param);
-        memo.insert(value, flag);
-        return flag;
-    }
-
-    let Some(&idx) = def_map.get(&value) else {
-        memo.insert(value, false);
-        return false;
-    };
-
-    let inst = &function.body[idx];
-    let mut flag = true;
-    for operand in &inst.operands {
-        match operand {
-            Operand::Literal(_) => {}
-            Operand::Value(dep) => {
-                if !is_static_value(function, cx, def_map, memo, *dep) {
-                    flag = false;
-                    break;
-                }
-            }
-            Operand::TupleElement { .. } => {
-                flag = false;
-                break;
-            }
-        }
-    }
-
-    memo.insert(value, flag);
-    flag
 }
 
 fn describe_static_subgraph<B: PortableBackend + 'static>(

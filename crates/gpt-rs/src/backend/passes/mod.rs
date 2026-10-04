@@ -10,6 +10,7 @@ mod fusion_hints;
 mod param_only_fold_to_param;
 mod reshape_canonicalization;
 mod slice_canonicalization;
+mod static_values;
 mod transpose_canonicalization;
 
 pub use broadcast_canonicalization::{

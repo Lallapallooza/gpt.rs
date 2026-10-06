@@ -75,9 +75,6 @@ type FaerBackend = gpt_rs_backend_faer::FaerPortableBackend;
 #[cfg(feature = "conversion-c")]
 type CBackend = gpt_rs_backend_c::CBackend;
 
-#[cfg(feature = "triton")]
-type TritonBackend = gpt_rs_backend_triton::TritonBackend;
-
 enum PyLoadedModelInner {
     Cpu {
         backend: Arc<CpuBackend>,
@@ -92,11 +89,6 @@ enum PyLoadedModelInner {
     C {
         backend: Arc<CBackend>,
         model: ModelHandle<CBackend>,
-    },
-    #[cfg(feature = "triton")]
-    Triton {
-        backend: Arc<TritonBackend>,
-        model: ModelHandle<TritonBackend>,
     },
 }
 
@@ -116,11 +108,6 @@ macro_rules! with_model {
             } => $body,
             #[cfg(feature = "conversion-c")]
             PyLoadedModelInner::C {
-                backend: $backend,
-                model: $model,
-            } => $body,
-            #[cfg(feature = "triton")]
-            PyLoadedModelInner::Triton {
                 backend: $backend,
                 model: $model,
             } => $body,
@@ -323,8 +310,6 @@ pub fn load_model(
     load_as!(FaerBackend, Faer);
     #[cfg(feature = "conversion-c")]
     load_as!(CBackend, C);
-    #[cfg(feature = "triton")]
-    load_as!(TritonBackend, Triton);
 
     Err(PyRuntimeError::new_err(format!(
         "unsupported backend '{backend_name}' for runtime.load_model (missing feature build?)",
@@ -350,7 +335,6 @@ pub fn backend_features<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
     d.set_item("cpu", true)?;
     d.set_item("faer", cfg!(feature = "faer"))?;
     d.set_item("conversion_c", cfg!(feature = "conversion-c"))?;
-    d.set_item("triton", cfg!(feature = "triton"))?;
     Ok(d)
 }
 

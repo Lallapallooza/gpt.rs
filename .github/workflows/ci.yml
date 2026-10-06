@@ -55,4 +55,3 @@ jobs:
           cargo test --workspace
           --exclude gpt-rs-py
           --exclude gpt-rs-backend-c
-          --exclude gpt-rs-backend-triton

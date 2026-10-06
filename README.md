@@ -69,7 +69,6 @@ Scripts:
 ## Roadmap (TODO)
 
 Backends:
-- [ ] Triton backend
 - [ ] NVIDIA GPU (CUDA + cuDNN) backend
 - [ ] XLA backend
 - [ ] IREE backend

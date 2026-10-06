@@ -7,50 +7,50 @@ use gpt_rs::profiling::{ProfileFormatOptions, WorkStats};
 
 fn record_common_backend_metrics() {
     profiling::record_backend_aggregate(
-        "backend.triton.exec.dispatch",
+        "backend.exec.dispatch",
         1,
         Duration::from_millis(12),
         WorkStats::default(),
     );
     profiling::record_backend_aggregate(
-        "backend.triton.exec.launches",
+        "backend.exec.launches",
         24,
         Duration::ZERO,
         WorkStats::default(),
     );
     profiling::record_backend_aggregate(
-        "backend.triton.kernel.total",
+        "backend.kernel.total",
         24,
         Duration::from_millis(18),
         WorkStats::default(),
     );
     profiling::record_backend_aggregate(
-        "backend.triton.kernel.host",
+        "backend.kernel.host",
         24,
         Duration::from_millis(20),
         WorkStats::default(),
     );
     profiling::record_backend_aggregate(
-        "backend.triton.kernel.gpu",
+        "backend.kernel.gpu",
         24,
         Duration::from_millis(15),
         WorkStats::default(),
     );
     profiling::record_backend_aggregate(
-        "backend.triton.cublas_sgemm",
+        "backend.sgemm",
         3,
         Duration::from_millis(7),
         WorkStats::default(),
     );
-    profiling::cache_event("triton_backend.kernel_hit_mem");
-    profiling::cache_event("triton_backend.kernel_hit_mem");
+    profiling::cache_event("backend.kernel_hit_mem");
+    profiling::cache_event("backend.kernel_hit_mem");
 }
 
 fn seed_many_backend_rows() {
     for idx in 0..40u32 {
         let signature = profiling::signature_id(&format!("sig-{idx}"));
         profiling::record_backend_aggregate_with_signature(
-            "backend.triton.kernel.total",
+            "backend.kernel.total",
             signature,
             1,
             Duration::from_micros(1_000 + u64::from(idx)),
@@ -97,8 +97,8 @@ fn compact_backend_view_can_be_expanded_with_profile_full() {
     })
     .expect("expected full profiler report");
 
-    let compact_rows = compact.matches("backend.triton.kernel.total [").count();
-    let full_rows = full.matches("backend.triton.kernel.total [").count();
+    let compact_rows = compact.matches("backend.kernel.total [").count();
+    let full_rows = full.matches("backend.kernel.total [").count();
     assert!(compact_rows < full_rows);
 }
 

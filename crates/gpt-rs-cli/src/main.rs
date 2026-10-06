@@ -17,8 +17,6 @@ use gpt_rs::PortableBackend;
 #[cfg(feature = "conversion-c")]
 use gpt_rs_backend_c::CBackend;
 use gpt_rs_backend_faer::FaerCpuBackend;
-#[cfg(feature = "backend-triton")]
-use gpt_rs_backend_triton::TritonBackend;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use std::env;
@@ -517,8 +515,6 @@ fn main() -> Result<()> {
 
     #[cfg(feature = "conversion-c")]
     gpt_rs_backend_c::register_conversion_targets();
-    #[cfg(feature = "backend-triton")]
-    gpt_rs_backend_triton::register_conversion_targets();
 
     if profile_enabled {
         profiling::reset();
@@ -573,27 +569,6 @@ fn main() -> Result<()> {
                 );
             }
         }
-        "triton" => {
-            #[cfg(feature = "backend-triton")]
-            {
-                // Per-op CUDA event timing is only enabled for `--profile-full`.
-                gpt_rs_backend_triton::set_gpu_event_timing(profile_enabled && args.profile_full);
-                let backend = Arc::new(TritonBackend::new());
-                run_with_backend(
-                    backend,
-                    command,
-                    profile_enabled,
-                    args.profile_full,
-                    &artifact_config,
-                )?
-            }
-            #[cfg(not(feature = "backend-triton"))]
-            {
-                bail!(
-                    "GPTRS_BACKEND='triton' requires building gpt-rs-cli with --features backend-triton"
-                );
-            }
-        }
         other => {
             bail!(
                 "unknown backend '{}'; available: {}",
@@ -624,14 +599,10 @@ fn main() -> Result<()> {
 }
 
 fn supported_backends() -> Vec<&'static str> {
-    [
-        Some("faer"),
-        cfg!(feature = "backend-triton").then_some("triton"),
-        cfg!(feature = "conversion-c").then_some("c"),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+    [Some("faer"), cfg!(feature = "conversion-c").then_some("c")]
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 fn run_with_backend<B: PortableBackend + 'static>(

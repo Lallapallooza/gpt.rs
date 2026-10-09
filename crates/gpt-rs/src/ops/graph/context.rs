@@ -1,12 +1,12 @@
-//! Thread-local default arena context for implicit graph capture.
+//! Thread-local default arena, the graph that tensor ops record into.
 //!
-//! This module provides a thread-local stack of graph arenas that allows functional operators
-//! to implicitly capture operations into a shared graph without explicit arena passing.
+//! This module provides a thread-local stack of graph arenas, so tensor ops record into one shared
+//! graph without passing the arena around.
 //!
 //! ## Usage Pattern
 //!
-//! [`capture!`](crate::capture) records into the default arena when none of its operands has a
-//! graph.
+//! Every op of [`DeviceTensor`](crate::DeviceTensor) records into the default arena when one is
+//! installed for its backend.
 //!
 //! ## Thread-Local Stack
 //!
@@ -17,9 +17,8 @@
 //! ```rust,ignore
 //! let arena = GraphArena::new(backend);
 //! with_default_arena(arena, || {
-//!     // All operations in this scope implicitly use `arena`
-//!     let result = some_functional_op(x, y)?;
-//!     Ok(result)
+//!     // Every op in this scope records into `arena`.
+//!     functional::gelu(&(&x + &y))
 //! })
 //! ```
 
@@ -27,7 +26,7 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use crate::backend::spec::PortableBackend;
+use crate::backend::PortableBackend;
 
 use super::GraphArena;
 

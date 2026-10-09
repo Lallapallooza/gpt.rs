@@ -1,22 +1,17 @@
-//! Core tensor abstractions shared across backends.
-//!
-//! The tensor module defines portable shapes, dtypes, storage element traits, and the
-//! device-aware tensor wrappers that power functional kernels. It re-exports
-//! [`DeviceTensorOps`] so helper traits live next to
-//! the tensor types consumers manipulate in forward passes.
+//! Core tensor abstractions shared across backends: the lazy [`DeviceTensor`] and its ops, the
+//! host tensor, shapes and dtypes.
 
 mod device_tensor;
-pub mod dtype;
-mod host_tensor;
 mod lazy_tensor;
+mod ops;
 pub mod shape;
-pub(crate) mod spec_utils;
-pub mod storage;
+mod slicing;
 
-pub use crate::ops::functional::DeviceTensorOps;
 pub use device_tensor::DeviceTensor;
-pub use dtype::DType;
-pub use host_tensor::Tensor;
+pub use gpt_rs_ir::host::HostTensor;
+pub use gpt_rs_ir::types::DType;
 pub use lazy_tensor::InputRole;
-pub(crate) use lazy_tensor::LazyHandle;
+pub(crate) use lazy_tensor::{LazyHandle, Materialized};
+pub use ops::Operand;
 pub use shape::Shape;
+pub use slicing::{AxisIndex, Position};

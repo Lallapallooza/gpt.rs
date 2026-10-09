@@ -8,15 +8,15 @@ description = "C backend for executing gpt-rs portable tensor IR (PTIR)."
 
 [features]
 default = []
-conversion-c = []
 torch = ["gpt-rs-backend-tests/torch"]
 
 [dependencies]
+anyhow = { workspace = true }
 gpt-rs = { path = "../gpt-rs", version = "0.1.0" }
+gpt-rs-ir = { path = "../gpt-rs-ir", version = "0.1.0" }
 libloading = "0.8"
-bincode = { workspace = true }
-linkme = "0.3"
 num_cpus = "1.17"
 
 [dev-dependencies]
 gpt-rs-backend-tests = { path = "../gpt-rs-backend-tests", version = "0.1.0" }
+gpt-rs-filetests = { path = "../gpt-rs-filetests", features = ["backend"] }

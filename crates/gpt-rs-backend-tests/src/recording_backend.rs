@@ -1,77 +1,61 @@
-use std::sync::Mutex;
+//! A backend that runs nothing and records the last function the graph arena compiled.
 
-use gpt_rs::backend::spec::{
-    BackendResult, Function, Instruction, PortableBackend, Program, TensorInit, TensorLiteral,
-};
+use std::sync::{Arc, Mutex};
 
-/// Test-only portable backend that records the latest emitted PTIR program.
+use anyhow::{anyhow, Result};
+use gpt_rs::backend::{ParamStore, PortableBackend};
+use gpt_rs::gpt_rs_ir::host::HostTensor;
+use gpt_rs::gpt_rs_ir::module::Module;
+
 #[derive(Default)]
 pub struct RecordingBackend {
-    last_program: Mutex<Option<Program>>,
+    params: ParamStore<()>,
+    last: Mutex<Option<(Arc<Module>, String)>>,
 }
 
 impl RecordingBackend {
-    pub fn recorded_program(&self) -> Option<Program> {
-        self.last_program
+    /// The module and the name of the function that the arena compiled last.
+    pub fn recorded_or_panic(&self) -> (Arc<Module>, String) {
+        self.last
             .lock()
             .expect("backend mutex poisoned")
             .clone()
-    }
-
-    pub fn recorded_program_or_panic(&self) -> Program {
-        self.recorded_program()
-            .expect("backend should record emitted program")
-    }
-
-    pub fn recorded_entry_function_or_panic(&self) -> Function {
-        let program = self.recorded_program_or_panic();
-        program
-            .functions
-            .iter()
-            .find(|function| function.name == program.entry)
-            .expect("captured function present")
-            .clone()
+            .expect("the arena compiled a function")
     }
 }
 
 impl PortableBackend for RecordingBackend {
     type TensorHandle = ();
+    /// The number of results.
+    type Executable = usize;
 
     fn backend_name(&self) -> &str {
         "recording"
     }
 
-    fn materialize(&self, _init: TensorInit) -> BackendResult<Self::TensorHandle> {
+    fn params(&self) -> &ParamStore<()> {
+        &self.params
+    }
+
+    fn compile(&self, module: &Arc<Module>, func: &str) -> Result<usize> {
+        let inst = module
+            .func(func)
+            .ok_or_else(|| anyhow!("the module has no function @{func}"))?;
+        let results = module.op(inst).as_func().expect("a function").results.len();
+        *self.last.lock().expect("backend mutex poisoned") =
+            Some((Arc::clone(module), func.to_string()));
+        Ok(results)
+    }
+
+    fn run(&self, results: &usize, _args: &[()]) -> Result<Vec<()>> {
+        Ok(vec![(); *results])
+    }
+
+    fn upload(&self, _host: HostTensor) -> Result<()> {
         Ok(())
     }
 
-    fn to_literal(&self, _tensor: &Self::TensorHandle) -> BackendResult<TensorLiteral> {
-        unreachable!("recording backend does not materialize to host")
-    }
-
-    fn execute_instruction(
-        &self,
-        _instruction: &Instruction,
-        _inputs: &[Self::TensorHandle],
-    ) -> BackendResult<Vec<Self::TensorHandle>> {
-        unreachable!("recording backend does not execute standalone instructions")
-    }
-
-    fn run_program(
-        &self,
-        program: &Program,
-        _entry_inputs: &[Self::TensorHandle],
-    ) -> BackendResult<Vec<Self::TensorHandle>> {
-        let output_count = program
-            .functions
-            .iter()
-            .find(|function| function.name == program.entry)
-            .map(|function| function.results.len())
-            .unwrap_or(0);
-        self.last_program
-            .lock()
-            .expect("backend mutex poisoned")
-            .replace(program.clone());
-        Ok(vec![(); output_count])
+    fn download(&self, _tensor: &()) -> Result<HostTensor> {
+        Err(anyhow!("the recording backend holds no tensor data"))
     }
 }

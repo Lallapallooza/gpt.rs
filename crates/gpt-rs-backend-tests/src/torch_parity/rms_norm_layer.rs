@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use gpt_rs::backend::spec::PortableBackend;
+use gpt_rs::backend::PortableBackend;
 use gpt_rs::module::Layer;
 use gpt_rs::nn::layers::RmsNormConfig;
-use gpt_rs::tensor::{DeviceTensor, Shape, Tensor};
+use gpt_rs::tensor::{DeviceTensor, HostTensor};
 use tch::{Kind, Tensor as TchTensor};
 
 use super::common::*;
@@ -38,12 +38,12 @@ fn run_rms_norm_case<B: PortableBackend + 'static>(
     let input_vec = input_override.unwrap_or_else(|| random_vec(&mut rng, len));
     let gamma_vec = random_vec(&mut rng, feature_dim);
 
-    let input_host = Tensor::from_vec(Shape::new(shape.to_vec()), input_vec).unwrap();
+    let input_host = HostTensor::f32(shape, input_vec).unwrap();
     let gamma_host = tensor_from_vec(&[feature_dim], gamma_vec);
 
     let expected = timed_torch(|| {
-        let input_tch = tch_tensor_from_vec(shape, input_host.data());
-        let mut gamma_tch = tch_tensor_from_vec(&[feature_dim], gamma_host.data());
+        let input_tch = tch_tensor_from_vec(shape, input_host.as_f32().unwrap());
+        let mut gamma_tch = tch_tensor_from_vec(&[feature_dim], gamma_host.as_f32().unwrap());
         if unit_offset {
             gamma_tch += 1.0;
         }
@@ -58,11 +58,11 @@ fn run_rms_norm_case<B: PortableBackend + 'static>(
         let layer = rms_norm_layer(backend, gamma_host.clone(), config);
         let input_device =
             DeviceTensor::from_host(Arc::clone(backend), input_host.clone()).unwrap();
-        let output_device = layer.call(&input_device).unwrap();
+        let output_device = layer.call(&input_device);
         output_device.to_host().unwrap()
     });
 
-    assert_close(&expected, output_host.data());
+    assert_close(&expected, output_host.as_f32().unwrap());
 }
 
 pub fn rms_norm_layer_matches_torch_basic<B: PortableBackend + 'static>(backend: &Arc<B>) {

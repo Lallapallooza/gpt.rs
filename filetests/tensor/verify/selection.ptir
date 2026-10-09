@@ -1,0 +1,55 @@
+// RUN: verify
+
+// ERROR: tensor.argmax: axis 2 is out of range for rank 2
+func.func @argmax_axis(%0: tensor<2x5xf32>) -> tensor<2xsi32> {
+  %1 = tensor.argmax(%0) {axis = 2, out = si32} : (tensor<2x5xf32>) -> tensor<2xsi32>
+  func.return(%1) : (tensor<2xsi32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.argmax: indices must be si32 or si64, got f32
+func.func @argmax_float_indices(%0: tensor<2x5xf32>) -> tensor<2xf32> {
+  %1 = tensor.argmax(%0) {axis = 1, out = f32} : (tensor<2x5xf32>) -> tensor<2xf32>
+  func.return(%1) : (tensor<2xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.argmax: axis 1 of tensor<2x0xf32> is empty
+func.func @argmax_empty_axis(%0: tensor<2x0xf32>) -> tensor<2xsi32> {
+  %1 = tensor.argmax(%0) {axis = 1, out = si32} : (tensor<2x0xf32>) -> tensor<2xsi32>
+  func.return(%1) : (tensor<2xsi32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.top_k: k = 6 exceeds axis 1 of tensor<2x5xf32>
+func.func @top_k_too_many(%0: tensor<2x5xf32>) -> (tensor<2x6xf32>, tensor<2x6xsi32>) {
+  %1, %2 = tensor.top_k(%0) {k = 6, axis = 1, largest = true, indices = si32} : (tensor<2x5xf32>) -> (tensor<2x6xf32>, tensor<2x6xsi32>)
+  func.return(%1, %2) : (tensor<2x6xf32>, tensor<2x6xsi32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.top_k: indices must be si32 or si64, got f32
+func.func @top_k_float_indices(%0: tensor<2x5xf32>) -> (tensor<2x2xf32>, tensor<2x2xf32>) {
+  %1, %2 = tensor.top_k(%0) {k = 2, axis = 1, largest = true, indices = f32} : (tensor<2x5xf32>) -> (tensor<2x2xf32>, tensor<2x2xf32>)
+  func.return(%1, %2) : (tensor<2x2xf32>, tensor<2x2xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.segment_sum: segment ids must be si32 or si64 with one id per row of tensor<6x4xf32>, got tensor<5xsi32>
+func.func @segment_ids(%0: tensor<6x4xf32>, %1: tensor<5xsi32>) -> tensor<3x4xf32> {
+  %2 = tensor.segment_sum(%0, %1) {num_segments = 3} : (tensor<6x4xf32>, tensor<5xsi32>) -> tensor<3x4xf32>
+  func.return(%2) : (tensor<3x4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.segment_sum: data must have rank at least 1, got tensor<f32>
+func.func @segment_scalar(%0: tensor<f32>, %1: tensor<1xsi32>) -> tensor<3xf32> {
+  %2 = tensor.segment_sum(%0, %1) {num_segments = 3} : (tensor<f32>, tensor<1xsi32>) -> tensor<3xf32>
+  func.return(%2) : (tensor<3xf32>) -> ()
+}

@@ -1,17 +1,16 @@
-use gpt_rs::backend::conversion::{ConversionError, ConversionResult};
-use gpt_rs::backend::spec::DType;
+use anyhow::{anyhow, Result};
+use gpt_rs_ir::types::DType;
 
-pub(crate) fn dtype_tag(dtype: DType) -> Option<u32> {
-    match dtype {
-        DType::F32 => Some(0),
-        DType::F16 => Some(1),
-        DType::Bf16 => Some(2),
-        DType::Si32 => Some(3),
-        DType::I1 => Some(4),
-        _ => None,
-    }
-}
-
-pub(crate) fn dtype_tag_value(dtype: DType) -> ConversionResult<u32> {
-    dtype_tag(dtype).ok_or_else(|| ConversionError::new("dtype not supported by C backend"))
+/// The tag of `dtype` in a `PtirTensor`.
+pub(crate) fn dtype_tag(dtype: DType) -> Result<u32> {
+    Ok(match dtype {
+        DType::F32 => 0,
+        DType::F16 => 1,
+        DType::Bf16 => 2,
+        DType::Si32 => 3,
+        DType::I1 => 4,
+        DType::F8E4M3 => 5,
+        DType::Ui64 => 6,
+        _ => return Err(anyhow!("the C backend has no {dtype} tensors")),
+    })
 }

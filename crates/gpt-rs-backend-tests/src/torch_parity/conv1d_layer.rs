@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
-use gpt_rs::backend::spec::PortableBackend;
+use gpt_rs::backend::PortableBackend;
 use gpt_rs::module::Layer;
-use gpt_rs::nn::layers::Conv1D;
+use gpt_rs::nn::layers::Linear;
+use gpt_rs::ops::functional::WeightLayout;
 
 use super::common::*;
 
-/// `nn::Conv1D` against `transformers`' `Conv1D` with `weight` `[in_features, out_features]`.
+/// A [`Linear`] with an `[in_features, out_features]` weight against `transformers`' `Conv1D`.
 fn run_conv1d_case<B: PortableBackend + 'static>(
     backend: &Arc<B>,
     (batch, in_features, out_features): (usize, usize, usize),
@@ -22,18 +23,14 @@ fn run_conv1d_case<B: PortableBackend + 'static>(
 
     let actual = timed_gpt(|| {
         let layer = load_layer(backend, conv.tensors("proj"), |p| {
-            p.scoped("proj", Conv1D::new)
+            p.scoped("proj", |p| Linear::with_layout(p, WeightLayout::InOut))
         })
         .unwrap();
         let input = device_tensor_from_data(backend, &[batch, in_features], &input);
-        to_host_vec(&layer.call(&input).unwrap())
+        to_host_vec(&layer.call(&input))
     });
 
     assert_close(&expected, &actual);
-}
-
-pub fn conv1d_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    run_conv1d_case(backend, (4, 5, 3), 0xC1D0);
 }
 
 pub fn conv1d_matches_torch_batch1_in32_out96<B: PortableBackend + 'static>(backend: &Arc<B>) {

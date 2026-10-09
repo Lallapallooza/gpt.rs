@@ -14,12 +14,11 @@ Tensor/layer/functional APIs are intentionally not exposed in Python (for now).
 uv sync
 uv pip install maturin
 
-# Build the extension (recommended: enable all backends you want available at runtime):
-uv --project "$(pwd)" --directory "$(pwd)/crates/gpt-rs-py" run maturin develop --release --features faer,conversion-c
+# Build the extension with the backends you want at runtime (`maturin develop --release`):
+uv run python scripts/rebuild_py.py --features faer,conversion-c
 
-# Or enable a single backend to reduce build time:
-uv --project "$(pwd)" --directory "$(pwd)/crates/gpt-rs-py" run maturin develop --release --features faer
-uv --project "$(pwd)" --directory "$(pwd)/crates/gpt-rs-py" run maturin develop --release --features conversion-c
+# Or one backend, to build faster:
+uv run python scripts/rebuild_py.py --features faer
 ```
 
 Then pick a backend at runtime:
@@ -27,7 +26,7 @@ Then pick a backend at runtime:
 ```python
 import gpt_rs
 
-gpt_rs.set_backend("faer")  # or: "c", "cpu", "cpu-portable"
+gpt_rs.set_backend("faer")  # or: "c", "ref-cpu"; gpt_rs.list_backends() lists them
 ```
 
 ## Quick smoke test
@@ -54,7 +53,7 @@ tok = gpt_rs.Tokenizer.from_file(f"{model_dir}/tokenizer.json")
 model = gpt_rs.load_model(model_dir)
 
 prompt = tok.encode("Hello")
-out = model.generate_tokens(prompt, 64, temperature=0.8, kv_cache=True)
+out = model.generate_tokens(prompt, 64, temperature=0.8, top_k=50, seed=0)
 print(tok.decode(out))
 ```
 

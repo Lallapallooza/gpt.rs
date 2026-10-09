@@ -1,109 +1,100 @@
-use crate::backend::spec::PortableBackend;
-use crate::inference::sampler::Sampler;
-use crate::inference::{CausalLanguageModel, LayerCache};
-use crate::tensor::{Shape, Tensor};
-use anyhow::{bail, ensure, Result};
+//! Token generation: [`Generator`] picks the tokens after a prompt one at a time.
 
-fn last_logits_row(logits: &Tensor) -> Result<&[f32]> {
-    let dims = logits.shape().dims();
-    ensure!(
-        dims.len() == 2,
-        "expected logits [T, V], got shape {:?}",
-        dims
-    );
-    let seq_len = dims[0];
-    let vocab = dims[1];
-    ensure!(seq_len > 0 && vocab > 0, "logits must be non-empty");
-    let data = logits.data();
-    let start = (seq_len - 1) * vocab;
-    Ok(&data[start..start + vocab])
+use anyhow::{ensure, Result};
+
+use crate::inference::{CausalLanguageModel, Decode};
+
+/// How a generation picks each token: the most likely one, or a random draw from the softmax of
+/// the logits divided by `temperature`, over the `top_k` most likely tokens when it is set. The
+/// model picks on the device, so a step downloads one token id.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sampling {
+    /// Zero or less picks the most likely token.
+    pub temperature: f32,
+    pub top_k: Option<usize>,
+    /// The seed of the random draws.
+    pub seed: u64,
 }
 
-pub struct GenerateConfig {
-    pub max_new_tokens: usize,
-    pub kv_cache: bool,
-    pub kv_cache_capacity: Option<usize>,
-    pub stop_tokens: Vec<usize>,
-}
-
-impl Default for GenerateConfig {
-    fn default() -> Self {
+impl Sampling {
+    /// Picks the most likely token.
+    pub fn greedy() -> Self {
         Self {
-            max_new_tokens: 0,
-            kv_cache: true,
-            kv_cache_capacity: None,
-            stop_tokens: Vec::new(),
+            temperature: 0.0,
+            top_k: None,
+            seed: 0,
         }
+    }
+
+    /// Draws each token at `temperature`, with the random draws of `seed`.
+    pub fn random(temperature: f32, seed: u64) -> Self {
+        Self {
+            temperature,
+            top_k: None,
+            seed,
+        }
+    }
+
+    /// Draws only among the `k` most likely tokens.
+    pub fn with_top_k(mut self, k: usize) -> Self {
+        self.top_k = Some(k.max(1));
+        self
+    }
+
+    /// Whether the tokens are random draws rather than the most likely ones.
+    pub fn is_random(&self) -> bool {
+        self.temperature > 0.0
     }
 }
 
-pub struct Generator<'a, B: PortableBackend + 'static> {
-    model: &'a dyn CausalLanguageModel<B>,
-    sampler: &'a Sampler,
-    caches: Option<Vec<Option<LayerCache<B>>>>,
-    processed_len: usize,
-    window_start: usize,
+/// Generates the tokens after a prompt, one per [`Generator::step`].
+pub struct Generator<'a> {
+    decode: Box<dyn Decode + 'a>,
     tokens: Vec<usize>,
-    logits_row: Vec<f32>,
-    pending_sampled_token: Option<usize>,
-    kv_cache_capacity: Option<usize>,
+    /// The most tokens, the prompt included, that the generation holds.
+    max_len: usize,
     stop_tokens: Vec<usize>,
     finished: bool,
 }
 
-impl<'a, B: PortableBackend + 'static> Generator<'a, B> {
+impl<'a> Generator<'a> {
+    /// Prefills `prompt` to generate up to `max_new_tokens` after it. The generation ends early
+    /// when it fills the context length of `model`.
     pub fn new(
-        model: &'a dyn CausalLanguageModel<B>,
-        sampler: &'a Sampler,
+        model: &'a dyn CausalLanguageModel,
         prompt: &[usize],
-        kv_cache: bool,
-        kv_cache_capacity: Option<usize>,
+        max_new_tokens: usize,
+        sampling: &Sampling,
     ) -> Result<Self> {
         ensure!(!prompt.is_empty(), "prompt must be non-empty");
-
+        ensure!(
+            max_new_tokens > 0,
+            "a generation needs at least one new token"
+        );
         let context_length = model.context_length();
-        let tokens = prompt.to_vec();
-        let window_start = tokens.len().saturating_sub(context_length);
-
-        let mut caches = kv_cache.then(|| vec![None; model.num_layers()]);
-        let mut processed_len = 0usize;
-
-        let context = &tokens[window_start..];
-        ensure!(!context.is_empty(), "context window must be non-empty");
-
-        let logits_row = if let Some(caches_vec) = caches.as_mut() {
-            let logits =
-                model.forward_with_decode_cache(context, 0, caches_vec, kv_cache_capacity)?;
-            processed_len = context.len();
-            last_logits_row(&logits)?.to_vec()
-        } else {
-            let logits = model.forward(context)?;
-            last_logits_row(&logits)?.to_vec()
-        };
-
+        ensure!(
+            prompt.len() < context_length,
+            "a prompt of {} tokens leaves no room in the context length {context_length}",
+            prompt.len()
+        );
+        let max_len = (prompt.len() + max_new_tokens).min(context_length);
         Ok(Self {
-            model,
-            sampler,
-            caches,
-            processed_len,
-            window_start,
-            tokens,
-            logits_row,
-            pending_sampled_token: None,
-            kv_cache_capacity,
+            decode: model.decode(prompt, max_len, sampling)?,
+            tokens: prompt.to_vec(),
+            max_len,
             stop_tokens: Vec::new(),
             finished: false,
         })
     }
 
-    /// Ends the generation right after the sampler picks one of `tokens`, which the output keeps.
-    /// The generator then skips the forward pass for the next position.
+    /// Ends the generation right after one of `tokens`, which the output keeps.
     pub fn with_stop_tokens(mut self, tokens: &[usize]) -> Self {
         self.stop_tokens = tokens.to_vec();
         self
     }
 
-    /// Returns whether the last sampled token was a stop token. Further steps return an error.
+    /// Whether the generation ended: after a stop token, or with every token it may hold. Further
+    /// steps return an error.
     pub fn is_finished(&self) -> bool {
         self.finished
     }
@@ -116,107 +107,32 @@ impl<'a, B: PortableBackend + 'static> Generator<'a, B> {
         self.tokens
     }
 
-    /// Samples the next token from the current logits row and appends it to the generated
-    /// sequence without computing the next logits.
-    ///
-    /// This is intended for the final generation step: once the token is emitted, the caller can
-    /// stop without paying for an unused forward pass.
-    pub fn step_final(&mut self) -> Result<usize> {
-        let next = self.take_next_token()?;
-        self.tokens.push(next);
-        self.finished = self.stop_tokens.contains(&next);
-        Ok(next)
-    }
-
+    /// The next token, which the output keeps.
     pub fn step(&mut self) -> Result<usize> {
-        let next = self.step_final()?;
-        if self.finished {
-            return Ok(next);
-        }
-
-        let context_length = self.model.context_length();
-        if self.tokens.len() - self.window_start > context_length {
-            self.window_start = self.tokens.len().saturating_sub(context_length);
-            if let Some(caches_vec) = self.caches.as_mut() {
-                caches_vec.iter_mut().for_each(|slot| *slot = None);
-                self.processed_len = 0;
-            }
-        }
-
-        if let Some(caches_vec) = self.caches.as_mut() {
-            let context = &self.tokens[self.window_start..];
-            let offset = self.processed_len.min(context.len());
-            let chunk = &context[offset..];
-            ensure!(!chunk.is_empty(), "decode chunk must be non-empty");
-            if let Some(request) = self.sampler.decode_sample_request() {
-                if let Some(token) = self.model.forward_with_decode_cache_sample_next(
-                    chunk,
-                    offset,
-                    caches_vec,
-                    self.kv_cache_capacity,
-                    request,
-                )? {
-                    self.processed_len = context.len();
-                    self.pending_sampled_token = Some(token);
-                    self.logits_row.clear();
-                    return Ok(next);
-                }
-            }
-            let logits = self.model.forward_with_decode_cache(
-                chunk,
-                offset,
-                caches_vec,
-                self.kv_cache_capacity,
-            )?;
-            self.processed_len = context.len();
-            self.logits_row = last_logits_row(&logits)?.to_vec();
-        } else {
-            let context_len = context_length.min(self.tokens.len());
-            let start = self.tokens.len() - context_len;
-            let logits = self.model.forward(&self.tokens[start..])?;
-            self.logits_row = last_logits_row(&logits)?.to_vec();
-        }
-
-        Ok(next)
-    }
-
-    fn take_next_token(&mut self) -> Result<usize> {
-        if self.finished {
-            bail!("generation already finished with a stop token");
-        }
-        if let Some(next) = self.pending_sampled_token.take() {
-            return Ok(next);
-        }
-
-        let vocab = self.logits_row.len();
-        ensure!(vocab > 0, "logits row is empty");
-        let row_tensor =
-            Tensor::from_vec(Shape::new([vocab]), std::mem::take(&mut self.logits_row))?;
-        self.sampler.sample(&row_tensor)
+        ensure!(!self.finished, "generation already finished");
+        let token = self.decode.next_token()?;
+        self.tokens.push(token);
+        self.finished = self.stop_tokens.contains(&token) || self.tokens.len() == self.max_len;
+        Ok(token)
     }
 }
 
-pub fn generate_tokens<B: PortableBackend + 'static>(
-    model: &dyn CausalLanguageModel<B>,
+/// `prompt` followed by up to `max_new_tokens` generated tokens. The generation ends after one of
+/// `stop_tokens`, which the output keeps, or when it fills the context length.
+pub fn generate_tokens(
+    model: &dyn CausalLanguageModel,
     prompt: &[usize],
-    sampler: &Sampler,
-    cfg: GenerateConfig,
+    max_new_tokens: usize,
+    sampling: &Sampling,
+    stop_tokens: &[usize],
 ) -> Result<Vec<usize>> {
-    if cfg.max_new_tokens == 0 {
+    if max_new_tokens == 0 {
         return Ok(prompt.to_vec());
     }
-
-    let mut gen = Generator::new(model, sampler, prompt, cfg.kv_cache, cfg.kv_cache_capacity)?
-        .with_stop_tokens(&cfg.stop_tokens);
-    for step in 0..cfg.max_new_tokens {
-        if step + 1 == cfg.max_new_tokens {
-            gen.step_final()?;
-        } else {
-            gen.step()?;
-        }
-        if gen.is_finished() {
-            break;
-        }
+    let mut generator =
+        Generator::new(model, prompt, max_new_tokens, sampling)?.with_stop_tokens(stop_tokens);
+    while !generator.is_finished() {
+        generator.step()?;
     }
-    Ok(gen.into_tokens())
+    Ok(generator.into_tokens())
 }

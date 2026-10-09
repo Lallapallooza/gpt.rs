@@ -1,14 +1,18 @@
+//! Running loaded models: the decoder language models ([`decoder`]) with token generation
+//! ([`generate`]), and the image models ([`vision`]).
+
 pub mod decoder;
 pub mod generate;
-pub mod sampler;
+pub mod vision;
 
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 
-use crate::backend::spec::{DecodeSampleRequest, PortableBackend};
+use crate::backend::PortableBackend;
 use crate::ops::functional::{DecodeKvCache, LinearAttentionCache};
-use crate::tensor::{DeviceTensor, Shape, Tensor};
+use crate::tensor::{DeviceTensor, HostTensor};
+use generate::Sampling;
 
 /// Incremental decode state of one decoder layer, carried between generation steps.
 pub enum LayerCache<B: PortableBackend + 'static> {
@@ -16,15 +20,6 @@ pub enum LayerCache<B: PortableBackend + 'static> {
     Attention(DecodeKvCache<B>),
     /// Convolution window and recurrent state of a linear-attention (Gated DeltaNet) layer.
     LinearAttention(LinearAttentionCache<B>),
-}
-
-impl<B: PortableBackend + 'static> Clone for LayerCache<B> {
-    fn clone(&self) -> Self {
-        match self {
-            LayerCache::Attention(cache) => LayerCache::Attention(cache.clone()),
-            LayerCache::LinearAttention(cache) => LayerCache::LinearAttention(cache.clone()),
-        }
-    }
 }
 
 impl<B: PortableBackend + 'static> LayerCache<B> {
@@ -36,16 +31,11 @@ impl<B: PortableBackend + 'static> LayerCache<B> {
         }
     }
 
-    /// Stops exporting the state of a cache that is being replaced.
-    pub(crate) fn release_exports(&self) {
+    /// Replaces this cache with `next` and stops exporting the replaced state.
+    pub(crate) fn replace(&mut self, next: LayerCache<B>) {
         for tensor in self.tensors() {
             tensor.release_export();
         }
-    }
-
-    /// Replaces this cache with `next` and releases the exports of the replaced state.
-    pub(crate) fn replace(&mut self, next: LayerCache<B>) {
-        self.release_exports();
         *self = next;
     }
 }
@@ -59,40 +49,32 @@ pub(crate) fn index_tensor<B: PortableBackend + 'static>(
         .into_iter()
         .map(|i| i32::try_from(i).map_err(|_| anyhow!("index {i} exceeds i32::MAX")))
         .collect::<Result<Vec<i32>>>()?;
-    let host = Tensor::from_i32(Shape::new([ids.len()]), ids)?;
+    let host = HostTensor::si32(vec![ids.len()], ids)?;
     DeviceTensor::from_host(Arc::clone(backend), host)
 }
 
-pub trait CausalLanguageModel<B: PortableBackend + 'static> {
+/// What a loaded causal language model does: logits of a token sequence, and decoding the tokens
+/// after a prompt.
+pub trait CausalLanguageModel {
+    /// The most positions a sequence can hold.
     fn context_length(&self) -> usize;
-    fn num_layers(&self) -> usize;
 
-    fn forward(&self, tokens: &[usize]) -> Result<Tensor>;
+    /// The logits `[T, vocab]` of every position of `tokens`, computed as one prefill.
+    fn forward(&self, tokens: &[usize]) -> Result<HostTensor>;
 
-    /// Runs `tokens` at `position_offset` through the model, updating `caches` (one slot per layer).
-    ///
-    /// `capacity` pins the KV cache capacity. With `None`, the capacity is the end position rounded
-    /// up to a power of two, capped at the context length. Returns logits `[1, vocab]` for the last
-    /// position of `tokens`.
-    fn forward_with_decode_cache(
+    /// Prefills `prompt` and returns the state that decodes the tokens after it, each picked as
+    /// `sampling` says. `max_len` bounds the tokens, the prompt included, that the state will
+    /// hold. It sizes the caches.
+    fn decode(
         &self,
-        tokens: &[usize],
-        position_offset: usize,
-        caches: &mut [Option<LayerCache<B>>],
-        capacity: Option<usize>,
-    ) -> Result<Tensor>;
+        prompt: &[usize],
+        max_len: usize,
+        sampling: &Sampling,
+    ) -> Result<Box<dyn Decode + '_>>;
+}
 
-    /// Runs `tokens` like [`CausalLanguageModel::forward_with_decode_cache`] and samples the next
-    /// token on the backend according to `request`. Returns `None` and leaves `caches` untouched
-    /// when the model or the backend cannot sample on the backend.
-    fn forward_with_decode_cache_sample_next(
-        &self,
-        _tokens: &[usize],
-        _position_offset: usize,
-        _caches: &mut [Option<LayerCache<B>>],
-        _capacity: Option<usize>,
-        _request: DecodeSampleRequest,
-    ) -> Result<Option<usize>> {
-        Ok(None)
-    }
+/// The tokens that a causal language model decodes after a prompt, one at a time.
+pub trait Decode {
+    /// The next token. The first call returns the token after the prompt.
+    fn next_token(&mut self) -> Result<usize>;
 }

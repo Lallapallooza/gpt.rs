@@ -285,7 +285,7 @@ class Qwen35Case:
         steps = int(cfg.params.get("generate_tokens", 0))
         continuation: list[int] = []
         if steps > 0:
-            generated = rs_model.generate_tokens(tokens, steps, temperature=0.0, kv_cache=True)
+            generated = rs_model.generate_tokens(tokens, steps, temperature=0.0)
             continuation = [int(t) for t in generated[len(tokens) :]]
 
         # One teacher-forced reference pass over prompt + continuation: causal logits at prompt
@@ -353,7 +353,6 @@ class Qwen35Case:
         steps = int(cfg.params.get("bench_tokens", 32))
         if steps < 1:
             raise SystemExit("--bench-tokens must be at least 1")
-        capacity = len(tokens) + steps + 1
         torch.set_num_threads(cfg.threads)
 
         def measure(generate: Callable[[int], Any]) -> tuple[list[float], list[float], int]:
@@ -378,8 +377,6 @@ class Qwen35Case:
                     tokens,
                     n,
                     temperature=0.0,
-                    kv_cache=True,
-                    kv_cache_capacity=capacity,
                     ignore_eos=True,
                 )
             )
@@ -444,9 +441,7 @@ class Qwen35Case:
         temperature = float(cfg.params.get("temperature", 0.0))
         t0 = time.perf_counter()
         with debug_context(cfg.params):
-            out = rs_model.generate_tokens(
-                tokens, max_tokens, temperature=temperature, kv_cache=True
-            )
+            out = rs_model.generate_tokens(tokens, max_tokens, temperature=temperature)
         wall_s = time.perf_counter() - t0
         sys.stdout.write(tokenizer.decode(out[len(tokens) :], skip_special_tokens=True) + "\n")
         return CliRunResult(

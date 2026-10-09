@@ -192,7 +192,6 @@ class MinistralCase:
                 prompt_tokens,
                 max_tokens,
                 temperature=temperature,
-                kv_cache=True,
             )
         wall_s = time.perf_counter() - t0
 

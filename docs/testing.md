@@ -6,39 +6,55 @@ backends.
 
 ## Overview
 
-There are three main categories of tests:
+The main categories of tests:
 
-1. **Library/unit/integration tests** (in the `gpt-rs` crate)
-2. **Backend suite tests** (one `backend_suite` per backend crate)
-3. **Python validation scripts** (manual tools under `scripts/`)
+1. **Filetests and the law test** (in `gpt-rs-ir`, and the filetests of the C backend's passes in
+   `gpt-rs-backend-c`)
+2. **Contract tests** (in the crate that owns the API, mostly `gpt-rs`)
+3. **Backend suite tests** (one `backend_suite` per backend crate)
+4. **Python validation scripts** (manual tools under `scripts/`)
 
 Each category answers a different question:
 
-- **"Does capture/validation behave correctly?"** -> `crates/gpt-rs/tests/`
+- **"Does a pass of the IR or of a backend, the text form or the verifier do the right thing?"**
+  -> `filetests/`
+- **"Does an op's trait hold for its semantics?"** -> `crates/gpt-rs-ir/tests/laws.rs`
+- **"Does a public API keep its documented behavior?"** -> `crates/<crate>/tests/`
 - **"Do backend kernels produce the same numbers as Torch?"** -> backend suites
 - **"Do full models match Hugging Face end-to-end?"** -> Python scripts
 
-## 1) gpt-rs crate tests (PTIR inspection)
+## 1) Filetests and the law test
 
-Portable ops live in `crates/gpt-rs/src/ops/functional/` and are typically
-implemented as:
+Filetests live under `filetests/` at the repository root: `filetests/tensor/<topic>/*.ptir` for the
+IR passes and the text form, and `filetests/backend/<backend>/*.ptir` for the passes that a backend
+adds to its pipeline (`PortableBackend::pipeline()`). One runner, the `gpt-rs-filetests` crate,
+runs them, and its crate doc gives the format. `gpt-rs-ir` runs `filetests/tensor/` from its
+`tests/filetests.rs`. A backend crate with passes of its own runs its directory from its
+`tests/filetests.rs`, with each pass of its pipeline under its name and the whole pipeline as
+`default`.
 
-- a validation phase that checks shapes/dtypes and plans the op
-- a capture phase that emits PTIR for the backend to execute
+The cases of a backend start from the IR that the functionals record. A run with `--dump-dir`
+writes the module after each pass to `passes/`.
 
-Tests under `crates/gpt-rs/tests/` focus on:
+`crates/gpt-rs-ir/tests/laws.rs` evaluates every equation an op's traits claim (commutativity,
+identities, ...) through the op's semantics, for every op of the roundtrip filetests.
 
-- PTIR capture shape rules and error messages
-- graph structure and invariants
-- non-numerical behavior (rejecting invalid inputs consistently)
+```bash
+cargo test -p gpt-rs-ir
+cargo test -p gpt-rs-backend-c --test filetests
+```
 
-Run them with:
+## 2) Contract tests
+
+Tests under `crates/<crate>/tests/` check public behavior with an exact documented answer:
+validation messages of functionals, checkpoint loading, tokenizer ids, program counts and cache
+hits.
 
 ```bash
 cargo test -p gpt-rs
 ```
 
-## 2) Backend suites + Torch parity (numerical correctness)
+## 3) Backend suites + Torch parity (numerical correctness)
 
 ### Where the tests live
 
@@ -51,7 +67,7 @@ It contains:
 - `src/torch_parity/`: numerical parity tests against Torch (via `tch`)
 - `src/lib.rs`: the `define_backend_tests!` macro that wires everything together
 
-Each backend crate (faer/cpu/...) then contains a single test entrypoint:
+Each backend crate (ref-cpu, faer, c) then contains a single test entrypoint:
 
 - `crates/<backend-crate>/tests/backend_suite.rs`
 
@@ -60,7 +76,7 @@ instance, e.g.:
 
 ```rust
 gpt_rs_backend_tests::define_backend_tests!(faer_backend_tests, || {
-    std::sync::Arc::new(gpt_rs_backend_faer::FaerCpuBackend::create())
+    std::sync::Arc::new(gpt_rs_backend_faer::FaerPortableBackend::new())
 });
 ```
 
@@ -119,15 +135,6 @@ List all available backend suite tests:
 cargo test -p gpt-rs-backend-faer --features torch --test backend_suite -- --list
 ```
 
-There is also a smaller Torch parity entrypoint in the `gpt-rs` crate:
-
-```bash
-cargo test -p gpt-rs --features torch --test torch_parity
-```
-
-Without `--features torch`, the `torch_parity` integration test target exists
-but runs 0 tests (this is expected).
-
 #### Libtorch notes
 
 The `torch` feature enables the optional `tch` dependency. By default this
@@ -138,17 +145,13 @@ its libraries).
 
 ### Timing output (Torch parity)
 
-Each torch parity test runs twice:
-
-- **baseline**: optimizer passes disabled
-- **optimized**: optimizer passes enabled
-
-Timings are printed as a compact table (one row per test) including baseline/optimized
-times (gpt execution only; compile/optimizer time excluded), Torch reference time, and
-speedup. Use `--nocapture` to see the output:
+Each Torch parity test adds one row to a table: the Torch reference time and, for each backend,
+the time its programs ran, which a trace sink measures. Recording and compiling are left out. The
+harness prints the table when the last backend in `GPTRS_TORCH_PARITY_BACKENDS`
+([development.md](development.md#environment-variables)) finishes its suite:
 
 ```bash
-cargo test -p gpt-rs-backend-faer --features torch --test backend_suite -- --nocapture
+GPTRS_TORCH_PARITY_BACKENDS=faer cargo test -p gpt-rs-backend-faer --features torch --test backend_suite
 ```
 
 ### Torch parity tolerances
@@ -182,20 +185,17 @@ Example:
    (either in an existing module or a new one exported by
    `torch_parity/mod.rs`).
 2. Wire it into `define_backend_tests!` in
-   `crates/gpt-rs-backend-tests/src/lib.rs` by calling your function from a
-   `#[test]` body.
+   `crates/gpt-rs-backend-tests/src/lib.rs` with one line,
+   `parity_test!(torch_<name>, <module>::<function>);`. A new module also joins the
+   `use $crate::torch_parity::{...}` list at the top of the macro.
 
-That is what makes the test run "normally" across all backends.
+That is what makes the test run across all backends.
 
-Avoid writing backend-specific parity test files like:
+Torch parity never goes in a backend crate: the numbers a backend computes are checked in the
+shared harness, and a backend's own passes are checked with filetests under
+`filetests/backend/<backend>/`.
 
-- `crates/gpt-rs-backend-*/tests/*.rs`
-
-unless the test is truly backend-specific (e.g., testing a backend-only kernel
-or feature flag). For cross-backend correctness, the shared harness is the
-source of truth.
-
-## 3) Python model validation scripts
+## 4) Python model validation scripts
 
 For end-to-end model checks against Hugging Face `transformers`, use the
 scripts under `scripts/`. These are intentionally *not* part of `cargo test`,
@@ -214,6 +214,8 @@ same Hugging Face checkpoint (`--hf-model`, a Hub id or a local directory) for:
 
 - `validate`: compare logits
 - `bench`: compare throughput/latency
+- `run`: run gpt-rs alone (generation, or a forward pass of an image model)
+- `all`: every workload the case supports
 
 Examples:
 
@@ -244,8 +246,7 @@ Notes:
 - `--profile` prints tables only when built with `-F gpt-rs/profiler` (otherwise gpt-rs-cli warns).
 - `--dump-dir` and `--dump-mode` work without the profiler feature.
 
-- Dump PTIR programs while validating a vision model (requires rebuilding the Python extension after
-  enabling the new debug helpers):
+- Dump the modules the backend runs while validating a vision model:
   ```bash
   uv run python scripts/eval.py --model resnet34 --workload validate --dump-dir dumps/resnet34_validate
   ```
@@ -263,13 +264,10 @@ Notes:
   #   uv run python scripts/rebuild_py.py --features faer,profiler
   uv run python scripts/eval.py --model gpt2 --workload run \
     --prompt "Hi" --max-tokens 128 --temperature 0.8 \
-    --backend faer --kv-cache \
-    --dump-dir dumps/gpt2_ptir_new_e --dump-mode all \
+    --backend faer \
+    --dump-dir dumps/gpt2 --dump-mode all \
     --profile
   ```
-
-Legacy wrapper scripts have been removed; use `scripts/eval.py` directly with
-`--workload validate|bench|run`.
 
 For Ministral text runs, `scripts/eval.py --model ministral_3_3b_instruct_2512 --workload run`
 tokenizes with the checkpoint's `transformers` `AutoTokenizer`, because `gpt_rs.Tokenizer` does not
@@ -277,19 +275,14 @@ support the `ignore_merges` option that its `tokenizer.json` sets.
 
 ### Debugging knobs (env vars)
 
-- `GPTRS_EAGER=1`: force tensors created from captured nodes to materialize immediately (useful for debugging fusion).
-- `GPTRS_OPT_PRE_ITERS` / `GPTRS_OPT_POST_ITERS`: tune optimizer fixed-point iterations.
-- `GPTRS_PASS_STATS=1`: emit per-pass optimizer stats to the trace sink (for example into `passes.jsonl` when using `--dump-dir`).
-- C backend only:
-  - `GPTRS_PROFILE_BACKEND=1`: enable C backend profiling counters (requires building with C backend support).
-  - `GPTRS_C_CACHE_DIR=/path`: override the on-disk cache directory used by the C backend.
+See [development.md](development.md#environment-variables).
 
-## 4) Model-agnostic CLI runner (gpt-rs-cli)
+## 5) Model-agnostic CLI runner (gpt-rs-cli)
 
 `gpt-rs-cli` is a thin runner around `gpt-rs` that can execute different model kinds
 with the same debugging hooks:
 
-- `--dump-dir` / `--dump-mode` to dump PTIR programs
+- `--dump-dir` / `--dump-mode` to dump the module of each program the backend runs
 - `--profile` to print gpt-rs profiler tables
 - `--backend` (or `GPTRS_BACKEND`) to choose a backend (default: `faer`)
 
@@ -309,7 +302,7 @@ cargo run --release -p gpt-rs-cli -F gpt-rs/profiler -- generate \
   --profile
 ```
 
-### Forward pass (vision models today)
+### Forward pass
 
 Download the checkpoint and run the model. The CLI generates a deterministic random input unless
 you pass `--input`, a safetensors file:

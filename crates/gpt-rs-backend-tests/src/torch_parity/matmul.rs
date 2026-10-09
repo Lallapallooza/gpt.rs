@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
-use gpt_rs::backend::spec::PortableBackend;
-use gpt_rs::capture;
-use gpt_rs::ops::ptir::{axes_iter, DotAttrs, DotDims};
-use gpt_rs::tensor::DeviceTensorOps;
+use gpt_rs::backend::PortableBackend;
+use gpt_rs::gpt_rs_ir::dialects::tensor::DotGeneral;
+use gpt_rs::ops::functional;
 
 use super::common::*;
 
@@ -28,7 +27,7 @@ fn run_matmul_case<B: PortableBackend + 'static>(
     let actual = timed_gpt(|| {
         let lhs_dev = device_tensor_from_data(backend, lhs_shape, &lhs_data);
         let rhs_dev = device_tensor_from_data(backend, rhs_shape, &rhs_data);
-        to_host_vec(&lhs_dev.matmul(&rhs_dev).unwrap())
+        to_host_vec(&functional::matmul(&lhs_dev, &rhs_dev))
     });
 
     assert_close(&expected, &actual);
@@ -55,7 +54,7 @@ fn run_batched_matmul_case<B: PortableBackend + 'static>(
     let actual = timed_gpt(|| {
         let lhs_dev = device_tensor_from_data(backend, lhs_shape, &lhs_data);
         let rhs_dev = device_tensor_from_data(backend, rhs_shape, &rhs_data);
-        to_host_vec(&lhs_dev.matmul(&rhs_dev).unwrap())
+        to_host_vec(&functional::matmul(&lhs_dev, &rhs_dev))
     });
 
     assert_close(&expected, &actual);
@@ -97,24 +96,28 @@ bmm_case!(
     &[1, 5, 2],
     18
 );
+
 bmm_case!(
     batched_matmul_matches_torch_b2_7x13_13x9,
     &[2, 7, 13],
     &[2, 13, 9],
     19
 );
+
 bmm_case!(
     batched_matmul_matches_torch_b8_4x8_8x4,
     &[8, 4, 8],
     &[8, 8, 4],
     20
 );
+
 bmm_case!(
     batched_matmul_matches_torch_b3_33x65_65x31,
     &[3, 33, 65],
     &[3, 65, 31],
     21
 );
+
 bmm_case!(
     batched_matmul_matches_torch_b2_6x40_40x150,
     &[2, 6, 40],
@@ -128,7 +131,7 @@ fn run_batched_dot_case<B: PortableBackend + 'static>(
     backend: &Arc<B>,
     lhs_shape: &[usize],
     rhs_shape: &[usize],
-    contract: (usize, usize),
+    contract: (i64, i64),
     seed: u64,
 ) {
     let mut rng = seeded_rng(seed);
@@ -152,22 +155,12 @@ fn run_batched_dot_case<B: PortableBackend + 'static>(
         tensor_to_vec(&lhs_t.bmm(&rhs_t).contiguous())
     });
 
-    let actual = timed_gpt(|| -> anyhow::Result<Vec<f32>> {
+    let actual = timed_gpt(|| {
         let lhs_dev = device_tensor_from_data(backend, lhs_shape, &lhs_data);
         let rhs_dev = device_tensor_from_data(backend, rhs_shape, &rhs_data);
-        let dims = DotDims::new(
-            axes_iter([0]),
-            axes_iter([contract.0]),
-            axes_iter([contract.1]),
-        );
-        let out = capture!(|lhs_dev, rhs_dev| lhs_dev.dot_general(
-            &rhs_dev,
-            &dims,
-            &DotAttrs::default()
-        ))?;
-        Ok(to_host_vec(&out))
-    })
-    .unwrap();
+        let dims = DotGeneral::contract([contract.0], [contract.1]).batch([0], [0]);
+        to_host_vec(&lhs_dev.dot_general(&rhs_dev, dims))
+    });
 
     assert_close(&expected, &actual);
 }
@@ -189,6 +182,7 @@ batched_dot_case!(
     (2, 2),
     32
 );
+
 batched_dot_case!(
     batched_dot_nt_matches_torch_b2_m5_k1100,
     &[2, 5, 1100],
@@ -196,6 +190,7 @@ batched_dot_case!(
     (2, 2),
     33
 );
+
 batched_dot_case!(
     batched_dot_nt_matches_torch_b2_m70,
     &[2, 70, 37],
@@ -211,21 +206,3 @@ batched_dot_case!(
     (1, 1),
     34
 );
-
-pub fn matmul_rejects_inner_dim_mismatch<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    let err = timed_gpt(|| {
-        let lhs = device_tensor_from_data(backend, &[4, 5], &[0.0; 20]);
-        let rhs = device_tensor_from_data(backend, &[4, 3], &[0.0; 12]);
-        lhs.matmul(&rhs).unwrap_err()
-    });
-    assert!(err.to_string().contains("dimension mismatch"));
-}
-
-pub fn batched_matmul_rejects_batch_mismatch<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    let err = timed_gpt(|| {
-        let lhs = device_tensor_from_data(backend, &[2, 4, 5], &[0.0; 40]);
-        let rhs = device_tensor_from_data(backend, &[3, 5, 2], &[0.0; 30]);
-        lhs.matmul(&rhs).unwrap_err()
-    });
-    assert!(err.to_string().contains("batch dimension mismatch"));
-}

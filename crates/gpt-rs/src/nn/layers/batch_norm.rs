@@ -29,7 +29,7 @@ impl BatchNorm2d {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> Tensor {
         functional::batch_norm(
             x,
             &self.weight,

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use gpt_rs::nn::LayerNorm;
-use gpt_rs::tensor::{Shape, Tensor};
+use gpt_rs::tensor::HostTensor;
 use gpt_rs_backend_ref_cpu::CpuPortableBackend;
 use gpt_rs_backend_tests::load_layer;
 
@@ -10,9 +10,12 @@ use gpt_rs_backend_tests::load_layer;
 fn optional_sublayer_needs_all_or_none_of_its_tensors() -> Result<()> {
     let backend = Arc::new(CpuPortableBackend::new());
     let norm = |names: &[&str]| {
-        let tensors = names
-            .iter()
-            .map(|name| (name.to_string(), Tensor::ones(Shape::new([4]))));
+        let tensors = names.iter().map(|name| {
+            (
+                name.to_string(),
+                HostTensor::f32([4], vec![1.0; 4]).unwrap(),
+            )
+        });
         load_layer(&backend, tensors, |p| {
             p.optional(|p| p.scoped("norm", |p| LayerNorm::new(p, 1e-5)))
         })

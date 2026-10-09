@@ -1,0 +1,14 @@
+// RUN: pass canonicalize
+
+// Constants alone do not group: no parameter goes into them, so the run would compute both adds
+// anyway.
+// CHECK: func.func @constants_stay
+// CHECK: [[A:%[0-9]+]] = tensor.add(%0, {{%[0-9]+}})
+// CHECK-NEXT: tensor.add([[A]], {{%[0-9]+}})
+func.func @constants_stay(%0: tensor<4xsi32>) -> tensor<4xsi32> {
+  %1 = tensor.constant() {value = dense<[4] x si32: 3>} : () -> tensor<4xsi32>
+  %2 = tensor.constant() {value = dense<[4] x si32: 5>} : () -> tensor<4xsi32>
+  %3 = tensor.add(%0, %1) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  %4 = tensor.add(%3, %2) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  func.return(%4) : (tensor<4xsi32>) -> ()
+}

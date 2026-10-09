@@ -6,9 +6,11 @@
  * y is contiguous f32 [batch, M, N].
  *
  * The kernels compute MR x NR tiles of dot products with 16-lane partial sums. They reduce the
- * partial sums horizontally at the end of each K block. bf16 operands are widened to f32 in
- * registers, which is exact. So the results are f32 products and sums of the stored values.
- * Threads split N, so each weight row streams from memory exactly once per call.
+ * partial sums horizontally at the end of each K block. bf16 and f8e4m3 operands are widened to
+ * f32 in registers, which is exact. So the results are f32 products and sums of the stored values.
+ * The `_scale` kernels read f8e4m3 weights dequantized by a one-element scale: each weight is
+ * w * scale rounded to the dtype of the scale, then to the dtype of x. Threads split N, so each
+ * weight row streams from memory exactly once per call.
  */
 
 /* NR: 4 x 6 accumulators plus 6 weight vectors use 30 of the 32 zmm registers. KC: one K block of
@@ -19,26 +21,23 @@ enum { GPTRS_LIN_NR = 6, GPTRS_LIN_KC = 1024 };
  * per-core L2 with the weight rows that stream through it, so x may take half of the L2. */
 #define GPTRS_LIN_X_CACHE_BYTES ((size_t)GPTRS_L2_BYTES / 2)
 
+/* Expands a parenthesized list without its parentheses. The drivers append the parameter list
+ * WPARAMS to their own parameters and the argument list WARGS to each call that reads weights, so a
+ * weight format with a scale passes it through, and `()` passes nothing. */
+#define GPTRS_LIN_UNWRAP(...) __VA_ARGS__
+
 #if GPTRS_HAS_AVX512
 
-/* Operand loaders. `NAME(p)` reads one vector. `NAME##_tail(p, left)` reads the last `left`
- * elements. */
-static inline __m512 gpt_rs_lin_f32(const float* p) {
-    return _mm512_loadu_ps(p);
-}
-
-static inline __m512 gpt_rs_lin_f32_tail(const float* p, size_t left) {
-    return _mm512_maskz_loadu_ps((__mmask16)gpt_rs_tail_mask(left), p);
-}
-
-static inline __m512 gpt_rs_lin_bf16(const uint16_t* p) {
-    const __m256i raw = _mm256_loadu_si256((const __m256i*)p);
-    return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16));
-}
-
-static inline __m512 gpt_rs_lin_bf16_tail(const uint16_t* p, size_t left) {
-    const __m256i raw = _mm256_maskz_loadu_epi16((__mmask16)gpt_rs_tail_mask(left), p);
-    return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16));
+/* Rounds the f32 lanes of v to bf16 to nearest even, as gpt_rs_f32_to_bf16 does. */
+static inline __m256i gpt_rs_lin_round_bf16(__m512 v) {
+    const __m512i bits = _mm512_castps_si512(v);
+    const __m512i odd = _mm512_and_si512(_mm512_srli_epi32(bits, 16), _mm512_set1_epi32(1));
+    const __m512i bias = _mm512_add_epi32(odd, _mm512_set1_epi32(0x7fff));
+    const __m512i rounded = _mm512_srli_epi32(_mm512_add_epi32(bits, bias), 16);
+    const __mmask16 nan = _mm512_cmp_ps_mask(v, v, _CMP_UNORD_Q);
+    const __m512i quiet =
+        _mm512_mask_or_epi32(rounded, nan, _mm512_srli_epi32(bits, 16), _mm512_set1_epi32(0x40));
+    return _mm512_cvtepi32_epi16(quiet);
 }
 
 static inline __m512 gpt_rs_lin_fma(__m512 acc, __m512 x, __m512 w) {
@@ -160,10 +159,11 @@ static inline __m512 gpt_rs_lin_fma(__m512 acc, __m512 x, __m512 w) {
  * cache, the driver sweeps K blocks outermost. Each thread then reuses one m x KC block of x
  * across all of its panels. Both loop orders sum each output in the same order.
  */
-#define GPTRS_DEFINE_LINEAR_DRIVER(NAME, XTYPE, WTYPE, PANEL, NR, KC)                          \
+#define GPTRS_DEFINE_LINEAR_DRIVER(NAME, XTYPE, WTYPE, PANEL, NR, KC, WPARAMS, WARGS)         \
     static void NAME(const XTYPE* GPTRS_RESTRICT x, const WTYPE* GPTRS_RESTRICT w,            \
                      float* GPTRS_RESTRICT y, size_t batch, size_t m, size_t n, size_t k,     \
-                     size_t sxb, size_t ldx, size_t swb, size_t ldw) {                        \
+                     size_t sxb, size_t ldx, size_t swb,                                      \
+                     size_t ldw GPTRS_LIN_UNWRAP WPARAMS) {                                   \
         if (batch == 0 || m == 0 || n == 0) {                                                \
             return;                                                                          \
         }                                                                                    \
@@ -188,49 +188,123 @@ static inline __m512 gpt_rs_lin_fma(__m512 acc, __m512 x, __m512 w) {
                 const size_t kb = (k_outer ? step / count : step % blocks) * (KC);           \
                 PANEL(x + bi * sxb + kb, ldx, w + bi * swb + n0 * ldw + kb, ldw,             \
                       y + bi * m * n + n0, n, m, GPTRS_MIN((size_t)(NR), n - n0),            \
-                      GPTRS_MIN((size_t)(KC), k - kb), kb != 0);                             \
+                      GPTRS_MIN((size_t)(KC), k - kb), kb != 0 GPTRS_LIN_UNWRAP WARGS);      \
             }                                                                                \
         }                                                                                    \
     }
 
-GPTRS_DEFINE_LINEAR_FAMILY(gpt_rs_lin_f32, float, float, __m512, 16, gpt_rs_lin_f32,
-                           gpt_rs_lin_f32, gpt_rs_lin_fma)
-GPTRS_DEFINE_LINEAR_FAMILY(gpt_rs_lin_f32_bf16, float, uint16_t, __m512, 16, gpt_rs_lin_f32,
-                           gpt_rs_lin_bf16, gpt_rs_lin_fma)
+GPTRS_DEFINE_LINEAR_FAMILY(gpt_rs_lin_f32, float, float, __m512, 16, gpt_rs_load_f32,
+                           gpt_rs_load_f32, gpt_rs_lin_fma)
+GPTRS_DEFINE_LINEAR_FAMILY(gpt_rs_lin_f32_bf16, float, uint16_t, __m512, 16, gpt_rs_load_f32,
+                           gpt_rs_load_bf16, gpt_rs_lin_fma)
+GPTRS_DEFINE_LINEAR_FAMILY(gpt_rs_lin_f32_f8e4m3, float, uint8_t, __m512, 16, gpt_rs_load_f32,
+                           gpt_rs_load_f8e4m3, gpt_rs_lin_fma)
+
+/* Stores the first `left` lanes of v as bf16, rounded by gpt_rs_lin_round_bf16, or as f32. */
+static inline void gpt_rs_lin_store_bf16(uint16_t* p, __m512 v, size_t left) {
+    _mm256_mask_storeu_epi16(p, (__mmask16)gpt_rs_tail_mask(left), gpt_rs_lin_round_bf16(v));
+}
+
+static inline void gpt_rs_lin_store_f32(float* p, __m512 v, size_t left) {
+    _mm512_mask_storeu_ps(p, (__mmask16)gpt_rs_tail_mask(left), v);
+}
+
+/* Dequantizes the panel's nr x kc block of f8e4m3 weights into L1 once, then runs PANEL over all m
+ * rows. STORE writes each weight times the scale, multiplied in f32, as WTYPE, the weight type of
+ * PANEL. With a bf16 scale the f32 product is exact, so its one rounding to bf16 equals a bf16
+ * multiply. */
+#define GPTRS_DEFINE_LINEAR_SCALE_PANEL(NAME, XTYPE, WTYPE, STORE, PANEL)                     \
+    static inline void NAME(const XTYPE* GPTRS_RESTRICT x, size_t ldx,                        \
+                            const uint8_t* GPTRS_RESTRICT w, size_t ldw,                      \
+                            float* GPTRS_RESTRICT y, size_t ldy, size_t m, size_t nr,         \
+                            size_t kc, int accumulate, float scale) {                         \
+        WTYPE wb[GPTRS_LIN_NR * GPTRS_LIN_KC] __attribute__((aligned(64)));                   \
+        const __m512 s = _mm512_set1_ps(scale);                                               \
+        for (size_t j = 0; j < nr; ++j) {                                                     \
+            const uint8_t* row = w + j * ldw;                                                 \
+            size_t p = 0;                                                                     \
+            for (; p + 16 <= kc; p += 16) {                                                   \
+                STORE(wb + j * kc + p, _mm512_mul_ps(gpt_rs_load_f8e4m3(row + p), s), 16);    \
+            }                                                                                 \
+            if (p < kc) {                                                                     \
+                const __m512 v = _mm512_mul_ps(gpt_rs_load_f8e4m3_tail(row + p, kc - p), s);  \
+                STORE(wb + j * kc + p, v, kc - p);                                            \
+            }                                                                                 \
+        }                                                                                     \
+        PANEL(x, ldx, wb, kc, y, ldy, m, nr, kc, accumulate);                                 \
+    }
+
+GPTRS_DEFINE_LINEAR_SCALE_PANEL(gpt_rs_lin_f32_f8e4m3_bf16_scale_panel, float, uint16_t,
+                                gpt_rs_lin_store_bf16, gpt_rs_lin_f32_bf16_panel)
+GPTRS_DEFINE_LINEAR_SCALE_PANEL(gpt_rs_lin_f32_f8e4m3_f32_scale_panel, float, float,
+                                gpt_rs_lin_store_f32, gpt_rs_lin_f32_panel)
+
 GPTRS_DEFINE_LINEAR_DRIVER(gpt_rs_c_linear_nt_f32, float, float, gpt_rs_lin_f32_panel,
-                           GPTRS_LIN_NR, GPTRS_LIN_KC)
+                           GPTRS_LIN_NR, GPTRS_LIN_KC, (), ())
 GPTRS_DEFINE_LINEAR_DRIVER(gpt_rs_c_linear_nt_f32_bf16, float, uint16_t, gpt_rs_lin_f32_bf16_panel,
-                           GPTRS_LIN_NR, GPTRS_LIN_KC)
+                           GPTRS_LIN_NR, GPTRS_LIN_KC, (), ())
+GPTRS_DEFINE_LINEAR_DRIVER(gpt_rs_c_linear_nt_f32_f8e4m3, float, uint8_t,
+                           gpt_rs_lin_f32_f8e4m3_panel, GPTRS_LIN_NR, GPTRS_LIN_KC, (), ())
+GPTRS_DEFINE_LINEAR_DRIVER(gpt_rs_c_linear_nt_f32_f8e4m3_bf16_scale, float, uint8_t,
+                           gpt_rs_lin_f32_f8e4m3_bf16_scale_panel, GPTRS_LIN_NR, GPTRS_LIN_KC,
+                           (, const uint16_t* scale), (, gpt_rs_bf16_to_f32(*scale)))
+GPTRS_DEFINE_LINEAR_DRIVER(gpt_rs_c_linear_nt_f32_f8e4m3_f32_scale, float, uint8_t,
+                           gpt_rs_lin_f32_f8e4m3_f32_scale_panel, GPTRS_LIN_NR, GPTRS_LIN_KC,
+                           (, const float* scale), (, *scale))
 
 #else
 
-/* Portable fallback for bf16 weights. It computes one output per (row, column) pair, and threads
- * split the columns. */
-#define GPTRS_DEFINE_LINEAR_SCALAR(NAME, XTYPE, LOADX)                                         \
-    static void NAME(const XTYPE* GPTRS_RESTRICT x, const uint16_t* GPTRS_RESTRICT w,         \
+/* Portable fallback for bf16 and f8e4m3 weights. It computes one output per (row, column) pair,
+ * and threads split the columns. */
+#define GPTRS_DEFINE_LINEAR_SCALAR(NAME, XTYPE, WTYPE, LOADX, LOADW, WPARAMS, WARGS)           \
+    static void NAME(const XTYPE* GPTRS_RESTRICT x, const WTYPE* GPTRS_RESTRICT w,            \
                      float* GPTRS_RESTRICT y, size_t batch, size_t m, size_t n, size_t k,     \
-                     size_t sxb, size_t ldx, size_t swb, size_t ldw) {                        \
+                     size_t sxb, size_t ldx, size_t swb,                                      \
+                     size_t ldw GPTRS_LIN_UNWRAP WPARAMS) {                                   \
         _Pragma("omp parallel for schedule(static) if (batch * m * n * k >= GPTRS_PARALLEL_MIN_WORK)") \
         for (size_t col = 0; col < batch * n; ++col) {                                       \
             const size_t bi = col / n;                                                       \
             const size_t j = col % n;                                                        \
-            const uint16_t* wr = w + bi * swb + j * ldw;                                     \
+            const WTYPE* wr = w + bi * swb + j * ldw;                                        \
             for (size_t i = 0; i < m; ++i) {                                                 \
                 const XTYPE* xr = x + bi * sxb + i * ldx;                                    \
                 float acc = 0.0f;                                                            \
                 _Pragma("omp simd reduction(+:acc)")                                         \
                 for (size_t p = 0; p < k; ++p) {                                             \
-                    acc += LOADX(xr[p]) * gpt_rs_bf16_to_f32(wr[p]);                         \
+                    acc += LOADX(xr[p]) * LOADW(wr[p] GPTRS_LIN_UNWRAP WARGS);               \
                 }                                                                            \
                 y[(bi * m + i) * n + j] = acc;                                               \
             }                                                                                \
         }                                                                                    \
     }
 
-#define GPTRS_LIN_SCALAR_F32(v) (v)
+/* An f8e4m3 weight times a scale in f32, then rounded to bf16 or kept. */
+static inline float gpt_rs_lin_f8e4m3_scale_bf16(uint8_t bits, float scale) {
+    return gpt_rs_bf16_to_f32(gpt_rs_f32_to_bf16(gpt_rs_f8e4m3_to_f32(bits) * scale));
+}
 
-GPTRS_DEFINE_LINEAR_SCALAR(gpt_rs_c_linear_nt_f32_bf16, float, GPTRS_LIN_SCALAR_F32)
-GPTRS_DEFINE_LINEAR_SCALAR(gpt_rs_c_linear_nt_bf16_bf16, uint16_t, gpt_rs_bf16_to_f32)
+static inline float gpt_rs_lin_f8e4m3_scale_f32(uint8_t bits, float scale) {
+    return gpt_rs_f8e4m3_to_f32(bits) * scale;
+}
+
+GPTRS_DEFINE_LINEAR_SCALAR(gpt_rs_c_linear_nt_f32_bf16, float, uint16_t, gpt_rs_f32_to_f32,
+                           gpt_rs_bf16_to_f32, (), ())
+GPTRS_DEFINE_LINEAR_SCALAR(gpt_rs_c_linear_nt_f32_f8e4m3, float, uint8_t, gpt_rs_f32_to_f32,
+                           gpt_rs_f8e4m3_to_f32, (), ())
+GPTRS_DEFINE_LINEAR_SCALAR(gpt_rs_c_linear_nt_f32_f8e4m3_bf16_scale, float, uint8_t,
+                           gpt_rs_f32_to_f32, gpt_rs_lin_f8e4m3_scale_bf16,
+                           (, const uint16_t* scale), (, gpt_rs_bf16_to_f32(*scale)))
+GPTRS_DEFINE_LINEAR_SCALAR(gpt_rs_c_linear_nt_f32_f8e4m3_f32_scale, float, uint8_t,
+                           gpt_rs_f32_to_f32, gpt_rs_lin_f8e4m3_scale_f32,
+                           (, const float* scale), (, *scale))
+GPTRS_DEFINE_LINEAR_SCALAR(gpt_rs_c_linear_nt_bf16_bf16, uint16_t, uint16_t, gpt_rs_bf16_to_f32,
+                           gpt_rs_bf16_to_f32, (), ())
+GPTRS_DEFINE_LINEAR_SCALAR(gpt_rs_c_linear_nt_bf16_f8e4m3_bf16_scale, uint16_t, uint8_t,
+                           gpt_rs_bf16_to_f32, gpt_rs_lin_f8e4m3_scale_bf16,
+                           (, const uint16_t* scale), (, gpt_rs_bf16_to_f32(*scale)))
+GPTRS_DEFINE_LINEAR_SCALAR(gpt_rs_c_linear_nt_bf16_f8e4m3_f32_scale, uint16_t, uint8_t,
+                           gpt_rs_bf16_to_f32, gpt_rs_lin_f8e4m3_scale_bf16,
+                           (, const float* scale), (, *scale))
 
 static void gpt_rs_c_linear_nt_f32(const float* GPTRS_RESTRICT x, const float* GPTRS_RESTRICT w,
                                    float* GPTRS_RESTRICT y, size_t batch, size_t m, size_t n,
@@ -379,9 +453,9 @@ static inline void gpt_rs_lin_packed_panel(const uint16_t* GPTRS_RESTRICT x, siz
 }
 
 GPTRS_DEFINE_LINEAR_DRIVER(gpt_rs_lin_dp_rows, uint16_t, uint16_t, gpt_rs_lin_dp_panel,
-                           GPTRS_LIN_NR, GPTRS_LIN_KC)
+                           GPTRS_LIN_NR, GPTRS_LIN_KC, (), ())
 GPTRS_DEFINE_LINEAR_DRIVER(gpt_rs_lin_packed_rows, uint16_t, uint16_t, gpt_rs_lin_packed_panel,
-                           GPTRS_LIN_PACK_NR, GPTRS_LIN_PACK_KC)
+                           GPTRS_LIN_PACK_NR, GPTRS_LIN_PACK_KC, (), ())
 
 static void gpt_rs_c_linear_nt_bf16_bf16(const uint16_t* GPTRS_RESTRICT x,
                                          const uint16_t* GPTRS_RESTRICT w,
@@ -405,9 +479,23 @@ static void gpt_rs_c_linear_nt_bf16_bf16(const uint16_t* GPTRS_RESTRICT x,
 
 #elif GPTRS_HAS_AVX512
 
-GPTRS_DEFINE_LINEAR_FAMILY(gpt_rs_lin_bb, uint16_t, uint16_t, __m512, 16, gpt_rs_lin_bf16,
-                           gpt_rs_lin_bf16, gpt_rs_lin_fma)
-GPTRS_DEFINE_LINEAR_DRIVER(gpt_rs_c_linear_nt_bf16_bf16, uint16_t, uint16_t, gpt_rs_lin_bb_panel,
-                           GPTRS_LIN_NR, GPTRS_LIN_KC)
+GPTRS_DEFINE_LINEAR_FAMILY(gpt_rs_lin_dp, uint16_t, uint16_t, __m512, 16, gpt_rs_load_bf16,
+                           gpt_rs_load_bf16, gpt_rs_lin_fma)
+GPTRS_DEFINE_LINEAR_DRIVER(gpt_rs_c_linear_nt_bf16_bf16, uint16_t, uint16_t, gpt_rs_lin_dp_panel,
+                           GPTRS_LIN_NR, GPTRS_LIN_KC, (), ())
+
+#endif
+
+#if GPTRS_HAS_AVX512
+
+/* bf16 x reads the weights as bf16, so both scale dtypes round the f32 product to bf16. */
+GPTRS_DEFINE_LINEAR_SCALE_PANEL(gpt_rs_lin_bf16_f8e4m3_scale_panel, uint16_t, uint16_t,
+                                gpt_rs_lin_store_bf16, gpt_rs_lin_dp_panel)
+GPTRS_DEFINE_LINEAR_DRIVER(gpt_rs_c_linear_nt_bf16_f8e4m3_bf16_scale, uint16_t, uint8_t,
+                           gpt_rs_lin_bf16_f8e4m3_scale_panel, GPTRS_LIN_NR, GPTRS_LIN_KC,
+                           (, const uint16_t* scale), (, gpt_rs_bf16_to_f32(*scale)))
+GPTRS_DEFINE_LINEAR_DRIVER(gpt_rs_c_linear_nt_bf16_f8e4m3_f32_scale, uint16_t, uint8_t,
+                           gpt_rs_lin_bf16_f8e4m3_scale_panel, GPTRS_LIN_NR, GPTRS_LIN_KC,
+                           (, const float* scale), (, *scale))
 
 #endif

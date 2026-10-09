@@ -67,9 +67,6 @@ def test_runtime_api():
         info = gpt_rs.version_info()
         print(f"✓ version_info: {info}")
 
-        feats = gpt_rs.backend_features()
-        print(f"✓ backend_features: {feats}")
-
         return True
     except Exception as e:
         print(f"✗ Runtime API test failed: {e}")

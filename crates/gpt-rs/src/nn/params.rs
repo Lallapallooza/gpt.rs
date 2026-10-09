@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::backend::spec::PortableBackend;
+use crate::backend::PortableBackend;
 use crate::tensor::{DType, DeviceTensor};
 
 /// The checkpoint tensors that a model's constructors read, by module path.
@@ -25,8 +25,8 @@ pub struct Params<'a, B: PortableBackend + 'static> {
 }
 
 impl<'a, B: PortableBackend + 'static> Params<'a, B> {
-    /// Reads tensors by name from `get`, which returns `None` for a name the checkpoint does not
-    /// have.
+    /// Reads tensors by name from `get`, which returns parameters ([`DeviceTensor::as_param`]), or
+    /// `None` for a name the checkpoint does not have.
     pub fn new(
         backend: Arc<B>,
         get: &'a mut dyn FnMut(&str) -> Result<Option<DeviceTensor<B>>>,
@@ -85,7 +85,7 @@ impl<'a, B: PortableBackend + 'static> Params<'a, B> {
             },
         };
         self.reads += usize::from(tensor.is_some());
-        tensor.map(|tensor| tensor.as_param()).transpose()
+        Ok(tensor)
     }
 
     /// Builds a sublayer that the checkpoint may leave out, like a `shortcut` or a

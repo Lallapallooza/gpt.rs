@@ -9,8 +9,9 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use safetensors::tensor::{Dtype, SafeTensors, View};
 
-use crate::backend::spec::ExternalBytes;
-use crate::tensor::{DType, Shape, Tensor};
+use crate::tensor::{DType, HostTensor};
+use gpt_rs_ir::host::ExternalBytes;
+use gpt_rs_ir::types::TensorType;
 
 pub use safetensors::tensor::Dtype as StoredDtype;
 
@@ -69,28 +70,49 @@ impl SafetensorsFile {
     }
 }
 
-/// The dtype of a stored tensor, when the runtime has it.
+/// The safetensors dtypes and the runtime dtypes they hold.
+const DTYPES: [(Dtype, DType); 21] = [
+    (Dtype::BOOL, DType::I1),
+    (Dtype::U8, DType::Ui8),
+    (Dtype::I8, DType::Si8),
+    (Dtype::U16, DType::Ui16),
+    (Dtype::I16, DType::Si16),
+    (Dtype::U32, DType::Ui32),
+    (Dtype::I32, DType::Si32),
+    (Dtype::U64, DType::Ui64),
+    (Dtype::I64, DType::Si64),
+    (Dtype::F4, DType::F4E2M1),
+    (Dtype::F6_E2M3, DType::F6E2M3),
+    (Dtype::F6_E3M2, DType::F6E3M2),
+    (Dtype::F8_E4M3, DType::F8E4M3),
+    (Dtype::F8_E5M2, DType::F8E5M2),
+    (Dtype::F8_E4M3FNUZ, DType::F8E4M3Fnuz),
+    (Dtype::F8_E5M2FNUZ, DType::F8E5M2Fnuz),
+    (Dtype::F8_E8M0, DType::E8M0),
+    (Dtype::BF16, DType::Bf16),
+    (Dtype::F16, DType::F16),
+    (Dtype::F32, DType::F32),
+    (Dtype::F64, DType::F64),
+];
+
+/// The dtype of a stored tensor, when the runtime has it: every safetensors dtype but complex.
 pub fn runtime_dtype(dtype: Dtype) -> Option<DType> {
-    match dtype {
-        Dtype::F32 => Some(DType::F32),
-        Dtype::F16 => Some(DType::F16),
-        Dtype::BF16 => Some(DType::BF16),
-        Dtype::I32 => Some(DType::I32),
-        _ => None,
-    }
+    DTYPES
+        .iter()
+        .find(|(stored, _)| *stored == dtype)
+        .map(|&(_, runtime)| runtime)
 }
 
-fn stored_dtype(dtype: DType) -> Dtype {
-    match dtype {
-        DType::F32 => Dtype::F32,
-        DType::F16 => Dtype::F16,
-        DType::BF16 => Dtype::BF16,
-        DType::I32 => Dtype::I32,
-    }
+/// The safetensors dtype of `dtype`.
+fn stored_dtype(dtype: DType) -> Option<Dtype> {
+    DTYPES
+        .iter()
+        .find(|(_, runtime)| *runtime == dtype)
+        .map(|&(stored, _)| stored)
 }
 
 /// Reads every tensor of the file at `path`.
-pub fn load(path: impl AsRef<Path>) -> Result<HashMap<String, Tensor>> {
+pub fn load(path: impl AsRef<Path>) -> Result<HashMap<String, HostTensor>> {
     let file = SafetensorsFile::open(path)?;
     file.tensors()
         .iter()
@@ -102,46 +124,52 @@ pub fn load(path: impl AsRef<Path>) -> Result<HashMap<String, Tensor>> {
                     stored.dtype
                 )
             })?;
-            let tensor = Tensor::from_le_bytes(
-                Shape::new(stored.dims.clone()),
-                dtype,
-                file.bytes(stored)?.as_slice(),
-            )
-            .map_err(|err| anyhow!("tensor {}: {err}", stored.name))?;
+            let ty = TensorType::new(dtype, stored.dims.iter().copied());
+            let tensor = HostTensor::from_le_bytes(&ty, file.bytes(stored)?.as_slice())
+                .map_err(|err| anyhow!("tensor {}: {err}", stored.name))?;
             Ok((stored.name.clone(), tensor))
         })
         .collect()
 }
 
-struct TensorData<'a>(&'a Tensor);
+struct TensorData<'a> {
+    tensor: &'a HostTensor,
+    dtype: Dtype,
+}
 
 impl View for TensorData<'_> {
     fn dtype(&self) -> Dtype {
-        stored_dtype(self.0.dtype())
+        self.dtype
     }
 
     fn shape(&self) -> &[usize] {
-        self.0.shape().dims()
+        &self.tensor.dims
     }
 
     fn data(&self) -> Cow<'_, [u8]> {
-        Cow::Borrowed(self.0.to_le_bytes())
+        Cow::Borrowed(self.tensor.to_le_bytes())
     }
 
     fn data_len(&self) -> usize {
-        self.0.to_le_bytes().len()
+        self.tensor.to_le_bytes().len()
     }
 }
 
 /// Writes `tensors` to a safetensors file at `path`.
 pub fn save<'a>(
     path: impl AsRef<Path>,
-    tensors: impl IntoIterator<Item = (&'a str, &'a Tensor)>,
+    tensors: impl IntoIterator<Item = (&'a str, &'a HostTensor)>,
 ) -> Result<()> {
     let path = path.as_ref();
     let views = tensors
         .into_iter()
-        .map(|(name, tensor)| (name, TensorData(tensor)));
+        .map(|(name, tensor)| {
+            let dtype = stored_dtype(tensor.dtype()).ok_or_else(|| {
+                anyhow!("tensor {name}: safetensors has no {} dtype", tensor.dtype())
+            })?;
+            Ok((name, TensorData { tensor, dtype }))
+        })
+        .collect::<Result<Vec<_>>>()?;
     safetensors::serialize_to_file(views, None, path)
         .map_err(|err| anyhow!("failed to write {}: {err}", path.display()))
 }

@@ -4,9 +4,9 @@ Rust-first **research project** for portable tensor programs (PTIR) and model ru
 
 PTIR lets you keep model math portable while backends compete on execution:
 - Layers call portable functionals (no open-coded kernels).
-- Functionals capture PTIR graphs and can be overridden at runtime.
-- Backends execute PTIR and can rewrite/fuse graphs into custom kernels.
-- Parameters have stable `u128` ids and can be streamed lazily from checkpoints.
+- Functionals record PTIR ops into lazy graphs.
+- Backends execute PTIR and run recognized op sequences, such as a convolution, on their own kernels.
+- Parameters have stable `u128` ids, and weights load as views of the memory-mapped checkpoint.
 
 Warning: expect churn. APIs, formats, and model coverage change quickly.
 
@@ -42,10 +42,10 @@ GPTRS_C_CACHE_DIR=./.cache/gpt_rs_c_backend uv run python scripts/eval.py \
 ## Highlights
 
 - **Capability-based runtime**: `runtime::load_model` returns a dynamic model handle; the CLI runs `generate` / `forward` without hardcoding model kinds. See [docs/runtime.md](docs/runtime.md).
-- **Parameter streaming + stable ids**: checkpoint-backed `ParamSource` loads weights on demand; backends can memoize derived parameter formats by stable id. See [docs/howto.md](docs/howto.md) and [docs/formats.md](docs/formats.md).
-- **Backend rewrites**: backend optimizer passes rewrite PTIR by matching the pattern views that `#[functional]` generates. See [docs/backend_optimizer.md](docs/backend_optimizer.md) (and [crates/gpt-rs-backend-c/src/optimizer/conv2d.rs](crates/gpt-rs-backend-c/src/optimizer/conv2d.rs) for a real example).
+- **Stable parameter ids**: weights are views of the memory-mapped checkpoint; backends can memoize derived parameter formats by stable id. See [docs/runtime.md](docs/runtime.md#parameter-identity) and [docs/formats.md](docs/formats.md).
+- **Kernel selection**: backends pick their kernels by matching the plain ops they compile, so the IR keeps its meaning through every pass. See [docs/backends/README.md](docs/backends/README.md) and [crates/gpt-rs-backend-faer/src/select.rs](crates/gpt-rs-backend-faer/src/select.rs).
 - **Correctness tooling**: Torch parity at the kernel level and end-to-end model baselines via Python runners. See [docs/testing.md](docs/testing.md).
-- **Debuggability**: PTIR dumps (`--dump-dir`), profiling (`--profile` with `-F gpt-rs/profiler`), and eager debugging (`GPTRS_EAGER=1`).
+- **Debuggability**: PTIR dumps (`--dump-dir`), profiling (`--profile`, with the `profiler` feature), and eager debugging (`GPTRS_EAGER=1`).
 
 ## Docs
 
@@ -58,9 +58,9 @@ Start here:
 
 Reference:
 - [docs/backends/README.md](docs/backends/README.md) (how each backend works: ref-cpu, faer, c)
-- [docs/backend.md](docs/backend.md) (PTIR backend contract, ptir.v0.4)
-- [docs/backend_optimizer.md](docs/backend_optimizer.md) (optimizer pipeline + patterns)
-- [docs/ops.md](docs/ops.md) (PTIR capture/graphs/execution)
+- [docs/ptir/tensor.md](docs/ptir/tensor.md) (the `tensor` dialect: the PTIR spec, generated from the code)
+- [docs/ptir/passes.md](docs/ptir/passes.md) (the passes and the pipeline of each backend)
+- [docs/ops.md](docs/ops.md) (PTIR recording/graphs/execution)
 - [docs/frontend.md](docs/frontend.md) (frontend layering)
 
 Scripts:
@@ -84,7 +84,6 @@ Inference:
 - [ ] Speculative decoding
 
 Tooling / interop:
-- [ ] Chrome trace export (profiler visualization)
 - [ ] Full Python interop (define/train models in Python)
 - [ ] PyTorch importer
 
@@ -105,10 +104,18 @@ Misc
 
 ## Repository layout
 
-- `crates/gpt-rs`: core library (tensors, PTIR capture, layers, models, tokenizer, checkpoints, runtime).
-- `crates/gpt-rs-cli`: model runner CLI (`generate` / `forward`) with dump/profile hooks.
-- `crates/gpt-rs-backend-*`: backend implementations (faer, ref-cpu, optional C backend).
+- `crates/gpt-rs`: core library (tensors, PTIR recording, layers, models, tokenizer, checkpoints, runtime).
+- `crates/gpt-rs-macros`: the `#[nn::module]` and `#[functional]` proc macros.
+- `crates/gpt-rs-ir`: the IR: dialects, text form, verifier, interpreter and passes.
+- `crates/gpt-rs-ir-macros`: the macros that define ops, dialects, attributes, passes, patterns and folds.
+- `crates/gpt-rs-filetests`: the filetest runner.
+- `crates/gpt-rs-docs`: writes the IR reference pages, `docs/ptir/`, from the code.
+- `filetests/`: IR filetests (`cargo test -p gpt-rs-ir --test filetests`) and the C backend's (`cargo test -p gpt-rs-backend-c --test filetests`).
+- `crates/gpt-rs-backend-ref-cpu`, `crates/gpt-rs-backend-faer`, `crates/gpt-rs-backend-c`: the backends (reference interpreter, faer, generated C).
+- `crates/gpt-rs-backends`: maps a backend name to its type; the CLI and Python load models through it.
 - `crates/gpt-rs-backend-tests`: backend suite + Torch parity harness (via `tch` / libtorch).
+- `crates/gpt-rs-cli`: model runner CLI (`--help` lists its commands) with dump/profile hooks.
+- `crates/gpt-rs-py`: Python bindings for checkpoint-backed inference.
 - `scripts/`: Python baselines against Torch (`scripts/eval.py`).
 
 ## Architecture (high level)
@@ -120,13 +127,16 @@ inputs (tokens / images)
   model::* (Gpt, ResNet, MobileNetV2, ...)
         |
         v
-   nn::layers::* (Linear, LayerNorm, Attention, Conv2d, ...)
+   nn::layers::* (Linear, LayerNorm, CausalSelfAttention, Conv2d, ...)
         |
         v
 ops::functional::* (matmul, layer_norm, conv2d, ...)
         |
         v
-backend::spec::PortableBackend (dot_general, reduce_window, gather, elementwise, ...)
+gpt_rs_ir tensor dialect -> the backend's pass pipeline
+        |
+        v
+backend::PortableBackend (compile and run a function of the IR)
         |
         v
 backend impl (faer, ref-cpu, ...)
@@ -178,17 +188,21 @@ uv run python scripts/eval.py --model ministral_3_3b_instruct_2512 --workload va
 ```
 
 Notes:
-- Select a backend with `--backend` (or `GPTRS_BACKEND`, default: `faer`).
-- `--profile` prints tables only when built with `-F gpt-rs/profiler`.
+- Select a backend with `--backend` (default: `faer`).
+- `--profile` prints tables only when the extension is built with the `profiler` feature
+  (`uv run python scripts/rebuild_py.py --features faer,profiler`).
 - Use `--dump-dir` / `--dump-mode` to capture PTIR programs (Rust CLI or Python runner).
 
 ## Testing
 
 ```bash
-cargo test  # workspace unit + integration tests (no Torch)
+# The tokenizer tests read configs/gpt2_tokenizer.json (CI downloads it the same way):
+mkdir -p configs && curl -fsSL https://huggingface.co/gpt2/resolve/main/tokenizer.json -o configs/gpt2_tokenizer.json
 
-cargo test -p gpt-rs-backend-faer --features torch --test backend_suite -- --nocapture  # Torch parity + timings (libtorch via tch)
-cargo test -p gpt-rs --features torch --test torch_parity  # smaller parity set (ref-cpu backend)
+cargo test  # workspace unit + integration tests (no Torch)
+cargo test --workspace --exclude gpt-rs-py --exclude gpt-rs-backend-c  # the subset CI runs
+
+GPTRS_TORCH_PARITY_BACKENDS=faer cargo test -p gpt-rs-backend-faer --features torch --test backend_suite  # Torch parity + timings (libtorch via tch)
 ```
 
 Torch parity tests live under `crates/gpt-rs-backend-tests/src/torch_parity/` and are wired into each backend via
@@ -200,8 +214,9 @@ Forward inference for causal LMs (`gpt2`, `ministral3`, `qwen3_5_text`) and imag
 models (`resnet`, `mobilenet_v2`) is implemented, with portable PTIR kernels and Torch baselines
 for correctness.
 
-The functional layer exposes portable math (elementwise ops, matmul, normalization, attention, conv/pool) via the
-`DeviceTensorOps` extension trait while still delegating to backend PTIR execution.
+`DeviceTensor` exposes the elementwise ops and operators (with Torch-style broadcasting), and the
+functional layer the composite math (matmul, normalization, attention, conv/pool), all recorded as
+PTIR for the backends to run.
 
 ## License
 

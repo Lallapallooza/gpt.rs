@@ -3,16 +3,13 @@
 
 use std::sync::Arc;
 
-use anyhow::{ensure, Result};
+use anyhow::Result;
+use gpt_rs_ir::dialects::tensor::DotGeneral;
 
-use crate::backend::spec::{DType, PortableBackend};
-use crate::ops::functional::activation::softmax_ptir;
-use crate::ops::ptir::{self, scalar_broadcast, DotAttrs, DotDims};
-use crate::tensor::{DeviceTensor, Shape, Tensor as HostTensor};
-use crate::{
-    capture, ensure_dtype, ensure_rank, ensure_same_backend, ensure_same_dtype, ensure_same_shape,
-    functional,
-};
+use crate::backend::PortableBackend;
+use crate::ops::functional::{apply_rope, softmax};
+use crate::tensor::{DType, DeviceTensor, HostTensor, Shape};
+use crate::{ensure_dtype, ensure_rank, ensure_same_dtype, ensure_same_shape, functional, s};
 
 /// Additive attention-score bias for masked positions. After the softmax subtracts the maximum,
 /// `exp` maps this bias to exactly 0.
@@ -42,8 +39,9 @@ impl<B: PortableBackend + 'static> DecodeKvCache<B> {
     /// Builds a decode cache from fixed-capacity key/value tensors plus the active prefix length.
     ///
     /// Layout: `[num_kv_heads, capacity, head_dim]`.
-    pub fn new(keys: DeviceTensor<B>, values: DeviceTensor<B>, len: usize) -> Result<Self> {
-        ensure!(
+    #[track_caller]
+    pub fn new(keys: DeviceTensor<B>, values: DeviceTensor<B>, len: usize) -> Self {
+        assert!(
             keys.dtype() == values.dtype() && keys.shape().dims() == values.shape().dims(),
             "decode cache keys ({:?} {:?}) and values ({:?} {:?}) must match",
             keys.dtype(),
@@ -51,19 +49,17 @@ impl<B: PortableBackend + 'static> DecodeKvCache<B> {
             values.dtype(),
             values.shape().dims()
         );
-        ensure!(
+        assert!(
             keys.shape().rank() == 3,
             "decode cache keys must have rank 3, got {:?}",
             keys.shape().dims()
         );
-        let capacity = keys.shape().dims()[1];
-        ensure!(
+        let capacity = keys.size(1);
+        assert!(
             len <= capacity,
-            "decode cache len {} exceeds capacity {}",
-            len,
-            capacity
+            "decode cache len {len} exceeds capacity {capacity}"
         );
-        Ok(Self { keys, values, len })
+        Self { keys, values, len }
     }
 
     /// Returns the key buffer shaped as `[num_heads, capacity, head_dim]`.
@@ -81,11 +77,12 @@ impl<B: PortableBackend + 'static> DecodeKvCache<B> {
         self.len
     }
 
-    /// Total cache capacity (`keys.shape().dims()[1]`).
+    /// The number of positions the cache has room for.
     pub fn capacity(&self) -> usize {
-        self.keys.shape().dims()[1]
+        self.keys.size(1)
     }
 
+    /// Whether the cache holds no positions.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -100,105 +97,58 @@ impl<B: PortableBackend + 'static> DecodeKvCache<B> {
         let shape = Shape::new([num_kv_heads, capacity, head_dim]);
         let keys = DeviceTensor::zeros(Arc::clone(backend), shape.clone())?;
         let values = DeviceTensor::zeros(Arc::clone(backend), shape)?;
-        Self::new(keys, values, 0)
+        Ok(Self::new(keys, values, 0))
     }
+}
 
-    /// Returns the cache with room for `capacity` positions. The result holds a copy of the stored
-    /// prefix.
-    pub fn grow(&self, capacity: usize) -> Result<Self> {
-        ensure!(
-            capacity >= self.capacity(),
-            "cannot shrink a decode cache from {} to {capacity}",
-            self.capacity()
+/// What every attention layer of a forward reads about its `T` new tokens:
+///
+/// - their positions (`si32 [T]`, consecutive);
+/// - for rotary attention, the rotary `(cos, sin)` tables of those positions, each
+///   `[T, rotary_dim / 2]`;
+/// - where their keys and values go in a cache.
+pub struct AttentionPositions<B: PortableBackend + 'static> {
+    positions: DeviceTensor<B>,
+    rotary: Option<(DeviceTensor<B>, DeviceTensor<B>)>,
+    /// The offsets of the first token's row in a cache `[num_kv_heads, capacity, head_dim]`:
+    /// `[0, position, 0]`.
+    cache_starts: DeviceTensor<B>,
+}
+
+impl<B: PortableBackend + 'static> AttentionPositions<B> {
+    /// The tokens at `positions` (`si32 [T]`), with the rotary tables of those positions for
+    /// rotary attention.
+    #[track_caller]
+    pub fn new(
+        positions: DeviceTensor<B>,
+        rotary: Option<(DeviceTensor<B>, DeviceTensor<B>)>,
+    ) -> Self {
+        assert!(
+            positions.dtype() == DType::Si32 && positions.shape().rank() == 1,
+            "attention positions must be si32 [T], got {:?} {:?}",
+            positions.dtype(),
+            positions.shape().dims()
         );
-        if capacity == self.capacity() {
-            return Ok(self.clone());
+        let zero = HostTensor::si32([1], vec![0]).expect("one element");
+        let zero = DeviceTensor::constant(&positions, &zero);
+        let cache_starts = DeviceTensor::concat(0, &[&zero, &positions.slice(s![..1]), &zero]);
+        Self {
+            positions,
+            rotary,
+            cache_starts,
         }
-        let backend = self.keys.backend();
-        let dims = self.keys.shape().dims();
-        let starts = DeviceTensor::from_host(
-            Arc::clone(&backend),
-            HostTensor::from_i32(Shape::new([3]), vec![0, 0, 0])?,
-        )?;
-        let grown = |old: &DeviceTensor<B>| {
-            let base = DeviceTensor::zeros(
-                Arc::clone(&backend),
-                Shape::new([dims[0], capacity, dims[2]]),
-            )?;
-            dynamic_update_slice_into(&base, old, &starts)
-        };
-        Self::new(grown(&self.keys)?, grown(&self.values)?, self.len)
     }
-}
-
-/// Bundle returned by [`attention_kv_cache`].
-pub struct DecodeAttentionComputation<B: PortableBackend + 'static> {
-    pub output: DeviceTensor<B>,
-    pub cache: DecodeKvCache<B>,
-}
-
-/// Extracts `len` entries starting at `start` along `axis`, keeping the other dimensions.
-#[functional]
-pub fn slice_along_axis(x: &Tensor, axis: usize, start: usize, len: usize) -> Result<Tensor> {
-    let dims = x.shape().dims();
-    ensure!(
-        axis < dims.len(),
-        "{FUNCTIONAL}: axis {axis} must be less than the rank of x {dims:?}"
-    );
-    ensure!(
-        start + len <= dims[axis],
-        "{FUNCTIONAL}: slice [{start}..{}) must fit in dimension {axis} of x {dims:?}",
-        start + len
-    );
-    let mut starts = vec![0usize; dims.len()];
-    let mut sizes = dims.to_vec();
-    starts[axis] = start;
-    sizes[axis] = len;
-    capture!(|x| x.slice(starts, sizes))
-}
-
-/// Writes `update` into `base` at the dynamic offsets `starts` (`i32 [rank]`). The functional
-/// exports the result, so later programs can read it.
-#[functional]
-pub fn dynamic_update_slice_into(
-    base: &Tensor,
-    update: &Tensor,
-    starts: &Tensor,
-) -> Result<Tensor> {
-    ensure_same_backend!(base, update, starts);
-    ensure_same_dtype!(base, update);
-    ensure_rank!(starts, 1);
-    ensure_dtype!(starts, I32);
-    let base_dims = base.shape().dims();
-    let update_dims = update.shape().dims();
-    ensure!(
-        starts.shape().dims() == [base_dims.len()],
-        "{FUNCTIONAL}: starts must have shape [rank of base], got {:?} for base {base_dims:?}",
-        starts.shape().dims()
-    );
-    ensure!(
-        update_dims.len() == base_dims.len()
-            && update_dims.iter().zip(base_dims).all(|(u, b)| u <= b),
-        "{FUNCTIONAL}: update {update_dims:?} must fit in base {base_dims:?}"
-    );
-    let sizes = update_dims.to_vec();
-    capture!(session, |base, update, starts| {
-        let updated = base.dynamic_update_slice(&update, &starts, sizes);
-        session.export(updated);
-        updated
-    })
 }
 
 /// Grouped-query causal attention for `T` new tokens appended to a fixed-capacity KV cache.
 ///
-/// `q` is `[Hq, T, D]`, and `k` and `v` are `[Hkv, T, D]`, with RoPE already applied.
-/// `update_starts` (`i32 [3]`) holds `[0, position, 0]`. `position` is the absolute position of
-/// the first new token and must equal `cache.len()`.
+/// `q` is `[T, Hq, D]`, and `k` and `v` are `[T, Hkv, D]`. When `positions` holds rotary tables,
+/// they rotate `q` and `k`. The first position must equal `cache.len()`.
 ///
-/// The functional writes the new keys and values at `position` with `dynamic_update_slice`. Query
-/// `t` then attends to cache rows `0..=position + t` with scale `D^-1/2`. The causal mask uses
-/// only integer iotas and comparisons. The functional returns the context as `[T, Hq * D]`
-/// (query-head major) and the updated cache.
+/// The functional writes the new keys and values at the first position with
+/// `dynamic_update_slice`. Query `t` then attends to the cache rows up to its own position, with
+/// scale `D^-1/2`. The causal mask compares the positions with an integer iota. The functional
+/// returns the context as `[T, Hq * D]` (query-head major) and the extended cache.
 ///
 /// Shapes depend only on `(T, capacity)`, so all positions reuse the same compiled programs.
 #[functional]
@@ -207,41 +157,36 @@ pub fn attention_kv_cache(
     k: &Tensor,
     v: &Tensor,
     cache: &DecodeKvCache<B>,
-    update_starts: &Tensor,
-) -> Result<DecodeAttentionComputation<B>> {
+    positions: &AttentionPositions<B>,
+) -> (Tensor, DecodeKvCache<B>) {
     let cache_keys = cache.keys();
-    let cache_values = cache.values();
+    let token_positions = &positions.positions;
     ensure_rank!(q, 3);
     ensure_rank!(k, 3);
-    ensure_rank!(v, 3);
-    ensure_same_backend!(q, k, v, cache_keys, update_starts);
     ensure_dtype!(q, F32);
     ensure_same_dtype!(q, k, v, cache_keys);
     ensure_same_shape!(k, v);
-    ensure_dtype!(update_starts, I32);
-    ensure!(
-        update_starts.shape().dims() == [3],
-        "{FUNCTIONAL}: update_starts must have shape [3], got {:?}",
-        update_starts.shape().dims()
+    ensure_rank!(token_positions, 1);
+    ensure_dtype!(token_positions, Si32);
+    let [t, hq, d] = [0, 1, 2].map(|axis| q.size(axis));
+    let hkv = k.size(1);
+    assert!(
+        k.shape().dims() == [t, hkv, d] && token_positions.size(0) == t,
+        "{FUNCTIONAL}: k must be [{t}, {hkv}, {d}] and positions [{t}], got {:?} and {:?}",
+        k.shape().dims(),
+        token_positions.shape().dims()
     );
-    let (q_dims, k_dims) = (q.shape().dims(), k.shape().dims());
-    let (hq, t, d) = (q_dims[0], q_dims[1], q_dims[2]);
-    let hkv = k_dims[0];
-    ensure!(
-        k_dims[1] == t && k_dims[2] == d,
-        "{FUNCTIONAL}: k must be [{hkv}, {t}, {d}], got {k_dims:?}"
-    );
-    ensure!(
+    assert!(
         hkv > 0 && hq.is_multiple_of(hkv),
         "{FUNCTIONAL}: query heads ({hq}) must be a multiple of kv heads ({hkv})"
     );
     let cache_dims = cache_keys.shape().dims();
-    ensure!(
+    assert!(
         cache_dims[0] == hkv && cache_dims[2] == d,
         "{FUNCTIONAL}: cache must be [{hkv}, capacity, {d}], got {cache_dims:?}"
     );
     let c = cache_dims[1];
-    ensure!(
+    assert!(
         cache.len() + t <= c,
         "{FUNCTIONAL}: update would exceed capacity (len {} + seq_len {t} > {c})",
         cache.len()
@@ -249,54 +194,40 @@ pub fn attention_kv_cache(
     let group = hq / hkv;
     let scale = 1.0f32 / (d as f32).sqrt();
 
-    let (output, keys, values) =
-        capture!(session, |q,
-                           k,
-                           v,
-                           cache_keys,
-                           cache_values,
-                           update_starts| {
-            let keys = cache_keys.dynamic_update_slice(&k, &update_starts, vec![hkv, t, d]);
-            let values = cache_values.dynamic_update_slice(&v, &update_starts, vec![hkv, t, d]);
+    let (mut q, mut k, v) = (
+        q.transpose([1, 0, 2]),
+        k.transpose([1, 0, 2]),
+        v.transpose([1, 0, 2]),
+    );
+    if let Some((cos, sin)) = &positions.rotary {
+        q = apply_rope(&q, cos, sin);
+        k = apply_rope(&k, cos, sin);
+    }
 
-            let q_grouped = q.reshape(vec![hkv, group * t, d]);
-            let scores = q_grouped.dot_general(
-                &keys,
-                &DotDims::new(crate::axes!(0), crate::axes!(2), crate::axes!(2)),
-                &DotAttrs::default(),
-            ) * scale;
-            // Query positions `position..position + T`, read from an iota at the cache write
-            // offset.
-            let query_pos = session
-                .iota(vec![1, c, 1], 1, DType::Si32)
-                .dynamic_slice(&update_starts, vec![1, t, 1])
-                .reshape(vec![t, 1])
-                .broadcast_to(vec![t, c]);
-            let key_pos = session.iota(vec![t, c], 1, DType::Si32);
-            let allowed = query_pos.greater_equal(&key_pos);
-            let bias = ptir::Tensor::select(
-                &allowed,
-                &scalar_broadcast(&session, 0.0, &[t, c]),
-                &scalar_broadcast(&session, MASKED_BIAS, &[t, c]),
-            )
-            .reshape(vec![1, 1, t, c])
-            .broadcast_to(vec![hkv, group, t, c])
-            .reshape(vec![hkv, group * t, c]);
-            let probs = softmax_ptir(&(scores + bias), 2);
-            let context = probs
-                .dot_general(
-                    &values,
-                    &DotDims::new(crate::axes!(0), crate::axes!(2), crate::axes!(1)),
-                    &DotAttrs::default(),
-                )
-                .reshape(vec![hkv, group, t, d])
-                .transpose(vec![2, 0, 1, 3])
-                .reshape(vec![t, hq * d]);
+    let starts = &positions.cache_starts;
+    let keys = cache_keys.dynamic_update_slice(&k, starts);
+    let values = cache.values().dynamic_update_slice(&v, starts);
+    keys.export();
+    values.export();
 
-            session.export(keys);
-            session.export(values);
-            (context, keys, values)
-        })?;
-    let cache = DecodeKvCache::new(keys, values, cache.len() + t)?;
-    Ok(DecodeAttentionComputation { output, cache })
+    let scores = q
+        .reshape([hkv, group * t, d])
+        .dot_general(&keys, DotGeneral::contract([2], [2]).batch([0], [0]))
+        * scale;
+    let key_pos = DeviceTensor::iota(&q, [t, c], 1, DType::Si32);
+    let bias = token_positions
+        .reshape([t, 1])
+        .greater_equal(&key_pos)
+        .select(0.0, MASKED_BIAS)
+        .reshape([1, 1, t, c])
+        .broadcast_to([hkv, group, t, c])
+        .reshape([hkv, group * t, c]);
+    let probs = softmax(&(scores + bias), -1);
+    let output = probs
+        .dot_general(&values, DotGeneral::contract([2], [1]).batch([0], [0]))
+        .reshape([hkv, group, t, d])
+        .transpose([2, 0, 1, 3])
+        .reshape([t, hq * d]);
+    let cache = DecodeKvCache::new(keys, values, cache.len() + t);
+    (output, cache)
 }

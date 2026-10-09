@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use gpt_rs::backend::spec::PortableBackend;
+use gpt_rs::backend::PortableBackend;
 use gpt_rs::module::Layer;
 use gpt_rs::nn::layers::Linear;
 use gpt_rs::tensor::DeviceTensor;
@@ -29,11 +29,12 @@ fn run_linear_case<B: PortableBackend + 'static>(
         bias.then(|| tensor_from_vec(&[out_features], random_vec(&mut rng, out_features)));
 
     let expected = timed_torch(|| {
-        let input_tch = tch_tensor_from_vec(&[batch, in_features], input_host.data());
-        let weight_tch = tch_tensor_from_vec(&[out_features, in_features], weight_host.data());
+        let input_tch = tch_tensor_from_vec(&[batch, in_features], input_host.as_f32().unwrap());
+        let weight_tch =
+            tch_tensor_from_vec(&[out_features, in_features], weight_host.as_f32().unwrap());
         let bias_tch = bias_host
             .as_ref()
-            .map(|b| tch_tensor_from_vec(&[out_features], b.data()));
+            .map(|b| tch_tensor_from_vec(&[out_features], b.as_f32().unwrap()));
         tensor_to_vec(&input_tch.linear(&weight_tch, bias_tch.as_ref()))
     });
 
@@ -46,11 +47,11 @@ fn run_linear_case<B: PortableBackend + 'static>(
         let layer = load_layer(backend, tensors, |p| p.scoped("proj", Linear::new)).unwrap();
         let input_device =
             DeviceTensor::from_host(Arc::clone(backend), input_host.clone()).unwrap();
-        let output = layer.call(&input_device).unwrap();
+        let output = layer.call(&input_device);
         output.to_host().unwrap()
     });
 
-    assert_close(&expected, output_host.data());
+    assert_close(&expected, output_host.as_f32().unwrap());
 }
 
 pub fn linear_matches_torch_with_bias<B: PortableBackend + 'static>(backend: &Arc<B>) {

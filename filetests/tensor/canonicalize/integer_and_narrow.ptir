@@ -1,0 +1,58 @@
+// RUN: pass canonicalize
+
+// Integer sums merge: wrapping addition combines in any order and grouping.
+// CHECK: func.func @int_merge
+// CHECK-NEXT: [[R:%[0-9]+]] = tensor.reduce_sum(%0) {axes = [0, 1]} : (tensor<2x3xsi32>) -> tensor<si32>
+// CHECK-NEXT: func.return([[R]])
+func.func @int_merge(%0: tensor<2x3xsi32>) -> tensor<si32> {
+  %1 = tensor.reduce_sum(%0) {axes = [1]} : (tensor<2x3xsi32>) -> tensor<2xsi32>
+  %2 = tensor.reduce_sum(%1) {axes = [0]} : (tensor<2xsi32>) -> tensor<si32>
+  func.return(%2) : (tensor<si32>) -> ()
+}
+
+// -----
+// An integer sum of a concatenation adds the sums of the parts.
+// CHECK: func.func @int_of_concat
+// CHECK-NEXT: [[A:%[0-9]+]] = tensor.reduce_sum(%0) {axes = [0]} : (tensor<2x3xsi32>) -> tensor<3xsi32>
+// CHECK-NEXT: [[B:%[0-9]+]] = tensor.reduce_sum(%1) {axes = [0]} : (tensor<1x3xsi32>) -> tensor<3xsi32>
+// CHECK-NEXT: [[S:%[0-9]+]] = tensor.add([[A]], [[B]])
+// CHECK-NEXT: func.return([[S]])
+func.func @int_of_concat(%0: tensor<2x3xsi32>, %1: tensor<1x3xsi32>) -> tensor<3xsi32> {
+  %2 = tensor.concat(%0, %1) {axis = 0} : (tensor<2x3xsi32>, tensor<1x3xsi32>) -> tensor<3x3xsi32>
+  %3 = tensor.reduce_sum(%2) {axes = [0]} : (tensor<3x3xsi32>) -> tensor<3xsi32>
+  func.return(%3) : (tensor<3xsi32>) -> ()
+}
+
+// -----
+// An accumulator or result dtype equal to the default is left out, here for integer dots and
+// windows.
+// CHECK: func.func @int_defaults
+// CHECK-NEXT: tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xsi32>, tensor<3x2xsi32>) -> tensor<2x2xsi32>
+// CHECK-NEXT: tensor.reduce_window_max(%2) {window_dims = [2], strides = [1], padding = [(1, 0)], base_dilation = [1], window_dilation = [1]} : (tensor<4xsi32>) -> tensor<4xsi32>
+func.func @int_defaults(%0: tensor<2x3xsi32>, %1: tensor<3x2xsi32>, %2: tensor<4xsi32>) -> (tensor<2x2xsi32>, tensor<4xsi32>) {
+  %3 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0], out = si32} : (tensor<2x3xsi32>, tensor<3x2xsi32>) -> tensor<2x2xsi32>
+  %4 = tensor.reduce_window_max(%2) {window_dims = [2], strides = [1], padding = [(1, 0)], base_dilation = [1], window_dilation = [1], accum = si32} : (tensor<4xsi32>) -> tensor<4xsi32>
+  func.return(%3, %4) : (tensor<2x2xsi32>, tensor<4xsi32>) -> ()
+}
+
+// -----
+// Arithmetic, casts and comparisons of bf16 broadcasts run on the broadcast inputs.
+// CHECK: func.func @bf16_hoist
+// CHECK-NEXT: [[M:%[0-9]+]] = tensor.mul(%0, %1) : (tensor<3xbf16>, tensor<3xbf16>) -> tensor<3xbf16>
+// CHECK-NEXT: [[E:%[0-9]+]] = tensor.exp([[M]]) : (tensor<3xbf16>) -> tensor<3xbf16>
+// CHECK-NEXT: [[C:%[0-9]+]] = tensor.cast([[E]]) {to = si32} : (tensor<3xbf16>) -> tensor<3xsi32>
+// CHECK-NEXT: [[X:%[0-9]+]] = tensor.broadcast_to([[C]]) {shape = [2, 3]}
+// CHECK-NEXT: [[L:%[0-9]+]] = tensor.compare([[M]], [[E]]) {kind = less} : (tensor<3xbf16>, tensor<3xbf16>) -> tensor<3xi1>
+// CHECK-NEXT: [[B:%[0-9]+]] = tensor.cast([[L]]) {to = bf16} : (tensor<3xi1>) -> tensor<3xbf16>
+// CHECK-NEXT: [[Y:%[0-9]+]] = tensor.broadcast_to([[B]]) {shape = [2, 3]}
+// CHECK-NEXT: func.return([[X]], [[Y]])
+func.func @bf16_hoist(%0: tensor<3xbf16>, %1: tensor<3xbf16>) -> (tensor<2x3xsi32>, tensor<2x3xbf16>) {
+  %2 = tensor.broadcast_to(%0) {shape = [2, 3]} : (tensor<3xbf16>) -> tensor<2x3xbf16>
+  %3 = tensor.broadcast_to(%1) {shape = [2, 3]} : (tensor<3xbf16>) -> tensor<2x3xbf16>
+  %4 = tensor.mul(%2, %3) : (tensor<2x3xbf16>, tensor<2x3xbf16>) -> tensor<2x3xbf16>
+  %5 = tensor.exp(%4) : (tensor<2x3xbf16>) -> tensor<2x3xbf16>
+  %6 = tensor.cast(%5) {to = si32} : (tensor<2x3xbf16>) -> tensor<2x3xsi32>
+  %7 = tensor.compare(%4, %5) {kind = less} : (tensor<2x3xbf16>, tensor<2x3xbf16>) -> tensor<2x3xi1>
+  %8 = tensor.cast(%7) {to = bf16} : (tensor<2x3xi1>) -> tensor<2x3xbf16>
+  func.return(%6, %8) : (tensor<2x3xsi32>, tensor<2x3xbf16>) -> ()
+}

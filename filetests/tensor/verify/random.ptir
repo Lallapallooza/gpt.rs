@@ -1,0 +1,23 @@
+// RUN: verify
+
+// ERROR: tensor.rng_normal: dtype must be a float dtype, got si32
+func.func @normal_int(%0: tensor<2xui64>) -> tensor<4xsi32> {
+  %1, %2 = tensor.rng_normal(%0) {shape = [4], dtype = si32} : (tensor<2xui64>) -> (tensor<2xui64>, tensor<4xsi32>)
+  func.return(%2) : (tensor<4xsi32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.rng_uniform: dtype must be an integer or float dtype, got i1
+func.func @uniform_i1(%0: tensor<2xui64>) -> tensor<4xi1> {
+  %1, %2 = tensor.rng_uniform(%0) {shape = [4], dtype = i1} : (tensor<2xui64>) -> (tensor<2xui64>, tensor<4xi1>)
+  func.return(%2) : (tensor<4xi1>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.rng_uniform: the state must be tensor<2xui64>, got tensor<2xsi64>
+func.func @state_type(%0: tensor<2xsi64>) -> tensor<4xf32> {
+  %1, %2 = tensor.rng_uniform(%0) {shape = [4], dtype = f32} : (tensor<2xsi64>) -> (tensor<2xui64>, tensor<4xf32>)
+  func.return(%2) : (tensor<4xf32>) -> ()
+}

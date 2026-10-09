@@ -5,10 +5,10 @@ design docs; it just tells you "where to look".
 
 ## Key directories
 
-- `crates/gpt-rs/src/ops/functional/`: portable kernels (validate + capture).
-- `crates/gpt-rs/src/ops/ptir/`: PTIR DSL (typed builder API).
-- `crates/gpt-rs/src/ops/graph/`: graph arena + plan cache + optimizer hooks.
-- `crates/gpt-rs/src/backend/`: PTIR spec + backend hook points.
+- `crates/gpt-rs/src/tensor/`: `DeviceTensor` and its ops (`ops.rs`), each recording one PTIR op.
+- `crates/gpt-rs/src/ops/functional/`: portable kernels (validate, then record ops).
+- `crates/gpt-rs/src/ops/graph/`: graph arena + program cache.
+- `crates/gpt-rs/src/backend/`: the `PortableBackend` trait and the parameter store.
 - `crates/gpt-rs/src/nn/layers/`: layers built from functionals. Each layer is declared with
   `#[nn::module]` (`crates/gpt-rs-macros/src/nn_module.rs`) and built from checkpoint tensors
   through `nn::Params` (`nn/params.rs`). The `Module` and `Layer` traits live in
@@ -16,34 +16,31 @@ design docs; it just tells you "where to look".
 - `crates/gpt-rs/src/model/`: model configs and assemblies. `registry.rs` maps each checkpoint
   `kind` to its builder.
 - `crates/gpt-rs/src/inference/`: the shared causal decoder (`decoder.rs`), KV caches, generation
-  and sampling.
+  with sampling on the device (`generate.rs`), and the image models (`vision.rs`).
 - `crates/gpt-rs/src/runtime/`: checkpoint loading + model capability adapters.
+- `crates/gpt-rs-backends/`: the backends of a build, chosen by name (`load_model`).
 
 ## Core data flow (portable op)
 
 ```
-functional::foo(&x) / x.add(&y)       (#[functional], DeviceTensorOps)
+functional::foo(&x)                    (#[functional])
          |
          v
   validation macros (ensure_rank!, ensure_dtype!, ...)
          |
          v
-  capture!(|x| ...) --> GraphArena::capture --> PtirSession graph nodes
+  x.exp(), &x + &y, ...  --> GraphArena: one node per op, typed by the op's type rule
          |
          v
-  lazy DeviceTensor(s) (DeviceTensor::from_lazy, spec inferred from the arena)
+  lazy DeviceTensor (DeviceTensor::from_lazy)
 ```
 In practice:
-- layers call functionals and use `DeviceTensorOps` for elementwise math
-- functionals validate and capture PTIR
+- layers call functionals and use the ops of `DeviceTensor` for elementwise math
+- functionals validate, then record PTIR ops
 - the graph arena caches plans and runs the optimizer passes before backend execution
 
 ## Functional layer notes
 
-- `#[functional]` and `capture!` are documented on their definitions in
-  `crates/gpt-rs-macros/src/lib.rs`. The validation macros are documented in
-  `crates/gpt-rs/src/ops/functional/validate.rs`.
-- Each `#[functional]` also generates a pattern view, for example `GeluPattern` for `gelu` with the
-  target `gpt_rs.gelu`. Backends match these views with `OpRewritePattern<View>` and rewrite them to
-  faster kernels. See [backend_optimizer.md](backend_optimizer.md). `gpt-rs-cli patterns` lists the
-  views.
+- `#[functional]` is documented on its definition in `crates/gpt-rs-macros/src/lib.rs`. The
+  validation macros are documented in `crates/gpt-rs/src/ops/functional/validate.rs`.
+- Each `#[functional]` runs inside its own profiler scope, named after the function.

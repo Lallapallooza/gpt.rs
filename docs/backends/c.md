@@ -1,31 +1,33 @@
 # C backend (`gpt-rs-backend-c`)
 
-The C backend converts a PTIR `Program` into a **single C translation unit**, compiles it into a
-shared library, and executes the generated entrypoint.
+The C backend generates a **single C translation unit** from a function of the IR, compiles it into
+a shared library, and runs the generated entrypoint.
 
-This is useful as a "portable codegen" backend:
-- PTIR stays the portable source of truth (see [../backend.md](../backend.md)).
-- Backends can still run optimizer passes and fuse patterns before lowering to C.
-- Generated artifacts are cached on disk so repeated runs are fast.
+- The IR stays the portable source of truth (see [../ptir/tensor.md](../ptir/tensor.md)).
+- The backend's pipeline adds a pass that lays out GEMM weights for its kernels, and the backend
+  chooses its kernels as it generates C.
+- Compiled libraries are cached on disk by a fingerprint of their source, the compiler, its flags
+  and the host, so repeated runs are fast.
 
 Source of truth: [../../crates/gpt-rs-backend-c/src/lib.rs](../../crates/gpt-rs-backend-c/src/lib.rs).
 
 ## Data flow
 
 ```text
-PTIR Program
-  -> legality + buffer planning (static shapes/dtypes)
-  -> optimizer (backend pipeline)
-  -> PTIR -> C conversion (codegen)
+recorded module (`tensor` dialect)
+  -> `CBackend::pipeline`: the default passes, with `c-pack-weights` before the load-time passes
+  -> kernel selection, buffer planning (static shapes and dtypes) and C codegen
   -> write program_<fp>.c
   -> compile libgpt_rs_c_<fp>.(so|dylib|dll)
-  -> dlopen + call entrypoint(inputs, outputs)
+  -> dlopen + call gpt_rs_c_entry(inputs, outputs)
 ```
 
 Key entrypoints:
-- `CBackend::run_program`: convert + compile + execute.
-- `CConversionTarget::convert`: PTIR -> `ConvertedIr { module: String, entrypoints }`.
-- `CBackend::get_or_compile`: on-disk compile cache + `libloading` of the compiled module.
+- `CBackend::compile`: generate the C source, then load the library compiled from it.
+- `generate_c_module`: the C source of a function (`gpt-rs-cli convert` writes it to a file).
+- `get_or_compile`: the on-disk compile cache, and `libloading` of the compiled library.
+- `CBackend::run`: call the entrypoint on the input tensors and on output buffers, reused from
+  earlier runs when one is free (`OutputPool`).
 
 ## Single-file codegen
 
@@ -37,18 +39,46 @@ The generated module is intentionally self-contained:
 Code generation lives in:
 - [../../crates/gpt-rs-backend-c/src/codegen/mod.rs](../../crates/gpt-rs-backend-c/src/codegen/mod.rs)
 
-Before emission, the backend pipeline ([../../crates/gpt-rs-backend-c/src/optimizer/](../../crates/gpt-rs-backend-c/src/optimizer/))
-applies these rewrites, among others:
-- Linear bf16 weights: the legalize stage rewrites `dot_general(x: f32 [m, k], cast(w: bf16 [n, k]))`
-  into a backend-private custom call. Its kernel reads the bf16 weights and widens them in registers,
-  so no f32 copy of the weights exists. See
-  [optimizer/linear.rs](../../crates/gpt-rs-backend-c/src/optimizer/linear.rs). bf16 x bf16 dots
-  in linear layout stay plain `dot_general`. Codegen has no kernel for other dots with bf16 operands
-  and rejects them.
-- Elementwise fusion: each fused kernel starts from the last op of a chain and absorbs its
+`c-pack-weights` ([optimizer/pack.rs](../../crates/gpt-rs-backend-c/src/optimizer/pack.rs)) runs
+before `outline-static`. It rewrites an f32 `dot_general` that goes to the packed GEMM. A reshape
+and a transpose put its weight `w`, `[K, N]` or `[N, K]`, in the GEMM's panel layout
+`[N / 64, K, 64]`. The dot then contracts `x` with the panels into `[.., N / 64, 64]`, and a reshape
+gives that back as `[.., N]`. The `[KH * KW * C_in, C_out]` weight of a convolution, which
+`merge-contracted-axes` writes, gets the same layout.
+
+The pass packs only a static `w`, computed from parameters and constants only, whose packed form
+takes no more bytes than those parameters. So it leaves `w` unpacked when N is not a multiple of
+64, which would pad the panels with zeros, or when `w` widens a parameter of a narrower dtype. Other
+weights stay unpacked, and the GEMM packs them on each call, as it packs activations.
+
+At load time, `outline-static` computes the packed weight and stores it as a parameter. Its id is a
+hash of the load-time function, which names the ids of the parameters it reads, so each model gets
+its own packed weights.
+
+Codegen chooses the kernels ([codegen/select.rs](../../crates/gpt-rs-backend-c/src/codegen/select.rs)):
+- Convolution: a `dot_general` that contracts the last axis of `extract_patches` with a
+  `[KH * KW * C_in, C_out]` weight, packed or not, runs on the conv kernel, which builds the patches
+  tile by tile and never materializes them. The kernel also covers a bias add on the channel axis
+  that follows it. That add is a conv bias or a folded BatchNorm shift.
+- GEMM: `reads_panels` in [codegen/emit/dot.rs](../../crates/gpt-rs-backend-c/src/codegen/emit/dot.rs)
+  sends a `dot_general` over a panel weight to the packed GEMM.
+- Linear layers with bf16 or FP8 weights: `gpt_rs::ops::functional::linear_weight` matches a
+  `dot_general` in linear layout (`x [m, k] . w [n, k]`) whose weight operand is `cast(w)` or the
+  dequantized FP8 weight of `nn::Linear`, `cast(w) * broadcast_to(scale)`. The weight operand may
+  also be cast to the dtype of `x`. It runs on a linear kernel when `linear_kernel` in
+  [targets.rs](../../crates/gpt-rs-backend-c/src/targets.rs) has one for the dtypes of `x`, `w` and
+  the scale. The kernels read the weights in place and widen them as they multiply, so no f32 or
+  bf16 copy of a weight exists. The scaled kernels round each `w * scale` to the dtype of the scale,
+  as `transformers` dequantizes it, and then to the dtype of `x`. bf16 x bf16 dots, projections
+  included, run on the bf16 GEMM, which widens the panels it packs to f32. A single row of `x`
+  against a `[K, N]` weight reads the bf16 weight in place, without packing.
+- Elementwise fusion: each fused kernel starts from the last op of a chain and covers its
   single-use producers. The kernel reads `broadcast_to` and `slice` inputs in place and does not
-  materialise them. When the only user of a kernel is an f32 -> bf16 `cast`, the kernel writes bf16
+  materialize them. When the only user of a kernel is an f32 -> bf16 `cast`, the kernel writes bf16
   directly.
+
+An op that a kernel covers, such as the cast of a weight that a linear kernel reads in place, is
+emitted only when another emitted op reads it.
 
 Emission then outlines each op into a `static` function, with the operands renamed to parameters,
 and deduplicates identical bodies. This keeps compile times low for deep models that repeat the same
@@ -61,13 +91,14 @@ layers ([../../crates/gpt-rs-backend-c/src/codegen/outline.rs](../../crates/gpt-
   [../../crates/gpt-rs-backend-c/src/lib.rs](../../crates/gpt-rs-backend-c/src/lib.rs).
 - `dot_kernel` in [codegen/emit/dot.rs](../../crates/gpt-rs-backend-c/src/codegen/emit/dot.rs) sends
   each dot whose operands are both contiguous along K to
-  [kernels/linear.inc.c](../../crates/gpt-rs-backend-c/src/kernels/linear.inc.c). The exception is
-  an f32 dot with at least `LINEAR_PACK_MIN_ROWS` rows. It goes to the packed GEMM with every other
-  f32 dot, and the GEMM packing absorbs the operand strides.
+  [kernels/linear.inc.c](../../crates/gpt-rs-backend-c/src/kernels/linear.inc.c). The exceptions
+  are an f32 dot with at least `LINEAR_PACK_MIN_ROWS` rows and every bf16 x bf16 dot: they go to
+  the packed GEMM with every other f32 dot, and the GEMM packing absorbs the operand strides.
 - Threads: the default is one thread per physical core. Each entry call sets the team size to
-  `GPTRS_NUM_THREADS`. A team with one thread per SMT sibling stalls at every barrier whenever
-  another process is runnable. `OMP_NUM_THREADS` overrides the default.
-- Numerics: the build does not use `-ffast-math`. The vectorised `expf`, `logf`, `tanhf` and `erff`
+  `GPTRS_NUM_THREADS`, a define that the build computes from the physical core count. A team with
+  one thread per SMT sibling stalls at every barrier whenever another process is runnable. When
+  `OMP_NUM_THREADS` is set, the build leaves the define out and OpenMP's setting decides.
+- Numerics: the build does not use `-ffast-math`. The vectorized `expf`, `logf`, `tanhf` and `erff`
   come from glibc's libmvec. They are accurate to within 4 ulp, but not correctly rounded.
 
 ## On-disk cache
@@ -75,12 +106,16 @@ layers ([../../crates/gpt-rs-backend-c/src/codegen/outline.rs](../../crates/gpt-
 The cache directory defaults to a temp folder and can be overridden:
 - `GPTRS_C_CACHE_DIR=/path/to/dir`
 
-Artifacts (names are stable per converted program fingerprint):
+Artifacts (named by the fingerprint of the source, the compiler, its flags and the host):
 - `program_<fingerprint>.c`
 - `libgpt_rs_c_<fingerprint>.(so|dylib|dll)`
 
-See `c_cache_dir()` and `CBackend::get_or_compile()` in
+See `c_cache_dir()` and `get_or_compile()` in
 [../../crates/gpt-rs-backend-c/src/lib.rs](../../crates/gpt-rs-backend-c/src/lib.rs).
+
+A loaded module stays loaded until the process exits, and every `CBackend` in the process shares
+it. So the generated code keeps no data from one call to the next: the next call can come from
+another backend or model, with other values at the same addresses.
 
 ## Profiling (C backend)
 
@@ -91,12 +126,12 @@ counters into the usual profiler tables. Without the flag, the macros compile to
 - Enable: `GPTRS_PROFILE_BACKEND=1`
 - Implemented in: [../../crates/gpt-rs-backend-c/src/codegen/profile.rs](../../crates/gpt-rs-backend-c/src/codegen/profile.rs)
 
-## Limitations (current)
+## Limitations
 
-The C backend is strict today:
-- Requires **static shapes** and **known dtypes** (buffer planning rejects dynamic dims).
-- Accepts a limited dtype set for execution (see `c_legality_spec()`).
-- `execute_instruction` is not implemented; only `run_program` is supported.
+- Requires **static shapes** and whole-byte dtypes: f32, bf16, f8e4m3, si32, ui64 and i1 (`c_type`
+  in [codegen/utils.rs](../../crates/gpt-rs-backend-c/src/codegen/utils.rs)).
+- Draws only uniform f32 values (`tensor.rng_uniform`, the Philox stream of `random.inc.c`), and
+  searches (`argmax`, `top_k`) only f32 tensors, which covers sampling tokens from logits.
 
 ## Build / run
 

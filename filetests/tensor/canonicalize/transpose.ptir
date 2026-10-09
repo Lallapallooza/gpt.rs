@@ -1,0 +1,47 @@
+// RUN: pass canonicalize
+
+// Two transposes that compose to the identity disappear.
+// CHECK: func.func @inverse
+// CHECK-NOT: tensor.transpose
+// CHECK: func.return(%0)
+func.func @inverse(%0: tensor<2x3xf32>) -> tensor<2x3xf32> {
+  %1 = tensor.transpose(%0) {perm = [1, 0]} : (tensor<2x3xf32>) -> tensor<3x2xf32>
+  %2 = tensor.transpose(%1) {perm = [1, 0]} : (tensor<3x2xf32>) -> tensor<2x3xf32>
+  func.return(%2) : (tensor<2x3xf32>) -> ()
+}
+
+// -----
+
+// A chain becomes one transpose by the composed permutation q[i] = p1[p2[i]].
+// CHECK: func.func @chain
+// CHECK-NEXT: [[T:%[0-9]+]] = tensor.transpose(%0) {perm = [1, 2, 0]} : (tensor<2x3x4xf32>) -> tensor<3x4x2xf32>
+// CHECK-NEXT: func.return([[T]])
+func.func @chain(%0: tensor<2x3x4xf32>) -> tensor<3x4x2xf32> {
+  %1 = tensor.transpose(%0) {perm = [1, 0, 2]} : (tensor<2x3x4xf32>) -> tensor<3x2x4xf32>
+  %2 = tensor.transpose(%1) {perm = [0, 2, 1]} : (tensor<3x2x4xf32>) -> tensor<3x4x2xf32>
+  func.return(%2) : (tensor<3x4x2xf32>) -> ()
+}
+
+// -----
+
+// A chain collapses even when the inner transpose has another use, which keeps it.
+// CHECK: func.func @shared
+// CHECK: [[A:%[0-9]+]] = tensor.transpose(%0) {perm = [1, 0]}
+// CHECK: func.return(%0, [[A]])
+func.func @shared(%0: tensor<2x3xf32>) -> (tensor<2x3xf32>, tensor<3x2xf32>) {
+  %1 = tensor.transpose(%0) {perm = [1, 0]} : (tensor<2x3xf32>) -> tensor<3x2xf32>
+  %2 = tensor.transpose(%1) {perm = [1, 0]} : (tensor<3x2xf32>) -> tensor<2x3xf32>
+  func.return(%2, %1) : (tensor<2x3xf32>, tensor<3x2xf32>) -> ()
+}
+
+// -----
+
+// On a cube both composition orders type-check, so only the values tell them apart.
+// CHECK: func.func @cube
+// CHECK-NEXT: tensor.transpose(%0)
+// CHECK-NEXT: func.return
+func.func @cube(%0: tensor<3x3x3xf32>) -> tensor<3x3x3xf32> {
+  %1 = tensor.transpose(%0) {perm = [1, 0, 2]} : (tensor<3x3x3xf32>) -> tensor<3x3x3xf32>
+  %2 = tensor.transpose(%1) {perm = [0, 2, 1]} : (tensor<3x3x3xf32>) -> tensor<3x3x3xf32>
+  func.return(%2) : (tensor<3x3x3xf32>) -> ()
+}

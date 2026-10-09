@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use gpt_rs::inference::decoder::PREFILL_CHUNK;
 use gpt_rs::io::safetensors;
-use gpt_rs::tensor::{Shape, Tensor};
+use gpt_rs::tensor::HostTensor;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde_json::{json, Value};
@@ -166,10 +166,7 @@ fn write(prefix: &str, config: Value, tensors: &[(String, Vec<usize>)]) -> Resul
         .map(|(name, dims)| {
             let len = dims.iter().product();
             let data = (0..len).map(|_| rng.gen_range(-0.3..0.3)).collect();
-            Ok((
-                name.as_str(),
-                Tensor::from_vec(Shape::new(dims.clone()), data)?,
-            ))
+            Ok((name.as_str(), HostTensor::f32(dims.clone(), data)?))
         })
         .collect::<Result<Vec<_>>>()?;
     safetensors::save(

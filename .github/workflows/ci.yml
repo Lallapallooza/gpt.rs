@@ -55,3 +55,6 @@ jobs:
           cargo test --workspace
           --exclude gpt-rs-py
           --exclude gpt-rs-backend-c
+
+      - name: Run the profiler tests
+        run: cargo test -p gpt-rs --features profiler --test 'profiling*'

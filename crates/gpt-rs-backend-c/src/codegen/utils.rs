@@ -1,5 +1,5 @@
-use gpt_rs::backend::conversion::{ConversionError, ConversionResult};
-use gpt_rs::backend::spec::{DType, Dimension, Literal, TensorSpec};
+use anyhow::{anyhow, ensure, Result};
+use gpt_rs_ir::types::{DType, TensorType};
 
 pub(super) fn escape_c_string(input: &str) -> String {
     input
@@ -15,27 +15,17 @@ pub(super) fn escape_c_string(input: &str) -> String {
         .collect::<Vec<_>>()
         .join("")
 }
-pub(super) fn sizing_from_spec(spec: &TensorSpec) -> ConversionResult<(usize, usize)> {
-    let elem_count = spec
-        .shape
+/// The element count and the byte length of a tensor of type `ty`.
+pub(super) fn sizing(ty: &TensorType) -> Result<(usize, usize)> {
+    let elem_count = ty
         .element_count()
-        .ok_or_else(|| ConversionError::new("dynamic shape not supported"))?;
-    let byte_len = spec
-        .byte_len()
-        .ok_or_else(|| ConversionError::new("unknown dtype size"))?;
+        .ok_or_else(|| anyhow!("{ty} has a dynamic dimension"))?;
+    let byte_len = ty
+        .dtype
+        .size_in_bytes()
+        .and_then(|size| elem_count.checked_mul(size))
+        .ok_or_else(|| anyhow!("{ty} has no byte length"))?;
     Ok((elem_count, byte_len))
-}
-pub(super) fn dims_from_shape(spec: &TensorSpec) -> ConversionResult<Vec<i64>> {
-    let mut dims = Vec::with_capacity(spec.shape.rank());
-    for dim in spec.shape.dims() {
-        match dim {
-            Dimension::Static(value) => dims.push(*value as i64),
-            Dimension::Dynamic(_) => {
-                return Err(ConversionError::new("dynamic dimensions not supported"))
-            }
-        }
-    }
-    Ok(dims)
 }
 pub(super) fn emit_value_array(values: &[String]) -> String {
     values.join(", ")
@@ -56,31 +46,28 @@ pub(super) fn format_f32(value: f32) -> String {
         format!("{base}{suffix}")
     }
 }
-pub(super) fn c_type(dtype: DType) -> ConversionResult<&'static str> {
+pub(super) fn c_type(dtype: DType) -> Result<&'static str> {
     match dtype {
         DType::F32 => Ok("float"),
         DType::Si32 => Ok("int32_t"),
         DType::I1 => Ok("uint8_t"),
-        // bfloat16 values are carried as raw bit patterns.
+        // bfloat16 and float8_e4m3fn values are carried as raw bit patterns.
         DType::Bf16 => Ok("uint16_t"),
-        _ => Err(ConversionError::new("dtype not supported by C codegen")),
+        DType::F8E4M3 => Ok("uint8_t"),
+        DType::Ui64 => Ok("uint64_t"),
+        _ => Err(anyhow!("the C backend has no {dtype} tensors")),
     }
 }
 
 /// Validates the operands of pure data-movement ops. These ops copy elements through `c_type`
 /// pointers, so they work for any representable dtype when the input and output dtypes agree.
-pub(super) fn ensure_copy_dtypes(
-    op: &str,
-    inputs: &[DType],
-    output: DType,
-) -> ConversionResult<()> {
+pub(super) fn ensure_copy_dtypes(op: &str, inputs: &[DType], output: DType) -> Result<()> {
     c_type(output)?;
     for dtype in inputs {
-        if *dtype != output {
-            return Err(ConversionError::new(format!(
-                "{op} operands must match the output dtype ({output:?}), got {dtype:?}"
-            )));
-        }
+        ensure!(
+            *dtype == output,
+            "{op} operands must match the output dtype ({output}), got {dtype}"
+        );
     }
     Ok(())
 }
@@ -90,37 +77,15 @@ pub(super) fn emit_memcpy(module: &mut String, out: &str, input: &str, byte_len:
     }
     let block = format!(
         r#"
-            memcpy({out}, {input}, {byte_len});
+            gpt_rs_copy({out}, {input}, {byte_len});
         "#
     );
     push_block(module, 1, &block);
 }
-pub(super) fn dims_usize(spec: &TensorSpec) -> ConversionResult<Vec<usize>> {
-    let mut dims = Vec::with_capacity(spec.shape.rank());
-    for dim in spec.shape.dims() {
-        match dim {
-            Dimension::Static(value) => dims.push(*value),
-            Dimension::Dynamic(_) => {
-                return Err(ConversionError::new("dynamic dimensions not supported"))
-            }
-        }
-    }
-    Ok(dims)
-}
-pub(super) fn axis_index(axis: isize, rank: usize) -> ConversionResult<usize> {
-    let axis = if axis < 0 {
-        let shifted = rank as isize + axis;
-        if shifted < 0 {
-            return Err(ConversionError::new("invalid axis"));
-        }
-        shifted as usize
-    } else {
-        axis as usize
-    };
-    if axis >= rank {
-        return Err(ConversionError::new("axis out of range"));
-    }
-    Ok(axis)
+pub(super) fn dims_usize(ty: &TensorType) -> Result<Vec<usize>> {
+    ty.static_dims()
+        .map(|dims| dims.into_vec())
+        .ok_or_else(|| anyhow!("{ty} has a dynamic dimension"))
 }
 pub(super) fn linear_index_expr(dims: &[usize], indices: &[String]) -> String {
     if dims.is_empty() {
@@ -149,12 +114,12 @@ pub(super) fn omp_parallel_pragma(total: usize, collapse: usize) -> Option<Strin
     ))
 }
 
-// Threads also share long innermost loops, in chunks that are long enough to stay vectorised.
+// Threads also share long innermost loops, in chunks that are long enough to stay vectorized.
 const PARALLEL_INNER_CHUNK: usize = 2048;
 
 /// Like [`emit_loops_with_indices`], for loop nests whose iterations write distinct output
 /// elements, so they are safe to run concurrently. Never use it for reductions or scatters. The
-/// innermost loop is never collapsed, so the compiler can still vectorise it.
+/// innermost loop is never collapsed, so the compiler can still vectorize it.
 pub(super) fn emit_parallel_loops_with_indices<F>(
     module: &mut String,
     dims: &[usize],
@@ -307,14 +272,14 @@ pub(super) fn push_block(module: &mut String, indent: usize, block: &str) {
         }
     }
 }
-pub(super) fn literal_to_f32_scalar(value: &Literal) -> ConversionResult<f32> {
-    match value {
-        Literal::I1(v) => Ok(if *v { 1.0 } else { 0.0 }),
-        Literal::Signed(v) => Ok(*v as f32),
-        Literal::Unsigned(v) => Ok(*v as f32),
-        Literal::Float(v) => Ok(*v as f32),
-        Literal::Complex { .. } => {
-            Err(ConversionError::new("complex pad values are not supported"))
-        }
+
+/// Row-major strides of `dims`, in elements.
+pub(super) fn contiguous_strides(dims: &[usize]) -> Result<Vec<usize>> {
+    let mut strides = vec![1usize; dims.len()];
+    for axis in (0..dims.len().saturating_sub(1)).rev() {
+        strides[axis] = strides[axis + 1]
+            .checked_mul(dims[axis + 1])
+            .ok_or_else(|| anyhow!("a tensor of shape {dims:?} has too many elements"))?;
     }
+    Ok(strides)
 }

@@ -1,0 +1,7 @@
+// RUN: verify
+
+// ERROR: tensor.custom_call: the target is empty
+func.func @empty_target(%0: tensor<4xf32>) -> tensor<4xf32> {
+  %1 = tensor.custom_call(%0) {target = "", results = [tensor<4xf32>]} : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%1) : (tensor<4xf32>) -> ()
+}

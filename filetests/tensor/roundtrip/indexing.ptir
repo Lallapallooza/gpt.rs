@@ -1,0 +1,57 @@
+// RUN: roundtrip
+
+func.func @iota() -> (tensor<2x3xsi32>, tensor<{T}xf32>) {
+  %0 = tensor.iota() {shape = [2, 3], dtype = si32, axis = 1} : () -> tensor<2x3xsi32>
+  %1 = tensor.iota() {shape = [{T}], dtype = f32, axis = 0} : () -> tensor<{T}xf32>
+  func.return(%0, %1) : (tensor<2x3xsi32>, tensor<{T}xf32>) -> ()
+}
+
+// -----
+
+func.func @take(%0: tensor<50x8xf32> {param = 3}, %1: tensor<2x3xsi32>, %2: tensor<50x8xbf16>, %3: tensor<{B}xsi32>) -> (tensor<2x3x8xf32>, tensor<{B}x8xbf16>) {
+  %4 = tensor.take(%0, %1) : (tensor<50x8xf32>, tensor<2x3xsi32>) -> tensor<2x3x8xf32>
+  %5 = tensor.take(%2, %3) : (tensor<50x8xbf16>, tensor<{B}xsi32>) -> tensor<{B}x8xbf16>
+  func.return(%4, %5) : (tensor<2x3x8xf32>, tensor<{B}x8xbf16>) -> ()
+}
+
+// -----
+
+func.func @dynamic_slice(%0: tensor<4x8xf32>, %1: tensor<{S}x8xsi32>, %2: tensor<2xsi32>) -> (tensor<1x8xf32>, tensor<2x8xsi32>) {
+  %3 = tensor.dynamic_slice(%0, %2) {sizes = [1, 8]} : (tensor<4x8xf32>, tensor<2xsi32>) -> tensor<1x8xf32>
+  %4 = tensor.dynamic_slice(%1, %2) {sizes = [2, 8]} : (tensor<{S}x8xsi32>, tensor<2xsi32>) -> tensor<2x8xsi32>
+  func.return(%3, %4) : (tensor<1x8xf32>, tensor<2x8xsi32>) -> ()
+}
+
+// -----
+
+func.func @dynamic_update_slice(%0: tensor<2x16x4xf32>, %1: tensor<2x1x4xf32>, %2: tensor<3xsi32>, %3: tensor<2x{S}x4xf32>) -> (tensor<2x16x4xf32>, tensor<2x{S}x4xf32>) {
+  %4 = tensor.dynamic_update_slice(%0, %1, %2) : (tensor<2x16x4xf32>, tensor<2x1x4xf32>, tensor<3xsi32>) -> tensor<2x16x4xf32>
+  %5 = tensor.dynamic_update_slice(%3, %1, %2) : (tensor<2x{S}x4xf32>, tensor<2x1x4xf32>, tensor<3xsi32>) -> tensor<2x{S}x4xf32>
+  func.return(%4, %5) : (tensor<2x16x4xf32>, tensor<2x{S}x4xf32>) -> ()
+}
+
+// -----
+
+func.func @gather(%0: tensor<3x4xf32>, %1: tensor<3x2xsi32>, %2: tensor<5x4xsi32>) -> (tensor<3x2xf32>, tensor<5x4xf32>) {
+  %3 = tensor.gather(%0, %1) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>) -> tensor<3x2xf32>
+  %4 = tensor.gather(%0, %2) {axis = 0} : (tensor<3x4xf32>, tensor<5x4xsi32>) -> tensor<5x4xf32>
+  func.return(%3, %4) : (tensor<3x2xf32>, tensor<5x4xf32>) -> ()
+}
+
+// -----
+
+func.func @scatter(%0: tensor<3x4xf32>, %1: tensor<3x2xsi32>, %2: tensor<3x2xf32>) -> (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) {
+  %3 = tensor.scatter_add(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  %4 = tensor.scatter_max(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  %5 = tensor.scatter_min(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  %6 = tensor.scatter_replace(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  func.return(%3, %4, %5, %6) : (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) -> ()
+}
+
+// -----
+
+func.func @si64_indices(%0: tensor<50x8xf32>, %1: tensor<3xsi64>, %2: tensor<2xsi64>) -> (tensor<3x8xf32>, tensor<1x8xf32>) {
+  %3 = tensor.take(%0, %1) : (tensor<50x8xf32>, tensor<3xsi64>) -> tensor<3x8xf32>
+  %4 = tensor.dynamic_slice(%0, %2) {sizes = [1, 8]} : (tensor<50x8xf32>, tensor<2xsi64>) -> tensor<1x8xf32>
+  func.return(%3, %4) : (tensor<3x8xf32>, tensor<1x8xf32>) -> ()
+}

@@ -2,12 +2,10 @@
 //!
 //! [`RotaryEmbedding`] holds no parameters, so it is not a module.
 
-use std::sync::Arc;
-
 use anyhow::{ensure, Result};
 
-use crate::backend::spec::PortableBackend;
-use crate::tensor::{DeviceTensor, Shape, Tensor};
+use crate::backend::PortableBackend;
+use crate::tensor::{DType, DeviceTensor, HostTensor};
 
 /// Position scaling of the rotary frequencies: the `rope_type` of Hugging Face `rope_parameters`
 /// and its keys.
@@ -186,27 +184,22 @@ impl RotaryEmbedding {
         })
     }
 
-    /// `(cos, sin)` on `backend`, each `[len, rotary_dim / 2]`, for positions `start..start + len`.
+    /// The `(cos, sin)` tables of `positions` (`si32 [T]`), each `[T, rotary_dim / 2]`, computed
+    /// in the graph like Hugging Face does: `cos(position * inv_freq) * attention_scaling`, and
+    /// the same for `sin`.
+    #[track_caller]
     pub fn tables<B: PortableBackend + 'static>(
         &self,
-        backend: &Arc<B>,
-        start: usize,
-        len: usize,
-    ) -> Result<(DeviceTensor<B>, DeviceTensor<B>)> {
+        positions: &DeviceTensor<B>,
+    ) -> (DeviceTensor<B>, DeviceTensor<B>) {
         let half = self.inv_freq.len();
-        let mut cos = Vec::with_capacity(len * half);
-        let mut sin = Vec::with_capacity(len * half);
-        for pos in start..start + len {
-            for &inv_freq in &self.inv_freq {
-                let angle = pos as f32 * inv_freq;
-                cos.push(angle.cos() * self.attention_scaling);
-                sin.push(angle.sin() * self.attention_scaling);
-            }
+        let inv_freq = HostTensor::f32([1, half], self.inv_freq.clone()).expect("one row");
+        let inv_freq = DeviceTensor::constant(positions, &inv_freq);
+        let angles = positions.cast(DType::F32).reshape([positions.size(0), 1]) * inv_freq;
+        let (cos, sin) = (angles.cos(), angles.sin());
+        if self.attention_scaling == 1.0 {
+            return (cos, sin);
         }
-        let table = |data| {
-            let host = Tensor::from_vec(Shape::new([len, half]), data)?;
-            DeviceTensor::from_host(Arc::clone(backend), host)
-        };
-        Ok((table(cos)?, table(sin)?))
+        (cos * self.attention_scaling, sin * self.attention_scaling)
     }
 }

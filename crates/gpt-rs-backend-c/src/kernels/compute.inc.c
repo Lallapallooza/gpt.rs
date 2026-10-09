@@ -123,6 +123,9 @@ static inline void gpt_rs_compute_block(const float* apack, const float* b, size
 }
 
 /*
+ * Defines gpt_rs_gemv_SUFFIX_rows for operands of type T, read with the operand loader LOAD and
+ * widened one at a time with WIDEN.
+ *
  * One row of a (m == 1): c[j] = bias[j] + sum_p a[p * sak] * b[p * sbk + j] for j < nc, with b
  * contiguous along j.
  *
@@ -130,55 +133,62 @@ static inline void gpt_rs_compute_block(const float* apack, const float* b, size
  * over c and reads each row segment in address order. The caller passes at most GPTRS_GEMV_NC
  * columns, so c stays in L1.
  */
-static inline void gpt_rs_gemv_f32_rows(const float* a, size_t sak, const float* b, size_t sbk,
-                                        float* c, size_t nc, size_t k, const float* bias) {
-    const size_t full = nc / 16 * 16;
-    const __mmask16 tail = (__mmask16)gpt_rs_tail_mask(nc - full);
-    for (size_t j = 0; j < full; j += 16) {
-        _mm512_storeu_ps(c + j, bias ? _mm512_loadu_ps(bias + j) : _mm512_setzero_ps());
+#define GPTRS_DEFINE_GEMV_ROWS(SUFFIX, T, LOAD, WIDEN)                                        \
+    static inline void gpt_rs_gemv_##SUFFIX##_rows(const T* a, size_t sak, const T* b,        \
+                                                   size_t sbk, float* c, size_t nc, size_t k, \
+                                                   const float* bias) {                       \
+        const size_t full = nc / 16 * 16;                                                     \
+        const size_t left = nc - full;                                                        \
+        const __mmask16 tail = (__mmask16)gpt_rs_tail_mask(left);                             \
+        for (size_t j = 0; j < full; j += 16) {                                               \
+            _mm512_storeu_ps(c + j, bias ? _mm512_loadu_ps(bias + j) : _mm512_setzero_ps());  \
+        }                                                                                     \
+        if (tail) {                                                                           \
+            const __m512 init =                                                               \
+                bias ? _mm512_maskz_loadu_ps(tail, bias + full) : _mm512_setzero_ps();        \
+            _mm512_mask_storeu_ps(c + full, tail, init);                                      \
+        }                                                                                     \
+        size_t p = 0;                                                                         \
+        for (; p + 4 <= k; p += 4) {                                                          \
+            const __m512 a0 = _mm512_set1_ps(WIDEN(a[p * sak]));                              \
+            const __m512 a1 = _mm512_set1_ps(WIDEN(a[(p + 1) * sak]));                        \
+            const __m512 a2 = _mm512_set1_ps(WIDEN(a[(p + 2) * sak]));                        \
+            const __m512 a3 = _mm512_set1_ps(WIDEN(a[(p + 3) * sak]));                        \
+            const T* b0 = b + p * sbk;                                                        \
+            const T* b1 = b0 + sbk;                                                           \
+            const T* b2 = b1 + sbk;                                                           \
+            const T* b3 = b2 + sbk;                                                           \
+            for (size_t j = 0; j < full; j += 16) {                                           \
+                __m512 acc = _mm512_fmadd_ps(a0, LOAD(b0 + j), _mm512_loadu_ps(c + j));       \
+                acc = _mm512_fmadd_ps(a1, LOAD(b1 + j), acc);                                 \
+                acc = _mm512_fmadd_ps(a2, LOAD(b2 + j), acc);                                 \
+                acc = _mm512_fmadd_ps(a3, LOAD(b3 + j), acc);                                 \
+                _mm512_storeu_ps(c + j, acc);                                                 \
+            }                                                                                 \
+            if (tail) {                                                                       \
+                __m512 acc = _mm512_maskz_loadu_ps(tail, c + full);                           \
+                acc = _mm512_fmadd_ps(a0, LOAD##_tail(b0 + full, left), acc);                 \
+                acc = _mm512_fmadd_ps(a1, LOAD##_tail(b1 + full, left), acc);                 \
+                acc = _mm512_fmadd_ps(a2, LOAD##_tail(b2 + full, left), acc);                 \
+                acc = _mm512_fmadd_ps(a3, LOAD##_tail(b3 + full, left), acc);                 \
+                _mm512_mask_storeu_ps(c + full, tail, acc);                                   \
+            }                                                                                 \
+        }                                                                                     \
+        for (; p < k; ++p) {                                                                  \
+            const __m512 av = _mm512_set1_ps(WIDEN(a[p * sak]));                              \
+            const T* bp = b + p * sbk;                                                        \
+            for (size_t j = 0; j < full; j += 16) {                                           \
+                const __m512 acc = _mm512_fmadd_ps(av, LOAD(bp + j), _mm512_loadu_ps(c + j)); \
+                _mm512_storeu_ps(c + j, acc);                                                 \
+            }                                                                                 \
+            if (tail) {                                                                       \
+                const __m512 acc = _mm512_fmadd_ps(av, LOAD##_tail(bp + full, left),          \
+                                                   _mm512_maskz_loadu_ps(tail, c + full));    \
+                _mm512_mask_storeu_ps(c + full, tail, acc);                                   \
+            }                                                                                 \
+        }                                                                                     \
     }
-    if (tail) {
-        _mm512_mask_storeu_ps(c + full, tail,
-                              bias ? _mm512_maskz_loadu_ps(tail, bias + full) : _mm512_setzero_ps());
-    }
-    size_t p = 0;
-    for (; p + 4 <= k; p += 4) {
-        const __m512 a0 = _mm512_set1_ps(a[p * sak]);
-        const __m512 a1 = _mm512_set1_ps(a[(p + 1) * sak]);
-        const __m512 a2 = _mm512_set1_ps(a[(p + 2) * sak]);
-        const __m512 a3 = _mm512_set1_ps(a[(p + 3) * sak]);
-        const float* b0 = b + p * sbk;
-        const float* b1 = b0 + sbk;
-        const float* b2 = b1 + sbk;
-        const float* b3 = b2 + sbk;
-        for (size_t j = 0; j < full; j += 16) {
-            __m512 acc = _mm512_fmadd_ps(a0, _mm512_loadu_ps(b0 + j), _mm512_loadu_ps(c + j));
-            acc = _mm512_fmadd_ps(a1, _mm512_loadu_ps(b1 + j), acc);
-            acc = _mm512_fmadd_ps(a2, _mm512_loadu_ps(b2 + j), acc);
-            acc = _mm512_fmadd_ps(a3, _mm512_loadu_ps(b3 + j), acc);
-            _mm512_storeu_ps(c + j, acc);
-        }
-        if (tail) {
-            __m512 acc = _mm512_maskz_loadu_ps(tail, c + full);
-            acc = _mm512_fmadd_ps(a0, _mm512_maskz_loadu_ps(tail, b0 + full), acc);
-            acc = _mm512_fmadd_ps(a1, _mm512_maskz_loadu_ps(tail, b1 + full), acc);
-            acc = _mm512_fmadd_ps(a2, _mm512_maskz_loadu_ps(tail, b2 + full), acc);
-            acc = _mm512_fmadd_ps(a3, _mm512_maskz_loadu_ps(tail, b3 + full), acc);
-            _mm512_mask_storeu_ps(c + full, tail, acc);
-        }
-    }
-    for (; p < k; ++p) {
-        const __m512 av = _mm512_set1_ps(a[p * sak]);
-        const float* bp = b + p * sbk;
-        for (size_t j = 0; j < full; j += 16) {
-            _mm512_storeu_ps(c + j,
-                             _mm512_fmadd_ps(av, _mm512_loadu_ps(bp + j), _mm512_loadu_ps(c + j)));
-        }
-        if (tail) {
-            const __m512 acc = _mm512_fmadd_ps(av, _mm512_maskz_loadu_ps(tail, bp + full),
-                                               _mm512_maskz_loadu_ps(tail, c + full));
-            _mm512_mask_storeu_ps(c + full, tail, acc);
-        }
-    }
-}
+
+GPTRS_DEFINE_GEMV_ROWS(f32, float, gpt_rs_load_f32, gpt_rs_f32_to_f32)
+GPTRS_DEFINE_GEMV_ROWS(bf16, uint16_t, gpt_rs_load_bf16, gpt_rs_bf16_to_f32)
 #endif

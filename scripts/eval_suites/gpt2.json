@@ -9,8 +9,7 @@
     "threads": [1, 4],
     "params": {
       "generate_tokens": 0,
-      "bench_tokens": [1, 64],
-      "kv_cache": true
+      "bench_tokens": [1, 64]
     }
   },
   "runs": [

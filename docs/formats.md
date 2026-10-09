@@ -36,14 +36,22 @@ Source of truth is the code:
   - the text decoder's tensors, renamed from `model.language_model.` or `language_model.model.` to
     `model.`;
   - `lm_head.weight`.
-- 2-D float tensors (projection and embedding matrices) keep their stored dtype. Other float tensors
-  load as f32. FP8 (`F8_E4M3`) weights with a per-tensor `<name>_scale_inv` are dequantized to the
-  dtype of the scale, as `transformers` does. An FP8 scale of another shape is a load error. The
-  `activation_scale` tensors are not loaded. Tensors in dtypes the runtime does not have, such as
-  BatchNorm's int64 `num_batches_tracked`, are not loaded.
-- Tensors stored in their load dtype reach the backend as views of the memory-mapped file. A backend
-  that runs on host memory may use them without a copy (`PortableBackend::materialize_external`).
-  Converted tensors are copies.
+- 2-D tensors keep their stored dtype: the projection and embedding matrices, FP8 (`F8_E4M3`)
+  weights included. Other f16 and bf16 tensors load as f32, and tensors of every other dtype load
+  as stored.
+- An FP8 tensor that is not 2-D is a load error. An FP8 weight's scale, `<name>_scale_inv`, is per
+  tensor: a float of rank 0, which keeps its dtype. A scale of another rank or dtype is a load
+  error. The scale is a parameter of the weight's `nn::Linear`, whose weight is
+  `weight * weight_scale_inv` in the dtype of the scale, as `transformers` dequantizes it. Backends
+  with a linear kernel for it read the FP8 weight in place and dequantize it as they multiply. The
+  reference backend computes the dequantization as recorded.
+- The `activation_scale` tensors are not loaded, and complex tensors, a dtype the runtime does not
+  have, are skipped. A model uploads only the tensors it reads, so BatchNorm's
+  `num_batches_tracked` never reaches a backend.
+- Tensors stored in their load dtype reach the backend as views of the memory-mapped file, and
+  backends that run on host memory execute on those views (`PortableBackend::upload` of a
+  `HostTensor::view`): the weights stay in the OS page cache. Tensors that load as f32 from another
+  stored dtype are copies, and so are entries that the file does not align for their dtype.
 
 `load_model_with_options` also takes runtime settings and config overrides
 ([runtime.md](runtime.md)).
@@ -60,8 +68,10 @@ only Hugging Face names.
 
 The Rust modules mirror the Hugging Face modules, so parameter names are the module paths that
 `Module::visit_params` yields and match the checkpoint names (see "How tensors load"). `nn::Linear`
-is PyTorch's `nn.Linear`: `weight: [out_features, in_features]`, `y = x @ weight^T + bias`.
-`nn::Conv1D` is GPT-2's `Conv1D`: `weight: [in_features, out_features]`, `y = x @ weight + bias`.
+is PyTorch's `nn.Linear`: `weight: [out_features, in_features]`, `y = x @ weight^T + bias`. With
+`WeightLayout::InOut` it is GPT-2's `Conv1D`: `weight: [in_features, out_features]`,
+`y = x @ weight + bias`. A decoder family whose module names differ from the Llama family's names
+them in its `nn::DecoderNames`.
 The language-model head reuses the token embedding weight when `tie_word_embeddings` is true. When
 `config.json` omits the key, the default of the Hugging Face config class applies (true for
 `GPT2Config`).
@@ -104,22 +114,7 @@ The CLI reads vision inputs (`gpt-rs-cli forward --input ... --input-key input`)
 (`--out`) as safetensors, which `safetensors.numpy.load_file` and `safetensors.torch.load_file`
 read.
 
-## Parameter identity and streaming
+## Parameter identity
 
-Key ideas (see `crates/gpt-rs/src/params.rs`):
-
-- Parameters are identified by stable **names** (ASCII, dot-separated path) produced by `Module::visit_params`.
-- `BaseParamId(u128)` is a deterministic hash of the parameter name.
-- `ModelNamespaceId(u128)` is assigned at runtime so multiple models can coexist without collisions.
-- `ParamKey(u128)` is derived from `(namespace, base_id)` and becomes the stable id used for caching.
-
-Streaming path:
-
-- With weight streaming on (`LoadOptions.runtime.weight_streaming`),
-  `runtime::load_model_with_options` wraps checkpoint tensors as `DeviceTensor::lazy_param(...)`,
-  storing:
-  - `base_id` (for loading bytes) and
-  - `stable_id` (the `ParamKey`, used for caching and backend resolvers).
-- When a param is first needed, the tensor's `ParamSource<B>` loads it by `BaseParamId`.
-- Backends may expose a `ParamResolver` (`PortableBackend::param_resolver`) so optimized/derived parameter
-  representations (packed weights, layouts) can be memoized by stable id without changing model code.
+How parameters get their stable ids, and how backends key derived formats by them, is in
+[runtime.md](runtime.md#parameter-identity).

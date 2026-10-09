@@ -1,0 +1,21 @@
+[package]
+name = "gpt-rs-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The gpt.rs IR: dialects, text form, verifier, interpreter and rewrites."
+
+[dependencies]
+anyhow = { workspace = true }
+blake3 = "1.5"
+bytemuck = { version = "1", features = ["derive"] }
+gpt-rs-ir-macros = { path = "../gpt-rs-ir-macros", version = "0.1.0" }
+half = { version = "2.6", features = ["bytemuck"] }
+libm = "0.2"
+linkme = "0.3"
+smallvec = { workspace = true }
+
+[dev-dependencies]
+gpt-rs-filetests = { path = "../gpt-rs-filetests" }
+rand = { workspace = true }

@@ -8,8 +8,8 @@ use std::fmt::{self, Write as _};
 
 use anyhow::{ensure, Result};
 
-use crate::backend::spec::PortableBackend;
-use crate::tensor::{DeviceTensor, Shape, Tensor};
+use crate::backend::PortableBackend;
+use crate::tensor::{DeviceTensor, HostTensor};
 
 thread_local! {
     static CAPTURE: RefCell<Option<Capture>> = const { RefCell::new(None) };
@@ -22,6 +22,8 @@ struct Capture {
     /// Width and rows of each module's output, in first-recorded order. Every call appends its
     /// rows, one call per prompt chunk.
     outputs: Vec<(String, usize, Vec<f32>)>,
+    /// The first output that could not be read back. [`module_outputs`] returns it.
+    error: Option<anyhow::Error>,
 }
 
 fn capturing() -> bool {
@@ -30,7 +32,7 @@ fn capturing() -> bool {
 
 /// Runs `f` with capture enabled and returns its result with the recorded module outputs, each
 /// `[rows, width]`, in first-recorded order.
-pub fn module_outputs<T>(f: impl FnOnce() -> Result<T>) -> Result<(T, Vec<(String, Tensor)>)> {
+pub fn module_outputs<T>(f: impl FnOnce() -> Result<T>) -> Result<(T, Vec<(String, HostTensor)>)> {
     ensure!(!capturing(), "module output capture is already running");
     /// Ends the capture, also when `f` fails or panics.
     struct Stop;
@@ -42,39 +44,55 @@ pub fn module_outputs<T>(f: impl FnOnce() -> Result<T>) -> Result<(T, Vec<(Strin
     CAPTURE.set(Some(Capture::default()));
     let _stop = Stop;
     let value = f()?;
-    let outputs = CAPTURE
-        .take()
-        .unwrap_or_default()
+    let capture = CAPTURE.take().unwrap_or_default();
+    if let Some(error) = capture.error {
+        return Err(error.context("reading back a module output"));
+    }
+    let outputs = capture
         .outputs
         .into_iter()
         .map(|(name, width, rows)| {
-            let shape = Shape::new([rows.len() / width, width]);
-            Ok((name, Tensor::from_vec(shape, rows)?))
+            Ok((
+                name,
+                HostTensor::f32(vec![rows.len() / width, width], rows)?,
+            ))
         })
         .collect::<Result<_>>()?;
     Ok((value, outputs))
 }
 
-/// Records `output` (`[rows, width]`) as the output of module `name` in the enclosing scope.
-pub fn record<B: PortableBackend + 'static>(name: &str, output: &DeviceTensor<B>) -> Result<()> {
-    if !capturing() {
-        return Ok(());
-    }
+/// The width and the rows of `output` (`[rows, width]`), read back to the host.
+fn read<B: PortableBackend + 'static>(output: &DeviceTensor<B>) -> Result<(usize, Vec<f32>)> {
     let host = output.to_host()?;
-    let width = host.shape().dims().last().copied().unwrap_or(1).max(1);
+    let width = host.dims.last().copied().unwrap_or(1).max(1);
+    Ok((width, host.as_f32()?.to_vec()))
+}
+
+/// Records `output` (`[rows, width]`) as the output of module `name` in the enclosing scope.
+pub fn record<B: PortableBackend + 'static>(name: &str, output: &DeviceTensor<B>) {
+    if !capturing() {
+        return;
+    }
+    let read = read(output);
     CAPTURE.with_borrow_mut(|capture| {
         let Some(capture) = capture else { return };
+        let (width, values) = match read {
+            Ok(read) => read,
+            Err(error) => {
+                capture.error.get_or_insert(error);
+                return;
+            }
+        };
         let mut path = capture.path.clone();
         if !path.is_empty() && !name.is_empty() {
             path.push('.');
         }
         path.push_str(name);
         match capture.outputs.iter_mut().find(|(seen, ..)| *seen == path) {
-            Some((_, _, rows)) => rows.extend_from_slice(host.data()),
-            None => capture.outputs.push((path, width, host.data().to_vec())),
+            Some((_, _, rows)) => rows.extend_from_slice(&values),
+            None => capture.outputs.push((path, width, values)),
         }
     });
-    Ok(())
 }
 
 /// Prefixes module `name` to the names recorded until the returned guard drops.
@@ -99,7 +117,7 @@ pub struct Scope {
 
 impl Scope {
     /// Records `output` as the output of the scope's own module.
-    pub fn record<B: PortableBackend + 'static>(&self, output: &DeviceTensor<B>) -> Result<()> {
+    pub fn record<B: PortableBackend + 'static>(&self, output: &DeviceTensor<B>) {
         record("", output)
     }
 }

@@ -48,6 +48,12 @@ repos:
         language: system
         types: [rust]
         pass_filenames: false
+      - id: ptir-docs
+        name: docs/ptir matches the code
+        entry: cargo run -q -p gpt-rs-docs -- --check
+        language: system
+        files: '\.(rs|ptir)$|^crates/gpt-rs-ir/src/(dialects/tensor|passes)/README\.md$|^docs/ptir/'
+        pass_filenames: false
   - repo: https://github.com/commitizen-tools/commitizen
     rev: v4.9.1
     hooks:

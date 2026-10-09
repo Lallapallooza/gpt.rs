@@ -1,9 +1,8 @@
 //! Parameter-free elementwise activations, named as in Hugging Face configs.
 
-use crate::backend::spec::PortableBackend;
+use crate::backend::PortableBackend;
 use crate::nn;
 use crate::ops::functional;
-use anyhow::Result;
 
 /// Activation function, serialized with its Hugging Face name (`hidden_act`,
 /// `activation_function`).
@@ -21,6 +20,9 @@ pub enum ActivationFunction {
     /// `min(max(x, 0), 6)`.
     #[serde(rename = "relu6")]
     Relu6,
+    /// `x * sigmoid(x)`.
+    #[serde(rename = "silu", alias = "swish")]
+    Silu,
 }
 
 impl ActivationFunction {
@@ -31,6 +33,7 @@ impl ActivationFunction {
             ActivationFunction::GeluTanh => functional::gelu_tanh,
             ActivationFunction::Relu => functional::relu,
             ActivationFunction::Relu6 => functional::relu6,
+            ActivationFunction::Silu => functional::silu,
         };
         Activation { function }
     }
@@ -40,12 +43,12 @@ impl ActivationFunction {
 #[nn::module]
 pub struct Activation {
     #[module(config)]
-    function: fn(&Tensor) -> Result<Tensor>,
+    function: fn(&Tensor) -> Tensor,
 }
 
 #[nn::module]
 impl Activation {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> Tensor {
         (self.function)(x)
     }
 }

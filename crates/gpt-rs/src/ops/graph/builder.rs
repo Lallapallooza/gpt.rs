@@ -1,20 +1,32 @@
-//! Mutable builder used to stage operations inside a [`GraphArena`](super::arena::GraphArena).
+//! Mutable builder that records operations in a [`GraphArena`](super::arena::GraphArena).
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::ops::Range;
+use std::sync::{Arc, OnceLock};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
+use gpt_rs_ir::dense::Dense;
+use gpt_rs_ir::dialects::tensor::{BroadcastTo, Constant};
+use gpt_rs_ir::module::Module;
+use gpt_rs_ir::op::{InOp, OpDyn};
+use gpt_rs_ir::types::{DType, Dim, TensorType, Type};
+use smallvec::SmallVec;
 
-use crate::backend::spec::{Operand, Operation, PortableBackend, TensorSpec, ValueId, ValueType};
-use crate::backend::text_ir::{PtirSnippet, SnippetBindings, SnippetResult};
-use crate::tensor::{DeviceTensor, InputRole, LazyHandle};
+use crate::backend::PortableBackend;
+use crate::ops::graph::ValueId;
+use crate::tensor::{DeviceTensor, LazyHandle, Materialized};
 
 use super::arena::GraphArena;
-use super::state::{GraphInner, NodeRecord, NodeState, ParamSourceRecord, ParameterRecord};
+use super::state::{GraphInner, NodeState, OpRecord, ScalarKey, ValueDef, ValueRecord};
 
-/// Context passed to graph capture closures for importing tensors and emitting nodes.
-pub struct GraphBuilder<'a, B: PortableBackend + 'static> {
-    pub(super) arena: Arc<GraphArena<B>>,
+/// An empty module. The type rules of ops without regions take a module but read none of it.
+fn empty_module() -> &'static Module {
+    static EMPTY: OnceLock<Module> = OnceLock::new();
+    EMPTY.get_or_init(Module::new)
+}
+
+/// Records ops into a [`GraphArena`]: imports tensors and emits nodes.
+pub(crate) struct GraphBuilder<'a, B: PortableBackend + 'static> {
+    pub(super) arena: &'a Arc<GraphArena<B>>,
     pub(super) inner: &'a mut GraphInner<B>,
 }
 
@@ -22,228 +34,116 @@ impl<'a, B: PortableBackend + 'static> GraphBuilder<'a, B> {
     /// Imports a tensor into the graph, returning the associated value identifier.
     /// Existing handles are reused so repeated captures share parameters.
     pub fn import(&mut self, tensor: &DeviceTensor<B>) -> Result<ValueId> {
-        match &**tensor.lazy_handle() {
-            LazyHandle::Input { .. } => {
-                let role = tensor
-                    .lazy_handle()
-                    .role()
-                    .ok_or_else(|| anyhow!("input handle missing role"))?;
-                let stable_id = tensor
-                    .lazy_handle()
-                    .id()
-                    .ok_or_else(|| anyhow!("input handle missing stable id"))?;
-                let key = (role, stable_id);
-
-                if let Some(existing) = self.inner.parameter_lookup.get(&key) {
-                    return Ok(*existing);
+        match tensor.lazy_handle() {
+            LazyHandle::Input(input) => {
+                let key = (input.role, input.id);
+                if let Some(&existing) = self.inner.inputs.get(&key) {
+                    return Ok(existing);
                 }
-
-                let handle = tensor.materialize()?;
-                let value = self.allocate_value();
-                let spec = tensor.tensor_spec();
-                if role == InputRole::Param {
-                    self.arena.param_resolver.set(stable_id, handle.clone());
-                }
-                self.inner.push_parameter(ParameterRecord {
-                    value,
-                    spec,
-                    handle: Some(handle),
-                    role,
-                    stable_id: Some(stable_id),
-                });
-                self.inner.parameter_lookup.insert(key, value);
+                let value = self
+                    .inner
+                    .push_value(tensor.tensor_type(), ValueDef::Input(Arc::clone(input)));
+                self.inner.inputs.insert(key, value);
                 self.inner.bump_version();
                 Ok(value)
             }
-            LazyHandle::Param {
-                base_id, source, ..
-            } => {
-                let stable_id = tensor
-                    .lazy_handle()
-                    .id()
-                    .ok_or_else(|| anyhow!("param handle missing stable id"))?;
-                let key = (InputRole::Param, stable_id);
-
-                if let Some(existing) = self.inner.parameter_lookup.get(&key) {
-                    return Ok(*existing);
-                }
-
-                let value = self.allocate_value();
-                let spec = tensor.tensor_spec();
-                self.inner.param_sources.insert(
-                    stable_id,
-                    ParamSourceRecord {
-                        base_id: *base_id,
-                        source: Arc::clone(source),
-                    },
-                );
-                self.inner.push_parameter(ParameterRecord {
-                    value,
-                    spec,
-                    handle: None,
-                    role: InputRole::Param,
-                    stable_id: Some(stable_id),
-                });
-                self.inner.parameter_lookup.insert(key, value);
+            LazyHandle::Node { graph, value } if Arc::ptr_eq(graph, self.arena) => Ok(*value),
+            LazyHandle::Node { .. } => {
+                let input = Materialized::arg(tensor.materialize()?);
+                let value = self
+                    .inner
+                    .push_value(tensor.tensor_type(), ValueDef::Input(input));
                 self.inner.bump_version();
                 Ok(value)
-            }
-            LazyHandle::Node { graph, value } => {
-                if Arc::ptr_eq(graph, &self.arena) {
-                    Ok(*value)
-                } else {
-                    let handle = tensor.materialize()?;
-                    let value_id = self.allocate_value();
-                    let spec = tensor.tensor_spec();
-                    self.inner.push_parameter(ParameterRecord {
-                        value: value_id,
-                        spec,
-                        handle: Some(handle),
-                        role: InputRole::Arg,
-                        stable_id: None,
-                    });
-                    self.inner.bump_version();
-                    Ok(value_id)
-                }
             }
         }
     }
 
-    /// Emits a new operation node and returns its output value identifier.
-    /// The builder records insertion order to preserve dependencies during flushing.
-    pub fn emit(&mut self, op: Operation, operands: Vec<Operand>, spec: TensorSpec) -> ValueId {
-        let value = self.allocate_value();
-        crate::backend::pattern::record_node(value, &op, &operands);
-        self.inner.nodes.insert(
-            value,
-            NodeRecord {
-                op,
-                operands,
-                spec,
+    /// The tensor of extents `dims` whose every element has the little-endian bytes `element` of
+    /// `dtype`: a rank-0 constant, broadcast to `dims`. A graph records each scalar, and each
+    /// broadcast of it, once and reuses them while they are pending.
+    pub fn scalar(&mut self, dtype: DType, element: &[u8], dims: &[usize]) -> Result<ValueId> {
+        let mut bits = [0u8; 8];
+        bits[..element.len()].copy_from_slice(element);
+        let bits = u64::from_le_bytes(bits);
+        let constant = match self.pending_scalar(&(dtype, bits, SmallVec::new())) {
+            Some(constant) => constant,
+            None => {
+                let value = Dense::splat(dtype, [], element);
+                let constant = ValueId(self.emit(Constant { value }, &[])?.start);
+                self.inner
+                    .scalars
+                    .insert((dtype, bits, SmallVec::new()), constant);
+                constant
+            }
+        };
+        if dims.is_empty() {
+            return Ok(constant);
+        }
+        let key = (dtype, bits, SmallVec::from_slice(dims));
+        if let Some(value) = self.pending_scalar(&key) {
+            return Ok(value);
+        }
+        let shape = dims.iter().map(|&dim| Dim::Static(dim)).collect();
+        let value = ValueId(self.emit(BroadcastTo { shape }, &[constant])?.start);
+        self.inner.scalars.insert(key, value);
+        Ok(value)
+    }
+
+    /// The scalar of `key` that this graph recorded, while it is pending.
+    fn pending_scalar(&self, key: &ScalarKey) -> Option<ValueId> {
+        let &value = self.inner.scalars.get(key)?;
+        let record = self.inner.values.get(value.0 as usize)?;
+        matches!(
+            record.def,
+            ValueDef::Node {
                 state: NodeState::Pending,
-            },
-        );
-        self.inner.order.push(value);
-        self.inner.bump_version();
-        value
-    }
-
-    /// Returns the arena backing the builder.
-    /// This lets callers spawn additional captures or force eager materialisation.
-    pub fn arena(&self) -> Arc<GraphArena<B>> {
-        Arc::clone(&self.arena)
-    }
-
-    /// Marks a value identifier as an exported graph output so future materialisations
-    /// surface the handle without additional compilation.
-    pub fn export(&mut self, value: ValueId) {
-        self.inner.exports.insert(value);
-    }
-
-    /// Removes a value identifier from the exported set if it no longer needs to be surfaced.
-    pub fn unexport(&mut self, value: ValueId) {
-        self.inner.exports.remove(&value);
-    }
-
-    /// Emits a reusable PTIR snippet using the supplied bindings, returning the produced values.
-    pub fn emit_snippet(
-        &mut self,
-        snippet: PtirSnippet,
-        bindings: &SnippetBindings,
-    ) -> Result<SnippetResult> {
-        let parsed = snippet
-            .instantiate(bindings)
-            .map_err(|err| anyhow!(err.to_string()))?;
-
-        let function = parsed
-            .program
-            .functions
-            .first()
-            .ok_or_else(|| anyhow!("snippet must define at least one function"))?;
-
-        let mut id_map: HashMap<ValueId, ValueId> = HashMap::new();
-        for (name, actual) in bindings.bound_values() {
-            let snippet_id = parsed
-                .value_names
-                .get(name)
-                .copied()
-                .ok_or_else(|| anyhow!("snippet does not declare value `{name}`"))?;
-            id_map.insert(snippet_id, actual);
-        }
-
-        for param_id in &function.parameter_ids {
-            if !id_map.contains_key(param_id) {
-                let name = parsed
-                    .value_names
-                    .iter()
-                    .find_map(|(key, value)| if value == param_id { Some(key) } else { None })
-                    .map(|s| s.as_str())
-                    .unwrap_or("<unnamed>");
-                return Err(anyhow!("missing snippet binding for parameter `%{name}`"));
+                ..
             }
-        }
-
-        for instruction in &function.body {
-            let mapped_operands = instruction
-                .operands
-                .iter()
-                .map(|operand| match operand {
-                    Operand::Value(value) => id_map
-                        .get(value)
-                        .copied()
-                        .map(Operand::Value)
-                        .ok_or_else(|| anyhow!("snippet references unknown value id {:?}", value)),
-                    Operand::TupleElement { tuple, index } => id_map
-                        .get(tuple)
-                        .copied()
-                        .map(|mapped| Operand::TupleElement {
-                            tuple: mapped,
-                            index: *index,
-                        })
-                        .ok_or_else(|| anyhow!("snippet references unknown tuple id {:?}", tuple)),
-                    Operand::Literal(lit) => Ok(Operand::Literal(lit.clone())),
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            let spec = match &instruction.output {
-                ValueType::Tensor(spec) => spec.clone(),
-                _ => {
-                    return Err(anyhow!(
-                        "non-tensor snippet outputs are not supported in graph capture"
-                    ))
-                }
-            };
-
-            let new_id = self.emit(instruction.op.clone(), mapped_operands, spec);
-            id_map.insert(instruction.id, new_id);
-        }
-
-        let mut results = Vec::with_capacity(function.result_ids.len());
-        let mut result_specs = Vec::with_capacity(function.result_ids.len());
-        for (result_id, value_type) in function.result_ids.iter().zip(function.results.iter()) {
-            let mapped = id_map
-                .get(result_id)
-                .copied()
-                .ok_or_else(|| anyhow!("snippet result id {:?} missing mapping", result_id))?;
-            let spec = match value_type {
-                ValueType::Tensor(spec) => spec.clone(),
-                other => {
-                    return Err(anyhow!(
-                        "snippet result type {:?} is not supported in graph capture",
-                        other
-                    ))
-                }
-            };
-            results.push(mapped);
-            result_specs.push(spec);
-        }
-
-        Ok(SnippetResult::new(results, result_specs))
+        )
+        .then_some(value)
     }
 
-    fn allocate_value(&mut self) -> ValueId {
-        let value = ValueId(self.inner.next_value);
-        self.inner.next_value += 1;
-        value
+    /// The type of the captured value `value`.
+    pub fn type_of(&self, value: ValueId) -> Result<&TensorType> {
+        Ok(self.inner.value(value)?.tensor_type())
+    }
+
+    /// Records `op` applied to `operands` and returns the ids of its results, which are
+    /// consecutive. Their types come from the op's type rule, which rejects operands the op does
+    /// not accept.
+    pub fn emit<T: InOp + OpDyn>(&mut self, op: T, operands: &[ValueId]) -> Result<Range<u32>> {
+        let results = {
+            let mut types = SmallVec::<[&Type; 4]>::new();
+            for &operand in operands {
+                types.push(&self.inner.value(operand)?.ty);
+            }
+            let (results, _) = op
+                .dyn_result_types(&types, None, &[], empty_module())
+                .map_err(|err| anyhow!("{}: {err:#}", op.name()))?;
+            results
+        };
+        if results.iter().any(|ty| ty.as_tensor().is_none()) {
+            bail!("{} gives a result that is no tensor", op.name());
+        }
+        let index = self.inner.ops.len() as u32;
+        let first = self.inner.values.len() as u32;
+        let start = self.inner.operands.len() as u32;
+        self.inner.operands.extend_from_slice(operands);
+        for (result, ty) in results.into_iter().enumerate() {
+            let def = ValueDef::Node {
+                op: index,
+                result: result as u32,
+                state: NodeState::Pending,
+            };
+            self.inner.values.push(ValueRecord { ty, def });
+        }
+        self.inner.ops.push(OpRecord {
+            op: op.into(),
+            operands: (start, self.inner.operands.len() as u32),
+            first: ValueId(first),
+        });
+        self.inner.bump_version();
+        Ok(first..self.inner.values.len() as u32)
     }
 }

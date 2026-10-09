@@ -59,9 +59,14 @@ pub fn profiling_reset() -> PyResult<()> {
     Ok(())
 }
 
+/// Takes the recorded profile, which resets it, as its tables and its report JSON. The JSON is
+/// indented when `pretty` is true. `None` without a recorded profile or a `profiler` build.
 #[pyfunction]
-pub fn profiling_take_report() -> PyResult<Option<String>> {
-    Ok(gpt_rs::profiling::take_formatted_tables())
+#[pyo3(signature = (pretty = false))]
+pub fn profiling_take_report(pretty: bool) -> PyResult<Option<(String, String)>> {
+    let options = gpt_rs::profiling::ProfileFormatOptions::default();
+    Ok(gpt_rs::profiling::take_snapshot(pretty, &options)
+        .map(|snapshot| (snapshot.formatted, snapshot.report_json)))
 }
 
 #[pyfunction]
@@ -73,24 +78,6 @@ pub fn profiling_push_section(name: String) -> PyResult<()> {
 #[pyfunction]
 pub fn profiling_pop_section() -> PyResult<bool> {
     Ok(gpt_rs::profiling::pop_section())
-}
-
-#[pyfunction]
-#[pyo3(signature = (pretty = true))]
-pub fn profiling_take_report_bundle(pretty: bool) -> PyResult<Option<(String, String)>> {
-    Ok(gpt_rs::profiling::take_formatted_tables_and_report_json(
-        pretty,
-    ))
-}
-
-#[pyfunction]
-#[pyo3(signature = (pretty = false))]
-pub fn profiling_take_report_json(pretty: bool) -> PyResult<Option<String>> {
-    if pretty {
-        Ok(gpt_rs::profiling::take_report_json_pretty())
-    } else {
-        Ok(gpt_rs::profiling::take_report_json())
-    }
 }
 
 #[pyfunction]
@@ -114,9 +101,5 @@ pub fn profiling_trace_reset() -> PyResult<()> {
 #[pyfunction]
 #[pyo3(signature = (pretty = false))]
 pub fn profiling_take_trace_json(pretty: bool) -> PyResult<Option<String>> {
-    if pretty {
-        Ok(gpt_rs::profiling::take_trace_json_pretty())
-    } else {
-        Ok(gpt_rs::profiling::take_trace_json())
-    }
+    Ok(gpt_rs::profiling::take_trace_json(pretty))
 }

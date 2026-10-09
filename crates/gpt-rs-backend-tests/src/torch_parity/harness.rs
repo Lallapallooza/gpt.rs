@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -7,19 +7,18 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::process;
 use std::sync::{Arc, Mutex, Once, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
-use gpt_rs::backend::optimizer::{OptimizeContext, Optimizer, PassResult};
-use gpt_rs::backend::spec::{Function, PortableBackend};
-use gpt_rs::ops::graph::{context::with_default_arena, CachePolicy, GraphArena};
+use gpt_rs::backend::PortableBackend;
+use gpt_rs::gpt_rs_ir::module::Module;
+use gpt_rs::ops::graph::{context::with_default_arena, GraphArena};
+use gpt_rs::ops::trace::{self, ExecutionTraceSink, ProgramContext, ProgramStats, TraceGuard};
 
 use super::common;
-
-const BASELINE_CACHE_CAPACITY: usize = 64;
 
 #[derive(Default, Clone, Copy)]
 struct RunDurations {
@@ -35,8 +34,7 @@ thread_local! {
 struct TableRow {
     backend: String,
     test_name: String,
-    baseline_ms: f64,
-    optimized_ms: f64,
+    gpt_ms: f64,
     torch_ms: f64,
     status: String,
 }
@@ -110,7 +108,7 @@ fn print_table(rows: &[TableRow]) {
     struct PivotRow {
         torch_ms: f64,
         status: String,
-        cells: HashMap<String, (f64, f64, String)>,
+        cells: HashMap<String, (f64, String)>,
     }
 
     let mut backends_set: HashSet<String> = HashSet::new();
@@ -135,18 +133,17 @@ fn print_table(rows: &[TableRow]) {
         if row.torch_ms.is_finite() {
             entry.torch_ms = row.torch_ms;
         }
-        entry.cells.insert(
-            row.backend.clone(),
-            (row.baseline_ms, row.optimized_ms, row.status.clone()),
-        );
+        entry
+            .cells
+            .insert(row.backend.clone(), (row.gpt_ms, row.status.clone()));
     }
 
     for entry in by_test.values_mut() {
         let mut failed = false;
         for backend in &backends {
             match entry.cells.get(backend) {
-                Some((baseline, optimized, status)) => {
-                    if !baseline.is_finite() || !optimized.is_finite() || status != "ok" {
+                Some((gpt_ms, status)) => {
+                    if !gpt_ms.is_finite() || status != "ok" {
                         failed = true;
                     }
                 }
@@ -234,32 +231,24 @@ fn print_table(rows: &[TableRow]) {
         align: Align::Center,
     });
 
-    let mut backend_cols: Vec<(String, usize, String, usize)> = Vec::new();
+    let mut backend_cols: Vec<(String, usize)> = Vec::new();
     for backend in &backends {
-        let opt_name = format!("{backend}-opt");
-        let mut base_w = backend.len().max(3);
-        let mut opt_w = opt_name.len().max(3);
+        let mut width = backend.len().max(3);
         for entry in by_test.values() {
-            let (baseline, optimized) = entry
+            let gpt_ms = entry
                 .cells
                 .get(backend)
-                .map(|(b, o, _)| (*b, *o))
-                .unwrap_or((f64::NAN, f64::NAN));
-            base_w = base_w.max(format_ms(baseline).len());
-            opt_w = opt_w.max(format_ms(optimized).len());
+                .map(|(ms, _)| *ms)
+                .unwrap_or(f64::NAN);
+            width = width.max(format_ms(gpt_ms).len());
         }
-        backend_cols.push((backend.clone(), base_w, opt_name, opt_w));
+        backend_cols.push((backend.clone(), width));
     }
 
-    for (backend, base_w, opt_name, opt_w) in &backend_cols {
+    for (backend, width) in &backend_cols {
         cols.push(Col {
             header: backend.clone(),
-            width: *base_w,
-            align: Align::Right,
-        });
-        cols.push(Col {
-            header: opt_name.clone(),
-            width: *opt_w,
+            width: *width,
             align: Align::Right,
         });
     }
@@ -284,14 +273,13 @@ fn print_table(rows: &[TableRow]) {
             Align::Right,
         ));
         cells.push(format_cell(&entry.status, status_width, Align::Center));
-        for (backend, base_w, _opt_name, opt_w) in &backend_cols {
-            let (baseline, optimized) = entry
+        for (backend, width) in &backend_cols {
+            let gpt_ms = entry
                 .cells
                 .get(backend)
-                .map(|(b, o, _)| (*b, *o))
-                .unwrap_or((f64::NAN, f64::NAN));
-            cells.push(format_cell(&format_ms(baseline), *base_w, Align::Right));
-            cells.push(format_cell(&format_ms(optimized), *opt_w, Align::Right));
+                .map(|(ms, _)| *ms)
+                .unwrap_or(f64::NAN);
+            cells.push(format_cell(&format_ms(gpt_ms), *width, Align::Right));
         }
         println!("| {} |", cells.join(" | "));
     }
@@ -339,13 +327,8 @@ impl TableAggregator {
         for row in rows {
             writeln!(
                 file,
-                "{}\t{}\t{}\t{}\t{}\t{}",
-                row.backend,
-                row.test_name,
-                row.baseline_ms,
-                row.optimized_ms,
-                row.torch_ms,
-                row.status
+                "{}\t{}\t{}\t{}\t{}",
+                row.backend, row.test_name, row.gpt_ms, row.torch_ms, row.status
             )?;
         }
         Ok(())
@@ -431,18 +414,16 @@ impl TableAggregator {
 }
 
 fn parse_row_line(line: &str) -> Option<TableRow> {
-    let mut parts = line.splitn(6, '\t');
+    let mut parts = line.splitn(5, '\t');
     let backend = parts.next()?.to_string();
     let test_name = parts.next()?.to_string();
-    let baseline_ms = parts.next()?.parse::<f64>().ok()?;
-    let optimized_ms = parts.next()?.parse::<f64>().ok()?;
+    let gpt_ms = parts.next()?.parse::<f64>().ok()?;
     let torch_ms = parts.next()?.parse::<f64>().ok()?;
     let status = parts.next()?.to_string();
     Some(TableRow {
         backend,
         test_name,
-        baseline_ms,
-        optimized_ms,
+        gpt_ms,
         torch_ms,
         status,
     })
@@ -460,11 +441,7 @@ fn expected_backends() -> Vec<String> {
             return backends;
         }
     }
-    vec![
-        "c".to_string(),
-        "cpu-portable".to_string(),
-        "faer".to_string(),
-    ]
+    vec!["c".to_string(), "ref-cpu".to_string(), "faer".to_string()]
 }
 
 fn expected_backends_present(rows: &[TableRow]) -> bool {
@@ -476,38 +453,6 @@ fn expected_backends_present(rows: &[TableRow]) -> bool {
     expected
         .iter()
         .all(|backend| seen.contains(backend.as_str()))
-}
-#[derive(Clone, Copy)]
-enum BenchMode {
-    Baseline,
-    Optimized,
-}
-
-struct NoopOptimizer;
-
-impl<B: PortableBackend + 'static> Optimizer<B> for NoopOptimizer {
-    fn optimize(&self, _function: &mut Function, _cx: &mut OptimizeContext<B>) -> PassResult {
-        PassResult::default()
-    }
-}
-
-fn arena_for_mode<B: PortableBackend + 'static>(
-    backend: &Arc<B>,
-    mode: BenchMode,
-) -> Arc<GraphArena<B>> {
-    match mode {
-        BenchMode::Baseline => {
-            let optimizer: Arc<dyn Optimizer<B>> = Arc::new(NoopOptimizer);
-            GraphArena::with_policy(
-                Arc::clone(backend),
-                CachePolicy::LazyPrograms {
-                    capacity: BASELINE_CACHE_CAPACITY,
-                    optimizer: Some(optimizer),
-                },
-            )
-        }
-        BenchMode::Optimized => GraphArena::new(Arc::clone(backend)),
-    }
 }
 
 fn reset_durations() {
@@ -530,106 +475,76 @@ pub fn timed_torch<T, F: FnOnce() -> T>(f: F) -> T {
     output
 }
 
+thread_local! {
+    /// How long the programs of this thread ran, as [`ProgramTimer`] measures it.
+    static PROGRAM_TIME: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+}
+
+/// Adds the run time of each program to [`PROGRAM_TIME`] of the thread that ran it.
+struct ProgramTimer;
+
+impl ExecutionTraceSink for ProgramTimer {
+    fn before_program(&self, _context: &ProgramContext, _module: &Module) {}
+
+    fn after_program(&self, _context: &ProgramContext, stats: &ProgramStats) {
+        PROGRAM_TIME.with(|time| time.set(time.get() + stats.duration));
+    }
+}
+
+/// Runs `f`, the gpt.rs side of a parity test, and adds the time its programs ran to the test's
+/// gpt.rs time. Recording and compiling are left out.
 pub fn timed_gpt<T, F: FnOnce() -> T>(f: F) -> T {
-    gpt_rs::ops::graph::timing::reset_compile_time();
-    let start = Instant::now();
+    static TIMER: OnceLock<TraceGuard> = OnceLock::new();
+    TIMER.get_or_init(|| trace::install_global_sink(Arc::new(ProgramTimer)));
+    let before = PROGRAM_TIME.with(Cell::get);
     let output = f();
-    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-    let compile = gpt_rs::ops::graph::timing::take_compile_time();
-    let compile_ms = compile.as_secs_f64() * 1000.0;
-    let exec_ms = (elapsed - compile_ms).max(0.0);
+    let ran = PROGRAM_TIME.with(Cell::get) - before;
     RUN_CONTEXT.with(|ctx| {
-        ctx.borrow_mut().gpt_ms += exec_ms;
+        ctx.borrow_mut().gpt_ms += ran.as_secs_f64() * 1000.0;
     });
     output
 }
 
-fn run_mode<B: PortableBackend + 'static, F: Fn(&Arc<B>)>(
-    backend: &Arc<B>,
-    mode: BenchMode,
-    f: &F,
-) -> Result<(f64, RunDurations), Box<dyn std::any::Any + Send + 'static>> {
-    let arena = arena_for_mode(backend, mode);
-    reset_durations();
-    let start = Instant::now();
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        with_default_arena(arena, || f(backend))
-    }));
-    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let durations = take_durations();
-    match result {
-        Ok(()) => Ok((elapsed_ms, durations)),
-        Err(err) => Err(err),
-    }
-}
-
-pub fn run_parity_test_with_modes<B: PortableBackend + 'static, F: Fn(&Arc<B>)>(
+pub fn run_parity_test<B: PortableBackend + 'static, F: Fn(&Arc<B>)>(
     backend: Arc<B>,
     test_name: &str,
     f: F,
 ) {
     let backend_name = backend.backend_name().to_string();
+    if let Some(reason) = xfail_reason(&backend_name, test_name) {
+        print_row(&backend_name, test_name, f64::NAN, f64::NAN, "xfail");
+        eprintln!("torch_parity xfail: backend={backend_name} test={test_name} reason={reason}");
+        return;
+    }
     configure_c_backend_cache_for_parity(&backend_name);
     let _context_guard = common::set_parity_context(&backend_name, test_name);
-    let baseline = run_mode(&backend, BenchMode::Baseline, &f);
-    match baseline {
-        Ok((baseline_total_ms, baseline_durations)) => {
-            let optimized = run_mode(&backend, BenchMode::Optimized, &f);
-            match optimized {
-                Ok((optimized_total_ms, optimized_durations)) => {
-                    let baseline_ms = resolve_gpt_ms(baseline_total_ms, baseline_durations);
-                    let optimized_ms = resolve_gpt_ms(optimized_total_ms, optimized_durations);
-                    let torch_ms = resolve_torch_ms(baseline_durations, optimized_durations);
-                    print_row(
-                        &backend_name,
-                        test_name,
-                        baseline_ms,
-                        optimized_ms,
-                        torch_ms,
-                        "ok",
-                    );
-                }
-                Err(err) => {
-                    print_row(
-                        &backend_name,
-                        test_name,
-                        resolve_gpt_ms(baseline_total_ms, baseline_durations),
-                        f64::NAN,
-                        resolve_torch_ms(baseline_durations, RunDurations::default()),
-                        "fail",
-                    );
-                    std::panic::resume_unwind(err);
-                }
-            }
+    let arena = GraphArena::new(Arc::clone(&backend));
+    reset_durations();
+    let start = Instant::now();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        with_default_arena(arena, || f(&backend))
+    }));
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let durations = take_durations();
+    let torch_ms = resolve_torch_ms(durations);
+    match result {
+        Ok(()) => {
+            let gpt_ms = resolve_gpt_ms(elapsed_ms, durations);
+            print_row(&backend_name, test_name, gpt_ms, torch_ms, "ok");
         }
         Err(err) => {
-            print_row(
-                &backend_name,
-                test_name,
-                f64::NAN,
-                f64::NAN,
-                f64::NAN,
-                "fail",
-            );
+            print_row(&backend_name, test_name, f64::NAN, torch_ms, "fail");
             std::panic::resume_unwind(err);
         }
     }
 }
 
-fn print_row(
-    backend: &str,
-    test_name: &str,
-    baseline_ms: f64,
-    optimized_ms: f64,
-    torch_ms: f64,
-    status: &str,
-) {
+fn print_row(backend: &str, test_name: &str, gpt_ms: f64, torch_ms: f64, status: &str) {
     register_table_printer();
     let row = TableRow {
         backend: backend.to_string(),
         test_name: test_name.to_string(),
-        baseline_ms,
-        optimized_ms,
+        gpt_ms,
         torch_ms,
         status: status.to_string(),
     };
@@ -647,14 +562,17 @@ fn resolve_gpt_ms(total_ms: f64, durations: RunDurations) -> f64 {
     }
 }
 
-fn resolve_torch_ms(baseline: RunDurations, optimized: RunDurations) -> f64 {
-    if baseline.torch_ms > 0.0 {
-        baseline.torch_ms
-    } else if optimized.torch_ms > 0.0 {
-        optimized.torch_ms
+fn resolve_torch_ms(durations: RunDurations) -> f64 {
+    if durations.torch_ms > 0.0 {
+        durations.torch_ms
     } else {
         f64::NAN
     }
+}
+
+fn xfail_reason(backend_name: &str, test_name: &str) -> Option<&'static str> {
+    (backend_name == "ref-cpu" && test_name.contains("_fp8_"))
+        .then_some("the reference backend stores f8e4m3 tensors but does not compute with them")
 }
 
 fn format_ms(value: f64) -> String {

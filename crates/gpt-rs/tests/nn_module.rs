@@ -2,10 +2,9 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
 use gpt_rs::module::{Layer, Module, ParamVisitor, ParamVisitorMut, TensorRole};
 use gpt_rs::nn;
-use gpt_rs::tensor::{DeviceTensor, DeviceTensorOps, Shape, Tensor as HostTensor};
+use gpt_rs::tensor::{DeviceTensor, HostTensor};
 use gpt_rs_backend_ref_cpu::CpuPortableBackend;
 
 type Backend = CpuPortableBackend;
@@ -17,8 +16,8 @@ struct Scale {
 
 #[nn::module]
 impl Scale {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        x.mul(&self.weight)
+    fn forward(&self, x: &Tensor) -> Tensor {
+        x * &self.weight
     }
 }
 
@@ -29,8 +28,8 @@ struct ScaleAdd {
 
 #[nn::module]
 impl ScaleAdd {
-    fn forward(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
-        a.mul(&self.weight)?.add(b)
+    fn forward(&self, a: &Tensor, b: &Tensor) -> Tensor {
+        a * &self.weight + b
     }
 }
 
@@ -43,7 +42,7 @@ enum Branch {
 
 #[nn::module]
 impl Branch {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> Tensor {
         match self {
             Branch::Left(scale) | Branch::Right(scale) => scale.call(x),
         }
@@ -71,18 +70,18 @@ struct Net {
 
 #[nn::module]
 impl Net {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y = self.scale(x)?;
-        let y = self.maybe(&y)?.unwrap_or(y);
-        let mut y = self.missing(&y)?.unwrap_or(y);
+    fn forward(&self, x: &Tensor) -> Tensor {
+        let y = self.scale(x);
+        let y = self.maybe(&y).unwrap_or(y);
+        let mut y = self.missing(&y).unwrap_or(y);
         for scale in &self.stack {
-            y = scale.call(&y)?;
+            y = scale.call(&y);
         }
-        let y = self.branch(&y)?;
-        let y = self.pair((&y, x))?;
+        let y = self.branch(&y);
+        let y = self.pair((&y, x));
         match &self.bias {
-            Some(bias) => y.add(bias),
-            None => Ok(y),
+            Some(bias) => y + bias,
+            None => y,
         }
     }
 }
@@ -92,7 +91,7 @@ fn backend() -> Arc<Backend> {
 }
 
 fn filled(backend: &Arc<Backend>, value: f32) -> DeviceTensor<Backend> {
-    let host = HostTensor::from_vec(Shape::new([2]), vec![value; 2]).unwrap();
+    let host = HostTensor::f32([2], vec![value; 2]).unwrap();
     DeviceTensor::from_host(Arc::clone(backend), host).unwrap()
 }
 
@@ -170,8 +169,8 @@ fn mutable_visit_matches_and_updates_parameters() {
 
     // Every scale is 1 and the bias 1: `x * 1 + x + 1`.
     let x = filled(&backend, 4.0);
-    let y = net.call(&x).unwrap().to_host().unwrap();
-    assert_eq!(y.data(), [9.0, 9.0]);
+    let y = net.call(&x).to_host().unwrap();
+    assert_eq!(y.as_f32().unwrap(), [9.0, 9.0]);
 }
 
 #[test]
@@ -182,19 +181,19 @@ fn forward_runs_sublayers_through_generated_calls() {
     // 0.5 * 2 * 3 * 5 * 7 * 11 * 13 + 0.5 + 1; `missing` is skipped.
     let expected = 0.5 * 2.0 * 3.0 * 5.0 * 7.0 * 11.0 * 13.0 + 0.5 + 1.0;
     assert_eq!(
-        net.call(&x).unwrap().to_host().unwrap().data(),
+        net.call(&x).to_host().unwrap().as_f32().unwrap(),
         [expected; 2]
     );
     assert_eq!(
-        net.forward(&x).unwrap().to_host().unwrap().data(),
+        net.forward(&x).to_host().unwrap().as_f32().unwrap(),
         [expected; 2]
     );
 
     let pair = ScaleAdd {
         weight: filled(&backend, 3.0),
     };
-    let y = pair.call((&x, &filled(&backend, 1.0))).unwrap();
-    assert_eq!(y.to_host().unwrap().data(), [2.5, 2.5]);
+    let y = pair.call((&x, &filled(&backend, 1.0)));
+    assert_eq!(y.to_host().unwrap().as_f32().unwrap(), [2.5, 2.5]);
 }
 
 #[test]

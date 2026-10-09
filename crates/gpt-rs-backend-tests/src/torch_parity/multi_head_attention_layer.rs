@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
-use gpt_rs::backend::spec::PortableBackend;
+use gpt_rs::backend::PortableBackend;
 use gpt_rs::module::Layer;
 use gpt_rs::nn::layers::{
-    AttentionConfig, AttentionPositions, CausalSelfAttention, RmsNormConfig, RopeConfig,
-    RopeScaling, RotaryEmbedding,
+    AttentionConfig, CausalSelfAttention, LlamaNames, RmsNormConfig, RopeConfig, RopeScaling,
+    RotaryEmbedding,
 };
+use gpt_rs::ops::functional::{AttentionPositions, WeightLayout};
+use gpt_rs::tensor::HostTensor;
 use tch::{Device, Kind, Tensor as TchTensor};
 
 use super::common::*;
@@ -63,9 +65,10 @@ fn attention_reference(
     input: &TchTensor,
     weights: &HostAttention,
     config: &AttentionConfig,
+    rope: Option<RopeConfig>,
 ) -> TchTensor {
     let seq_len = input.size()[0];
-    let num_heads = config.num_heads() as i64;
+    let num_heads = config.num_query_heads as i64;
     let kv_heads = config.num_key_value_heads as i64;
     let head_dim = config.head_dim as i64;
     let group_size = num_heads / kv_heads;
@@ -93,7 +96,7 @@ fn attention_reference(
         k = rms_norm_reference(&k, k_weight, norm);
     }
     let (mut q, mut k, v) = (q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1));
-    if let Some(rope) = config.rope {
+    if let Some(rope) = rope {
         q = rope_reference(&q, rope.rotary_dim);
         k = rope_reference(&k, rope.rotary_dim);
     }
@@ -120,11 +123,47 @@ fn attention_reference(
     weights.o.torch(&context)
 }
 
+/// The `[in_features, out_features]` weight and the bias of `linears` fused along their outputs,
+/// as `prefix.weight` and `prefix.bias`: a `Conv1D` that computes all of them.
+fn fused_in_out(prefix: &str, linears: &[&HostLinear]) -> Vec<(String, HostTensor)> {
+    let parts: Vec<Vec<(String, HostTensor)>> =
+        linears.iter().map(|linear| linear.tensors("p")).collect();
+    let in_features = parts[0][0].1.dims[1];
+    let out_features: usize = parts.iter().map(|part| part[0].1.dims[0]).sum();
+    let mut weight = vec![0.0; in_features * out_features];
+    let mut bias = Vec::with_capacity(out_features);
+    let mut column = 0;
+    for part in &parts {
+        let (rows, values) = (part[0].1.dims[0], part[0].1.as_f32().unwrap());
+        for row in 0..rows {
+            for input in 0..in_features {
+                weight[input * out_features + column + row] = values[row * in_features + input];
+            }
+        }
+        match part.get(1) {
+            Some((_, part_bias)) => bias.extend_from_slice(part_bias.as_f32().unwrap()),
+            None => bias.extend(std::iter::repeat_n(0.0, rows)),
+        }
+        column += rows;
+    }
+    vec![
+        (
+            format!("{prefix}.weight"),
+            tensor_from_vec(&[in_features, out_features], weight),
+        ),
+        (
+            format!("{prefix}.bias"),
+            tensor_from_vec(&[out_features], bias),
+        ),
+    ]
+}
+
 /// Runs `prefill_len` tokens as one chunk into a fresh cache, then `decode_steps` single tokens,
 /// and compares every output row with full-sequence Torch attention.
 fn run_attention_case<B: PortableBackend + 'static>(
     backend: &Arc<B>,
     config: AttentionConfig,
+    rope: Option<RopeConfig>,
     bias: bool,
     (prefill_len, decode_steps): (usize, usize),
     seed: u64,
@@ -151,17 +190,27 @@ fn run_attention_case<B: PortableBackend + 'static>(
             &tch_tensor_from_vec(&[total_seq, embed_dim], &input),
             &weights,
             &config,
+            rope,
         ))
     });
 
     timed_gpt(|| {
-        let mut tensors = [
-            weights.q.tensors("attn.q_proj"),
-            weights.k.tensors("attn.k_proj"),
-            weights.v.tensors("attn.v_proj"),
-            weights.o.tensors("attn.o_proj"),
-        ]
-        .concat();
+        let mut tensors = if config.fused_qkv {
+            let qkv = [&weights.q, &weights.k, &weights.v];
+            [
+                fused_in_out("attn.qkv_proj", &qkv),
+                fused_in_out("attn.o_proj", &[&weights.o]),
+            ]
+            .concat()
+        } else {
+            [
+                weights.q.tensors("attn.q_proj"),
+                weights.k.tensors("attn.k_proj"),
+                weights.v.tensors("attn.v_proj"),
+                weights.o.tensors("attn.o_proj"),
+            ]
+            .concat()
+        };
         if let Some((q_weight, k_weight)) = &weights.qk_norm {
             for (name, weight) in [
                 ("attn.q_norm.weight", q_weight),
@@ -174,18 +223,21 @@ fn run_attention_case<B: PortableBackend + 'static>(
             }
         }
         let layer = load_layer(backend, tensors, |p| {
-            p.scoped("attn", |p| CausalSelfAttention::new(p, config.clone()))
+            p.scoped("attn", |p| {
+                CausalSelfAttention::<_, LlamaNames>::new(p, config.clone())
+            })
         })
         .unwrap();
-        let rotary = config.rope.map(|rope| RotaryEmbedding::new(rope).unwrap());
+        let rotary = rope.map(|rope| RotaryEmbedding::new(rope).unwrap());
         let mut cache = layer.config.empty_cache(backend, total_seq).unwrap();
         let mut position = 0;
         for len in std::iter::once(prefill_len).chain(std::iter::repeat_n(1, decode_steps)) {
             let rows = position * embed_dim..(position + len) * embed_dim;
             let x = device_tensor_from_data(backend, &[len, embed_dim], &input[rows.clone()]);
-            let positions =
-                AttentionPositions::new(backend, position, len, rotary.as_ref()).unwrap();
-            let (output, next_cache) = layer.call((&x, &cache, &positions)).unwrap();
+            let ids = positions_tensor(backend, position..position + len);
+            let tables = rotary.as_ref().map(|rope| rope.tables(&ids));
+            let positions = AttentionPositions::new(ids, tables);
+            let (output, next_cache) = layer.call((&x, &cache, &positions));
             assert_close(&expected[rows], &to_host_vec(&output));
             cache = next_cache;
             position += len;
@@ -203,7 +255,7 @@ fn run_mha_case<B: PortableBackend + 'static>(
     bias: bool,
 ) {
     let config = AttentionConfig::with_kv(embed_dim, num_heads, num_kv_heads).unwrap();
-    run_attention_case(backend, config, bias, steps, seed);
+    run_attention_case(backend, config, None, bias, steps, seed);
 }
 
 pub fn multi_head_attention_matches_torch_without_bias<B: PortableBackend + 'static>(
@@ -267,11 +319,8 @@ pub fn attention_full_rotary_grouped_kv2_prefill4_decode3_matches_torch<
 >(
     backend: &Arc<B>,
 ) {
-    let config = AttentionConfig::with_kv(32, 4, 2)
-        .unwrap()
-        .with_rope(rope(8))
-        .unwrap();
-    run_attention_case(backend, config, false, (4, 3), 0xA507);
+    let config = AttentionConfig::with_kv(32, 4, 2).unwrap();
+    run_attention_case(backend, config, Some(rope(8)), false, (4, 3), 0xA507);
 }
 
 pub fn attention_qk_norm_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
@@ -281,7 +330,7 @@ pub fn attention_qk_norm_matches_torch<B: PortableBackend + 'static>(backend: &A
             eps: 1e-6,
             unit_offset: false,
         });
-    run_attention_case(backend, config, false, (6, 0), 0xA508);
+    run_attention_case(backend, config, None, false, (6, 0), 0xA508);
 }
 
 pub fn attention_output_gate_grouped_kv2_prefill5_decode2_matches_torch<
@@ -292,7 +341,7 @@ pub fn attention_output_gate_grouped_kv2_prefill5_decode2_matches_torch<
     let config = AttentionConfig::with_kv(32, 4, 2)
         .unwrap()
         .with_output_gate();
-    run_attention_case(backend, config, true, (5, 2), 0xA509);
+    run_attention_case(backend, config, None, true, (5, 2), 0xA509);
 }
 
 pub fn attention_partial_rotary_qk_norm_output_gate_prefill5_decode3_matches_torch<
@@ -306,8 +355,18 @@ pub fn attention_partial_rotary_qk_norm_output_gate_prefill5_decode3_matches_tor
             eps: 1e-6,
             unit_offset: true,
         })
-        .with_rope(rope(4))
-        .unwrap()
         .with_output_gate();
-    run_attention_case(backend, config, false, (5, 3), 0xA50A);
+    run_attention_case(backend, config, Some(rope(4)), false, (5, 3), 0xA50A);
+}
+
+/// One projection computes the queries, keys and values, and every projection stores its weight
+/// as `[in_features, out_features]`, as in GPT-2.
+pub fn attention_fused_qkv_in_out_prefill4_decode3_matches_torch<B: PortableBackend + 'static>(
+    backend: &Arc<B>,
+) {
+    let config = AttentionConfig::with_equal_heads(32, 4)
+        .unwrap()
+        .with_fused_qkv()
+        .with_weight_layout(WeightLayout::InOut);
+    run_attention_case(backend, config, None, true, (4, 3), 0xA50B);
 }

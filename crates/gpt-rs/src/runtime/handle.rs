@@ -1,28 +1,31 @@
 use anyhow::Result;
 
-use crate::backend::spec::PortableBackend;
+use crate::inference::vision::VisionModel;
 use crate::inference::CausalLanguageModel;
 
-use super::{ModelInput, ModelOutput};
-
-pub trait LoadedModel<B: PortableBackend + 'static>: Send {
+/// A model loaded from a checkpoint. Its capabilities tell what it runs on: token ids for a
+/// causal language model, pixels for an image model.
+pub trait LoadedModel: Send + Sync {
+    /// The Hugging Face `model_type` of the checkpoint.
     fn kind(&self) -> &str;
 
-    fn forward(&mut self, input: ModelInput<B>) -> Result<ModelOutput>;
+    fn as_causal_lm(&self) -> Option<&dyn CausalLanguageModel> {
+        None
+    }
 
-    fn as_causal_lm(&self) -> Option<&dyn CausalLanguageModel<B>> {
+    fn as_vision(&self) -> Option<&dyn VisionModel> {
         None
     }
 }
 
 /// A model loaded from a checkpoint, with the checkpoint's generation metadata.
-pub struct ModelHandle<B: PortableBackend + 'static> {
-    inner: Box<dyn LoadedModel<B>>,
+pub struct ModelHandle {
+    inner: Box<dyn LoadedModel>,
     eos_token_ids: Vec<usize>,
 }
 
-impl<B: PortableBackend + 'static> ModelHandle<B> {
-    pub fn new(inner: Box<dyn LoadedModel<B>>, eos_token_ids: Vec<usize>) -> Self {
+impl ModelHandle {
+    pub fn new(inner: Box<dyn LoadedModel>, eos_token_ids: Vec<usize>) -> Self {
         Self {
             inner,
             eos_token_ids,
@@ -33,18 +36,31 @@ impl<B: PortableBackend + 'static> ModelHandle<B> {
     pub fn eos_token_ids(&self) -> &[usize] {
         &self.eos_token_ids
     }
+
+    /// The model as a causal language model, or an error naming its kind.
+    pub fn causal_lm(&self) -> Result<&dyn CausalLanguageModel> {
+        self.as_causal_lm().ok_or_else(|| {
+            anyhow::anyhow!("model '{}' is not a causal language model", self.kind())
+        })
+    }
+
+    /// The model as an image model, or an error naming its kind.
+    pub fn vision(&self) -> Result<&dyn VisionModel> {
+        self.as_vision()
+            .ok_or_else(|| anyhow::anyhow!("model '{}' is not an image model", self.kind()))
+    }
 }
 
-impl<B: PortableBackend + 'static> LoadedModel<B> for ModelHandle<B> {
+impl LoadedModel for ModelHandle {
     fn kind(&self) -> &str {
         self.inner.kind()
     }
 
-    fn forward(&mut self, input: ModelInput<B>) -> Result<ModelOutput> {
-        self.inner.forward(input)
+    fn as_causal_lm(&self) -> Option<&dyn CausalLanguageModel> {
+        self.inner.as_causal_lm()
     }
 
-    fn as_causal_lm(&self) -> Option<&dyn CausalLanguageModel<B>> {
-        self.inner.as_causal_lm()
+    fn as_vision(&self) -> Option<&dyn VisionModel> {
+        self.inner.as_vision()
     }
 }

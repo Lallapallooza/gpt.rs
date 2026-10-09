@@ -1,0 +1,112 @@
+// RUN: verify
+
+// ERROR: tensor.iota: axis 2 is out of range for rank 2
+func.func @iota_axis() -> tensor<2x3xsi32> {
+  %0 = tensor.iota() {shape = [2, 3], dtype = si32, axis = 2} : () -> tensor<2x3xsi32>
+  func.return(%0) : (tensor<2x3xsi32>) -> ()
+}
+
+// -----
+// ERROR: tensor.iota: dtype must be an integer or float dtype, got i1
+func.func @iota_i1() -> tensor<3xi1> {
+  %0 = tensor.iota() {shape = [3], dtype = i1, axis = 0} : () -> tensor<3xi1>
+  func.return(%0) : (tensor<3xi1>) -> ()
+}
+
+// -----
+// ERROR: tensor.take: the table must have rank at least 1, got tensor<f32>
+func.func @take_scalar_table(%0: tensor<f32>, %1: tensor<3xsi32>) -> tensor<3xf32> {
+  %2 = tensor.take(%0, %1) : (tensor<f32>, tensor<3xsi32>) -> tensor<3xf32>
+  func.return(%2) : (tensor<3xf32>) -> ()
+}
+
+// -----
+// ERROR: tensor.take: indices must be si32 or si64, got tensor<3xf32>
+func.func @take_float_indices(%0: tensor<10x4xf32>, %1: tensor<3xf32>) -> tensor<3x4xf32> {
+  %2 = tensor.take(%0, %1) : (tensor<10x4xf32>, tensor<3xf32>) -> tensor<3x4xf32>
+  func.return(%2) : (tensor<3x4xf32>) -> ()
+}
+
+// -----
+// ERROR: tensor.dynamic_slice: sizes [1] do not match rank 2
+func.func @dynamic_slice_rank(%0: tensor<4x8xf32>, %1: tensor<2xsi32>) -> tensor<1xf32> {
+  %2 = tensor.dynamic_slice(%0, %1) {sizes = [1]} : (tensor<4x8xf32>, tensor<2xsi32>) -> tensor<1xf32>
+  func.return(%2) : (tensor<1xf32>) -> ()
+}
+
+// -----
+// ERROR: tensor.dynamic_slice: starts must be si32 or si64 of shape [2], got tensor<2xf32>
+func.func @dynamic_slice_starts_dtype(%0: tensor<4x8xf32>, %1: tensor<2xf32>) -> tensor<1x8xf32> {
+  %2 = tensor.dynamic_slice(%0, %1) {sizes = [1, 8]} : (tensor<4x8xf32>, tensor<2xf32>) -> tensor<1x8xf32>
+  func.return(%2) : (tensor<1x8xf32>) -> ()
+}
+
+// -----
+// ERROR: tensor.dynamic_slice: starts must be si32 or si64 of shape [2], got tensor<{N}xsi32>
+func.func @dynamic_slice_starts_shape(%0: tensor<4x8xf32>, %1: tensor<{N}xsi32>) -> tensor<1x8xf32> {
+  %2 = tensor.dynamic_slice(%0, %1) {sizes = [1, 8]} : (tensor<4x8xf32>, tensor<{N}xsi32>) -> tensor<1x8xf32>
+  func.return(%2) : (tensor<1x8xf32>) -> ()
+}
+
+// -----
+// ERROR: tensor.dynamic_slice: size 5 exceeds extent 4 on axis 0
+func.func @dynamic_slice_size(%0: tensor<4x8xf32>, %1: tensor<2xsi32>) -> tensor<5x8xf32> {
+  %2 = tensor.dynamic_slice(%0, %1) {sizes = [5, 8]} : (tensor<4x8xf32>, tensor<2xsi32>) -> tensor<5x8xf32>
+  func.return(%2) : (tensor<5x8xf32>) -> ()
+}
+
+// -----
+// ERROR: tensor.dynamic_update_slice: update must have rank 2, got tensor<1xf32>
+func.func @dynamic_update_slice_rank(%0: tensor<4x8xf32>, %1: tensor<1xf32>, %2: tensor<2xsi32>) -> tensor<4x8xf32> {
+  %3 = tensor.dynamic_update_slice(%0, %1, %2) : (tensor<4x8xf32>, tensor<1xf32>, tensor<2xsi32>) -> tensor<4x8xf32>
+  func.return(%3) : (tensor<4x8xf32>) -> ()
+}
+
+// -----
+// ERROR: tensor.dynamic_update_slice: size 5 exceeds extent 4 on axis 0
+func.func @dynamic_update_slice_size(%0: tensor<4x8xf32>, %1: tensor<5x8xf32>, %2: tensor<2xsi32>) -> tensor<4x8xf32> {
+  %3 = tensor.dynamic_update_slice(%0, %1, %2) : (tensor<4x8xf32>, tensor<5x8xf32>, tensor<2xsi32>) -> tensor<4x8xf32>
+  func.return(%3) : (tensor<4x8xf32>) -> ()
+}
+
+// -----
+// ERROR: tensor.dynamic_update_slice: update must have dtype f32, got tensor<1x8xsi32>
+func.func @dynamic_update_slice_update_dtype(%0: tensor<4x8xf32>, %1: tensor<1x8xsi32>, %2: tensor<2xsi32>) -> tensor<4x8xf32> {
+  %3 = tensor.dynamic_update_slice(%0, %1, %2) : (tensor<4x8xf32>, tensor<1x8xsi32>, tensor<2xsi32>) -> tensor<4x8xf32>
+  func.return(%3) : (tensor<4x8xf32>) -> ()
+}
+
+// -----
+// ERROR: tensor.dynamic_update_slice: update must have static extents, got tensor<1x{N}xf32>
+func.func @dynamic_update_slice_dynamic_update(%0: tensor<4x8xf32>, %1: tensor<1x{N}xf32>, %2: tensor<2xsi32>) -> tensor<4x8xf32> {
+  %3 = tensor.dynamic_update_slice(%0, %1, %2) : (tensor<4x8xf32>, tensor<1x{N}xf32>, tensor<2xsi32>) -> tensor<4x8xf32>
+  func.return(%3) : (tensor<4x8xf32>) -> ()
+}
+
+// -----
+// ERROR: tensor.gather: indices must be si32 or si64, got tensor<3x2xf32>
+func.func @gather_float_indices(%0: tensor<3x4xf32>, %1: tensor<3x2xf32>) -> tensor<3x2xf32> {
+  %2 = tensor.gather(%0, %1) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xf32>) -> tensor<3x2xf32>
+  func.return(%2) : (tensor<3x2xf32>) -> ()
+}
+
+// -----
+// ERROR: tensor.gather: indices tensor<2x2xsi32> must match tensor<3x4xf32> on every axis but 1
+func.func @gather_other_axis(%0: tensor<3x4xf32>, %1: tensor<2x2xsi32>) -> tensor<2x2xf32> {
+  %2 = tensor.gather(%0, %1) {axis = 1} : (tensor<3x4xf32>, tensor<2x2xsi32>) -> tensor<2x2xf32>
+  func.return(%2) : (tensor<2x2xf32>) -> ()
+}
+
+// -----
+// ERROR: tensor.gather: axis 2 is out of range for rank 2
+func.func @gather_axis(%0: tensor<3x4xf32>, %1: tensor<3x4xsi32>) -> tensor<3x4xf32> {
+  %2 = tensor.gather(%0, %1) {axis = 2} : (tensor<3x4xf32>, tensor<3x4xsi32>) -> tensor<3x4xf32>
+  func.return(%2) : (tensor<3x4xf32>) -> ()
+}
+
+// -----
+// ERROR: tensor.scatter_add: updates must have the dtype of tensor<3x4xf32> and the shape of tensor<3x2xsi32>, got tensor<3x3xf32>
+func.func @scatter_updates(%0: tensor<3x4xf32>, %1: tensor<3x2xsi32>, %2: tensor<3x3xf32>) -> tensor<3x4xf32> {
+  %3 = tensor.scatter_add(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x3xf32>) -> tensor<3x4xf32>
+  func.return(%3) : (tensor<3x4xf32>) -> ()
+}

@@ -1,26 +1,17 @@
 //! Validation macros for [`#[functional]`](crate::functional) bodies.
 //!
-//! Each macro checks its tensor arguments. When a check fails, the macro returns an error from the
-//! functional. Each message starts with the name of the functional, which is the `FUNCTIONAL`
-//! constant that the attribute defines. The message names each argument as written:
+//! Each macro checks its tensor arguments and panics when a check fails, as a shape that does not
+//! fit is a bug in the caller. Each message starts with the name of the functional, which is the
+//! `FUNCTIONAL` constant that the attribute defines. The message names each argument as written:
 //! `gelu: x must have rank >= 1, got []`.
 
-use anyhow::anyhow;
-
-#[doc(hidden)]
-pub fn error(functional: &str, message: std::fmt::Arguments<'_>) -> anyhow::Error {
-    anyhow!("{functional}: {message}")
-}
-
-/// Returns `functional: <message>` as the error of the enclosing functional unless `cond` holds.
+/// Panics with `functional: <message>` unless `cond` holds.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __functional_ensure {
     ($cond:expr, $($message:tt)+) => {
         if !$cond {
-            return ::core::result::Result::Err(::core::convert::From::from(
-                $crate::ops::functional::validate::error(FUNCTIONAL, format_args!($($message)+)),
-            ));
+            ::core::panic!("{}: {}", FUNCTIONAL, format_args!($($message)+));
         }
     };
 }
@@ -67,16 +58,16 @@ macro_rules! ensure_last_dim {
     };
 }
 
-/// `ensure_dtype!(x, F32)` or `ensure_dtype!(x, F32 | BF16)` checks that `x` has one of the
+/// `ensure_dtype!(x, F32)` or `ensure_dtype!(x, F32 | Bf16)` checks that `x` has one of the
 /// [`DType`](crate::tensor::DType)s.
 #[macro_export]
 macro_rules! ensure_dtype {
     ($tensor:expr, $($dtype:ident)|+ $(,)?) => {
         $crate::__functional_ensure!(
             matches!($tensor.dtype(), $($crate::tensor::DType::$dtype)|+),
-            "{} must have dtype {}, got {:?}",
+            "{} must have dtype {}, got {}",
             stringify!($tensor),
-            stringify!($($dtype)|+),
+            [$($crate::tensor::DType::$dtype.to_string()),+].join(" | "),
             $tensor.dtype()
         )
     };
@@ -89,7 +80,7 @@ macro_rules! ensure_same_dtype {
         $(
             $crate::__functional_ensure!(
                 $first.dtype() == $other.dtype(),
-                "{} dtype {:?} must match {} dtype {:?}",
+                "{} dtype {} must match {} dtype {}",
                 stringify!($other),
                 $other.dtype(),
                 stringify!($first),
@@ -111,23 +102,6 @@ macro_rules! ensure_same_shape {
                 $other.shape().dims(),
                 stringify!($first),
                 $first.shape().dims()
-            );
-        )+
-    };
-}
-
-/// `ensure_same_backend!(a, b, ...)` checks that every tensor is on the backend instance of `a`.
-#[macro_export]
-macro_rules! ensure_same_backend {
-    ($first:expr, $($other:expr),+ $(,)?) => {
-        $(
-            $crate::__functional_ensure!(
-                ::std::sync::Arc::ptr_eq(&$first.backend(), &$other.backend()),
-                "{} and {} must be on the same backend, got {} and {}",
-                stringify!($first),
-                stringify!($other),
-                $first.backend().backend_name(),
-                $other.backend().backend_name()
             );
         )+
     };

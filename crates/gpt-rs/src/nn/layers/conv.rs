@@ -1,12 +1,12 @@
-//! Convolution layers: 2D image convolutions (NHWC internal layout) and the depthwise causal 1D
-//! convolution of linear attention.
+//! Convolution layers: 2D image convolutions (NHWC internal layout), alone or with batch norm and
+//! activation, and the depthwise causal 1D convolution of linear attention.
 
-use anyhow::{bail, ensure, Result};
+use anyhow::Result;
 
+use super::activation::{Activation, ActivationFunction};
+use super::batch_norm::BatchNorm2d;
 use crate::nn::{self, Params};
-use crate::ops::functional::{
-    causal_conv1d, conv2d, reshape, CausalConv1dResult, Conv2dParams2d, Padding2d,
-};
+use crate::ops::functional::{causal_conv1d, conv2d, CausalConv1dResult, Conv2dParams, Padding2d};
 
 /// How a [`Conv2d`] pads its input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,25 +50,15 @@ impl Conv2d {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> Tensor {
         let (input, weight) = (x.shape().dims(), self.weight.shape().dims());
-        let ([_, height, width, channels], [_, group_channels, kh, kw]) = (input, weight) else {
-            bail!("conv2d expects NHWC input and an OIHW weight, got {input:?} and {weight:?}");
+        let (&[_, height, width, channels], &[_, group_channels, kh, kw]) = (input, weight) else {
+            panic!("conv2d expects NHWC input and an OIHW weight, got {input:?} and {weight:?}");
         };
-        ensure!(
-            *group_channels > 0 && channels.is_multiple_of(*group_channels),
-            "conv2d input channels {channels} must be a multiple of the weight's {group_channels} input channels"
-        );
-        let mut params = Conv2dParams2d {
-            kernel: [*kh, *kw],
-            stride: [self.stride; 2],
-            dilation: [self.dilation; 2],
-            padding: Padding2d::zero(),
-            groups: channels / group_channels,
-        };
-        params.padding = match self.padding {
+        let kernel = [kh, kw];
+        let padding = match self.padding {
             ConvPadding::Centered => {
-                let [pad_h, pad_w] = params.kernel.map(|k| (k - 1) / 2 * self.dilation);
+                let [pad_h, pad_w] = kernel.map(|k| (k - 1) / 2 * self.dilation);
                 Padding2d {
                     top: pad_h,
                     bottom: pad_h,
@@ -76,23 +66,69 @@ impl Conv2d {
                     right: pad_w,
                 }
             }
-            ConvPadding::TfSame => tf_same_padding([*height, *width], &params),
+            ConvPadding::TfSame => {
+                tf_same_padding([height, width], kernel, self.stride, self.dilation)
+            }
+        };
+        let params = Conv2dParams {
+            stride: [self.stride; 2],
+            dilation: [self.dilation; 2],
+            padding,
+            groups: channels / group_channels.max(1),
         };
         conv2d(x, &self.weight, self.bias.as_ref(), params)
     }
 }
 
+/// Bias-free [`Conv2d`], [`BatchNorm2d`], then an optional activation: the conv layer of the
+/// `transformers` image models (`ResNetConvLayer`, `MobileNetV2ConvLayer`).
+#[nn::module]
+pub struct ConvNormActivation {
+    pub convolution: Conv2d,
+    pub normalization: BatchNorm2d,
+    pub activation: Option<Activation>,
+}
+
+#[nn::module]
+impl ConvNormActivation {
+    pub fn new(
+        p: &mut Params<B>,
+        stride: usize,
+        dilation: usize,
+        padding: ConvPadding,
+        eps: f32,
+        activation: Option<ActivationFunction>,
+    ) -> Result<Self> {
+        Ok(Self {
+            convolution: Conv2d::new(p, stride, dilation, padding)?,
+            normalization: BatchNorm2d::new(p, eps)?,
+            activation: activation.map(ActivationFunction::layer),
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Tensor {
+        let x = self.convolution(x);
+        let x = self.normalization(&x);
+        self.activation(&x).unwrap_or(x)
+    }
+}
+
 /// TensorFlow `SAME` padding, as `transformers` applies it: the output has `ceil(input / stride)`
 /// positions, and the odd padding row or column goes after the input.
-fn tf_same_padding(input: [usize; 2], params: &Conv2dParams2d) -> Padding2d {
+fn tf_same_padding(
+    input: [usize; 2],
+    kernel: [usize; 2],
+    stride: usize,
+    dilation: usize,
+) -> Padding2d {
     let [(top, bottom), (left, right)] = [0, 1].map(|axis| {
-        let (size, kernel, stride) = (input[axis], params.kernel[axis], params.stride[axis]);
+        let (size, kernel) = (input[axis], kernel[axis]);
         let remainder = match size % stride {
             0 => stride,
             remainder => remainder,
         };
-        let total = kernel.saturating_sub(remainder) * params.dilation[axis];
-        let before = kernel.saturating_sub(remainder) / 2 * params.dilation[axis];
+        let total = kernel.saturating_sub(remainder) * dilation;
+        let before = kernel.saturating_sub(remainder) / 2 * dilation;
         (before, total - before)
     });
     Padding2d {
@@ -119,14 +155,13 @@ impl CausalConv1d {
 
     /// Convolves `x` (`[T, channels]`) after the earlier inputs in `state`, a
     /// `[kernel - 1, channels]` window (see [`causal_conv1d`]).
-    fn forward(&self, x: &Tensor, state: &Tensor) -> Result<CausalConv1dResult<B>> {
+    fn forward(&self, x: &Tensor, state: &Tensor) -> CausalConv1dResult<B> {
         let [channels, _, kernel] = self.weight.shape().dims() else {
-            bail!(
+            panic!(
                 "causal conv1d weight must be [channels, 1, kernel], got {:?}",
                 self.weight.shape().dims()
             );
         };
-        let weight = reshape(&self.weight, &[*channels, *kernel])?;
-        causal_conv1d(x, state, &weight)
+        causal_conv1d(x, state, &self.weight.reshape([*channels, *kernel]))
     }
 }

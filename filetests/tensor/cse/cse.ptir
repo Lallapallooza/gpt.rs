@@ -1,0 +1,36 @@
+// RUN: pass cse,dce
+
+// Identical pure ops merge.
+// CHECK: func.func @same
+// CHECK: [[E:%[0-9]+]] = tensor.exp(%0)
+// CHECK-NOT: tensor.exp
+// CHECK: tensor.add([[E]], [[E]])
+func.func @same(%0: tensor<4xf32>) -> tensor<4xf32> {
+  %1 = tensor.exp(%0) : (tensor<4xf32>) -> tensor<4xf32>
+  %2 = tensor.exp(%0) : (tensor<4xf32>) -> tensor<4xf32>
+  %3 = tensor.add(%1, %2) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%3) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// Equal attributes on different operands keep both ops.
+// CHECK: [[T:%[0-9]+]] = tensor.transpose(%0) {perm = [1, 0]}
+// CHECK-NEXT: tensor.transpose([[T]]) {perm = [1, 0]}
+func.func @keep(%0: tensor<3x3xf32>) -> (tensor<3x3xf32>, tensor<3x3xf32>) {
+  %1 = tensor.transpose(%0) {perm = [1, 0]} : (tensor<3x3xf32>) -> tensor<3x3xf32>
+  %2 = tensor.transpose(%1) {perm = [1, 0]} : (tensor<3x3xf32>) -> tensor<3x3xf32>
+  func.return(%1, %2) : (tensor<3x3xf32>, tensor<3x3xf32>) -> ()
+}
+
+// -----
+
+// An opaque op is never merged.
+// NO-INTERP: custom calls have no reference semantics
+// CHECK: tensor.custom_call(%0)
+// CHECK: tensor.custom_call(%0)
+func.func @opaque(%0: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
+  %1 = tensor.custom_call(%0) {target = "k", results = [tensor<4xf32>]} : (tensor<4xf32>) -> tensor<4xf32>
+  %2 = tensor.custom_call(%0) {target = "k", results = [tensor<4xf32>]} : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%1, %2) : (tensor<4xf32>, tensor<4xf32>) -> ()
+}

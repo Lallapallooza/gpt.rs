@@ -7,9 +7,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use gpt_rs::checkpoint;
+use gpt_rs::gpt_rs_ir::types::TensorType;
 use gpt_rs::io::safetensors;
-use gpt_rs::runtime::{load_model_with_options, LoadOptions, LoadedModel};
-use gpt_rs::tensor::{DType, Shape, Tensor};
+use gpt_rs::runtime::{load_model_with_options, LoadOptions};
+use gpt_rs::tensor::{DType, HostTensor};
 use gpt_rs_backend_ref_cpu::CpuPortableBackend;
 use serde_json::json;
 
@@ -39,7 +40,7 @@ fn write_raw_safetensors(path: &Path, tensors: &[(&str, &str, Vec<usize>, Vec<u8
 #[test]
 fn sharded_directory_reads_the_tensors_of_every_shard() -> Result<()> {
     let single = checkpoint_support::gpt2()?;
-    let tensors: BTreeMap<String, Tensor> =
+    let tensors: BTreeMap<String, HostTensor> =
         safetensors::load(single.path.join("model.safetensors"))?
             .into_iter()
             .collect();
@@ -92,7 +93,7 @@ fn sharded_directory_reads_the_tensors_of_every_shard() -> Result<()> {
 fn config_overrides_replace_checkpoint_config_fields() -> Result<()> {
     let checkpoint = checkpoint_support::gpt2()?;
     let options = LoadOptions {
-        config_overrides: json!({"n_layer": 1})
+        config_overrides: json!({"n_positions": 8})
             .as_object()
             .cloned()
             .unwrap_or_default(),
@@ -100,8 +101,7 @@ fn config_overrides_replace_checkpoint_config_fields() -> Result<()> {
     };
     let backend = Arc::new(CpuPortableBackend::new());
     let loaded = load_model_with_options(backend, &checkpoint.path, options)?;
-    let causal = loaded.as_causal_lm().expect("gpt2 is a causal LM");
-    assert_eq!(causal.num_layers(), 1);
+    assert_eq!(loaded.causal_lm()?.context_length(), 8);
     Ok(())
 }
 
@@ -126,7 +126,6 @@ fn multimodal_fp8_checkpoint_opens_as_its_text_model() -> Result<()> {
             .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
             .collect()
     };
-    // 0x38 is 1.0 and 0x40 is 2.0 in float8_e4m3fn.
     write_raw_safetensors(
         &dir.path.join("model.safetensors"),
         &[
@@ -181,16 +180,15 @@ fn multimodal_fp8_checkpoint_opens_as_its_text_model() -> Result<()> {
     assert_eq!(config.eos_token_ids, vec![2, 3]);
     assert_eq!(config.config["tie_word_embeddings"], json!(true));
 
-    let read = |name: &str| -> Result<Tensor> {
+    let read = |name: &str| -> Result<HostTensor> {
         let index = checkpoint
             .tensors()
             .iter()
             .position(|entry| entry.name == name)
             .ok_or_else(|| anyhow::anyhow!("no tensor {name}"))?;
         let entry = &checkpoint.tensors()[index];
-        Tensor::from_le_bytes(
-            Shape::new(entry.dims.clone()),
-            entry.dtype,
+        HostTensor::from_le_bytes(
+            &TensorType::new(entry.dtype, entry.dims.iter().copied()),
             checkpoint.bytes(index)?.as_slice(),
         )
     };
@@ -206,18 +204,107 @@ fn multimodal_fp8_checkpoint_opens_as_its_text_model() -> Result<()> {
             "lm_head.weight",
             "model.embed_tokens.weight",
             "model.layers.0.mlp.up_proj.weight",
+            "model.layers.0.mlp.up_proj.weight_scale_inv",
             "model.norm.weight",
         ]
     );
+    // The FP8 weight and its scale keep their stored dtypes and bytes.
     let up_proj = read("model.layers.0.mlp.up_proj.weight")?;
-    assert_eq!(up_proj.dtype(), DType::BF16);
-    assert_eq!(
-        up_proj.to_le_bytes(),
-        bf16(&[0.5, 1.0, 0.5, 1.0]).as_slice()
-    );
+    assert_eq!(up_proj.dtype(), DType::F8E4M3);
+    assert_eq!(up_proj.to_le_bytes(), [0x38, 0x40, 0x38, 0x40]);
+    let scale = read("model.layers.0.mlp.up_proj.weight_scale_inv")?;
+    assert_eq!(scale.dtype(), DType::Bf16);
+    assert_eq!(scale.to_le_bytes(), bf16(&[0.5]).as_slice());
     let norm = read("model.norm.weight")?;
     assert_eq!(norm.dtype(), DType::F32);
-    assert_eq!(norm.data(), [1.5, 2.5]);
+    assert_eq!(norm.as_f32().unwrap(), [1.5, 2.5]);
+    Ok(())
+}
+
+#[test]
+fn stored_dtypes_load_as_stored() -> Result<()> {
+    let dir = TempDir::new("gpt_rs_hf_dtypes");
+    fs::write(
+        dir.path.join("config.json"),
+        serde_json::to_vec(&json!({"model_type": "ministral3"}))?,
+    )?;
+    // The bytes and scales of an MXFP4 block as gpt-oss stores them, its codes as f4e2m1, a
+    // BatchNorm counter and a mask.
+    let tensors = [
+        ("blocks", "U8", vec![2, 2], vec![0x21, 0x43, 0x65, 0x87]),
+        ("scales", "F8_E8M0", vec![2], vec![127, 128]),
+        ("codes", "F4", vec![4], vec![0x21, 0x43]),
+        (
+            "num_batches_tracked",
+            "I64",
+            vec![],
+            7i64.to_le_bytes().to_vec(),
+        ),
+        ("mask", "BOOL", vec![3], vec![1, 0, 1]),
+    ];
+    write_raw_safetensors(&dir.path.join("model.safetensors"), &tensors)?;
+    let checkpoint = checkpoint::open(&dir.path)?;
+    for (name, _, dims, bytes) in &tensors {
+        let index = checkpoint
+            .tensors()
+            .iter()
+            .position(|entry| entry.name == *name)
+            .ok_or_else(|| anyhow::anyhow!("no tensor {name}"))?;
+        assert_eq!(checkpoint.tensors()[index].dims, *dims, "{name}");
+        assert_eq!(
+            checkpoint.bytes(index)?.as_slice(),
+            bytes.as_slice(),
+            "{name}"
+        );
+    }
+    let dtypes: Vec<DType> = checkpoint.tensors().iter().map(|e| e.dtype).collect();
+    assert_eq!(
+        dtypes,
+        [
+            DType::Ui8,
+            DType::E8M0,
+            DType::F4E2M1,
+            DType::Si64,
+            DType::I1
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn fp8_tensors_that_would_load_unscaled_are_rejected() -> Result<()> {
+    let open_with = |weight_dims: Vec<usize>, scale_dtype: &str, scale_dims: Vec<usize>| {
+        let dir = TempDir::new("gpt_rs_hf_fp8");
+        fs::write(
+            dir.path.join("config.json"),
+            serde_json::to_vec(&json!({"model_type": "ministral3"}))?,
+        )?;
+        let weight = vec![0x38; weight_dims.iter().product()];
+        let scale = vec![0; scale_dims.iter().product::<usize>() * 2];
+        write_raw_safetensors(
+            &dir.path.join("model.safetensors"),
+            &[
+                ("proj.weight", "F8_E4M3", weight_dims, weight),
+                ("proj.weight_scale_inv", scale_dtype, scale_dims, scale),
+            ],
+        )?;
+        let err = checkpoint::open(&dir.path)
+            .err()
+            .expect("the checkpoint must be rejected");
+        anyhow::Ok(format!("{err:#}"))
+    };
+    assert_eq!(
+        open_with(vec![2, 2, 2], "BF16", vec![])?,
+        "proj.weight: only 2-D FP8 tensors are supported, got shape [2, 2, 2]"
+    );
+    assert_eq!(
+        open_with(vec![2, 2], "BF16", vec![1])?,
+        "proj.weight_scale_inv: only per-tensor FP8 scales of rank 0 are supported, got shape [1]"
+    );
+    assert_eq!(
+        open_with(vec![2, 2], "I16", vec![])?,
+        "proj.weight_scale_inv: FP8 scale has unsupported dtype I16"
+    );
     Ok(())
 }
 

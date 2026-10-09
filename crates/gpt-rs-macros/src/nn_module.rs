@@ -151,8 +151,8 @@ fn backend_type(ty: &mut Type) -> Result<Kind> {
     let error = || {
         Error::new(
             span,
-            "#[nn::module] fields must be `Tensor`s or sublayers without generic arguments, \
-             because the macro adds the backend. Mark plain data with `#[module(config)]`",
+            "#[nn::module] fields must be `Tensor`s or sublayers, whose backend argument the \
+             macro adds. Mark plain data with `#[module(config)]`",
         )
     };
     let Type::Path(path) = &mut *ty else {
@@ -162,10 +162,11 @@ fn backend_type(ty: &mut Type) -> Result<Kind> {
         return Err(error());
     }
     let last = path.path.segments.last_mut().expect("paths are non-empty");
-    if !last.arguments.is_none() {
-        return Err(error());
+    match &mut last.arguments {
+        PathArguments::None => last.arguments = PathArguments::AngleBracketed(parse_quote!(<B>)),
+        PathArguments::AngleBracketed(args) => args.args.insert(0, parse_quote!(B)),
+        PathArguments::Parenthesized(_) => return Err(error()),
     }
-    last.arguments = PathArguments::AngleBracketed(parse_quote!(<B>));
     Ok(Kind::Layer)
 }
 
@@ -181,7 +182,7 @@ pub(crate) fn add_backend_param(generics: &mut Generics, macro_name: &str) -> Re
     let position = generics.lifetimes().count();
     generics.params.insert(
         position,
-        parse_quote!(B: ::gpt_rs::backend::spec::PortableBackend + 'static),
+        parse_quote!(B: ::gpt_rs::backend::PortableBackend + 'static),
     );
     Ok(())
 }
@@ -460,18 +461,15 @@ fn call_method(field: &Visited) -> Option<TokenStream> {
         Wrap::Plain => Some(quote! {
             /// Runs the sublayer inside its profiling scope (`Layer::call`).
             #[allow(dead_code)]
-            fn #ident(&self, args: #args) -> anyhow::Result<#output> {
+            fn #ident(&self, args: #args) -> #output {
                 #call(&self.#ident, args)
             }
         }),
         Wrap::Option => Some(quote! {
             /// Runs the sublayer, when present, inside its profiling scope (`Layer::call`).
             #[allow(dead_code)]
-            fn #ident(&self, args: #args) -> anyhow::Result<Option<#output>> {
-                match &self.#ident {
-                    Some(layer) => #call(layer, args).map(Some),
-                    None => Ok(None),
-                }
+            fn #ident(&self, args: #args) -> Option<#output> {
+                self.#ident.as_ref().map(|layer| #call(layer, args))
             }
         }),
         Wrap::Vec => None,
@@ -708,7 +706,12 @@ fn layer_impl(item: &ItemImpl, forward: syn::ImplItemFn) -> Result<TokenStream> 
     } else {
         (quote!((#pats)), quote!((#types)))
     };
-    let (output, result) = forward_output(&sig.output)?;
+    let ReturnType::Type(_, output) = &sig.output else {
+        return Err(Error::new(
+            sig.output.span(),
+            "`forward` must return its output",
+        ));
+    };
 
     let (impl_generics, _, where_clause) = item.generics.split_for_impl();
     let self_ty = &item.self_ty;
@@ -723,35 +726,7 @@ fn layer_impl(item: &ItemImpl, forward: syn::ImplItemFn) -> Result<TokenStream> 
             type Output = #output;
 
             #(#forward_attrs)*
-            fn forward(&self, #args_pat: Self::Args<'_>) -> #result #block
+            fn forward(&self, #args_pat: Self::Args<'_>) -> Self::Output #block
         }
     })
-}
-
-/// Returns `T` from the `-> Result<T>` of `forward`, and that return type rewritten as
-/// `Result<Self::Output>`.
-fn forward_output(output: &ReturnType) -> Result<(Type, Type)> {
-    let error = |span: Span| Error::new(span, "`forward` must return `Result<T>`");
-    let ReturnType::Type(_, ty) = output else {
-        return Err(error(output.span()));
-    };
-    let mut result = (**ty).clone();
-    let Type::Path(path) = &mut result else {
-        return Err(error(ty.span()));
-    };
-    let last = path.path.segments.last_mut().expect("paths are non-empty");
-    if last.ident != "Result" {
-        return Err(error(ty.span()));
-    }
-    let PathArguments::AngleBracketed(args) = &mut last.arguments else {
-        return Err(error(ty.span()));
-    };
-    let single = args.args.len() == 1;
-    match args.args.first_mut() {
-        Some(GenericArgument::Type(output)) if single => {
-            let output = std::mem::replace(output, parse_quote!(Self::Output));
-            Ok((output, result))
-        }
-        _ => Err(error(ty.span())),
-    }
 }

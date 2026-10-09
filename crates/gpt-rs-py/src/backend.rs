@@ -1,103 +1,41 @@
-use gpt_rs::backend::registry;
+//! The backend that `load_model` uses when the call names none.
+
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use std::sync::RwLock;
 
-// Global backend state - stores the name of the currently selected backend
-static CURRENT_BACKEND_NAME: RwLock<String> = RwLock::new(String::new());
+/// The backend that `set_backend` chose, or `None` for the build's default.
+static CURRENT_BACKEND: RwLock<Option<String>> = RwLock::new(None);
 
-/// Initialize the backend system and ensure backends are registered
-fn ensure_backends_registered() {
-    // Ensure built-in backends are registered
-    gpt_rs_backend_ref_cpu::register_cpu_backend();
-
-    #[cfg(feature = "faer")]
-    gpt_rs_backend_faer::register_faer_backend();
-
-    #[cfg(feature = "conversion-c")]
-    gpt_rs_backend_c::register_c_backend();
-}
-
-/// Get the default backend name
-fn default_backend_name() -> &'static str {
-    #[cfg(feature = "faer")]
-    {
-        "faer"
-    }
-    #[cfg(not(feature = "faer"))]
-    {
-        "cpu"
-    }
-}
-
-/// Set the global backend for tensor operations
-/// WARNING: This invalidates all existing Tensor and Layer instances per FR14
+/// Makes `name` the backend of later `load_model` calls that name none.
 #[pyfunction]
 pub fn set_backend(name: &str) -> PyResult<()> {
-    ensure_backends_registered();
-
-    // Check if backend exists
-    if !registry::has_backend(name) {
-        let available = registry::list_backends();
+    let names = gpt_rs_backends::names();
+    if !names.contains(&name) {
         return Err(PyValueError::new_err(format!(
-            "unknown backend: '{}'. Available backends: {}",
-            name,
-            available.join(", ")
+            "unknown backend '{name}'; this build has {}",
+            names.join(", ")
         )));
     }
-
-    // Update global state
-    let mut state = CURRENT_BACKEND_NAME
+    let mut current = CURRENT_BACKEND
         .write()
-        .map_err(|e| PyRuntimeError::new_err(format!("failed to acquire backend lock: {}", e)))?;
-    *state = name.to_string();
-
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to acquire backend lock: {e}")))?;
+    *current = Some(name.to_string());
     Ok(())
 }
 
-/// Get the current backend name
+/// The backend of `load_model` calls that name none.
 #[pyfunction]
-pub fn get_backend() -> PyResult<String> {
-    ensure_backends_registered();
-
-    let state = CURRENT_BACKEND_NAME
+pub fn get_backend() -> String {
+    CURRENT_BACKEND
         .read()
-        .map_err(|e| PyRuntimeError::new_err(format!("failed to acquire backend lock: {}", e)))?;
-
-    // Return default if not set
-    if state.is_empty() {
-        Ok(default_backend_name().to_string())
-    } else {
-        Ok(state.clone())
-    }
+        .ok()
+        .and_then(|current| current.clone())
+        .unwrap_or_else(|| gpt_rs_backends::DEFAULT.to_string())
 }
 
-/// List all available backends
+/// The backends of this build.
 #[pyfunction]
-pub fn list_backends() -> PyResult<Vec<String>> {
-    ensure_backends_registered();
-    Ok(registry::list_backends())
-}
-
-/// Internal helper to get current backend name (for Rust code)
-pub(crate) fn get_current_backend_name() -> String {
-    CURRENT_BACKEND_NAME
-        .read()
-        .map(|state| {
-            if state.is_empty() {
-                default_backend_name().to_string()
-            } else {
-                state.clone()
-            }
-        })
-        .unwrap_or_else(|_| default_backend_name().to_string())
-}
-
-/// Create the current backend instance
-pub(crate) fn create_current_backend() -> PyResult<Box<dyn registry::ErasedBackend>> {
-    ensure_backends_registered();
-
-    let name = get_current_backend_name();
-    registry::create_backend(&name)
-        .ok_or_else(|| PyValueError::new_err(format!("backend '{}' not available", name)))
+pub fn list_backends() -> Vec<&'static str> {
+    gpt_rs_backends::names()
 }

@@ -50,7 +50,7 @@ ignore_missing_imports = true
 
 [tool.basedpyright]
 include = ["scripts"]
-extraPaths = ["scripts"]
+extraPaths = ["scripts", "crates/gpt-rs-py/python"]
 pythonVersion = "3.10"
 typeCheckingMode = "standard"
 

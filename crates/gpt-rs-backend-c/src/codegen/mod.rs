@@ -1,60 +1,51 @@
 mod emit;
 mod outline;
+mod plan;
 mod profile;
+mod select;
 mod types;
 mod utils;
 mod value_info;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use gpt_rs::backend::conversion::{BufferPlan, ConversionError, ConversionResult};
-use gpt_rs::backend::spec::Program;
+use anyhow::{anyhow, Result};
+use gpt_rs_ir::module::Module;
+use gpt_rs_ir::traits::Terminator;
+use gpt_rs_ir::types::TensorType;
 
-use crate::dtype::dtype_tag_value;
+use crate::dtype::dtype_tag;
 use crate::kernels;
 
-use self::emit::{emit_instructions, emit_region_function, EntryEmit};
+use self::emit::emit_instructions;
 use self::outline::Outliner;
-use self::profile::{emit_c_profile_metadata, emit_matmul_cache_metadata, OpProfile};
-use self::types::{MatmulCacheEntry, ValueKey, ValueStorage};
+use self::profile::{emit_c_profile_metadata, OpProfile};
+use self::types::ValueStorage;
 use self::utils::{c_type, emit_value_array, push_block};
-use self::value_info::{
-    build_value_infos, emit_tensor_dims, flatten_result_bindings, flatten_value_types,
-    is_tuple_type, literal_to_values, output_indices_map, value_info_for_path, LiteralCache,
-};
+use self::value_info::{build_value_infos, constant_values, emit_tensor_dims, tensor_type};
 
-pub fn generate_c_module(
-    program: &Program,
-    entrypoint: &str,
-    plan: &BufferPlan,
-) -> ConversionResult<String> {
-    let function = program
-        .functions
-        .iter()
-        .find(|f| f.name == program.entry)
-        .ok_or_else(|| ConversionError::new("entry function not found"))?;
+/// The C function that the generated source exports: it takes the inputs and the outputs of the
+/// function as `PtirTensor` arrays and returns 0 on success.
+pub const ENTRY_SYMBOL: &str = "gpt_rs_c_entry";
 
-    if function.parameters.iter().any(is_tuple_type) {
-        return Err(ConversionError::new(
-            "tuple-typed parameters are not supported by C codegen yet",
-        ));
-    }
+/// The C source of the function `func` of `module`, which exports [`ENTRY_SYMBOL`].
+pub fn generate_c_module(module: &Module, func: &str) -> Result<String> {
+    let func_inst = module
+        .func(func)
+        .ok_or_else(|| anyhow!("the module has no function @{func}"))?;
+    let body = module.regions(func_inst)[0];
+    let args = module.args(body).to_vec();
+    let (ops, terminator): (Vec<_>, Vec<_>) = module
+        .insts(body)
+        .partition(|&inst| !module.op(inst).has_trait::<Terminator>());
+    let results = terminator
+        .first()
+        .map(|&inst| module.operands(inst).to_vec())
+        .unwrap_or_default();
+    let insts = select::select(module, &ops, &results)?;
+    let (value_infos, constants) = build_value_infos(module, &args, &insts, &results)?;
 
-    let func_plan = plan
-        .function(&function.name)
-        .ok_or_else(|| ConversionError::new("buffer plan missing entry function"))?;
-
-    let result_bindings = flatten_result_bindings(&function.result_ids, &function.results)?;
-    let output_indices = output_indices_map(&result_bindings);
-    let (value_infos, const_literals) = build_value_infos(
-        &function.parameter_ids,
-        &function.parameters,
-        &function.body,
-        func_plan,
-        &output_indices,
-    )?;
-
-    let mut module = String::new();
+    let mut source = String::new();
     let kernels_src = kernels::emit_c_kernels();
     let header = format!(
         r#"
@@ -73,12 +64,6 @@ pub fn generate_c_module(
               void* data;
             }} PtirTensor;
 
-            #define PTIR_DTYPE_F32 0u
-            #define PTIR_DTYPE_F16 1u
-            #define PTIR_DTYPE_BF16 2u
-            #define PTIR_DTYPE_SI32 3u
-            #define PTIR_DTYPE_I1 4u
-
             {kernels_src}
             static int check_tensor(const PtirTensor* t, uint32_t dtype, uint32_t rank, const int64_t* dims) {{
               if (!t || !t->data || !t->dims) {{ return 0; }}
@@ -90,44 +75,28 @@ pub fn generate_c_module(
             }}
         "#
     );
-    push_block(&mut module, 0, &header);
+    push_block(&mut source, 0, &header);
 
     let mut body = String::new();
     let mut matmul_profile = OpProfile::default();
-    let mut matmul_caches: Vec<MatmulCacheEntry> = Vec::new();
 
-    if !program.regions.is_empty() {
-        for region in &program.regions {
-            let region_id = region.id.0;
-            push_block(
-                &mut body,
-                0,
-                &format!(
-                    "static int region_r{region_id}(const void* const* inputs, void* const* outputs);"
-                ),
-            );
-        }
-        body.push('\n');
-    }
-
-    for region in &program.regions {
-        let region_plan = plan
-            .region(region.id)
-            .ok_or_else(|| ConversionError::new("buffer plan missing region"))?;
-        emit_region_function(&mut body, region, region_plan, program, &mut matmul_profile)?;
-    }
-
-    let input_specs = flatten_value_types(&function.parameters)?;
-    let output_specs = flatten_value_types(&function.results)?;
-    let input_dims = emit_tensor_dims(&mut body, "kInputDims", &input_specs)?;
-    let output_dims = emit_tensor_dims(&mut body, "kOutputDims", &output_specs)?;
+    let input_types: Vec<TensorType> = args
+        .iter()
+        .map(|&arg| tensor_type(module, arg))
+        .collect::<Result<_>>()?;
+    let output_types: Vec<TensorType> = results
+        .iter()
+        .map(|&result| tensor_type(module, result))
+        .collect::<Result<_>>()?;
+    let input_dims = emit_tensor_dims(&mut body, "kInputDims", &input_types)?;
+    let output_dims = emit_tensor_dims(&mut body, "kOutputDims", &output_types)?;
 
     let mut entry = String::new();
-    let input_count = input_specs.len();
-    let output_count = output_specs.len();
+    let input_count = input_types.len();
+    let output_count = output_types.len();
     let entry_header = format!(
         r#"
-            int {entrypoint}(
+            int {ENTRY_SYMBOL}(
               const PtirTensor* inputs,
               size_t input_count,
               PtirTensor* outputs,
@@ -142,9 +111,9 @@ pub fn generate_c_module(
     push_block(&mut entry, 0, &entry_header);
 
     for (index, dims_name) in input_dims.iter().enumerate() {
-        let spec = &input_specs[index];
-        let tag = dtype_tag_value(spec.dtype)?;
-        let rank = spec.shape.rank();
+        let ty = &input_types[index];
+        let tag = dtype_tag(ty.dtype)?;
+        let rank = ty.rank();
         push_block(
             &mut entry,
             1,
@@ -154,9 +123,9 @@ pub fn generate_c_module(
         );
     }
     for (index, dims_name) in output_dims.iter().enumerate() {
-        let spec = &output_specs[index];
-        let tag = dtype_tag_value(spec.dtype)?;
-        let rank = spec.shape.rank();
+        let ty = &output_types[index];
+        let tag = dtype_tag(ty.dtype)?;
+        let rank = ty.rank();
         push_block(
             &mut entry,
             1,
@@ -166,24 +135,24 @@ pub fn generate_c_module(
         );
     }
 
-    let mut literal_cache = LiteralCache::hoisted();
     let mut param_types = HashMap::new();
 
-    let mut value_keys: Vec<ValueKey> = value_infos.keys().cloned().collect();
-    value_keys.sort_by(|a, b| match a.value.0.cmp(&b.value.0) {
-        std::cmp::Ordering::Equal => a.path.cmp(&b.path),
-        other => other,
-    });
-    let mut declared = std::collections::HashSet::new();
-    for value_key in value_keys.iter() {
-        let value_info = value_infos.get(value_key).expect("value id must exist");
+    // Every value, in the order the function defines them.
+    let values: Vec<_> = args
+        .iter()
+        .copied()
+        .chain(insts.iter().flat_map(|inst| inst.results.iter().copied()))
+        .collect();
+    let mut declared = HashSet::new();
+    for value in &values {
+        let value_info = &value_infos[value];
         if matches!(value_info.storage, ValueStorage::Alias) {
             continue;
         }
         if !declared.insert(value_info.var.clone()) {
             continue;
         }
-        let ctype = c_type(value_info.spec.dtype)?;
+        let ctype = c_type(value_info.ty.dtype)?;
         let param_type = match value_info.storage {
             ValueStorage::Input { .. } | ValueStorage::Const => format!("const {ctype}*"),
             _ => format!("{ctype}*"),
@@ -218,12 +187,7 @@ pub fn generate_c_module(
             }
             ValueStorage::Const => {
                 let const_name = value_info.const_name.as_ref().expect("const name");
-                let literal = const_literals
-                    .get(&value_key.value)
-                    .ok_or_else(|| ConversionError::new("missing const literal"))?
-                    .clone();
-                let values = literal_to_values(&literal, Some(value_info.elem_count))?;
-                let values_str = emit_value_array(&values);
+                let values_str = emit_value_array(&constant_values(&constants[value])?);
                 let var = &value_info.var;
                 let block = format!(
                     r#"
@@ -242,32 +206,25 @@ pub fn generate_c_module(
         entry.push('\n');
     }
 
-    let mut outliner = Outliner::new(param_types, &value_infos);
+    let mut outliner = Outliner::new(param_types);
     emit_instructions(
         &mut entry,
-        &function.body,
+        &insts,
         &value_infos,
-        &mut literal_cache,
-        program,
         &mut matmul_profile,
-        Some(EntryEmit {
-            matmul_caches: &mut matmul_caches,
-            outliner: &mut outliner,
-        }),
+        &mut outliner,
     )?;
     let outlined_ops = outliner.finish();
 
-    if !function.results.is_empty() {
+    if !results.is_empty() {
         entry.push('\n');
     }
 
-    for (index, binding) in result_bindings.iter().enumerate() {
-        let info = value_info_for_path(&value_infos, binding.value, &binding.path)
-            .map_err(|_| ConversionError::new("missing result value info"))?;
-        if matches!(
-            info.storage,
-            ValueStorage::Output { .. } | ValueStorage::Alias
-        ) {
+    // A result that the function computes into its output buffer is in place. Any other result,
+    // such as an argument, a constant, or a value returned twice, is copied.
+    for (index, result) in results.iter().enumerate() {
+        let info = &value_infos[result];
+        if info.storage == (ValueStorage::Output { index }) {
             continue;
         }
         let var = &info.var;
@@ -275,13 +232,13 @@ pub fn generate_c_module(
         push_block(
             &mut entry,
             1,
-            &format!("memcpy(outputs[{index}].data, {var}, {byte_len});"),
+            &format!("gpt_rs_copy(outputs[{index}].data, {var}, {byte_len});"),
         );
     }
 
-    let mut freed = std::collections::HashSet::new();
-    for value_key in value_keys.iter() {
-        let value_info = value_infos.get(value_key).expect("value id must exist");
+    let mut freed = HashSet::new();
+    for value in &values {
+        let value_info = &value_infos[value];
         if matches!(value_info.storage, ValueStorage::Temp { .. })
             && freed.insert(value_info.var.clone())
         {
@@ -295,10 +252,7 @@ pub fn generate_c_module(
     entry.push('\n');
 
     let profile_meta = emit_c_profile_metadata(&matmul_profile);
-    let cache_meta = emit_matmul_cache_metadata(&matmul_caches, input_specs.len());
-    let file_literals = literal_cache.take_hoisted();
-    module =
-        format!("{module}{profile_meta}{cache_meta}{body}{file_literals}{outlined_ops}{entry}");
+    source = format!("{source}{profile_meta}{body}{outlined_ops}{entry}");
 
-    Ok(module)
+    Ok(source)
 }

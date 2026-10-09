@@ -7,22 +7,21 @@
 
 use std::collections::HashMap;
 
-use gpt_rs::backend::conversion::{ConversionError, ConversionResult};
-use gpt_rs::backend::spec::{Instruction, Operand, ValueId};
+use anyhow::{ensure, Result};
+use gpt_rs_ir::module::Value;
 
-use super::types::{ValueInfo, ValueKey};
+use super::types::{Instruction, ValueInfo};
 use super::utils::push_block;
 
 pub(super) struct Outliner {
     param_types: HashMap<String, String>,
-    keys_by_value: HashMap<ValueId, Vec<ValueKey>>,
     definitions: String,
     by_body: HashMap<String, String>,
 }
 
 /// Value infos of one instruction with its buffer variables renamed to parameters.
 pub(super) struct RenamedOperands {
-    pub(super) value_infos: HashMap<ValueKey, ValueInfo>,
+    pub(super) value_infos: HashMap<Value, ValueInfo>,
     /// Original variable of each parameter, in parameter order.
     args: Vec<String>,
 }
@@ -32,23 +31,9 @@ fn param_name(index: usize) -> String {
 }
 
 impl Outliner {
-    pub(super) fn new(
-        param_types: HashMap<String, String>,
-        value_infos: &HashMap<ValueKey, ValueInfo>,
-    ) -> Self {
-        let mut keys_by_value: HashMap<ValueId, Vec<ValueKey>> = HashMap::new();
-        for key in value_infos.keys() {
-            keys_by_value
-                .entry(key.value)
-                .or_default()
-                .push(key.clone());
-        }
-        for keys in keys_by_value.values_mut() {
-            keys.sort_by(|a, b| a.path.cmp(&b.path));
-        }
+    pub(super) fn new(param_types: HashMap<String, String>) -> Self {
         Self {
             param_types,
-            keys_by_value,
             definitions: String::new(),
             by_body: HashMap::new(),
         }
@@ -58,38 +43,28 @@ impl Outliner {
     /// variable to the next parameter.
     pub(super) fn rename(
         &self,
-        inst: &Instruction,
-        value_infos: &HashMap<ValueKey, ValueInfo>,
-    ) -> ConversionResult<RenamedOperands> {
-        let values = inst
-            .operands
-            .iter()
-            .filter_map(|operand| match operand {
-                Operand::Value(value) | Operand::TupleElement { tuple: value, .. } => Some(*value),
-                Operand::Literal(_) => None,
-            })
-            .chain(std::iter::once(inst.id));
+        inst: &Instruction<'_>,
+        value_infos: &HashMap<Value, ValueInfo>,
+    ) -> Result<RenamedOperands> {
+        let values = inst.operands.iter().chain(&inst.results).copied();
         let mut renamed = HashMap::new();
         let mut args: Vec<String> = Vec::new();
         for value in values {
-            for key in self.keys_by_value.get(&value).into_iter().flatten() {
-                let mut info = value_infos[key].clone();
-                if !self.param_types.contains_key(&info.var) {
-                    return Err(ConversionError::new(format!(
-                        "buffer variable '{}' is not declared in the entry function",
-                        info.var
-                    )));
+            let mut info = value_infos[&value].clone();
+            ensure!(
+                self.param_types.contains_key(&info.var),
+                "buffer variable '{}' is not declared in the entry function",
+                info.var
+            );
+            let index = match args.iter().position(|arg| *arg == info.var) {
+                Some(index) => index,
+                None => {
+                    args.push(info.var.clone());
+                    args.len() - 1
                 }
-                let index = match args.iter().position(|arg| *arg == info.var) {
-                    Some(index) => index,
-                    None => {
-                        args.push(info.var.clone());
-                        args.len() - 1
-                    }
-                };
-                info.var = param_name(index);
-                renamed.insert(key.clone(), info);
-            }
+            };
+            info.var = param_name(index);
+            renamed.insert(value, info);
         }
         Ok(RenamedOperands {
             value_infos: renamed,

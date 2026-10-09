@@ -33,12 +33,12 @@ impl RmsNorm {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> Tensor {
         let scale = if self.unit_offset {
-            functional::add_scalar(&self.weight, 1.0)?
+            &self.weight + 1.0
         } else {
             self.weight.clone()
         };
-        Ok(functional::rms_norm(x, &scale, self.eps)?.output)
+        functional::rms_norm(x, &scale, self.eps)
     }
 }

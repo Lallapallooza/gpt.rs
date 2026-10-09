@@ -1,0 +1,14 @@
+// RUN: roundtrip
+
+// A load-time function binds its results to the parameters they compute.
+func.func @static(%0: tensor<4xf32> {param = 1}, %1: tensor<4xf32> {param = 2}) -> (tensor<4xf32> {param = 170141183460469231731687303715884105728}, tensor<4xf32> {param = 9}) {
+  %2 = tensor.add(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%2, %0) : (tensor<4xf32>, tensor<4xf32>) -> ()
+}
+
+// -----
+
+// A function can return nothing and take index and scalar arguments.
+func.func @no_results(%0: tensor<4xf32>, %1: index, %2: f32) -> () {
+  func.return() : () -> ()
+}

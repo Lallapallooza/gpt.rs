@@ -12,3 +12,8 @@ pub use ministral::{Ministral, MinistralConfig};
 pub use mobilenet_v2::{MobileNetV2, MobileNetV2Config};
 pub use qwen3_5::{Qwen35, Qwen35Config};
 pub use resnet::{ResNet, ResNetConfig};
+
+/// `silu`, the `hidden_act` that `transformers` configs of the Llama family default to.
+fn silu() -> crate::nn::ActivationFunction {
+    crate::nn::ActivationFunction::Silu
+}

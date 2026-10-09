@@ -1,10 +1,8 @@
-use crate::labels;
-use gpt_rs::backend::conversion::ConversionResult;
-use gpt_rs::backend::spec::{Operation, TensorSpec};
-use gpt_rs::profiling::{tensor_spec_signature, WorkStats};
+use anyhow::Result;
+use gpt_rs::profiling::WorkStats;
+use gpt_rs_ir::types::TensorType;
 
-use super::types::{MatmulCacheEntry, ValueInfo};
-use super::utils::{escape_c_string, push_block, sizing_from_spec};
+use super::utils::{escape_c_string, push_block, sizing};
 
 #[derive(Default)]
 pub(super) struct OpProfile {
@@ -70,13 +68,13 @@ pub(super) fn matmul_work_stats(
     }
 }
 pub(super) fn elementwise_work_stats(
-    out_spec: &TensorSpec,
-    input_specs: &[TensorSpec],
-) -> ConversionResult<WorkStats> {
-    let (out_elems, out_bytes) = sizing_from_spec(out_spec)?;
+    out_spec: &TensorType,
+    input_specs: &[TensorType],
+) -> Result<WorkStats> {
+    let (out_elems, out_bytes) = sizing(out_spec)?;
     let mut bytes_read: u64 = 0;
     for spec in input_specs {
-        let (_, bytes) = sizing_from_spec(spec)?;
+        let (_, bytes) = sizing(spec)?;
         bytes_read = bytes_read.saturating_add(bytes as u64);
     }
     Ok(WorkStats {
@@ -213,109 +211,32 @@ pub(super) fn emit_c_profile_metadata(profile: &OpProfile) -> String {
     push_block(&mut out, 0, &helpers);
     out
 }
-/// Returns the C argument for the packed copy of b that op `op_id` keeps. When `caches` is given
-/// and b is the entry input `rhs_index`, this registers a cache. Otherwise it returns `NULL`.
-pub(super) fn bpack_cache_arg(
-    caches: Option<&mut Vec<MatmulCacheEntry>>,
-    rhs_index: Option<usize>,
-    op_id: usize,
-    n: usize,
-    k: usize,
-    sbk: usize,
-    sbn: usize,
-) -> String {
-    let (Some(caches), Some(rhs_index)) = (caches, rhs_index) else {
-        return "NULL".to_string();
-    };
-    caches.push(MatmulCacheEntry {
-        op_id,
-        rhs_index,
-        n,
-        k,
-        sbk,
-        sbn,
-    });
-    format!("&gpt_rs_bcache_{op_id}")
-}
-pub(super) fn emit_matmul_cache_metadata(
-    entries: &[MatmulCacheEntry],
-    input_count: usize,
-) -> String {
-    if entries.is_empty() {
-        return String::new();
-    }
-    let mut out = String::new();
-    for entry in entries {
-        let op_id = entry.op_id;
-        let block = format!(
-            r#"
-                static GPTRS_THREAD_LOCAL gpt_rs_bpack_cache gpt_rs_bcache_{op_id};
-            "#
-        );
-        push_block(&mut out, 0, &block);
-    }
-    let header = format!(
-        r#"
-            void gpt_rs_c_prepare(const PtirTensor* inputs, size_t input_count) {{
-              if (!inputs || input_count != {input_count}) {{ return; }}
-        "#
-    );
-    push_block(&mut out, 0, &header);
-    for entry in entries {
-        let MatmulCacheEntry {
-            op_id,
-            rhs_index,
-            n,
-            k,
-            sbk,
-            sbn,
-        } = *entry;
-        let block = format!(
-            r#"
-                {{
-                  const float* b = (const float*)inputs[{rhs_index}].data;
-                  if (b) {{
-                    gpt_rs_bpack_cache_prepare(&gpt_rs_bcache_{op_id}, b, {n}, {k}, {sbk}, {sbn});
-                  }}
-                }}
-            "#
-        );
-        push_block(&mut out, 1, &block);
-    }
-    push_block(&mut out, 0, "}");
-    out.push('\n');
-    out.push('\n');
-    out
-}
-pub(super) fn backend_operation_label(op: &Operation) -> &'static str {
-    labels::backend_operation_label(op)
-}
-pub(super) fn signature_unary(out_spec: &TensorSpec, input_spec: &TensorSpec) -> String {
-    let input_sig = tensor_spec_signature(input_spec);
-    let out_sig = tensor_spec_signature(out_spec);
+pub(super) fn signature_unary(out_spec: &TensorType, input_spec: &TensorType) -> String {
+    let input_sig = input_spec.to_string();
+    let out_sig = out_spec.to_string();
     format!("x={input_sig} out={out_sig}")
 }
 pub(super) fn signature_binary(
-    out_spec: &TensorSpec,
-    lhs_spec: &TensorSpec,
-    rhs_spec: &TensorSpec,
+    out_spec: &TensorType,
+    lhs_spec: &TensorType,
+    rhs_spec: &TensorType,
 ) -> String {
-    let lhs_sig = tensor_spec_signature(lhs_spec);
-    let rhs_sig = tensor_spec_signature(rhs_spec);
-    let out_sig = tensor_spec_signature(out_spec);
+    let lhs_sig = lhs_spec.to_string();
+    let rhs_sig = rhs_spec.to_string();
+    let out_sig = out_spec.to_string();
     format!("lhs={lhs_sig} rhs={rhs_sig} out={out_sig}")
 }
-pub(super) fn signature_generic(out_spec: &TensorSpec, input_specs: &[TensorSpec]) -> String {
+pub(super) fn signature_generic(out_spec: &TensorType, input_specs: &[TensorType]) -> String {
     let inputs = input_specs
         .iter()
         .enumerate()
         .map(|(idx, spec)| {
-            let sig = tensor_spec_signature(spec);
+            let sig = spec.to_string();
             format!("in{idx}={sig}")
         })
         .collect::<Vec<_>>()
         .join(" ");
-    let out_sig = tensor_spec_signature(out_spec);
+    let out_sig = out_spec.to_string();
     let out = format!("out={out_sig}");
     if inputs.is_empty() {
         out
@@ -326,9 +247,9 @@ pub(super) fn signature_generic(out_spec: &TensorSpec, input_specs: &[TensorSpec
 pub(super) fn register_op_profile_unary(
     profile: &mut OpProfile,
     label: &str,
-    out_spec: &TensorSpec,
-    input_spec: &TensorSpec,
-) -> ConversionResult<usize> {
+    out_spec: &TensorType,
+    input_spec: &TensorType,
+) -> Result<usize> {
     let signature = signature_unary(out_spec, input_spec);
     let work = elementwise_work_stats(out_spec, std::slice::from_ref(input_spec))?;
     Ok(profile.register(label, signature, work))
@@ -336,10 +257,10 @@ pub(super) fn register_op_profile_unary(
 pub(super) fn register_op_profile_binary(
     profile: &mut OpProfile,
     label: &str,
-    out_spec: &TensorSpec,
-    lhs_spec: &TensorSpec,
-    rhs_spec: &TensorSpec,
-) -> ConversionResult<usize> {
+    out_spec: &TensorType,
+    lhs_spec: &TensorType,
+    rhs_spec: &TensorType,
+) -> Result<usize> {
     let signature = signature_binary(out_spec, lhs_spec, rhs_spec);
     let inputs = [lhs_spec.clone(), rhs_spec.clone()];
     let work = elementwise_work_stats(out_spec, &inputs)?;
@@ -348,80 +269,10 @@ pub(super) fn register_op_profile_binary(
 pub(super) fn register_op_profile_generic(
     profile: &mut OpProfile,
     label: &str,
-    out_spec: &TensorSpec,
-    input_specs: &[TensorSpec],
-) -> ConversionResult<usize> {
+    out_spec: &TensorType,
+    input_specs: &[TensorType],
+) -> Result<usize> {
     let signature = signature_generic(out_spec, input_specs);
     let work = elementwise_work_stats(out_spec, input_specs)?;
-    Ok(profile.register(label, signature, work))
-}
-pub(super) fn register_op_profile_custom_call(
-    profile: &mut OpProfile,
-    label: &str,
-    out_spec: &TensorSpec,
-    input_specs: &[TensorSpec],
-    target: &str,
-) -> ConversionResult<usize> {
-    let mut parts = Vec::new();
-    if !target.is_empty() {
-        parts.push(format!("target={target}"));
-    }
-    let generic = signature_generic(out_spec, input_specs);
-    if !generic.is_empty() {
-        parts.push(generic);
-    }
-    let signature = parts.join(" ");
-    let work = elementwise_work_stats(out_spec, input_specs)?;
-    Ok(profile.register(label, signature, work))
-}
-pub(super) fn register_op_profile_multi_output(
-    profile: &mut OpProfile,
-    label: &str,
-    outputs: &[&ValueInfo],
-    input_specs: &[TensorSpec],
-) -> ConversionResult<usize> {
-    let inputs = input_specs
-        .iter()
-        .enumerate()
-        .map(|(idx, spec)| {
-            let sig = tensor_spec_signature(spec);
-            format!("in{idx}={sig}")
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    let output_sigs = outputs
-        .iter()
-        .enumerate()
-        .map(|(idx, info)| {
-            let sig = tensor_spec_signature(&info.spec);
-            format!("out{idx}={sig}")
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    let signature = [inputs, output_sigs]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let mut bytes_read: u64 = 0;
-    for spec in input_specs {
-        let (_, bytes) = sizing_from_spec(spec)?;
-        bytes_read = bytes_read.saturating_add(bytes as u64);
-    }
-    let mut elements: u64 = 0;
-    let mut bytes_written: u64 = 0;
-    for info in outputs {
-        elements = elements.saturating_add(info.elem_count as u64);
-        bytes_written = bytes_written.saturating_add(info.byte_len as u64);
-    }
-    let work = WorkStats {
-        elements,
-        bytes_read,
-        bytes_written,
-        flops: 0,
-        alloc_bytes: 0,
-        alloc_count: 0,
-    };
     Ok(profile.register(label, signature, work))
 }

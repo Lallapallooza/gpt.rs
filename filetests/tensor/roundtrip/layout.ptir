@@ -1,0 +1,98 @@
+// RUN: roundtrip
+
+func.func @transpose(%0: tensor<2x3x4xf32>) -> tensor<4x2x3xf32> {
+  %1 = tensor.transpose(%0) {perm = [2, 0, 1]} : (tensor<2x3x4xf32>) -> tensor<4x2x3xf32>
+  func.return(%1) : (tensor<4x2x3xf32>) -> ()
+}
+
+// -----
+
+func.func @reshape(%0: tensor<2x3x4xf32>) -> (tensor<6x4xf32>, tensor<2x12xf32>, tensor<24xf32>) {
+  %1 = tensor.reshape(%0) {shape = [6, 4]} : (tensor<2x3x4xf32>) -> tensor<6x4xf32>
+  %2 = tensor.reshape(%0) {shape = [2, 12]} : (tensor<2x3x4xf32>) -> tensor<2x12xf32>
+  %3 = tensor.reshape(%0) {shape = [24]} : (tensor<2x3x4xf32>) -> tensor<24xf32>
+  func.return(%1, %2, %3) : (tensor<6x4xf32>, tensor<2x12xf32>, tensor<24xf32>) -> ()
+}
+
+// -----
+
+func.func @reshape_scalar(%0: tensor<1x1xsi32>) -> tensor<si32> {
+  %1 = tensor.reshape(%0) {shape = []} : (tensor<1x1xsi32>) -> tensor<si32>
+  func.return(%1) : (tensor<si32>) -> ()
+}
+
+// -----
+
+func.func @reshape_dynamic(%0: tensor<{B}x3x4xf32>) -> (tensor<{B}x12xf32>, tensor<{B}x2x6xf32>) {
+  %1 = tensor.reshape(%0) {shape = [{B}, 12]} : (tensor<{B}x3x4xf32>) -> tensor<{B}x12xf32>
+  %2 = tensor.reshape(%0) {shape = [{B}, 2, 6]} : (tensor<{B}x3x4xf32>) -> tensor<{B}x2x6xf32>
+  func.return(%1, %2) : (tensor<{B}x12xf32>, tensor<{B}x2x6xf32>) -> ()
+}
+
+// -----
+
+// An empty tensor has no elements, whatever its dynamic extents are.
+func.func @reshape_empty(%0: tensor<0x{B}xf32>) -> tensor<0xf32> {
+  %1 = tensor.reshape(%0) {shape = [0]} : (tensor<0x{B}xf32>) -> tensor<0xf32>
+  func.return(%1) : (tensor<0xf32>) -> ()
+}
+
+// -----
+
+func.func @broadcast_to(%0: tensor<3xf32>, %1: tensor<1x3xsi32>, %2: tensor<i1>) -> (tensor<2x3xf32>, tensor<4x2x3xsi32>, tensor<2x2xi1>) {
+  %3 = tensor.broadcast_to(%0) {shape = [2, 3]} : (tensor<3xf32>) -> tensor<2x3xf32>
+  %4 = tensor.broadcast_to(%1) {shape = [4, 2, 3]} : (tensor<1x3xsi32>) -> tensor<4x2x3xsi32>
+  %5 = tensor.broadcast_to(%2) {shape = [2, 2]} : (tensor<i1>) -> tensor<2x2xi1>
+  func.return(%3, %4, %5) : (tensor<2x3xf32>, tensor<4x2x3xsi32>, tensor<2x2xi1>) -> ()
+}
+
+// -----
+
+func.func @broadcast_to_dynamic(%0: tensor<1x768xf32>, %1: tensor<{B}x1xf32>) -> (tensor<{B}x768xf32>, tensor<2x{B}x4xf32>) {
+  %2 = tensor.broadcast_to(%0) {shape = [{B}, 768]} : (tensor<1x768xf32>) -> tensor<{B}x768xf32>
+  %3 = tensor.broadcast_to(%1) {shape = [2, {B}, 4]} : (tensor<{B}x1xf32>) -> tensor<2x{B}x4xf32>
+  func.return(%2, %3) : (tensor<{B}x768xf32>, tensor<2x{B}x4xf32>) -> ()
+}
+
+// -----
+
+func.func @slice(%0: tensor<4x6xf32>, %1: tensor<{B}x6xf32>) -> (tensor<2x3xf32>, tensor<1x4xf32>) {
+  %2 = tensor.slice(%0) {starts = [1, 2], sizes = [2, 3]} : (tensor<4x6xf32>) -> tensor<2x3xf32>
+  %3 = tensor.slice(%1) {starts = [0, 2], sizes = [1, 4]} : (tensor<{B}x6xf32>) -> tensor<1x4xf32>
+  func.return(%2, %3) : (tensor<2x3xf32>, tensor<1x4xf32>) -> ()
+}
+
+// -----
+
+func.func @concat(%0: tensor<2x3xf32>, %1: tensor<4x3xf32>, %2: tensor<2x1xf32>) -> (tensor<6x3xf32>, tensor<2x4xf32>, tensor<2x3xf32>) {
+  %3 = tensor.concat(%0, %1) {axis = 0} : (tensor<2x3xf32>, tensor<4x3xf32>) -> tensor<6x3xf32>
+  %4 = tensor.concat(%0, %2) {axis = 1} : (tensor<2x3xf32>, tensor<2x1xf32>) -> tensor<2x4xf32>
+  %5 = tensor.concat(%0) {axis = 1} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+  func.return(%3, %4, %5) : (tensor<6x3xf32>, tensor<2x4xf32>, tensor<2x3xf32>) -> ()
+}
+
+// -----
+
+func.func @concat_dynamic(%0: tensor<{B}x3xf32>, %1: tensor<{B}x5xf32>, %2: tensor<{T}x2xf32>) -> (tensor<{B}x8xf32>, tensor<{T}x2xf32>) {
+  %3 = tensor.concat(%0, %1) {axis = 1} : (tensor<{B}x3xf32>, tensor<{B}x5xf32>) -> tensor<{B}x8xf32>
+  %4 = tensor.concat(%2) {axis = 0} : (tensor<{T}x2xf32>) -> tensor<{T}x2xf32>
+  func.return(%3, %4) : (tensor<{B}x8xf32>, tensor<{T}x2xf32>) -> ()
+}
+
+// -----
+
+func.func @strided_slice(%0: tensor<4x9xf32>) -> tensor<2x3xf32> {
+  %1 = tensor.slice(%0) {starts = [1, 0], sizes = [2, 3], strides = [2, 4]} : (tensor<4x9xf32>) -> tensor<2x3xf32>
+  func.return(%1) : (tensor<2x3xf32>) -> ()
+}
+
+// -----
+
+// The bits of the last axis read as another dtype: eight 4-bit codes per 32-bit word, and three
+// bytes per four 6-bit codes.
+func.func @bitcast(%0: tensor<4x2xsi32>, %1: tensor<4x3xui8>, %2: tensor<4xbf16>) -> (tensor<4x16xui4>, tensor<4x4xf6e2m3>, tensor<4xsi16>) {
+  %3 = tensor.bitcast(%0) {to = ui4} : (tensor<4x2xsi32>) -> tensor<4x16xui4>
+  %4 = tensor.bitcast(%1) {to = f6e2m3} : (tensor<4x3xui8>) -> tensor<4x4xf6e2m3>
+  %5 = tensor.bitcast(%2) {to = si16} : (tensor<4xbf16>) -> tensor<4xsi16>
+  func.return(%3, %4, %5) : (tensor<4x16xui4>, tensor<4x4xf6e2m3>, tensor<4xsi16>) -> ()
+}

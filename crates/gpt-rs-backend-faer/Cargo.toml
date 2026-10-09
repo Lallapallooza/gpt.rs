@@ -11,10 +11,13 @@ default = []
 torch = ["gpt-rs-backend-tests/torch"]
 
 [dependencies]
+anyhow = { workspace = true }
+bytemuck = "1"
 faer = "0.23"
+gemm-common = { version = "0.18", default-features = false, features = ["std"] }
 gpt-rs = { path = "../gpt-rs", version = "0.1.0" }
-gpt-rs-backend-ref-cpu = { path = "../gpt-rs-backend-ref-cpu", version = "0.1.0" }
-linkme = "0.3"
+gpt-rs-ir = { path = "../gpt-rs-ir", version = "0.1.0" }
+half = "2.6"
 
 [dev-dependencies]
 gpt-rs-backend-tests = { path = "../gpt-rs-backend-tests", version = "0.1.0" }

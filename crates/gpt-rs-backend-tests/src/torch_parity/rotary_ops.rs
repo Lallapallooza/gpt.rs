@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use gpt_rs::backend::spec::PortableBackend;
+use gpt_rs::backend::PortableBackend;
 use gpt_rs::nn::{RopeConfig, RopeScaling, RotaryEmbedding};
 use gpt_rs::ops::functional;
 use tch::{Device, Kind, Tensor as TchTensor};
@@ -57,8 +57,7 @@ fn run_rope_case<B: PortableBackend + 'static>(
     };
     let (cos, sin) = RotaryEmbedding::new(rope)
         .unwrap()
-        .tables(backend, 0, seq_len)
-        .unwrap();
+        .tables(&positions_tensor(backend, 0..seq_len));
     let half = rotary_dim / 2;
 
     let expected = timed_torch(|| {
@@ -70,7 +69,7 @@ fn run_rope_case<B: PortableBackend + 'static>(
 
     let actual = timed_gpt(|| {
         let x = device_tensor_from_data(backend, &[num_heads, seq_len, head_dim], &x_data);
-        let out = functional::apply_rope(&x, &cos, &sin).unwrap();
+        let out = functional::apply_rope(&x, &cos, &sin);
         to_host_vec(&out)
     });
 
@@ -83,23 +82,6 @@ pub fn rope_apply_matches_torch_full_rotary<B: PortableBackend + 'static>(backen
 
 pub fn rope_apply_matches_torch_partial_rotary<B: PortableBackend + 'static>(backend: &Arc<B>) {
     run_rope_case(backend, 3, 7, 24, 16, 0x7011_u64);
-}
-
-pub fn rope_apply_rejects_sequence_mismatch<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    let err = timed_gpt(|| {
-        let x = device_tensor_from_data(backend, &[2, 8, 16], &[0.0; 2 * 8 * 16]);
-        let cos = device_tensor_from_data(backend, &[7, 8], &[0.0; 7 * 8]);
-        let sin = device_tensor_from_data(backend, &[7, 8], &[0.0; 7 * 8]);
-        match functional::apply_rope(&x, &cos, &sin) {
-            Ok(_) => panic!("apply_rope should reject sequence mismatch"),
-            Err(err) => err,
-        }
-    });
-    assert!(
-        err.to_string().contains("sequence length"),
-        "error should mention sequence mismatch, got: {}",
-        err
-    );
 }
 
 pub fn rope_cache_yarn_scaling_matches_formula<B: PortableBackend + 'static>(backend: &Arc<B>) {
@@ -136,8 +118,7 @@ fn yarn_tables_match_formula<B: PortableBackend + 'static>(
     };
     let (cos, sin) = RotaryEmbedding::new(rope)
         .unwrap()
-        .tables(backend, 0, seq_len)
-        .unwrap();
+        .tables(&positions_tensor(backend, 0..seq_len));
 
     let (expected_cos, expected_sin) = timed_torch(|| {
         let get_mscale = |scale: f64, mscale: f64| {

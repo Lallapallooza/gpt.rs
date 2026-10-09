@@ -1,0 +1,33 @@
+// RUN: pass prune-params
+
+// A parameter argument that nothing reads goes. A run-time argument stays even when nothing reads
+// it, so the run-time arguments keep their positions.
+// CHECK: func.func @unread(%0: tensor<4xf32>, %1: tensor<4xf32>, %2: tensor<4xf32> {param = 2}) -> tensor<4xf32>
+// CHECK-NEXT: tensor.add(%0, %2)
+func.func @unread(%0: tensor<4xf32>, %1: tensor<4xf32> {param = 1}, %2: tensor<4xf32>, %3: tensor<4xf32> {param = 2}) -> tensor<4xf32> {
+  %4 = tensor.add(%0, %3) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%4) : (tensor<4xf32>) -> ()
+}
+
+// -----
+// A function whose parameters all go keeps only its run-time arguments.
+// CHECK: func.func @none_read(%0: tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: tensor.neg(%0)
+func.func @none_read(%0: tensor<4xf32>, %1: tensor<4xf32> {param = 1}, %2: tensor<2xsi32> {param = 2}) -> tensor<4xf32> {
+  %3 = tensor.neg(%0) : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%3) : (tensor<4xf32>) -> ()
+}
+
+// -----
+// A load-time function loses the parameters it does not read too.
+// CHECK: func.func @run(%0: tensor<4xf32>, %1: tensor<4xf32> {param = 3}) -> tensor<4xf32>
+// CHECK: func.func @load(%0: tensor<4xf32> {param = 1}) -> (tensor<4xf32> {param = 3})
+// CHECK-NEXT: tensor.exp(%0)
+func.func @run(%0: tensor<4xf32>, %1: tensor<4xf32> {param = 3}) -> tensor<4xf32> {
+  %2 = tensor.mul(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%2) : (tensor<4xf32>) -> ()
+}
+func.func @load(%0: tensor<4xf32> {param = 1}, %1: tensor<4xf32> {param = 2}) -> (tensor<4xf32> {param = 3}) {
+  %2 = tensor.exp(%0) : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%2) : (tensor<4xf32>) -> ()
+}

@@ -1,0 +1,21 @@
+// RUN: pass dce
+
+// Unused pure ops go, including chains.
+// CHECK: func.func @dead
+// CHECK-NOT: tensor.exp
+// CHECK: func.return(%0)
+func.func @dead(%0: tensor<4xf32>) -> tensor<4xf32> {
+  %1 = tensor.exp(%0) : (tensor<4xf32>) -> tensor<4xf32>
+  %2 = tensor.neg(%1) : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%0) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// An unused opaque op stays.
+// NO-INTERP: custom calls have no reference semantics
+// CHECK: tensor.custom_call(%0)
+func.func @kept(%0: tensor<4xf32>) -> tensor<4xf32> {
+  %1 = tensor.custom_call(%0) {target = "k", results = [tensor<4xf32>]} : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%0) : (tensor<4xf32>) -> ()
+}

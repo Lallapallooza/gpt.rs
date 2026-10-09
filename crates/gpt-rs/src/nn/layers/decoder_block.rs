@@ -1,19 +1,18 @@
-//! Pre-norm decoder layer of the Llama-style decoders: `h = x + mixer(norm1(x))`,
-//! `out = h + mlp(norm2(h))`.
+//! Pre-norm decoder layer: `h = x + mixer(norm1(x))`, `out = h + mlp(norm2(h))`.
 
 use std::sync::Arc;
 
-use super::attention::{AttentionConfig, AttentionPositions, CausalSelfAttention};
+use super::attention::{AttentionConfig, CausalSelfAttention};
+use super::feed_forward::{FeedForward, MlpConfig};
 use super::gated_delta_net::{GatedDeltaNet, GatedDeltaNetConfig};
-use super::gated_feed_forward::GatedFeedForward;
-use super::rms_norm::{RmsNorm, RmsNormConfig};
+use super::names::DecoderNames;
+use super::norm::{Norm, NormConfig};
 use crate::inference::LayerCache;
 use crate::nn::{self, capture, Params};
-use crate::ops::functional::DeviceTensorOps;
-use anyhow::{bail, Result};
+use crate::ops::functional::AttentionPositions;
+use anyhow::Result;
 
-/// Hugging Face module names of the token mixers inside a decoder layer.
-const SELF_ATTN: &str = "self_attn";
+/// Hugging Face module name of linear attention inside a decoder layer.
 const LINEAR_ATTN: &str = "linear_attn";
 
 /// Token mixer of one decoder layer.
@@ -27,15 +26,15 @@ pub enum MixerConfig {
 
 /// Token mixer of a decoder layer, named by its Hugging Face module.
 #[nn::module]
-pub enum Mixer {
-    #[module(rename = SELF_ATTN)]
-    Attention(CausalSelfAttention),
+pub enum Mixer<N: DecoderNames> {
+    #[module(rename = N::SELF_ATTN)]
+    Attention(CausalSelfAttention<N>),
     #[module(rename = LINEAR_ATTN)]
     LinearAttention(GatedDeltaNet),
 }
 
 #[nn::module]
-impl Mixer {
+impl<N: DecoderNames> Mixer<N> {
     pub fn new(p: &mut Params<B>, config: &MixerConfig) -> Result<Self> {
         Ok(match config {
             MixerConfig::Attention(config) => {
@@ -50,7 +49,7 @@ impl Mixer {
     /// Hugging Face module name of the mixer inside its decoder layer.
     pub fn name(&self) -> &'static str {
         match self {
-            Mixer::Attention(_) => SELF_ATTN,
+            Mixer::Attention(_) => N::SELF_ATTN,
             Mixer::LinearAttention(_) => LINEAR_ATTN,
         }
     }
@@ -62,17 +61,17 @@ impl Mixer {
         x: &Tensor,
         cache: &LayerCache<B>,
         positions: &AttentionPositions<B>,
-    ) -> Result<(Tensor, LayerCache<B>)> {
+    ) -> (Tensor, LayerCache<B>) {
         match (self, cache) {
             (Mixer::Attention(attn), LayerCache::Attention(kv)) => {
-                let (out, kv) = attn.call((x, kv, positions))?;
-                Ok((out, LayerCache::Attention(kv)))
+                let (out, kv) = attn.call((x, kv, positions));
+                (out, LayerCache::Attention(kv))
             }
             (Mixer::LinearAttention(lin), LayerCache::LinearAttention(state)) => {
-                let (out, state) = lin.call((x, state))?;
-                Ok((out, LayerCache::LinearAttention(state)))
+                let (out, state) = lin.call((x, state));
+                (out, LayerCache::LinearAttention(state))
             }
-            _ => bail!("layer cache kind does not match the {} layer", self.name()),
+            _ => panic!("layer cache kind does not match the {} layer", self.name()),
         }
     }
 
@@ -91,25 +90,32 @@ impl Mixer {
     }
 }
 
-/// Pre-norm residual decoder layer.
+/// Pre-norm residual decoder layer, with the module names of the family `N`.
 #[nn::module]
-pub struct DecoderBlock {
-    pub input_layernorm: RmsNorm,
+pub struct DecoderBlock<N: DecoderNames> {
+    #[module(rename = N::INPUT_LAYERNORM)]
+    pub input_layernorm: Norm,
     /// Its parameters are under the mixer's own name ([`Mixer::name`]).
     #[module(flatten)]
-    pub mixer: Mixer,
-    pub post_attention_layernorm: RmsNorm,
-    pub mlp: GatedFeedForward,
+    pub mixer: Mixer<N>,
+    #[module(rename = N::POST_ATTENTION_LAYERNORM)]
+    pub post_attention_layernorm: Norm,
+    pub mlp: FeedForward<N>,
 }
 
 #[nn::module]
-impl DecoderBlock {
-    pub fn new(p: &mut Params<B>, norm: RmsNormConfig, mixer: &MixerConfig) -> Result<Self> {
+impl<N: DecoderNames> DecoderBlock<N> {
+    pub fn new(
+        p: &mut Params<B>,
+        norm: NormConfig,
+        mixer: &MixerConfig,
+        mlp: MlpConfig,
+    ) -> Result<Self> {
         Ok(Self {
-            input_layernorm: RmsNorm::new(p, norm)?,
+            input_layernorm: Norm::new(p, norm)?,
             mixer: Mixer::new(p, mixer)?,
-            post_attention_layernorm: RmsNorm::new(p, norm)?,
-            mlp: GatedFeedForward::new(p)?,
+            post_attention_layernorm: Norm::new(p, norm)?,
+            mlp: FeedForward::new(p, mlp)?,
         })
     }
 
@@ -119,16 +125,16 @@ impl DecoderBlock {
         x: &Tensor,
         cache: &LayerCache<B>,
         positions: &AttentionPositions<B>,
-    ) -> Result<(Tensor, LayerCache<B>)> {
-        let normed = self.input_layernorm(x)?;
-        capture::record("input_layernorm", &normed)?;
-        let (mixed, cache) = self.mixer((&normed, cache, positions))?;
-        capture::record(self.mixer.name(), &mixed)?;
-        let residual = mixed.add(x)?;
-        let normed = self.post_attention_layernorm(&residual)?;
-        capture::record("post_attention_layernorm", &normed)?;
-        let mlp = self.mlp(&normed)?;
-        capture::record("mlp", &mlp)?;
-        Ok((mlp.add(&residual)?, cache))
+    ) -> (Tensor, LayerCache<B>) {
+        let normed = self.input_layernorm(x);
+        capture::record(N::INPUT_LAYERNORM, &normed);
+        let (mixed, cache) = self.mixer((&normed, cache, positions));
+        capture::record(self.mixer.name(), &mixed);
+        let residual = mixed + x;
+        let normed = self.post_attention_layernorm(&residual);
+        capture::record(N::POST_ATTENTION_LAYERNORM, &normed);
+        let mlp = self.mlp(&normed);
+        capture::record("mlp", &mlp);
+        (mlp + residual, cache)
     }
 }

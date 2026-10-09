@@ -69,13 +69,9 @@ def debug_context(params: dict[str, Any]) -> Iterator[DebugHooks]:
     profile = bool(profile_tables or profile_json or profile_trace)
 
     prev_profile_backend = None
-    prev_c_trace = None
     if profile:
         prev_profile_backend = os.environ.get("GPTRS_PROFILE_BACKEND")
         os.environ["GPTRS_PROFILE_BACKEND"] = "1"
-    if profile_trace:
-        prev_c_trace = os.environ.get("GPTRS_C_TRACE")
-        os.environ["GPTRS_C_TRACE"] = "1"
 
     try:
         try:
@@ -114,31 +110,22 @@ def debug_context(params: dict[str, Any]) -> Iterator[DebugHooks]:
             yield hooks
         finally:
             hooks.pop_all_sections()
-            if profile_json:
+            if profile_json or profile_tables:
                 try:
-                    bundle = gpt_rs.profiling_take_report_bundle(pretty=True)
+                    bundle = gpt_rs.profiling_take_report(pretty=True)
                 except Exception:
                     bundle = None
                 if bundle:
                     text, json_report = bundle
                     if profile_tables:
                         print(text, file=sys.stderr)
-                    if dump_dir is not None:
+                    if profile_json and dump_dir is not None:
                         Path(dump_dir).mkdir(parents=True, exist_ok=True)
                         (Path(dump_dir) / "profiler_report.json").write_text(
                             json_report, encoding="utf-8"
                         )
-                    else:
+                    elif profile_json:
                         print(json_report, file=sys.stderr)
-                else:
-                    print(_no_profile_report(gpt_rs), file=sys.stderr)
-            elif profile_tables:
-                try:
-                    report = gpt_rs.profiling_take_report()
-                except Exception:
-                    report = None
-                if report:
-                    print(report, file=sys.stderr)
                 else:
                     print(_no_profile_report(gpt_rs), file=sys.stderr)
 
@@ -169,11 +156,6 @@ def debug_context(params: dict[str, Any]) -> Iterator[DebugHooks]:
                 os.environ.pop("GPTRS_PROFILE_BACKEND", None)
             else:
                 os.environ["GPTRS_PROFILE_BACKEND"] = prev_profile_backend
-        if profile_trace:
-            if prev_c_trace is None:
-                os.environ.pop("GPTRS_C_TRACE", None)
-            else:
-                os.environ["GPTRS_C_TRACE"] = prev_c_trace
 
 
 class DebugHooks:

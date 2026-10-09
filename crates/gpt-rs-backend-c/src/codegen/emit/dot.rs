@@ -1,125 +1,152 @@
-use gpt_rs::backend::conversion::{ConversionError, ConversionResult};
-use gpt_rs::backend::shape_helpers::contiguous_strides_or_error;
-use gpt_rs::backend::spec::{DType, DotGeneralSpec, Instruction, Operation, TensorSpec};
+use anyhow::{anyhow, Result};
+use gpt_rs_ir::dialects::tensor::{DotAxes, DotGeneral, TensorOp};
+use gpt_rs_ir::module::Value;
+use gpt_rs_ir::types::{DType, TensorType};
 
-use crate::kernels::LINEAR_PACK_MIN_ROWS;
-use crate::targets::TARGET_LINEAR_NT_F32_BF16;
+use crate::kernels::{LINEAR_PACK_MIN_ROWS, PANEL_N};
+use crate::targets::linear_kernel;
 
-use super::super::profile::{
-    backend_operation_label, bpack_cache_arg, matmul_work_stats, register_op_profile_binary,
-    signature_binary,
-};
+use super::super::profile::{matmul_work_stats, register_op_profile_binary, signature_binary};
+use super::super::types::{Instruction, Kind};
 use super::super::utils::{
-    c_type, dims_usize, emit_loops_with_indices, emit_parallel_loops_with_indices,
-    linear_index_expr, push_block,
+    c_type, contiguous_strides, dims_usize, emit_loops_with_indices,
+    emit_parallel_loops_with_indices, linear_index_expr, push_block,
 };
 use super::super::value_info::{
-    ensure_dtype, operand_dtype, operand_expr, operand_input_index, operand_spec, output_info,
+    ensure_dtype, operand_dtype, operand_expr, operand_type, output_info,
 };
 use super::EmitContext;
 
 pub(super) fn emit_instruction(
-    inst: &Instruction,
+    inst: &Instruction<'_>,
     ctx: &mut EmitContext<'_>,
-) -> ConversionResult<Option<usize>> {
-    let linear_spec;
-    let spec = match &inst.op {
-        Operation::DotGeneral(spec) => spec,
-        Operation::CustomCall(call) if call.target == TARGET_LINEAR_NT_F32_BF16 => {
-            // `x [M, K] . w [N, K]`.
-            linear_spec = DotGeneralSpec {
-                batch_lhs: vec![],
-                batch_rhs: vec![],
-                contract_lhs: vec![1],
-                contract_rhs: vec![1],
-                accum_dtype: Some(DType::F32),
-                out_dtype: Some(DType::F32),
-            };
-            &linear_spec
-        }
-        _ => return Ok(None),
+) -> Result<Option<usize>> {
+    let &Kind::Op(TensorOp::DotGeneral(spec)) = &inst.kind else {
+        return Ok(None);
     };
-    let [lhs, rhs] = inst.operands.as_slice() else {
-        return Err(ConversionError::new("dot_general expects two operands"));
+    let &[lhs, rhs] = inst.operands.as_slice() else {
+        return Err(anyhow!("dot_general expects two operands"));
     };
-    let lhs_dtype = operand_dtype(lhs, ctx.value_infos)?;
-    let rhs_dtype = operand_dtype(rhs, ctx.value_infos)?;
-    if lhs_dtype != rhs_dtype && matches!(inst.op, Operation::DotGeneral(_)) {
-        return Err(ConversionError::new(format!(
-            "dot_general operands must share a dtype, got {lhs_dtype:?} x {rhs_dtype:?}"
-        )));
+    if reads_panels(
+        spec,
+        &operand_type(&lhs, ctx.value_infos)?,
+        &operand_type(&rhs, ctx.value_infos)?,
+    ) {
+        return emit_matmul_packed(inst, ctx).map(Some);
     }
-    emit_dot(inst, spec, ctx).map(Some)
+    let lhs_dtype = operand_dtype(&lhs, ctx.value_infos)?;
+    let rhs_dtype = operand_dtype(&rhs, ctx.value_infos)?;
+    if lhs_dtype != rhs_dtype {
+        return Err(anyhow!(
+            "dot_general operands must share a dtype, got {lhs_dtype} x {rhs_dtype}"
+        ));
+    }
+    emit_dot(inst, spec, None, ctx).map(Some)
 }
 
+/// Emits a [`Kind::Linear`] instruction, `x [M, K] . w [N, K]` with `w` as stored, scaled by the
+/// third operand when there is one.
+pub(super) fn emit_linear(inst: &Instruction<'_>, ctx: &mut EmitContext<'_>) -> Result<usize> {
+    let scale = match inst.operands.as_slice() {
+        [_, _] => None,
+        [_, _, scale] => Some(scale),
+        _ => return Err(anyhow!("a linear kernel reads [x, w] or [x, w, s]")),
+    };
+    let spec = DotGeneral::contract([1], [1]).with_dtypes(DType::F32, DType::F32);
+    emit_dot(inst, &spec, scale, ctx)
+}
+
+/// Whether `spec` contracts the last axis of `x` with a weight in the GEMM's panels,
+/// `[N / PANEL_N, K, PANEL_N]`, as the C backend's packing pass lays it out.
+fn reads_panels(spec: &DotGeneral, x: &TensorType, w: &TensorType) -> bool {
+    let panels = matches!(w.static_dims().as_deref(), Some(&[_, _, PANEL_N]));
+    let Ok(axes) = spec.axes(x.rank(), w.rank()) else {
+        return false;
+    };
+    panels
+        && axes.batch_lhs.is_empty()
+        && axes.batch_rhs.is_empty()
+        && axes.contract_rhs[..] == [1]
+        && axes.contract_lhs[..] == [x.rank() - 1]
+}
+
+/// Emits `lhs . rhs`. A `scale` operand is the one-element scale of a dequantized `rhs`.
 fn emit_dot(
-    inst: &Instruction,
-    spec: &DotGeneralSpec,
+    inst: &Instruction<'_>,
+    spec: &DotGeneral,
+    scale: Option<&Value>,
     ctx: &mut EmitContext<'_>,
-) -> ConversionResult<usize> {
+) -> Result<usize> {
     let EmitContext {
         module,
         value_infos,
-        literal_cache,
         matmul_profile,
-        matmul_caches,
-        ..
     } = ctx;
-    let out_info = output_info(value_infos, inst.id)?;
+    let out_info = output_info(value_infos, inst.result())?;
     ensure_dtype(
-        out_info.spec.dtype,
+        out_info.ty.dtype,
         DType::F32,
         "dot_general output must be f32",
     )?;
-    let lhs_spec = operand_spec(&inst.operands[0], value_infos)?;
-    let rhs_spec = operand_spec(&inst.operands[1], value_infos)?;
-    let lhs = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-    let rhs = operand_expr(&inst.operands[1], value_infos, module, literal_cache)?;
-    let label = backend_operation_label(&inst.op);
+    let lhs_spec = operand_type(&inst.operands[0], value_infos)?;
+    let rhs_spec = operand_type(&inst.operands[1], value_infos)?;
+    let lhs = operand_expr(&inst.operands[0], value_infos)?;
+    let rhs = operand_expr(&inst.operands[1], value_infos)?;
+    let scale_arg = match scale {
+        Some(scale) => {
+            let scale_spec = operand_type(scale, value_infos)?;
+            if scale_spec.element_count() != Some(1) {
+                return Err(anyhow!("a linear weight scale must have one element"));
+            }
+            let expr = operand_expr(scale, value_infos)?;
+            let arg = format!(", (const {}*){expr}", c_type(scale_spec.dtype)?);
+            Some((scale_spec.dtype, arg))
+        }
+        None => None,
+    };
+    let label = inst.label;
     let out = &out_info.var;
+    let axes = spec.axes(lhs_spec.rank(), rhs_spec.rank())?;
 
     let layout = strided_batched_layout(
         &dims_usize(&lhs_spec)?,
         &dims_usize(&rhs_spec)?,
-        &dims_usize(&out_info.spec)?,
-        spec,
+        &dims_usize(&out_info.ty)?,
+        &axes,
     )?;
     let no_kernel = || {
-        ConversionError::new(format!(
-            "no C kernel for {:?} x {:?} dot_general with {spec:?}",
-            lhs_spec.dtype, rhs_spec.dtype
-        ))
+        anyhow!(
+            "no C kernel for {} x {} dot_general with {spec:?}",
+            lhs_spec.dtype,
+            rhs_spec.dtype
+        )
     };
     let Some(layout) = layout else {
-        if lhs_spec.dtype != DType::F32 || rhs_spec.dtype != DType::F32 {
+        if lhs_spec.dtype != DType::F32 || rhs_spec.dtype != DType::F32 || scale_arg.is_some() {
             return Err(no_kernel());
         }
-        let op_id = register_op_profile_binary(
-            matmul_profile,
-            label,
-            &out_info.spec,
-            &lhs_spec,
-            &rhs_spec,
-        )?;
+        let op_id =
+            register_op_profile_binary(matmul_profile, label, &out_info.ty, &lhs_spec, &rhs_spec)?;
         emit_dot_general(
             module,
             out,
             &lhs,
             &rhs,
-            &out_info.spec,
+            &out_info.ty,
             &lhs_spec,
             &rhs_spec,
-            spec,
+            &axes,
         )?;
         return Ok(op_id);
     };
 
+    let scale_dtype = scale_arg.as_ref().map(|(dtype, _)| *dtype);
     let (form, kernel) =
-        dot_kernel(&layout, lhs_spec.dtype, rhs_spec.dtype).ok_or_else(no_kernel)?;
-    let elem_bytes = |spec: &TensorSpec| {
+        dot_kernel(&layout, lhs_spec.dtype, rhs_spec.dtype, scale_dtype).ok_or_else(no_kernel)?;
+    let elem_bytes = |spec: &TensorType| {
         spec.dtype
             .size_in_bytes()
-            .ok_or_else(|| ConversionError::new("dot_general operand dtype has no byte size"))
+            .ok_or_else(|| anyhow!("dot_general operand dtype has no byte size"))
     };
     let StridedBatchedLayout {
         batch,
@@ -141,31 +168,72 @@ fn emit_dot(
         elem_bytes(&lhs_spec)?,
         elem_bytes(&rhs_spec)?,
     );
-    let signature = signature_binary(&out_info.spec, &lhs_spec, &rhs_spec);
+    let signature = signature_binary(&out_info.ty, &lhs_spec, &rhs_spec);
     let op_id = matmul_profile.register(label, signature, work);
     let (xtype, wtype) = (c_type(lhs_spec.dtype)?, c_type(rhs_spec.dtype)?);
     let args =
         format!("(const {xtype}*){lhs}, (const {wtype}*){rhs}, {out}, {batch}, {m}, {n}, {k}");
     let call = match form {
-        DotForm::Nt => format!("{kernel}({args}, {sab}, {sam}, {sbb}, {sbn});"),
+        DotForm::Nt => {
+            let scale_suffix = scale_arg.as_ref().map_or("", |(_, arg)| arg.as_str());
+            format!("{kernel}({args}, {sab}, {sam}, {sbb}, {sbn}{scale_suffix});")
+        }
         DotForm::Gemm => {
-            // When b is an entry input, the kernel keeps a packed copy of b across calls. A single
-            // row of a gets no copy, because the kernel multiplies it with b in place.
-            let rhs_input =
-                operand_input_index(&inst.operands[1], value_infos).filter(|_| batch == 1 && m > 1);
-            let cache = bpack_cache_arg(
-                matmul_caches.as_deref_mut(),
-                rhs_input,
-                op_id,
-                n,
-                k,
-                sbk,
-                sbn,
-            );
-            format!("{kernel}({args}, {sab}, {sam}, {sak}, {sbb}, {sbk}, {sbn}, {cache}, NULL);")
+            format!("{kernel}({args}, {sab}, {sam}, {sak}, {sbb}, {sbk}, {sbn}, 0, NULL);")
         }
     };
     push_block(module, 1, &call);
+    Ok(op_id)
+}
+
+/// Emits the GEMM of `x [.., K]` and `w` packed as `[N / PANEL_N, K, PANEL_N]`, whose result
+/// `[.., N / PANEL_N, PANEL_N]` holds `x . w` as `[.., N]`.
+fn emit_matmul_packed(inst: &Instruction<'_>, ctx: &mut EmitContext<'_>) -> Result<usize> {
+    let EmitContext {
+        module,
+        value_infos,
+        matmul_profile,
+    } = ctx;
+    let [x, packed] = inst.operands.as_slice() else {
+        return Err(anyhow!("the packed GEMM reads [x, packed]"));
+    };
+    let out_info = output_info(value_infos, inst.result())?;
+    let x_spec = operand_type(x, value_infos)?;
+    let packed_spec = operand_type(packed, value_infos)?;
+    for spec in [&out_info.ty, &x_spec, &packed_spec] {
+        ensure_dtype(spec.dtype, DType::F32, "the packed GEMM is f32")?;
+    }
+    let (x_dims, packed_dims, out_dims) = (
+        dims_usize(&x_spec)?,
+        dims_usize(&packed_spec)?,
+        dims_usize(&out_info.ty)?,
+    );
+    let mismatch =
+        || anyhow!("the packed GEMM does not take {x_dims:?} x {packed_dims:?} -> {out_dims:?}");
+    let (Some((&k, rows)), &[panels, packed_k, PANEL_N]) =
+        (x_dims.split_last(), packed_dims.as_slice())
+    else {
+        return Err(mismatch());
+    };
+    let m: usize = rows.iter().product();
+    let n = panels * PANEL_N;
+    let expected: Vec<usize> = rows.iter().copied().chain([panels, PANEL_N]).collect();
+    if packed_k != k || out_dims != expected {
+        return Err(mismatch());
+    }
+    let label = inst.label;
+    let signature = signature_binary(&out_info.ty, &x_spec, &packed_spec);
+    let op_id = matmul_profile.register(label, signature, matmul_work_stats(1, m, n, k, 4, 4));
+    let x = operand_expr(x, value_infos)?;
+    let packed = operand_expr(packed, value_infos)?;
+    let out = &out_info.var;
+    push_block(
+        module,
+        1,
+        &format!(
+            "gpt_rs_c_matmul_f32((const float*){x}, NULL, {out}, 1, {m}, {n}, {k}, 0, {k}, 1, 0, 0, 0, (const float*){packed}, NULL);"
+        ),
+    );
     Ok(op_id)
 }
 
@@ -179,19 +247,22 @@ enum DotForm {
     Gemm,
 }
 
+/// The kernel for `lhs . rhs`, where `rhs` is dequantized with a scale of dtype `scale` when one
+/// is given.
 fn dot_kernel(
     layout: &StridedBatchedLayout,
     lhs: DType,
     rhs: DType,
+    scale: Option<DType>,
 ) -> Option<(DotForm, &'static str)> {
     let nt = layout.sak == 1 && layout.sbk == 1;
-    match (lhs, rhs) {
-        (DType::F32, DType::F32) if nt && layout.m < LINEAR_PACK_MIN_ROWS => {
+    match (lhs, rhs, scale) {
+        (DType::F32, DType::F32, None) if nt && layout.m < LINEAR_PACK_MIN_ROWS => {
             Some((DotForm::Nt, "gpt_rs_c_linear_nt_f32"))
         }
-        (DType::F32, DType::F32) => Some((DotForm::Gemm, "gpt_rs_c_matmul_f32")),
-        (DType::F32, DType::Bf16) if nt => Some((DotForm::Nt, "gpt_rs_c_linear_nt_f32_bf16")),
-        (DType::Bf16, DType::Bf16) if nt => Some((DotForm::Nt, "gpt_rs_c_linear_nt_bf16_bf16")),
+        (DType::F32, DType::F32, None) => Some((DotForm::Gemm, "gpt_rs_c_matmul_f32")),
+        (DType::Bf16, DType::Bf16, None) => Some((DotForm::Gemm, "gpt_rs_c_matmul_bf16")),
+        _ if nt => Some((DotForm::Nt, linear_kernel(lhs, rhs, scale)?)),
         _ => None,
     }
 }
@@ -202,11 +273,11 @@ fn emit_dot_general(
     out: &str,
     lhs: &str,
     rhs: &str,
-    out_spec: &TensorSpec,
-    lhs_spec: &TensorSpec,
-    rhs_spec: &TensorSpec,
-    spec: &DotGeneralSpec,
-) -> ConversionResult<()> {
+    out_spec: &TensorType,
+    lhs_spec: &TensorType,
+    rhs_spec: &TensorType,
+    spec: &DotAxes,
+) -> Result<()> {
     let lhs_dims = dims_usize(lhs_spec)?;
     let rhs_dims = dims_usize(rhs_spec)?;
     let out_dims = dims_usize(out_spec)?;
@@ -216,14 +287,14 @@ fn emit_dot_general(
 
     let batch_count = spec.batch_lhs.len();
     if batch_count != spec.batch_rhs.len() {
-        return Err(ConversionError::new("dot_general batch rank mismatch"));
+        return Err(anyhow!("dot_general batch rank mismatch"));
     }
 
     let mut is_lhs_batch = vec![false; lhs_rank];
     let mut is_rhs_batch = vec![false; rhs_rank];
     for (lhs_axis, rhs_axis) in spec.batch_lhs.iter().zip(spec.batch_rhs.iter()) {
         if *lhs_axis >= lhs_rank || *rhs_axis >= rhs_rank {
-            return Err(ConversionError::new("dot_general batch axis out of range"));
+            return Err(anyhow!("dot_general batch axis out of range"));
         }
         is_lhs_batch[*lhs_axis] = true;
         is_rhs_batch[*rhs_axis] = true;
@@ -233,9 +304,7 @@ fn emit_dot_general(
     let mut is_rhs_contract = vec![false; rhs_rank];
     for (lhs_axis, rhs_axis) in spec.contract_lhs.iter().zip(spec.contract_rhs.iter()) {
         if *lhs_axis >= lhs_rank || *rhs_axis >= rhs_rank {
-            return Err(ConversionError::new(
-                "dot_general contract axis out of range",
-            ));
+            return Err(anyhow!("dot_general contract axis out of range"));
         }
         is_lhs_contract[*lhs_axis] = true;
         is_rhs_contract[*rhs_axis] = true;
@@ -256,7 +325,7 @@ fn emit_dot_general(
 
     let expected_out_rank = batch_count + lhs_free.len() + rhs_free.len();
     if out_dims.len() != expected_out_rank {
-        return Err(ConversionError::new("dot_general output rank mismatch"));
+        return Err(anyhow!("dot_general output rank mismatch"));
     }
 
     emit_parallel_loops_with_indices(module, &out_dims, 2, "o", |module, out_indices, indent| {
@@ -335,12 +404,12 @@ fn operand_axes(
     dims: &[usize],
     batch: Option<usize>,
     contract: usize,
-) -> ConversionResult<Option<OperandAxes>> {
+) -> Result<Option<OperandAxes>> {
     let rank = dims.len();
     if batch.is_some_and(|axis| axis >= rank) || contract >= rank || batch == Some(contract) {
-        return Err(ConversionError::new(format!(
+        return Err(anyhow!(
             "dot_general axes (batch {batch:?}, contract {contract}) are invalid for rank {rank}"
-        )));
+        ));
     }
     let free: Vec<usize> = (0..rank)
         .filter(|axis| Some(*axis) != batch && *axis != contract)
@@ -366,8 +435,8 @@ fn strided_batched_layout(
     lhs_dims: &[usize],
     rhs_dims: &[usize],
     out_dims: &[usize],
-    spec: &DotGeneralSpec,
-) -> ConversionResult<Option<StridedBatchedLayout>> {
+    spec: &DotAxes,
+) -> Result<Option<StridedBatchedLayout>> {
     let (([], [], [contract_lhs], [contract_rhs]) | ([_], [_], [contract_lhs], [contract_rhs])) = (
         spec.batch_lhs.as_slice(),
         spec.batch_rhs.as_slice(),
@@ -382,9 +451,8 @@ fn strided_batched_layout(
     ) else {
         return Ok(None);
     };
-    let overflow = || ConversionError::new("dot_general operand size overflows");
-    let lhs_strides = contiguous_strides_or_error(lhs_dims, overflow)?;
-    let rhs_strides = contiguous_strides_or_error(rhs_dims, overflow)?;
+    let lhs_strides = contiguous_strides(lhs_dims)?;
+    let rhs_strides = contiguous_strides(rhs_dims)?;
     let extent = |dims: &[usize], strides: &[usize], axis: Option<usize>| {
         axis.map_or((1, 0), |axis| (dims[axis], strides[axis]))
     };
@@ -402,9 +470,9 @@ fn strided_batched_layout(
     .flatten()
     .collect();
     if rhs_dims[rhs.contract] != k || rhs_batch != batch || expected_out != out_dims {
-        return Err(ConversionError::new(format!(
+        return Err(anyhow!(
             "dot_general shapes {lhs_dims:?} x {rhs_dims:?} -> {out_dims:?} do not match {spec:?}"
-        )));
+        ));
     }
     Ok(Some(StridedBatchedLayout {
         batch,

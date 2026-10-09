@@ -1,0 +1,159 @@
+// RUN: verify
+
+// ERROR: tensor.dot_general: operands of different dtypes, tensor<2x3xf32> and tensor<3x2xbf16>, need accum and out
+func.func @dtype_mismatch(%0: tensor<2x3xf32>, %1: tensor<3x2xbf16>) -> tensor<2x2xf32> {
+  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x2xbf16>) -> tensor<2x2xf32>
+  func.return(%2) : (tensor<2x2xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.dot_general: lhs must be an integer, float or narrow float tensor, got tensor<2x3xi1>
+func.func @i1_operands(%0: tensor<2x3xi1>, %1: tensor<3x2xi1>) -> tensor<2x2xi1> {
+  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xi1>, tensor<3x2xi1>) -> tensor<2x2xi1>
+  func.return(%2) : (tensor<2x2xi1>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.dot_general: accum must be a float dtype, got i1
+func.func @i1_accum(%0: tensor<2x3xf32>, %1: tensor<3x2xf32>) -> tensor<2x2xf32> {
+  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0], accum = i1} : (tensor<2x3xf32>, tensor<3x2xf32>) -> tensor<2x2xf32>
+  func.return(%2) : (tensor<2x2xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.dot_general: batch_lhs [0] and batch_rhs [] differ in length
+func.func @batch_count(%0: tensor<2x3x4xf32>, %1: tensor<4x5xf32>) -> tensor<2x3x5xf32> {
+  %2 = tensor.dot_general(%0, %1) {batch_lhs = [0], contract_lhs = [2], contract_rhs = [0]} : (tensor<2x3x4xf32>, tensor<4x5xf32>) -> tensor<2x3x5xf32>
+  func.return(%2) : (tensor<2x3x5xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.dot_general: contract_lhs [1] and contract_rhs [0, 1] differ in length
+func.func @contract_count(%0: tensor<2x3xf32>, %1: tensor<3x3xf32>) -> tensor<2xf32> {
+  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0, 1]} : (tensor<2x3xf32>, tensor<3x3xf32>) -> tensor<2xf32>
+  func.return(%2) : (tensor<2xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.dot_general: contract_rhs axis 2 is out of range for rank 2
+func.func @axis_range(%0: tensor<2x3xf32>, %1: tensor<3x2xf32>) -> tensor<2x3xf32> {
+  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [2]} : (tensor<2x3xf32>, tensor<3x2xf32>) -> tensor<2x3xf32>
+  func.return(%2) : (tensor<2x3xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.dot_general: contract_lhs axis -3 is out of range for rank 2
+func.func @negative_axis_range(%0: tensor<2x3xf32>, %1: tensor<3x2xf32>) -> tensor<2x2xf32> {
+  %2 = tensor.dot_general(%0, %1) {contract_lhs = [-3], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x2xf32>) -> tensor<2x2xf32>
+  func.return(%2) : (tensor<2x2xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.dot_general: lhs axis -1 is named twice
+func.func @axis_twice_counted_back(%0: tensor<3x3xf32>, %1: tensor<3x3xf32>) -> tensor<f32> {
+  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1, -1], contract_rhs = [0, 1]} : (tensor<3x3xf32>, tensor<3x3xf32>) -> tensor<f32>
+  func.return(%2) : (tensor<f32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.dot_general: lhs axis 0 is named twice
+func.func @axis_twice(%0: tensor<3x3xf32>, %1: tensor<3x3x2xf32>) -> tensor<3x3x2xf32> {
+  %2 = tensor.dot_general(%0, %1) {batch_lhs = [0], batch_rhs = [0], contract_lhs = [0], contract_rhs = [1]} : (tensor<3x3xf32>, tensor<3x3x2xf32>) -> tensor<3x3x2xf32>
+  func.return(%2) : (tensor<3x3x2xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.dot_general: rhs axis 0 is named twice
+func.func @axis_twice_in_group(%0: tensor<3x3xf32>, %1: tensor<3x3xf32>) -> tensor<f32> {
+  %2 = tensor.dot_general(%0, %1) {contract_lhs = [0, 1], contract_rhs = [0, 0]} : (tensor<3x3xf32>, tensor<3x3xf32>) -> tensor<f32>
+  func.return(%2) : (tensor<f32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.dot_general: batch_lhs axis 0 has extent 2, but batch_rhs axis 0 has extent 3
+func.func @batch_extent(%0: tensor<2x4x8xf32>, %1: tensor<3x8x16xf32>) -> tensor<2x4x16xf32> {
+  %2 = tensor.dot_general(%0, %1) {batch_lhs = [0], batch_rhs = [0], contract_lhs = [2], contract_rhs = [1]} : (tensor<2x4x8xf32>, tensor<3x8x16xf32>) -> tensor<2x4x16xf32>
+  func.return(%2) : (tensor<2x4x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.dot_general: contract_lhs axis 1 has extent {K}, but contract_rhs axis 0 has extent 8
+func.func @contract_extent(%0: tensor<4x{K}xf32>, %1: tensor<8x16xf32>) -> tensor<4x16xf32> {
+  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} : (tensor<4x{K}xf32>, tensor<8x16xf32>) -> tensor<4x16xf32>
+  func.return(%2) : (tensor<4x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.reduce_sum: the input must be an integer or float tensor, got tensor<4xi1>
+func.func @reduce_i1(%0: tensor<4xi1>) -> tensor<1xi1> {
+  %1 = tensor.reduce_sum(%0) {axes = [0], keepdims = true} : (tensor<4xi1>) -> tensor<1xi1>
+  func.return(%1) : (tensor<1xi1>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.reduce_max: accum must be a float dtype, got i1
+func.func @reduce_i1_accum(%0: tensor<4xf32>) -> tensor<1xf32> {
+  %1 = tensor.reduce_max(%0) {axes = [0], keepdims = true, accum = i1} : (tensor<4xf32>) -> tensor<1xf32>
+  func.return(%1) : (tensor<1xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.reduce_sum: axis 2 is out of range for rank 2
+func.func @reduce_axis_range(%0: tensor<2x3xf32>) -> tensor<2x3x1xf32> {
+  %1 = tensor.reduce_sum(%0) {axes = [2], keepdims = true} : (tensor<2x3xf32>) -> tensor<2x3x1xf32>
+  func.return(%1) : (tensor<2x3x1xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.reduce_sum: axis -4 is out of range for rank 3
+func.func @reduce_negative_axis_range(%0: tensor<2x3x4xf32>) -> tensor<2x3xf32> {
+  %1 = tensor.reduce_sum(%0) {axes = [-4]} : (tensor<2x3x4xf32>) -> tensor<2x3xf32>
+  func.return(%1) : (tensor<2x3xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.reduce_min: axis 1 is named twice
+func.func @reduce_axes_twice(%0: tensor<2x3xf32>) -> tensor<2xf32> {
+  %1 = tensor.reduce_min(%0) {axes = [1, 1]} : (tensor<2x3xf32>) -> tensor<2xf32>
+  func.return(%1) : (tensor<2xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.reduce_max: axis -1 is named twice
+func.func @reduce_axes_twice_counted_back(%0: tensor<2x3xf32>) -> tensor<2xf32> {
+  %1 = tensor.reduce_max(%0) {axes = [1, -1]} : (tensor<2x3xf32>) -> tensor<2xf32>
+  func.return(%1) : (tensor<2xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.dot_general: rhs must be an integer tensor, got tensor<3x2xf32>
+func.func @dot_int_float(%0: tensor<2x3xsi8>, %1: tensor<3x2xf32>) -> tensor<2x2xsi32> {
+  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0], accum = si32, out = si32} : (tensor<2x3xsi8>, tensor<3x2xf32>) -> tensor<2x2xsi32>
+  func.return(%2) : (tensor<2x2xsi32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.reduce_and: the input must be an i1 or integer tensor, got tensor<4xf32>
+func.func @reduce_and_float(%0: tensor<4xf32>) -> tensor<f32> {
+  %1 = tensor.reduce_and(%0) {axes = [0]} : (tensor<4xf32>) -> tensor<f32>
+  func.return(%1) : (tensor<f32>) -> ()
+}

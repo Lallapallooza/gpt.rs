@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use gpt_rs::backend::spec::PortableBackend;
-use gpt_rs::ops::functional::{self, DecodeKvCache};
+use gpt_rs::backend::PortableBackend;
+use gpt_rs::ops::functional::{self, AttentionPositions, DecodeKvCache};
 use tch::{Kind, Tensor as TchTensor};
 
 use super::common::*;
@@ -70,21 +70,25 @@ fn run_kv_cache_attention_case<B: PortableBackend + 'static>(
             device_tensor_from_data(backend, &[kv_heads, capacity, head_dim], &cache_k),
             device_tensor_from_data(backend, &[kv_heads, capacity, head_dim], &cache_v),
             prefix,
-        )
-        .unwrap();
-        let res = functional::attention_kv_cache(
-            &device_tensor_from_data(backend, &[query_heads, seq, head_dim], &q),
-            &device_tensor_from_data(backend, &[kv_heads, seq, head_dim], &k),
-            &device_tensor_from_data(backend, &[kv_heads, seq, head_dim], &v),
+        );
+        // The functional takes `[T, heads, head_dim]`.
+        let heads = |heads: usize, data: &[f32]| {
+            device_tensor_from_data(backend, &[heads, seq, head_dim], data).transpose([1, 0, 2])
+        };
+        let positions =
+            AttentionPositions::new(positions_tensor(backend, prefix..prefix + seq), None);
+        let (output, cache) = functional::attention_kv_cache(
+            &heads(query_heads, &q),
+            &heads(kv_heads, &k),
+            &heads(kv_heads, &v),
             &cache,
-            &kv_cache_update_starts(backend, prefix),
-        )
-        .unwrap();
+            &positions,
+        );
         (
-            to_host_vec(&res.output),
-            to_host_vec(res.cache.keys()),
-            to_host_vec(res.cache.values()),
-            res.cache.len(),
+            to_host_vec(&output),
+            to_host_vec(cache.keys()),
+            to_host_vec(cache.values()),
+            cache.len(),
         )
     });
 

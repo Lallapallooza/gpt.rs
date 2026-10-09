@@ -7,14 +7,12 @@ mod checkpoint_support;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use gpt_rs::backend::spec::Program;
+use gpt_rs::gpt_rs_ir::module::Module;
 use gpt_rs::inference::decoder::PREFILL_CHUNK;
-use gpt_rs::inference::CausalLanguageModel;
+use gpt_rs::inference::generate::{Generator, Sampling};
 use gpt_rs::ops::trace::{self, ExecutionTraceSink, ProgramContext, ProgramStats};
 use gpt_rs::runtime::load_model;
 use gpt_rs_backend_ref_cpu::CpuPortableBackend;
-
-use checkpoint_support::CONTEXT;
 
 /// Whether each backend program run reused a compiled program.
 #[derive(Default)]
@@ -23,8 +21,8 @@ struct ProgramRuns {
 }
 
 impl ExecutionTraceSink for ProgramRuns {
-    fn before_program(&self, context: &ProgramContext, _program: &Program) {
-        let hit = context.cache.program_cache_hit;
+    fn before_program(&self, context: &ProgramContext, _module: &Module) {
+        let hit = context.program_cache_hit;
         self.cache_hits.lock().unwrap().push(hit);
     }
 
@@ -32,11 +30,11 @@ impl ExecutionTraceSink for ProgramRuns {
 }
 
 impl ProgramRuns {
-    /// Whether each program that `f` runs reused a compiled program.
-    fn record<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<Vec<bool>> {
+    /// What `f` returns, and whether each program that it runs reused a compiled program.
+    fn record<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<(T, Vec<bool>)> {
         let before = self.cache_hits.lock().unwrap().len();
-        f()?;
-        Ok(self.cache_hits.lock().unwrap()[before..].to_vec())
+        let value = f()?;
+        Ok((value, self.cache_hits.lock().unwrap()[before..].to_vec()))
     }
 }
 
@@ -51,39 +49,39 @@ fn decoder_runs_one_program_per_prefill_chunk_and_decode_step() -> Result<()> {
         ("qwen3_5", checkpoint_support::qwen3_5()?),
     ] {
         let loaded = load_model(Arc::clone(&backend), &checkpoint.path)?;
-        let model: &dyn CausalLanguageModel<CpuPortableBackend> =
-            loaded.as_causal_lm().expect("a decoder is a causal LM");
+        let model = loaded.causal_lm()?;
 
         let prompt: Vec<usize> = (0..PREFILL_CHUNK + 8).map(|i| i % 64).collect();
-        let forward = runs.record(|| model.forward(&prompt))?;
+        let (_, forward) = runs.record(|| model.forward(&prompt))?;
         assert_eq!(
             forward.len(),
             2,
             "{name}: programs run by a two-chunk forward"
         );
 
-        let mut caches = vec![None; model.num_layers()];
-        let capacity = Some(CONTEXT);
-        let prefill =
-            runs.record(|| model.forward_with_decode_cache(&prompt, 0, &mut caches, capacity))?;
+        // A random pick with top-k records the most ops into each step.
+        let sampling = Sampling::random(0.8, 7).with_top_k(5);
+        let (mut generator, prefill) =
+            runs.record(|| Generator::new(model, &prompt, 4, &sampling))?;
         assert_eq!(
             prefill.len(),
             2,
             "{name}: programs run by a two-chunk prefill"
         );
-
-        for step in 0..3 {
-            let position = prompt.len() + step;
-            let decode = runs.record(|| {
-                model.forward_with_decode_cache(&[step + 1], position, &mut caches, capacity)
-            })?;
+        let (_, first) = runs.record(|| generator.step())?;
+        assert!(
+            first.is_empty(),
+            "{name}: the prefill picks the first token"
+        );
+        for step in 1..4 {
+            let (_, decode) = runs.record(|| generator.step())?;
             assert_eq!(
                 decode.len(),
                 1,
                 "{name}: programs run by decode step {step}"
             );
             assert!(
-                step == 0 || decode[0],
+                step == 1 || decode[0],
                 "{name}: decode step {step} compiled its program again"
             );
         }

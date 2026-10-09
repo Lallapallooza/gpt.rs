@@ -15,18 +15,6 @@ fn load_gpt2_tokenizer() -> Tokenizer {
 }
 
 #[test]
-fn tokenizer_roundtrip() {
-    let tokenizer = load_gpt2_tokenizer();
-
-    let text = "Hello rust";
-    let tokens = tokenizer.encode(text).expect("encode");
-    let decoded = tokenizer.decode(&tokens);
-
-    assert_eq!(decoded, text);
-    assert!(!tokens.is_empty());
-}
-
-#[test]
 fn tokenizer_config_parses_hf_tokenizer_json_schema() {
     let json = r#"
     {

@@ -1,0 +1,111 @@
+// RUN: pass outline-static,dce
+
+// Computation over parameters moves into a load-time function, whose result binds the new
+// parameter argument the run-time function reads.
+// CHECK: func.func @simple(%0: tensor<4xf32>, %1: tensor<4xf32> {param = 1}, %2: tensor<4xf32> {param = [[ID:[0-9]+]]}) -> tensor<4xf32>
+// CHECK-NEXT: [[S:%[0-9]+]] = tensor.add(%0, %2)
+// CHECK-NEXT: func.return([[S]])
+// CHECK: func.func @static.{{[0-9a-f]+}}(%0: tensor<4xf32> {param = 1}) -> (tensor<4xf32> {param = [[ID]]})
+// CHECK-NEXT: tensor.constant
+// CHECK-NEXT: [[M:%[0-9]+]] = tensor.mul(%0, %1)
+// CHECK-NEXT: func.return([[M]])
+func.func @simple(%0: tensor<4xf32>, %1: tensor<4xf32> {param = 1}) -> tensor<4xf32> {
+  %2 = tensor.constant() {value = dense<[4] x f32: 2.0>} : () -> tensor<4xf32>
+  %3 = tensor.mul(%1, %2) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %4 = tensor.add(%0, %3) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%4) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// What moves is the value before its broadcast, so the runtime keeps 3 elements, not 12.
+// CHECK: func.func @broadcast(%0: tensor<4x3xf32>, %1: tensor<3xf32> {param = 1}, %2: tensor<3xf32> {param = {{[0-9]+}}}) -> tensor<4x3xf32>
+// CHECK-NEXT: [[B:%[0-9]+]] = tensor.broadcast_to(%2) {shape = [4, 3]}
+// CHECK-NEXT: tensor.add(%0, [[B]])
+// CHECK: func.func @static.{{[0-9a-f]+}}(%0: tensor<3xf32> {param = 1}) -> (tensor<3xf32>
+func.func @broadcast(%0: tensor<4x3xf32>, %1: tensor<3xf32> {param = 1}) -> tensor<4x3xf32> {
+  %2 = tensor.exp(%1) : (tensor<3xf32>) -> tensor<3xf32>
+  %3 = tensor.broadcast_to(%2) {shape = [4, 3]} : (tensor<3xf32>) -> tensor<4x3xf32>
+  %4 = tensor.add(%0, %3) : (tensor<4x3xf32>, tensor<4x3xf32>) -> tensor<4x3xf32>
+  func.return(%4) : (tensor<4x3xf32>) -> ()
+}
+
+// -----
+
+// Equal computations in two functions share one load-time function and one parameter. A static
+// value computed from constants alone stays where it is.
+// CHECK: func.func @first(%0: tensor<4xf32>, %1: tensor<4xf32> {param = 1}, %2: tensor<4xf32> {param = [[ID:[0-9]+]]})
+// CHECK: tensor.mul({{%[0-9]+}}, {{%[0-9]+}})
+// CHECK: tensor.add
+// CHECK: func.func @second(%0: tensor<4xf32>, %1: tensor<4xf32> {param = 1}, %2: tensor<4xf32> {param = [[ID]]})
+// CHECK: func.func @static.
+// CHECK-NOT: func.func @static.
+func.func @first(%0: tensor<4xf32>, %1: tensor<4xf32> {param = 1}) -> tensor<4xf32> {
+  %2 = tensor.exp(%1) : (tensor<4xf32>) -> tensor<4xf32>
+  %3 = tensor.constant() {value = dense<[4] x f32: 2.0>} : () -> tensor<4xf32>
+  %4 = tensor.constant() {value = dense<[4] x f32: 3.0>} : () -> tensor<4xf32>
+  %5 = tensor.mul(%3, %4) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %6 = tensor.add(%0, %2) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %7 = tensor.add(%6, %5) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%7) : (tensor<4xf32>) -> ()
+}
+func.func @second(%0: tensor<4xf32>, %1: tensor<4xf32> {param = 1}) -> tensor<4xf32> {
+  %2 = tensor.exp(%1) : (tensor<4xf32>) -> tensor<4xf32>
+  %3 = tensor.add(%0, %2) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%3) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// A static value read both at run time and by more static work moves on its own, and the work
+// after it moves with a copy of it.
+// CHECK: func.func @chained(%0: tensor<2xf32>, %1: tensor<4xf32> {param = 1}, %2: tensor<2xf32> {param = {{[0-9]+}}}, %3: tensor<2xf32> {param = {{[0-9]+}}})
+// CHECK-NEXT: [[A:%[0-9]+]] = tensor.add(%0, %2)
+// CHECK-NEXT: [[M:%[0-9]+]] = tensor.mul([[A]], %3)
+// CHECK: func.func @static.
+// CHECK-NEXT: tensor.slice(%0)
+// CHECK-NEXT: func.return
+// CHECK: func.func @static.
+// CHECK-NEXT: tensor.slice(%0)
+// CHECK-NEXT: tensor.neg
+func.func @chained(%0: tensor<2xf32>, %1: tensor<4xf32> {param = 1}) -> tensor<2xf32> {
+  %2 = tensor.slice(%1) {starts = [0], sizes = [2]} : (tensor<4xf32>) -> tensor<2xf32>
+  %3 = tensor.neg(%2) : (tensor<2xf32>) -> tensor<2xf32>
+  %4 = tensor.add(%0, %2) : (tensor<2xf32>, tensor<2xf32>) -> tensor<2xf32>
+  %5 = tensor.mul(%4, %3) : (tensor<2xf32>, tensor<2xf32>) -> tensor<2xf32>
+  func.return(%5) : (tensor<2xf32>) -> ()
+}
+
+// -----
+
+// A weight cast to a wider dtype would take twice its bytes, so the cast stays at run time.
+// CHECK: func.func @widening(%0: tensor<2x8xf32>, %1: tensor<4x8xbf16> {param = 1}) -> tensor<2x4xf32>
+// CHECK-NEXT: [[W:%[0-9]+]] = tensor.cast(%1)
+// CHECK-NEXT: tensor.dot_general(%0, [[W]])
+// CHECK-NOT: func.func @static.
+func.func @widening(%0: tensor<2x8xf32>, %1: tensor<4x8xbf16> {param = 1}) -> tensor<2x4xf32> {
+  %2 = tensor.cast(%1) {to = f32} : (tensor<4x8xbf16>) -> tensor<4x8xf32>
+  %3 = tensor.dot_general(%0, %2) {contract_lhs = [1], contract_rhs = [1]} : (tensor<2x8xf32>, tensor<4x8xf32>) -> tensor<2x4xf32>
+  func.return(%3) : (tensor<2x4xf32>) -> ()
+}
+
+// -----
+
+// A value that stays at run time still gets its static inputs from load-time results. Here the
+// scaled weight stays: its 128 bytes exceed the 68 bytes of the weight and the scale. The scale
+// moves.
+// CHECK: func.func @widening_inputs(%0: tensor<2x8xf32>, %1: tensor<4x8xbf16> {param = 1}, %2: tensor<f32> {param = 2}, %3: tensor<f32> {param = {{[0-9]+}}}) -> tensor<2x4xf32>
+// CHECK-NEXT: [[W:%[0-9]+]] = tensor.cast(%1)
+// CHECK-NEXT: [[B:%[0-9]+]] = tensor.broadcast_to(%3) {shape = [4, 8]}
+// CHECK-NEXT: [[S:%[0-9]+]] = tensor.mul([[W]], [[B]])
+// CHECK-NEXT: tensor.dot_general(%0, [[S]])
+// CHECK: func.func @static.{{[0-9a-f]+}}(%0: tensor<f32> {param = 2}) -> (tensor<f32>
+// CHECK-NEXT: tensor.exp(%0)
+func.func @widening_inputs(%0: tensor<2x8xf32>, %1: tensor<4x8xbf16> {param = 1}, %2: tensor<f32> {param = 2}) -> tensor<2x4xf32> {
+  %3 = tensor.cast(%1) {to = f32} : (tensor<4x8xbf16>) -> tensor<4x8xf32>
+  %4 = tensor.exp(%2) : (tensor<f32>) -> tensor<f32>
+  %5 = tensor.broadcast_to(%4) {shape = [4, 8]} : (tensor<f32>) -> tensor<4x8xf32>
+  %6 = tensor.mul(%3, %5) : (tensor<4x8xf32>, tensor<4x8xf32>) -> tensor<4x8xf32>
+  %7 = tensor.dot_general(%0, %6) {contract_lhs = [1], contract_rhs = [1]} : (tensor<2x8xf32>, tensor<4x8xf32>) -> tensor<2x4xf32>
+  func.return(%7) : (tensor<2x4xf32>) -> ()
+}

@@ -9,10 +9,10 @@ use std::path::Path;
 use anyhow::{bail, ensure, Result};
 use half::{bf16, f16};
 
-use crate::backend::spec::ExternalBytes;
 use crate::io::safetensors::StoredDtype;
 use crate::model::ModelConfig;
 use crate::tensor::DType;
+use gpt_rs_ir::host::ExternalBytes;
 
 pub use hf::HfCheckpoint;
 
@@ -22,12 +22,6 @@ pub struct TensorEntry {
     pub name: String,
     pub dims: Vec<usize>,
     pub dtype: DType,
-}
-
-impl TensorEntry {
-    pub fn byte_len(&self) -> usize {
-        self.dims.iter().product::<usize>() * self.dtype.size_in_bytes()
-    }
 }
 
 /// A stored model in some file format.
@@ -53,66 +47,35 @@ pub fn open(path: impl AsRef<Path>) -> Result<Box<dyn Checkpoint>> {
     Ok(Box::new(HfCheckpoint::open(path)?))
 }
 
+/// Suffix of the per-tensor scale of an FP8 weight.
+const FP8_SCALE: &str = "_scale_inv";
+
 /// The dtype the runtime loads a stored tensor as. 2-D tensors (projection and embedding matrices)
-/// and integer tensors keep their stored dtype, which the kernels read directly. Other float
-/// tensors widen to f32, the dtype of the activations they combine with.
-fn load_dtype(dims: &[usize], stored: DType) -> DType {
-    if dims.len() == 2 || stored == DType::I32 {
-        stored
-    } else {
+/// keep their stored dtype, which the kernels read directly, as do tensors of every dtype but f16
+/// and bf16. The scale of an FP8 weight also keeps its dtype, because the weight dequantizes to
+/// that dtype. Other f16 and bf16 tensors widen to f32, the dtype of the activations they combine
+/// with.
+fn load_dtype(name: &str, dims: &[usize], stored: DType) -> DType {
+    let widened =
+        matches!(stored, DType::F16 | DType::Bf16) && dims.len() != 2 && !name.ends_with(FP8_SCALE);
+    if widened {
         DType::F32
-    }
-}
-
-/// Decodes little-endian `bytes` of `dtype` to f32.
-fn decode_f32(bytes: &[u8], dtype: StoredDtype) -> Result<Vec<f32>> {
-    Ok(match dtype {
-        StoredDtype::F32 => bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect(),
-        StoredDtype::F16 => bytes
-            .chunks_exact(2)
-            .map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32())
-            .collect(),
-        StoredDtype::BF16 => bytes
-            .chunks_exact(2)
-            .map(|b| bf16::from_le_bytes([b[0], b[1]]).to_f32())
-            .collect(),
-        StoredDtype::F8_E4M3 => bytes.iter().map(|&b| f8_e4m3_to_f32(b)).collect(),
-        other => bail!("cannot convert {other} tensors"),
-    })
-}
-
-/// Encodes `values` as little-endian `dtype`.
-fn encode(values: &[f32], dtype: DType) -> Result<Vec<u8>> {
-    Ok(match dtype {
-        DType::F32 => values.iter().flat_map(|v| v.to_le_bytes()).collect(),
-        DType::F16 => values
-            .iter()
-            .flat_map(|&v| f16::from_f32(v).to_le_bytes())
-            .collect(),
-        DType::BF16 => values
-            .iter()
-            .flat_map(|&v| bf16::from_f32(v).to_le_bytes())
-            .collect(),
-        DType::I32 => bail!("cannot convert float tensors to i32"),
-    })
-}
-
-/// `float8_e4m3fn`: 4 exponent bits with bias 7, 3 mantissa bits, no infinities, and NaN at
-/// `S.1111.111`.
-fn f8_e4m3_to_f32(bits: u8) -> f32 {
-    let sign = if bits & 0x80 != 0 { -1.0 } else { 1.0 };
-    let exponent = i32::from((bits >> 3) & 0x0f);
-    let mantissa = f32::from(bits & 0x07);
-    if exponent == 0x0f && bits & 0x07 == 0x07 {
-        return f32::NAN;
-    }
-    let magnitude = if exponent == 0 {
-        mantissa / 8.0 * 2f32.powi(-6)
     } else {
-        (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7)
+        stored
+    }
+}
+
+/// Widens little-endian f16 or bf16 `bytes` to little-endian f32.
+fn widen_to_f32(bytes: &[u8], dtype: StoredDtype) -> Result<Vec<u8>> {
+    let widen: fn([u8; 2]) -> f32 = match dtype {
+        StoredDtype::F16 => |b| f16::from_le_bytes(b).to_f32(),
+        StoredDtype::BF16 => |b| bf16::from_le_bytes(b).to_f32(),
+        other => bail!("cannot widen {other} tensors to f32"),
     };
-    sign * magnitude
+    Ok(bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .flat_map(|&b| widen(b).to_le_bytes())
+        .collect())
 }

@@ -1,39 +1,33 @@
 //! Hugging Face model directories: `config.json`, an optional `generation_config.json`, and the
 //! weights in `model.safetensors` or in the shards that `model.safetensors.index.json` lists.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde_json::{Map, Value};
 
-use super::{decode_f32, encode, load_dtype, Checkpoint, TensorEntry};
-use crate::backend::spec::ExternalBytes;
-use crate::io::safetensors::{runtime_dtype, SafetensorsFile, StoredDtype, StoredTensor};
+use super::{load_dtype, widen_to_f32, Checkpoint, TensorEntry, FP8_SCALE};
+use crate::io::safetensors::{runtime_dtype, SafetensorsFile, StoredTensor};
 use crate::model::ModelConfig;
+use crate::tensor::DType;
+use gpt_rs_ir::host::ExternalBytes;
 
 /// Prefixes of the text decoder inside multimodal checkpoints. `language_model.model.` is the
 /// layout older `transformers` versions saved.
 const TEXT_PREFIXES: [&str; 2] = ["model.language_model.", "language_model.model."];
 const TEXT_LM_HEADS: [&str; 1] = ["language_model.lm_head.weight"];
 
-/// Suffix of the per-tensor scale of an FP8 weight. The dequantized weight is
-/// `weight * scale_inv`, in the dtype of the scale.
-const FP8_SCALE: &str = "_scale_inv";
-/// Input scales of FP8 matmuls, which dequantized weights do not use.
+/// Input scales of FP8 matmuls, which matmuls on f32 or bf16 inputs do not use.
 const FP8_ACTIVATION_SCALE: &str = ".activation_scale";
 
-/// Where the payload of a tensor comes from.
-enum Source {
-    /// Stored in the load dtype.
-    Stored(usize, StoredTensor),
-    /// Stored in another dtype, or as FP8 with a scale.
-    Converted {
-        file: usize,
-        tensor: StoredTensor,
-        scale: Option<(usize, StoredTensor)>,
-    },
+/// Where the payload of a tensor comes from: the file it is stored in, and whether it is stored in
+/// another dtype than it loads as.
+struct Source {
+    file: usize,
+    tensor: StoredTensor,
+    converted: bool,
 }
 
 /// A Hugging Face model directory. A multimodal checkpoint loads as its text model: the
@@ -61,15 +55,6 @@ impl HfCheckpoint {
             .iter()
             .map(|file| SafetensorsFile::open(dir.join(file)))
             .collect::<Result<Vec<_>>>()?;
-        let stored: HashMap<&str, (usize, &StoredTensor)> = files
-            .iter()
-            .enumerate()
-            .flat_map(|(file, f)| {
-                f.tensors()
-                    .iter()
-                    .map(move |t| (t.name.as_str(), (file, t)))
-            })
-            .collect();
 
         let mut entries = Vec::new();
         let mut sources = Vec::new();
@@ -78,53 +63,47 @@ impl HfCheckpoint {
                 let Some(name) = loaded_name(&tensor.name, text.is_some()) else {
                     continue;
                 };
-                if tensor.name.ends_with(FP8_SCALE) || tensor.name.ends_with(FP8_ACTIVATION_SCALE) {
+                if tensor.name.ends_with(FP8_ACTIVATION_SCALE) {
                     continue;
                 }
-                let scale = stored
-                    .get(format!("{}{FP8_SCALE}", tensor.name).as_str())
-                    .map(|&(file, scale)| (file, scale.clone()));
-                let (stored_dtype, source) = match (&scale, tensor.dtype) {
-                    (Some((_, scale)), StoredDtype::F8_E4M3) => {
-                        let dtype = runtime_dtype(scale.dtype).ok_or_else(|| {
-                            anyhow!(
-                                "FP8 scale {} has unsupported dtype {}",
-                                scale.name,
-                                scale.dtype
-                            )
-                        })?;
-                        if scale.dims.iter().product::<usize>() != 1 {
-                            bail!(
-                                "{}: only per-tensor FP8 scales are supported, got scale shape {:?}",
-                                tensor.name,
-                                scale.dims
-                            );
-                        }
-                        (dtype, None)
-                    }
-                    (_, dtype) => match runtime_dtype(dtype) {
-                        Some(dtype) => (dtype, Some(Source::Stored(file, tensor.clone()))),
-                        // Skip tensors that the runtime has no dtype for, such as
-                        // BatchNorm's int64 `num_batches_tracked`. A layer that reads one, such as
-                        // an FP8 weight without a scale, reports it as missing.
-                        None => continue,
-                    },
+                let is_scale = tensor.name.ends_with(FP8_SCALE);
+                // Skip tensors that the runtime has no dtype for: complex ones. Without its float
+                // scale, an FP8 weight would load unscaled.
+                let runtime = runtime_dtype(tensor.dtype);
+                ensure!(
+                    !is_scale || runtime.is_some_and(DType::is_float),
+                    "{}: FP8 scale has unsupported dtype {}",
+                    tensor.name,
+                    tensor.dtype
+                );
+                let Some(stored_dtype) = runtime else {
+                    continue;
                 };
-                let dtype = load_dtype(&tensor.dims, stored_dtype);
-                let source = match source {
-                    Some(source) if dtype == stored_dtype => source,
-                    _ => Source::Converted {
-                        file,
-                        tensor: tensor.clone(),
-                        scale,
-                    },
-                };
+                ensure!(
+                    !is_scale || tensor.dims.is_empty(),
+                    "{}: only per-tensor FP8 scales of rank 0 are supported, got shape {:?}",
+                    tensor.name,
+                    tensor.dims
+                );
+                // Only `Linear` reads an FP8 scale, so an FP8 tensor of another rank would compute
+                // unscaled.
+                ensure!(
+                    stored_dtype != DType::F8E4M3 || tensor.dims.len() == 2,
+                    "{}: only 2-D FP8 tensors are supported, got shape {:?}",
+                    tensor.name,
+                    tensor.dims
+                );
+                let dtype = load_dtype(&tensor.name, &tensor.dims, stored_dtype);
                 entries.push(TensorEntry {
                     name,
                     dims: tensor.dims.clone(),
                     dtype,
                 });
-                sources.push(source);
+                sources.push(Source {
+                    file,
+                    tensor: tensor.clone(),
+                    converted: dtype != stored_dtype,
+                });
             }
         }
         Ok(Self {
@@ -147,26 +126,14 @@ impl Checkpoint for HfCheckpoint {
 
     fn bytes(&self, index: usize) -> Result<ExternalBytes> {
         let entry = &self.entries[index];
-        match &self.sources[index] {
-            Source::Stored(file, tensor) => self.files[*file].bytes(tensor),
-            Source::Converted {
-                file,
-                tensor,
-                scale,
-            } => {
-                let raw = self.files[*file].bytes(tensor)?;
-                let mut values = decode_f32(raw.as_slice(), tensor.dtype)?;
-                if let Some((scale_file, scale)) = scale {
-                    let raw = self.files[*scale_file].bytes(scale)?;
-                    let factor = decode_f32(raw.as_slice(), scale.dtype)?[0];
-                    values.iter_mut().for_each(|v| *v *= factor);
-                }
-                let bytes: Arc<Vec<u8>> = Arc::new(encode(&values, entry.dtype)?);
-                let len = bytes.len();
-                ExternalBytes::new(bytes, 0, len)
-                    .map_err(|err| anyhow!("tensor {}: {err}", entry.name))
-            }
+        let source = &self.sources[index];
+        let raw = self.files[source.file].bytes(&source.tensor)?;
+        if !source.converted {
+            return Ok(raw);
         }
+        let bytes = Arc::new(widen_to_f32(raw.as_slice(), source.tensor.dtype)?);
+        let len = bytes.len();
+        ExternalBytes::new(bytes, 0, len).map_err(|err| anyhow!("tensor {}: {err}", entry.name))
     }
 }
 

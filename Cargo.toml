@@ -6,6 +6,11 @@ members = [
     "crates/gpt-rs-backend-ref-cpu",
     "crates/gpt-rs-backend-faer",
     "crates/gpt-rs-backend-tests",
+    "crates/gpt-rs-backends",
+    "crates/gpt-rs-docs",
+    "crates/gpt-rs-filetests",
+    "crates/gpt-rs-ir",
+    "crates/gpt-rs-ir-macros",
     "crates/gpt-rs-macros",
     "crates/gpt-rs-py",
 ]
@@ -16,6 +21,11 @@ default-members = [
     "crates/gpt-rs-backend-ref-cpu",
     "crates/gpt-rs-backend-faer",
     "crates/gpt-rs-backend-tests",
+    "crates/gpt-rs-backends",
+    "crates/gpt-rs-docs",
+    "crates/gpt-rs-filetests",
+    "crates/gpt-rs-ir",
+    "crates/gpt-rs-ir-macros",
     "crates/gpt-rs-macros",
     "crates/gpt-rs-py",
 ]
@@ -29,9 +39,9 @@ authors = ["gpt.rs contributors"]
 
 [workspace.dependencies]
 anyhow = "1"
-bincode = "1"
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+smallvec = { version = "1", features = ["union"] }
 thiserror = "1"

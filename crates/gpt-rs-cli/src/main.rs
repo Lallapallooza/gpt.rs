@@ -1,23 +1,15 @@
 use anyhow::{anyhow, bail, ensure, Context, Result};
-use clap::{ArgAction, Args as ClapArgs, Parser, Subcommand, ValueEnum};
-use gpt_rs::backend::conversion::{self, ConversionOptions};
-use gpt_rs::backend::spec::Program;
-use gpt_rs::backend::text_ir::parse_program;
-use gpt_rs::inference::generate::Generator;
-use gpt_rs::inference::sampler::Sampler;
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use gpt_rs::inference::generate::{Generator, Sampling};
 use gpt_rs::io::safetensors;
 use gpt_rs::model::config::ModelRuntimeConfig;
 use gpt_rs::ops::trace::{self, FileTraceOptions, FileTraceSink, ProgramDumpFilter};
-use gpt_rs::params::ModelNamespaceId;
 use gpt_rs::profiling;
-use gpt_rs::runtime::{self, LoadedModel, ModelHandle};
-use gpt_rs::tensor::{DeviceTensor, Shape, Tensor};
+use gpt_rs::runtime::{LoadOptions, LoadedModel, ModelHandle};
+use gpt_rs::tensor::HostTensor;
 use gpt_rs::tokenizer::{StreamDecoder, Tokenizer};
-use gpt_rs::PortableBackend;
-#[cfg(feature = "conversion-c")]
-use gpt_rs_backend_c::CBackend;
-use gpt_rs_backend_faer::FaerCpuBackend;
-use rand::SeedableRng;
+use gpt_rs_ir::module::Module;
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::env;
 use std::fs;
@@ -30,28 +22,15 @@ mod benchmark;
 
 use benchmark::compile_freeze::{self, CompileFreezeGate};
 
-fn model_namespace_for_backend<B: PortableBackend + ?Sized>(backend: &B) -> ModelNamespaceId {
-    if backend.backend_name() == "c" {
-        ModelNamespaceId(0)
-    } else {
-        runtime::next_namespace()
-    }
-}
-
-fn load_checkpoint<B: PortableBackend + 'static>(
-    backend: &Arc<B>,
-    checkpoint: &Path,
-    load: &LoadArgs,
-) -> Result<ModelHandle<B>> {
-    let options = runtime::LoadOptions {
-        namespace: Some(model_namespace_for_backend(backend.as_ref())),
+/// Loads the model directory `checkpoint` onto the backend `backend`.
+fn load_checkpoint(backend: &str, checkpoint: &Path, load: &LoadArgs) -> Result<ModelHandle> {
+    let options = LoadOptions {
         runtime: ModelRuntimeConfig {
             matmul_input_dtype: load.matmul_input_dtype,
-            ..ModelRuntimeConfig::default()
         },
-        ..runtime::LoadOptions::default()
+        ..LoadOptions::default()
     };
-    runtime::load_model_with_options(Arc::clone(backend), checkpoint, options)
+    gpt_rs_backends::load_model(backend, checkpoint, options)
         .with_context(|| format!("failed to load checkpoint {}", checkpoint.display()))
 }
 
@@ -86,7 +65,7 @@ struct Args {
         long,
         value_name = "NAME",
         global = true,
-        help = "Backend to use (overrides $GPTRS_BACKEND)"
+        help = "Backend to use (overrides $GPTRS_BACKEND) [default: faer]"
     )]
     backend: Option<String>,
 
@@ -184,11 +163,8 @@ enum Command {
     /// Run a model forward pass once (tokens or vision input).
     Forward(ForwardArgs),
 
-    /// Convert a PTIR program into a target IR module.
+    /// Write the C source that the C backend generates for a PTIR program.
     Convert(ConvertArgs),
-
-    /// List the PTIR pattern views `#[functional]` generates.
-    Patterns(PatternsArgs),
 }
 
 /// Checkpoint loading options shared by every command that loads a model.
@@ -225,83 +201,53 @@ struct CausalArgs {
     #[arg(long)]
     top_k: Option<usize>,
 
-    /// Recompute the whole context at every step instead of caching it.
-    #[arg(long = "no-kv-cache", action = ArgAction::SetFalse)]
-    kv_cache: bool,
-
-    #[arg(
-        long,
-        value_name = "TOKENS",
-        help = "KV cache capacity in tokens [default: prompt length + max tokens, capped at the context length]"
-    )]
-    kv_cache_capacity: Option<usize>,
+    /// Seed of the random draws [default: a fresh seed for each run].
+    #[arg(long)]
+    seed: Option<u64>,
 }
 
-/// A loaded causal LM with its encoded prompt and sampler.
-struct CausalSession<B: PortableBackend + 'static> {
-    model: ModelHandle<B>,
+/// A loaded causal LM with its encoded prompt and sampling.
+struct CausalSession {
+    model: ModelHandle,
     tokenizer: Tokenizer,
     prompt_tokens: Vec<usize>,
-    sampler: Sampler,
-    kv_cache: bool,
-    kv_cache_capacity: Option<usize>,
+    sampling: Sampling,
 }
 
 impl CausalArgs {
-    fn session<B: PortableBackend + 'static>(
-        &self,
-        backend: &Arc<B>,
-        max_tokens: usize,
-    ) -> Result<CausalSession<B>> {
+    fn session(&self, backend: &str) -> Result<CausalSession> {
         let model = load_checkpoint(backend, &self.checkpoint, &self.load)?;
-        let context_length = model
-            .as_causal_lm()
-            .ok_or_else(|| {
-                anyhow!(
-                    "model kind '{}' does not support causal generation",
-                    model.kind()
-                )
-            })?
-            .context_length();
+        model.causal_lm()?;
         let tokenizer = load_tokenizer(&self.checkpoint, self.tokenizer.as_deref())?;
         let prompt_tokens = tokenizer.encode(&self.prompt)?;
         ensure!(
             !prompt_tokens.is_empty(),
             "prompt produced an empty token sequence"
         );
-        let mut sampler = Sampler::new(if self.greedy { 0.0 } else { self.temperature });
-        sampler.top_k = self.top_k.map(|k| k.max(1));
-        let kv_cache_capacity = resolve_kv_cache_capacity(
-            self.kv_cache,
-            self.kv_cache_capacity,
-            prompt_tokens.len(),
-            max_tokens,
-            context_length,
-        );
+        let sampling = if self.greedy {
+            Sampling::greedy()
+        } else {
+            let seed = self.seed.unwrap_or_else(rand::random);
+            let sampling = Sampling::random(self.temperature, seed);
+            match self.top_k {
+                Some(k) => sampling.with_top_k(k),
+                None => sampling,
+            }
+        };
         Ok(CausalSession {
             model,
             tokenizer,
             prompt_tokens,
-            sampler,
-            kv_cache: self.kv_cache,
-            kv_cache_capacity,
+            sampling,
         })
     }
 }
 
-impl<B: PortableBackend + 'static> CausalSession<B> {
-    fn generator(&self) -> Result<Generator<'_, B>> {
-        let model = self
-            .model
-            .as_causal_lm()
-            .ok_or_else(|| anyhow!("model kind '{}' is not a causal LM", self.model.kind()))?;
-        Generator::new(
-            model,
-            &self.sampler,
-            &self.prompt_tokens,
-            self.kv_cache,
-            self.kv_cache_capacity,
-        )
+impl CausalSession {
+    /// Prefills the prompt to generate up to `max_new_tokens` after it.
+    fn generator(&self, max_new_tokens: usize) -> Result<Generator<'_>> {
+        let model = self.model.causal_lm()?;
+        Generator::new(model, &self.prompt_tokens, max_new_tokens, &self.sampling)
     }
 }
 
@@ -354,16 +300,17 @@ struct BenchmarkArgs {
 
     #[arg(
         long,
-        default_value_t = 129,
+        default_value_t = 130,
         help = "Number of generated tokens for decode-steady mode"
     )]
     max_tokens: usize,
 
     #[arg(
         long,
-        default_value_t = 1,
+        default_value_t = 2,
         value_name = "N",
-        help = "Warmup tokens excluded from decode-steady timing"
+        help = "Warmup tokens excluded from decode-steady timing: the first comes from the prefill, \
+                the second compiles the decode step"
     )]
     warmup_tokens: usize,
 
@@ -435,31 +382,16 @@ struct ForwardArgs {
 
 #[derive(ClapArgs, Clone)]
 struct ConvertArgs {
-    /// Conversion target name (e.g., "c").
-    #[arg(long)]
-    target: String,
-
-    /// Input PTIR program (.json or .ptir).
+    /// Input PTIR text module, such as a `program.ptir` that `--dump-dir` writes.
     #[arg(long)]
     ptir: PathBuf,
 
-    /// Output directory for converted IR.
+    /// Output directory for the C source, `program.c`.
     #[arg(long)]
     out: PathBuf,
-
-    /// Optional entrypoint override.
-    #[arg(long)]
-    entrypoint: Option<String>,
 }
 
-#[derive(ClapArgs, Clone)]
-struct PatternsArgs {
-    /// Optional pattern target filter (exact match).
-    #[arg(long)]
-    target: Option<String>,
-}
-
-fn load_vision_input_tensor(args: &VisionInputArgs) -> Result<Tensor> {
+fn load_vision_input_tensor(args: &VisionInputArgs) -> Result<HostTensor> {
     if let Some(path) = args.input.as_ref() {
         let tensors = safetensors::load(path)?;
         let input = tensors.get(&args.input_key).ok_or_else(|| {
@@ -482,11 +414,22 @@ fn load_vision_input_tensor(args: &VisionInputArgs) -> Result<Tensor> {
     );
 
     let mut rng = ChaCha8Rng::seed_from_u64(args.seed);
-    Ok(Tensor::randn(
-        Shape::new([args.batch, 3, args.image_size, args.image_size]),
-        1.0,
-        &mut rng,
-    ))
+    let dims = [args.batch, 3, args.image_size, args.image_size];
+    HostTensor::f32(dims, standard_normal(dims.iter().product(), &mut rng))
+}
+
+/// `len` samples of the standard normal distribution, by the Box-Muller transform.
+fn standard_normal(len: usize, rng: &mut impl Rng) -> Vec<f32> {
+    let mut values = Vec::with_capacity(len + 1);
+    while values.len() < len {
+        let u1: f32 = rng.gen::<f32>().max(f32::MIN_POSITIVE);
+        let u2: f32 = rng.gen::<f32>();
+        let r = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * std::f32::consts::PI * u2;
+        values.extend([r * theta.cos(), r * theta.sin()]);
+    }
+    values.truncate(len);
+    values
 }
 
 fn main() -> Result<()> {
@@ -513,9 +456,6 @@ fn main() -> Result<()> {
         None
     };
 
-    #[cfg(feature = "conversion-c")]
-    gpt_rs_backend_c::register_conversion_targets();
-
     if profile_enabled {
         profiling::reset();
     }
@@ -527,66 +467,25 @@ fn main() -> Result<()> {
         });
     }
 
-    if matches!(args.command, Command::Patterns(_)) {
-        return run_patterns(match args.command {
-            Command::Patterns(patterns) => patterns,
-            _ => unreachable!(),
-        });
-    }
-
-    let backend_env = args
+    let backend = args
         .backend
-        .unwrap_or_else(|| env::var("GPTRS_BACKEND").unwrap_or_else(|_| "faer".to_string()));
-    let command = args.command;
-    let supported = supported_backends();
-    let profile_consumed = match backend_env.trim() {
-        "faer" => {
-            let backend = Arc::new(FaerCpuBackend::create());
-            run_with_backend(
-                backend,
-                command,
-                profile_enabled,
-                args.profile_full,
-                &artifact_config,
-            )?
-        }
-        "c" => {
-            #[cfg(feature = "conversion-c")]
-            {
-                let backend = Arc::new(CBackend::new());
-                run_with_backend(
-                    backend,
-                    command,
-                    profile_enabled,
-                    args.profile_full,
-                    &artifact_config,
-                )?
-            }
-            #[cfg(not(feature = "conversion-c"))]
-            {
-                bail!(
-                    "GPTRS_BACKEND='c' requires building gpt-rs-cli with --features conversion-c"
-                );
-            }
-        }
-        other => {
-            bail!(
-                "unknown backend '{}'; available: {}",
-                other,
-                supported.join(", ")
-            );
-        }
-    };
+        .or_else(|| env::var("GPTRS_BACKEND").ok())
+        .unwrap_or_else(|| gpt_rs_backends::DEFAULT.to_string());
+    let profile_consumed = run(
+        backend.trim(),
+        args.command,
+        profile_enabled,
+        args.profile_full,
+        &artifact_config,
+    )?;
 
     if profile_enabled && !profile_consumed {
         let options = profiling::ProfileFormatOptions {
             profile_full: args.profile_full,
             ..profiling::ProfileFormatOptions::default()
         };
-        if let Some(snapshot) = profiling::take_profile_snapshot_with_options(false, &options) {
-            if let Some(formatted) = snapshot.formatted_str() {
-                eprintln!("{formatted}");
-            }
+        if let Some(snapshot) = profiling::take_snapshot(false, &options) {
+            eprintln!("{}", snapshot.formatted);
             write_profile_artifacts(&snapshot, &artifact_config)?;
         } else {
             eprintln!(
@@ -598,15 +497,9 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn supported_backends() -> Vec<&'static str> {
-    [Some("faer"), cfg!(feature = "conversion-c").then_some("c")]
-        .into_iter()
-        .flatten()
-        .collect()
-}
-
-fn run_with_backend<B: PortableBackend + 'static>(
-    backend: Arc<B>,
+/// Runs `command` on the backend `backend`. Returns whether the command printed the profile.
+fn run(
+    backend: &str,
     command: Command,
     profile: bool,
     profile_full: bool,
@@ -622,64 +515,23 @@ fn run_with_backend<B: PortableBackend + 'static>(
 
     match command {
         Command::Generate(args) => {
-            run_generate(&backend, &args, profile)?;
+            run_generate(backend, &args, profile)?;
             Ok(false)
         }
         Command::Benchmark(args) => {
-            run_benchmark(&backend, &args, profile, profile_full, artifact_config)
+            run_benchmark(backend, &args, profile, profile_full, artifact_config)
         }
         Command::Forward(args) => {
-            run_forward(&backend, &args, profile)?;
+            run_forward(backend, &args, profile)?;
             Ok(false)
         }
         Command::Convert(_) => unreachable!(),
-        Command::Patterns(_) => unreachable!(),
     }
 }
 
-fn run_patterns(args: PatternsArgs) -> Result<()> {
-    let mut defs: Vec<_> = gpt_rs::backend::pattern::all_pattern_defs()
-        .iter()
-        .collect();
-    defs.sort_by_key(|def| def.target);
-
-    let mut printed = 0usize;
-    for def in defs {
-        if args
-            .target
-            .as_deref()
-            .is_some_and(|target| target != def.target)
-        {
-            continue;
-        }
-        println!("{} -> {}::{}", def.target, def.module_path, def.view_name);
-        for field in def.fields {
-            if field.optional {
-                println!("  {}: Option<{}>", field.name, field.view);
-            } else {
-                println!("  {}: {}", field.name, field.view);
-            }
-        }
-        printed += 1;
-    }
-
-    if printed == 0 {
-        if let Some(target) = args.target {
-            println!("no patterns found for target {target}");
-        } else {
-            println!("no patterns registered");
-        }
-    }
-
-    Ok(())
-}
-
-fn run_generate<B: PortableBackend + 'static>(
-    backend: &Arc<B>,
-    args: &GenerateArgs,
-    profile: bool,
-) -> Result<()> {
-    let session = args.causal.session(backend, args.max_tokens)?;
+fn run_generate(backend: &str, args: &GenerateArgs, profile: bool) -> Result<()> {
+    ensure!(args.max_tokens > 0, "--max-tokens must be > 0");
+    let session = args.causal.session(backend)?;
     let stop_tokens = if args.ignore_eos {
         &[][..]
     } else {
@@ -691,36 +543,37 @@ fn run_generate<B: PortableBackend + 'static>(
         profiling::reset();
     }
     let prefill_t0 = Instant::now();
-    let mut generator = session.generator()?.with_stop_tokens(stop_tokens);
+    let mut generator = session
+        .generator(args.max_tokens)?
+        .with_stop_tokens(stop_tokens);
     let prefill_elapsed = prefill_t0.elapsed();
 
     let mut decoder = StreamDecoder::new();
     let mut stdout = io::BufWriter::with_capacity(STREAM_FLUSH_BYTES, io::stdout().lock());
     let (mut generated, mut decode_steps, mut decode_elapsed) = (0usize, 0usize, Duration::ZERO);
-    for step in 0..args.max_tokens {
+    for step in 0.. {
         if profile && warmup > 0 && step == warmup {
             profiling::reset();
         }
-        let last = step + 1 == args.max_tokens;
         let t0 = Instant::now();
-        let token = if last {
-            generator.step_final()?
-        } else {
-            generator.step()?
-        };
-        if generator.is_finished() {
-            break;
-        }
-        // Timed steps sample a token and run the forward pass for the next position.
-        if step >= warmup && !last {
+        let token = generator.step()?;
+        // The prefill picked the first token. Every later step runs the forward pass of the
+        // token before it.
+        if step > 0 && step >= warmup {
             decode_elapsed += t0.elapsed();
             decode_steps += 1;
+        }
+        if stop_tokens.contains(&token) {
+            break;
         }
         generated += 1;
         let piece = decoder.push(&session.tokenizer, token);
         stdout.write_all(piece.as_bytes())?;
         if generated.is_multiple_of(STREAM_FLUSH_TOKENS) || piece.contains('\n') {
             stdout.flush()?;
+        }
+        if generator.is_finished() {
+            break;
         }
     }
     stdout.write_all(decoder.finish().as_bytes())?;
@@ -745,36 +598,15 @@ fn run_generate<B: PortableBackend + 'static>(
 const STREAM_FLUSH_TOKENS: usize = 16;
 const STREAM_FLUSH_BYTES: usize = 4096;
 
-fn resolve_kv_cache_capacity(
-    kv_cache_enabled: bool,
-    requested_capacity: Option<usize>,
-    prompt_len: usize,
-    max_tokens: usize,
-    context_length: usize,
-) -> Option<usize> {
-    if !kv_cache_enabled {
-        return None;
-    }
-    if let Some(capacity) = requested_capacity {
-        return Some(capacity);
-    }
-    let required = prompt_len.saturating_add(max_tokens).max(1);
-    let auto_capacity = required.min(context_length);
-    if auto_capacity == 0 {
-        None
-    } else {
-        Some(auto_capacity)
-    }
-}
-
-fn run_benchmark<B: PortableBackend + 'static>(
-    backend: &Arc<B>,
+fn run_benchmark(
+    backend: &str,
     args: &BenchmarkArgs,
     profile: bool,
     profile_full: bool,
     artifact_config: &ProfileArtifactConfig,
 ) -> Result<bool> {
-    let session = args.causal.session(backend, args.max_tokens)?;
+    ensure!(args.max_tokens > 0, "--max-tokens must be > 0");
+    let session = args.causal.session(backend)?;
     let prompt_tokens = &session.prompt_tokens;
 
     match args.mode {
@@ -785,7 +617,7 @@ fn run_benchmark<B: PortableBackend + 'static>(
             let elapsed = {
                 let _scope = profile.then(|| profiling::backend_scope("benchmark.prefill_total"));
                 let t0 = Instant::now();
-                let _generator = session.generator()?;
+                let _generator = session.generator(args.max_tokens)?;
                 t0.elapsed()
             };
             eprintln!(
@@ -816,8 +648,8 @@ fn run_benchmark<B: PortableBackend + 'static>(
                 let _scope =
                     profile.then(|| profiling::backend_scope("benchmark.first_token_total"));
                 let t0 = Instant::now();
-                let mut generator = session.generator()?;
-                let token = generator.step_final()?;
+                let mut generator = session.generator(args.max_tokens)?;
+                let token = generator.step()?;
                 (token, t0.elapsed())
             };
             eprintln!(
@@ -856,7 +688,7 @@ fn run_benchmark<B: PortableBackend + 'static>(
                 args.warmup_tokens
             );
 
-            let mut generator = session.generator()?;
+            let mut generator = session.generator(args.max_tokens)?;
 
             for _ in 0..warmup {
                 generator.step()?;
@@ -867,15 +699,10 @@ fn run_benchmark<B: PortableBackend + 'static>(
             }
             let freeze_capture_token = args.compile_freeze_after.min(measured_steps);
             let mut compile_baseline_ms = if profile && freeze_capture_token == 0 {
-                profiling::take_profile_snapshot_with_options(
-                    false,
-                    &profiling::ProfileFormatOptions::default(),
-                )
-                .and_then(|snapshot| {
-                    snapshot
-                        .report_json_str()
-                        .and_then(compile_freeze::compile_ms_from_report_json)
-                })
+                profiling::take_snapshot(false, &profiling::ProfileFormatOptions::default())
+                    .and_then(|snapshot| {
+                        compile_freeze::compile_ms_from_report_json(&snapshot.report_json)
+                    })
             } else {
                 None
             };
@@ -884,21 +711,13 @@ fn run_benchmark<B: PortableBackend + 'static>(
                     profile.then(|| profiling::backend_scope("benchmark.decode_steady_total"));
                 let t0 = Instant::now();
                 for step in 0..measured_steps {
-                    if step + 1 == measured_steps {
-                        generator.step_final()?;
-                    } else {
-                        generator.step()?;
-                    }
+                    generator.step()?;
                     if profile && step + 1 == freeze_capture_token {
-                        compile_baseline_ms = profiling::take_profile_snapshot_with_options(
-                            false,
-                            &profiling::ProfileFormatOptions::default(),
-                        )
-                        .and_then(|snapshot| {
-                            snapshot
-                                .report_json_str()
-                                .and_then(compile_freeze::compile_ms_from_report_json)
-                        });
+                        let options = profiling::ProfileFormatOptions::default();
+                        compile_baseline_ms =
+                            profiling::take_snapshot(false, &options).and_then(|snapshot| {
+                                compile_freeze::compile_ms_from_report_json(&snapshot.report_json)
+                            });
                     }
                 }
                 t0.elapsed()
@@ -948,8 +767,8 @@ fn emit_profile_with_attribution(
         profile_full,
         ..profiling::ProfileFormatOptions::default()
     };
-    if let Some(snapshot) = profiling::take_profile_snapshot_with_options(false, &format_options) {
-        let report_json = snapshot.report_json_str().unwrap_or("");
+    if let Some(snapshot) = profiling::take_snapshot(false, &format_options) {
+        let report_json = snapshot.report_json.as_str();
         if let Some(gate) = compile_freeze_gate {
             match compile_freeze::evaluate_compile_freeze(report_json, gate) {
                 Some(observation) if observation.has_anomaly() => {
@@ -1005,9 +824,7 @@ fn emit_profile_with_attribution(
         } else {
             eprintln!("Attribution ({label}): unavailable (failed to parse profiler report).");
         }
-        if let Some(formatted) = snapshot.formatted_str() {
-            eprintln!("{formatted}");
-        }
+        eprintln!("{}", snapshot.formatted);
         write_profile_artifacts(&snapshot, artifact_config)?;
     } else {
         eprintln!(
@@ -1028,12 +845,11 @@ fn write_profile_artifacts(
         .with_context(|| format!("failed to create profile output dir {}", out_dir.display()))?;
 
     let jsonl_path = out_dir.join("profile.jsonl");
-    let profile_jsonl = snapshot.profile_jsonl_str().unwrap_or("");
-    fs::write(&jsonl_path, profile_jsonl.as_bytes())
+    fs::write(&jsonl_path, snapshot.profile_jsonl.as_bytes())
         .with_context(|| format!("failed to write {}", jsonl_path.display()))?;
 
     if artifact_config.write_timeline || artifact_config.write_flamegraph {
-        let Some(trace_json) = profiling::take_trace_json() else {
+        let Some(trace_json) = profiling::take_trace_json(false) else {
             return Err(anyhow!(
                 "trace export requested but no trace events were captured; ensure profiler support is enabled"
             ));
@@ -1086,85 +902,53 @@ fn measured_component_ms_from_report_json(report_json: &str) -> Option<f64> {
     Some(total)
 }
 
+/// Writes the C source that the C backend generates for the run-time function of a PTIR text
+/// module.
 fn run_conversion(args: ConvertArgs) -> Result<()> {
-    let program = load_ptir_program(&args.ptir)?;
-    let target = conversion::get_conversion_target(&args.target).ok_or_else(|| {
-        anyhow!(
-            "unknown conversion target '{}'; available: {}",
-            args.target,
-            conversion::list_conversion_targets().join(", ")
-        )
-    })?;
-
-    let options = ConversionOptions {
-        entrypoint_override: args.entrypoint.clone(),
+    let path = &args.ptir;
+    let src =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let module = Module::from_text(&src).with_context(|| format!("{}", path.display()))?;
+    gpt_rs_ir::verify::verify(&module).map_err(|err| anyhow!("{}: {err}", path.display()))?;
+    let run_time: Vec<String> = module
+        .funcs()
+        .into_iter()
+        .filter_map(|f| module.op(f).as_func().filter(|f| !f.is_load_time()))
+        .map(|f| f.name.clone())
+        .collect();
+    let [func] = &run_time[..] else {
+        bail!(
+            "{}: convert takes one run-time function, found {}",
+            path.display(),
+            run_time.len()
+        );
     };
-
-    target
-        .check(&program, &options)
-        .map_err(|err| anyhow!(err.to_string()))?;
-    let converted = target
-        .convert(&program, &options)
-        .map_err(|err| anyhow!(err.to_string()))?;
-
+    let source = c_source(&module, func)?;
     fs::create_dir_all(&args.out)
         .with_context(|| format!("failed to create output dir {}", args.out.display()))?;
-    let filename = format!("program.{}", target.file_extension());
-    let out_path = args.out.join(filename);
-    fs::write(&out_path, converted.module)
+    let out_path = args.out.join("program.c");
+    fs::write(&out_path, source)
         .with_context(|| format!("failed to write {}", out_path.display()))?;
-
-    let meta_path = args.out.join("meta.json");
-    let meta = serde_json::json!({
-        "target": target.name(),
-        "entrypoints": converted.entrypoints.iter().map(|e| {
-            serde_json::json!({ "ptir": e.ptir, "symbol": e.symbol })
-        }).collect::<Vec<_>>(),
-    });
-    fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)
-        .with_context(|| format!("failed to write {}", meta_path.display()))?;
-
     eprintln!(
         "Converted PTIR '{}' to {}",
-        args.ptir.display(),
+        path.display(),
         out_path.display()
     );
     Ok(())
 }
 
-fn load_ptir_program(path: &Path) -> Result<Program> {
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-    match ext {
-        "json" => Program::load_json(path).map_err(|err| anyhow!(err.to_string())),
-        "ptir" | "txt" => {
-            let src = fs::read_to_string(path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            if src.trim_start().starts_with("program @") {
-                bail!("text PTIR program parsing is not supported yet; use the JSON dump instead");
-            }
-            parse_program(&src).map_err(|err| anyhow!(err.to_string()))
-        }
-        _ => {
-            let json = Program::load_json(path);
-            if let Ok(program) = json {
-                return Ok(program);
-            }
-            let src = fs::read_to_string(path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            if src.trim_start().starts_with("program @") {
-                bail!("text PTIR program parsing is not supported yet; use the JSON dump instead");
-            }
-            parse_program(&src).map_err(|err| anyhow!(err.to_string()))
-        }
-    }
+#[cfg(feature = "conversion-c")]
+fn c_source(module: &Module, func: &str) -> Result<String> {
+    gpt_rs_backend_c::generate_c_module(module, func)
 }
 
-fn run_forward<B: PortableBackend + 'static>(
-    backend: &Arc<B>,
-    args: &ForwardArgs,
-    profile: bool,
-) -> Result<()> {
-    let mut model = load_checkpoint(backend, &args.checkpoint, &args.load)?;
+#[cfg(not(feature = "conversion-c"))]
+fn c_source(_module: &Module, _func: &str) -> Result<String> {
+    bail!("convert requires building gpt-rs-cli with --features conversion-c")
+}
+
+fn run_forward(backend: &str, args: &ForwardArgs, profile: bool) -> Result<()> {
+    let model = load_checkpoint(backend, &args.checkpoint, &args.load)?;
 
     let is_text = args.prompt.is_some() || !args.tokens.is_empty();
     if args.prompt.is_some() && !args.tokens.is_empty() {
@@ -1177,32 +961,34 @@ fn run_forward<B: PortableBackend + 'static>(
         bail!("cannot combine text input (--prompt/--tokens) with vision input (--input)");
     }
 
-    let input = if let Some(prompt) = args.prompt.as_ref() {
-        let tokenizer = load_tokenizer(&args.checkpoint, args.tokenizer.as_deref())?;
-        let tokens = tokenizer.encode(prompt)?;
-        ensure!(
-            !tokens.is_empty(),
-            "prompt produced an empty token sequence"
-        );
-        runtime::ModelInput::Tokens(tokens)
-    } else if !args.tokens.is_empty() {
-        runtime::ModelInput::Tokens(args.tokens.clone())
-    } else {
-        let input = load_vision_input_tensor(&args.vision)?;
-        let input_device = DeviceTensor::from_host(Arc::clone(backend), input)
-            .with_context(|| "failed to move input to device")?;
-        runtime::ModelInput::Vision(input_device)
+    let tokens = match args.prompt.as_ref() {
+        Some(prompt) => {
+            let tokenizer = load_tokenizer(&args.checkpoint, args.tokenizer.as_deref())?;
+            let tokens = tokenizer.encode(prompt)?;
+            ensure!(
+                !tokens.is_empty(),
+                "prompt produced an empty token sequence"
+            );
+            tokens
+        }
+        None => args.tokens.clone(),
     };
+    let pixels = (!is_text)
+        .then(|| load_vision_input_tensor(&args.vision))
+        .transpose()?;
 
     if profile {
         profiling::reset();
     }
     let t0 = Instant::now();
-    let runtime::ModelOutput::Tensor(host) = LoadedModel::forward(&mut model, input)?;
+    let host = match pixels {
+        Some(pixels) => model.vision()?.forward(pixels)?,
+        None => model.causal_lm()?.forward(&tokens)?,
+    };
     let elapsed = t0.elapsed();
 
     let model_kind = model.kind();
-    let shape = host.shape().dims();
+    let shape = host.dims.as_slice();
     println!("model={} output_shape={:?}", model_kind, shape);
 
     if shape.len() == 2 && shape[0] > 0 && shape[1] > 0 {
@@ -1210,7 +996,7 @@ fn run_forward<B: PortableBackend + 'static>(
         let cols = shape[1];
         let row = if is_text { rows - 1 } else { 0 };
         let start = row * cols;
-        let logits = &host.data()[start..start + cols];
+        let logits = &host.as_f32().unwrap()[start..start + cols];
         let mut best = 0usize;
         let mut best_val = f32::NEG_INFINITY;
         for (i, &v) in logits.iter().enumerate() {

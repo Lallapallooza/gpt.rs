@@ -15,15 +15,15 @@ pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
 numpy = "0.22"
 gpt-rs = { path = "../gpt-rs", version = "0.1.0" }
 gpt-rs-backend-ref-cpu = { path = "../gpt-rs-backend-ref-cpu", version = "0.1.0" }
-gpt-rs-backend-faer = { path = "../gpt-rs-backend-faer", version = "0.1.0", optional = true }
-gpt-rs-backend-c = { path = "../gpt-rs-backend-c", version = "0.1.0", optional = true, default-features = false }
+gpt-rs-backends = { path = "../gpt-rs-backends", version = "0.1.0" }
 thiserror.workspace = true
 anyhow.workspace = true
+rand.workspace = true
 serde_json = "1"
 
 [features]
 default = ["cpu"]
 cpu = []
-faer = ["gpt-rs-backend-faer"]
-conversion-c = ["dep:gpt-rs-backend-c", "gpt-rs-backend-c/conversion-c"]
+faer = ["gpt-rs-backends/faer"]
+conversion-c = ["gpt-rs-backends/c"]
 profiler = ["gpt-rs/profiler"]

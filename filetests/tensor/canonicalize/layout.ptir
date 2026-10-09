@@ -1,0 +1,40 @@
+// RUN: pass canonicalize
+
+// Chains of reshapes, of broadcasts and of slices collapse into one op.
+// CHECK: func.func @chains
+// CHECK-NEXT: [[R:%[0-9]+]] = tensor.reshape(%0) {shape = [6]}
+// CHECK-NEXT: [[B:%[0-9]+]] = tensor.broadcast_to(%1) {shape = [2, 4, 3]}
+// CHECK-NEXT: [[S:%[0-9]+]] = tensor.slice(%2) {starts = [3, 1], sizes = [2, 2]}
+// CHECK-NEXT: func.return([[R]], [[B]], [[S]])
+func.func @chains(%0: tensor<2x3xf32>, %1: tensor<3xf32>, %2: tensor<8x4xf32>) -> (tensor<6xf32>, tensor<2x4x3xf32>, tensor<2x2xf32>) {
+  %3 = tensor.reshape(%0) {shape = [3, 2]} : (tensor<2x3xf32>) -> tensor<3x2xf32>
+  %4 = tensor.reshape(%3) {shape = [6]} : (tensor<3x2xf32>) -> tensor<6xf32>
+  %5 = tensor.broadcast_to(%1) {shape = [4, 3]} : (tensor<3xf32>) -> tensor<4x3xf32>
+  %6 = tensor.broadcast_to(%5) {shape = [2, 4, 3]} : (tensor<4x3xf32>) -> tensor<2x4x3xf32>
+  %7 = tensor.slice(%2) {starts = [2, 0], sizes = [4, 4]} : (tensor<8x4xf32>) -> tensor<4x4xf32>
+  %8 = tensor.slice(%7) {starts = [1, 1], sizes = [2, 2]} : (tensor<4x4xf32>) -> tensor<2x2xf32>
+  func.return(%4, %6, %8) : (tensor<6xf32>, tensor<2x4x3xf32>, tensor<2x2xf32>) -> ()
+}
+
+// -----
+
+// Steps of 1 are written as no strides.
+// CHECK: func.func @unit_strides
+// CHECK-NEXT: tensor.slice(%0) {starts = [1, 0], sizes = [2, 3]} :
+func.func @unit_strides(%0: tensor<4x6xf32>) -> tensor<2x3xf32> {
+  %1 = tensor.slice(%0) {starts = [1, 0], sizes = [2, 3], strides = [1, 1]} : (tensor<4x6xf32>) -> tensor<2x3xf32>
+  func.return(%1) : (tensor<2x3xf32>) -> ()
+}
+
+// -----
+
+// A slice of a strided slice steps by the product of the strides, from the second slice's start
+// counted in steps of the first. Element k of the result is element 1 + (1 + 2k) * 2 = 3 + 4k.
+// CHECK: func.func @strided_chain
+// CHECK-NEXT: tensor.slice(%0) {starts = [3], sizes = [3], strides = [4]} :
+// CHECK-NEXT: func.return
+func.func @strided_chain(%0: tensor<16xf32>) -> tensor<3xf32> {
+  %1 = tensor.slice(%0) {starts = [1], sizes = [7], strides = [2]} : (tensor<16xf32>) -> tensor<7xf32>
+  %2 = tensor.slice(%1) {starts = [1], sizes = [3], strides = [2]} : (tensor<7xf32>) -> tensor<3xf32>
+  func.return(%2) : (tensor<3xf32>) -> ()
+}

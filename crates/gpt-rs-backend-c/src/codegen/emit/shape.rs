@@ -1,168 +1,113 @@
 use std::collections::HashMap;
 
-use gpt_rs::backend::conversion::{ConversionError, ConversionResult};
-use gpt_rs::backend::spec::{
-    ConcatSpec, DType, Instruction, IotaSpec, Operand, Operation, PadSpec, SliceSpec, TensorSpec,
-    TileSpec, TransposeSpec,
-};
+use anyhow::{anyhow, Result};
+use gpt_rs_ir::dialects::tensor::{axis_index, Concat, Iota, Slice, TensorOp, Transpose};
+use gpt_rs_ir::module::Value;
+use gpt_rs_ir::types::{DType, TensorType};
 
-use super::super::profile::{
-    backend_operation_label, register_op_profile_generic, register_op_profile_unary,
-};
-use super::super::types::{ValueInfo, ValueKey};
+use super::super::profile::{register_op_profile_generic, register_op_profile_unary};
+use super::super::types::{Instruction, Kind, ValueInfo};
 use super::super::utils::{
-    axis_index, dims_usize, emit_memcpy, emit_parallel_loops_with_indices, ensure_copy_dtypes,
-    format_f32, linear_index_expr, literal_to_f32_scalar, push_block,
+    dims_usize, emit_memcpy, emit_parallel_loops_with_indices, ensure_copy_dtypes,
+    linear_index_expr, push_block,
 };
 use super::super::value_info::{
-    ensure_dtype, operand_dtype, operand_elem_count, operand_expr, operand_spec, operand_specs,
-    output_info, LiteralCache,
+    ensure_dtype, operand_dtype, operand_elem_count, operand_expr, operand_type, operand_types,
+    output_info,
 };
 use super::EmitContext;
 
 pub(super) fn emit_instruction(
-    inst: &Instruction,
+    inst: &Instruction<'_>,
     ctx: &mut EmitContext<'_>,
-) -> ConversionResult<Option<usize>> {
+) -> Result<Option<usize>> {
     let EmitContext {
         module,
         value_infos,
-        literal_cache,
         matmul_profile,
         ..
     } = ctx;
 
-    let op_id = match &inst.op {
-        Operation::Reshape(_spec) => {
-            let out_info = output_info(value_infos, inst.id)?;
-            let label = backend_operation_label(&inst.op);
-            let input_spec = operand_spec(&inst.operands[0], value_infos)?;
+    let &Kind::Op(op) = &inst.kind else {
+        return Ok(None);
+    };
+    let op_id = match op {
+        TensorOp::Reshape(_) => {
+            let out_info = output_info(value_infos, inst.result())?;
+            let label = inst.label;
+            let input_spec = operand_type(&inst.operands[0], value_infos)?;
             let op_id =
-                register_op_profile_unary(matmul_profile, label, &out_info.spec, &input_spec)?;
-            let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
+                register_op_profile_unary(matmul_profile, label, &out_info.ty, &input_spec)?;
+            let input = operand_expr(&inst.operands[0], value_infos)?;
             let in_elem = operand_elem_count(&inst.operands[0], value_infos)?;
             if out_info.elem_count != in_elem {
-                return Err(ConversionError::new("reshape element count mismatch"));
+                return Err(anyhow!("reshape element count mismatch"));
             }
             emit_memcpy(module, &out_info.var, &input, out_info.byte_len);
             op_id
         }
-        Operation::BroadcastTo(_spec) => {
-            let out_info = output_info(value_infos, inst.id)?;
+        TensorOp::BroadcastTo(_) => {
+            let out_info = output_info(value_infos, inst.result())?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
-            ensure_copy_dtypes("broadcast", &[input_dtype], out_info.spec.dtype)?;
-            let label = backend_operation_label(&inst.op);
-            let input_spec = operand_spec(&inst.operands[0], value_infos)?;
+            ensure_copy_dtypes("broadcast", &[input_dtype], out_info.ty.dtype)?;
+            let label = inst.label;
+            let input_spec = operand_type(&inst.operands[0], value_infos)?;
             let op_id =
-                register_op_profile_unary(matmul_profile, label, &out_info.spec, &input_spec)?;
-            let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_broadcast(module, &out_info.var, &input, &out_info.spec, &input_spec)?;
+                register_op_profile_unary(matmul_profile, label, &out_info.ty, &input_spec)?;
+            let input = operand_expr(&inst.operands[0], value_infos)?;
+            emit_broadcast(module, &out_info.var, &input, &out_info.ty, &input_spec)?;
             op_id
         }
-        Operation::Transpose(spec) => {
-            let out_info = output_info(value_infos, inst.id)?;
+        TensorOp::Transpose(spec) => {
+            let out_info = output_info(value_infos, inst.result())?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
-            ensure_copy_dtypes("transpose", &[input_dtype], out_info.spec.dtype)?;
-            let label = backend_operation_label(&inst.op);
-            let in_spec = operand_spec(&inst.operands[0], value_infos)?;
-            let op_id = register_op_profile_unary(matmul_profile, label, &out_info.spec, &in_spec)?;
-            let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_transpose(
-                module,
-                &out_info.var,
-                &input,
-                &out_info.spec,
-                &in_spec,
-                spec,
-            )?;
+            ensure_copy_dtypes("transpose", &[input_dtype], out_info.ty.dtype)?;
+            let label = inst.label;
+            let in_spec = operand_type(&inst.operands[0], value_infos)?;
+            let op_id = register_op_profile_unary(matmul_profile, label, &out_info.ty, &in_spec)?;
+            let input = operand_expr(&inst.operands[0], value_infos)?;
+            emit_transpose(module, &out_info.var, &input, &out_info.ty, &in_spec, spec)?;
             op_id
         }
-        Operation::Slice(spec) => {
-            let out_info = output_info(value_infos, inst.id)?;
+        TensorOp::Slice(spec) => {
+            let out_info = output_info(value_infos, inst.result())?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
-            ensure_copy_dtypes("slice", &[input_dtype], out_info.spec.dtype)?;
-            let label = backend_operation_label(&inst.op);
-            let in_spec = operand_spec(&inst.operands[0], value_infos)?;
-            let op_id = register_op_profile_unary(matmul_profile, label, &out_info.spec, &in_spec)?;
-            let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_slice(
-                module,
-                &out_info.var,
-                &input,
-                &out_info.spec,
-                &in_spec,
-                spec,
-            )?;
+            ensure_copy_dtypes("slice", &[input_dtype], out_info.ty.dtype)?;
+            let label = inst.label;
+            let in_spec = operand_type(&inst.operands[0], value_infos)?;
+            let op_id = register_op_profile_unary(matmul_profile, label, &out_info.ty, &in_spec)?;
+            let input = operand_expr(&inst.operands[0], value_infos)?;
+            emit_slice(module, &out_info.var, &input, &out_info.ty, &in_spec, spec)?;
             op_id
         }
-        Operation::Concat(spec) => {
-            let out_info = output_info(value_infos, inst.id)?;
+        TensorOp::Concat(spec) => {
+            let out_info = output_info(value_infos, inst.result())?;
             let dtypes = inst
                 .operands
                 .iter()
                 .map(|operand| operand_dtype(operand, value_infos))
-                .collect::<ConversionResult<Vec<_>>>()?;
-            ensure_copy_dtypes("concat", &dtypes, out_info.spec.dtype)?;
-            let label = backend_operation_label(&inst.op);
-            let input_specs = operand_specs(&inst.operands, value_infos)?;
+                .collect::<Result<Vec<_>>>()?;
+            ensure_copy_dtypes("concat", &dtypes, out_info.ty.dtype)?;
+            let label = inst.label;
+            let input_specs = operand_types(&inst.operands, value_infos)?;
             let op_id =
-                register_op_profile_generic(matmul_profile, label, &out_info.spec, &input_specs)?;
+                register_op_profile_generic(matmul_profile, label, &out_info.ty, &input_specs)?;
             emit_concat(
                 module,
                 &out_info.var,
-                &out_info.spec,
+                &out_info.ty,
                 &inst.operands,
                 spec,
                 value_infos,
-                literal_cache,
             )?;
             op_id
         }
-        Operation::Pad(spec) => {
-            let out_info = output_info(value_infos, inst.id)?;
-            let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
-            ensure_dtype(input_dtype, DType::F32, "pad input must be f32")?;
-            ensure_dtype(out_info.spec.dtype, DType::F32, "pad output must be f32")?;
-            let label = backend_operation_label(&inst.op);
-            let input_spec = operand_spec(&inst.operands[0], value_infos)?;
-            let op_id =
-                register_op_profile_unary(matmul_profile, label, &out_info.spec, &input_spec)?;
-            let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_pad(
-                module,
-                &out_info.var,
-                &input,
-                &out_info.spec,
-                &input_spec,
-                spec,
-            )?;
-            op_id
-        }
-        Operation::Tile(spec) => {
-            let out_info = output_info(value_infos, inst.id)?;
-            let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
-            ensure_copy_dtypes("tile", &[input_dtype], out_info.spec.dtype)?;
-            let label = backend_operation_label(&inst.op);
-            let input_spec = operand_spec(&inst.operands[0], value_infos)?;
-            let op_id =
-                register_op_profile_unary(matmul_profile, label, &out_info.spec, &input_spec)?;
-            let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_tile(
-                module,
-                &out_info.var,
-                &input,
-                &out_info.spec,
-                &input_spec,
-                spec,
-            )?;
-            op_id
-        }
-        Operation::Iota(spec) => {
-            let out_info = output_info(value_infos, inst.id)?;
-            ensure_dtype(out_info.spec.dtype, DType::Si32, "iota output must be si32")?;
-            let label = backend_operation_label(&inst.op);
-            let op_id = register_op_profile_generic(matmul_profile, label, &out_info.spec, &[])?;
-            emit_iota(module, &out_info.var, &out_info.spec, spec)?;
+        TensorOp::Iota(spec) => {
+            let out_info = output_info(value_infos, inst.result())?;
+            ensure_dtype(out_info.ty.dtype, DType::Si32, "iota output must be si32")?;
+            let label = inst.label;
+            let op_id = register_op_profile_generic(matmul_profile, label, &out_info.ty, &[])?;
+            emit_iota(module, &out_info.var, &out_info.ty, spec)?;
             op_id
         }
         _ => return Ok(None),
@@ -175,15 +120,13 @@ fn emit_broadcast(
     module: &mut String,
     out: &str,
     input: &str,
-    out_spec: &TensorSpec,
-    in_spec: &TensorSpec,
-) -> ConversionResult<()> {
+    out_spec: &TensorType,
+    in_spec: &TensorType,
+) -> Result<()> {
     let out_dims = dims_usize(out_spec)?;
     let in_dims = dims_usize(in_spec)?;
     if out_dims.len() < in_dims.len() {
-        return Err(ConversionError::new(
-            "broadcast output rank is smaller than input rank",
-        ));
+        return Err(anyhow!("broadcast output rank is smaller than input rank"));
     }
     let mut padded_in_dims = vec![1usize; out_dims.len() - in_dims.len()];
     padded_in_dims.extend(in_dims);
@@ -211,14 +154,14 @@ fn emit_transpose(
     module: &mut String,
     out: &str,
     input: &str,
-    out_spec: &TensorSpec,
-    in_spec: &TensorSpec,
-    spec: &TransposeSpec,
-) -> ConversionResult<()> {
+    out_spec: &TensorType,
+    in_spec: &TensorType,
+    spec: &Transpose,
+) -> Result<()> {
     let out_dims = dims_usize(out_spec)?;
     let in_dims = dims_usize(in_spec)?;
     if spec.perm.len() != out_dims.len() || in_dims.len() != out_dims.len() {
-        return Err(ConversionError::new("transpose rank mismatch"));
+        return Err(anyhow!("transpose rank mismatch"));
     }
 
     emit_parallel_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
@@ -243,21 +186,20 @@ fn emit_slice(
     module: &mut String,
     out: &str,
     input: &str,
-    out_spec: &TensorSpec,
-    in_spec: &TensorSpec,
-    spec: &SliceSpec,
-) -> ConversionResult<()> {
+    out_spec: &TensorType,
+    in_spec: &TensorType,
+    spec: &Slice,
+) -> Result<()> {
     let out_dims = dims_usize(out_spec)?;
     let in_dims = dims_usize(in_spec)?;
     if spec.starts.len() != out_dims.len() || spec.sizes.len() != out_dims.len() {
-        return Err(ConversionError::new("slice spec rank mismatch"));
+        return Err(anyhow!("slice spec rank mismatch"));
     }
     emit_parallel_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
         let mut in_indices = Vec::with_capacity(indices.len());
-        for (idx, start) in spec.starts.iter().enumerate() {
-            let base = start;
-            let offset = &indices[idx];
-            in_indices.push(format!("{base} + {offset}"));
+        for (axis, start) in spec.starts.iter().enumerate() {
+            let stride = spec.stride(axis);
+            in_indices.push(format!("{start} + {stride} * {}", indices[axis]));
         }
         let out_idx = linear_index_expr(&out_dims, indices);
         let in_idx = linear_index_expr(&in_dims, &in_indices);
@@ -272,12 +214,11 @@ fn emit_slice(
 fn emit_concat(
     module: &mut String,
     out: &str,
-    out_spec: &TensorSpec,
-    operands: &[Operand],
-    spec: &ConcatSpec,
-    values: &HashMap<ValueKey, ValueInfo>,
-    literal_cache: &mut LiteralCache,
-) -> ConversionResult<()> {
+    out_spec: &TensorType,
+    operands: &[Value],
+    spec: &Concat,
+    values: &HashMap<Value, ValueInfo>,
+) -> Result<()> {
     let out_dims = dims_usize(out_spec)?;
     let axis = axis_index(spec.axis, out_dims.len())?;
     let mut operand_exprs = Vec::with_capacity(operands.len());
@@ -286,17 +227,15 @@ fn emit_concat(
     let mut axis_cursor = 0usize;
 
     for operand in operands {
-        let input = operand_expr(operand, values, module, literal_cache)?;
-        let in_spec = operand_spec(operand, values)?;
+        let input = operand_expr(operand, values)?;
+        let in_spec = operand_type(operand, values)?;
         let in_dims = dims_usize(&in_spec)?;
         if in_dims.len() != out_dims.len() {
-            return Err(ConversionError::new("concat operand rank mismatch"));
+            return Err(anyhow!("concat operand rank mismatch"));
         }
         for (idx, (in_dim, out_dim)) in in_dims.iter().zip(out_dims.iter()).enumerate() {
             if idx != axis && in_dim != out_dim {
-                return Err(ConversionError::new(
-                    "concat operand shape mismatch on non-concat axis",
-                ));
+                return Err(anyhow!("concat operand shape mismatch on non-concat axis"));
             }
         }
         axis_offsets.push(axis_cursor);
@@ -306,9 +245,7 @@ fn emit_concat(
     }
 
     if axis_cursor != out_dims[axis] {
-        return Err(ConversionError::new(
-            "concat axis size does not match output shape",
-        ));
+        return Err(anyhow!("concat axis size does not match output shape"));
     }
 
     emit_parallel_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
@@ -351,108 +288,13 @@ fn emit_concat(
     });
     Ok(())
 }
-fn emit_pad(
-    module: &mut String,
-    out: &str,
-    input: &str,
-    out_spec: &TensorSpec,
-    in_spec: &TensorSpec,
-    spec: &PadSpec,
-) -> ConversionResult<()> {
+fn emit_iota(module: &mut String, out: &str, out_spec: &TensorType, spec: &Iota) -> Result<()> {
     let out_dims = dims_usize(out_spec)?;
-    let in_dims = dims_usize(in_spec)?;
-    if spec.low.len() != out_dims.len()
-        || spec.high.len() != out_dims.len()
-        || spec.interior.len() != out_dims.len()
-    {
-        return Err(ConversionError::new("pad spec rank mismatch"));
-    }
-    let pad_value = literal_to_f32_scalar(&spec.pad_value)?;
-    let pad = format_f32(pad_value);
-
-    emit_parallel_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
-        push_block(module, indent, "int in_bounds = 1;");
-        let mut in_indices: Vec<String> = Vec::with_capacity(indices.len());
-        for (axis, idx) in indices.iter().enumerate() {
-            let low = spec.low[axis];
-            let interior = spec.interior[axis];
-            let step = interior + 1;
-            let in_dim = in_dims[axis];
-            let in_name = format!("pad{axis}");
-            let block = format!(
-                r#"size_t {in_name} = 0;
-if ({idx} < {low}) {{
-  in_bounds = 0;
-}}
-if (in_bounds) {{
-  size_t rel = {idx} - {low};
-  if (rel % {step} != 0) {{
-    in_bounds = 0;
-  }} else {{
-    {in_name} = rel / {step};
-    if ({in_name} >= {in_dim}) {{
-      in_bounds = 0;
-    }}
-  }}
-}}"#
-            );
-            push_block(module, indent, &block);
-            in_indices.push(in_name);
-        }
-        let out_idx = linear_index_expr(&out_dims, indices);
-        let in_idx = linear_index_expr(&in_dims, &in_indices);
-        let block = format!(
-            r#"if (in_bounds) {{
-  {out}[{out_idx}] = {input}[{in_idx}];
-}} else {{
-  {out}[{out_idx}] = {pad};
-}}"#
-        );
-        push_block(module, indent, &block);
-    });
-    Ok(())
-}
-fn emit_tile(
-    module: &mut String,
-    out: &str,
-    input: &str,
-    out_spec: &TensorSpec,
-    in_spec: &TensorSpec,
-    spec: &TileSpec,
-) -> ConversionResult<()> {
-    let out_dims = dims_usize(out_spec)?;
-    let in_dims = dims_usize(in_spec)?;
-    if spec.repeats.len() != out_dims.len() || in_dims.len() != out_dims.len() {
-        return Err(ConversionError::new("tile rank mismatch"));
-    }
-    emit_parallel_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
-        let mut in_indices = Vec::with_capacity(indices.len());
-        for (axis, idx) in indices.iter().enumerate() {
-            let dim = in_dims[axis];
-            in_indices.push(format!("{idx} % {dim}"));
-        }
-        let out_idx = linear_index_expr(&out_dims, indices);
-        let in_idx = linear_index_expr(&in_dims, &in_indices);
-        push_block(
-            module,
-            indent,
-            &format!("{out}[{out_idx}] = {input}[{in_idx}];"),
-        );
-    });
-    Ok(())
-}
-fn emit_iota(
-    module: &mut String,
-    out: &str,
-    out_spec: &TensorSpec,
-    spec: &IotaSpec,
-) -> ConversionResult<()> {
-    let out_dims = dims_usize(out_spec)?;
-    let axis = axis_index(spec.axis as isize, out_dims.len())?;
+    let axis = axis_index(spec.axis, out_dims.len())?;
     let assign = match out_spec.dtype {
         DType::F32 => "float",
         DType::Si32 => "int32_t",
-        _ => return Err(ConversionError::new("iota output must be f32 or si32")),
+        _ => return Err(anyhow!("iota output must be f32 or si32")),
     };
     emit_parallel_loops_with_indices(module, &out_dims, 2, "i", |module, indices, indent| {
         let out_idx = linear_index_expr(&out_dims, indices);

@@ -23,8 +23,7 @@ impl LayerNorm {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let outputs = functional::layer_norm(x, &self.weight, &self.bias, self.eps)?;
-        Ok(outputs.output)
+    fn forward(&self, x: &Tensor) -> Tensor {
+        functional::layer_norm(x, &self.weight, &self.bias, self.eps)
     }
 }

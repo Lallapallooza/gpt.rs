@@ -5,23 +5,20 @@
 //! `reduce_1x1` (+ input when the shape is kept)\] -> `conv_1x1` -> global average pool ->
 //! `classifier`.
 //!
-//! A conv layer ([`MobileNetV2ConvLayer`]) is a bias-free convolution, a [`BatchNorm2d`] and the
+//! A conv layer ([`ConvNormActivation`]) is a bias-free convolution, a batch norm and the
 //! `hidden_act` activation, except the `reduce_1x1` projections, which have no activation. With
 //! `tf_padding` the convolutions pad like TensorFlow `SAME`, asymmetrically when a strided
 //! convolution meets an even size. Once the resolution has shrunk by `output_stride`, depthwise
 //! convolutions dilate instead of striding. The checkpoint shapes give the channel counts, so
 //! the model does not read `depth_multiplier`.
 
-use std::sync::Arc;
+use anyhow::Result;
 
-use anyhow::{anyhow, bail, Result};
-
-use crate::backend::spec::PortableBackend;
-use crate::module::Layer;
-use crate::nn::layers::{Activation, ActivationFunction, BatchNorm2d, Conv2d, ConvPadding, Linear};
+use crate::backend::PortableBackend;
+use crate::inference::vision::VisionConfig;
+use crate::nn::layers::{ActivationFunction, ConvNormActivation, ConvPadding, Linear};
 use crate::nn::{self, Params};
-use crate::ops::functional::{global_avg_pool2d, transpose};
-use crate::tensor::{DeviceTensor, DeviceTensorOps};
+use crate::ops::functional::global_avg_pool2d;
 
 pub const KIND: &str = "mobilenet_v2";
 
@@ -79,63 +76,43 @@ impl MobileNetV2Config {
     }
 }
 
-pub(crate) fn build_from_model_config<B: PortableBackend + 'static>(
-    backend: Arc<B>,
-    cfg: &super::ModelConfig,
-    get: &mut dyn FnMut(&str) -> Result<Option<DeviceTensor<B>>>,
-) -> Result<Box<dyn crate::runtime::LoadedModel<B>>> {
-    let config: MobileNetV2Config = serde_json::from_value(cfg.config.clone())
-        .map_err(|err| anyhow!("invalid {KIND} config: {err}"))?;
-    let mut params =
-        Params::new(backend, get).with_linear_input_dtype(cfg.runtime.matmul_input_dtype);
-    Ok(Box::new(MobileNetV2::new(&mut params, &config)?))
+impl VisionConfig for MobileNetV2Config {
+    const KIND: &'static str = KIND;
+
+    type Model<B: PortableBackend + 'static> = MobileNetV2<B>;
+
+    fn build<B: PortableBackend + 'static>(&self, p: &mut Params<B>) -> Result<MobileNetV2<B>> {
+        MobileNetV2::new(p, self)
+    }
 }
 
-/// Bias-free convolution, batch norm, then an optional activation.
-#[nn::module]
-pub struct MobileNetV2ConvLayer {
-    convolution: Conv2d,
-    normalization: BatchNorm2d,
-    activation: Option<Activation>,
+/// A conv layer with the `hidden_act` activation.
+fn conv_layer<B: PortableBackend + 'static>(
+    p: &mut Params<B>,
+    config: &MobileNetV2Config,
+    stride: usize,
+    dilation: usize,
+) -> Result<ConvNormActivation<B>> {
+    let eps = config.layer_norm_eps;
+    let activation = Some(config.hidden_act);
+    ConvNormActivation::new(p, stride, dilation, config.padding(), eps, activation)
 }
 
-#[nn::module]
-impl MobileNetV2ConvLayer {
-    fn new(
-        p: &mut Params<B>,
-        config: &MobileNetV2Config,
-        stride: usize,
-        dilation: usize,
-    ) -> Result<Self> {
-        Ok(Self {
-            convolution: Conv2d::new(p, stride, dilation, config.padding())?,
-            normalization: BatchNorm2d::new(p, config.layer_norm_eps)?,
-            activation: Some(config.hidden_act.layer()),
-        })
-    }
-
-    /// A conv layer without activation, for the `reduce_1x1` projections.
-    fn linear(p: &mut Params<B>, config: &MobileNetV2Config) -> Result<Self> {
-        Ok(Self {
-            activation: None,
-            ..Self::new(p, config, 1, 1)?
-        })
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = self.convolution(x)?;
-        let x = self.normalization(&x)?;
-        Ok(self.activation(&x)?.unwrap_or(x))
-    }
+/// A conv layer without activation, for the `reduce_1x1` projections.
+fn linear_conv_layer<B: PortableBackend + 'static>(
+    p: &mut Params<B>,
+    config: &MobileNetV2Config,
+) -> Result<ConvNormActivation<B>> {
+    ConvNormActivation::new(p, 1, 1, config.padding(), config.layer_norm_eps, None)
 }
 
 /// Inverted residual: a 1x1 expansion, a depthwise 3x3 convolution and a linear 1x1 projection,
 /// plus the input when the layer keeps the shape.
 #[nn::module]
 pub struct MobileNetV2InvertedResidual {
-    expand_1x1: MobileNetV2ConvLayer,
-    conv_3x3: MobileNetV2ConvLayer,
-    reduce_1x1: MobileNetV2ConvLayer,
+    expand_1x1: ConvNormActivation,
+    conv_3x3: ConvNormActivation,
+    reduce_1x1: ConvNormActivation,
 }
 
 #[nn::module]
@@ -147,22 +124,22 @@ impl MobileNetV2InvertedResidual {
         dilation: usize,
     ) -> Result<Self> {
         Ok(Self {
-            expand_1x1: MobileNetV2ConvLayer::new(p, config, 1, 1)?,
-            conv_3x3: MobileNetV2ConvLayer::new(p, config, stride, dilation)?,
-            reduce_1x1: MobileNetV2ConvLayer::linear(p, config)?,
+            expand_1x1: conv_layer(p, config, 1, 1)?,
+            conv_3x3: conv_layer(p, config, stride, dilation)?,
+            reduce_1x1: linear_conv_layer(p, config)?,
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let features = self.expand_1x1(x)?;
-        let features = self.conv_3x3(&features)?;
-        let features = self.reduce_1x1(&features)?;
+    fn forward(&self, x: &Tensor) -> Tensor {
+        let features = self.expand_1x1(x);
+        let features = self.conv_3x3(&features);
+        let features = self.reduce_1x1(&features);
         // `transformers` adds the input when the stride is 1 and the channel count stays, so the
         // shape is unchanged.
         if features.shape() == x.shape() {
-            x.add(&features)
+            x + features
         } else {
-            Ok(features)
+            features
         }
     }
 }
@@ -171,27 +148,27 @@ impl MobileNetV2InvertedResidual {
 /// the checkpoint has no `expand_1x1`, the first convolution is the expansion.
 #[nn::module]
 pub struct MobileNetV2Stem {
-    first_conv: MobileNetV2ConvLayer,
-    expand_1x1: Option<MobileNetV2ConvLayer>,
-    conv_3x3: MobileNetV2ConvLayer,
-    reduce_1x1: MobileNetV2ConvLayer,
+    first_conv: ConvNormActivation,
+    expand_1x1: Option<ConvNormActivation>,
+    conv_3x3: ConvNormActivation,
+    reduce_1x1: ConvNormActivation,
 }
 
 #[nn::module]
 impl MobileNetV2Stem {
     fn new(p: &mut Params<B>, config: &MobileNetV2Config) -> Result<Self> {
         Ok(Self {
-            first_conv: MobileNetV2ConvLayer::new(p, config, 2, 1)?,
-            expand_1x1: p.optional(|p| MobileNetV2ConvLayer::new(p, config, 1, 1))?,
-            conv_3x3: MobileNetV2ConvLayer::new(p, config, 1, 1)?,
-            reduce_1x1: MobileNetV2ConvLayer::linear(p, config)?,
+            first_conv: conv_layer(p, config, 2, 1)?,
+            expand_1x1: p.optional(|p| conv_layer(p, config, 1, 1))?,
+            conv_3x3: conv_layer(p, config, 1, 1)?,
+            reduce_1x1: linear_conv_layer(p, config)?,
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let features = self.first_conv(x)?;
-        let features = self.expand_1x1(&features)?.unwrap_or(features);
-        let features = self.conv_3x3(&features)?;
+    fn forward(&self, x: &Tensor) -> Tensor {
+        let features = self.first_conv(x);
+        let features = self.expand_1x1(&features).unwrap_or(features);
+        let features = self.conv_3x3(&features);
         self.reduce_1x1(&features)
     }
 }
@@ -201,7 +178,7 @@ impl MobileNetV2Stem {
 pub struct MobileNetV2Model {
     conv_stem: MobileNetV2Stem,
     layer: Vec<MobileNetV2InvertedResidual>,
-    conv_1x1: MobileNetV2ConvLayer,
+    conv_1x1: ConvNormActivation,
 }
 
 #[nn::module]
@@ -212,18 +189,18 @@ impl MobileNetV2Model {
             layer: p.each(config.layer_strides(), |p, (stride, dilation)| {
                 MobileNetV2InvertedResidual::new(p, config, stride, dilation)
             })?,
-            conv_1x1: MobileNetV2ConvLayer::new(p, config, 1, 1)?,
+            conv_1x1: conv_layer(p, config, 1, 1)?,
         })
     }
 
     /// Pooled features `[N, channels]` of NCHW images.
-    fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
-        let x = transpose(pixel_values, &[0, 2, 3, 1])?;
-        let mut x = self.conv_stem(&x)?;
+    fn forward(&self, pixel_values: &Tensor) -> Tensor {
+        let x = pixel_values.transpose([0, 2, 3, 1]);
+        let mut x = self.conv_stem(&x);
         for layer in &self.layer {
-            x = layer.call(&x)?;
+            x = layer.call(&x);
         }
-        let x = self.conv_1x1(&x)?;
+        let x = self.conv_1x1(&x);
         global_avg_pool2d(&x)
     }
 }
@@ -246,28 +223,8 @@ impl MobileNetV2 {
 
     /// Class logits `[N, num_labels]` of NCHW images, or the pooled features when the checkpoint
     /// has no classifier.
-    fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
-        let pooled = self.mobilenet_v2(pixel_values)?;
-        Ok(self.classifier(&pooled)?.unwrap_or(pooled))
-    }
-}
-
-impl<B: PortableBackend + 'static> crate::runtime::LoadedModel<B> for MobileNetV2<B> {
-    fn kind(&self) -> &str {
-        KIND
-    }
-
-    fn forward(
-        &mut self,
-        input: crate::runtime::ModelInput<B>,
-    ) -> Result<crate::runtime::ModelOutput> {
-        match input {
-            crate::runtime::ModelInput::Vision(input) => Ok(crate::runtime::ModelOutput::Tensor(
-                self.call(&input)?.to_host()?,
-            )),
-            crate::runtime::ModelInput::Tokens(_) => {
-                bail!("model '{KIND}' expects vision input, got token input")
-            }
-        }
+    fn forward(&self, pixel_values: &Tensor) -> Tensor {
+        let pooled = self.mobilenet_v2(pixel_values);
+        self.classifier(&pooled).unwrap_or(pooled)
     }
 }

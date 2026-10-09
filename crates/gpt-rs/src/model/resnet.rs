@@ -4,22 +4,19 @@
 //! `layers` x \[`layer` conv layers + `shortcut` -> `activation`\] -> global average pool ->
 //! `classifier`.
 //!
-//! A conv layer ([`ResNetConvLayer`]) is a bias-free convolution, a [`BatchNorm2d`] and an
-//! optional activation. A basic layer runs two 3x3 conv layers. A bottleneck layer runs 1x1, 3x3
+//! A conv layer ([`ConvNormActivation`]) is a bias-free convolution, a batch norm and an optional
+//! activation. A basic layer runs two 3x3 conv layers. A bottleneck layer runs 1x1, 3x3
 //! and 1x1 conv layers. The shortcut, when the checkpoint has one, is a 1x1 conv layer without
 //! activation, and the input otherwise. The first layer of each stage after the first halves the
 //! resolution. With `downsample_in_first_stage`, the first stage does too.
 
-use std::sync::Arc;
+use anyhow::{ensure, Result};
 
-use anyhow::{anyhow, bail, ensure, Result};
-
-use crate::backend::spec::PortableBackend;
-use crate::module::Layer;
-use crate::nn::layers::{Activation, ActivationFunction, BatchNorm2d, Conv2d, ConvPadding, Linear};
+use crate::backend::PortableBackend;
+use crate::inference::vision::VisionConfig;
+use crate::nn::layers::{Activation, ActivationFunction, ConvNormActivation, ConvPadding, Linear};
 use crate::nn::{self, Params};
-use crate::ops::functional::{global_avg_pool2d, max_pool2d, transpose, Padding2d};
-use crate::tensor::{DeviceTensor, DeviceTensorOps};
+use crate::ops::functional::{global_avg_pool2d, max_pool2d, Padding2d};
 
 pub const KIND: &str = "resnet";
 
@@ -57,53 +54,38 @@ impl Default for ResNetConfig {
     }
 }
 
-pub(crate) fn build_from_model_config<B: PortableBackend + 'static>(
-    backend: Arc<B>,
-    cfg: &super::ModelConfig,
-    get: &mut dyn FnMut(&str) -> Result<Option<DeviceTensor<B>>>,
-) -> Result<Box<dyn crate::runtime::LoadedModel<B>>> {
-    let config: ResNetConfig = serde_json::from_value(cfg.config.clone())
-        .map_err(|err| anyhow!("invalid {KIND} config: {err}"))?;
-    let mut params =
-        Params::new(backend, get).with_linear_input_dtype(cfg.runtime.matmul_input_dtype);
-    Ok(Box::new(ResNet::new(&mut params, &config)?))
+impl VisionConfig for ResNetConfig {
+    const KIND: &'static str = KIND;
+
+    type Model<B: PortableBackend + 'static> = ResNet<B>;
+
+    fn build<B: PortableBackend + 'static>(&self, p: &mut Params<B>) -> Result<ResNet<B>> {
+        ResNet::new(p, self)
+    }
 }
 
-/// Bias-free convolution with centered padding, batch norm, then an optional activation.
-#[nn::module]
-pub struct ResNetConvLayer {
-    convolution: Conv2d,
-    normalization: BatchNorm2d,
-    activation: Option<Activation>,
-}
-
-#[nn::module]
-impl ResNetConvLayer {
-    fn new(
-        p: &mut Params<B>,
-        stride: usize,
-        activation: Option<ActivationFunction>,
-    ) -> Result<Self> {
-        Ok(Self {
-            convolution: Conv2d::new(p, stride, 1, ConvPadding::Centered)?,
-            normalization: BatchNorm2d::new(p, BATCH_NORM_EPS)?,
-            activation: activation.map(ActivationFunction::layer),
-        })
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = self.convolution(x)?;
-        let x = self.normalization(&x)?;
-        Ok(self.activation(&x)?.unwrap_or(x))
-    }
+/// A conv layer with centered padding.
+fn conv_layer<B: PortableBackend + 'static>(
+    p: &mut Params<B>,
+    stride: usize,
+    activation: Option<ActivationFunction>,
+) -> Result<ConvNormActivation<B>> {
+    ConvNormActivation::new(
+        p,
+        stride,
+        1,
+        ConvPadding::Centered,
+        BATCH_NORM_EPS,
+        activation,
+    )
 }
 
 /// Residual layer: `ResNetBasicLayer` or `ResNetBottleNeckLayer`, which differ only in their conv
 /// layers.
 #[nn::module]
 pub struct ResNetLayer {
-    shortcut: Option<ResNetConvLayer>,
-    layer: Vec<ResNetConvLayer>,
+    shortcut: Option<ConvNormActivation>,
+    layer: Vec<ConvNormActivation>,
     activation: Activation,
 }
 
@@ -120,21 +102,21 @@ impl ResNetLayer {
             ResNetLayerType::Bottleneck => vec![(1, relu), (stride, relu), (1, None)],
         };
         Ok(Self {
-            shortcut: p.optional(|p| ResNetConvLayer::new(p, stride, None))?,
+            shortcut: p.optional(|p| conv_layer(p, stride, None))?,
             layer: p.each(convs, |p, (stride, activation)| {
-                ResNetConvLayer::new(p, stride, activation)
+                conv_layer(p, stride, activation)
             })?,
             activation: config.hidden_act.layer(),
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let residual = self.shortcut(x)?.unwrap_or_else(|| x.clone());
+    fn forward(&self, x: &Tensor) -> Tensor {
+        let residual = self.shortcut(x).unwrap_or_else(|| x.clone());
         let mut hidden = x.clone();
         for conv in &self.layer {
-            hidden = conv.call(&hidden)?;
+            hidden = conv.call(&hidden);
         }
-        self.activation(&hidden.add(&residual)?)
+        self.activation(&(hidden + residual))
     }
 }
 
@@ -155,12 +137,12 @@ impl ResNetStage {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> Tensor {
         let mut x = x.clone();
         for layer in &self.layers {
-            x = layer.call(&x)?;
+            x = layer.call(&x);
         }
-        Ok(x)
+        x
     }
 }
 
@@ -188,38 +170,32 @@ impl ResNetEncoder {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> Tensor {
         let mut x = x.clone();
         for stage in &self.stages {
-            x = stage.call(&x)?;
+            x = stage.call(&x);
         }
-        Ok(x)
+        x
     }
 }
 
 /// The stem: a 7x7 stride-2 conv layer, then a 3x3 stride-2 max pool.
 #[nn::module]
 pub struct ResNetEmbeddings {
-    embedder: ResNetConvLayer,
+    embedder: ConvNormActivation,
 }
 
 #[nn::module]
 impl ResNetEmbeddings {
     fn new(p: &mut Params<B>, config: &ResNetConfig) -> Result<Self> {
         Ok(Self {
-            embedder: ResNetConvLayer::new(p, 2, Some(config.hidden_act))?,
+            embedder: conv_layer(p, 2, Some(config.hidden_act))?,
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = self.embedder(x)?;
-        let padding = Padding2d {
-            top: 1,
-            bottom: 1,
-            left: 1,
-            right: 1,
-        };
-        max_pool2d(&x, [3, 3], [2, 2], padding)
+    fn forward(&self, x: &Tensor) -> Tensor {
+        let x = self.embedder(x);
+        max_pool2d(&x, [3, 3], [2, 2], Padding2d::uniform(1))
     }
 }
 
@@ -240,10 +216,10 @@ impl ResNetModel {
     }
 
     /// Pooled features `[N, channels]` of NCHW images.
-    fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
-        let x = transpose(pixel_values, &[0, 2, 3, 1])?;
-        let x = self.embedder(&x)?;
-        let x = self.encoder(&x)?;
+    fn forward(&self, pixel_values: &Tensor) -> Tensor {
+        let x = pixel_values.transpose([0, 2, 3, 1]);
+        let x = self.embedder(&x);
+        let x = self.encoder(&x);
         global_avg_pool2d(&x)
     }
 }
@@ -264,7 +240,7 @@ impl ResNetClassifier {
         })
     }
 
-    fn forward(&self, pooled: &Tensor) -> Result<Tensor> {
+    fn forward(&self, pooled: &Tensor) -> Tensor {
         self.linear(pooled)
     }
 }
@@ -287,28 +263,8 @@ impl ResNet {
 
     /// Class logits `[N, num_labels]` of NCHW images, or the pooled features when the checkpoint
     /// has no classifier.
-    fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
-        let pooled = self.resnet(pixel_values)?;
-        Ok(self.classifier(&pooled)?.unwrap_or(pooled))
-    }
-}
-
-impl<B: PortableBackend + 'static> crate::runtime::LoadedModel<B> for ResNet<B> {
-    fn kind(&self) -> &str {
-        KIND
-    }
-
-    fn forward(
-        &mut self,
-        input: crate::runtime::ModelInput<B>,
-    ) -> Result<crate::runtime::ModelOutput> {
-        match input {
-            crate::runtime::ModelInput::Vision(input) => Ok(crate::runtime::ModelOutput::Tensor(
-                self.call(&input)?.to_host()?,
-            )),
-            crate::runtime::ModelInput::Tokens(_) => {
-                bail!("model '{KIND}' expects vision input, got token input")
-            }
-        }
+    fn forward(&self, pixel_values: &Tensor) -> Tensor {
+        let pooled = self.resnet(pixel_values);
+        self.classifier(&pooled).unwrap_or(pooled)
     }
 }

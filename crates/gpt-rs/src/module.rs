@@ -1,6 +1,6 @@
 use anyhow::{ensure, Result};
 
-use crate::backend::spec::PortableBackend;
+use crate::backend::PortableBackend;
 use crate::tensor::DeviceTensor;
 
 pub type VisitParamsFn<'a, B> = dyn FnMut(&str, TensorRole, &DeviceTensor<B>) -> Result<()> + 'a;
@@ -167,11 +167,11 @@ pub trait Layer<B: PortableBackend + 'static>: Module<B> {
     type Args<'a>;
     type Output;
 
-    fn forward(&self, args: Self::Args<'_>) -> Result<Self::Output>;
+    fn forward(&self, args: Self::Args<'_>) -> Self::Output;
 
     /// Runs [`Self::forward`] inside the profiler layer scope [`Module::NAME`], like PyTorch
     /// `module(args)`.
-    fn call(&self, args: Self::Args<'_>) -> Result<Self::Output> {
+    fn call(&self, args: Self::Args<'_>) -> Self::Output {
         let _scope = crate::profiling::layer_scope(Self::NAME);
         self.forward(args)
     }

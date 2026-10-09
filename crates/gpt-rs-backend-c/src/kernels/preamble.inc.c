@@ -33,7 +33,7 @@ static inline uint32_t gpt_rs_tail_mask(size_t left) {
 }
 
 /* glibc declares its libmvec vector variants only under -ffast-math. These declarations let GCC
- * vectorise elementwise loops with libmvec, whose results are within 4 ulp. Clang gets
+ * vectorize elementwise loops with libmvec, whose results are within 4 ulp. Clang gets
  * -fveclib=libmvec instead. */
 #if defined(__GNUC__) && !defined(__clang__) && defined(__x86_64__) && defined(__GLIBC__) && \
     !defined(__FAST_MATH__)
@@ -58,6 +58,25 @@ static inline int gpt_rs_c_team_size(void) {
 #else
     return 1;
 #endif
+}
+
+/* Copies `bytes` bytes. A copy counts one unit of work per 4 bytes, like an f32 element of a
+ * loop, and splits across the team in cache-line-aligned shares at GPTRS_PARALLEL_MIN_WORK
+ * units or more. */
+static void gpt_rs_copy(void* GPTRS_RESTRICT dst, const void* GPTRS_RESTRICT src, size_t bytes) {
+    const size_t team = (size_t)gpt_rs_c_team_size();
+    if (team < 2 || bytes / 4 < GPTRS_PARALLEL_MIN_WORK) {
+        memcpy(dst, src, bytes);
+        return;
+    }
+    const size_t share = (bytes / team + 63) / 64 * 64;
+    _Pragma("omp parallel for schedule(static)")
+    for (size_t t = 0; t < team; ++t) {
+        const size_t begin = t * share;
+        if (begin < bytes) {
+            memcpy((char*)dst + begin, (const char*)src + begin, GPTRS_MIN(share, bytes - begin));
+        }
+    }
 }
 
 /* Tasks per thread of the parallel matmul loops. Threads claim tasks dynamically, so faster or
@@ -94,6 +113,14 @@ static inline float gpt_rs_bf16_to_f32(uint16_t bits) {
     return out;
 }
 
+/* float8_e4m3fn: 4 exponent bits with bias 7, 3 mantissa bits, no infinities, and NaN at
+ * S.1111.111. The host generates the table of all 256 values. */
+static inline float gpt_rs_f8e4m3_to_f32(uint8_t bits) {
+    float out;
+    memcpy(&out, &gpt_rs_f8e4m3_bits[bits], sizeof(out));
+    return out;
+}
+
 /* Converts with round-to-nearest-even. NaNs stay quiet NaNs. */
 static inline uint16_t gpt_rs_f32_to_bf16(float value) {
     uint32_t bits;
@@ -103,6 +130,119 @@ static inline uint16_t gpt_rs_f32_to_bf16(float value) {
     }
     uint32_t rounding = 0x7fffu + ((bits >> 16) & 1u);
     return (uint16_t)((bits + rounding) >> 16);
+}
+
+/* The identity, for kernels that read f32 operands where other instances widen narrower ones. */
+static inline float gpt_rs_f32_to_f32(float value) {
+    return value;
+}
+
+#if GPTRS_HAS_AVX512
+/* Operand loaders. `NAME(p)` reads 16 elements and widens them to f32 lanes, which is exact.
+ * `NAME##_tail(p, left)` reads the first min(left, 16) elements, and the other lanes are zero. */
+static inline __m512 gpt_rs_load_f32(const float* p) {
+    return _mm512_loadu_ps(p);
+}
+
+static inline __m512 gpt_rs_load_f32_tail(const float* p, size_t left) {
+    return _mm512_maskz_loadu_ps((__mmask16)gpt_rs_tail_mask(left), p);
+}
+
+static inline __m512 gpt_rs_load_bf16(const uint16_t* p) {
+    const __m256i raw = _mm256_loadu_si256((const __m256i*)p);
+    return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16));
+}
+
+static inline __m512 gpt_rs_load_bf16_tail(const uint16_t* p, size_t left) {
+    const __m256i raw = _mm256_maskz_loadu_epi16((__mmask16)gpt_rs_tail_mask(left), p);
+    return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16));
+}
+
+/* f8e4m3 widens exactly through f16. Its bits S.EEEE.MMM move to the f16 fields as
+ * S.0EEEE.MMM0000000, which is the value times 2^-8, because the exponent biases are 7 and 15. f16
+ * subnormals hold the f8e4m3 subnormals. Sign extension puts the sign in bit 15 after the shift,
+ * and the mask clears its copy in bit 14. S.1111.111 is NaN. */
+static inline __m512 gpt_rs_widen_f8e4m3(__m128i raw) {
+    const __m256i half = _mm256_and_si256(_mm256_slli_epi16(_mm256_cvtepi8_epi16(raw), 7),
+                                          _mm256_set1_epi16((short)0xbf80));
+    const __m256i magnitude = _mm256_and_si256(half, _mm256_set1_epi16(0x3f80));
+    const __mmask16 nan = _mm256_cmpeq_epi16_mask(magnitude, _mm256_set1_epi16(0x3f80));
+    const __m512 value = _mm512_mul_ps(_mm512_cvtph_ps(half), _mm512_set1_ps(256.0f));
+    return _mm512_mask_mov_ps(value, nan, _mm512_set1_ps(NAN));
+}
+
+static inline __m512 gpt_rs_load_f8e4m3(const uint8_t* p) {
+    return gpt_rs_widen_f8e4m3(_mm_loadu_si128((const __m128i*)p));
+}
+
+static inline __m512 gpt_rs_load_f8e4m3_tail(const uint8_t* p, size_t left) {
+    return gpt_rs_widen_f8e4m3(_mm_maskz_loadu_epi8((__mmask16)gpt_rs_tail_mask(left), p));
+}
+#endif
+
+/* Keys that order floats the way IEEE 754-2019 maximum and minimum do: -0.0 below +0.0, and NaN
+ * above every number for maximum and below every number for minimum. The unsigned max or min of
+ * keys is exact in any order of accumulation, so reductions over keys vectorize. */
+static inline uint32_t gpt_rs_f32_to_order_key(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    /* Sets the sign bit of a positive float and flips every bit of a negative one. */
+    uint32_t negative = 0u - (bits >> 31);
+    return bits ^ (negative | 0x80000000u);
+}
+
+static inline uint32_t gpt_rs_f32_to_max_key(float value) {
+    return value != value ? UINT32_MAX : gpt_rs_f32_to_order_key(value);
+}
+
+static inline uint32_t gpt_rs_f32_to_min_key(float value) {
+    return value != value ? 0u : gpt_rs_f32_to_order_key(value);
+}
+
+/* Inverts the keys. The NaN keys UINT32_MAX and 0 come back as NaN. */
+static inline float gpt_rs_key_to_f32(uint32_t key) {
+    uint32_t positive = key >> 31;
+    uint32_t bits = key ^ ((positive - 1u) | 0x80000000u);
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+/* The float whose bits are the AND, or the OR, of the bits of two floats. */
+static inline float gpt_rs_f32_and_bits(float lhs, float rhs) {
+    uint32_t a, b;
+    memcpy(&a, &lhs, sizeof(a));
+    memcpy(&b, &rhs, sizeof(b));
+    a &= b;
+    memcpy(&lhs, &a, sizeof(lhs));
+    return lhs;
+}
+
+static inline float gpt_rs_f32_or_bits(float lhs, float rhs) {
+    uint32_t a, b;
+    memcpy(&a, &lhs, sizeof(a));
+    memcpy(&b, &rhs, sizeof(b));
+    a |= b;
+    memcpy(&lhs, &a, sizeof(lhs));
+    return lhs;
+}
+
+/* IEEE 754-2019 maximum: NaN when either operand is NaN, and -0.0 orders below +0.0. Equal
+ * operands differ at most in the sign of a zero, and ANDing their bits keeps +0.0. The function
+ * is written as selects, so loops over it vectorize. */
+static inline float gpt_rs_maximum_f32(float lhs, float rhs) {
+    float larger = lhs < rhs ? rhs : lhs;
+    float result = lhs == rhs ? gpt_rs_f32_and_bits(lhs, rhs) : larger;
+    return rhs != rhs ? rhs : result;
+}
+
+/* IEEE 754-2019 minimum: NaN when either operand is NaN, and -0.0 orders below +0.0. Equal
+ * operands differ at most in the sign of a zero, and ORing their bits keeps -0.0. The function
+ * is written as selects, so loops over it vectorize. */
+static inline float gpt_rs_minimum_f32(float lhs, float rhs) {
+    float smaller = lhs > rhs ? rhs : lhs;
+    float result = lhs == rhs ? gpt_rs_f32_or_bits(lhs, rhs) : smaller;
+    return rhs != rhs ? rhs : result;
 }
 
 enum {
@@ -161,8 +301,6 @@ static inline uint64_t gpt_rs_c_now_ns(void) {
 #endif
 
 enum { GPTRS_MR = 6, GPTRS_NR = 16 };
-/* Packed b panels are as wide as the widest micro-kernel, 6 x 64. */
-enum { GPTRS_PANEL_N = 64 };
 enum { GPTRS_MC = 120, GPTRS_NC = 256, GPTRS_KC = 256 };
 enum { GPTRS_PREFETCH_DIST = 8 };
 

@@ -16,11 +16,9 @@ uv run --extra dev pre-commit run --all-files # run them on the whole tree
 
 Common:
 
-- `GPTRS_BACKEND`: default backend for the CLI/Python runners (for example `faer`, `ref-cpu`, `c`).
-- `GPTRS_EAGER=1`: forces tensors created from captured nodes to materialize immediately (useful for debugging fusion).
-- `GPTRS_OPT_PRE_ITERS`: fixed-point iterations for the optimizer "pre" loop (default: 2).
-- `GPTRS_OPT_POST_ITERS`: fixed-point iterations for the optimizer "post" loop (default: 4).
-- `GPTRS_PASS_STATS=1`: emits per-pass optimizer stats into the trace sink (for example into `passes.jsonl` when using `--dump-dir`).
+- `GPTRS_BACKEND`: the CLI backend when `--backend` is not given (default `faer`).
+- `GPTRS_EAGER=1`: forces tensors created from recorded nodes to materialize immediately (useful for debugging fusion).
+- `GPTRS_PASS_STATS=1`: with `--dump-dir`, writes one line per pass to `passes.jsonl` of the dump directory: its options, whether it changed the module, the ops left, and the pass's own statistics.
 
 C backend only:
 
@@ -33,4 +31,4 @@ C backend only:
 
 Torch parity harness:
 
-- `GPTRS_TORCH_PARITY_BACKENDS=...`: overrides which backends the parity harness runs against (see `crates/gpt-rs-backend-tests/src/torch_parity/harness.rs`).
+- `GPTRS_TORCH_PARITY_BACKENDS=faer,c`: the backends whose rows the parity harness waits for before it prints its timing table. `expected_backends` in `crates/gpt-rs-backend-tests/src/torch_parity/harness.rs` holds the default.

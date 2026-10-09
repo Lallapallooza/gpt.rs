@@ -2,9 +2,8 @@
 
 use std::sync::Arc;
 
-use gpt_rs::backend::spec::{DType as PtirDType, PortableBackend};
-use gpt_rs::capture;
-use gpt_rs::ops::functional;
+use gpt_rs::backend::PortableBackend;
+use gpt_rs::s;
 use gpt_rs::tensor::DType;
 use tch::Kind;
 
@@ -22,16 +21,12 @@ pub fn two_offset_slices_feed_one_chain_matches_torch<B: PortableBackend + 'stat
         let up = x.narrow(0, 2, 4).narrow(1, 11, 8);
         tensor_to_vec(&(&gate * gate.exp() * up).contiguous())
     });
-    let actual = timed_gpt(|| -> anyhow::Result<Vec<f32>> {
+    let actual = timed_gpt(|| {
         let x_d = device_tensor_from_data(backend, &[6, 20], &values);
-        let out = capture!(|x_d| {
-            let gate = x_d.slice(vec![1, 2], vec![4, 8]);
-            let up = x_d.slice(vec![2, 11], vec![4, 8]);
-            gate * gate.exp() * up
-        })?;
-        Ok(to_host_vec(&out))
-    })
-    .unwrap();
+        let gate = x_d.slice(s![1..5, 2..10]);
+        let up = x_d.slice(s![2..6, 11..19]);
+        to_host_vec(&(&gate * gate.exp() * up))
+    });
     assert_close(&expected, &actual);
 }
 
@@ -51,18 +46,12 @@ pub fn smaller_producers_broadcast_into_chain_matches_torch<B: PortableBackend +
         let gain = tch_tensor_from_vec(&[cols], &weight) + 1.0;
         tensor_to_vec(&(x_t * factor * gain))
     });
-    let actual = timed_gpt(|| -> anyhow::Result<Vec<f32>> {
+    let actual = timed_gpt(|| {
         let x_d = device_tensor_from_data(backend, &[rows, cols], &x);
         let s_d = device_tensor_from_data(backend, &[rows, 1], &row_log_scale);
         let w_d = device_tensor_from_data(backend, &[cols], &weight);
-        let out = capture!(|x_d, s_d, w_d| {
-            let factor = s_d.exp().broadcast_to(vec![rows, cols]);
-            let gain = (w_d + 1.0f32).broadcast_to(vec![rows, cols]);
-            x_d * factor * gain
-        })?;
-        Ok(to_host_vec(&out))
-    })
-    .unwrap();
+        to_host_vec(&(x_d * s_d.exp() * (w_d + 1.0)))
+    });
     assert_close(&expected, &actual);
 }
 
@@ -93,13 +82,11 @@ pub fn chain_with_bf16_store_matches_torch<B: PortableBackend + 'static>(backend
             .to_kind(Kind::Float);
         tensor_to_vec(&result)
     });
-    let actual = timed_gpt(|| -> anyhow::Result<Vec<f32>> {
+    let actual = timed_gpt(|| {
         let d = |v: &[f32]| device_tensor_from_data(backend, &[4, n / 4], v);
-        let (x_d, y_d, z_d) = (d(&x), d(&y), d(&z));
-        let narrowed = capture!(|x_d, y_d, z_d| (x_d * y_d + z_d).cast(PtirDType::Bf16))?;
-        assert_eq!(narrowed.dtype(), DType::BF16);
-        Ok(to_host_vec(&functional::cast(&narrowed, DType::F32)?))
-    })
-    .unwrap();
+        let narrowed = (d(&x) * d(&y) + d(&z)).cast(DType::Bf16);
+        assert_eq!(narrowed.dtype(), DType::Bf16);
+        to_host_vec(&narrowed.cast(DType::F32))
+    });
     assert_close_tol(&expected, &actual, 0.0, 0.0);
 }

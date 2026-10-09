@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use gpt_rs::backend::spec::PortableBackend;
+use gpt_rs::backend::PortableBackend;
 use gpt_rs::module::Layer;
 use gpt_rs::nn::layers::{BatchNorm2d, Conv2d, ConvPadding};
 use gpt_rs::ops::functional;
-use gpt_rs::tensor::Tensor;
+use gpt_rs::tensor::HostTensor;
 use tch::Tensor as TchTensor;
 
 use super::common::*;
@@ -27,7 +27,7 @@ impl HostBatchNorm {
         }
     }
 
-    fn tensors(&self, prefix: &str) -> Vec<(String, Tensor)> {
+    fn tensors(&self, prefix: &str) -> Vec<(String, HostTensor)> {
         let channels = self.weight.len();
         [
             ("weight", &self.weight),
@@ -86,7 +86,7 @@ pub fn batch_norm2d_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>
         })
         .unwrap();
         let x = device_tensor_from_data(backend, &shape, &x_data);
-        to_host_vec(&layer.call(&x).unwrap())
+        to_host_vec(&layer.call(&x))
     });
 
     assert_close(&expected, &actual);
@@ -118,8 +118,8 @@ pub fn conv2d_batch_norm_relu_matches_torch<B: PortableBackend + 'static>(backen
         })
         .unwrap();
         let x = device_tensor_from_data(backend, &[n, h, w, c_in], &x_data);
-        let y = bn.call(&conv.call(&x).unwrap()).unwrap();
-        to_host_vec(&functional::relu(&y).unwrap())
+        let y = bn.call(&conv.call(&x));
+        to_host_vec(&functional::relu(&y))
     });
 
     assert_close(&expected, &actual);
@@ -167,7 +167,7 @@ fn run_tf_padding_case<B: PortableBackend + 'static>(
         })
         .unwrap();
         let x = device_tensor_from_data(backend, &[n, h, w, channels], &x_data);
-        to_host_vec(&conv.call(&x).unwrap())
+        to_host_vec(&conv.call(&x))
     });
 
     assert_close(&expected, &actual);

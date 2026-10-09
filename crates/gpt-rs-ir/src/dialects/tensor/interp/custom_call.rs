@@ -1,0 +1,18 @@
+//! Semantics of the ops in `ir/custom_call.rs`.
+
+use crate::dialects::tensor::ir::{CustomCall, CustomCallOperands, CustomCallResults};
+use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
+use anyhow::{bail, Result};
+
+impl Eval for CustomCall {
+    fn eval(
+        &self,
+        _ins: CustomCallOperands<Host<'_>>,
+        _cx: &mut EvalCx<'_, NoRegions>,
+    ) -> Result<CustomCallResults<OwnedHost>> {
+        bail!(
+            "`{}` is a backend kernel with no reference semantics",
+            self.target
+        )
+    }
+}

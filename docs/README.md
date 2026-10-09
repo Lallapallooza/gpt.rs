@@ -14,13 +14,14 @@ Doc policy:
 - [architecture.md](architecture.md): crate/module layout and data flow.
 - [runtime.md](runtime.md): checkpoint loading, capability dispatch.
 - [frontend.md](frontend.md): models/layers/functionals/backends.
-- [code_map.md](code_map.md): where the functional/capture plumbing lives.
+- [code_map.md](code_map.md): where the functional/recording plumbing lives.
 
 ## Reference
-- [backends/README.md](backends/README.md): how each backend executes PTIR (ref-cpu, faer, c).
-- [backend.md](backend.md): PTIR backend contract (ptir.v0.4). Treat as a spec.
-- [ops.md](ops.md): ops/capture/graph execution architecture (implementation-oriented).
-- [backend_optimizer.md](backend_optimizer.md): PTIR rewrite/optimizer architecture (implementation-oriented).
+- [backends/README.md](backends/README.md): the backend interface, and how each backend executes PTIR (ref-cpu, faer, c).
+- [ptir/tensor.md](ptir/tensor.md): the `tensor` dialect, the PTIR spec, generated from the code.
+- [ops.md](ops.md): ops/recording/graph execution architecture (implementation-oriented).
+- [ptir/passes.md](ptir/passes.md): the passes and the pipeline of each backend, generated from
+  the code.
 - [formats.md](formats.md): checkpoints (Hugging Face model directories) and safetensors tensor
   files.
 - [development.md](development.md): env vars and local development notes.

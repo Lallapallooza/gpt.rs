@@ -1,12 +1,14 @@
-use super::linear::Linear;
-use super::rms_norm::{RmsNorm, RmsNormConfig};
-use super::rotary_embedding::{RopeConfig, RotaryEmbedding};
-use crate::backend::spec::PortableBackend;
-use crate::nn::{self, Params};
-use crate::ops::functional::{self, DecodeKvCache, DeviceTensorOps};
-use crate::tensor::DeviceTensor;
-use anyhow::{bail, ensure, Result};
+use std::marker::PhantomData;
 use std::sync::Arc;
+
+use super::linear::Linear;
+use super::names::DecoderNames;
+use super::rms_norm::{RmsNorm, RmsNormConfig};
+use crate::backend::PortableBackend;
+use crate::nn::{self, Params};
+use crate::ops::functional::{self, AttentionPositions, DecodeKvCache, WeightLayout};
+use crate::s;
+use anyhow::{ensure, Result};
 
 /// Configuration of a [`CausalSelfAttention`] layer.
 ///
@@ -14,7 +16,8 @@ use std::sync::Arc;
 /// * `num_key_value_heads == 1` -> multi-query attention (shared KV).
 /// * `1 < num_key_value_heads < num_query_heads` -> grouped-query attention.
 ///
-/// Queries, keys and values share `head_dim`.
+/// Queries, keys and values share `head_dim`. The rotary embedding, when the model has one, comes
+/// with the positions ([`AttentionPositions`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttentionConfig {
     pub embed_dim: usize,
@@ -23,10 +26,14 @@ pub struct AttentionConfig {
     pub head_dim: usize,
     /// RMSNorm over each query and key head (`q_norm`, `k_norm`), before the rotary embedding.
     pub qk_norm: Option<RmsNormConfig>,
-    pub rope: Option<RopeConfig>,
     /// `q_proj` emits `[query, gate]` per head. The layer multiplies the attention output by
     /// `sigmoid(gate)` before `o_proj`.
     pub output_gate: bool,
+    /// One projection computes `[queries, keys, values]` in place of `q_proj`, `k_proj` and
+    /// `v_proj`.
+    pub fused_qkv: bool,
+    /// How the checkpoint stores the projection weights.
+    pub weight_layout: WeightLayout,
 }
 
 impl AttentionConfig {
@@ -81,26 +88,16 @@ impl AttentionConfig {
             num_key_value_heads,
             head_dim,
             qk_norm: None,
-            rope: None,
             output_gate: false,
+            fused_qkv: false,
+            weight_layout: WeightLayout::OutIn,
         })
     }
 
-    /// Normalises each query and key head (see [`Self::qk_norm`]).
+    /// Normalizes each query and key head (see [`Self::qk_norm`]).
     pub fn with_qk_norm(mut self, norm: RmsNormConfig) -> Self {
         self.qk_norm = Some(norm);
         self
-    }
-
-    /// Rotates the leading `rope.rotary_dim` channels of each query and key head.
-    pub fn with_rope(mut self, rope: RopeConfig) -> Result<Self> {
-        let (rotary_dim, head_dim) = (rope.rotary_dim, self.head_dim);
-        ensure!(
-            rotary_dim > 0 && rotary_dim.is_multiple_of(2) && rotary_dim <= head_dim,
-            "rotary_dim ({rotary_dim}) must be positive, even and <= head_dim ({head_dim})"
-        );
-        self.rope = Some(rope);
-        Ok(self)
     }
 
     /// Gates the attention output per channel (see [`Self::output_gate`]).
@@ -109,9 +106,16 @@ impl AttentionConfig {
         self
     }
 
-    /// Returns the number of query heads configured for the layer.
-    pub fn num_heads(&self) -> usize {
-        self.num_query_heads
+    /// Computes the queries, keys and values with one projection (see [`Self::fused_qkv`]).
+    pub fn with_fused_qkv(mut self) -> Self {
+        self.fused_qkv = true;
+        self
+    }
+
+    /// Reads the projection weights in `layout`.
+    pub fn with_weight_layout(mut self, layout: WeightLayout) -> Self {
+        self.weight_layout = layout;
+        self
     }
 
     /// Width of the attention output (`num_query_heads * head_dim`), the input of `o_proj`.
@@ -140,53 +144,43 @@ impl AttentionConfig {
     }
 }
 
-/// Inputs shared by every attention layer for `T` new tokens at positions `position..position + T`.
-pub struct AttentionPositions<B: PortableBackend + 'static> {
-    /// `[0, position, 0]` (`i32`): where the new keys and values go in the KV caches.
-    pub update_starts: DeviceTensor<B>,
-    /// Rotary `(cos, sin)` tables of the positions, each `[T, rotary_dim / 2]`.
-    pub rotary: Option<(DeviceTensor<B>, DeviceTensor<B>)>,
-}
-
-impl<B: PortableBackend + 'static> AttentionPositions<B> {
-    /// Creates the inputs for positions `position..position + len`.
-    pub fn new(
-        backend: &Arc<B>,
-        position: usize,
-        len: usize,
-        rotary: Option<&RotaryEmbedding>,
-    ) -> Result<Self> {
-        Ok(Self {
-            update_starts: crate::inference::index_tensor(backend, [0, position, 0])?,
-            rotary: rotary
-                .map(|rope| rope.tables(backend, position, len))
-                .transpose()?,
-        })
-    }
-}
-
-/// Decoder-style causal self-attention over a fixed-capacity KV cache. A full sequence runs as a
-/// prefill into an empty cache.
+/// Decoder-style causal self-attention over a fixed-capacity KV cache, with the projection names
+/// of the family `N`. A full sequence runs as a prefill into an empty cache.
 #[nn::module]
-pub struct CausalSelfAttention {
+pub struct CausalSelfAttention<N: DecoderNames> {
     #[module(config)]
     pub config: AttentionConfig,
-    pub q_proj: Linear,
-    pub k_proj: Linear,
-    pub v_proj: Linear,
+    pub q_proj: Option<Linear>,
+    pub k_proj: Option<Linear>,
+    pub v_proj: Option<Linear>,
+    #[module(rename = N::QKV_PROJ)]
+    pub qkv_proj: Option<Linear>,
+    #[module(rename = N::O_PROJ)]
     pub o_proj: Linear,
     pub q_norm: Option<RmsNorm>,
     pub k_norm: Option<RmsNorm>,
+    #[module(config)]
+    names: PhantomData<N>,
 }
 
 #[nn::module]
-impl CausalSelfAttention {
+impl<N: DecoderNames> CausalSelfAttention<N> {
     pub fn new(p: &mut Params<B>, config: AttentionConfig) -> Result<Self> {
+        ensure!(
+            !(config.fused_qkv && config.output_gate),
+            "an attention with a fused query, key and value projection has no output gate"
+        );
+        let (separate, fused) = (!config.fused_qkv, config.fused_qkv);
+        let layout = config.weight_layout;
+        let projection = |p: &mut Params<B>, present: bool| {
+            present.then(|| Linear::with_layout(p, layout)).transpose()
+        };
         Ok(Self {
-            q_proj: Linear::new(p)?,
-            k_proj: Linear::new(p)?,
-            v_proj: Linear::new(p)?,
-            o_proj: Linear::new(p)?,
+            q_proj: projection(p, separate)?,
+            k_proj: projection(p, separate)?,
+            v_proj: projection(p, separate)?,
+            qkv_proj: projection(p, fused)?,
+            o_proj: Linear::with_layout(p, layout)?,
             q_norm: config
                 .qk_norm
                 .map(|norm| RmsNorm::new(p, norm))
@@ -196,6 +190,7 @@ impl CausalSelfAttention {
                 .map(|norm| RmsNorm::new(p, norm))
                 .transpose()?,
             config,
+            names: PhantomData,
         })
     }
 
@@ -207,68 +202,47 @@ impl CausalSelfAttention {
         x: &Tensor,
         cache: &DecodeKvCache<B>,
         positions: &AttentionPositions<B>,
-    ) -> Result<(Tensor, DecodeKvCache<B>)> {
+    ) -> (Tensor, DecodeKvCache<B>) {
         let cfg = &self.config;
-        let (t, d) = (x.shape().dims()[0], cfg.head_dim);
-        let split_heads =
-            |y: &Tensor, heads: usize, width: usize| functional::reshape(y, &[t, heads, width]);
-
-        let q_proj = self.q_proj(x)?;
+        let (t, d) = (x.size(0), cfg.head_dim);
+        let (q_proj, k, v) = match self.qkv_proj(x) {
+            Some(qkv) => {
+                let (q_dim, kv_dim) = (cfg.query_dim(), cfg.key_value_projection_dim());
+                (
+                    qkv.slice(s![.., ..q_dim]),
+                    qkv.slice(s![.., q_dim..q_dim + kv_dim]),
+                    qkv.slice(s![.., q_dim + kv_dim..]),
+                )
+            }
+            None => {
+                let project = |proj: Option<Tensor>| proj.expect("separate q, k and v projections");
+                (
+                    project(self.q_proj(x)),
+                    project(self.k_proj(x)),
+                    project(self.v_proj(x)),
+                )
+            }
+        };
         let (q, gate) = if cfg.output_gate {
-            let q_and_gate = split_heads(&q_proj, cfg.num_query_heads, 2 * d)?;
-            let gate = functional::slice_along_axis(&q_and_gate, 2, d, d)?;
+            let q_and_gate = q_proj.reshape([t, cfg.num_query_heads, 2 * d]);
+            let gate = q_and_gate.slice(s![.., .., d..]);
             (
-                functional::slice_along_axis(&q_and_gate, 2, 0, d)?,
-                Some(functional::reshape(&gate, &[t, cfg.query_dim()])?),
+                q_and_gate.slice(s![.., .., ..d]),
+                Some(gate.reshape([t, cfg.query_dim()])),
             )
         } else {
-            (split_heads(&q_proj, cfg.num_query_heads, d)?, None)
+            (q_proj.reshape([t, cfg.num_query_heads, d]), None)
         };
-        let k = split_heads(&self.k_proj(x)?, cfg.num_key_value_heads, d)?;
-        let v = split_heads(&self.v_proj(x)?, cfg.num_key_value_heads, d)?;
-        let q = self.q_norm(&q)?.unwrap_or(q);
-        let k = self.k_norm(&k)?.unwrap_or(k);
+        let k = k.reshape([t, cfg.num_key_value_heads, d]);
+        let v = v.reshape([t, cfg.num_key_value_heads, d]);
+        let q = self.q_norm(&q).unwrap_or(q);
+        let k = self.k_norm(&k).unwrap_or(k);
 
-        let (output, cache) = cached_attention(cfg, &q, &k, &v, cache, positions)?;
+        let (output, cache) = functional::attention_kv_cache(&q, &k, &v, cache, positions);
         let output = match gate {
-            Some(gate) => output.mul(&functional::sigmoid(&gate)?)?,
+            Some(gate) => output * functional::sigmoid(&gate),
             None => output,
         };
-        Ok((self.o_proj(&output)?, cache))
+        (self.o_proj(&output), cache)
     }
-}
-
-/// Causal attention of the query heads `q` (`[T, num_query_heads, head_dim]`) at `positions`. The
-/// keys and values are `cache` followed by `k` and `v` (`[T, num_key_value_heads, head_dim]`). The
-/// rotary embedding of `config` applies to `q` and `k`. Returns the output `[T, query_dim]` and
-/// the cache extended by `k` and `v` (see [`functional::attention_kv_cache`]).
-pub fn cached_attention<B: PortableBackend + 'static>(
-    config: &AttentionConfig,
-    q: &DeviceTensor<B>,
-    k: &DeviceTensor<B>,
-    v: &DeviceTensor<B>,
-    cache: &DecodeKvCache<B>,
-    positions: &AttentionPositions<B>,
-) -> Result<(DeviceTensor<B>, DecodeKvCache<B>)> {
-    let t = q.shape().dims()[0];
-    let heads_first = |y: &DeviceTensor<B>| functional::transpose(y, &[1, 0, 2]);
-    let (mut q, mut k, v) = (heads_first(q)?, heads_first(k)?, heads_first(v)?);
-    match (&config.rope, &positions.rotary) {
-        (Some(RopeConfig { rotary_dim, .. }), Some((cos, sin))) => {
-            ensure!(
-                cos.shape().dims() == [t, rotary_dim / 2],
-                "rotary tables have shape {:?}, expected [{t}, {}]",
-                cos.shape().dims(),
-                rotary_dim / 2
-            );
-            q = functional::apply_rope(&q, cos, sin)?;
-            k = functional::apply_rope(&k, cos, sin)?;
-        }
-        (None, None) => {}
-        (Some(_), None) => bail!("rotary attention needs rotary tables in its positions"),
-        (None, Some(_)) => bail!("attention without rotary embedding got rotary tables"),
-    }
-    let functional::DecodeAttentionComputation { output, cache } =
-        functional::attention_kv_cache(&q, &k, &v, cache, &positions.update_starts)?;
-    Ok((output, cache))
 }

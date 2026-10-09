@@ -26,87 +26,96 @@ static inline void gpt_rs_transpose16(__m512i r[16]) {
     }
 }
 
+_Static_assert(GPTRS_MR <= 16, "a packed row of a is one masked 16-lane store");
+
 /*
- * Packs the kc x nc block of b into panels of GPTRS_PANEL_N columns. Element (p, j) of b is at
- * b[p * sbk + j * sbn], and it goes to
+ * Defines the packing of GEMM operands of type T into f32 panels. LOAD is an operand loader of T,
+ * and WIDEN converts one element of T to f32.
+ *
+ * gpt_rs_pack_b_SUFFIX packs the kc x nc block of b into panels of GPTRS_PANEL_N columns. Element
+ * (p, j) of b is at b[p * sbk + j * sbn], and it goes to
  *
  *     bpack[j / GPTRS_PANEL_N * kc * GPTRS_PANEL_N + p * GPTRS_PANEL_N + j % GPTRS_PANEL_N].
  *
- * Columns from nc up to the next multiple of 16 are zero.
+ * Columns from nc up to the next multiple of 16 are zero. When the columns of b are contiguous
+ * (sbk == 1), it transposes 16 x 16 blocks.
+ *
+ * gpt_rs_pack_a_SUFFIX packs the mc x kc block of a. Element (i, p) of a is at
+ * a[i * sam + p * sak]. When rows of a are contiguous (sak == 1), it packs 16 columns at a time
+ * with a register transpose of the rows. Rows past mr are zero.
  */
-static inline void gpt_rs_pack_b(const float* b, size_t sbk, size_t sbn, size_t kc, size_t nc,
-                                 float* bpack) {
-    for (size_t j0 = 0; j0 < nc; j0 += 16) {
-        const float* src = b + j0 * sbn;
-        float* dst = bpack + j0 / GPTRS_PANEL_N * kc * GPTRS_PANEL_N + j0 % GPTRS_PANEL_N;
-        const size_t nr = GPTRS_MIN((size_t)16, nc - j0);
-        if (sbn == 1) {
-            const __mmask16 mask = (__mmask16)gpt_rs_tail_mask(nr);
-            for (size_t p = 0; p < kc; ++p) {
-                _mm512_store_ps(dst + p * GPTRS_PANEL_N, _mm512_maskz_loadu_ps(mask, src + p * sbk));
-            }
-        } else if (sbk == 1) {
-            /* Columns of b are contiguous, so transpose 16 x 16 blocks. */
-            for (size_t p0 = 0; p0 < kc; p0 += 16) {
-                const __mmask16 mask = (__mmask16)gpt_rs_tail_mask(kc - p0);
-                __m512i r[16];
-                for (size_t j = 0; j < 16; ++j) {
-                    r[j] = j < nr ? _mm512_maskz_loadu_epi32(mask, src + j * sbn + p0)
-                                  : _mm512_setzero_si512();
-                }
-                gpt_rs_transpose16(r);
-                for (size_t q = 0; q < GPTRS_MIN((size_t)16, kc - p0); ++q) {
-                    _mm512_store_si512((void*)(dst + (p0 + q) * GPTRS_PANEL_N), r[q]);
-                }
-            }
-        } else {
-            for (size_t p = 0; p < kc; ++p) {
-                for (size_t j = 0; j < 16; ++j) {
-                    dst[p * GPTRS_PANEL_N + j] = j < nr ? src[p * sbk + j * sbn] : 0.0f;
-                }
-            }
-        }
+#define GPTRS_DEFINE_GEMM_PACK(SUFFIX, T, LOAD, WIDEN)                                        \
+    static inline void gpt_rs_pack_b_##SUFFIX(const T* b, size_t sbk, size_t sbn, size_t kc,  \
+                                              size_t nc, float* bpack) {                      \
+        for (size_t j0 = 0; j0 < nc; j0 += 16) {                                              \
+            const T* src = b + j0 * sbn;                                                      \
+            float* dst =                                                                      \
+                bpack + j0 / GPTRS_PANEL_N * kc * GPTRS_PANEL_N + j0 % GPTRS_PANEL_N;         \
+            const size_t nr = GPTRS_MIN((size_t)16, nc - j0);                                 \
+            if (sbn == 1) {                                                                   \
+                for (size_t p = 0; p < kc; ++p) {                                             \
+                    _mm512_store_ps(dst + p * GPTRS_PANEL_N, LOAD##_tail(src + p * sbk, nr)); \
+                }                                                                             \
+            } else if (sbk == 1) {                                                            \
+                for (size_t p0 = 0; p0 < kc; p0 += 16) {                                      \
+                    __m512i r[16];                                                            \
+                    for (size_t j = 0; j < 16; ++j) {                                         \
+                        r[j] = j < nr                                                         \
+                                   ? _mm512_castps_si512(                                     \
+                                         LOAD##_tail(src + j * sbn + p0, kc - p0))            \
+                                   : _mm512_setzero_si512();                                  \
+                    }                                                                         \
+                    gpt_rs_transpose16(r);                                                    \
+                    for (size_t q = 0; q < GPTRS_MIN((size_t)16, kc - p0); ++q) {             \
+                        _mm512_store_si512((void*)(dst + (p0 + q) * GPTRS_PANEL_N), r[q]);    \
+                    }                                                                         \
+                }                                                                             \
+            } else {                                                                          \
+                for (size_t p = 0; p < kc; ++p) {                                             \
+                    for (size_t j = 0; j < 16; ++j) {                                         \
+                        dst[p * GPTRS_PANEL_N + j] =                                          \
+                            j < nr ? WIDEN(src[p * sbk + j * sbn]) : 0.0f;                    \
+                    }                                                                         \
+                }                                                                             \
+            }                                                                                 \
+        }                                                                                     \
+    }                                                                                         \
+    static inline void gpt_rs_pack_a_##SUFFIX(const T* a, size_t sam, size_t sak, size_t kc,  \
+                                              size_t mc, float* apack) {                      \
+        const size_t mtiles = (mc + GPTRS_MR - 1) / GPTRS_MR;                                 \
+        for (size_t ib = 0; ib < mtiles; ++ib) {                                              \
+            const size_t i0 = ib * GPTRS_MR;                                                  \
+            const size_t mr = GPTRS_MIN(GPTRS_MR, mc - i0);                                   \
+            float* ap = apack + ib * kc * GPTRS_MR;                                           \
+            size_t p = 0;                                                                     \
+            if (sak == 1) {                                                                   \
+                for (; p + 16 <= kc; p += 16) {                                               \
+                    __m512i r[16];                                                            \
+                    for (size_t i = 0; i < 16; ++i) {                                         \
+                        r[i] = i < mr ? _mm512_castps_si512(LOAD(a + (i0 + i) * sam + p))     \
+                                      : _mm512_setzero_si512();                               \
+                    }                                                                         \
+                    gpt_rs_transpose16(r);                                                    \
+                    for (size_t q = 0; q < 16; ++q) {                                         \
+                        _mm512_mask_storeu_epi32(ap + (p + q) * GPTRS_MR,                     \
+                                                 (__mmask16)((1u << GPTRS_MR) - 1u), r[q]);   \
+                    }                                                                         \
+                }                                                                             \
+            }                                                                                 \
+            for (; p < kc; ++p) {                                                             \
+                float* dst = ap + p * GPTRS_MR;                                               \
+                for (size_t i = 0; i < mr; ++i) {                                             \
+                    dst[i] = WIDEN(a[(i0 + i) * sam + p * sak]);                              \
+                }                                                                             \
+                for (size_t i = mr; i < GPTRS_MR; ++i) {                                      \
+                    dst[i] = 0.0f;                                                            \
+                }                                                                             \
+            }                                                                                 \
+        }                                                                                     \
     }
-}
 
-_Static_assert(GPTRS_MR <= 16, "a packed row of a is one masked 16-lane store");
-
-/* Packs the mc x kc block of a. Element (i, p) of a is at a[i * sam + p * sak]. */
-static inline void gpt_rs_pack_a(const float* a, size_t sam, size_t sak, size_t kc, size_t mc,
-                                 float* apack) {
-    const size_t mtiles = (mc + GPTRS_MR - 1) / GPTRS_MR;
-    for (size_t ib = 0; ib < mtiles; ++ib) {
-        const size_t i0 = ib * GPTRS_MR;
-        const size_t mr = GPTRS_MIN(GPTRS_MR, mc - i0);
-        float* ap = apack + ib * kc * GPTRS_MR;
-        size_t p = 0;
-        if (sak == 1) {
-            /* Packs 16 columns at a time with a register transpose of the rows. Rows past mr
-             * are zero. */
-            for (; p + 16 <= kc; p += 16) {
-                __m512i r[16];
-                for (size_t i = 0; i < 16; ++i) {
-                    r[i] = i < mr ? _mm512_loadu_si512(a + (i0 + i) * sam + p)
-                                  : _mm512_setzero_si512();
-                }
-                gpt_rs_transpose16(r);
-                for (size_t q = 0; q < 16; ++q) {
-                    _mm512_mask_storeu_epi32(ap + (p + q) * GPTRS_MR,
-                                             (__mmask16)((1u << GPTRS_MR) - 1u), r[q]);
-                }
-            }
-        }
-        for (; p < kc; ++p) {
-            float* dst = ap + p * GPTRS_MR;
-            for (size_t i = 0; i < mr; ++i) {
-                dst[i] = a[(i0 + i) * sam + p * sak];
-            }
-            for (size_t i = mr; i < GPTRS_MR; ++i) {
-                dst[i] = 0.0f;
-            }
-        }
-    }
-}
+GPTRS_DEFINE_GEMM_PACK(f32, float, gpt_rs_load_f32, gpt_rs_f32_to_f32)
+GPTRS_DEFINE_GEMM_PACK(bf16, uint16_t, gpt_rs_load_bf16, gpt_rs_bf16_to_f32)
 
 static inline void gpt_rs_pack_a_conv(
     const float* input,
@@ -225,44 +234,3 @@ static inline void gpt_rs_pack_a_conv(
     }
 }
 #endif
-
-/* A persistent copy of a k x n matrix b in the panel layout of gpt_rs_pack_b. Calls reuse it. */
-typedef struct {
-    const float* b_ptr;
-    size_t n;
-    size_t k;
-    float* bpack;
-} gpt_rs_bpack_cache;
-
-/* Returns whether `cache` holds b. Packs b again when b, n or k changed. */
-static inline int gpt_rs_bpack_cache_prepare(gpt_rs_bpack_cache* cache, const float* b, size_t n,
-                                             size_t k, size_t sbk, size_t sbn) {
-#if GPTRS_HAS_AVX512
-    if (cache->b_ptr == b && cache->n == n && cache->k == k && cache->bpack) {
-        return 1;
-    }
-    const size_t panels = (n + GPTRS_PANEL_N - 1) / GPTRS_PANEL_N;
-    if (panels == 0 || k == 0 || k > SIZE_MAX / sizeof(float) / GPTRS_PANEL_N / panels) {
-        return 0;
-    }
-    float* buf = (float*)gpt_rs_aligned_malloc(panels * k * GPTRS_PANEL_N * sizeof(float));
-    if (!buf) {
-        return 0;
-    }
-    gpt_rs_pack_b(b, sbk, sbn, k, n, buf);
-    gpt_rs_aligned_free(cache->bpack);
-    cache->bpack = buf;
-    cache->b_ptr = b;
-    cache->n = n;
-    cache->k = k;
-    return 1;
-#else
-    (void)cache;
-    (void)b;
-    (void)n;
-    (void)k;
-    (void)sbk;
-    (void)sbn;
-    return 0;
-#endif
-}

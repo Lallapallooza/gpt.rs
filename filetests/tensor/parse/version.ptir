@@ -1,0 +1,7 @@
+// RUN: parse
+
+// ERROR: 2:27: the program follows ptir.v0.4, but this parser reads ptir.v0.5
+spec_version = "ptir.v0.4"
+func.func @f(%0: tensor<4xf32>) -> tensor<4xf32> {
+  func.return(%0) : (tensor<4xf32>) -> ()
+}

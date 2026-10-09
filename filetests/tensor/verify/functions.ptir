@@ -1,0 +1,36 @@
+// RUN: verify
+
+// ERROR: func.func: a load-time function reads only parameters
+func.func @load_time_input(%0: tensor<4xf32>) -> (tensor<4xf32> {param = 7}) {
+  func.return(%0) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: func.func: region 0 yields (tensor<4xf32>), expected (tensor<4xsi32>)
+func.func @wrong_return(%0: tensor<4xf32>) -> tensor<4xsi32> {
+  func.return(%0) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: func.func: region 0 does not end with its terminator
+func.func @no_return(%0: tensor<4xf32>) -> tensor<4xf32> {
+  %1 = tensor.exp(%0) : (tensor<4xf32>) -> tensor<4xf32>
+}
+
+// -----
+
+// ERROR: func.return: a terminator must be the last op of its region
+func.func @two_returns(%0: tensor<4xf32>) -> tensor<4xf32> {
+  func.return(%0) : (tensor<4xf32>) -> ()
+  func.return(%0) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tensor.add: result types are (tensor<8xf32>), but the op gives (tensor<4xf32>)
+func.func @stale_result(%0: tensor<4xf32>) -> tensor<8xf32> {
+  %1 = tensor.add(%0, %0) : (tensor<4xf32>, tensor<4xf32>) -> tensor<8xf32>
+  func.return(%1) : (tensor<8xf32>) -> ()
+}

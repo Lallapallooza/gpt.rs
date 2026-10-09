@@ -55,12 +55,6 @@ class Gpt2Case:
             default=[1, 64],
             help="Max tokens to generate for benchmark runs.",
         )
-        parser.add_argument(
-            "--kv-cache",
-            action=argparse.BooleanOptionalAction,
-            default=True,
-            help="Enable kv-cache for gpt-rs bench (default: true).",
-        )
 
     def _build_gpt_rs(self, cfg: RunConfig) -> tuple[Any, Any]:
         tokenizer_path = hf_model_dir(cfg) / "tokenizer.json"
@@ -130,7 +124,6 @@ class Gpt2Case:
 
         prompt = str(cfg.params.get("prompt", "Hello"))
         torch_device = str(cfg.torch_device)
-        kv_cache = bool(cfg.params.get("kv_cache", True))
         max_tokens = int(cfg.params.get("bench_tokens", 64))
 
         np.random.seed(cfg.seed)
@@ -175,11 +168,11 @@ class Gpt2Case:
             torch_sync()
 
         def gptrs_once() -> None:
+            # Greedy, like the torch side: GPT-2's generation config does not sample.
             out_tokens = rs_model.generate_tokens(
                 prompt_tokens,
                 max_tokens,
-                temperature=1.0,
-                kv_cache=kv_cache,
+                temperature=0.0,
                 ignore_eos=True,
             )
             _ = int(out_tokens[-1])
@@ -220,7 +213,6 @@ class Gpt2Case:
         prompt = str(cfg.params.get("prompt", "Hello"))
         temperature = float(cfg.params.get("temperature", 0.8))
         max_tokens = int(cfg.params.get("max_tokens", 128))
-        kv_cache = bool(cfg.params.get("kv_cache", True))
 
         rs_tokenizer, rs_model = self._build_gpt_rs(cfg)
         prompt_tokens: list[int] = list(rs_tokenizer.encode(prompt))
@@ -231,7 +223,6 @@ class Gpt2Case:
                 prompt_tokens,
                 max_tokens,
                 temperature=temperature,
-                kv_cache=kv_cache,
             )
         wall_s = time.perf_counter() - t0
 

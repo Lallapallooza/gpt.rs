@@ -1,56 +1,51 @@
 use std::collections::HashMap;
 
-use gpt_rs::backend::conversion::{ConversionError, ConversionResult};
-use gpt_rs::backend::spec::{
-    CustomCallSpec, DType, ExtractPatchesSpec, Instruction, Operand, Operation, TensorSpec,
-};
+use anyhow::{anyhow, Result};
+use gpt_rs_ir::dialects::tensor::{ExtractPatches, TensorOp};
+use gpt_rs_ir::module::Value;
+use gpt_rs_ir::types::{DType, TensorType};
 
-use super::super::profile::{backend_operation_label, bpack_cache_arg, register_op_profile_unary};
-use super::super::types::{MatmulCacheEntry, ValueInfo, ValueKey};
+use crate::kernels::PANEL_N;
+
+use super::super::profile::register_op_profile_unary;
+use super::super::types::{Instruction, Kind, ValueInfo};
 use super::super::utils::{
-    dims_usize, emit_parallel_loops_with_indices, format_f32, linear_index_expr,
-    literal_to_f32_scalar, push_block,
+    dims_usize, emit_parallel_loops_with_indices, format_f32, linear_index_expr, push_block,
 };
 use super::super::value_info::{
-    ensure_dtype, operand_dtype, operand_expr, operand_input_index, operand_spec, output_info,
-    LiteralCache,
+    ensure_dtype, operand_dtype, operand_expr, operand_type, output_info,
 };
-use super::{custom_call_attr_i64_array, EmitContext};
+use super::EmitContext;
 
 pub(super) fn emit_instruction(
-    inst: &Instruction,
+    inst: &Instruction<'_>,
     ctx: &mut EmitContext<'_>,
-) -> ConversionResult<Option<usize>> {
+) -> Result<Option<usize>> {
     let EmitContext {
         module,
         value_infos,
-        literal_cache,
         matmul_profile,
         ..
     } = ctx;
 
-    let op_id = match &inst.op {
-        Operation::ExtractPatches(spec) => {
-            let out_info = output_info(value_infos, inst.id)?;
+    let &Kind::Op(op) = &inst.kind else {
+        return Ok(None);
+    };
+    let op_id = match op {
+        TensorOp::ExtractPatches(spec) => {
+            let out_info = output_info(value_infos, inst.result())?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             ensure_dtype(input_dtype, DType::F32, "extract_patches input must be f32")?;
             ensure_dtype(
-                out_info.spec.dtype,
+                out_info.ty.dtype,
                 DType::F32,
                 "extract_patches output must be f32",
             )?;
-            let label = backend_operation_label(&inst.op);
-            let in_spec = operand_spec(&inst.operands[0], value_infos)?;
-            let op_id = register_op_profile_unary(matmul_profile, label, &out_info.spec, &in_spec)?;
-            let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_extract_patches(
-                module,
-                &out_info.var,
-                &input,
-                &out_info.spec,
-                &in_spec,
-                spec,
-            )?;
+            let label = inst.label;
+            let in_spec = operand_type(&inst.operands[0], value_infos)?;
+            let op_id = register_op_profile_unary(matmul_profile, label, &out_info.ty, &in_spec)?;
+            let input = operand_expr(&inst.operands[0], value_infos)?;
+            emit_extract_patches(module, &out_info.var, &input, &out_info.ty, &in_spec, spec)?;
             op_id
         }
         _ => return Ok(None),
@@ -63,14 +58,14 @@ fn emit_extract_patches(
     module: &mut String,
     out: &str,
     input: &str,
-    out_spec: &TensorSpec,
-    in_spec: &TensorSpec,
-    spec: &ExtractPatchesSpec,
-) -> ConversionResult<()> {
+    out_spec: &TensorType,
+    in_spec: &TensorType,
+    spec: &ExtractPatches,
+) -> Result<()> {
     let in_dims = dims_usize(in_spec)?;
     let out_dims = dims_usize(out_spec)?;
     if in_dims.len() < 3 {
-        return Err(ConversionError::new("extract_patches requires rank >= 3"));
+        return Err(anyhow!("extract_patches requires rank >= 3"));
     }
     let spatial_rank = in_dims.len() - 2;
     if spec.window.len() != spatial_rank
@@ -78,21 +73,18 @@ fn emit_extract_patches(
         || spec.dilation.len() != spatial_rank
         || spec.padding.len() != spatial_rank
     {
-        return Err(ConversionError::new("extract_patches spec rank mismatch"));
+        return Err(anyhow!("extract_patches spec rank mismatch"));
     }
     let channels = *in_dims.last().expect("channels dim");
     let window_elems: usize = spec.window.iter().product();
     let expected_last = window_elems
         .checked_mul(channels)
-        .ok_or_else(|| ConversionError::new("extract_patches window overflow"))?;
+        .ok_or_else(|| anyhow!("extract_patches window overflow"))?;
     if *out_dims.last().unwrap_or(&0) != expected_last {
-        return Err(ConversionError::new(
-            "extract_patches output shape mismatch",
-        ));
+        return Err(anyhow!("extract_patches output shape mismatch"));
     }
 
-    let pad_value = literal_to_f32_scalar(&spec.pad_value)?;
-    let pad = format_f32(pad_value);
+    let pad = format_f32(spec.pad_value.0 as f32);
 
     emit_parallel_loops_with_indices(module, &out_dims, 2, "o", |module, indices, indent| {
         let out_idx = linear_index_expr(&out_dims, indices);
@@ -220,101 +212,74 @@ fn emit_extract_patches(
 
     Ok(())
 }
-#[allow(clippy::too_many_arguments)]
-pub(super) fn emit_custom_call_conv2d(
+/// Emits a [`Kind::Conv2d`] instruction: the convolution kernel on `x` and `w`, plus the bias.
+pub(super) fn emit_conv2d(
     module: &mut String,
-    spec: &CustomCallSpec,
-    operands: &[Operand],
+    patches: &ExtractPatches,
+    operands: &[Value],
     out_info: &ValueInfo,
-    value_infos: &HashMap<ValueKey, ValueInfo>,
-    literal_cache: &mut LiteralCache,
-    op_id: usize,
-    matmul_caches: Option<&mut Vec<MatmulCacheEntry>>,
-) -> ConversionResult<()> {
-    ensure_dtype(out_info.spec.dtype, DType::F32, "conv2d output must be f32")?;
+    value_infos: &HashMap<Value, ValueInfo>,
+) -> Result<()> {
+    ensure_dtype(out_info.ty.dtype, DType::F32, "conv2d output must be f32")?;
     if operands.len() < 2 || operands.len() > 3 {
-        return Err(ConversionError::new(
-            "conv2d custom_call expects 2 or 3 operands",
+        return Err(anyhow!("a convolution reads [x, w] or [x, w, bias]"));
+    }
+    for operand in operands {
+        ensure_dtype(
+            operand_dtype(operand, value_infos)?,
+            DType::F32,
+            "a convolution is f32",
+        )?;
+    }
+    let (
+        &[k_h, k_w],
+        &[stride_h, stride_w],
+        &[dilation_h, dilation_w],
+        &[(pad_top, _), (pad_left, _)],
+    ) = (
+        patches.window.as_slice(),
+        patches.strides.as_slice(),
+        patches.dilation.as_slice(),
+        patches.padding.as_slice(),
+    )
+    else {
+        return Err(anyhow!("a convolution has two spatial axes"));
+    };
+
+    let in_dims = dims_usize(&operand_type(&operands[0], value_infos)?)?;
+    let weight_dims = dims_usize(&operand_type(&operands[1], value_infos)?)?;
+    let out_dims = dims_usize(&out_info.ty)?;
+    let (weight_k, c_out, packed) = match *weight_dims.as_slice() {
+        [k, c_out] => (k, c_out, 0),
+        [panels, k, PANEL_N] => (k, panels * PANEL_N, 1),
+        _ => return Err(anyhow!("conv2d weight must be [K, C_out] or packed")),
+    };
+    let &[n, in_h, in_w, c_in] = in_dims.as_slice() else {
+        return Err(anyhow!("a convolution reads an NHWC input"));
+    };
+    // The result is [N, OH, OW, C_out], or [N, OH, OW, C_out / PANEL_N, PANEL_N] in the same
+    // order when the weight is packed.
+    let (out_h, out_w) = match out_dims.as_slice() {
+        &[out_n, out_h, out_w, ..] if out_n == n => (out_h, out_w),
+        _ => {
+            return Err(anyhow!(
+                "the convolution result {out_dims:?} does not match {in_dims:?}"
+            ))
+        }
+    };
+    if out_dims.iter().product::<usize>() != n * out_h * out_w * c_out {
+        return Err(anyhow!(
+            "the convolution result {out_dims:?} has the wrong size"
         ));
     }
-    let in_dtype = operand_dtype(&operands[0], value_infos)?;
-    let w_dtype = operand_dtype(&operands[1], value_infos)?;
-    ensure_dtype(in_dtype, DType::F32, "conv2d input must be f32")?;
-    ensure_dtype(w_dtype, DType::F32, "conv2d weights must be f32")?;
-    if operands.len() == 3 {
-        let b_dtype = operand_dtype(&operands[2], value_infos)?;
-        ensure_dtype(b_dtype, DType::F32, "conv2d bias must be f32")?;
+    if weight_k != k_h * k_w * c_in {
+        return Err(anyhow!("conv2d weight shape mismatch"));
     }
 
-    let window = custom_call_attr_i64_array(spec, "window")?;
-    let strides = custom_call_attr_i64_array(spec, "strides")?;
-    let dilation = custom_call_attr_i64_array(spec, "dilation")?;
-    let padding = custom_call_attr_i64_array(spec, "padding")?;
-    if window.len() != 2 || strides.len() != 2 || dilation.len() != 2 || padding.len() != 4 {
-        return Err(ConversionError::new(
-            "conv2d custom_call attribute lengths invalid",
-        ));
-    }
-
-    let in_spec = operand_spec(&operands[0], value_infos)?;
-    let weight_spec = operand_spec(&operands[1], value_infos)?;
-    let in_dims = dims_usize(&in_spec)?;
-    let weight_dims = dims_usize(&weight_spec)?;
-    let out_dims = dims_usize(&out_info.spec)?;
-
-    if in_dims.len() != 4 || out_dims.len() != 4 {
-        return Err(ConversionError::new(
-            "conv2d custom_call expects rank-4 NHWC tensors",
-        ));
-    }
-    if weight_dims.len() != 2 {
-        return Err(ConversionError::new(
-            "conv2d custom_call expects packed weight shape [K, C_out]",
-        ));
-    }
-
-    let k_h = usize::try_from(window[0])
-        .map_err(|_| ConversionError::new("conv2d window must be non-negative"))?;
-    let k_w = usize::try_from(window[1])
-        .map_err(|_| ConversionError::new("conv2d window must be non-negative"))?;
-    let stride_h = usize::try_from(strides[0])
-        .map_err(|_| ConversionError::new("conv2d strides must be non-negative"))?;
-    let stride_w = usize::try_from(strides[1])
-        .map_err(|_| ConversionError::new("conv2d strides must be non-negative"))?;
-    let dilation_h = usize::try_from(dilation[0])
-        .map_err(|_| ConversionError::new("conv2d dilation must be non-negative"))?;
-    let dilation_w = usize::try_from(dilation[1])
-        .map_err(|_| ConversionError::new("conv2d dilation must be non-negative"))?;
-    let pad_top = usize::try_from(padding[0])
-        .map_err(|_| ConversionError::new("conv2d padding must be non-negative"))?;
-    let pad_left = usize::try_from(padding[2])
-        .map_err(|_| ConversionError::new("conv2d padding must be non-negative"))?;
-
-    let (n, in_h, in_w, c_in) = (in_dims[0], in_dims[1], in_dims[2], in_dims[3]);
-    let (out_h, out_w, c_out) = (out_dims[1], out_dims[2], out_dims[3]);
-    if out_dims[0] != n {
-        return Err(ConversionError::new(
-            "conv2d custom_call batch dimension mismatch",
-        ));
-    }
-
-    let k = k_h
-        .checked_mul(k_w)
-        .and_then(|v| v.checked_mul(c_in))
-        .ok_or_else(|| ConversionError::new("conv2d kernel size overflow"))?;
-    if weight_dims[0] != k || weight_dims[1] != c_out {
-        return Err(ConversionError::new("conv2d packed weight shape mismatch"));
-    }
-
-    let input = operand_expr(&operands[0], value_infos, module, literal_cache)?;
-    let weight = operand_expr(&operands[1], value_infos, module, literal_cache)?;
+    let input = operand_expr(&operands[0], value_infos)?;
+    let weight = operand_expr(&operands[1], value_infos)?;
     let bias = if operands.len() == 3 {
-        Some(operand_expr(
-            &operands[2],
-            value_infos,
-            module,
-            literal_cache,
-        )?)
+        Some(operand_expr(&operands[2], value_infos)?)
     } else {
         None
     };
@@ -334,8 +299,6 @@ pub(super) fn emit_custom_call_conv2d(
         "#
     );
     push_block(module, 1, &header);
-    let weight_input = operand_input_index(&operands[1], value_infos);
-    let cache = bpack_cache_arg(matmul_caches, weight_input, op_id, c_out, k, c_out, 1);
     let call = format!(
         r#"
             gpt_rs_c_conv2d_nhwc_f32(
@@ -346,7 +309,7 @@ pub(super) fn emit_custom_call_conv2d(
               {stride_h}, {stride_w},
               {dilation_h}, {dilation_w},
               {pad_top}, {pad_left},
-              {cache}
+              {packed}
             );
         "#
     );

@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::backend::spec::PortableBackend;
-use crate::inference::decoder;
+use crate::backend::PortableBackend;
+use crate::inference::{decoder, vision};
 use crate::runtime::LoadedModel;
 use crate::tensor::DeviceTensor;
 
@@ -15,7 +15,7 @@ pub type BuildFn<B> = fn(
     Arc<B>,
     &ModelConfig,
     &mut dyn FnMut(&str) -> Result<Option<DeviceTensor<B>>>,
-) -> Result<Box<dyn LoadedModel<B>>>;
+) -> Result<Box<dyn LoadedModel>>;
 
 #[derive(Clone, Copy)]
 pub struct ModelFactory<B: PortableBackend + 'static> {
@@ -44,11 +44,11 @@ pub fn model_factories<B: PortableBackend + 'static>() -> &'static [ModelFactory
         },
         ModelFactory {
             kind: super::resnet::KIND,
-            build: super::resnet::build_from_model_config::<B>,
+            build: vision::build_from_model_config::<B, super::resnet::ResNetConfig>,
         },
         ModelFactory {
             kind: super::mobilenet_v2::KIND,
-            build: super::mobilenet_v2::build_from_model_config::<B>,
+            build: vision::build_from_model_config::<B, super::mobilenet_v2::MobileNetV2Config>,
         },
     ]
 }

@@ -1,153 +1,77 @@
-use gpt_rs::backend::conversion::{ConversionError, ConversionResult};
-use gpt_rs::backend::spec::{
-    ArgMaxSpec, DType, Instruction, Operation, ReduceKind, ReduceSpec, ReduceWindowSpec,
-    SegmentReduceKind, SegmentReduceSpec, TensorSpec, TopKSpec,
-};
+use anyhow::{anyhow, Result};
+use gpt_rs_ir::dialects::tensor::{Reduce, ReduceKind, ReduceWindow, TensorOp};
+use gpt_rs_ir::types::{DType, TensorType};
 
-use super::super::profile::{
-    backend_operation_label, register_op_profile_generic, register_op_profile_multi_output,
-    register_op_profile_unary,
-};
-use super::super::types::ValueInfo;
+use super::super::profile::register_op_profile_unary;
+use super::super::types::{Instruction, Kind};
 use super::super::utils::{
-    axis_index, dims_usize, emit_loops_with_indices, emit_parallel_loops_with_indices,
-    linear_index_expr, push_block,
+    dims_usize, emit_loops_with_indices, emit_parallel_loops_with_indices, linear_index_expr,
+    push_block,
 };
 use super::super::value_info::{
-    ensure_dtype, operand_dtype, operand_expr, operand_spec, operand_specs, output_info,
-    output_infos,
+    ensure_dtype, operand_dtype, operand_expr, operand_type, output_info,
 };
 use super::EmitContext;
 
 pub(super) fn emit_instruction(
-    inst: &Instruction,
+    inst: &Instruction<'_>,
     ctx: &mut EmitContext<'_>,
-) -> ConversionResult<Option<usize>> {
+) -> Result<Option<usize>> {
     let EmitContext {
         module,
         value_infos,
-        literal_cache,
         matmul_profile,
         ..
     } = ctx;
 
-    let op_id = match &inst.op {
-        Operation::Reduce(spec) => {
-            let out_info = output_info(value_infos, inst.id)?;
+    let &Kind::Op(op) = &inst.kind else {
+        return Ok(None);
+    };
+    let op_id = match op {
+        TensorOp::Reduce(spec) => {
+            let out_info = output_info(value_infos, inst.result())?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             ensure_dtype(input_dtype, DType::F32, "reduce input must be f32")?;
-            ensure_dtype(out_info.spec.dtype, DType::F32, "reduce output must be f32")?;
-            let label = backend_operation_label(&inst.op);
-            let input_spec = operand_spec(&inst.operands[0], value_infos)?;
+            ensure_dtype(out_info.ty.dtype, DType::F32, "reduce output must be f32")?;
+            ensure_dtype(
+                spec.accum.unwrap_or(DType::F32),
+                DType::F32,
+                "reduce accumulator must be f32",
+            )?;
+            let label = inst.label;
+            let input_spec = operand_type(&inst.operands[0], value_infos)?;
             let op_id =
-                register_op_profile_unary(matmul_profile, label, &out_info.spec, &input_spec)?;
-            let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
+                register_op_profile_unary(matmul_profile, label, &out_info.ty, &input_spec)?;
+            let input = operand_expr(&inst.operands[0], value_infos)?;
             emit_reduce(
                 module,
                 &out_info.var,
                 &input,
-                &out_info.spec,
+                &out_info.ty,
                 &input_spec,
                 spec,
             )?;
             op_id
         }
-        Operation::ArgMax(spec) => {
-            let out_info = output_info(value_infos, inst.id)?;
-            let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
-            ensure_dtype(input_dtype, DType::F32, "argmax input must be f32")?;
-            ensure_dtype(
-                out_info.spec.dtype,
-                DType::Si32,
-                "argmax output must be si32",
-            )?;
-            let label = backend_operation_label(&inst.op);
-            let input_spec = operand_spec(&inst.operands[0], value_infos)?;
-            let op_id =
-                register_op_profile_unary(matmul_profile, label, &out_info.spec, &input_spec)?;
-            let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_argmax(
-                module,
-                &out_info.var,
-                &input,
-                &out_info.spec,
-                &input_spec,
-                spec,
-            )?;
-            op_id
-        }
-        Operation::ReduceWindow(spec) => {
-            let out_info = output_info(value_infos, inst.id)?;
+        TensorOp::ReduceWindow(spec) => {
+            let out_info = output_info(value_infos, inst.result())?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             ensure_dtype(input_dtype, DType::F32, "reduce_window input must be f32")?;
             ensure_dtype(
-                out_info.spec.dtype,
+                spec.accum.unwrap_or(DType::F32),
+                DType::F32,
+                "reduce_window accumulator must be f32",
+            )?;
+            ensure_dtype(
+                out_info.ty.dtype,
                 DType::F32,
                 "reduce_window output must be f32",
             )?;
-            let label = backend_operation_label(&inst.op);
-            let in_spec = operand_spec(&inst.operands[0], value_infos)?;
-            let op_id = register_op_profile_unary(matmul_profile, label, &out_info.spec, &in_spec)?;
-            let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            emit_reduce_window(
-                module,
-                &out_info.var,
-                &input,
-                &out_info.spec,
-                &in_spec,
-                spec,
-            )?;
-            op_id
-        }
-        Operation::TopK(spec) => {
-            let outputs = output_infos(value_infos, inst.id)?;
-            if outputs.len() != 2 {
-                return Err(ConversionError::new("top_k expects two outputs"));
-            }
-            let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
-            ensure_dtype(input_dtype, DType::F32, "top_k input must be f32")?;
-            let label = backend_operation_label(&inst.op);
-            let input_specs = operand_specs(&inst.operands, value_infos)?;
-            let op_id =
-                register_op_profile_multi_output(matmul_profile, label, &outputs, &input_specs)?;
-            let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            let in_spec = operand_spec(&inst.operands[0], value_infos)?;
-            emit_topk(module, &input, &in_spec, outputs[0], outputs[1], spec)?;
-            op_id
-        }
-        Operation::SegmentReduce(spec) => {
-            let out_info = output_info(value_infos, inst.id)?;
-            let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
-            let indices_dtype = operand_dtype(&inst.operands[1], value_infos)?;
-            ensure_dtype(input_dtype, DType::F32, "segment_reduce input must be f32")?;
-            ensure_dtype(
-                indices_dtype,
-                DType::Si32,
-                "segment_reduce indices must be si32",
-            )?;
-            ensure_dtype(
-                out_info.spec.dtype,
-                DType::F32,
-                "segment_reduce output must be f32",
-            )?;
-            let label = backend_operation_label(&inst.op);
-            let input_specs = operand_specs(&inst.operands, value_infos)?;
-            let op_id =
-                register_op_profile_generic(matmul_profile, label, &out_info.spec, &input_specs)?;
-            let input = operand_expr(&inst.operands[0], value_infos, module, literal_cache)?;
-            let indices = operand_expr(&inst.operands[1], value_infos, module, literal_cache)?;
-            let in_spec = operand_spec(&inst.operands[0], value_infos)?;
-            let idx_spec = operand_spec(&inst.operands[1], value_infos)?;
-            emit_segment_reduce(
-                module,
-                &out_info.var,
-                &input,
-                &indices,
-                &out_info.spec,
-                &in_spec,
-                &idx_spec,
-                spec,
-            )?;
+            let label = inst.label;
+            let in_spec = operand_type(&inst.operands[0], value_infos)?;
+            let op_id = register_op_profile_unary(matmul_profile, label, &out_info.ty, &in_spec)?;
+            let input = operand_expr(&inst.operands[0], value_infos)?;
+            emit_reduce_window(module, &out_info.var, &input, &out_info.ty, &in_spec, spec)?;
             op_id
         }
         _ => return Ok(None),
@@ -156,20 +80,23 @@ pub(super) fn emit_instruction(
     Ok(Some(op_id))
 }
 
+/// Why the f32 reductions here meet no `and` or `or`: those reduce integers and `i1`.
+const F32_ONLY: &str = "and and or reduce integers, not f32";
+
 fn emit_reduce(
     module: &mut String,
     out: &str,
     input: &str,
-    out_spec: &TensorSpec,
-    in_spec: &TensorSpec,
-    spec: &ReduceSpec,
-) -> ConversionResult<()> {
+    out_spec: &TensorType,
+    in_spec: &TensorType,
+    spec: &Reduce,
+) -> Result<()> {
     let in_dims = dims_usize(in_spec)?;
     let out_dims = dims_usize(out_spec)?;
     let rank = in_dims.len();
     let mut axes_set = vec![false; rank];
-    for axis in &spec.axes {
-        axes_set[axis_index(*axis as isize, rank)?] = true;
+    for axis in spec.reduced_axes(rank)? {
+        axes_set[axis] = true;
     }
     // Reduced axes in memory order, so the innermost loop walks the fastest-varying one.
     let reduce_axes: Vec<usize> = (0..rank).filter(|axis| axes_set[*axis]).collect();
@@ -192,12 +119,7 @@ fn emit_reduce(
     }
 
     emit_parallel_loops_with_indices(module, &out_dims, 2, "o", |module, out_indices, indent| {
-        let init = match spec.kind {
-            ReduceKind::Sum => "0.0f",
-            ReduceKind::Max => "-INFINITY",
-            ReduceKind::Min => "INFINITY",
-        };
-        push_block(module, indent, &format!("float acc = {init};"));
+        push_block(module, indent, accumulator_decl(spec.kind));
         let update = |module: &mut String, red_indices: &[String], indent: usize| {
             let mut in_indices = vec!["0".to_string(); rank];
             for axis in 0..rank {
@@ -210,15 +132,7 @@ fn emit_reduce(
                 }
             }
             let in_idx = linear_index_expr(&in_dims, &in_indices);
-            let update = match spec.kind {
-                ReduceKind::Sum => format!("acc += {input}[{in_idx}];"),
-                ReduceKind::Max => {
-                    format!("if ({input}[{in_idx}] > acc) acc = {input}[{in_idx}];")
-                }
-                ReduceKind::Min => {
-                    format!("if ({input}[{in_idx}] < acc) acc = {input}[{in_idx}];")
-                }
-            };
+            let update = accumulator_update(spec.kind, &format!("{input}[{in_idx}]"));
             push_block(module, indent, &update);
         };
         match reduce_dims.split_last() {
@@ -226,13 +140,14 @@ fn emit_reduce(
             Some((&inner, outer)) => {
                 emit_loops_with_indices(module, outer, indent, "r", |module, outer_idx, indent| {
                     // When the innermost reduced axis is contiguous, the compiler may reassociate
-                    // this one accumulator, so the loop vectorises. No other value in the module
-                    // is reassociated.
+                    // this one accumulator, so the loop vectorizes. That is exact for the order
+                    // keys of `max` and `min`. No other value in the module is reassociated.
                     if reduce_axes.last() == Some(&(rank - 1)) {
                         let op = match spec.kind {
                             ReduceKind::Sum => "+",
                             ReduceKind::Max => "max",
                             ReduceKind::Min => "min",
+                            ReduceKind::And | ReduceKind::Or => unreachable!("{F32_ONLY}"),
                         };
                         push_block(
                             module,
@@ -255,79 +170,55 @@ fn emit_reduce(
         }
 
         let out_idx = linear_index_expr(&out_dims, out_indices);
-        push_block(module, indent, &format!("{out}[{out_idx}] = acc;"));
+        let result = accumulator_result(spec.kind);
+        push_block(module, indent, &format!("{out}[{out_idx}] = {result};"));
     });
     Ok(())
 }
-fn emit_argmax(
-    module: &mut String,
-    out: &str,
-    input: &str,
-    out_spec: &TensorSpec,
-    in_spec: &TensorSpec,
-    spec: &ArgMaxSpec,
-) -> ConversionResult<()> {
-    let in_dims = dims_usize(in_spec)?;
-    let axis = axis_index(spec.axis, in_dims.len())?;
-    let out_dims = dims_usize(out_spec)?;
-    let mut expected = Vec::with_capacity(in_dims.len());
-    for (idx, dim) in in_dims.iter().enumerate() {
-        if idx == axis {
-            if spec.keepdims {
-                expected.push(1);
-            }
-        } else {
-            expected.push(*dim);
-        }
-    }
-    if out_dims != expected {
-        return Err(ConversionError::new("argmax output shape mismatch"));
-    }
-    let outer = if axis == 0 {
-        1usize
-    } else {
-        in_dims[..axis].iter().product::<usize>()
-    };
-    let inner = if axis + 1 >= in_dims.len() {
-        1usize
-    } else {
-        in_dims[axis + 1..].iter().product::<usize>()
-    };
-    let axis_len = in_dims[axis];
 
-    let block = format!(
-        r#"
-            {{
-              const float* input = (const float*){input};
-              int32_t* out = (int32_t*){out};
-              for (size_t o = 0; o < {outer}; ++o) {{
-                for (size_t i = 0; i < {inner}; ++i) {{
-                  size_t base = o * {axis_len} * {inner} + i;
-                  float max_val = input[base];
-                  int32_t max_idx = 0;
-                  for (size_t a = 1; a < {axis_len}; ++a) {{
-                    float v = input[base + a * {inner}];
-                    if (v > max_val) {{ max_val = v; max_idx = (int32_t)a; }}
-                  }}
-                  size_t out_index = o * {inner} + i;
-                  out[out_index] = max_idx;
-                }}
-              }}
-            }}
-        "#
-    );
-    push_block(module, 1, &block);
-
-    Ok(())
+/// Declares the accumulator `acc` of a reduction, holding its identity. `max` and `min`
+/// accumulate the order keys from the kernel preamble, whose unsigned max and min propagate NaN
+/// and order `-0.0` below `+0.0`.
+fn accumulator_decl(kind: ReduceKind) -> &'static str {
+    match kind {
+        ReduceKind::Sum => "float acc = 0.0f;",
+        ReduceKind::Max => "uint32_t acc = gpt_rs_f32_to_max_key(-INFINITY);",
+        ReduceKind::Min => "uint32_t acc = gpt_rs_f32_to_min_key(INFINITY);",
+        ReduceKind::And | ReduceKind::Or => unreachable!("{F32_ONLY}"),
+    }
 }
+
+/// Folds the f32 expression `value` into `acc`.
+fn accumulator_update(kind: ReduceKind, value: &str) -> String {
+    match kind {
+        ReduceKind::Sum => format!("acc += {value};"),
+        ReduceKind::Max => format!(
+            "{{ uint32_t key = gpt_rs_f32_to_max_key({value}); acc = key > acc ? key : acc; }}"
+        ),
+        ReduceKind::Min => format!(
+            "{{ uint32_t key = gpt_rs_f32_to_min_key({value}); acc = key < acc ? key : acc; }}"
+        ),
+        ReduceKind::And | ReduceKind::Or => unreachable!("{F32_ONLY}"),
+    }
+}
+
+/// The f32 value of `acc`.
+fn accumulator_result(kind: ReduceKind) -> &'static str {
+    match kind {
+        ReduceKind::Sum => "acc",
+        ReduceKind::Max | ReduceKind::Min => "gpt_rs_key_to_f32(acc)",
+        ReduceKind::And | ReduceKind::Or => unreachable!("{F32_ONLY}"),
+    }
+}
+
 fn emit_reduce_window(
     module: &mut String,
     out: &str,
     input: &str,
-    out_spec: &TensorSpec,
-    in_spec: &TensorSpec,
-    spec: &ReduceWindowSpec,
-) -> ConversionResult<()> {
+    out_spec: &TensorType,
+    in_spec: &TensorType,
+    spec: &ReduceWindow,
+) -> Result<()> {
     let in_dims = dims_usize(in_spec)?;
     let out_dims = dims_usize(out_spec)?;
     if spec.window_dims.len() != in_dims.len()
@@ -336,291 +227,93 @@ fn emit_reduce_window(
         || spec.base_dilation.len() != in_dims.len()
         || spec.window_dilation.len() != in_dims.len()
     {
-        return Err(ConversionError::new("reduce_window rank mismatch"));
+        return Err(anyhow!("reduce_window rank mismatch"));
     }
     if spec.base_dilation.iter().any(|&d| d != 1) || spec.window_dilation.iter().any(|&d| d != 1) {
-        return Err(ConversionError::new(
-            "reduce_window dilation not supported yet",
-        ));
+        return Err(anyhow!("reduce_window dilation not supported yet"));
     }
 
     emit_parallel_loops_with_indices(module, &out_dims, 2, "o", |module, out_indices, indent| {
-        let init = match spec.reduce {
-            ReduceKind::Sum => "0.0f",
-            ReduceKind::Max => "-INFINITY",
-            ReduceKind::Min => "INFINITY",
-        };
-        push_block(module, indent, &format!("float acc = {init};"));
-
-        emit_loops_with_indices(
-            module,
-            &spec.window_dims,
-            indent,
-            "w",
-            |module, win_indices, indent| {
-                let mut in_indices = Vec::with_capacity(in_dims.len());
-                for axis in 0..in_dims.len() {
-                    let stride = spec.strides[axis];
-                    let pad_low = spec.padding[axis].0;
-                    let out_index = &out_indices[axis];
-                    let win_index = &win_indices[axis];
-                    let expr =
-                        format!("((int64_t){out_index} * {stride} + {win_index} - {pad_low})");
-                    in_indices.push(expr);
-                }
-
-                let in_bounds = in_indices
-                    .iter()
-                    .enumerate()
-                    .map(|(axis, idx)| {
-                        let dim = in_dims[axis];
-                        format!("({idx} >= 0 && {idx} < {dim})")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" && ");
-                let in_idx = linear_index_expr(&in_dims, &in_indices);
-                let update = match spec.reduce {
-                    ReduceKind::Sum => format!("acc += {input}[{in_idx}];"),
-                    ReduceKind::Max => {
-                        format!("if ({input}[{in_idx}] > acc) acc = {input}[{in_idx}];")
-                    }
-                    ReduceKind::Min => {
-                        format!("if ({input}[{in_idx}] < acc) acc = {input}[{in_idx}];")
-                    }
-                };
-                let block = format!(
-                    r#"
-                        if ({in_bounds}) {{
-                          {update}
-                        }}
-                    "#
-                );
-                push_block(module, indent, &block);
-            },
-        );
-
-        let out_idx = linear_index_expr(&out_dims, out_indices);
-        push_block(module, indent, &format!("{out}[{out_idx}] = acc;"));
-    });
-
-    Ok(())
-}
-fn emit_topk(
-    module: &mut String,
-    input: &str,
-    in_spec: &TensorSpec,
-    out_values: &ValueInfo,
-    out_indices: &ValueInfo,
-    spec: &TopKSpec,
-) -> ConversionResult<()> {
-    let in_dims = dims_usize(in_spec)?;
-    let out_dims = dims_usize(&out_values.spec)?;
-    let out_idx_dims = dims_usize(&out_indices.spec)?;
-    if out_dims != out_idx_dims {
-        return Err(ConversionError::new("top_k output shape mismatch"));
-    }
-    if out_dims.len() != in_dims.len() {
-        return Err(ConversionError::new("top_k rank mismatch"));
-    }
-    let axis = axis_index(spec.axis, in_dims.len())?;
-    if out_dims[axis] != spec.k {
-        return Err(ConversionError::new("top_k output axis mismatch"));
-    }
-    if in_dims[axis] < spec.k {
-        return Err(ConversionError::new("top_k k exceeds axis size"));
-    }
-    if out_indices.spec.dtype != spec.indices_dtype {
-        return Err(ConversionError::new("top_k indices dtype mismatch"));
-    }
-    if out_values.spec.dtype != DType::F32 {
-        return Err(ConversionError::new(
-            "top_k values dtype must be f32 for C backend",
-        ));
-    }
-    if out_indices.spec.dtype != DType::Si32 {
-        return Err(ConversionError::new(
-            "top_k indices dtype must be si32 for C backend",
-        ));
-    }
-
-    let mut outer_dims = Vec::new();
-    for (idx, dim) in in_dims.iter().enumerate() {
-        if idx != axis {
-            outer_dims.push(*dim);
-        }
-    }
-    let mut in_indices = Vec::with_capacity(in_dims.len());
-    let mut out_indices_vec = Vec::with_capacity(out_dims.len());
-    let mut outer_pos = 0usize;
-    for d in 0..in_dims.len() {
-        if d == axis {
-            in_indices.push("a".to_string());
-            out_indices_vec.push("kk".to_string());
-        } else {
-            in_indices.push(format!("o{outer_pos}"));
-            out_indices_vec.push(format!("o{outer_pos}"));
-            outer_pos += 1;
-        }
-    }
-    let in_idx_expr = linear_index_expr(&in_dims, &in_indices);
-    let out_idx_expr = linear_index_expr(&out_dims, &out_indices_vec);
-
-    let out_values_var = &out_values.var;
-    let out_indices_var = &out_indices.var;
-    let axis_dim = in_dims[axis];
-    let k = spec.k;
-    let header = format!(
-        r#"
-            {{
-              const float* input = (const float*){input};
-              float* out_values = (float*){out_values_var};
-              int32_t* out_indices = (int32_t*){out_indices_var};
-              const size_t axis_dim = {axis_dim};
-              const size_t k = {k};
-        "#
-    );
-    push_block(module, 1, &header);
-
-    emit_loops_with_indices(
-        module,
-        &outer_dims,
-        2,
-        "o",
-        |module, _outer_indices, indent| {
-            push_block(
+        push_block(module, indent, accumulator_decl(spec.kind));
+        // Every window of an empty input is empty, so each output is the value `acc` starts with.
+        if !in_dims.contains(&0) {
+            emit_loops_with_indices(
                 module,
+                &spec.window_dims,
                 indent,
-                r#"
-                    uint8_t* selected = (uint8_t*)calloc(axis_dim, 1);
-                    if (!selected) { return -4; }
-                    for (size_t kk = 0; kk < k; ++kk) {
-                "#,
+                "w",
+                |module, win_indices, indent| {
+                    let indices = (out_indices, win_indices);
+                    let fold = window_fold(spec, input, &in_dims, &out_dims, indices);
+                    push_block(module, indent, &fold);
+                },
             );
-            if spec.largest {
-                let block = format!(
-                    r#"
-                        float best = -INFINITY;
-                        int32_t best_idx = 0;
-                        for (size_t a = 0; a < axis_dim; ++a) {{
-                          if (selected[a]) {{ continue; }}
-                          float v = input[{in_idx_expr}];
-                          if (v > best) {{ best = v; best_idx = (int32_t)a; }}
-                        }}
-"#
-                );
-                push_block(module, indent + 1, &block);
-            } else {
-                let block = format!(
-                    r#"
-                        float best = INFINITY;
-                        int32_t best_idx = 0;
-                        for (size_t a = 0; a < axis_dim; ++a) {{
-                          if (selected[a]) {{ continue; }}
-                          float v = input[{in_idx_expr}];
-                          if (v < best) {{ best = v; best_idx = (int32_t)a; }}
-                        }}
-"#
-                );
-                push_block(module, indent + 1, &block);
-            }
-            let tail = format!(
-                r#"
-                        selected[best_idx] = 1;
-                        out_values[{out_idx_expr}] = best;
-                        out_indices[{out_idx_expr}] = best_idx;
-"#
-            );
-            push_block(module, indent + 1, &tail);
-            push_block(module, indent, "    }");
-            push_block(module, indent, "    free(selected);");
-        },
-    );
+        }
+        let out_idx = linear_index_expr(&out_dims, out_indices);
+        let result = accumulator_result(spec.kind);
+        push_block(module, indent, &format!("{out}[{out_idx}] = {result};"));
+    });
 
-    push_block(module, 1, "    }");
     Ok(())
 }
-#[allow(clippy::too_many_arguments)]
-fn emit_segment_reduce(
-    module: &mut String,
-    out: &str,
+
+/// C statements that fold the element of `input` at the output and window loop `indices` into
+/// `acc`. On the axes where a window can leave the input, the load reads a clamped index and a
+/// select replaces an element outside the input with the reduction's identity. The statements
+/// have no branch, so the loop over the innermost output axis vectorizes.
+fn window_fold(
+    spec: &ReduceWindow,
     input: &str,
-    indices: &str,
-    out_spec: &TensorSpec,
-    in_spec: &TensorSpec,
-    indices_spec: &TensorSpec,
-    spec: &SegmentReduceSpec,
-) -> ConversionResult<()> {
-    let in_dims = dims_usize(in_spec)?;
-    let out_dims = dims_usize(out_spec)?;
-    let idx_dims = dims_usize(indices_spec)?;
-    if idx_dims.len() != 1 {
-        return Err(ConversionError::new(
-            "segment_reduce indices must be rank-1",
+    in_dims: &[usize],
+    out_dims: &[usize],
+    (out_indices, win_indices): (&[String], &[String]),
+) -> String {
+    let mut lines = Vec::new();
+    let mut indices = Vec::with_capacity(in_dims.len());
+    let mut inside = Vec::new();
+    for (axis, &dim) in in_dims.iter().enumerate() {
+        let (out_index, win_index) = (&out_indices[axis], &win_indices[axis]);
+        let (stride, pad_low) = (spec.strides[axis], spec.padding[axis].0);
+        let index = format!("((int64_t){out_index} * {stride} + {win_index} - {pad_low})");
+        if always_inside(spec, axis, out_dims[axis], dim) {
+            indices.push(index);
+            continue;
+        }
+        lines.push(format!("int64_t i{axis} = {index};"));
+        inside.push(format!("(i{axis} >= 0) & (i{axis} < {dim})"));
+        let last = dim - 1;
+        indices.push(format!(
+            "(i{axis} < 0 ? 0 : i{axis} < {dim} ? i{axis} : {last})"
         ));
     }
-    if in_dims.is_empty() {
-        return Err(ConversionError::new(
-            "segment_reduce input must be rank >= 1",
-        ));
-    }
-    if idx_dims[0] != in_dims[0] {
-        return Err(ConversionError::new(
-            "segment_reduce indices length mismatch",
-        ));
-    }
-    if out_dims.len() != in_dims.len() {
-        return Err(ConversionError::new("segment_reduce output rank mismatch"));
-    }
-    if out_dims[0] != spec.num_segments {
-        return Err(ConversionError::new("segment_reduce num_segments mismatch"));
-    }
-    if out_dims[1..] != in_dims[1..] {
-        return Err(ConversionError::new("segment_reduce output shape mismatch"));
-    }
-
-    let inner_dims = &in_dims[1..];
-    let init_value = match spec.kind {
-        SegmentReduceKind::Sum => "0.0f",
-        SegmentReduceKind::Max => "-INFINITY",
+    let index = linear_index_expr(in_dims, &indices);
+    lines.push(format!("float x = {input}[{index}];"));
+    let value = if inside.is_empty() {
+        "x".to_string()
+    } else {
+        format!("(({}) ? x : {})", inside.join(" & "), identity(spec.kind))
     };
+    lines.push(accumulator_update(spec.kind, &value));
+    lines.join("\n")
+}
 
-    let out_elems = out_spec
-        .shape
-        .element_count()
-        .ok_or_else(|| ConversionError::new("segment_reduce dynamic shape"))?;
-    let in_len = in_dims[0];
-    let segment_count = spec.num_segments;
-    let header = format!(
-        r#"
-            {{
-              const float* input = (const float*){input};
-              const int32_t* indices = (const int32_t*){indices};
-              float* out = (float*){out};
-              for (size_t i = 0; i < {out_elems}; ++i) {{ out[i] = {init_value}; }}
-              for (size_t s = 0; s < {in_len}; ++s) {{
-                int32_t seg = indices[s];
-                if (seg < 0 || seg >= {segment_count}) {{ return -6; }}
-        "#
-    );
-    push_block(module, 1, &header);
-    emit_loops_with_indices(module, inner_dims, 3, "k", |module, inner_idx, indent| {
-        let mut in_indices = Vec::with_capacity(in_dims.len());
-        in_indices.push("s".to_string());
-        in_indices.extend(inner_idx.iter().cloned());
-        let mut out_indices = Vec::with_capacity(out_dims.len());
-        out_indices.push("seg".to_string());
-        out_indices.extend(inner_idx.iter().cloned());
-        let in_idx = linear_index_expr(&in_dims, &in_indices);
-        let out_idx = linear_index_expr(&out_dims, &out_indices);
-        let update = match spec.kind {
-            SegmentReduceKind::Sum => format!("out[{out_idx}] += input[{in_idx}];"),
-            SegmentReduceKind::Max => {
-                format!("if (input[{in_idx}] > out[{out_idx}]) out[{out_idx}] = input[{in_idx}];")
-            }
-        };
-        push_block(module, indent, &update);
-    });
-    push_block(module, 2, "}");
-    push_block(module, 1, "}");
-    Ok(())
+/// Whether every window of `axis` reads inside the input, so its index needs no bounds check.
+fn always_inside(spec: &ReduceWindow, axis: usize, out_dim: usize, in_dim: usize) -> bool {
+    let (Some(out_last), Some(window_last)) = (
+        out_dim.checked_sub(1),
+        spec.window_dims[axis].checked_sub(1),
+    ) else {
+        return true;
+    };
+    spec.padding[axis].0 == 0 && out_last * spec.strides[axis] + window_last < in_dim
+}
+
+/// The f32 value that leaves any accumulator of `kind` unchanged.
+fn identity(kind: ReduceKind) -> &'static str {
+    match kind {
+        ReduceKind::Sum => "-0.0f",
+        ReduceKind::Max => "-INFINITY",
+        ReduceKind::Min => "INFINITY",
+        ReduceKind::And | ReduceKind::Or => unreachable!("{F32_ONLY}"),
+    }
 }

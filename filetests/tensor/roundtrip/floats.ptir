@@ -1,0 +1,17 @@
+// RUN: roundtrip
+
+// An f32 element is parsed straight to f32: through f64, 7.038531e-26 would round to the next f32.
+func.func @f32_decimal() -> tensor<f32> {
+  %0 = tensor.constant() {value = dense<[] x f32: 7.038531e-26>} : () -> tensor<f32>
+  func.return(%0) : (tensor<f32>) -> ()
+}
+
+// -----
+
+// Elements narrower than a byte, packed from the least significant bits of each byte.
+func.func @packed_constants() -> (tensor<4xf4e2m1>, tensor<3xui4>, tensor<4xf6e3m2>) {
+  %0 = tensor.constant() {value = dense<[4] x f4e2m1: 0x2143>} : () -> tensor<4xf4e2m1>
+  %1 = tensor.constant() {value = dense<[3] x ui4: 0x210f>} : () -> tensor<3xui4>
+  %2 = tensor.constant() {value = dense<[4] x f6e3m2: 0x0c3000>} : () -> tensor<4xf6e3m2>
+  func.return(%0, %1, %2) : (tensor<4xf4e2m1>, tensor<3xui4>, tensor<4xf6e3m2>) -> ()
+}

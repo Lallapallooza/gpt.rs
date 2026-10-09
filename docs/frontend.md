@@ -5,18 +5,19 @@ particular kernel implementation:
 
 - **Models** (`gpt_rs::model::*`) compose layers into end-to-end networks.
 - **Layers** (`gpt_rs::nn::layers::*`) own parameters and control flow in their `forward` (`nn::module`).
-- **Functionals** (`gpt_rs::ops::functional::*`) implement portable math that captures PTIR graphs.
-- **Backends** (`gpt_rs::backend::spec::PortableBackend`) execute PTIR programs.
+- **Functionals** (`gpt_rs::ops::functional::*`) implement portable math from the ops of `DeviceTensor`.
+- **Backends** (`gpt_rs::backend::PortableBackend`) compile and run functions of the IR.
 
 The key idea is: layers do orchestration, functionals do portable math, and backends do execution.
 
 ## Models
 
 Models live in `crates/gpt-rs/src/model/` and are responsible for wiring submodules and deciding what the
-public outputs look like (logits, traces, etc).
+public outputs look like (logits, or pooled features for an image model).
 
-For runtime usage, `gpt_rs::runtime::load_model` loads a checkpoint into a `dyn LoadedModel<B>`, which
-exposes optional "capabilities" like `CausalLanguageModel` (generation) or vision tracing.
+For runtime usage, `gpt_rs::runtime::load_model` loads a checkpoint into a `ModelHandle`, whose
+capabilities are `CausalLanguageModel` (generation) and `VisionModel` (a forward pass); see
+[runtime.md](runtime.md).
 
 ## Layers
 
@@ -27,7 +28,6 @@ which does lightweight validation and orchestration. The macro makes the layer g
 backend `B: PortableBackend` and implements two traits:
 
 - `Module` (`crates/gpt-rs/src/module.rs`) enumerates and updates parameters by stable name.
-  Checkpoint tooling builds on it.
 - `Layer`, whose `call` runs `forward` inside the profiler's layer scope, named after the type. A
   parent calls a sublayer field as a method of the same name.
 
@@ -39,49 +39,54 @@ Functionals live in `crates/gpt-rs/src/ops/functional/`, each declared with `#[f
 
 ```rust
 #[functional]
-pub fn gelu(x: &Tensor) -> Result<Tensor> {
+pub fn gelu(x: &Tensor) -> Tensor {
     ensure_rank_at_least!(x, 1);
-    capture!(|x| {
-        let half = 0.5f32 * x;
-        let erf = ptir::erf(x / ptir::sqrt(2.0f32));
-        half * (1.0f32 + erf)
-    })
+    0.5 * x * (1.0 + (x / 2.0f32.sqrt()).erf())
 }
 ```
 
 - The validation macros (`ensure_rank!`, `ensure_dtype!`, `ensure_same_shape!`, ...) check the inputs.
-  Their errors name the functional and the argument, for example `gelu: x must have rank >= 1, got []`.
-- `capture!` records the PTIR of the body into the lazy graph of the operands and returns lazy
-  `DeviceTensor<B>`s.
+  They panic with a message that names the functional and the argument, for example
+  `gelu: x must have rank >= 1, got []`, and the panic names the caller's line.
+- The body computes with the ops of `DeviceTensor` (`crates/gpt-rs/src/tensor/ops.rs`) and with
+  other functionals. Each op records one PTIR op into the lazy graph and returns a lazy
+  `DeviceTensor<B>`. Binary ops and the operators `+ - * /` broadcast as Torch does, through
+  explicit `broadcast_to` ops, and take an `f32` for a tensor: `x.maximum(0.0)`, `x * 0.5`.
+  `slice` takes a Python-style index that `s!` writes: `x.slice(s![.., -3.., ..;2])` is
+  `x[:, -3:, ::2]`, with `...`, `None` and single positions as in Python.
 - The attribute adds the backend generic `B`. Tensors carry the backend, so callers write
-  `functional::gelu(&x)`. The attribute also generates the pattern view `GeluPattern`, which backends
-  rewrite to faster kernels.
+  `functional::gelu(&x)`. The attribute also opens the profiler scope of the functional.
 
 The macros are documented on their definitions (`crates/gpt-rs-macros/src/lib.rs`,
 `crates/gpt-rs/src/ops/functional/validate.rs`).
 
-### `DeviceTensorOps`
+### Errors
 
-`DeviceTensorOps` is an extension trait implemented for `DeviceTensor<B>`. It provides method syntax like
-`a.matmul(&b)?` over the functionals, so layers stay backend-agnostic.
+Tensor math returns tensors, not `Result`s. An op or functional whose inputs do not fit is a bug in
+the caller, so it panics there. Loading, uploading, compiling and running return `Result`, as they
+can fail at run time: `to_host()`, `DeviceTensor::from_host`, checkpoint loading.
 
 ### Faster implementations
 
-A functional has one implementation: its portable PTIR. Backends make it fast by rewriting the captured
-ops. For example, a backend can lower `Conv2dPattern` to its own convolution kernel. See
-[backend_optimizer.md](backend_optimizer.md).
+A functional has one implementation: its portable PTIR. Backends make it fast by recognizing the
+recorded ops when they compile them. For example, faer and C run the ops that `conv2d` records on
+their own convolution kernels. See [backends/README.md](backends/README.md).
 
 ## Backends
 
-Backends implement the PTIR contract (`gpt_rs::backend::spec::PortableBackend`) and live in crates like:
+Backends implement `gpt_rs::backend::PortableBackend` ([backends/README.md](backends/README.md)) and live in crates like:
 
 - `gpt-rs-backend-faer` (optimized CPU backend)
+- `gpt-rs-backend-c` (generated C)
 - `gpt-rs-backend-ref-cpu` (reference interpreter)
 
-Backends can be wrapped with hooks for dumping/profiling/debugging (see [testing.md](testing.md)).
+Dumps and profiles need no backend wrapper: dumps come from a trace sink that the graph arena
+calls (`gpt_rs::ops::trace`), and the profiler records ambient scopes around layers, functionals,
+passes and backend ops.
 
 ## Typical call flow
 
 1. Layer calls a functional (e.g. attention, layer norm, conv2d).
-2. Functional captures PTIR (or hits a cached plan) and asks the backend to execute.
-3. Backend returns lazy handles; materialization happens only when needed.
+2. The functional records PTIR ops into the lazy graph. Reading a result compiles the graph (or
+   hits a cached plan) and runs it on the backend.
+3. The backend returns its tensor handles; a `DeviceTensor` stays lazy until its value is needed.

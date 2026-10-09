@@ -1,0 +1,17 @@
+[package]
+name = "gpt-rs-docs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Writes the reference pages of the IR, its ops and its passes, from the code."
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+gpt-rs = { path = "../gpt-rs", version = "0.1.0" }
+gpt-rs-backend-c = { path = "../gpt-rs-backend-c", version = "0.1.0" }
+gpt-rs-backend-faer = { path = "../gpt-rs-backend-faer", version = "0.1.0" }
+gpt-rs-backend-ref-cpu = { path = "../gpt-rs-backend-ref-cpu", version = "0.1.0" }
+gpt-rs-filetests = { path = "../gpt-rs-filetests", version = "0.1.0" }
+gpt-rs-ir = { path = "../gpt-rs-ir", version = "0.1.0" }

@@ -19,15 +19,13 @@ A decoder-only text model only describes its structure:
    struct holds the keys of the Hugging Face text config that the model reads, under their Hugging
    Face names.
 2. Implement `inference::decoder::DecoderConfig` for the config: `KIND`, `BASE_MODEL_PREFIX`,
-   `context_length`, `tie_word_embeddings`, the base model type `Model`, and `base_model`, which
-   builds it.
-   - A Llama-style decoder uses `DecoderModel` and builds it from the `DecoderLayout` that the
-     config returns after validation (see `MinistralConfig::layout`). To add a new kind of token
-     mixer, add it to `MixerConfig` and `Mixer` in `nn/layers/decoder_block.rs`, with their match
-     arms.
-   - A model with another Hugging Face module tree declares that tree as `#[nn::module]` structs
-     (see "Write a layer" below) and implements `inference::decoder::BaseModel` for its base model
-     (see `model/gpt.rs`).
+   `context_length`, `tie_word_embeddings`, and `layout`, which validates the config and returns the
+   `DecoderLayout` of the base model (see `MinistralConfig::layout`).
+   - Implement `nn::DecoderNames` for the config too. Its defaults are the Llama family's module
+     names; a family with other names overrides them (see `GptConfig`).
+   - A building block that no layout can express yet goes into the shared layers: a new token mixer
+     into `MixerConfig` and `Mixer` in `nn/layers/decoder_block.rs`, an attention variant into
+     `nn::AttentionConfig`, an MLP variant into `nn::MlpConfig`.
 3. Register `decoder::build_from_model_config::<B, YourConfig>` in `model/registry.rs`.
 4. Add the eval case as in step 6 below.
 
@@ -39,7 +37,8 @@ Other models follow the full checklist:
    - Keep the config struct in the same file (see `model/resnet.rs`).
 2. Declare the model and its blocks as `#[nn::module]` structs whose fields are sublayers (see
    "Write a layer" below). Mirror the module tree of the source framework, so that the field names
-   are the parameter names.
+   are the parameter names. Build from the shared blocks, such as `nn::ConvNormActivation`, before
+   you write new ones.
    - Use NHWC/NCHW conventions explicitly (see "Layouts" below).
 3. Give each block a constructor `new(p: &mut nn::Params<B>, ...)` in its `#[nn::module]` impl:
    - Each field initializer of a `Self { .. }` literal reads its tensors under the field's name.
@@ -51,17 +50,13 @@ Other models follow the full checklist:
      builds the entries of a `ModuleList`.
    - Name parameters after the modules of the source framework
      ([formats.md](formats.md#parameter-names-and-layouts)).
-   - The registry factory receives `get: &mut dyn FnMut(&str) -> Result<Option<DeviceTensor<B>>>`.
-     `get` returns the parameter tensor of a checkpoint name, or `None` when the checkpoint has no
-     such tensor. Wrap it in `Params::new`, and pass `runtime.matmul_input_dtype` to
-     `with_linear_input_dtype`.
-4. Implement `runtime::LoadedModel<B>` for your model:
-   - `kind()` must match the checkpoint's `model_type`.
-   - `forward(ModelInput)` returns `ModelOutput`. Run the model with `Layer::call`.
-   - If applicable, expose capabilities:
-     - Causal LM generation: return `Some(self)` from `as_causal_lm()`.
+4. Implement `inference::vision::VisionConfig` for an image model: `KIND`, which must match the
+   checkpoint's `model_type`, the model type `Model`, and `build`. `inference::vision::ImageModel`
+   then loads it and runs it as one program per forward, as `runtime::LoadedModel` with the
+   `as_vision()` capability.
 5. Register the model factory:
-   - Add it to `model_factories()` in `crates/gpt-rs/src/model/registry.rs`.
+   - Add `inference::vision::build_from_model_config::<B, YourConfig>` to `model_factories()` in
+     `crates/gpt-rs/src/model/registry.rs`.
 6. Add an eval case:
    - Add a case class under `scripts/gptrs_eval/models/`.
    - List it in `scripts/gptrs_eval/registry.py`, with its Hugging Face repo as the `hf_model`
@@ -72,81 +67,94 @@ Other models follow the full checklist:
 
 Goal: a reusable module that owns parameters and calls portable functionals. A layer is a struct
 and an impl that holds its `forward`. Mark both with `#[nn::module]` (see
-`crates/gpt-rs/src/nn/layers/gated_feed_forward.rs` and the macro's documentation):
+`crates/gpt-rs/src/nn/layers/conv.rs` and the macro's documentation):
 
 ```rust
 #[nn::module]
-pub struct GatedFeedForward {
-    pub gate_proj: Linear,
-    pub up_proj: Linear,
-    pub down_proj: Linear,
+pub struct ConvNormActivation {
+    pub convolution: Conv2d,
+    pub normalization: BatchNorm2d,
+    pub activation: Option<Activation>,
 }
 
 #[nn::module]
-impl GatedFeedForward {
-    pub fn new(p: &mut Params<B>) -> Result<Self> {
+impl ConvNormActivation {
+    pub fn new(
+        p: &mut Params<B>,
+        stride: usize,
+        dilation: usize,
+        padding: ConvPadding,
+        eps: f32,
+        activation: Option<ActivationFunction>,
+    ) -> Result<Self> {
         Ok(Self {
-            gate_proj: Linear::new(p)?,
-            up_proj: Linear::new(p)?,
-            down_proj: Linear::new(p)?,
+            convolution: Conv2d::new(p, stride, dilation, padding)?,
+            normalization: BatchNorm2d::new(p, eps)?,
+            activation: activation.map(ActivationFunction::layer),
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj(x)?;
-        let up = self.up_proj(x)?;
-        let hidden = functional::swiglu(&gate, &up)?;
-        self.down_proj(&hidden)
+    fn forward(&self, x: &Tensor) -> Tensor {
+        let x = self.convolution(x);
+        let x = self.normalization(&x);
+        self.activation(&x).unwrap_or(x)
     }
 }
 ```
 
-- The macro adds the backend parameter `B`. Write sublayer fields without it. `Tensor` is
+- The macro adds the backend parameter `B`. Write sublayer fields without it; it goes before any
+  other generic argument (`DecoderBlock<N>` is `DecoderBlock<B, N>`). `Tensor` is
   `DeviceTensor<B>`. Mark plain data (dimensions, epsilons, configs) with `#[module(config)]`.
 - Field names are the parameter names, because the macro generates `Module<B>`. Mirror the module
-  tree of the source framework. Use `#[module(rename = "A_log")]` only for names that do not follow Rust's
-  snake_case field naming.
+  tree of the source framework. Use `#[module(rename = ...)]` only for names that do not follow Rust's
+  snake_case field naming (`"A_log"`) or that differ between decoder families (`nn::DecoderNames`).
 - Call a sublayer field as a method: `self.up_proj(x)`. When its `forward` takes several arguments,
   pass a tuple: `self.self_attn((x, cache, positions))`. The call runs inside the profiler scope of
   the sublayer. Run `Vec` elements and enum variants with `layer.call(args)` (`module::Layer`).
 - Call functionals with tensors only (`functional::gelu(&x)`). The tensors carry the backend.
 - Build layers only through their constructors and `nn::Params`, including in tests
   (`gpt_rs_backend_tests::load_layer`).
-- Use `DeviceTensorOps` for math (`x.add(&y)?`, ...) and `nn::Linear` for projections (PyTorch
-  `[out_features, in_features]` weights), or `nn::Conv1D` where the source module is a
-  `transformers` `Conv1D` (`[in_features, out_features]` weights).
+- `forward` returns its output, not a `Result`: tensor math panics on inputs that do not fit. A
+  forward that uploads inputs (token ids, positions) returns a `Result` for the upload.
+- Use the ops of `DeviceTensor` for math (`&x + &y`, `x.exp()`, ...) and `nn::Linear` for projections:
+  `Linear::new` for PyTorch `[out_features, in_features]` weights, and
+  `Linear::with_layout(p, WeightLayout::InOut)` where the source module is a `transformers` `Conv1D`
+  (`[in_features, out_features]` weights).
 - Avoid host materialization in forward paths (no `.to_host()?` inside layers).
 
 ## Write a functional (portable kernel)
 
-Goal: a backend-agnostic op that validates inputs and captures PTIR.
+Goal: a backend-agnostic op that validates inputs and records PTIR.
 
 Pattern (see `crates/gpt-rs/src/ops/functional/*`):
 
 1. Declare it with `#[functional]`. `Tensor` is `DeviceTensor<B>`, and the functional takes no
    backend argument.
 2. Validate with the validation macros (`ensure_rank!`, `ensure_dtype!`, `ensure_same_shape!`, ...).
-   For other checks, use `ensure!` with a message that starts with `{FUNCTIONAL}: `.
-3. Capture with `capture!(|x, y| body)`. The body returns the PTIR tensor (or a tuple), and
-   `capture!` returns the lazy `DeviceTensor`(s). Name the session (`capture!(session, |x| ...)`)
-   when the body needs constants or `session.export(value)`. `export` keeps a value that has no
-   reader, like an updated cache.
-4. Name each op that a backend rewrite needs with `let`. These ops become fields of the generated
-   pattern view.
+   For other checks, use `assert!` with a message that starts with `{FUNCTIONAL}: `.
+3. Compute with the ops of `DeviceTensor` and other functionals, and return the result. Binary ops
+   broadcast as Torch does and take an `f32` for a tensor (`x.maximum(0.0)`). `x.export()` keeps
+   a value that has no reader, like an updated cache, as a result of the graph.
 
 Testing expectations:
 
-- Add capture/shape/error-message tests under `crates/gpt-rs/tests/` when changing validation rules.
+- Add tests of the exact panic messages under `crates/gpt-rs/tests/` when changing validation rules.
 - Add numerical parity under `crates/gpt-rs-backend-tests/src/torch_parity/` when changing math.
   (See [docs/testing.md](testing.md).)
 
 ## Speed up a functional (custom kernel without touching model code)
 
-- Add optimizer passes in your backend crate via `PortableBackend::pipeline()`.
-- Match portable lowerings with the pattern views that `#[functional]` generates. For example, the C
-  backend conv2d pass in `crates/gpt-rs-backend-c/src/optimizer/conv2d.rs` uses
-  `ops::functional::conv::Conv2dPattern`.
-- Replace the matched subgraph with a `CustomCall` or a different PTIR sequence.
+- The backend chooses its kernels when it compiles a function: it recognizes the op sequence the
+  functional records and runs its kernel in place of those ops. faer does this in
+  `crates/gpt-rs-backend-faer/src/select.rs` and C in
+  `crates/gpt-rs-backend-c/src/codegen/select.rs`. The ops a kernel covers still run when another
+  op reads their results.
+- When the kernel needs a parameter in another layout, add a pass before `outline-static` to the
+  backend's pipeline (`PortableBackend::pipeline`). Write the layout with plain ops, as the C
+  backend's `c-pack-weights` does, so `outline-static` moves the work to load time and the
+  interpreter checks the pass ([ptir/passes.md](ptir/passes.md)).
+- The kernel computes what the `Eval` impls of the ops it covers compute. Torch parity checks its
+  numbers.
 
 ## Implement a new backend
 
@@ -159,31 +167,24 @@ Steps:
 
 1. Create a new crate `crates/gpt-rs-backend-<name>`.
 2. Implement `PortableBackend` in your backend type.
-   - The contract is defined in [crates/gpt-rs/src/backend/spec.rs](../crates/gpt-rs/src/backend/spec.rs)
-     (and summarized in [docs/backend.md](backend.md)).
-3. Optional but recommended:
-   - `PortableBackend::pipeline()` to inject legalization/fusion passes.
-   - `PortableBackend::param_resolver()` to cache derived param representations keyed by stable ids.
-4. Wire it into `gpt-rs-cli`:
-   - Extend the `--backend` match in `crates/gpt-rs-cli/src/main.rs`.
+   - The trait is in [crates/gpt-rs/src/backend/mod.rs](../crates/gpt-rs/src/backend/mod.rs), and
+     [backends/README.md](backends/README.md) describes what a backend compiles and runs.
+   - A backend without a kernel for an op can run it on the interpreter
+     (`gpt_rs_ir::interp::eval_inst`), as faer does.
+3. Optional: `PortableBackend::pipeline()` to add passes, such as a layout pass before
+   `outline-static`.
+4. Make it loadable by name: add it, behind a feature, to `load_model` in
+   `crates/gpt-rs-backends/src/lib.rs`, which the CLI and the Python bindings both call.
+5. Add `tests/backend_suite.rs` with `define_backend_tests!` for Torch parity, and the backend to
+   `backends()` in `crates/gpt-rs-docs/src/main.rs`, so the reference lists its pipeline.
 
-## Parameter identity + streaming (why it is flexible)
+## Parameter identity
 
-Key types live in `crates/gpt-rs/src/params.rs`:
-
-- `BaseParamId(u128)`: deterministic hash of the parameter name (`base_param_id("a.b.weight")`).
-- `ModelNamespaceId(u128)`: runtime-assigned namespace so multiple models can coexist without collisions.
-- `ParamKey(u128)`: stable key derived from `(namespace, base_id)`; used for caches and resolvers.
-- `ParamSource<B>`: random-access source that can load a backend handle by `BaseParamId`.
-
-What makes it "streaming":
-
-- With weight streaming on (`LoadOptions.runtime.weight_streaming`),
-  `runtime::load_model_with_options` builds `DeviceTensor::lazy_param(...)` handles for checkpoint
-  weights.
-- The underlying `ParamSource` (e.g. checkpoint reader) only loads a tensor when the backend needs it.
-- Backends can cache derived formats (packed weights, layouts) in `PortableBackend::param_resolver()`,
-  keyed by the stable param id, without leaking backend-specific code into models.
+The loader binds each checkpoint tensor the model reads under the `ParamKey` of its name in the
+model's namespace ([runtime.md](runtime.md#parameter-identity)).
+A backend's passes can derive formats (packed weights, layouts) from parameters. `outline-static`
+moves that work into load-time functions, which run once, and the backend's parameter store keeps
+their results, without backend-specific code in models.
 
 ## Layouts (NCHW vs NHWC)
 
@@ -194,6 +195,5 @@ gpt.rs treats layout as an explicit convention in shapes:
 
 Why this is low-friction:
 
-- Layout conversion is just `transpose(...)` in the same lazy graph, so backends can:
-  - fuse/absorb transposes into kernels via optimizer passes, or
-  - execute them as explicit ops when needed.
+- Layout conversion is just `transpose(...)` in the same lazy graph: `canonicalize` merges and
+  removes transposes, a backend's kernels cover others, and the rest run as ops.

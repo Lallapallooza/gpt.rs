@@ -1,0 +1,13 @@
+// RUN: parse
+
+// ERROR: 2:38: bad dimension `{}` in tensor type
+func.func @braces(%0: tensor<{}x3xf32>) -> tensor<{}x3xf32> {
+  func.return(%0) : (tensor<{}x3xf32>) -> ()
+}
+
+// -----
+
+// ERROR: 2:34: bad dimension `+3` in tensor type
+func.func @plus(%0: tensor<+3xf32>) -> tensor<+3xf32> {
+  func.return(%0) : (tensor<+3xf32>) -> ()
+}

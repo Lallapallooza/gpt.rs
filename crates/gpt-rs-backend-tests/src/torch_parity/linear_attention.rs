@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use gpt_rs::backend::spec::PortableBackend;
+use gpt_rs::backend::PortableBackend;
 use gpt_rs::ops::functional;
 use tch::{Kind, Tensor as TchTensor};
 
@@ -58,8 +58,7 @@ fn run_conv_case<B: PortableBackend + 'static>(
             &device_tensor_from_data(backend, &[seq, channels], &x),
             &device_tensor_from_data(backend, &[kernel - 1, channels], &state),
             &device_tensor_from_data(backend, &[channels, kernel], &weight),
-        )
-        .unwrap();
+        );
         (to_host_vec(&res.output), to_host_vec(&res.state))
     });
     assert_close(&expected_out, &actual_out);
@@ -228,8 +227,7 @@ fn run_delta_rule_case<B: PortableBackend + 'static>(backend: &Arc<B>, inputs: D
             &device_tensor_from_data(backend, &[seq, value_heads], &inputs.g),
             &device_tensor_from_data(backend, &[seq, value_heads], &inputs.beta),
             &device_tensor_from_data(backend, &[value_heads, key_dim, value_dim], &inputs.state),
-        )
-        .unwrap();
+        );
         (to_host_vec(&res.output), to_host_vec(&res.state))
     });
     assert_close(&expected_out, &actual_out);

@@ -3,12 +3,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use gpt_rs::backend::spec::PortableBackend;
+use gpt_rs::backend::PortableBackend;
 use gpt_rs::nn::layers::{Embedding, LayerNorm, Linear, RmsNorm, RmsNormConfig};
-use gpt_rs::tensor::{DeviceTensor, Shape, Tensor};
+use gpt_rs::tensor::{DeviceTensor, HostTensor};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::Deserialize;
 use tch::Tensor as TchTensor;
+
+pub use crate::panic_message;
 
 use super::harness;
 pub use crate::load_layer;
@@ -253,12 +255,33 @@ pub fn random_vec_nonzero(rng: &mut StdRng, len: usize, min_abs: f32) -> Vec<f32
         .collect()
 }
 
+/// NaNs of both signs and with a payload, both infinities, both zeros and two finite values. The
+/// checks compare zeros without their sign, because Torch's `maximum` and `minimum` do not order
+/// -0.0 below 0.0.
+pub const SPECIAL_VALUES: [f32; 9] = [
+    f32::NAN,
+    -f32::NAN,
+    f32::from_bits(0x7fc0_1234),
+    f32::INFINITY,
+    f32::NEG_INFINITY,
+    0.0,
+    -0.0,
+    1.5,
+    -2.0,
+];
+
+pub fn special_vec(rng: &mut StdRng, len: usize) -> Vec<f32> {
+    (0..len)
+        .map(|_| SPECIAL_VALUES[rng.gen_range(0..SPECIAL_VALUES.len())])
+        .collect()
+}
+
 pub fn const_vec(len: usize, value: f32) -> Vec<f32> {
     vec![value; len]
 }
 
-pub fn tensor_from_vec(shape: &[usize], data: Vec<f32>) -> Tensor {
-    Tensor::from_vec(Shape::new(shape.to_vec()), data).unwrap()
+pub fn tensor_from_vec(shape: &[usize], data: Vec<f32>) -> HostTensor {
+    HostTensor::f32(shape, data).unwrap()
 }
 
 pub fn device_tensor_from_data<B: PortableBackend + 'static>(
@@ -269,13 +292,14 @@ pub fn device_tensor_from_data<B: PortableBackend + 'static>(
     DeviceTensor::from_host(Arc::clone(backend), tensor_from_vec(shape, data.to_vec())).unwrap()
 }
 
-/// `[0, position, 0]`: the KV-cache write offset of `functional::attention_kv_cache`.
-pub fn kv_cache_update_starts<B: PortableBackend + 'static>(
+/// The token positions `positions` as an `si32` tensor.
+pub fn positions_tensor<B: PortableBackend + 'static>(
     backend: &Arc<B>,
-    position: usize,
+    positions: std::ops::Range<usize>,
 ) -> DeviceTensor<B> {
-    let starts = Tensor::from_i32(Shape::new([3]), vec![0, position as i32, 0]).unwrap();
-    DeviceTensor::from_host(Arc::clone(backend), starts).unwrap()
+    let positions: Vec<i32> = positions.map(|p| p as i32).collect();
+    let host = HostTensor::si32([positions.len()], positions).unwrap();
+    DeviceTensor::from_host(Arc::clone(backend), host).unwrap()
 }
 
 pub fn tch_tensor_from_vec(shape: &[usize], data: &[f32]) -> TchTensor {
@@ -291,27 +315,26 @@ pub fn tensor_to_vec(tensor: &TchTensor) -> Vec<f32> {
 }
 
 pub fn to_host_vec<B: PortableBackend + 'static>(tensor: &DeviceTensor<B>) -> Vec<f32> {
-    tensor.to_host().unwrap().data().to_vec()
+    tensor.to_host().unwrap().as_f32().unwrap().to_vec()
 }
 
 pub fn assert_close(expected: &[f32], actual: &[f32]) {
-    assert_eq!(expected.len(), actual.len());
     let resolved = resolve_tolerance();
-    let atol = resolved.atol;
-    let rtol = resolved.rtol;
-    for (idx, (&e, &a)) in expected.iter().zip(actual.iter()).enumerate() {
-        let diff = (e as f64 - a as f64).abs();
-        let thresh = atol + rtol * e.abs().max(a.abs()) as f64;
-        assert!(
-            diff <= thresh,
-            "value mismatch at index {idx}: expected {e}, actual {a}, diff {diff}, thresh {thresh}"
-        );
-    }
+    assert_close_tol(expected, actual, resolved.atol, resolved.rtol);
 }
 
+/// NaN and the infinities match only themselves, so a NaN of any sign or payload must appear
+/// exactly where `expected` has one.
 pub fn assert_close_tol(expected: &[f32], actual: &[f32], atol: f64, rtol: f64) {
     assert_eq!(expected.len(), actual.len());
     for (idx, (&e, &a)) in expected.iter().zip(actual.iter()).enumerate() {
+        if !e.is_finite() || !a.is_finite() {
+            assert!(
+                e == a || (e.is_nan() && a.is_nan()),
+                "value mismatch at index {idx}: expected {e}, actual {a}"
+            );
+            continue;
+        }
         let diff = (e as f64 - a as f64).abs();
         let thresh = atol + rtol * e.abs().max(a.abs()) as f64;
         assert!(
@@ -333,8 +356,8 @@ pub fn timed_gpt<T, F: FnOnce() -> T>(f: F) -> T {
 pub struct HostLinear {
     in_features: usize,
     out_features: usize,
-    weight: Tensor,
-    bias: Option<Tensor>,
+    weight: HostTensor,
+    bias: Option<HostTensor>,
 }
 
 impl HostLinear {
@@ -352,7 +375,7 @@ impl HostLinear {
         }
     }
 
-    pub fn tensors(&self, prefix: &str) -> Vec<(String, Tensor)> {
+    pub fn tensors(&self, prefix: &str) -> Vec<(String, HostTensor)> {
         let weight = (format!("{prefix}.weight"), self.weight.clone());
         let bias = self
             .bias
@@ -369,12 +392,14 @@ impl HostLinear {
     }
 
     pub fn torch(&self, input: &TchTensor) -> TchTensor {
-        let weight =
-            tch_tensor_from_vec(&[self.out_features, self.in_features], self.weight.data());
+        let weight = tch_tensor_from_vec(
+            &[self.out_features, self.in_features],
+            self.weight.as_f32().unwrap(),
+        );
         let bias = self
             .bias
             .as_ref()
-            .map(|b| tch_tensor_from_vec(&[self.out_features], b.data()));
+            .map(|b| tch_tensor_from_vec(&[self.out_features], b.as_f32().unwrap()));
         input.linear(&weight, bias.as_ref())
     }
 }
@@ -383,8 +408,8 @@ impl HostLinear {
 pub struct HostConv1D {
     in_features: usize,
     out_features: usize,
-    weight: Tensor,
-    bias: Tensor,
+    weight: HostTensor,
+    bias: HostTensor,
 }
 
 impl HostConv1D {
@@ -402,7 +427,7 @@ impl HostConv1D {
         }
     }
 
-    pub fn tensors(&self, prefix: &str) -> Vec<(String, Tensor)> {
+    pub fn tensors(&self, prefix: &str) -> Vec<(String, HostTensor)> {
         vec![
             (format!("{prefix}.weight"), self.weight.clone()),
             (format!("{prefix}.bias"), self.bias.clone()),
@@ -410,16 +435,18 @@ impl HostConv1D {
     }
 
     pub fn torch(&self, input: &TchTensor) -> TchTensor {
-        let weight =
-            tch_tensor_from_vec(&[self.in_features, self.out_features], self.weight.data());
-        let bias = tch_tensor_from_vec(&[self.out_features], self.bias.data());
+        let weight = tch_tensor_from_vec(
+            &[self.in_features, self.out_features],
+            self.weight.as_f32().unwrap(),
+        );
+        let bias = tch_tensor_from_vec(&[self.out_features], self.bias.as_f32().unwrap());
         bias.addmm(input, &weight)
     }
 }
 
 pub fn embedding_layer<B: PortableBackend + 'static>(
     backend: &Arc<B>,
-    weight: Tensor,
+    weight: HostTensor,
 ) -> Embedding<B> {
     load_layer(backend, [("embed.weight".to_string(), weight)], |p| {
         p.scoped("embed", Embedding::new)
@@ -429,8 +456,8 @@ pub fn embedding_layer<B: PortableBackend + 'static>(
 
 pub fn layer_norm_layer<B: PortableBackend + 'static>(
     backend: &Arc<B>,
-    weight: Tensor,
-    bias: Tensor,
+    weight: HostTensor,
+    bias: HostTensor,
     eps: f32,
 ) -> LayerNorm<B> {
     let tensors = [
@@ -445,7 +472,7 @@ pub fn layer_norm_layer<B: PortableBackend + 'static>(
 
 pub fn rms_norm_layer<B: PortableBackend + 'static>(
     backend: &Arc<B>,
-    weight: Tensor,
+    weight: HostTensor,
     config: RmsNormConfig,
 ) -> RmsNorm<B> {
     load_layer(backend, [("norm.weight".to_string(), weight)], |p| {

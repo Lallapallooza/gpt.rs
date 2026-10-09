@@ -12,15 +12,16 @@
 //!   `partial_rotary_factor` of each head.
 //! - Every RMSNorm except the DeltaNet output norm scales by `1 + weight`
 //!   ([`RmsNorm::unit_offset`](crate::nn::RmsNorm::unit_offset)).
-//! - The MLP is gated ([`GatedFeedForward`](crate::nn::GatedFeedForward)).
+//! - The MLP is gated ([`FeedForward`](crate::nn::FeedForward)).
 
 use anyhow::{anyhow, Result};
 
-use crate::backend::spec::PortableBackend;
-use crate::inference::decoder::{CausalDecoder, DecoderConfig, DecoderLayout, DecoderModel};
+use crate::inference::decoder::{CausalDecoder, DecoderConfig, DecoderLayout};
 use crate::nn::{
-    AttentionConfig, GatedDeltaNetConfig, MixerConfig, Params, RmsNormConfig, RopeParameters,
+    ActivationFunction, AttentionConfig, DecoderNames, GatedDeltaNetConfig, MixerConfig, MlpConfig,
+    NormConfig, RmsNormConfig, RopeParameters,
 };
+use crate::ops::functional::WeightLayout;
 
 pub const KIND: &str = "qwen3_5_text";
 
@@ -52,15 +53,17 @@ pub struct Qwen35Config {
     pub linear_key_head_dim: usize,
     pub linear_value_head_dim: usize,
     pub linear_conv_kernel_dim: usize,
+    #[serde(default = "super::silu")]
+    pub hidden_act: ActivationFunction,
     #[serde(default)]
     pub tie_word_embeddings: bool,
 }
 
+impl DecoderNames for Qwen35Config {}
+
 impl DecoderConfig for Qwen35Config {
     const KIND: &'static str = KIND;
     const BASE_MODEL_PREFIX: &'static str = "model";
-
-    type Model<B: PortableBackend + 'static> = DecoderModel<B>;
 
     fn context_length(&self) -> usize {
         self.max_position_embeddings
@@ -70,15 +73,6 @@ impl DecoderConfig for Qwen35Config {
         self.tie_word_embeddings
     }
 
-    fn base_model<B: PortableBackend + 'static>(
-        &self,
-        p: &mut Params<B>,
-    ) -> Result<DecoderModel<B>> {
-        DecoderModel::new(p, self.layout()?)
-    }
-}
-
-impl Qwen35Config {
     fn layout(&self) -> Result<DecoderLayout> {
         let norm = RmsNormConfig {
             eps: self.rms_norm_eps,
@@ -91,7 +85,6 @@ impl Qwen35Config {
             self.head_dim,
         )?
         .with_qk_norm(norm)
-        .with_rope(self.rope_parameters.rope(self.head_dim))?
         .with_output_gate();
         let linear_attention = GatedDeltaNetConfig {
             embed_dim: self.hidden_size,
@@ -121,6 +114,16 @@ impl Qwen35Config {
                 }
             })
             .collect();
-        Ok(DecoderLayout { norm, mixers })
+        Ok(DecoderLayout {
+            norm: NormConfig::Rms(norm),
+            mixers,
+            mlp: MlpConfig {
+                gated: true,
+                act: self.hidden_act,
+                weight_layout: WeightLayout::OutIn,
+            },
+            rope: Some(self.rope_parameters.rope(self.head_dim)),
+            absolute_positions: false,
+        })
     }
 }

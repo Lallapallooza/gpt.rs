@@ -1,0 +1,24 @@
+// RUN: pass fold,dce
+
+// A dynamic slice as large as its input is the input, and an update as large as its base
+// replaces it: the starts clamp to 0.
+// CHECK: func.func @whole
+// CHECK-NOT: tensor.dynamic
+// CHECK: func.return(%0, %1)
+func.func @whole(%0: tensor<2x3xf32>, %1: tensor<2x3xf32>, %2: tensor<2xsi32>) -> (tensor<2x3xf32>, tensor<2x3xf32>) {
+  %3 = tensor.dynamic_slice(%0, %2) {sizes = [2, 3]} : (tensor<2x3xf32>, tensor<2xsi32>) -> tensor<2x3xf32>
+  %4 = tensor.dynamic_update_slice(%0, %1, %2) : (tensor<2x3xf32>, tensor<2x3xf32>, tensor<2xsi32>) -> tensor<2x3xf32>
+  func.return(%3, %4) : (tensor<2x3xf32>, tensor<2x3xf32>) -> ()
+}
+
+// -----
+
+// A smaller slice or update depends on the run-time starts, so neither folds.
+// CHECK: func.func @partial
+// CHECK: tensor.dynamic_slice
+// CHECK: tensor.dynamic_update_slice
+func.func @partial(%0: tensor<4x3xf32>, %1: tensor<2x3xf32>, %2: tensor<2xsi32>) -> (tensor<2x3xf32>, tensor<4x3xf32>) {
+  %3 = tensor.dynamic_slice(%0, %2) {sizes = [2, 3]} : (tensor<4x3xf32>, tensor<2xsi32>) -> tensor<2x3xf32>
+  %4 = tensor.dynamic_update_slice(%0, %1, %2) : (tensor<4x3xf32>, tensor<2x3xf32>, tensor<2xsi32>) -> tensor<4x3xf32>
+  func.return(%3, %4) : (tensor<2x3xf32>, tensor<4x3xf32>) -> ()
+}

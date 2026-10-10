@@ -595,7 +595,7 @@ Defined by `DotGeneral` in [crates/gpt-rs-ir/src/dialects/tensor/ir/contraction.
 | Results | `output`: tensor |
 | Attributes | `batch_lhs`: `[i64]`, optional; `batch_rhs`: `[i64]`, optional; `contract_lhs`: `[i64]`; `contract_rhs`: `[i64]`; `accum`: `dtype`, optional; `out`: `dtype`, optional |
 | Effects | none |
-| Patterns | `PackGemmWeight` (`c-pack-weights`); `DropDefaultDotDtypes` (`canonicalize`); `NonNegativeDotAxes` (`canonicalize`); `MergeDotAxes` (`merge-contracted-axes`) |
+| Patterns | `PackGemmWeight` (`c-pack-weights`); `GroupedConvWeight` (`c-pack-weights`); `DropDefaultDotDtypes` (`canonicalize`); `NonNegativeDotAxes` (`canonicalize`); `MergeDotAxes` (`merge-contracted-axes`) |
 
 Example, from `filetests/tensor/roundtrip/contraction.ptir`:
 

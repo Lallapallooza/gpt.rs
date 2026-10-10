@@ -169,27 +169,48 @@ static inline void gpt_rs_c_conv2d_nhwc_f32(
     /* The kernel reads the whole weight as one K block, which it packs unless `w_packed`. */
     const float* bp = w_packed ? weight : NULL;
     const size_t panels = (c_out + GPTRS_PANEL_N - 1) / GPTRS_PANEL_N;
-    float* apack = NULL;
-    float* bpack = NULL;
-    if (!gpt_rs_get_scratch_with_capacity((size_t)GPTRS_MC * k,
-                                          bp ? 1 : panels * GPTRS_PANEL_N * k, &apack, &bpack)) {
-        abort();
-    }
     if (!bp) {
+        float* apack = NULL;
+        float* bpack = NULL;
+        if (!gpt_rs_get_scratch_with_capacity(1, panels * GPTRS_PANEL_N * k, &apack, &bpack)) {
+            abort();
+        }
         gpt_rs_pack_b_f32(weight, c_out, 1, k, c_out, bpack);
         bp = bpack;
     }
+    /*
+     * A task is a block of up to GPTRS_MC output pixels of one image times a run of whole panels
+     * of output channels. The panels split only as far as the team needs tasks. Each output sums
+     * over all of K in one task, so the split leaves every sum as the serial loop computes it.
+     */
+    const size_t m_blocks = (m + GPTRS_MC - 1) / GPTRS_MC;
+    const int parallel = n * m * c_out * k >= GPTRS_PARALLEL_MIN_WORK;
+    const size_t team = parallel ? (size_t)gpt_rs_c_team_size() : 1;
+    const size_t blocks = n * m_blocks;
+    const size_t parts =
+        GPTRS_MIN(panels, (team * GPTRS_TASKS_PER_THREAD + blocks - 1) / blocks);
     const int init_mode = bias ? GPTRS_INIT_BIAS : GPTRS_INIT_ZERO;
-    for (size_t batch = 0; batch < n; ++batch) {
-        float* out_b = out + batch * m * c_out;
-        for (size_t ic = 0; ic < m; ic += GPTRS_MC) {
-            const size_t mc = GPTRS_MIN(GPTRS_MC, m - ic);
-            gpt_rs_pack_a_conv(input, batch, in_h, in_w, c_in, out_w, k_h, k_w, stride_h,
-                               stride_w, dilation_h, dilation_w, pad_top, pad_left, 0, k, ic, mc,
-                               apack);
-            gpt_rs_compute_block(apack, bp, k * GPTRS_PANEL_N, out_b, c_out, ic, mc, 0, c_out, k,
-                                 bias, init_mode);
+    _Pragma("omp parallel for schedule(dynamic, 1) if (team > 1 && blocks * parts > 1)")
+    for (size_t task = 0; task < blocks * parts; ++task) {
+        /* Each thread packs its rows of patches into its own scratch. This call asks for a
+         * one-element second buffer, so it never reallocates the calling thread's second buffer,
+         * which holds the packed weight that the other threads read. */
+        float* apack = NULL;
+        float* unused = NULL;
+        if (!gpt_rs_get_scratch_with_capacity((size_t)GPTRS_MC * k, 1, &apack, &unused)) {
+            abort();
         }
+        const size_t part = task % parts;
+        const size_t block = task / parts;
+        const size_t batch = block / m_blocks;
+        const size_t ic = block % m_blocks * GPTRS_MC;
+        const size_t mc = GPTRS_MIN(GPTRS_MC, m - ic);
+        const size_t jc = panels * part / parts * GPTRS_PANEL_N;
+        const size_t nc = GPTRS_MIN(c_out, panels * (part + 1) / parts * GPTRS_PANEL_N) - jc;
+        gpt_rs_pack_a_conv(input, batch, in_h, in_w, c_in, out_w, k_h, k_w, stride_h, stride_w,
+                           dilation_h, dilation_w, pad_top, pad_left, 0, k, ic, mc, apack);
+        gpt_rs_compute_block(apack, bp + jc * k, k * GPTRS_PANEL_N, out + batch * m * c_out,
+                             c_out, ic, mc, jc, nc, k, bias, init_mode);
     }
 }
 #else
@@ -273,8 +294,14 @@ static inline void gpt_rs_c_conv2d_nhwc_f32(
     const int64_t dilation_h_i = (int64_t)dilation_h;
     const int64_t dilation_w_i = (int64_t)dilation_w;
 
-    for (size_t batch = 0; batch < n; ++batch) {
-        for (size_t oh = 0; oh < out_h; ++oh) {
+    /* Rows of the output split across the team. Each output sums in the same order whatever the
+     * split. */
+    const int parallel = n * out_h * out_w * c_out * k >= GPTRS_PARALLEL_MIN_WORK;
+    _Pragma("omp parallel for schedule(static) if (parallel)")
+    for (size_t row = 0; row < n * out_h; ++row) {
+        const size_t batch = row / out_h;
+        const size_t oh = row % out_h;
+        {
             const int64_t base_h = (int64_t)oh * stride_h_i - pad_top_i;
             for (size_t ow = 0; ow < out_w; ++ow) {
                 const int64_t base_w = (int64_t)ow * stride_w_i - pad_left_i;
@@ -312,3 +339,92 @@ static inline void gpt_rs_c_conv2d_nhwc_f32(
     }
 }
 #endif
+
+/*
+ * Grouped NHWC convolution padded with zeros, plus `bias` when it is not NULL. The weight is
+ * [k_h, k_w, c_in / groups, c_out]: output channel c belongs to group g = c / (c_out / groups),
+ * which reads input channels g * (c_in / groups) onward. A depthwise convolution is the case
+ * groups == c_in.
+ *
+ * Each output pixel accumulates in place, tap by tap and input channel by input channel. With one
+ * output channel per group, the innermost loop runs across the groups, so its vectors span
+ * channels as NHWC stores them. Otherwise it runs across the output channels of a group. Rows of
+ * the output split across the team, and each output sums in the same order whatever the split.
+ */
+static inline void gpt_rs_c_conv2d_grouped_nhwc_f32(
+    const float* GPTRS_RESTRICT input,
+    const float* GPTRS_RESTRICT weight,
+    const float* GPTRS_RESTRICT bias,
+    float* GPTRS_RESTRICT out,
+    size_t n,
+    size_t in_h,
+    size_t in_w,
+    size_t c_in,
+    size_t out_h,
+    size_t out_w,
+    size_t c_out,
+    size_t groups,
+    size_t k_h,
+    size_t k_w,
+    size_t stride_h,
+    size_t stride_w,
+    size_t dilation_h,
+    size_t dilation_w,
+    size_t pad_top,
+    size_t pad_left
+) {
+    if (n == 0 || out_h == 0 || out_w == 0 || c_out == 0) {
+        return;
+    }
+    const size_t cg_in = c_in / groups;
+    const size_t cg_out = c_out / groups;
+    const int parallel =
+        n * out_h * out_w * c_out * k_h * k_w * cg_in >= GPTRS_PARALLEL_MIN_WORK;
+    _Pragma("omp parallel for schedule(static) if (parallel)")
+    for (size_t row = 0; row < n * out_h; ++row) {
+        const size_t batch = row / out_h;
+        const int64_t base_h = (int64_t)(row % out_h * stride_h) - (int64_t)pad_top;
+        for (size_t ow = 0; ow < out_w; ++ow) {
+            const int64_t base_w = (int64_t)(ow * stride_w) - (int64_t)pad_left;
+            float* GPTRS_RESTRICT o = out + (row * out_w + ow) * c_out;
+            _Pragma("omp simd")
+            for (size_t c = 0; c < c_out; ++c) {
+                o[c] = bias ? bias[c] : 0.0f;
+            }
+            for (size_t kh = 0; kh < k_h; ++kh) {
+                const int64_t ih = base_h + (int64_t)(kh * dilation_h);
+                if (ih < 0 || ih >= (int64_t)in_h) {
+                    continue;
+                }
+                for (size_t kw = 0; kw < k_w; ++kw) {
+                    const int64_t iw = base_w + (int64_t)(kw * dilation_w);
+                    if (iw < 0 || iw >= (int64_t)in_w) {
+                        continue;
+                    }
+                    const float* GPTRS_RESTRICT x =
+                        input + ((batch * in_h + (size_t)ih) * in_w + (size_t)iw) * c_in;
+                    const float* GPTRS_RESTRICT w = weight + (kh * k_w + kw) * cg_in * c_out;
+                    for (size_t i = 0; i < cg_in; ++i) {
+                        const float* GPTRS_RESTRICT wi = w + i * c_out;
+                        if (cg_out == 1) {
+                            _Pragma("omp simd")
+                            for (size_t g = 0; g < groups; ++g) {
+                                o[g] += x[g * cg_in + i] * wi[g];
+                            }
+                            continue;
+                        }
+                        for (size_t g = 0; g < groups; ++g) {
+                            const float xv = x[g * cg_in + i];
+                            float* GPTRS_RESTRICT og = o + g * cg_out;
+                            const float* GPTRS_RESTRICT wg = wi + g * cg_out;
+                            _Pragma("omp simd")
+                            for (size_t j = 0; j < cg_out; ++j) {
+                                og[j] += xv * wg[j];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

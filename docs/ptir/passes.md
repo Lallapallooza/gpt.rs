@@ -289,24 +289,27 @@ The traits whose folds fire in the filetests; [tensor.md](tensor.md#traits) desc
 
 ### `c-pack-weights`
 
-Packs the weights of the dots that codegen sends to the GEMM into the GEMM's panel layout.
+Puts the weights of the dots that C kernels compute in the layout each kernel reads: GEMM
+weights in the GEMM's panels, and grouped convolution weights tap by tap.
 
-The packing is a reshape and a transpose of the weight, and the dot then contracts the packed
-weight, so the IR keeps its meaning. When the weight is static, `outline-static` moves the
-packing to load time, and the GEMM reads the packed parameter. Other weights, activations
-among them, stay unpacked, and the GEMM packs the panels it needs on each call.
+Each layout is a transpose of the weight, after a reshape for the GEMM's panels. The dot then
+contracts the weight in that layout, so the IR keeps its meaning. When the weight is static,
+`outline-static` moves the layout to load time, and the kernel reads the laid-out parameter.
+GEMM weights that are not static, activations among them, stay as they are, and the GEMM packs
+the panels it needs on each call.
 
 Defined by `PackWeights` in [crates/gpt-rs-backend-c/src/optimizer/mod.rs](../../crates/gpt-rs-backend-c/src/optimizer/mod.rs).
 
 | Statistic | |
 |---|---|
-| `packed` | GEMM weights packed into panels |
+| `packed` | weights laid out for a kernel |
 
 Patterns:
 
 | Pattern | Root | Rewrite | Fires in |
 |---|---|---|---|
 | `PackGemmWeight` | `tensor.dot_general` | Rewrites an f32 `x [.., K] . w`, which codegen sends to the GEMM (a convolution's patches among them), into `reshape(x . packed)`, where `packed` is `w` in panels of `PANEL_N` columns, `[N / PANEL_N, K, PANEL_N]`. `w` is `[K, N]` or `[N, K]`. The packed dot gives `[.., N / PANEL_N, PANEL_N]`, the same elements as `[.., N]`.<br><br>It packs only a static `w` whose packed form takes no more bytes than the parameters it is computed from, so `outline-static` moves the packing to load time. It skips a `w` whose `N` is not a multiple of `PANEL_N`, since the panels would pad it. A run-time `x` with one row, or with fewer than `LINEAR_PACK_MIN_ROWS` rows against an `[N, K]` weight, leaves `w` unpacked: the GEMM or the dot-product kernels read `w` in place. | [backend/c/pack.ptir](../../filetests/backend/c/pack.ptir), [backend/c/pipeline.ptir](../../filetests/backend/c/pipeline.ptir) |
+| `GroupedConvWeight` | `tensor.dot_general` | Lays out the weight of a grouped convolution for the grouped kernel. The dot of the patches `[N, OH, OW, KH, KW, G, C_in / G]` with the weight `[G, C_out / G, C_in / G, KH, KW]`, batched over the groups, becomes the same dot with the weight transposed to `[KH, KW, C_in / G, G, C_out / G]`, the order of `[KH, KW, C_in / G, C_out]` that the kernel reads. The result keeps its axes. `outline-static` moves the transpose of a static weight to load time. | [backend/c/pack.ptir](../../filetests/backend/c/pack.ptir) |
 
 Filetests: [backend/c/pack.ptir](../../filetests/backend/c/pack.ptir).
 

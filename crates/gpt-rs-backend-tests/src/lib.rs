@@ -192,6 +192,8 @@ macro_rules! define_backend_tests {
             parity_test!(torch_vision_conv2d_nhwc_k3_s1_p2_d2_bias_n1_h13_w13_c4_cout8, vision_ops::conv2d_nhwc_k3_s1_p2_d2_bias_n1_h13_w13_c4_cout8);
             parity_test!(torch_vision_group_conv2d_nhwc_g2_k3_s1_p1_bias_n1_h11_w11_c8_cout12, vision_ops::group_conv2d_nhwc_g2_k3_s1_p1_bias_n1_h11_w11_c8_cout12);
             parity_test!(torch_vision_depthwise_conv2d_nhwc_k5_s2_p2_n1_h15_w17_c8, vision_ops::depthwise_conv2d_nhwc_k5_s2_p2_n1_h15_w17_c8);
+            parity_test!(torch_vision_depthwise_conv2d_nhwc_k3_s1_p1_n2_h28_w28_c32, vision_ops::depthwise_conv2d_nhwc_k3_s1_p1_n2_h28_w28_c32);
+            parity_test!(torch_vision_group_conv2d_nhwc_g4_k3_s1_p1_bias_n1_h9_w9_c8_cout4, vision_ops::group_conv2d_nhwc_g4_k3_s1_p1_bias_n1_h9_w9_c8_cout4);
             parity_test!(torch_vision_max_pool2d_nhwc_w2_s2_p0_n1_h8_w8_c3, vision_ops::max_pool2d_nhwc_w2_s2_p0_n1_h8_w8_c3);
             parity_test!(torch_vision_max_pool2d_nhwc_special_values_matches_torch, vision_ops::max_pool2d_nhwc_special_values_matches_torch);
             parity_test!(torch_vision_relu6_edge_values_matches_torch, vision_ops::relu6_edge_values_matches_torch);

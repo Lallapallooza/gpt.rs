@@ -318,3 +318,61 @@ pub(super) fn emit_conv2d(
 
     Ok(())
 }
+
+/// Emits a [`Kind::GroupedConv2d`] instruction: the grouped convolution kernel on `x` and `w`,
+/// plus the bias, writing `[N, OH, OW, C_out]`.
+pub(super) fn emit_grouped_conv2d(
+    module: &mut String,
+    patches: &ExtractPatches,
+    groups: usize,
+    operands: &[Value],
+    out_info: &ValueInfo,
+    value_infos: &HashMap<Value, ValueInfo>,
+) -> Result<()> {
+    if operands.len() < 2 || operands.len() > 3 {
+        return Err(anyhow!("a convolution reads [x, w] or [x, w, bias]"));
+    }
+    let (
+        &[k_h, k_w],
+        &[stride_h, stride_w],
+        &[dilation_h, dilation_w],
+        &[(pad_top, _), (pad_left, _)],
+    ) = (
+        patches.window.as_slice(),
+        patches.strides.as_slice(),
+        patches.dilation.as_slice(),
+        patches.padding.as_slice(),
+    )
+    else {
+        return Err(anyhow!("a convolution has two spatial axes"));
+    };
+    let &[n, in_h, in_w, c_in] = dims_usize(&operand_type(&operands[0], value_infos)?)?.as_slice()
+    else {
+        return Err(anyhow!("a convolution reads an NHWC input"));
+    };
+    let &[_, out_h, out_w, c_out] = dims_usize(&out_info.ty)?.as_slice() else {
+        return Err(anyhow!("a convolution writes an NHWC result"));
+    };
+    let input = operand_expr(&operands[0], value_infos)?;
+    let weight = operand_expr(&operands[1], value_infos)?;
+    let bias = match operands.get(2) {
+        Some(bias) => format!("(const float*){}", operand_expr(bias, value_infos)?),
+        None => "NULL".to_string(),
+    };
+    let out = &out_info.var;
+    let call = format!(
+        r#"
+            gpt_rs_c_conv2d_grouped_nhwc_f32(
+              (const float*){input}, (const float*){weight}, {bias}, {out},
+              {n}, {in_h}, {in_w}, {c_in},
+              {out_h}, {out_w}, {c_out}, {groups},
+              {k_h}, {k_w},
+              {stride_h}, {stride_w},
+              {dilation_h}, {dilation_w},
+              {pad_top}, {pad_left}
+            );
+        "#
+    );
+    push_block(module, 1, &call);
+    Ok(())
+}

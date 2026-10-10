@@ -17,26 +17,33 @@ https://github.com/user-attachments/assets/4a99a79d-b98c-4b11-9f2d-64906b832ca7
 
 ## Benchmarks (early)
 
-Single-thread CPU numbers from `scripts/eval.py --workload bench --backend c` on AMD Ryzen 9 9950X3D (Linux):
+CPU numbers from `scripts/eval.py --workload bench --backend c` against Torch 2.14 in eager mode,
+on an AMD Ryzen 9 9950X3D (16 cores, Linux). Images are batch 1 at 224x224. GPT-2 generates 64
+tokens.
 
-| Workload | gpt.rs | torch | Speedup |
-| --- | ---: | ---: | ---: |
-| ResNet34 (batch=1, image=224) | 25.10 images/s | 23.32 images/s | 1.08x |
-| GPT-2 (generate 64 tokens) | 86.20 tokens/s | 49.31 tokens/s | 1.75x |
+| Workload | Threads | gpt.rs | torch | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| ResNet34 | 1 | 25.66 images/s | 24.45 images/s | 1.05x |
+| ResNet34 | 16 | 141.18 images/s | 127.01 images/s | 1.11x |
+| MobileNetV2 | 1 | 141.92 images/s | 78.36 images/s | 1.81x |
+| MobileNetV2 | 16 | 323.38 images/s | 108.71 images/s | 2.97x |
+| GPT-2 | 1 | 92.08 tokens/s | 50.46 tokens/s | 1.82x |
+| GPT-2 | 16 | 108.50 tokens/s | 49.10 tokens/s | 2.21x |
 
 Reproduce (C backend):
 ```bash
 # Build the Python extension with the C backend enabled:
 uv sync
 uv pip install maturin
-uv --project "$(pwd)" --directory "$(pwd)/crates/gpt-rs-py" run \
-  maturin develop --release --features conversion-c
+uv run python scripts/rebuild_py.py --features conversion-c
 
 # Bench (gpt.rs and Torch load the same Hugging Face checkpoints):
+for model in resnet34 mobilenet_v2; do
+  GPTRS_C_CACHE_DIR=./.cache/gpt_rs_c_backend uv run python scripts/eval.py --model "$model" \
+    --workload bench --backend c --threads 1 16 --warmup 3 --iters 30 --batch 1 --image-size 224
+done
 GPTRS_C_CACHE_DIR=./.cache/gpt_rs_c_backend uv run python scripts/eval.py \
-  --model resnet34 --workload bench --backend c --threads 1 --warmup 1 --iters 2 --batch 1 --image-size 224
-GPTRS_C_CACHE_DIR=./.cache/gpt_rs_c_backend uv run python scripts/eval.py \
-  --model gpt2 --workload bench --backend c --threads 1 --warmup 1 --iters 2 --bench-tokens 64
+  --model gpt2 --workload bench --backend c --threads 1 16 --warmup 2 --iters 5 --bench-tokens 64
 ```
 
 ## Highlights

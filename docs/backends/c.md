@@ -4,8 +4,8 @@ The C backend generates a **single C translation unit** from a function of the I
 a shared library, and runs the generated entrypoint.
 
 - The IR stays the portable source of truth (see [../ptir/tensor.md](../ptir/tensor.md)).
-- The backend's pipeline adds a pass that lays out GEMM weights for its kernels, and the backend
-  chooses its kernels as it generates C.
+- The backend's pipeline adds a pass that lays out GEMM and grouped-convolution weights for its
+  kernels, and the backend chooses its kernels as it generates C.
 - Compiled libraries are cached on disk by a fingerprint of their source, the compiler, its flags
   and the host, so repeated runs are fast.
 
@@ -55,11 +55,21 @@ At load time, `outline-static` computes the packed weight and stores it as a par
 hash of the load-time function, which names the ids of the parameters it reads, so each model gets
 its own packed weights.
 
+The same pass transposes the weight of a grouped convolution from `[G, C_out / G, C_in / G, KH, KW]`
+to `[KH, KW, C_in / G, G, C_out / G]`, the layout that the grouped kernel reads. `outline-static`
+moves this transpose to load time too.
+
 Codegen chooses the kernels ([codegen/select.rs](../../crates/gpt-rs-backend-c/src/codegen/select.rs)):
 - Convolution: a `dot_general` that contracts the last axis of `extract_patches` with a
   `[KH * KW * C_in, C_out]` weight, packed or not, runs on the conv kernel, which builds the patches
-  tile by tile and never materializes them. The kernel also covers a bias add on the channel axis
-  that follows it. That add is a conv bias or a folded BatchNorm shift.
+  tile by tile and never materializes them. With AVX-512, its tasks, blocks of output pixels by
+  runs of output channels, split across the team. The portable build splits output rows. The
+  kernel also covers a bias add on the channel axis that follows it. That add is a conv bias or a
+  folded BatchNorm shift.
+- Grouped convolution, depthwise included: the patches, the dot batched over the groups, and the
+  transpose and reshape back to `[N, OH, OW, C_out]` run on one grouped kernel. The kernel reads
+  the input and the laid-out weight in place and splits output rows across the team. It covers a
+  bias add as the conv kernel does.
 - GEMM: `reads_panels` in [codegen/emit/dot.rs](../../crates/gpt-rs-backend-c/src/codegen/emit/dot.rs)
   sends a `dot_general` over a panel weight to the packed GEMM.
 - Linear layers with bf16 or FP8 weights: `gpt_rs::ops::functional::linear_weight` matches a

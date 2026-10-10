@@ -8,21 +8,23 @@ use gpt_rs_ir::module::Module;
 use gpt_rs_ir::passes::{self, pass, Greedy, Pass, Pipeline, Rewrites};
 use gpt_rs_ir::rewrite::PatternSet;
 
-/// Packs the weights of the dots that codegen sends to the GEMM into the GEMM's panel layout.
+/// Puts the weights of the dots that C kernels compute in the layout each kernel reads: GEMM
+/// weights in the GEMM's panels, and grouped convolution weights tap by tap.
 ///
-/// The packing is a reshape and a transpose of the weight, and the dot then contracts the packed
-/// weight, so the IR keeps its meaning. When the weight is static, `outline-static` moves the
-/// packing to load time, and the GEMM reads the packed parameter. Other weights, activations
-/// among them, stay unpacked, and the GEMM packs the panels it needs on each call.
+/// Each layout is a transpose of the weight, after a reshape for the GEMM's panels. The dot then
+/// contracts the weight in that layout, so the IR keeps its meaning. When the weight is static,
+/// `outline-static` moves the layout to load time, and the kernel reads the laid-out parameter.
+/// GEMM weights that are not static, activations among them, stay as they are, and the GEMM packs
+/// the panels it needs on each call.
 #[pass(
     name = "c-pack-weights",
-    stats(packed = "GEMM weights packed into panels")
+    stats(packed = "weights laid out for a kernel")
 )]
 pub struct PackWeights;
 
-/// Adds the pattern that packs GEMM weights into panels.
+/// Adds the patterns that lay out weights for the C kernels.
 pub fn populate_weight_layout_patterns(set: &mut PatternSet) {
-    set.add(pack::PackGemmWeight);
+    set.add(pack::PackGemmWeight).add(pack::GroupedConvWeight);
 }
 
 impl Pass for PackWeights {

@@ -7,7 +7,8 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{anyhow, Result};
 use gpt_rs::ops::functional::{linear_weight, WeightLayout};
 use gpt_rs_ir::dialects::tensor::{
-    Binary, BinaryKind, BroadcastTo, Cast, DotGeneral, ExtractPatches, Reshape, Slice, Unary,
+    Binary, BinaryKind, BroadcastTo, Cast, DotGeneral, ExtractPatches, Reshape, Slice, Transpose,
+    Unary,
 };
 use gpt_rs_ir::module::{Inst, Module, Value};
 use gpt_rs_ir::types::DType;
@@ -33,7 +34,12 @@ pub(super) fn select<'m>(
     // Each kernel by the op whose result it gives.
     let mut fused: HashMap<Inst, Fused<'m>> = insts
         .iter()
-        .filter_map(|&inst| Some((inst, conv2d(module, inst).or_else(|| linear(module, inst))?)))
+        .filter_map(|&inst| {
+            let kernel = conv2d(module, inst)
+                .or_else(|| grouped_conv2d(module, inst))
+                .or_else(|| linear(module, inst))?;
+            Some((inst, kernel))
+        })
         .collect();
     for &add in insts {
         let Some((conv, bias, covers)) = bias_add(module, add, &fused) else {
@@ -139,6 +145,60 @@ fn conv2d(module: &Module, inst: Inst) -> Option<Fused<'_>> {
     })
 }
 
+/// A grouped convolution as the `conv2d` functional records it, once `c-pack-weights` has laid out
+/// its weight: `reshape(transpose(dot_general(reshape(extract_patches(x)), w)))`. The patches are
+/// `[N, OH, OW, KH, KW, G, C_in / G]` of an f32 NHWC `x` padded with zeros, `w` is
+/// `[KH, KW, C_in / G, G, C_out / G]`, the dot gives `[G, N, OH, OW, C_out / G]`, and the
+/// transpose and the reshape put that back as `[N, OH, OW, C_out]`. The grouped kernel reads `x`
+/// and `w` and writes the last.
+fn grouped_conv2d(module: &Module, inst: Inst) -> Option<Fused<'_>> {
+    let reshape = module.op_as::<Reshape>(inst)?;
+    let transpose = module.def_as::<Transpose>(reshape.operands.input)?;
+    let dot = module.def_as::<DotGeneral>(transpose.operands.input)?;
+    let patches_reshape = module.def_as::<Reshape>(dot.operands.lhs)?;
+    let patches = module.def_as::<ExtractPatches>(patches_reshape.operands.input)?;
+    let (input, weight) = (patches.operands.input, dot.operands.rhs);
+    let &[n, _, _, c_in] = f32_dims(module, input)?.as_slice() else {
+        return None;
+    };
+    let &[k_h, k_w] = patches.attrs.window.as_slice() else {
+        return None;
+    };
+    let &[w_h, w_w, group_in, groups, group_out] = f32_dims(module, weight)?.as_slice() else {
+        return None;
+    };
+    let &[out_n, out_h, out_w, c_out] = f32_dims(module, reshape.results.output)?.as_slice() else {
+        return None;
+    };
+    let attrs = &dot.attrs;
+    let shapes = [w_h, w_w] == [k_h, k_w]
+        && groups * group_in == c_in
+        && groups * group_out == c_out
+        && out_n == n
+        && f32_dims(module, patches_reshape.results.output)?
+            == [n, out_h, out_w, k_h, k_w, groups, group_in];
+    let axes = attrs.batch_lhs[..] == [5]
+        && attrs.batch_rhs[..] == [3]
+        && attrs.contract_lhs[..] == [3, 4, 6]
+        && attrs.contract_rhs[..] == [0, 1, 2]
+        && attrs.accum.is_none()
+        && attrs.out.is_none()
+        && transpose.attrs.perm[..] == [1, 2, 3, 0, 4];
+    let zero_padded = patches.attrs.pad_value.0 == 0.0;
+    (shapes && axes && zero_padded).then(|| Fused {
+        instruction: Instruction {
+            kind: Kind::GroupedConv2d {
+                patches: patches.attrs.clone(),
+                groups,
+            },
+            operands: vec![input, weight],
+            results: vec![reshape.results.output],
+            label: gpt_rs::profiling::intern_label("backend.c.grouped_conv2d"),
+        },
+        covers: vec![patches.inst, patches_reshape.inst, dot.inst, transpose.inst],
+    })
+}
+
 /// A projection in the PyTorch layout `x [M, K] . w [N, K]` whose weight a C linear kernel reads
 /// as stored: through its casts, and with the scale of an FP8 weight.
 fn linear(module: &Module, inst: Inst) -> Option<Fused<'_>> {
@@ -162,9 +222,9 @@ fn linear(module: &Module, inst: Inst) -> Option<Fused<'_>> {
     })
 }
 
-/// Matches `add` as a bias add on the result of a convolution kernel: one f32 value per output
-/// channel. Returns the kernel, the bias, and the ops between them: the broadcast of the bias, and
-/// the reshape of a result in panels. The kernel's result has no other reader.
+/// Matches `add` as a bias add on the result of a convolution kernel, dense or grouped: one f32
+/// value per output channel. Returns the kernel, the bias, and the ops between them: the broadcast
+/// of the bias, and the reshape of a result in panels. The kernel's result has no other reader.
 fn bias_add(
     module: &Module,
     add: Inst,
@@ -175,11 +235,14 @@ fn bias_add(
         return None;
     }
     let is_conv = |inst: Inst| {
-        matches!(
-            fused.get(&inst),
-            Some(Fused { instruction: Instruction { kind: Kind::Conv2d(_), operands, .. }, .. })
-                if operands.len() == 2
-        )
+        let Some(Fused { instruction, .. }) = fused.get(&inst) else {
+            return false;
+        };
+        let conv = matches!(
+            instruction.kind,
+            Kind::Conv2d(_) | Kind::GroupedConv2d { .. }
+        );
+        conv && instruction.operands.len() == 2
     };
     let single_use = |value: Value| module.uses(value).len() == 1;
     // The convolution behind `value`, and the reshape between them.

@@ -71,6 +71,19 @@ fn emit_instruction(inst: &Instruction<'_>, ctx: &mut EmitContext<'_>) -> Result
             )?;
             Ok(op_id)
         }
+        Kind::GroupedConv2d { patches, groups } => {
+            let op_id = register_kernel(inst, ctx)?;
+            let out_info = output_info(ctx.value_infos, inst.result())?;
+            conv::emit_grouped_conv2d(
+                ctx.module,
+                patches,
+                *groups,
+                &inst.operands,
+                out_info,
+                ctx.value_infos,
+            )?;
+            Ok(op_id)
+        }
         Kind::Elementwise(chain) => {
             let op_id = register_kernel(inst, ctx)?;
             let out_info = output_info(ctx.value_infos, inst.result())?;

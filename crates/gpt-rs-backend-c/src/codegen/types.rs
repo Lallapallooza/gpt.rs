@@ -51,6 +51,12 @@ pub(super) enum Kind<'m> {
     /// An NHWC f32 convolution with these patches. Operands `[x, w]` or `[x, w, bias]`, where `w`
     /// is `[KH * KW * C_in, C_out]` or in the GEMM's panels `[C_out / PANEL_N, K, PANEL_N]`.
     Conv2d(ExtractPatches),
+    /// An NHWC f32 convolution in `groups` groups with these patches. Operands `[x, w]` or
+    /// `[x, w, bias]`, where `w` is `[KH, KW, C_in / groups, groups, C_out / groups]`.
+    GroupedConv2d {
+        patches: ExtractPatches,
+        groups: usize,
+    },
     /// A projection `x [M, K] . w [N, K]` that reads `w` as stored. Operands `[x, w]` or
     /// `[x, w, s]`, where `s` is the one-element scale of an FP8 `w`.
     Linear,

@@ -892,6 +892,46 @@ pub fn depthwise_conv2d_nhwc_k5_s2_p2_n1_h15_w17_c8<B: PortableBackend + 'static
     );
 }
 
+pub fn depthwise_conv2d_nhwc_k3_s1_p1_n2_h28_w28_c32<B: PortableBackend + 'static>(
+    backend: &Arc<B>,
+) {
+    run_conv2d_case(
+        backend,
+        2,
+        28,
+        28,
+        32,
+        32,
+        [3, 3],
+        [1, 1],
+        Padding2d::uniform(1),
+        [1, 1],
+        32,
+        true,
+        309,
+    );
+}
+
+pub fn group_conv2d_nhwc_g4_k3_s1_p1_bias_n1_h9_w9_c8_cout4<B: PortableBackend + 'static>(
+    backend: &Arc<B>,
+) {
+    run_conv2d_case(
+        backend,
+        1,
+        9,
+        9,
+        8,
+        4,
+        [3, 3],
+        [1, 1],
+        Padding2d::uniform(1),
+        [1, 1],
+        4,
+        true,
+        310,
+    );
+}
+
 pub fn max_pool2d_nhwc_w2_s2_p0_n1_h8_w8_c3<B: PortableBackend + 'static>(backend: &Arc<B>) {
     run_max_pool_case(
         backend,

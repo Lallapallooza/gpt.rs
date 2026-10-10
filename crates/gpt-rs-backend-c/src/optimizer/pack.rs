@@ -1,9 +1,10 @@
-//! The pattern of `c-pack-weights`: a GEMM weight packed into the panel layout of the C GEMM.
+//! The patterns of `c-pack-weights`: the weights of the dots that C kernels compute, put in the
+//! layout each kernel reads.
 
 use std::collections::HashSet;
 
 use anyhow::Result;
-use gpt_rs_ir::dialects::tensor::{DotGeneral, Reshape, Transpose};
+use gpt_rs_ir::dialects::tensor::{DotGeneral, ExtractPatches, Reshape, Transpose};
 use gpt_rs_ir::module::{Inst, Module, Value, ValueDef};
 use gpt_rs_ir::op::Matched;
 use gpt_rs_ir::rewrite::{pattern, Pattern, Rewriter};
@@ -138,4 +139,45 @@ fn fits_parameters(module: &Module, w: Value) -> bool {
     params
         .zip(bytes(w))
         .is_some_and(|(have, need)| need <= have)
+}
+
+/// Lays out the weight of a grouped convolution for the grouped kernel. The dot of the patches
+/// `[N, OH, OW, KH, KW, G, C_in / G]` with the weight `[G, C_out / G, C_in / G, KH, KW]`, batched
+/// over the groups, becomes the same dot with the weight transposed to
+/// `[KH, KW, C_in / G, G, C_out / G]`, the order of `[KH, KW, C_in / G, C_out]` that the kernel
+/// reads. The result keeps its axes. `outline-static` moves the transpose of a static weight to
+/// load time.
+#[pattern]
+pub(super) struct GroupedConvWeight;
+
+impl Pattern for GroupedConvWeight {
+    type Root = DotGeneral;
+
+    fn rewrite(&self, dot: Matched<DotGeneral>, rw: &mut Rewriter<'_>) -> Result<bool> {
+        let attrs = &dot.attrs;
+        let grouped = attrs.batch_lhs[..] == [5]
+            && attrs.batch_rhs[..] == [0]
+            && attrs.contract_lhs[..] == [3, 4, 6]
+            && attrs.contract_rhs[..] == [3, 4, 2];
+        let (lhs, rhs) = (dot.operands.lhs, dot.operands.rhs);
+        let from_patches = rw.def_as::<Reshape>(lhs).is_some_and(|reshape| {
+            rw.def_as::<ExtractPatches>(reshape.operands.input)
+                .is_some()
+        });
+        let weight = f32_dims(rw.module, rhs).is_some_and(|dims| dims.len() == 5);
+        if !grouped || !from_patches || !weight {
+            return Ok(false);
+        }
+        let at = dot.inst;
+        let perm = [3, 4, 2, 0, 1].into_iter().collect();
+        let w = rw.insert_before(at, Transpose { perm }, rhs)?.output;
+        let laid_out = DotGeneral {
+            batch_rhs: [3].into_iter().collect(),
+            contract_rhs: [0, 1, 2].into_iter().collect(),
+            ..attrs.clone()
+        };
+        let out = rw.insert_before(at, laid_out, (lhs, w))?.output;
+        rw.replace(at, &[out])?;
+        Ok(true)
+    }
 }

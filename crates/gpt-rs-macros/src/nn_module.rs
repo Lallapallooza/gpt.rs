@@ -102,7 +102,9 @@ pub(crate) struct TensorSugar;
 impl VisitMut for TensorSugar {
     fn visit_type_mut(&mut self, ty: &mut Type) {
         if is_bare(ty, "Tensor") {
-            *ty = parse_quote!(::gpt_rs::tensor::DeviceTensor<B>);
+            // `DeviceTensor` takes the position of `Tensor`, so the IDE resolves `Tensor` to it.
+            let device = syn::Ident::new("DeviceTensor", ty.span());
+            *ty = parse_quote!(::gpt_rs::tensor::#device<B>);
             return;
         }
         visit_mut::visit_type_mut(self, ty);

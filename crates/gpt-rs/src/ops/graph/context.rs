@@ -26,9 +26,8 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use crate::backend::PortableBackend;
-
 use super::GraphArena;
+use crate::backend::PortableBackend;
 
 thread_local! {
     static ARENA_STACK: RefCell<Vec<Arc<dyn Any + Send + Sync>>> = RefCell::new(Vec::new());

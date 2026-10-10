@@ -3,12 +3,13 @@
 
 use std::marker::PhantomData;
 
+use anyhow::Result;
+
 use super::activation::{Activation, ActivationFunction};
 use super::linear::Linear;
 use super::names::DecoderNames;
 use crate::nn::{self, Params};
 use crate::ops::functional::WeightLayout;
-use anyhow::Result;
 
 /// How a [`FeedForward`] computes.
 #[derive(Debug, Clone, Copy, PartialEq)]

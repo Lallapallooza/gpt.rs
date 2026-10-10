@@ -7,9 +7,6 @@
 mod report;
 mod trace;
 
-pub use report::*;
-pub use trace::*;
-
 #[cfg(feature = "profiler")]
 use std::cell::Cell;
 #[cfg(feature = "profiler")]
@@ -28,6 +25,9 @@ use std::time::Instant;
 
 #[cfg(feature = "profiler")]
 use serde::{Deserialize, Serialize};
+
+pub use self::report::*;
+pub use self::trace::*;
 
 #[cfg_attr(not(feature = "profiler"), allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

@@ -1,11 +1,12 @@
 //! Lazy tensor handles that delay backend materialization until required.
 
-use crate::backend::PortableBackend;
-use crate::ops::graph::GraphArena;
-use crate::ops::graph::ValueId;
-use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+
+use crate::backend::PortableBackend;
+use crate::ops::graph::{GraphArena, ValueId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum InputRole {

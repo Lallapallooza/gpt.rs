@@ -4,4 +4,4 @@ mod interp;
 mod ir;
 pub(crate) mod passes;
 
-pub use ir::*;
+pub use self::ir::*;

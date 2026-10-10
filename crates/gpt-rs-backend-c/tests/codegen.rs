@@ -2,10 +2,13 @@
 //! `generate_c_module` writes (`gpt-rs-cli convert`). The C backend's passes have filetests under
 //! `filetests/backend/c/`.
 
+use std::sync::Arc;
+
 use gpt_rs::backend::{ParamStore, PortableBackend};
 use gpt_rs::module::Layer;
 use gpt_rs::nn::layers::Linear;
-use gpt_rs::ops::graph::{context::with_default_arena, GraphArena};
+use gpt_rs::ops::graph::context::with_default_arena;
+use gpt_rs::ops::graph::GraphArena;
 use gpt_rs::tensor::{DType, DeviceTensor, HostTensor};
 use gpt_rs_backend_c::{generate_c_module, CBackend};
 use gpt_rs_backend_tests::recording_backend::RecordingBackend;
@@ -13,7 +16,6 @@ use gpt_rs_backend_tests::{load_layer, tensor_as};
 use gpt_rs_ir::module::Module;
 use gpt_rs_ir::passes::Pipeline;
 use gpt_rs_ir::types::TensorType;
-use std::sync::Arc;
 
 /// Records the programs the graph arena runs, which it compiles with the C backend's pipeline.
 #[derive(Default)]

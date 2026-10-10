@@ -12,6 +12,12 @@ uv run --extra dev pre-commit install         # run the checks on every commit
 uv run --extra dev pre-commit run --all-files # run them on the whole tree
 ```
 
+The `cargo-fmt` hook runs the nightly rustfmt that it names, since only nightly applies the import
+options of `rustfmt.toml`: it groups and merges imports. Install that nightly once, with the date
+from the hook's `RUSTUP_TOOLCHAIN`:
+`rustup toolchain install --profile minimal --component rustfmt nightly-<date>`. rustfmt groups a
+bare module path with the external crates, so import a child module as `self::<module>::`.
+
 ## Environment variables
 
 Common:

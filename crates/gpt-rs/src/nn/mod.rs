@@ -12,5 +12,6 @@ pub mod layers;
 pub mod params;
 
 pub use gpt_rs_macros::module;
-pub use layers::*;
-pub use params::Params;
+
+pub use self::layers::*;
+pub use self::params::Params;

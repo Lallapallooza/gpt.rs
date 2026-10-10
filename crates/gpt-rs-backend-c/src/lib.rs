@@ -3,10 +3,8 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc, LazyLock, Mutex, OnceLock,
-};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, ensure, Result};
@@ -26,7 +24,7 @@ mod kernels;
 mod optimizer;
 mod targets;
 
-pub use codegen::generate_c_module;
+pub use self::codegen::generate_c_module;
 
 #[derive(Default)]
 pub struct CBackend {

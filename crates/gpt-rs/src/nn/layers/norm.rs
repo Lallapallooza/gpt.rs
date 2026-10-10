@@ -1,9 +1,10 @@
 //! The norm of a decoder: layer or RMS normalization, under the name of the field that holds it.
 
+use anyhow::Result;
+
 use super::layer_norm::LayerNorm;
 use super::rms_norm::{RmsNorm, RmsNormConfig};
 use crate::nn::{self, Params};
-use anyhow::Result;
 
 /// Which norm a [`Norm`] is.
 #[derive(Debug, Clone, Copy, PartialEq)]

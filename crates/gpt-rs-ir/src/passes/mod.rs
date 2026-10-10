@@ -9,22 +9,21 @@ mod registry;
 mod stats;
 
 use anyhow::{anyhow, Context, Result};
+pub use gpt_rs_ir_macros::pass;
 
+pub use self::canonicalize::{Canonicalize, Dce, Fold};
+pub use self::cse::Cse;
+pub use self::greedy::{Greedy, GreedyReport, Rewrites};
+pub use self::outline_static::OutlineStatic;
+pub use self::prune_params::PruneParams;
+pub use self::registry::{parse, registered, OptionInfo, PassEntry, StatInfo, PASSES};
+pub use self::stats::{take_stats, Stat};
 pub use crate::dialects::tensor::passes::{
     populate_dot_scale_patterns, populate_merge_dot_axes_patterns, DotScaleFold,
     MergeContractedAxes,
 };
 use crate::module::Module;
 use crate::verify::verify;
-
-pub use canonicalize::{Canonicalize, Dce, Fold};
-pub use cse::Cse;
-pub use gpt_rs_ir_macros::pass;
-pub use greedy::{Greedy, GreedyReport, Rewrites};
-pub use outline_static::OutlineStatic;
-pub use prune_params::PruneParams;
-pub use registry::{parse, registered, OptionInfo, PassEntry, StatInfo, PASSES};
-pub use stats::{take_stats, Stat};
 
 /// A transformation of a module. `#[pass]` on the struct implements `Registered`.
 pub trait Pass: Registered {

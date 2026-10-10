@@ -5,4 +5,4 @@ pub mod functional;
 pub mod graph;
 pub mod trace;
 
-pub use functional::*;
+pub use self::functional::*;

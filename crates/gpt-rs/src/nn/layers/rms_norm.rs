@@ -1,8 +1,9 @@
 //! RMS normalization built on [`functional::rms_norm`].
 
+use anyhow::Result;
+
 use crate::nn::{self, Params};
 use crate::ops::functional;
-use anyhow::Result;
 
 /// Epsilon and scale convention of an [`RmsNorm`].
 #[derive(Debug, Clone, Copy, PartialEq)]

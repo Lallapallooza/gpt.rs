@@ -4,15 +4,17 @@
 //! tokens such as `<|im_start|>` matched verbatim. At load time, the tokenizer rejects a Hugging
 //! Face `tokenizer.json` that uses options outside this scheme.
 
-use super::bpe::{get_pairs, BpeMerges};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use aho_corasick::{AhoCorasick, MatchKind};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use fancy_regex::Regex;
 use serde::Deserialize;
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::sync::Mutex;
 use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
+
+use super::bpe::{get_pairs, BpeMerges};
 
 /// Regular expression used by GPT-2 to chunk input text prior to BPE merges.
 const GPT2_PATTERN: &str =

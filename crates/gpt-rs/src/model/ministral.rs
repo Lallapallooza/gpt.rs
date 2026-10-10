@@ -9,13 +9,14 @@
 //! ([`RotaryEmbedding`](crate::nn::RotaryEmbedding), optionally linear or YaRN scaled) and a gated
 //! MLP ([`FeedForward`](crate::nn::FeedForward)). The model has no biases.
 
+use anyhow::Result;
+
 use crate::inference::decoder::{CausalDecoder, DecoderConfig, DecoderLayout};
 use crate::nn::{
     ActivationFunction, AttentionConfig, DecoderNames, MixerConfig, MlpConfig, NormConfig,
     RmsNormConfig, RopeParameters,
 };
 use crate::ops::functional::WeightLayout;
-use anyhow::Result;
 
 pub const KIND: &str = "ministral3";
 

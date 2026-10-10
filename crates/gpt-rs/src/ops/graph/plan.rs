@@ -6,12 +6,11 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use lru::LruCache;
-use once_cell::sync::Lazy;
-
 use gpt_rs_ir::module::Module;
 use gpt_rs_ir::types::TensorType;
 use gpt_rs_ir::Op;
+use lru::LruCache;
+use once_cell::sync::Lazy;
 
 use crate::ops::graph::ValueId;
 use crate::tensor::InputRole;

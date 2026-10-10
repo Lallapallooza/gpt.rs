@@ -1,21 +1,19 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::PathBuf;
-use std::process;
-use std::sync::{Arc, Mutex, Once, OnceLock};
-use std::time::{Duration, Instant};
-use std::time::{SystemTime, UNIX_EPOCH};
-
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{env, process};
 
 use gpt_rs::backend::PortableBackend;
 use gpt_rs::gpt_rs_ir::module::Module;
-use gpt_rs::ops::graph::{context::with_default_arena, GraphArena};
+use gpt_rs::ops::graph::context::with_default_arena;
+use gpt_rs::ops::graph::GraphArena;
 use gpt_rs::ops::trace::{self, ExecutionTraceSink, ProgramContext, ProgramStats, TraceGuard};
 
 use super::common;

@@ -46,7 +46,7 @@ use gpt_rs_ir::module::Module;
 use gpt_rs_ir::passes::{self, Pipeline};
 use gpt_rs_ir::verify::verify;
 
-pub use differential::{bits_eq, random_value, rotation, run_dims, Specials, ROUNDS};
+pub use self::differential::{bits_eq, random_value, rotation, run_dims, Specials, ROUNDS};
 
 /// The `filetests/` directory at the repository root.
 pub fn filetests_root() -> PathBuf {

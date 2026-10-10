@@ -6,15 +6,12 @@
 
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Mutex, RwLock,
-};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
-use serde::Serialize;
-
 use gpt_rs_ir::module::Module;
+use serde::Serialize;
 
 use crate::ops::graph::ValueId;
 

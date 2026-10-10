@@ -11,12 +11,11 @@ use gpt_rs_ir::op::{InOp, OpDyn};
 use gpt_rs_ir::types::{DType, Dim, TensorType, Type};
 use smallvec::SmallVec;
 
+use super::arena::GraphArena;
+use super::state::{GraphInner, NodeState, OpRecord, ScalarKey, ValueDef, ValueRecord};
 use crate::backend::PortableBackend;
 use crate::ops::graph::ValueId;
 use crate::tensor::{DeviceTensor, LazyHandle, Materialized};
-
-use super::arena::GraphArena;
-use super::state::{GraphInner, NodeState, OpRecord, ScalarKey, ValueDef, ValueRecord};
 
 /// An empty module. The type rules of ops without regions take a module but read none of it.
 fn empty_module() -> &'static Module {

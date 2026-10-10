@@ -2,9 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
-use pyo3::prelude::*;
-
 use gpt_rs::ops::trace::{self, FileTraceOptions, FileTraceSink, ProgramDumpFilter};
+use pyo3::prelude::*;
 
 static TRACE_GUARD: OnceLock<Mutex<Option<trace::TraceGuard>>> = OnceLock::new();
 

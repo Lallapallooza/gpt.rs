@@ -1,14 +1,15 @@
 //! Semantics of the ops in `ir/indexing.rs`.
 
-use crate::dialects::tensor::ir::shape::{axis_index, check_size};
-
 use std::borrow::Cow;
+
+use anyhow::{anyhow, bail, Result};
 
 use super::elementwise::{int_format, Arith};
 use super::kernels::{
     cast, from_ints, from_values, gather_elements, rounder, strides, unravel, values, Chunks,
     Values,
 };
+use crate::dialects::tensor::ir::shape::{axis_index, check_size};
 use crate::dialects::tensor::ir::{
     BinaryKind, DynamicSlice, DynamicSliceOperands, DynamicSliceResults, DynamicUpdateSlice,
     DynamicUpdateSliceOperands, DynamicUpdateSliceResults, Gather, GatherOperands, GatherResults,
@@ -18,7 +19,6 @@ use crate::dialects::tensor::ir::{
 use crate::host::HostTensor;
 use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
 use crate::types::DType;
-use anyhow::{anyhow, bail, Result};
 
 impl Eval for Iota {
     fn eval(

@@ -1,16 +1,17 @@
 //! Device-side tensor wrapper that tracks backend handles and shape metadata.
 
-use super::lazy_tensor::{InputRole, Materialized};
-use super::{lazy_tensor::LazyHandle, shape::Shape, DType, HostTensor};
-use anyhow::Result;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::backend::PortableBackend;
-use crate::ops::graph::GraphArena;
-use crate::ops::graph::ValueId;
+use anyhow::Result;
 use gpt_rs_ir::types::TensorType;
+
+use super::lazy_tensor::{InputRole, LazyHandle, Materialized};
+use super::shape::Shape;
+use super::{DType, HostTensor};
+use crate::backend::PortableBackend;
+use crate::ops::graph::{GraphArena, ValueId};
 
 type ArenaGroup<B> = (Arc<GraphArena<B>>, Vec<(usize, ValueId)>);
 

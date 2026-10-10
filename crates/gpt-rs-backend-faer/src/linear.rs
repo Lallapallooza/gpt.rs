@@ -23,9 +23,9 @@ use gpt_rs::ops::functional::WeightLayout;
 use gpt_rs_ir::float8::F8E4M3;
 use gpt_rs_ir::host::{Buffer, HostTensor, TensorData};
 use gpt_rs_ir::types::{DType, TensorType};
+use half::bf16;
 
 use crate::{dims_of, output_tensor};
-use half::bf16;
 
 /// The most activation rows the matrix-vector loop keeps in registers at once. Up to this many,
 /// it widens every weight element once, as the matmul path does, without the scratch round trip.

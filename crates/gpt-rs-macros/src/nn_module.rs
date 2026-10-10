@@ -2,13 +2,13 @@
 
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, ToTokens};
+use syn::punctuated::Punctuated;
+use syn::spanned::Spanned;
+use syn::visit_mut::{self, VisitMut};
 use syn::{
-    parse_quote,
-    punctuated::Punctuated,
-    spanned::Spanned,
-    visit_mut::{self, VisitMut},
-    Attribute, Error, Expr, Fields, FnArg, GenericArgument, Generics, ImplItem, Item, ItemEnum,
-    ItemImpl, ItemStruct, Lifetime, LitStr, Pat, PathArguments, Result, ReturnType, Token, Type,
+    parse_quote, Attribute, Error, Expr, Fields, FnArg, GenericArgument, Generics, ImplItem, Item,
+    ItemEnum, ItemImpl, ItemStruct, Lifetime, LitStr, Pat, PathArguments, Result, ReturnType,
+    Token, Type,
 };
 
 const BACKEND: &str = "B";

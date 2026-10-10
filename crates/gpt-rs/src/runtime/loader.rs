@@ -3,18 +3,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-
 use gpt_rs_ir::types::TensorType;
 
+use super::handle::ModelHandle;
+use super::namespace::next_namespace;
 use crate::backend::PortableBackend;
 use crate::checkpoint::{self, Checkpoint};
 use crate::model::config::ModelRuntimeConfig;
 use crate::model::registry as model_registry;
 use crate::params::{base_param_id, param_key, ModelNamespaceId};
 use crate::tensor::{DeviceTensor, HostTensor, Shape};
-
-use super::handle::ModelHandle;
-use super::namespace::next_namespace;
 
 /// Hands a checkpoint tensor to the backend as a view into the memory-mapped file, so a backend
 /// on host memory leaves the weights in the OS page cache. An entry that the file does not align

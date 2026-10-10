@@ -3,12 +3,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+use super::ModelConfig;
 use crate::backend::PortableBackend;
 use crate::inference::{decoder, vision};
 use crate::runtime::LoadedModel;
 use crate::tensor::DeviceTensor;
-
-use super::ModelConfig;
 
 /// Signature for model builders used by the runtime checkpoint loader.
 pub type BuildFn<B> = fn(

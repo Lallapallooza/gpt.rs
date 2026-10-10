@@ -3,4 +3,4 @@
 mod interp;
 mod ir;
 
-pub use ir::*;
+pub use self::ir::*;

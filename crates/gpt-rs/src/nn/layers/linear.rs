@@ -1,10 +1,11 @@
 //! The projection layer built on [`functional::linear`]: PyTorch `nn.Linear`, and `transformers`'
 //! `Conv1D` with its transposed weight.
 
+use anyhow::Result;
+
 use crate::nn::{self, Params};
 use crate::ops::functional::{self, WeightLayout};
 use crate::tensor::DType;
-use anyhow::Result;
 
 /// Fully connected layer `y = x W^T + b`. `weight` is stored as `layout` says: `[out_features,
 /// in_features]` like `nn.Linear`, or `[in_features, out_features]` like the `Conv1D` of GPT-2

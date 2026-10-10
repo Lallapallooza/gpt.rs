@@ -21,5 +21,5 @@ mod print;
 /// The version of the PTIR spec that the text form follows.
 pub const SPEC_VERSION: &str = "ptir.v0.5";
 
-pub use cursor::Cursor;
-pub(crate) use cursor::{is_ident_char, is_ident_start};
+pub use self::cursor::Cursor;
+pub(crate) use self::cursor::{is_ident_char, is_ident_start};

@@ -17,6 +17,11 @@ jobs:
       - name: Install the Rust toolchain of rust-toolchain.toml
         run: rustup toolchain install
 
+      - name: Install the nightly rustfmt of the cargo-fmt hook
+        run: >-
+          rustup toolchain install --profile minimal --component rustfmt
+          "$(grep -oP 'RUSTUP_TOOLCHAIN=\K\S+' .pre-commit-config.yaml)"
+
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
 

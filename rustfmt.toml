@@ -1,0 +1,4 @@
+# Both options are nightly-only: the `cargo-fmt` hook of `.pre-commit-config.yaml` runs the
+# nightly rustfmt it names. Stable rustfmt warns and ignores them.
+group_imports = "StdExternalCrate"
+imports_granularity = "Module"

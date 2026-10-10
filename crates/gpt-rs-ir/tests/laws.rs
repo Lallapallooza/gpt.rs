@@ -12,13 +12,12 @@ use gpt_rs_filetests::{
     ROUNDS,
 };
 use gpt_rs_ir::dense::Dense;
-use gpt_rs_ir::interp;
 use gpt_rs_ir::module::{Module, Value};
 use gpt_rs_ir::op::OpDyn;
 use gpt_rs_ir::rewrite::Builder;
 use gpt_rs_ir::traits::{Law, Term};
 use gpt_rs_ir::types::{DType, Dim, TensorType, Type};
-use gpt_rs_ir::Op;
+use gpt_rs_ir::{interp, Op};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 

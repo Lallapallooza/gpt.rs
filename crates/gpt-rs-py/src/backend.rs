@@ -1,8 +1,9 @@
 //! The backend that `load_model` uses when the call names none.
 
+use std::sync::RwLock;
+
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use std::sync::RwLock;
 
 /// The backend that `set_backend` chose, or `None` for the build's default.
 static CURRENT_BACKEND: RwLock<Option<String>> = RwLock::new(None);

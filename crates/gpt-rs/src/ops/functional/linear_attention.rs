@@ -13,13 +13,11 @@ use std::sync::Arc;
 use anyhow::{ensure, Result};
 use gpt_rs_ir::dialects::tensor::DotGeneral;
 
-use crate::s;
-
 use crate::backend::PortableBackend;
 use crate::ops::functional::attention::MASKED_BIAS;
 use crate::ops::functional::matmul;
 use crate::tensor::{DType, DeviceTensor, Shape};
-use crate::{ensure_dtype, ensure_rank, ensure_same_shape, functional};
+use crate::{ensure_dtype, ensure_rank, ensure_same_shape, functional, s};
 
 /// Chunk length of the WY-form evaluation in [`gated_delta_rule`].
 const CHUNK: usize = 64;

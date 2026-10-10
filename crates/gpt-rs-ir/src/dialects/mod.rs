@@ -7,6 +7,8 @@ use std::borrow::Cow;
 
 use anyhow::Result;
 
+use self::func::FuncOp;
+use self::tensor::TensorOp;
 use crate::dense::Dense;
 use crate::host::HostValue;
 use crate::module::{Module, Region};
@@ -14,8 +16,6 @@ use crate::op::{Effects, FoldIn, Folded, Group, OpDyn, RegionRunner, RegionSig};
 use crate::text;
 use crate::traits::{OpTrait, Traits};
 use crate::types::Type;
-use func::FuncOp;
-use tensor::TensorOp;
 
 /// Every op of every dialect.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

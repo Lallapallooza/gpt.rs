@@ -1,9 +1,10 @@
 //! Embedding layer (PyTorch `nn.Embedding`) built on [`functional::embedding_lookup`].
 
+use anyhow::Result;
+
 use crate::nn::{self, Params};
 use crate::ops::functional;
 use crate::tensor::DType;
-use anyhow::Result;
 
 /// Embedding layer that maps integer token IDs to dense vectors.
 #[nn::module]

@@ -1,7 +1,9 @@
 #[path = "../src/benchmark/compile_freeze.rs"]
 mod compile_freeze;
 
-use compile_freeze::{compile_ms_from_report_json, evaluate_compile_freeze, CompileFreezeGate};
+use self::compile_freeze::{
+    compile_ms_from_report_json, evaluate_compile_freeze, CompileFreezeGate,
+};
 
 #[test]
 fn compile_ms_from_report_json_sums_compilation_tables() {

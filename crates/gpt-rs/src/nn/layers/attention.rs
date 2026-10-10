@@ -1,6 +1,8 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use anyhow::{ensure, Result};
+
 use super::linear::Linear;
 use super::names::DecoderNames;
 use super::rms_norm::{RmsNorm, RmsNormConfig};
@@ -8,7 +10,6 @@ use crate::backend::PortableBackend;
 use crate::nn::{self, Params};
 use crate::ops::functional::{self, AttentionPositions, DecodeKvCache, WeightLayout};
 use crate::s;
-use anyhow::{ensure, Result};
 
 /// Configuration of a [`CausalSelfAttention`] layer.
 ///

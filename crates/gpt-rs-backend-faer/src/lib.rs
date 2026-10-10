@@ -13,18 +13,17 @@ use gpt_rs_ir::dialects::tensor::{
     BinaryKind, DotGeneral, ExtractPatches, ReduceKind, ReduceWindow, TensorOp,
 };
 use gpt_rs_ir::host::{Buffer, HostTensor, HostValue, TensorData};
-use gpt_rs_ir::interp;
 use gpt_rs_ir::module::{Inst, Module, Value};
 use gpt_rs_ir::traits::Terminator;
 use gpt_rs_ir::types::{DType, TensorType};
-use gpt_rs_ir::Op;
+use gpt_rs_ir::{interp, Op};
 
 mod layout;
 mod linear;
 mod reduce;
 mod select;
 
-use select::{Step, StepKind};
+use self::select::{Step, StepKind};
 
 thread_local! {
     static CONV2D_IM2COL_SCRATCH_F32: std::cell::RefCell<Vec<f32>> =

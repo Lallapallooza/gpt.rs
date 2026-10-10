@@ -1,9 +1,10 @@
 //! Batch normalization (PyTorch `nn.BatchNorm2d` in eval mode) built on
 //! [`functional::batch_norm`].
 
+use anyhow::Result;
+
 use crate::nn::{self, Params};
 use crate::ops::functional;
-use anyhow::Result;
 
 /// Batch normalization of NHWC activations by the running statistics `running_mean` and
 /// `running_var`, then the affine `weight` and `bias`, all `[channels]`.

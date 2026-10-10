@@ -1,5 +1,7 @@
 //! Semantics of the ops in `ir/window.rs`.
 
+use anyhow::Result;
+
 use super::contraction::reduce;
 use super::kernels::{cast, strides, unravel, Chunks};
 use crate::dialects::tensor::ir::{
@@ -8,7 +10,6 @@ use crate::dialects::tensor::ir::{
 };
 use crate::host::{HostTensor, TensorData};
 use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
-use anyhow::Result;
 
 impl Eval for ExtractPatches {
     fn eval(

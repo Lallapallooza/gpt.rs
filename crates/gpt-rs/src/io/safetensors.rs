@@ -7,13 +7,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use gpt_rs_ir::host::ExternalBytes;
+use gpt_rs_ir::types::TensorType;
+pub use safetensors::tensor::Dtype as StoredDtype;
 use safetensors::tensor::{Dtype, SafeTensors, View};
 
 use crate::tensor::{DType, HostTensor};
-use gpt_rs_ir::host::ExternalBytes;
-use gpt_rs_ir::types::TensorType;
-
-pub use safetensors::tensor::Dtype as StoredDtype;
 
 /// One tensor of a [`SafetensorsFile`].
 #[derive(Clone, Debug)]

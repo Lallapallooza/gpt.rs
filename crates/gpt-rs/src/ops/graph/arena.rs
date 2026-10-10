@@ -37,23 +37,15 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering as AtomicOrdering},
-    Arc, Mutex,
-};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
-
 use gpt_rs_ir::dialects::func::ParamId;
 use gpt_rs_ir::module::{Module, Value};
 use gpt_rs_ir::passes::{self, Pass, Pipeline, PruneParams};
 use gpt_rs_ir::types::Type;
-
-use crate::backend::PortableBackend;
-use crate::ops::graph::ValueId;
-use crate::ops::trace::{self, PassRun, ProgramContext, ProgramKind, ProgramStats, ProgramStatus};
-use crate::tensor::{InputRole, Materialized};
 
 use super::builder::GraphBuilder;
 use super::plan::{
@@ -61,6 +53,10 @@ use super::plan::{
     PlanInput, PlanKey, PlanNode, PlanNodeView, ValueRef,
 };
 use super::state::{GraphInner, NodeState, ValueDef};
+use crate::backend::PortableBackend;
+use crate::ops::graph::ValueId;
+use crate::ops::trace::{self, PassRun, ProgramContext, ProgramKind, ProgramStats, ProgramStatus};
+use crate::tensor::{InputRole, Materialized};
 
 /// Central storage for lazy tensor graphs built on top of a single backend instance.
 pub struct GraphArena<B: PortableBackend + 'static> {

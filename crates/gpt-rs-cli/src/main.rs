@@ -1,3 +1,9 @@
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use std::{env, fs};
+
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use gpt_rs::inference::generate::{Generator, Sampling};
@@ -11,16 +17,10 @@ use gpt_rs::tokenizer::{StreamDecoder, Tokenizer};
 use gpt_rs_ir::module::Module;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use std::env;
-use std::fs;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 mod benchmark;
 
-use benchmark::compile_freeze::{self, CompileFreezeGate};
+use self::benchmark::compile_freeze::{self, CompileFreezeGate};
 
 /// Loads the model directory `checkpoint` onto the backend `backend`.
 fn load_checkpoint(backend: &str, checkpoint: &Path, load: &LoadArgs) -> Result<ModelHandle> {

@@ -1,8 +1,9 @@
 //! Layer normalization (PyTorch `nn.LayerNorm`) built on [`functional::layer_norm`].
 
+use anyhow::Result;
+
 use crate::nn::{self, Params};
 use crate::ops::functional;
-use anyhow::Result;
 
 /// Layer normalization with a learnable affine `weight` and `bias`.
 #[nn::module]

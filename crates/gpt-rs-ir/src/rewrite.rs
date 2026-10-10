@@ -6,6 +6,7 @@
 use std::marker::PhantomData;
 
 use anyhow::{bail, ensure, Result};
+pub use gpt_rs_ir_macros::pattern;
 
 use crate::dense::Dense;
 use crate::dialects::constant_op;
@@ -17,8 +18,6 @@ use crate::op::{Folded, InOp, Matched, OpDef, OpDyn, Values};
 use crate::traits::OpTrait;
 use crate::types::Type;
 use crate::Op;
-
-pub use gpt_rs_ir_macros::pattern;
 
 /// Where a builder places new instructions.
 #[derive(Debug, Clone, Copy)]

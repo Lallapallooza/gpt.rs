@@ -25,8 +25,9 @@ pub mod traits;
 pub mod types;
 pub mod verify;
 
-pub use dialects::{Dialect, Op};
 pub(crate) use gpt_rs_ir_macros::{Attr, Dialect, Doc, Op};
 #[doc(hidden)]
 pub use linkme;
 pub use smallvec;
+
+pub use self::dialects::{Dialect, Op};

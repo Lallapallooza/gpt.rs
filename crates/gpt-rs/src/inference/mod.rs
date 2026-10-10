@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 
+use self::generate::Sampling;
 use crate::backend::PortableBackend;
 use crate::ops::functional::{DecodeKvCache, LinearAttentionCache};
 use crate::tensor::{DeviceTensor, HostTensor};
-use generate::Sampling;
 
 /// Incremental decode state of one decoder layer, carried between generation steps.
 pub enum LayerCache<B: PortableBackend + 'static> {

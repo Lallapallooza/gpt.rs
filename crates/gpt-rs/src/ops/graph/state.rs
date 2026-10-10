@@ -2,16 +2,14 @@
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use foldhash::fast::FixedState;
-use smallvec::SmallVec;
-
 use gpt_rs_ir::types::{DType, TensorType, Type};
 use gpt_rs_ir::Op;
+use smallvec::SmallVec;
 
 use crate::backend::PortableBackend;
 use crate::ops::graph::ValueId;

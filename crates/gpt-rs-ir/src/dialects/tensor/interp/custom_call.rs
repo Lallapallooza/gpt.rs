@@ -1,8 +1,9 @@
 //! Semantics of the ops in `ir/custom_call.rs`.
 
+use anyhow::{bail, Result};
+
 use crate::dialects::tensor::ir::{CustomCall, CustomCallOperands, CustomCallResults};
 use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
-use anyhow::{bail, Result};
 
 impl Eval for CustomCall {
     fn eval(

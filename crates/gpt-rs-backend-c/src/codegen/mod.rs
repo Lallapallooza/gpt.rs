@@ -14,15 +14,14 @@ use gpt_rs_ir::module::Module;
 use gpt_rs_ir::traits::Terminator;
 use gpt_rs_ir::types::TensorType;
 
-use crate::dtype::dtype_tag;
-use crate::kernels;
-
 use self::emit::emit_instructions;
 use self::outline::Outliner;
 use self::profile::{emit_c_profile_metadata, OpProfile};
 use self::types::ValueStorage;
 use self::utils::{c_type, emit_value_array, push_block};
 use self::value_info::{build_value_infos, constant_values, emit_tensor_dims, tensor_type};
+use crate::dtype::dtype_tag;
+use crate::kernels;
 
 /// The C function that the generated source exports: it takes the inputs and the outputs of the
 /// function as `PtirTensor` arrays and returns 0 on success.

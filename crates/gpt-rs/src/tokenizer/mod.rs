@@ -7,4 +7,4 @@
 pub mod bpe;
 pub mod model;
 
-pub use model::{AddedToken, StreamDecoder, Tokenizer, TokenizerConfig};
+pub use self::model::{AddedToken, StreamDecoder, Tokenizer, TokenizerConfig};

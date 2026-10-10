@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use anyhow::Result;
+
 use super::attention::{AttentionConfig, CausalSelfAttention};
 use super::feed_forward::{FeedForward, MlpConfig};
 use super::gated_delta_net::{GatedDeltaNet, GatedDeltaNetConfig};
@@ -10,7 +12,6 @@ use super::norm::{Norm, NormConfig};
 use crate::inference::LayerCache;
 use crate::nn::{self, capture, Params};
 use crate::ops::functional::AttentionPositions;
-use anyhow::Result;
 
 /// Hugging Face module name of linear attention inside a decoder layer.
 const LINEAR_ATTN: &str = "linear_attn";

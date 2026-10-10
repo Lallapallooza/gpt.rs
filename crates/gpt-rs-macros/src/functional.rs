@@ -2,10 +2,9 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{
-    parse_quote, spanned::Spanned, visit_mut::VisitMut, Error, FnArg, ItemFn, Result, ReturnType,
-    Stmt,
-};
+use syn::spanned::Spanned;
+use syn::visit_mut::VisitMut;
+use syn::{parse_quote, Error, FnArg, ItemFn, Result, ReturnType, Stmt};
 
 use crate::nn_module::{add_backend_param, TensorSugar};
 

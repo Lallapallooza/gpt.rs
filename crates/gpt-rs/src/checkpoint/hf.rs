@@ -6,13 +6,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
+use gpt_rs_ir::host::ExternalBytes;
 use serde_json::{Map, Value};
 
 use super::{load_dtype, widen_to_f32, Checkpoint, TensorEntry, FP8_SCALE};
 use crate::io::safetensors::{runtime_dtype, SafetensorsFile, StoredTensor};
 use crate::model::ModelConfig;
 use crate::tensor::DType;
-use gpt_rs_ir::host::ExternalBytes;
 
 /// Prefixes of the text decoder inside multimodal checkpoints. `language_model.model.` is the
 /// layout older `transformers` versions saved.

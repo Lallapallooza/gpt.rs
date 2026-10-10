@@ -5,8 +5,6 @@ use gpt_rs_ir::dialects::tensor::{BinaryKind, CompareKind, TensorOp, UnaryKind};
 use gpt_rs_ir::module::Value;
 use gpt_rs_ir::types::DType;
 
-use crate::targets::{binary_expr, fused_input_fits, unary_expr};
-
 use super::super::profile::{
     register_op_profile_binary, register_op_profile_generic, register_op_profile_unary,
 };
@@ -19,6 +17,7 @@ use super::super::value_info::{
     ensure_dtype, operand_dtype, operand_expr, operand_type, operand_types, output_info,
 };
 use super::EmitContext;
+use crate::targets::{binary_expr, fused_input_fits, unary_expr};
 
 pub(super) fn emit_instruction(
     inst: &Instruction<'_>,

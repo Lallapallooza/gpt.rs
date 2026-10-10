@@ -1,10 +1,11 @@
 //! Semantics of the ops in `ir/layout.rs`.
 
-use crate::dialects::tensor::ir::shape::{axis_index, check_window};
-
 use std::sync::Arc;
 
+use anyhow::Result;
+
 use super::kernels::{gather_elements, strides, unravel, Chunks};
+use crate::dialects::tensor::ir::shape::{axis_index, check_window};
 use crate::dialects::tensor::ir::{
     Bitcast, BitcastOperands, BitcastResults, BroadcastTo, BroadcastToOperands, BroadcastToResults,
     Concat, ConcatOperands, ConcatResults, Reshape, ReshapeOperands, ReshapeResults, Slice,
@@ -12,7 +13,6 @@ use crate::dialects::tensor::ir::{
 };
 use crate::host::{HostTensor, TensorData};
 use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
-use anyhow::Result;
 
 impl Eval for Reshape {
     fn eval(

@@ -10,7 +10,7 @@ use gpt_rs::tensor::{DType, DeviceTensor, HostTensor};
 use gpt_rs_backend_ref_cpu::CpuPortableBackend;
 use gpt_rs_backend_tests::{panic_message, tensor_as};
 
-use support::filled;
+use self::support::filled;
 
 #[test]
 fn gated_delta_rule_rejects_value_heads_not_divisible_by_key_heads() {

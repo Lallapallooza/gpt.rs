@@ -3,9 +3,6 @@ use gpt_rs_ir::dialects::tensor::{DotAxes, DotGeneral, TensorOp};
 use gpt_rs_ir::module::Value;
 use gpt_rs_ir::types::{DType, TensorType};
 
-use crate::kernels::{LINEAR_PACK_MIN_ROWS, PANEL_N};
-use crate::targets::linear_kernel;
-
 use super::super::profile::{matmul_work_stats, register_op_profile_binary, signature_binary};
 use super::super::types::{Instruction, Kind};
 use super::super::utils::{
@@ -16,6 +13,8 @@ use super::super::value_info::{
     ensure_dtype, operand_dtype, operand_expr, operand_type, output_info,
 };
 use super::EmitContext;
+use crate::kernels::{LINEAR_PACK_MIN_ROWS, PANEL_N};
+use crate::targets::linear_kernel;
 
 pub(super) fn emit_instruction(
     inst: &Instruction<'_>,

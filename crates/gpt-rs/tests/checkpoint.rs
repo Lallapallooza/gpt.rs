@@ -14,7 +14,7 @@ use gpt_rs::tensor::{DType, HostTensor};
 use gpt_rs_backend_ref_cpu::CpuPortableBackend;
 use serde_json::json;
 
-use checkpoint_support::TempDir;
+use self::checkpoint_support::TempDir;
 
 /// Writes a safetensors file of `(name, dtype, dims, payload)` tensors, for dtypes that host
 /// tensors cannot hold.

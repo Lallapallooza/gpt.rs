@@ -10,8 +10,8 @@ pub mod context;
 mod plan;
 mod state;
 
-pub use arena::GraphArena;
-pub(crate) use builder::GraphBuilder;
+pub use self::arena::GraphArena;
+pub(crate) use self::builder::GraphBuilder;
 
 /// The identifier of a value in a graph arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

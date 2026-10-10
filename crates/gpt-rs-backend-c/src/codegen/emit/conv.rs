@@ -5,8 +5,6 @@ use gpt_rs_ir::dialects::tensor::{ExtractPatches, TensorOp};
 use gpt_rs_ir::module::Value;
 use gpt_rs_ir::types::{DType, TensorType};
 
-use crate::kernels::PANEL_N;
-
 use super::super::profile::register_op_profile_unary;
 use super::super::types::{Instruction, Kind, ValueInfo};
 use super::super::utils::{
@@ -16,6 +14,7 @@ use super::super::value_info::{
     ensure_dtype, operand_dtype, operand_expr, operand_type, output_info,
 };
 use super::EmitContext;
+use crate::kernels::PANEL_N;
 
 pub(super) fn emit_instruction(
     inst: &Instruction<'_>,

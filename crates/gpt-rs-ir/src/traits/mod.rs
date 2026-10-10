@@ -14,18 +14,17 @@ mod structure;
 use std::any::Any;
 use std::fmt;
 
+pub use self::algebra::{
+    Absorbing, Associative, Commutative, DistributesOver, Idempotent, IntValue, Involution,
+    PerClass, RightIdentity,
+};
+pub use self::structure::{Elementwise, IsolatedFromAbove, Movement, Terminator};
 use crate::dense::Dense;
 use crate::doc::Doc;
 use crate::fold::FoldResult;
 use crate::module::{Module, Value};
 use crate::types::{DType, Type};
 use crate::Op;
-
-pub use algebra::{
-    Absorbing, Associative, Commutative, DistributesOver, Idempotent, IntValue, Involution,
-    PerClass, RightIdentity,
-};
-pub use structure::{Elementwise, IsolatedFromAbove, Movement, Terminator};
 
 /// A fact about an op. Every hook has a default that does nothing, so a trait implements only the
 /// behavior that follows from it. `Display` writes it with its parameters, as an op's entry in the

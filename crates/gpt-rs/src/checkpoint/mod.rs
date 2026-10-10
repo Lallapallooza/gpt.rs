@@ -7,14 +7,13 @@ mod hf;
 use std::path::Path;
 
 use anyhow::{bail, ensure, Result};
+use gpt_rs_ir::host::ExternalBytes;
 use half::{bf16, f16};
 
+pub use self::hf::HfCheckpoint;
 use crate::io::safetensors::StoredDtype;
 use crate::model::ModelConfig;
 use crate::tensor::DType;
-use gpt_rs_ir::host::ExternalBytes;
-
-pub use hf::HfCheckpoint;
 
 /// One parameter tensor of a [`Checkpoint`], in the dtype the runtime loads it as.
 #[derive(Clone, Debug)]

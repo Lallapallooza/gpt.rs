@@ -14,10 +14,9 @@ use gpt_rs_ir::module::{Inst, Module, Value};
 use gpt_rs_ir::types::DType;
 use gpt_rs_ir::Op;
 
+use super::types::{Elementwise, ElementwiseInput, Instruction, Kind, Node, NodeOp, NodeRef};
 use crate::kernels::PANEL_N;
 use crate::targets::{fused_input_fits, linear_kernel};
-
-use super::types::{Elementwise, ElementwiseInput, Instruction, Kind, Node, NodeOp, NodeRef};
 
 /// A kernel, and the ops it covers besides the op whose result it gives.
 struct Fused<'m> {

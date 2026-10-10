@@ -6,14 +6,13 @@ use std::sync::{Arc, OnceLock};
 use gpt_rs::backend::PortableBackend;
 use gpt_rs::nn::layers::{Embedding, LayerNorm, Linear, RmsNorm, RmsNormConfig};
 use gpt_rs::tensor::{DeviceTensor, HostTensor};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde::Deserialize;
 use tch::Tensor as TchTensor;
 
-pub use crate::panic_message;
-
 use super::harness;
-pub use crate::load_layer;
+pub use crate::{load_layer, panic_message};
 
 pub const ATOL: f64 = 5e-4;
 pub const RTOL: f64 = 1e-4;

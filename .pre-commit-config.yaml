@@ -36,9 +36,10 @@ repos:
         language: system
         types_or: [python, pyi]
         pass_filenames: false
+      # rustfmt.toml groups and merges imports, which only nightly rustfmt does.
       - id: cargo-fmt
         name: cargo fmt
-        entry: cargo fmt --all -- --check
+        entry: env RUSTUP_TOOLCHAIN=nightly-2026-10-01 cargo fmt --all -- --check
         language: system
         types: [rust]
         pass_filenames: false

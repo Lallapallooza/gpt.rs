@@ -1,5 +1,4 @@
 target/
-Cargo.lock
 .DS_Store
 checkpoints/*
 configs/*
@@ -8,7 +7,6 @@ configs/*
 # Local secrets
 .env
 .env.*
-!.env.example
 
 # Python
 __pycache__/
@@ -41,7 +39,6 @@ ENV/
 env/
 
 # Local and cache directories
-.ax/
 .cache/
 .local/
 .pc-home/

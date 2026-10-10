@@ -613,8 +613,10 @@ fn iota_converts_each_count_as_a_cast_does() {
     // 256.
     let bf16 = iota("bf16", 260);
     let bits: Vec<u16> = bf16.to_le_bytes()[2 * 255..]
-        .chunks_exact(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&b| u16::from_le_bytes(b))
         .collect();
     assert_eq!(bits, [0x437F, 0x4380, 0x4380, 0x4381, 0x4382]);
     // ui8 saturates at 255, as an integer cast does. Counting in ui8 would wrap to 0.

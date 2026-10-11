@@ -1,0 +1,79 @@
+// RUN: roundtrip
+
+// Every arith op, in the body of a parallel block.
+func.func @scalar_ops(%0: tensor<4xf32>, %1: tensor<4xsi32>, %2: tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) {
+  %3, %4, %5, %6 = tile.block(%0, %1, %2) {iters = [par 4], reads = [$0[d0], $1[d0], $2[0], $2[1]], folds = [none -> [d0], none -> [d0], none -> [d0], none -> [d0]]} ({
+  ^body(%0: f32, %1: si32, %2: ui64, %3: ui64):
+    %4 = arith.neg(%0) : (f32) -> f32
+    %5 = arith.abs(%4) : (f32) -> f32
+    %6 = arith.exp(%5) : (f32) -> f32
+    %7 = arith.log(%6) : (f32) -> f32
+    %8 = arith.tanh(%7) : (f32) -> f32
+    %9 = arith.erf(%8) : (f32) -> f32
+    %10 = arith.rsqrt(%9) : (f32) -> f32
+    %11 = arith.reciprocal(%10) : (f32) -> f32
+    %12 = arith.sin(%11) : (f32) -> f32
+    %13 = arith.cos(%12) : (f32) -> f32
+    %14 = arith.constant() {value = 0.5 : f32} : () -> f32
+    %15 = arith.add(%13, %14) : (f32, f32) -> f32
+    %16 = arith.sub(%15, %14) : (f32, f32) -> f32
+    %17 = arith.mul(%16, %14) : (f32, f32) -> f32
+    %18 = arith.div(%17, %14) : (f32, f32) -> f32
+    %19 = arith.maximum(%18, %14) : (f32, f32) -> f32
+    %20 = arith.minimum(%19, %14) : (f32, f32) -> f32
+    %21 = arith.constant() {value = 3 : si32} : () -> si32
+    %22 = arith.and(%1, %21) : (si32, si32) -> si32
+    %23 = arith.or(%22, %21) : (si32, si32) -> si32
+    %24 = arith.xor(%23, %21) : (si32, si32) -> si32
+    %25 = arith.shift_left(%24, %21) : (si32, si32) -> si32
+    %26 = arith.shift_right_logical(%25, %21) : (si32, si32) -> si32
+    %27 = arith.shift_right_arithmetic(%26, %21) : (si32, si32) -> si32
+    %28 = arith.not(%27) : (si32) -> si32
+    %29 = arith.less(%20, %14) : (f32, f32) -> i1
+    %30 = arith.select(%29, %20, %14) : (i1, f32, f32) -> f32
+    %31 = arith.cast(%30) {to = bf16} : (f32) -> bf16
+    %32 = arith.bitcast(%30) {to = si32} : (f32) -> si32
+    %33 = arith.add(%28, %32) : (si32, si32) -> si32
+    %34 = tile.index() {expr = d0, dtype = ui64} : () -> ui64
+    %35 = arith.rng_uniform(%2, %3, %34) {dtype = f32} : (ui64, ui64, ui64) -> f32
+    %36 = arith.rng_normal(%2, %3, %34) {dtype = bf16} : (ui64, ui64, ui64) -> bf16
+    tile.yield(%35, %33, %29, %36) : (f32, si32, i1, bf16) -> ()
+  }) : (tensor<4xf32>, tensor<4xsi32>, tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>)
+  func.return(%3, %4, %5, %6) : (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) -> ()
+}
+
+// -----
+
+// Literals of every computation type: integers, i1, f32-computed floats and f64.
+func.func @literals() -> (tensor<si64>, tensor<i1>, tensor<bf16>, tensor<f64>) {
+  %0, %1, %2, %3 = tile.block() {iters = [], reads = [], folds = [none -> [], none -> [], none -> [], none -> []]} ({
+    %0 = arith.constant() {value = -9223372036854775808 : si64} : () -> si64
+    %1 = arith.constant() {value = 1 : i1} : () -> i1
+    %2 = arith.constant() {value = -inf : bf16} : () -> bf16
+    %3 = arith.constant() {value = 0.1 : f64} : () -> f64
+    tile.yield(%0, %1, %2, %3) : (si64, i1, bf16, f64) -> ()
+  }) : () -> (tensor<si64>, tensor<i1>, tensor<bf16>, tensor<f64>)
+  func.return(%0, %1, %2, %3) : (tensor<si64>, tensor<i1>, tensor<bf16>, tensor<f64>) -> ()
+}
+
+// -----
+
+// Every arith comparison, joined into one flag.
+func.func @comparisons(%0: tensor<4xf32>, %1: tensor<4xf32>) -> tensor<4xi1> {
+  %2 = tile.block(%0, %1) {iters = [par 4], reads = [$0[d0], $1[d0]], folds = [none -> [d0]]} ({
+  ^body(%0: f32, %1: f32):
+    %2 = arith.less(%0, %1) : (f32, f32) -> i1
+    %3 = arith.less_equal(%0, %1) : (f32, f32) -> i1
+    %4 = arith.equal(%0, %1) : (f32, f32) -> i1
+    %5 = arith.greater_equal(%0, %1) : (f32, f32) -> i1
+    %6 = arith.greater(%0, %1) : (f32, f32) -> i1
+    %7 = arith.not_equal(%0, %1) : (f32, f32) -> i1
+    %8 = arith.and(%2, %3) : (i1, i1) -> i1
+    %9 = arith.or(%4, %5) : (i1, i1) -> i1
+    %10 = arith.xor(%6, %7) : (i1, i1) -> i1
+    %11 = arith.and(%8, %9) : (i1, i1) -> i1
+    %12 = arith.or(%11, %10) : (i1, i1) -> i1
+    tile.yield(%12) : (i1) -> ()
+  }) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  func.return(%2) : (tensor<4xi1>) -> ()
+}

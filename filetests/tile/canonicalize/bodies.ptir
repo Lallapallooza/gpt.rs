@@ -1,0 +1,55 @@
+// RUN: pass tensor-to-tile, canonicalize
+
+// A splat operand is a constant in the body.
+// CHECK: tile.block(%0) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0]]}
+// CHECK: arith.constant() {value = 2.0 : f32}
+// CHECK-NOT: tensor.constant
+func.func @splat_operand(%0: tensor<4xf32>) -> tensor<4xf32> {
+  %1 = tensor.constant() {value = dense<[4] x f32: 2.0>} : () -> tensor<4xf32>
+  %2 = tensor.mul(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%2) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// `x * 1.0` folds in the body, and the block that copies its operand is the operand.
+// CHECK: func.func @multiply_by_one
+// CHECK-NEXT: func.return(%0)
+func.func @multiply_by_one(%0: tensor<4xf32>) -> tensor<4xf32> {
+  %1 = tensor.constant() {value = dense<[4] x f32: 1.0>} : () -> tensor<4xf32>
+  %2 = tensor.mul(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%2) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// `x * 0` folds to the zero in the body, and the read of `x` is removed.
+// CHECK: tile.block() {iters = [par 4], reads = [], folds = [none -> [d0]]}
+// CHECK-NEXT: arith.constant() {value = 0 : si32}
+func.func @multiply_by_zero(%0: tensor<4xsi32>) -> tensor<4xsi32> {
+  %1 = tensor.constant() {value = dense<[4] x si32: 0>} : () -> tensor<4xsi32>
+  %2 = tensor.mul(%0, %1) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  func.return(%2) : (tensor<4xsi32>) -> ()
+}
+
+// -----
+
+// Iterators of extent 1 are 0.
+// CHECK: tile.block(%0) {iters = [par 4], reads = [$0[d0, 0]], folds = [sum -> [d0, 0]]}
+// CHECK: tile.block(%0) {iters = [par 4], reads = [$0[d0, 0]], folds = [none -> [0, d0]]}
+func.func @unit_axes(%0: tensor<4x1xf32>) -> (tensor<4x1xf32>, tensor<1x4xf32>) {
+  %1 = tensor.reduce_sum(%0) {axes = [1], keepdims = true} : (tensor<4x1xf32>) -> tensor<4x1xf32>
+  %2 = tensor.transpose(%0) {perm = [1, 0]} : (tensor<4x1xf32>) -> tensor<1x4xf32>
+  %3 = tensor.exp(%2) : (tensor<1x4xf32>) -> tensor<1x4xf32>
+  func.return(%1, %3) : (tensor<4x1xf32>, tensor<1x4xf32>) -> ()
+}
+
+// -----
+
+// Index expressions take their canonical form: the row-major position of `[d0, d1, d2]` in
+// `[4, 2, 3]`, divided by 6, is `d0`, since `d1 * 3 + d2` is below 6.
+// CHECK: tile.block(%0) {iters = [par 4, par 2, par 3], reads = [$0[d0, d1 * 3 + d2]]
+func.func @split_axis(%0: tensor<4x6xf32>) -> tensor<4x2x3xf32> {
+  %1 = tensor.reshape(%0) {shape = [4, 2, 3]} : (tensor<4x6xf32>) -> tensor<4x2x3xf32>
+  func.return(%1) : (tensor<4x2x3xf32>) -> ()
+}

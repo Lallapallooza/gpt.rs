@@ -13,16 +13,18 @@ Together they are the normative contract between producers and consumers.
   dialect's `passes/`) and the backend crates, such as `crates/gpt-rs-backend-ref-cpu`,
   `crates/gpt-rs-backend-faer` and `crates/gpt-rs-backend-c`.
 - Normative keywords: MUST / SHOULD / MAY.
-- Each op's attributes and type rule (`OpDef::result_types`) are in `ir/`. Its semantics are its
-  `Eval` impl in `interp/`. The reference backend runs them, and every pass is checked against
-  them.
+- Each op is defined in `ir.rs`: its struct, its attributes and its groups. Its type rule
+  (`OpDef::result_types`) is in `verify/`. Its semantics, its `Eval` impl, are in `interp/`. Its
+  folder is in `fold/`, and its cost is in `cost/`. Each is in the file named after the op's section
+  of `ir.rs`. Helpers are in `utils/`. The reference backend runs the semantics, and every pass
+  is checked against them.
 - Each op's documentation states what the op means, independent of any specific backend
   implementation strategy. The dialect holds no op outside this specification. If an op's
   documentation and its code disagree, fix the documentation or fix the code.
 - Notation: `T[shape]` means a tensor of dtype `T` and the given shape.
-- Extension ops (`extract_patches`, the random ops, `top_k`, the segment ops and the quantization
-  ops) go beyond the core ops, for broader model coverage. A backend MAY reject an extension op
-  other than `extract_patches` as unimplemented.
+- Extension ops (`extract_patches`, the random ops, `top_k`, `bottom_k`, the segment ops and the
+  quantization ops) go beyond the core ops, for broader model coverage. A backend MAY reject an
+  extension op other than `extract_patches` as unimplemented.
 - LLM attention is expressed as a **pattern** over core ops (no dedicated attention op), as
   "Canonical library forms" shows.
 - Backend implementation notes (how each backend executes PTIR) are in `docs/backends/README.md`.
@@ -49,6 +51,8 @@ line or without it, and rejects a module that names another version.
 
 4. Shapes and dynamic dims
    - Shapes are ordered tuples of non-negative integers.
+   - A tensor MUST have at most 8 axes. The text form rejects a type of higher rank, and an op
+     whose result would have a higher rank is rejected.
    - Dims MAY be dynamic at compile time, written as a symbol in braces in the text form, such as
      `{T}`.
    - Runtime dims MUST be non-negative and satisfy op constraints.
@@ -80,7 +84,7 @@ Ops that accept an `axis` (or list of axes) MUST accept negative indices interpr
 PTIR uses **explicit** broadcasting:
 
 - `broadcast_to` is the only operation that changes shapes by broadcasting.
-- Elementwise ops (`add`, `mul`, `compare`, `select`, ...) require operands to have the **same
+- Elementwise ops (`add`, `mul`, `less`, `select`, ...) require operands to have the **same
   shape** (after any explicit `broadcast_to`).
 
 `broadcast_to` follows a standard right-aligned compatibility rule:
@@ -143,13 +147,13 @@ The classes each op takes:
 | `exp`, `log`, `tanh`, `erf`, `rsqrt`, `reciprocal`, `sin`, `cos` | float |
 | `not`, `and`, `or`, `xor` | bool, integer |
 | `shift_left`, `shift_right_logical`, `shift_right_arithmetic` | integer |
-| `compare` | bool, integer, float |
+| `less`, `less_equal`, `equal`, `greater_equal`, `greater`, `not_equal` | bool, integer, float |
 | `cast` | every dtype in; every dtype but scale out |
-| `reduce_{sum,max,min}`, `reduce_window_{sum,max,min}`, `segment_{sum,max,min}`, `scatter_{add,max,min}`, `argmax`, `top_k`, `iota` | integer, float |
+| `reduce_{sum,max,min}`, `reduce_window_{sum,max,min}`, `segment_{sum,max,min}`, `scatter_{add,max,min}`, `argmax`, `top_k`, `bottom_k`, `iota` | integer, float |
 | `reduce_{and,or}`, `reduce_window_{and,or}`, `segment_{and,or}` | bool, integer |
 | `dot_general` | integer with integer; float or narrow float with float or narrow float |
 | `rng_uniform` | integer, float; `rng_normal`: float |
-| `quantize`, `quantize_dynamic`, `dequantize` | as "Quantization" states |
+| `quantize`, `quantize_stochastic`, `quantize_table`, `dequantize`, `block_scale_*`, `block_scale_range` | as "Quantization" states |
 
 The `accum` and `out` dtypes of a reduction are of the input's class. A `dot_general` of floats or narrow floats
 accumulates in a float and returns a float or a narrow float.
@@ -168,8 +172,8 @@ accumulates in a float and returns a float or a narrow float.
   value, as `tensor.quantize` does. Infinities saturate. NaN maps to NaN in a dtype that has one,
   and to 0 otherwise.
 - Into `i1`: 1 for every value but zero, NaN included.
-- Nothing casts into `e8m0`: `tensor.quantize_dynamic` computes e8m0 scales and states how it
-  rounds them.
+- Nothing casts into `e8m0`: the power-of-two `tensor.block_scale_*` ops compute e8m0 scales and
+  state how they round them.
 
 ## Accumulator/output dtype policy
 
@@ -211,10 +215,20 @@ real values. One scaling scheme covers, for training as well as inference:
 - `cast` decodes any element dtype.
 - `mul` and `add` apply scales and offsets, and a scale can itself be dequantized.
 
-The ops `tensor.dequantize`, `tensor.quantize` and `tensor.quantize_dynamic` name the common
-schemes, so that backends see their structure, and each is the composition its semantics states.
-A new format starts as a composition and becomes an attribute of these ops when a backend needs
-its structure.
+The quantization ops name the common schemes, so that backends see their structure, and each is
+the composition its semantics states:
+
+- `tensor.quantize`, `tensor.quantize_stochastic` and `tensor.quantize_table` quantize with given
+  scales, rounding to the nearest value, rounding at random, or to the nearest entry of a code
+  table;
+- `tensor.dequantize` maps quantized elements, or the values `take` read from a code table, back
+  to real values;
+- the `tensor.block_scale_*` ops and `tensor.block_scale_range` compute the scales, and offsets,
+  of the blocks of a tensor: dynamic quantization is one of them followed by a quantize op.
+
+Each op computes one thing: a rounding or a scale formula is an op of its own, never an attribute
+that switches what an op computes. A new format starts as a composition and becomes an op when a
+backend needs its structure.
 
 **Scale layout.** The attribute `block` gives one extent per axis of `x`. Element `x[i]` uses
 scale `scale[i / block]`, dividing per axis and rounding down, so the scale has the rank of `x` and
@@ -233,8 +247,7 @@ a `mul` by a scalar around these ops.
 
 The quantized elements `Q` are integers or narrow floats. Scales `S` are floats, narrow floats or
 `e8m0`; offsets are floats; a table holds floats or narrow floats along one axis. The real values
-that the ops read and write are `f32`, `bf16` or `f16`. The optional operands come in the order
-the ops list them, and the text form names which are present with `operand_segments`.
+that the ops read and write are `f32`, `bf16` or `f16`. The offset is the one optional operand.
 
 Requantizing is `tensor.quantize(tensor.dequantize(q, scale), new_scale)`; it has no op of its
 own.

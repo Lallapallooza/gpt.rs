@@ -9,9 +9,7 @@ use faer::linalg::matmul::matmul;
 use faer::mat::{MatMut, MatRef};
 use faer::{Accum, Par};
 use gpt_rs::backend::{ParamStore, PortableBackend};
-use gpt_rs_ir::dialects::tensor::{
-    BinaryKind, DotGeneral, ExtractPatches, ReduceKind, ReduceWindow, TensorOp,
-};
+use gpt_rs_ir::dialects::tensor::{DotGeneral, ExtractPatches, ReduceWindowAttrs, TensorOp};
 use gpt_rs_ir::host::{Buffer, HostTensor, HostValue, TensorData};
 use gpt_rs_ir::module::{Inst, Module, Value};
 use gpt_rs_ir::traits::Terminator;
@@ -201,12 +199,22 @@ fn kernel(
     outputs: &[TensorType],
 ) -> Option<Result<Vec<HostTensor>>> {
     let one = |result: Result<HostTensor>| Some(result.map(|tensor| vec![tensor]));
+    let one_of = |result: Option<Result<HostTensor>>| result.map(|r| r.map(|tensor| vec![tensor]));
     match (op, inputs, outputs) {
         (TensorOp::DotGeneral(dot), ..) => try_dot_general(inputs, outputs, dot),
-        (TensorOp::Binary(binary), ..) => try_elementwise_binary(inputs, outputs, binary.kind),
-        (TensorOp::ReduceWindow(window), ..) => try_reduce_window(inputs, outputs, window),
-        (TensorOp::Reduce(op), [input], [out]) => {
-            reduce::reduce(op, input, out).map(|result| result.map(|tensor| vec![tensor]))
+        (TensorOp::Add(_), ..) => try_elementwise_binary(inputs, outputs, |a, b| a + b),
+        (TensorOp::Mul(_), ..) => try_elementwise_binary(inputs, outputs, |a, b| a * b),
+        (TensorOp::Maximum(_), ..) => try_elementwise_binary(inputs, outputs, maximum),
+        (TensorOp::Minimum(_), ..) => try_elementwise_binary(inputs, outputs, minimum),
+        (TensorOp::ReduceWindowMax(window), ..) => try_reduce_window(inputs, outputs, window),
+        (TensorOp::ReduceSum(op), [input], [out]) => {
+            one_of(reduce::reduce(op, input, out, 0.0, |a, b| a + b))
+        }
+        (TensorOp::ReduceMax(op), [input], [out]) => {
+            one_of(reduce::reduce(op, input, out, f32::NEG_INFINITY, maximum))
+        }
+        (TensorOp::ReduceMin(op), [input], [out]) => {
+            one_of(reduce::reduce(op, input, out, f32::INFINITY, minimum))
         }
         (TensorOp::BroadcastTo(op), [input], [out]) => one(layout::broadcast_to(op, input, out)),
         (TensorOp::Transpose(op), [input], [out]) => one(layout::transpose(op, input, out)),
@@ -238,13 +246,13 @@ fn relu6_f32(input: &HostTensor) -> Result<HostTensor> {
             }
         })
         .collect();
-    HostTensor::f32(input.dims.clone(), out)
+    HostTensor::f32(input.dims, out)
 }
 
 /// The extents of `ty`, which must be static.
 pub(crate) fn dims_of(ty: &TensorType) -> Result<Vec<usize>> {
     ty.static_dims()
-        .map(|dims| dims.into_vec())
+        .map(|dims| dims.to_vec())
         .ok_or_else(|| anyhow!("{ty} has a dynamic dimension"))
 }
 
@@ -265,8 +273,8 @@ fn conv2d_nhwc_im2col_tiled_f32(
     spec: &ExtractPatches,
     output_spec: &TensorType,
 ) -> Result<HostTensor> {
-    let input_dims = input.dims.clone();
-    let weight_dims = weight.dims.clone();
+    let input_dims = input.dims;
+    let weight_dims = weight.dims;
     let out_dims = dims_of(output_spec)?;
 
     if input.dtype() != DType::F32
@@ -309,7 +317,7 @@ fn conv2d_nhwc_im2col_tiled_f32(
     }
 
     if let Some(bias) = bias {
-        let bias_dims = bias.dims.clone();
+        let bias_dims = bias.dims;
         if bias.dtype() != DType::F32 || bias_dims.iter().product::<usize>() != c_out {
             return Err(anyhow!("conv2d fusion bias shape mismatch"));
         }
@@ -888,8 +896,8 @@ fn depthwise_conv2d_nhwc_direct_f32(
     spec: &ExtractPatches,
     output_spec: &TensorType,
 ) -> Result<HostTensor> {
-    let input_dims = input.dims.clone();
-    let weight_dims = weight.dims.clone();
+    let input_dims = input.dims;
+    let weight_dims = weight.dims;
     let out_dims = dims_of(output_spec)?;
 
     if input.dtype() != DType::F32
@@ -935,7 +943,7 @@ fn depthwise_conv2d_nhwc_direct_f32(
     }
 
     if let Some(bias) = bias {
-        let bias_dims = bias.dims.clone();
+        let bias_dims = bias.dims;
         if bias.dtype() != DType::F32 || bias_dims.iter().product::<usize>() != c {
             return Err(anyhow!("depthwise conv fusion bias shape mismatch",));
         }
@@ -1065,10 +1073,11 @@ pub(crate) fn minimum(lhs: f32, rhs: f32) -> f32 {
     }
 }
 
+/// An f32 elementwise op that computes `op` on each pair of elements.
 fn try_elementwise_binary(
     inputs: &[HostTensor],
     outputs: &[TensorType],
-    op: BinaryKind,
+    op: impl Fn(f32, f32) -> f32,
 ) -> Option<Result<Vec<HostTensor>>> {
     if inputs.len() != 2 || outputs.len() != 1 {
         return None;
@@ -1089,36 +1098,11 @@ fn try_elementwise_binary(
         return Some(Err(anyhow!("elementwise size mismatch")));
     }
 
-    match op {
-        BinaryKind::Add | BinaryKind::Maximum | BinaryKind::Minimum | BinaryKind::Mul => {}
-        _ => return None,
-    }
-
-    let len = lhs_values.len();
-    let mut out = vec![0.0f32; len];
-    match op {
-        BinaryKind::Add => {
-            for i in 0..len {
-                out[i] = lhs_values[i] + rhs_values[i];
-            }
-        }
-        BinaryKind::Maximum => {
-            for i in 0..len {
-                out[i] = maximum(lhs_values[i], rhs_values[i]);
-            }
-        }
-        BinaryKind::Minimum => {
-            for i in 0..len {
-                out[i] = minimum(lhs_values[i], rhs_values[i]);
-            }
-        }
-        BinaryKind::Mul => {
-            for i in 0..len {
-                out[i] = lhs_values[i] * rhs_values[i];
-            }
-        }
-        _ => unreachable!("filtered above"),
-    }
+    let out: Vec<f32> = lhs_values
+        .iter()
+        .zip(rhs_values)
+        .map(|(&lhs, &rhs)| op(lhs, rhs))
+        .collect();
 
     Some(output_tensor(output_spec, TensorData::F32(Buffer::from(out))).map(|tensor| vec![tensor]))
 }
@@ -1126,12 +1110,9 @@ fn try_elementwise_binary(
 fn try_reduce_window(
     inputs: &[HostTensor],
     outputs: &[TensorType],
-    spec: &ReduceWindow,
+    spec: &ReduceWindowAttrs,
 ) -> Option<Result<Vec<HostTensor>>> {
     if inputs.len() != 1 || outputs.len() != 1 {
-        return None;
-    }
-    if spec.kind != ReduceKind::Max {
         return None;
     }
     let input = &inputs[0];
@@ -1156,7 +1137,7 @@ fn try_reduce_window(
         return None;
     };
 
-    let input_dims = input.dims.clone();
+    let input_dims = input.dims;
     let out_dims = match dims_of(output_spec) {
         Ok(dims) => dims,
         Err(err) => return Some(Err(err)),
@@ -1345,8 +1326,8 @@ fn try_dot_general(
         }
     }
 
-    let lhs_dims = lhs.dims.clone();
-    let rhs_dims = rhs.dims.clone();
+    let lhs_dims = lhs.dims;
+    let rhs_dims = rhs.dims;
     let out_dims = match dims_of(output_spec) {
         Ok(dims) => dims,
         Err(err) => return Some(Err(err)),

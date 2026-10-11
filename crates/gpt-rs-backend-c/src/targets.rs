@@ -1,7 +1,7 @@
 //! The C backend's kernel tables: which kernel reads which dtypes, and the C expressions of the
 //! elementwise ops.
 
-use gpt_rs_ir::dialects::tensor::{BinaryKind, UnaryKind};
+use gpt_rs_ir::dialects::tensor::TensorOp;
 use gpt_rs_ir::types::DType;
 
 /// The C function that computes `x [.., M, K] . w [.., N, K]` with f32 sums, for an `x` of dtype
@@ -46,39 +46,33 @@ pub fn fused_input_fits(out: &[usize], input: &[usize], starts: Option<&[usize]>
     }
 }
 
-/// The C expression of `kind` applied to the f32 expression `arg`.
-pub fn unary_expr(kind: UnaryKind, arg: &str) -> String {
-    match kind {
-        UnaryKind::Neg => format!("-({arg})"),
-        UnaryKind::Abs => format!("fabsf({arg})"),
-        UnaryKind::Exp => format!("expf({arg})"),
-        UnaryKind::Log => format!("logf({arg})"),
-        UnaryKind::Tanh => format!("tanhf({arg})"),
-        UnaryKind::Erf => format!("erff({arg})"),
-        UnaryKind::Rsqrt => format!("1.0f / sqrtf({arg})"),
-        UnaryKind::Reciprocal => format!("1.0f / ({arg})"),
-        UnaryKind::Sin => format!("sinf({arg})"),
-        UnaryKind::Cos => format!("cosf({arg})"),
-        UnaryKind::Not => unreachable!("not flips the bits of integers, not of f32"),
-    }
+/// The C expression of the elementwise `op` on the f32 expression `arg`, when `op` has one.
+pub fn unary_expr(op: &TensorOp, arg: &str) -> Option<String> {
+    Some(match op {
+        TensorOp::Neg(_) => format!("-({arg})"),
+        TensorOp::Abs(_) => format!("fabsf({arg})"),
+        TensorOp::Exp(_) => format!("expf({arg})"),
+        TensorOp::Log(_) => format!("logf({arg})"),
+        TensorOp::Tanh(_) => format!("tanhf({arg})"),
+        TensorOp::Erf(_) => format!("erff({arg})"),
+        TensorOp::Rsqrt(_) => format!("1.0f / sqrtf({arg})"),
+        TensorOp::Reciprocal(_) => format!("1.0f / ({arg})"),
+        TensorOp::Sin(_) => format!("sinf({arg})"),
+        TensorOp::Cos(_) => format!("cosf({arg})"),
+        _ => return None,
+    })
 }
 
-/// The C expression of `kind` applied to the f32 expressions `lhs` and `rhs`.
-pub fn binary_expr(kind: BinaryKind, lhs: &str, rhs: &str) -> String {
-    match kind {
-        BinaryKind::Add => format!("({lhs}) + ({rhs})"),
-        BinaryKind::Sub => format!("({lhs}) - ({rhs})"),
-        BinaryKind::Mul => format!("({lhs}) * ({rhs})"),
-        BinaryKind::Div => format!("({lhs}) / ({rhs})"),
-        BinaryKind::Maximum => format!("gpt_rs_maximum_f32({lhs}, {rhs})"),
-        BinaryKind::Minimum => format!("gpt_rs_minimum_f32({lhs}, {rhs})"),
-        BinaryKind::And
-        | BinaryKind::Or
-        | BinaryKind::Xor
-        | BinaryKind::ShiftLeft
-        | BinaryKind::ShiftRightLogical
-        | BinaryKind::ShiftRightArithmetic => {
-            unreachable!("bitwise ops compute on integers, not on f32")
-        }
-    }
+/// The C expression of the elementwise `op` on the f32 expressions `lhs` and `rhs`, when `op`
+/// has one.
+pub fn binary_expr(op: &TensorOp, lhs: &str, rhs: &str) -> Option<String> {
+    Some(match op {
+        TensorOp::Add(_) => format!("({lhs}) + ({rhs})"),
+        TensorOp::Sub(_) => format!("({lhs}) - ({rhs})"),
+        TensorOp::Mul(_) => format!("({lhs}) * ({rhs})"),
+        TensorOp::Div(_) => format!("({lhs}) / ({rhs})"),
+        TensorOp::Maximum(_) => format!("gpt_rs_maximum_f32({lhs}, {rhs})"),
+        TensorOp::Minimum(_) => format!("gpt_rs_minimum_f32({lhs}, {rhs})"),
+        _ => return None,
+    })
 }

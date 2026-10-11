@@ -6,6 +6,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+use gpt_rs_ir::location::Location;
 use gpt_rs_ir::module::Module;
 use gpt_rs_ir::types::TensorType;
 use gpt_rs_ir::Op;
@@ -99,6 +100,8 @@ pub(super) struct PlanNode {
     pub(super) operands: Vec<ValueId>,
     pub(super) first: ValueId,
     pub(super) result: usize,
+    /// Where the op comes from, when its record kept that. The program cache key leaves it out.
+    pub(super) location: Option<Location>,
 }
 
 /// Borrowed view of a pending node: its op, operands, type and result index.

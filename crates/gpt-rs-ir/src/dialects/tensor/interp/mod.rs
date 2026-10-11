@@ -1,13 +1,13 @@
 //! The semantics of the `tensor` ops: one `Eval` impl per op, used by the interpreter.
 
 mod constant;
-mod contraction;
+pub(crate) mod contraction;
 mod control;
 mod custom_call;
-mod elementwise;
-mod indexing;
-mod kernels;
+pub(crate) mod elementwise;
+pub(crate) mod indexing;
+pub(crate) mod kernels;
 mod layout;
-mod quant;
-mod random;
-mod window;
+pub(crate) mod quant;
+pub(crate) mod random;
+pub(crate) mod window;

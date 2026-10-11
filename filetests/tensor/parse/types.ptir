@@ -11,3 +11,11 @@ func.func @braces(%0: tensor<{}x3xf32>) -> tensor<{}x3xf32> {
 func.func @plus(%0: tensor<+3xf32>) -> tensor<+3xf32> {
   func.return(%0) : (tensor<+3xf32>) -> ()
 }
+
+// -----
+
+// ERROR: 2:49: tensor type: rank 9 is above the largest rank, 8
+func.func @rank(%0: tensor<1x1x1x1x1x1x1x1x1xf32>) -> tensor<f32> {
+  %1 = tensor.reshape(%0) {shape = []} : (tensor<1x1x1x1x1x1x1x1x1xf32>) -> tensor<f32>
+  func.return(%1) : (tensor<f32>) -> ()
+}

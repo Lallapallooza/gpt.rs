@@ -1,0 +1,147 @@
+// RUN: roundtrip
+
+func.func @linear_bias_gelu(%0: tensor<{M}x8xf32>, %1: tensor<6x8xbf16>, %2: tensor<6xf32>) -> tensor<{M}x6xf32> {
+  %3 = tile.block(%0, %1) {iters = [par {M}, par 6, red 8], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
+  ^body(%0: f32, %1: bf16):
+    %2 = arith.cast(%1) {to = f32} : (bf16) -> f32
+    %3 = arith.mul(%0, %2) : (f32, f32) -> f32
+    tile.yield(%3) : (f32) -> ()
+  }) : (tensor<{M}x8xf32>, tensor<6x8xbf16>) -> tensor<{M}x6xf32>
+  %4 = tile.block(%3, %2) {iters = [par {M}, par 6], reads = [$0[d0, d1], $1[d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%0: f32, %1: f32):
+    %2 = arith.add(%0, %1) : (f32, f32) -> f32
+    %3 = arith.constant() {value = 0.70710677 : f32} : () -> f32
+    %4 = arith.mul(%2, %3) : (f32, f32) -> f32
+    %5 = arith.erf(%4) : (f32) -> f32
+    %6 = arith.constant() {value = 1.0 : f32} : () -> f32
+    %7 = arith.add(%5, %6) : (f32, f32) -> f32
+    %8 = arith.constant() {value = 0.5 : f32} : () -> f32
+    %9 = arith.mul(%2, %8) : (f32, f32) -> f32
+    %10 = arith.mul(%9, %7) : (f32, f32) -> f32
+    tile.yield(%10) : (f32) -> ()
+  }) : (tensor<{M}x6xf32>, tensor<6xf32>) -> tensor<{M}x6xf32>
+  func.return(%4) : (tensor<{M}x6xf32>) -> ()
+}
+
+// -----
+
+// Folds of every kind: argmax and top_k over the last axis, an ordered sum, and the
+// logical folds.
+func.func @folds(%0: tensor<2x5xf32>, %1: tensor<2x5xi1>) -> (tensor<2xf32>, tensor<2xsi32>, tensor<2xf32>, tensor<2xsi64>, tensor<2x3xf32>, tensor<2x3xsi32>, tensor<2xf32>, tensor<2xf32>, tensor<2xf32>, tensor<2xi1>, tensor<2xi1>) {
+  %2, %3, %4, %5, %6, %7 = tile.block(%0) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [argmax -> [d0], [d0], argmin -> [d0], [d0], top_k<k = 3> -> [d0], [d0]]} ({
+  ^body(%0: f32):
+    %1 = tile.index() {expr = d1, dtype = si32} : () -> si32
+    %2 = tile.index() {expr = d1, dtype = si64} : () -> si64
+    tile.yield(%0, %1, %0, %2, %0, %1) : (f32, si32, f32, si64, f32, si32) -> ()
+  }) : (tensor<2x5xf32>) -> (tensor<2xf32>, tensor<2xsi32>, tensor<2xf32>, tensor<2xsi64>, tensor<2x3xf32>, tensor<2x3xsi32>)
+  %8, %9, %10 = tile.block(%0) {iters = [par 2, red ordered 5], reads = [$0[d0, d1]], folds = [sum -> [d0], max -> [d0], min -> [d0]]} ({
+  ^body(%0: f32):
+    tile.yield(%0, %0, %0) : (f32, f32, f32) -> ()
+  }) : (tensor<2x5xf32>) -> (tensor<2xf32>, tensor<2xf32>, tensor<2xf32>)
+  %11, %12 = tile.block(%1) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [and -> [d0], or -> [d0]]} ({
+  ^body(%0: i1):
+    tile.yield(%0, %0) : (i1, i1) -> ()
+  }) : (tensor<2x5xi1>) -> (tensor<2xi1>, tensor<2xi1>)
+  func.return(%2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12) : (tensor<2xf32>, tensor<2xsi32>, tensor<2xf32>, tensor<2xsi64>, tensor<2x3xf32>, tensor<2x3xsi32>, tensor<2xf32>, tensor<2xf32>, tensor<2xf32>, tensor<2xi1>, tensor<2xi1>) -> ()
+}
+
+// -----
+
+// Causal attention for one head: the scores fold with online softmax over the keys, the value
+// lanes `d1` drop from the states, and a sink starts each fold. The states merge, and the output is
+// `o / l`.
+func.func @attention(%0: tensor<{T}x8xf32>, %1: tensor<{S}x8xf32>, %2: tensor<{S}x8xf32>, %3: tensor<{T}xf32>, %4: tensor<{T}xf32>, %5: tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>, tensor<{T}x8xf32>) {
+  %6, %7, %8 = tile.block(%0, %1, %2, %3, %4, %5) {iters = [par {T}, par 8, red {S}], reads = [$0[d0, d1], $1[d2, d1], $2[d2, d1]], folds = [online_softmax<lanes = [d1]> -> [d0], [d0], [d0, d1] init $3, $4, $5], constraints = [d2 <= d0 or d2 < 4]} ({
+  ^body(%0: f32, %1: f32, %2: f32):
+    %3 = arith.mul(%0, %1) : (f32, f32) -> f32
+    tile.yield(%3, %2) : (f32, f32) -> ()
+  }) : (tensor<{T}x8xf32>, tensor<{S}x8xf32>, tensor<{S}x8xf32>, tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>)
+  %9, %10, %11 = tile.block(%6, %7, %8) {iters = [par {T}, par 8], reads = [$0[d0], $1[d0], $2[d0, d1]], folds = [online_softmax_merge<lanes = [d1]> -> [d0], [d0], [d0, d1]]} ({
+  ^body(%0: f32, %1: f32, %2: f32):
+    tile.yield(%0, %1, %2) : (f32, f32, f32) -> ()
+  }) : (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>)
+  %12 = tile.block(%10, %11) {iters = [par {T}, par 8], reads = [$0[d0], $1[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%0: f32, %1: f32):
+    %2 = arith.div(%1, %0) : (f32, f32) -> f32
+    tile.yield(%2) : (f32) -> ()
+  }) : (tensor<{T}xf32>, tensor<{T}x8xf32>) -> tensor<{T}x8xf32>
+  func.return(%6, %7, %8, %12) : (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>, tensor<{T}x8xf32>) -> ()
+}
+
+// -----
+
+// The partition function of the logits: the state, merged with itself, and `m + log(l)`.
+func.func @logsumexp(%0: tensor<2x16xf32>) -> (tensor<2xf32>, tensor<2xf32>, tensor<2xf32>) {
+  %1, %2 = tile.block(%0) {iters = [par 2, red 16], reads = [$0[d0, d1]], folds = [logsumexp -> [d0], [d0]]} ({
+  ^body(%0: f32):
+    tile.yield(%0) : (f32) -> ()
+  }) : (tensor<2x16xf32>) -> (tensor<2xf32>, tensor<2xf32>)
+  %3, %4 = tile.block(%1, %2) {iters = [par 2, red 2], reads = [$0[d0], $1[d0]], folds = [logsumexp_merge -> [d0], [d0]]} ({
+  ^body(%0: f32, %1: f32):
+    tile.yield(%0, %1) : (f32, f32) -> ()
+  }) : (tensor<2xf32>, tensor<2xf32>) -> (tensor<2xf32>, tensor<2xf32>)
+  %5 = tile.block(%3, %4) {iters = [par 2], reads = [$0[d0], $1[d0]], folds = [none -> [d0]]} ({
+  ^body(%0: f32, %1: f32):
+    %2 = arith.log(%1) : (f32) -> f32
+    %3 = arith.add(%0, %2) : (f32, f32) -> f32
+    tile.yield(%3) : (f32) -> ()
+  }) : (tensor<2xf32>, tensor<2xf32>) -> tensor<2xf32>
+  func.return(%1, %2, %5) : (tensor<2xf32>, tensor<2xf32>, tensor<2xf32>) -> ()
+}
+
+// -----
+
+// A cumulative sum, a padded shifted read, and an update of a cache at a position read from an
+// operand.
+func.func @prefix_and_into(%0: tensor<8xsi32>, %1: tensor<16x4xf32>, %2: tensor<1x4xf32>, %3: tensor<si32>) -> (tensor<8xsi32>, tensor<8xsi32>, tensor<16x4xf32>) {
+  %4 = tile.block(%0) {iters = [prefix 8], reads = [$0[d0]], folds = [sum -> [d0]]} ({
+  ^body(%0: si32):
+    tile.yield(%0) : (si32) -> ()
+  }) : (tensor<8xsi32>) -> tensor<8xsi32>
+  %5 = tile.block(%0) {iters = [par 8], reads = [$0[d0 - 1] pad 0.0], folds = [none -> [d0]]} ({
+  ^body(%0: si32):
+    tile.yield(%0) : (si32) -> ()
+  }) : (tensor<8xsi32>) -> tensor<8xsi32>
+  %6 = tile.block(%1, %2, %3) {iters = [par 1, par 4], reads = [$1[d0, d1]], folds = [none -> $0[$2[] + d0, d1]]} ({
+  ^body(%0: f32):
+    tile.yield(%0) : (f32) -> ()
+  }) : (tensor<16x4xf32>, tensor<1x4xf32>, tensor<si32>) -> tensor<16x4xf32>
+  func.return(%4, %5, %6) : (tensor<8xsi32>, tensor<8xsi32>, tensor<16x4xf32>) -> ()
+}
+
+// -----
+
+// One of three expert weights, picked per token.
+func.func @experts(%0: tensor<{T}x8xf32>, %1: tensor<{T}xsi32>, %2: tensor<4x8xf32>, %3: tensor<4x8xf32>, %4: tensor<4x8xf32>) -> tensor<{T}x4xf32> {
+  %5 = tile.block(%0, %1, %2, %3, %4) {iters = [par {T}, par 4, red 8], reads = [$0[d0, d2], $2..$4[$1[d0]][d1, d2]], folds = [sum -> [d0, d1]]} ({
+  ^body(%0: f32, %1: f32):
+    %2 = arith.mul(%0, %1) : (f32, f32) -> f32
+    tile.yield(%2) : (f32) -> ()
+  }) : (tensor<{T}x8xf32>, tensor<{T}xsi32>, tensor<4x8xf32>, tensor<4x8xf32>, tensor<4x8xf32>) -> tensor<{T}x4xf32>
+  func.return(%5) : (tensor<{T}x4xf32>) -> ()
+}
+
+// -----
+
+// Blocks grouped over a grid, a sealed dispatch with symbol facts, and its call.
+tile.dispatch @rms(%0: tensor<{T}x8xf32>) -> tensor<{T}xf32> {grid = [d0], facts = {T = [16, 4096] % 16}} {
+  %1 = tile.block(%0) {iters = [par {T}, red 8], reads = [$0[d0, d1]], folds = [sum -> [d0]]} ({
+  ^body(%0: f32):
+    %1 = arith.mul(%0, %0) : (f32, f32) -> f32
+    tile.yield(%1) : (f32) -> ()
+  }) : (tensor<{T}x8xf32>) -> tensor<{T}xf32>
+  func.return(%1) : (tensor<{T}xf32>) -> ()
+}
+
+func.func @call(%0: tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}x8xf32>) {
+  %1 = host.dispatch(%0) {callee = @rms} : (tensor<{T}x8xf32>) -> tensor<{T}xf32>
+  %2 = tile.group() {grid = [d0]} ({
+    %3 = tile.block(%0) {iters = [par {T}, par 8], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+    ^body(%0: f32):
+      %1 = arith.exp(%0) : (f32) -> f32
+      tile.yield(%1) : (f32) -> ()
+    }) : (tensor<{T}x8xf32>) -> tensor<{T}x8xf32>
+    tile.yield(%3) : (tensor<{T}x8xf32>) -> ()
+  }) : () -> tensor<{T}x8xf32>
+  func.return(%1, %2) : (tensor<{T}xf32>, tensor<{T}x8xf32>) -> ()
+}

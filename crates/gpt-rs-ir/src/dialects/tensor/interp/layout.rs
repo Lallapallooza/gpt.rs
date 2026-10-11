@@ -1,16 +1,16 @@
-//! Semantics of the ops in `ir/layout.rs`.
+//! Semantics of the layout ops.
 
 use std::sync::Arc;
 
 use anyhow::Result;
 
-use super::kernels::{gather_elements, strides, unravel, Chunks};
-use crate::dialects::tensor::ir::shape::{axis_index, check_window};
+use super::kernels::{strided, strides, Chunks};
 use crate::dialects::tensor::ir::{
     Bitcast, BitcastOperands, BitcastResults, BroadcastTo, BroadcastToOperands, BroadcastToResults,
     Concat, ConcatOperands, ConcatResults, Reshape, ReshapeOperands, ReshapeResults, Slice,
     SliceOperands, SliceResults, Transpose, TransposeOperands, TransposeResults,
 };
+use crate::dialects::tensor::utils::shape::{axis_index, check_window, pick};
 use crate::host::{HostTensor, TensorData};
 use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
 
@@ -34,16 +34,8 @@ impl Eval for Transpose {
     ) -> Result<TransposeResults<OwnedHost>> {
         let in_dims = &ins.input.dims;
         let out_dims: Vec<usize> = self.perm.iter().map(|&axis| in_dims[axis]).collect();
-        let in_strides = strides(in_dims);
-        let count: usize = out_dims.iter().product();
-        let source = |out_index: usize| -> usize {
-            unravel(out_index, &out_dims)
-                .iter()
-                .enumerate()
-                .map(|(out_axis, &coord)| coord * in_strides[self.perm[out_axis]])
-                .sum()
-        };
-        let data = gather_elements(&ins.input.data, count, source)?;
+        let steps = pick(&strides(in_dims), &self.perm);
+        let data = strided(&ins.input.data, 0, &out_dims, &steps)?;
         Ok(TransposeResults {
             output: HostTensor::new(out_dims, data)?,
         })
@@ -58,18 +50,16 @@ impl Eval for BroadcastTo {
     ) -> Result<BroadcastToResults<OwnedHost>> {
         let input = ins.input;
         let in_dims = &input.dims;
-        let rank_diff = self.shape.len() - in_dims.len();
         let out_dims = cx.result_dims(0)?;
         let in_strides = strides(in_dims);
-        let count: usize = out_dims.iter().product();
-        let source = |out_index: usize| -> usize {
-            let coord = unravel(out_index, &out_dims);
-            (0..in_dims.len())
-                .filter(|&axis| in_dims[axis] != 1)
-                .map(|axis| coord[rank_diff + axis] * in_strides[axis])
-                .sum()
-        };
-        let data = gather_elements(&input.data, count, source)?;
+        // A broadcast axis, new or of extent 1, steps by 0.
+        let steps: Vec<usize> = (0..out_dims.len())
+            .map(|axis| match self.source_axis(axis, in_dims.len()) {
+                Some(axis) if in_dims[axis] != 1 => in_strides[axis],
+                _ => 0,
+            })
+            .collect();
+        let data = strided(&input.data, 0, &out_dims, &steps)?;
         Ok(BroadcastToResults {
             output: HostTensor::new(out_dims, data)?,
         })
@@ -87,18 +77,17 @@ impl Eval for Slice {
             check_window(axis, self.starts[axis], self.span(axis), extent)?;
         }
         let in_strides = strides(&input.dims);
-        let count: usize = self.sizes.iter().product();
-        let source = |out_index: usize| -> usize {
-            unravel(out_index, &self.sizes)
-                .iter()
-                .enumerate()
-                .map(|(axis, &coord)| {
-                    (self.starts[axis] + coord * self.stride(axis)) * in_strides[axis]
-                })
-                .sum()
-        };
+        let start = (0..input.dims.len())
+            .map(|axis| self.starts[axis] * in_strides[axis])
+            .sum();
+        let steps: Vec<usize> = (0..input.dims.len())
+            .map(|axis| self.stride(axis) * in_strides[axis])
+            .collect();
         Ok(SliceResults {
-            output: HostTensor::new(&self.sizes, gather_elements(&input.data, count, source)?)?,
+            output: HostTensor::new(
+                self.sizes,
+                strided(&input.data, start, &self.sizes, &steps)?,
+            )?,
         })
     }
 }
@@ -111,7 +100,7 @@ impl Eval for Concat {
     ) -> Result<ConcatResults<OwnedHost>> {
         let first = ins.inputs[0];
         let axis = axis_index(self.axis, first.dims.len())?;
-        let mut out_dims = first.dims.clone();
+        let mut out_dims = first.dims;
         out_dims[axis] = ins.inputs.iter().map(|input| input.dims[axis]).sum();
         let outer: usize = out_dims[..axis].iter().product();
         // Each of the `outer` rows of the result is the next run of every input in turn.

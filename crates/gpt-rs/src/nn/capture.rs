@@ -1,10 +1,13 @@
-//! Capture of module outputs, for layer-by-layer comparison with a reference implementation.
+//! Capture of module outputs, for layer-by-layer comparison with a reference implementation, and
+//! the module path that names them.
 //!
-//! Outputs are named by their Hugging Face module path. Without a running capture, [`record`] and
-//! [`scope`] only test a thread-local slot. They build no names and read back no tensors.
+//! Outputs are named by their Hugging Face module path. The path also names the locations of
+//! recorded ops while a trace sink keeps them. Without either, [`record`] and [`scope`] only test
+//! a thread-local slot and a flag. They build no names and read back no tensors.
 
 use std::cell::RefCell;
 use std::fmt::{self, Write as _};
+use std::sync::Arc;
 
 use anyhow::{ensure, Result};
 
@@ -13,12 +16,13 @@ use crate::tensor::{DeviceTensor, HostTensor};
 
 thread_local! {
     static CAPTURE: RefCell<Option<Capture>> = const { RefCell::new(None) };
+    /// The module path of the enclosing scopes. Scopes extend it while something names things by
+    /// it: a capture, or a trace sink that keeps the locations of recorded ops.
+    static PATH: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 #[derive(Default)]
 struct Capture {
-    /// Module path of the enclosing scopes.
-    path: String,
     /// Width and rows of each module's output, in first-recorded order. Every call appends its
     /// rows, one call per prompt chunk.
     outputs: Vec<(String, usize, Vec<f32>)>,
@@ -28,6 +32,20 @@ struct Capture {
 
 fn capturing() -> bool {
     CAPTURE.with_borrow(Option::is_some)
+}
+
+/// Whether scopes extend the module path.
+fn naming() -> bool {
+    capturing() || crate::ops::trace::sink_installed()
+}
+
+/// The module path of the enclosing scopes, such as `model.layers.3.mlp`, while scopes extend it
+/// and it is not empty.
+pub fn path() -> Option<Arc<str>> {
+    if !naming() {
+        return None;
+    }
+    PATH.with_borrow(|path| (!path.is_empty()).then(|| Arc::from(path.as_str())))
 }
 
 /// Runs `f` with capture enabled and returns its result with the recorded module outputs, each
@@ -83,7 +101,7 @@ pub fn record<B: PortableBackend + 'static>(name: &str, output: &DeviceTensor<B>
                 return;
             }
         };
-        let mut path = capture.path.clone();
+        let mut path = PATH.with_borrow(String::clone);
         if !path.is_empty() && !name.is_empty() {
             path.push('.');
         }
@@ -97,21 +115,25 @@ pub fn record<B: PortableBackend + 'static>(name: &str, output: &DeviceTensor<B>
 
 /// Prefixes module `name` to the names recorded until the returned guard drops.
 pub fn scope(name: fmt::Arguments<'_>) -> Scope {
-    let parent_len = CAPTURE.with_borrow_mut(|capture| {
-        let path = &mut capture.as_mut()?.path;
+    if !naming() {
+        return Scope { parent_len: None };
+    }
+    let parent_len = PATH.with_borrow_mut(|path| {
         let len = path.len();
         if len > 0 {
             path.push('.');
         }
         let _ = path.write_fmt(name);
-        Some(len)
+        len
     });
-    Scope { parent_len }
+    Scope {
+        parent_len: Some(parent_len),
+    }
 }
 
 /// Guard of a [`scope`].
 pub struct Scope {
-    /// Length of the enclosing path, while capturing.
+    /// Length of the enclosing path, when the scope extended it.
     parent_len: Option<usize>,
 }
 
@@ -125,11 +147,7 @@ impl Scope {
 impl Drop for Scope {
     fn drop(&mut self) {
         if let Some(len) = self.parent_len {
-            CAPTURE.with_borrow_mut(|capture| {
-                if let Some(capture) = capture {
-                    capture.path.truncate(len);
-                }
-            });
+            PATH.with_borrow_mut(|path| path.truncate(len));
         }
     }
 }

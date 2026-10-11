@@ -66,6 +66,7 @@ Start here:
 Reference:
 - [docs/backends/README.md](docs/backends/README.md) (how each backend works: ref-cpu, faer, c)
 - [docs/ptir/tensor.md](docs/ptir/tensor.md) (the `tensor` dialect: the PTIR spec, generated from the code)
+- [docs/ptir/arith.md](docs/ptir/arith.md), [docs/ptir/tile.md](docs/ptir/tile.md) and [docs/ptir/host.md](docs/ptir/host.md) (the scalar, tile and host dialects, generated from the code)
 - [docs/ptir/passes.md](docs/ptir/passes.md) (the passes and the pipeline of each backend)
 - [docs/ops.md](docs/ops.md) (PTIR recording/graphs/execution)
 - [docs/frontend.md](docs/frontend.md) (frontend layering)

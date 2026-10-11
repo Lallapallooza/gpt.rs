@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use crate::module::{Inst, Module, Region, Value};
+use crate::op::{OpDyn, SymbolOp};
 use crate::traits::IsolatedFromAbove;
 use crate::types::{type_list, Type};
 
@@ -10,9 +11,12 @@ struct Printer<'m> {
     out: String,
     names: HashMap<Value, usize>,
     next: usize,
+    /// Whether each op with a location ends with it.
+    locations: bool,
 }
 
-fn result_types(types: &[&Type]) -> String {
+/// Result types as an op's text writes them: one type alone, several in parentheses.
+pub(crate) fn results_text(types: &[&Type]) -> String {
     match types {
         [single] => single.to_string(),
         _ => type_list(types),
@@ -21,15 +25,15 @@ fn result_types(types: &[&Type]) -> String {
 
 impl<'m> Printer<'m> {
     fn define(&mut self, value: Value) -> String {
-        let n = self.next;
+        let number = self.next;
         self.next += 1;
-        self.names.insert(value, n);
-        format!("%{n}")
+        self.names.insert(value, number);
+        format!("%{number}")
     }
 
     fn name(&self, value: Value) -> String {
         match self.names.get(&value) {
-            Some(n) => format!("%{n}"),
+            Some(number) => format!("%{number}"),
             None => format!("%<unknown {value:?}>"),
         }
     }
@@ -89,42 +93,41 @@ impl<'m> Printer<'m> {
         self.out.push('}');
     }
 
+    /// A symbol op: `{op} @{name}(%a: T{arg suffix}, ...) -> {results} {attrs} { body }`.
+    fn print_symbol(&mut self, inst: Inst, depth: usize, symbol: &dyn SymbolOp) {
+        let module = self.module;
+        let body = module.regions(inst)[0];
+        self.isolated(|p| {
+            let _ = write!(p.out, "{} @{}(", module.op(inst).name(), symbol.symbol());
+            for (index, &arg) in module.args(body).iter().enumerate() {
+                if index > 0 {
+                    p.out.push_str(", ");
+                }
+                let arg_name = p.define(arg);
+                let _ = write!(
+                    p.out,
+                    "{arg_name}: {}{}",
+                    module.ty(arg),
+                    symbol.arg_suffix(index)
+                );
+            }
+            let _ = write!(p.out, ") -> {}", symbol.results_text());
+            let attrs = symbol.attr_entries();
+            if !attrs.is_empty() {
+                let _ = write!(p.out, " {{{}}}", attrs.join(", "));
+            }
+            p.out.push_str(" {\n");
+            p.print_insts(body, depth + 1);
+            p.indent(depth);
+            p.out.push('}');
+        });
+    }
+
     fn print_inst(&mut self, inst: Inst, depth: usize) {
         let module = self.module;
         let op = module.op(inst);
-        if let Some(func) = op.as_func() {
-            let body = module.regions(inst)[0];
-            self.isolated(|p| {
-                let _ = write!(p.out, "func.func @{}(", func.name);
-                for (i, &arg) in module.args(body).iter().enumerate() {
-                    if i > 0 {
-                        p.out.push_str(", ");
-                    }
-                    let name = p.define(arg);
-                    let _ = write!(p.out, "{name}: {}", module.ty(arg));
-                    if let Some(Some(param)) = func.params.get(i) {
-                        let _ = write!(p.out, " {{param = {}}}", param.0);
-                    }
-                }
-                let results = if func.is_load_time() {
-                    let bound: Vec<String> = func
-                        .results
-                        .iter()
-                        .enumerate()
-                        .map(|(i, ty)| match func.result_params.get(i) {
-                            Some(param) => format!("{ty} {{param = {}}}", param.0),
-                            None => ty.to_string(),
-                        })
-                        .collect();
-                    format!("({})", bound.join(", "))
-                } else {
-                    result_types(&func.results.iter().collect::<Vec<_>>())
-                };
-                let _ = writeln!(p.out, ") -> {results} {{");
-                p.print_insts(body, depth + 1);
-                p.indent(depth);
-                p.out.push('}');
-            });
+        if let Some(symbol) = op.dyn_symbol() {
+            self.print_symbol(inst, depth, symbol);
             return;
         }
 
@@ -173,31 +176,51 @@ impl<'m> Printer<'m> {
             self.out,
             " : {} -> {}",
             type_list(&operand_types),
-            result_types(&result_tys)
+            results_text(&result_tys)
         );
+        if let Some(location) = module.location(inst).filter(|_| self.locations) {
+            let _ = write!(self.out, " {location}");
+        }
     }
+}
+
+/// What the text form shows besides the ops.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TextOptions {
+    /// The version of the spec the module follows, first: the form of a program stored for later.
+    pub versioned: bool,
+    /// The location of each op that has one, after its signature, as dumps show them.
+    pub locations: bool,
 }
 
 impl Module {
     /// The module in its text form.
     pub fn to_text(&self) -> String {
-        let mut printer = Printer {
-            module: self,
-            out: String::new(),
-            names: HashMap::new(),
-            next: 0,
-        };
-        printer.print_insts(self.body(), 0);
-        printer.out
+        self.print(TextOptions::default())
     }
 
     /// The module in its text form, after the version of the spec it follows: the form of a
     /// program stored for later.
     pub fn to_versioned_text(&self) -> String {
-        format!(
-            "spec_version = \"{}\"\n{}",
-            super::SPEC_VERSION,
-            self.to_text()
-        )
+        self.print(TextOptions {
+            versioned: true,
+            ..TextOptions::default()
+        })
+    }
+
+    /// The module in its text form, with what `options` adds.
+    pub fn print(&self, options: TextOptions) -> String {
+        let mut printer = Printer {
+            module: self,
+            out: String::new(),
+            names: HashMap::new(),
+            next: 0,
+            locations: options.locations,
+        };
+        if options.versioned {
+            let _ = writeln!(printer.out, "spec_version = \"{}\"", super::SPEC_VERSION);
+        }
+        printer.print_insts(self.body(), 0);
+        printer.out
     }
 }

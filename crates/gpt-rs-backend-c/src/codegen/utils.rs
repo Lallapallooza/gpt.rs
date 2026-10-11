@@ -84,7 +84,7 @@ pub(super) fn emit_memcpy(module: &mut String, out: &str, input: &str, byte_len:
 }
 pub(super) fn dims_usize(ty: &TensorType) -> Result<Vec<usize>> {
     ty.static_dims()
-        .map(|dims| dims.into_vec())
+        .map(|dims| dims.to_vec())
         .ok_or_else(|| anyhow!("{ty} has a dynamic dimension"))
 }
 pub(super) fn linear_index_expr(dims: &[usize], indices: &[String]) -> String {

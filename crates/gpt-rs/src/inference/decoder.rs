@@ -232,7 +232,6 @@ impl<B: PortableBackend + 'static, C: DecoderConfig> CausalDecoder<B, C> {
         caches: &mut [LayerCache<B>],
     ) -> Result<DeviceTensor<B>> {
         let positions = index_tensor(&self.backend(), start..start + tokens.size(0))?;
-        let _scope = capture::scope(format_args!("{}", C::BASE_MODEL_PREFIX));
         Ok(self.base_model((tokens, &positions, caches)))
     }
 

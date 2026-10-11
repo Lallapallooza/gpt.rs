@@ -260,8 +260,8 @@ fn dot_kernel(
             Some((DotForm::Nt, "gpt_rs_c_linear_nt_f32"))
         }
         (DType::F32, DType::F32, None) => Some((DotForm::Gemm, "gpt_rs_c_matmul_f32")),
-        (DType::Bf16, DType::Bf16, None) => Some((DotForm::Gemm, "gpt_rs_c_matmul_bf16")),
         _ if nt => Some((DotForm::Nt, linear_kernel(lhs, rhs, scale)?)),
+        (DType::Bf16, DType::Bf16, None) => Some((DotForm::Gemm, "gpt_rs_c_matmul_bf16")),
         _ => None,
     }
 }

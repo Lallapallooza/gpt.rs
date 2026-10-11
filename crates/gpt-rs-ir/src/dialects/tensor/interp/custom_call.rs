@@ -1,4 +1,4 @@
-//! Semantics of the ops in `ir/custom_call.rs`.
+//! Semantics of `tensor.custom_call`.
 
 use anyhow::{bail, Result};
 

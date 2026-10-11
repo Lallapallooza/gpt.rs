@@ -31,7 +31,8 @@ pub(super) fn emit_instruction(
     };
     let (axis, k, largest) = match op {
         TensorOp::ArgMax(spec) => (spec.axis, None, true),
-        TensorOp::TopK(spec) => (spec.axis, Some(spec.k), spec.largest),
+        TensorOp::TopK(spec) => (spec.axis, Some(spec.k), true),
+        TensorOp::BottomK(spec) => (spec.axis, Some(spec.k), false),
         _ => return Ok(None),
     };
     let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;

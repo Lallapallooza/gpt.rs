@@ -2,6 +2,8 @@
 
 mod canonicalize;
 mod cse;
+mod dce;
+mod fold;
 mod greedy;
 mod outline_static;
 mod prune_params;
@@ -11,17 +13,16 @@ mod stats;
 use anyhow::{anyhow, Context, Result};
 pub use gpt_rs_ir_macros::pass;
 
-pub use self::canonicalize::{Canonicalize, Dce, Fold};
+pub use self::canonicalize::Canonicalize;
 pub use self::cse::Cse;
-pub use self::greedy::{Greedy, GreedyReport, Rewrites};
+pub use self::dce::Dce;
+pub use self::fold::Fold;
+pub use self::greedy::{run_patterns, Greedy, GreedyReport, Rewrites};
 pub use self::outline_static::OutlineStatic;
 pub use self::prune_params::PruneParams;
 pub use self::registry::{parse, registered, OptionInfo, PassEntry, StatInfo, PASSES};
 pub use self::stats::{take_stats, Stat};
-pub use crate::dialects::tensor::passes::{
-    populate_dot_scale_patterns, populate_merge_dot_axes_patterns, DotScaleFold,
-    MergeContractedAxes,
-};
+use crate::dialects::tensor::{DotScaleFold, MergeContractedAxes};
 use crate::module::Module;
 use crate::verify::verify;
 

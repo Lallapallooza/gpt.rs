@@ -1,0 +1,37 @@
+// RUN: pass canonicalize
+
+// A dot over one product per result, such as an outer product of two vectors, is their product
+// along the result's axes plus 0. Adding 0 turns a product of -0.0 into 0.0, as the sum does.
+// CHECK: func.func @one_product
+// CHECK-NOT: tensor.dot_general
+// CHECK: [[P:%[0-9]+]] = tensor.mul(
+// CHECK: tensor.add([[P]],
+func.func @one_product(%0: tensor<4x3x1xf32>, %1: tensor<4x1x5xf32>) -> tensor<4x3x5xf32> {
+  %2 = tensor.dot_general(%0, %1) {batch_lhs = [0], batch_rhs = [0], contract_lhs = [2], contract_rhs = [1]} : (tensor<4x3x1xf32>, tensor<4x1x5xf32>) -> tensor<4x3x5xf32>
+  func.return(%2) : (tensor<4x3x5xf32>) -> ()
+}
+
+// -----
+
+// Narrow operands multiply in the accumulator, and the sum is cast to the result dtype.
+// CHECK: func.func @one_product_narrow
+// CHECK-NOT: tensor.dot_general
+// CHECK: tensor.cast(%0) {to = f32} : (tensor<3x1xbf16>) -> tensor<3x1xf32>
+// CHECK: tensor.cast(%1) {to = f32} : (tensor<1x5xbf16>) -> tensor<1x5xf32>
+// CHECK: tensor.mul(
+// CHECK: tensor.add(
+// CHECK: tensor.cast({{%[0-9]+}}) {to = bf16} : (tensor<3x5xf32>) -> tensor<3x5xbf16>
+func.func @one_product_narrow(%0: tensor<3x1xbf16>, %1: tensor<1x5xbf16>) -> tensor<3x5xbf16> {
+  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} : (tensor<3x1xbf16>, tensor<1x5xbf16>) -> tensor<3x5xbf16>
+  func.return(%2) : (tensor<3x5xbf16>) -> ()
+}
+
+// -----
+
+// A dot that sums more than one product stays.
+// CHECK: func.func @two_products
+// CHECK: tensor.dot_general(%0, %1)
+func.func @two_products(%0: tensor<3x2xf32>, %1: tensor<2x5xf32>) -> tensor<3x5xf32> {
+  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} : (tensor<3x2xf32>, tensor<2x5xf32>) -> tensor<3x5xf32>
+  func.return(%2) : (tensor<3x5xf32>) -> ()
+}

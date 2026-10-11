@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
-use gpt_rs_ir::dialects::func::ParamId;
+use gpt_rs_ir::dialects::func::{Func, ParamId};
 use gpt_rs_ir::module::{Module, Value};
 use gpt_rs_ir::passes::{self, Pass, Pipeline, PruneParams};
 use gpt_rs_ir::types::Type;
@@ -166,6 +166,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
         f(&mut GraphBuilder {
             arena: self,
             inner: &mut inner,
+            location: None,
         })
     }
 
@@ -387,7 +388,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
     /// does not hold yet, and stores the results there.
     fn load_static_params(&self, module: &Arc<Module>) -> Result<()> {
         for func in module.funcs() {
-            let attrs = module.op(func).as_func().expect("a function");
+            let attrs = module.op(func).get::<Func>().expect("a function");
             if !attrs.is_load_time() {
                 continue;
             }
@@ -439,6 +440,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
                     operands: inner.operands(op).to_vec(),
                     first: op.first,
                     result,
+                    location: op.location.clone(),
                 })
             })
             .collect()
@@ -730,7 +732,8 @@ fn build_module(
                                 .ok_or_else(|| anyhow!("{v:?} is not computed"))
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    let inst = b.build_op(node.op.clone(), operands, None, Vec::new())?;
+                    b.set_location(node.location.clone());
+                    let inst = b.create_op(node.op.clone(), operands, None, Vec::new());
                     insts.insert(node.first, inst);
                     inst
                 }
@@ -755,7 +758,7 @@ fn build_module(
 /// position among the plan inputs.
 fn prune_params(module: &mut Module) -> Result<Vec<InputBinding>> {
     let func = module.func("captured").expect("the captured function");
-    let attrs = module.op(func).as_func().expect("a function");
+    let attrs = module.op(func).get::<Func>().expect("a function");
     let args = module.args(module.regions(func)[0]);
     let bindings = args
         .iter()

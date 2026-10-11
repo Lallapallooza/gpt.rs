@@ -3,6 +3,7 @@
 use anyhow::Result;
 
 use super::{pass, Pass};
+use crate::dialects::func::Func;
 use crate::module::Module;
 
 /// Removes from every function the arguments bound to a parameter that nothing reads. A run-time
@@ -14,7 +15,7 @@ impl Pass for PruneParams {
     fn run(&self, module: &mut Module) -> Result<bool> {
         let mut pruned = 0;
         for func in module.funcs() {
-            let attrs = module.op(func).as_func().expect("a function");
+            let attrs = module.op(func).get::<Func>().expect("a function");
             let args = module.args(module.regions(func)[0]);
             let unread: Vec<usize> = (0..args.len())
                 .filter(|&i| attrs.param(i).is_some() && module.uses(args[i]).is_empty())

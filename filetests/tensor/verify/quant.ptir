@@ -8,9 +8,9 @@ func.func @dequantize_scale_extents(%0: tensor<4x64xf4e2m1>, %1: tensor<4x3xe8m0
 
 // -----
 
-// ERROR: tensor.dequantize: q must be an integer or narrow float tensor, got tensor<4x64xf32>
-func.func @dequantize_float(%0: tensor<4x64xf32>, %1: tensor<4x2xe8m0>) -> tensor<4x64xf32> {
-  %2 = tensor.dequantize(%0, %1) {block = [1, 32], to = f32} : (tensor<4x64xf32>, tensor<4x2xe8m0>) -> tensor<4x64xf32>
+// ERROR: tensor.dequantize: q must be an integer, narrow float or float tensor, got tensor<4x64xe8m0>
+func.func @dequantize_scales(%0: tensor<4x64xe8m0>, %1: tensor<4x2xe8m0>) -> tensor<4x64xf32> {
+  %2 = tensor.dequantize(%0, %1) {block = [1, 32], to = f32} : (tensor<4x64xe8m0>, tensor<4x2xe8m0>) -> tensor<4x64xf32>
   func.return(%2) : (tensor<4x64xf32>) -> ()
 }
 
@@ -32,73 +32,49 @@ func.func @quantize_to_float(%0: tensor<4x64xf32>, %1: tensor<4x2xf32>) -> tenso
 
 // -----
 
-// ERROR: tensor.quantize_dynamic: e8m0 scales are powers of two: they need scale_rule pow2_floor or pow2_ceil
-func.func @dynamic_e8m0_amax(%0: tensor<4x64xf32>) -> (tensor<4x64xsi8>, tensor<4x2xe8m0>) {
-  %1, %2 = tensor.quantize_dynamic(%0) {block = [1, 32], to = si8, scale_dtype = e8m0} : (tensor<4x64xf32>) -> (tensor<4x64xsi8>, tensor<4x2xe8m0>)
-  func.return(%1, %2) : (tensor<4x64xsi8>, tensor<4x2xe8m0>) -> ()
+// ERROR: tensor.block_scale_amax: e8m0 scales are powers of two, which this op does not give
+func.func @amax_e8m0(%0: tensor<4x64xf32>) -> tensor<4x2xe8m0> {
+  %1 = tensor.block_scale_amax(%0) {block = [1, 32], to = si8, scale_dtype = e8m0} : (tensor<4x64xf32>) -> tensor<4x2xe8m0>
+  func.return(%1) : (tensor<4x2xe8m0>) -> ()
 }
 
 // -----
 
-// ERROR: tensor.quantize_dynamic: a block of 2 needs a static extent, got {T}
-func.func @dynamic_block_extent(%0: tensor<{T}x64xf32>) -> (tensor<{T}x64xf4e2m1>, tensor<{T}x64xf32>) {
-  %1, %2 = tensor.quantize_dynamic(%0) {block = [2, 1], to = f4e2m1, scale_dtype = f32} : (tensor<{T}x64xf32>) -> (tensor<{T}x64xf4e2m1>, tensor<{T}x64xf32>)
-  func.return(%1, %2) : (tensor<{T}x64xf4e2m1>, tensor<{T}x64xf32>) -> ()
+// ERROR: tensor.block_scale_amax: a block of 2 needs a static extent, got {T}
+func.func @scale_block_extent(%0: tensor<{T}x64xf32>) -> tensor<{T}x64xf32> {
+  %1 = tensor.block_scale_amax(%0) {block = [2, 1], to = f4e2m1, scale_dtype = f32} : (tensor<{T}x64xf32>) -> tensor<{T}x64xf32>
+  func.return(%1) : (tensor<{T}x64xf32>) -> ()
 }
 
 // -----
 
-// ERROR: tensor.quantize: stochastic rounding needs a random operand
-func.func @stochastic_without_random(%0: tensor<8x16xf32>, %1: tensor<8x1xf32>) -> tensor<8x16xf8e4m3> {
-  %2 = tensor.quantize(%0, %1) {block = [1, 16], to = f8e4m3, rounding = stochastic} : (tensor<8x16xf32>, tensor<8x1xf32>) -> tensor<8x16xf8e4m3>
-  func.return(%2) : (tensor<8x16xf8e4m3>) -> ()
-}
-
-// -----
-
-// ERROR: tensor.quantize: only stochastic rounding reads random bits
-func.func @random_without_stochastic(%0: tensor<8x16xf32>, %1: tensor<8x1xf32>, %2: tensor<8x16xui32>) -> tensor<8x16xf8e4m3> {
-  %3 = tensor.quantize(%0, %1, %2) {block = [1, 16], to = f8e4m3, operand_segments = [1, 1, 0, 0, 1]} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x16xui32>) -> tensor<8x16xf8e4m3>
-  func.return(%3) : (tensor<8x16xf8e4m3>) -> ()
-}
-
-// -----
-
-// ERROR: tensor.quantize: the random bits must be tensor<8x16xui32>, got tensor<8x16xsi32>
+// ERROR: tensor.quantize_stochastic: the random bits must be tensor<8x16xui32>, got tensor<8x16xsi32>
 func.func @random_dtype(%0: tensor<8x16xf32>, %1: tensor<8x1xf32>, %2: tensor<8x16xsi32>) -> tensor<8x16xf8e4m3> {
-  %3 = tensor.quantize(%0, %1, %2) {block = [1, 16], to = f8e4m3, rounding = stochastic, operand_segments = [1, 1, 0, 0, 1]} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x16xsi32>) -> tensor<8x16xf8e4m3>
+  %3 = tensor.quantize_stochastic(%0, %1, %2) {block = [1, 16], to = f8e4m3} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x16xsi32>) -> tensor<8x16xf8e4m3>
   func.return(%3) : (tensor<8x16xf8e4m3>) -> ()
 }
 
 // -----
 
-// ERROR: tensor.quantize: a table quantizes to the nearest value
-func.func @table_stochastic(%0: tensor<8x16xf32>, %1: tensor<8x1xf32>, %2: tensor<16xf32>, %3: tensor<8x16xui32>) -> tensor<8x16xui4> {
-  %4 = tensor.quantize(%0, %1, %2, %3) {block = [1, 16], to = ui4, rounding = stochastic, operand_segments = [1, 1, 0, 1, 1]} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<16xf32>, tensor<8x16xui32>) -> tensor<8x16xui4>
-  func.return(%4) : (tensor<8x16xui4>) -> ()
+// ERROR: tensor.quantize_table: to must be an integer dtype, got f4e2m1
+func.func @table_float_codes(%0: tensor<4x64xf32>, %1: tensor<4x2xf16>, %2: tensor<16xf32>) -> tensor<4x64xf4e2m1> {
+  %3 = tensor.quantize_table(%0, %1, %2) {block = [1, 32], to = f4e2m1} : (tensor<4x64xf32>, tensor<4x2xf16>, tensor<16xf32>) -> tensor<4x64xf4e2m1>
+  func.return(%3) : (tensor<4x64xf4e2m1>) -> ()
 }
 
 // -----
 
-// ERROR: tensor.dequantize: codes with a table must be an integer dtype, got f4e2m1
-func.func @table_float_codes(%0: tensor<4x64xf4e2m1>, %1: tensor<4x2xf16>, %2: tensor<16xf32>) -> tensor<4x64xbf16> {
-  %3 = tensor.dequantize(%0, %1, %2) {block = [1, 32], to = bf16, operand_segments = [1, 1, 0, 1]} : (tensor<4x64xf4e2m1>, tensor<4x2xf16>, tensor<16xf32>) -> tensor<4x64xbf16>
-  func.return(%3) : (tensor<4x64xbf16>) -> ()
-}
-
-// -----
-
-// ERROR: tensor.dequantize: the table must have rank 1, got tensor<4x4xf32>
-func.func @table_rank(%0: tensor<4x64xui4>, %1: tensor<4x2xf16>, %2: tensor<4x4xf32>) -> tensor<4x64xbf16> {
-  %3 = tensor.dequantize(%0, %1, %2) {block = [1, 32], to = bf16, operand_segments = [1, 1, 0, 1]} : (tensor<4x64xui4>, tensor<4x2xf16>, tensor<4x4xf32>) -> tensor<4x64xbf16>
-  func.return(%3) : (tensor<4x64xbf16>) -> ()
+// ERROR: tensor.quantize_table: the table must have rank 1, got tensor<4x4xf32>
+func.func @table_rank(%0: tensor<4x64xf32>, %1: tensor<4x2xf16>, %2: tensor<4x4xf32>) -> tensor<4x64xui4> {
+  %3 = tensor.quantize_table(%0, %1, %2) {block = [1, 32], to = ui4} : (tensor<4x64xf32>, tensor<4x2xf16>, tensor<4x4xf32>) -> tensor<4x64xui4>
+  func.return(%3) : (tensor<4x64xui4>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.dequantize: the offset must have the scale's extents, got tensor<4x1xf16> and tensor<4x2xf16>
 func.func @offset_extents(%0: tensor<4x64xui4>, %1: tensor<4x2xf16>, %2: tensor<4x1xf16>) -> tensor<4x64xbf16> {
-  %3 = tensor.dequantize(%0, %1, %2) {block = [1, 32], to = bf16, operand_segments = [1, 1, 1, 0]} : (tensor<4x64xui4>, tensor<4x2xf16>, tensor<4x1xf16>) -> tensor<4x64xbf16>
+  %3 = tensor.dequantize(%0, %1, %2) {block = [1, 32], to = bf16} : (tensor<4x64xui4>, tensor<4x2xf16>, tensor<4x1xf16>) -> tensor<4x64xbf16>
   func.return(%3) : (tensor<4x64xbf16>) -> ()
 }
 
@@ -106,22 +82,14 @@ func.func @offset_extents(%0: tensor<4x64xui4>, %1: tensor<4x2xf16>, %2: tensor<
 
 // ERROR: tensor.dequantize: the offset must be a float tensor, got tensor<4x2xe8m0>
 func.func @offset_dtype(%0: tensor<4x64xui4>, %1: tensor<4x2xf16>, %2: tensor<4x2xe8m0>) -> tensor<4x64xbf16> {
-  %3 = tensor.dequantize(%0, %1, %2) {block = [1, 32], to = bf16, operand_segments = [1, 1, 1, 0]} : (tensor<4x64xui4>, tensor<4x2xf16>, tensor<4x2xe8m0>) -> tensor<4x64xbf16>
+  %3 = tensor.dequantize(%0, %1, %2) {block = [1, 32], to = bf16} : (tensor<4x64xui4>, tensor<4x2xf16>, tensor<4x2xe8m0>) -> tensor<4x64xbf16>
   func.return(%3) : (tensor<4x64xbf16>) -> ()
 }
 
 // -----
 
-// ERROR: tensor.quantize_dynamic: an asymmetric scale_dtype must be a float dtype, got e8m0
-func.func @asymmetric_e8m0(%0: tensor<4x64xf32>) -> (tensor<4x64xui8>, tensor<4x2xe8m0>, tensor<4x2xe8m0>) {
-  %1, %2, %3 = tensor.quantize_dynamic(%0) {block = [1, 32], to = ui8, scale_dtype = e8m0, scale_rule = pow2_floor, asymmetric = true} : (tensor<4x64xf32>) -> (tensor<4x64xui8>, tensor<4x2xe8m0>, tensor<4x2xe8m0>)
-  func.return(%1, %2, %3) : (tensor<4x64xui8>, tensor<4x2xe8m0>, tensor<4x2xe8m0>) -> ()
-}
-
-// -----
-
-// ERROR: tensor.quantize_dynamic: an asymmetric scale maps the block's range, not a power of two
-func.func @asymmetric_pow2(%0: tensor<4x64xf32>) -> (tensor<4x64xui8>, tensor<4x2xf32>, tensor<4x2xf32>) {
-  %1, %2, %3 = tensor.quantize_dynamic(%0) {block = [1, 32], to = ui8, scale_dtype = f32, scale_rule = pow2_ceil, asymmetric = true} : (tensor<4x64xf32>) -> (tensor<4x64xui8>, tensor<4x2xf32>, tensor<4x2xf32>)
-  func.return(%1, %2, %3) : (tensor<4x64xui8>, tensor<4x2xf32>, tensor<4x2xf32>) -> ()
+// ERROR: tensor.block_scale_range: scale_dtype must be a float dtype, got e8m0
+func.func @range_e8m0(%0: tensor<4x64xf32>) -> (tensor<4x2xe8m0>, tensor<4x2xe8m0>) {
+  %1, %2 = tensor.block_scale_range(%0) {block = [1, 32], to = ui8, scale_dtype = e8m0} : (tensor<4x64xf32>) -> (tensor<4x2xe8m0>, tensor<4x2xe8m0>)
+  func.return(%1, %2) : (tensor<4x2xe8m0>, tensor<4x2xe8m0>) -> ()
 }

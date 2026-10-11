@@ -1,0 +1,56 @@
+// RUN: pass canonicalize
+
+// Integer arith on index values and constants is one index expression, in canonical form.
+// CHECK: [[I:%[0-9]+]] = tile.index() {expr = d0 * 2 + 1, dtype = si64}
+// CHECK-NEXT: tile.yield([[I]])
+func.func @si64(%0: tensor<4xf32>) -> tensor<4xsi64> {
+  %1 = tile.block() {iters = [par 4], reads = [], folds = [none -> [d0]]} ({
+    %0 = tile.index() {expr = d0, dtype = si64} : () -> si64
+    %1 = arith.constant() {value = 2 : si64} : () -> si64
+    %2 = arith.mul(%0, %1) : (si64, si64) -> si64
+    %3 = arith.constant() {value = 1 : si64} : () -> si64
+    %4 = arith.add(%2, %3) : (si64, si64) -> si64
+    tile.yield(%4) : (si64) -> ()
+  }) : () -> tensor<4xsi64>
+  func.return(%1) : (tensor<4xsi64>) -> ()
+}
+
+// -----
+
+// The extents bound the values to the range of si32, so they fold. The negation of a minimum
+// folds too.
+// CHECK: [[I:%[0-9]+]] = tile.index() {expr = -min(d0, d1 - 1), dtype = si32}
+// CHECK-NEXT: tile.yield([[I]])
+func.func @si32_bounded(%0: tensor<4x3xf32>) -> tensor<4x3xsi32> {
+  %1 = tile.block() {iters = [par 4, par 3], reads = [], folds = [none -> [d0, d1]]} ({
+    %0 = tile.index() {expr = d0, dtype = si32} : () -> si32
+    %1 = tile.index() {expr = d1, dtype = si32} : () -> si32
+    %2 = arith.constant() {value = 1 : si32} : () -> si32
+    %3 = arith.sub(%1, %2) : (si32, si32) -> si32
+    %4 = arith.minimum(%0, %3) : (si32, si32) -> si32
+    %5 = arith.neg(%4) : (si32) -> si32
+    tile.yield(%5) : (si32) -> ()
+  }) : () -> tensor<4x3xsi32>
+  func.return(%1) : (tensor<4x3xsi32>) -> ()
+}
+
+// -----
+
+// A dynamic extent leaves the values unbounded, and a negative value is out of the range of ui64:
+// neither folds.
+// CHECK: arith.mul
+// CHECK: arith.sub
+func.func @unbounded(%0: tensor<{T}xf32>) -> (tensor<{T}xsi32>, tensor<4xui64>) {
+  %1 = tile.block() {iters = [par {T}], reads = [], folds = [none -> [d0]]} ({
+    %0 = tile.index() {expr = d0, dtype = si32} : () -> si32
+    %1 = arith.mul(%0, %0) : (si32, si32) -> si32
+    tile.yield(%1) : (si32) -> ()
+  }) : () -> tensor<{T}xsi32>
+  %2 = tile.block() {iters = [par 4], reads = [], folds = [none -> [d0]]} ({
+    %0 = tile.index() {expr = d0, dtype = ui64} : () -> ui64
+    %1 = arith.constant() {value = 3 : ui64} : () -> ui64
+    %2 = arith.sub(%0, %1) : (ui64, ui64) -> ui64
+    tile.yield(%2) : (ui64) -> ()
+  }) : () -> tensor<4xui64>
+  func.return(%1, %2) : (tensor<{T}xsi32>, tensor<4xui64>) -> ()
+}

@@ -1,0 +1,126 @@
+// RUN: pass tensor-to-tile
+
+// Arithmetic and transcendental ops of the unary and binary families.
+// CHECK: tile.block(%0, %1) {iters = [par 4], reads = [$0[d0], $1[d0]], folds = [none -> [d0]]}
+// CHECK-NEXT: ^body(%0: f32, %1: f32):
+// CHECK-NEXT: arith.add(%0, %1)
+// CHECK: arith.reciprocal
+// CHECK-NOT: tensor.
+func.func @arithmetic(%0: tensor<4xf32>, %1: tensor<4xf32>) -> tensor<4xf32> {
+  %2 = tensor.add(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %3 = tensor.sub(%2, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %4 = tensor.mul(%3, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %5 = tensor.div(%4, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %6 = tensor.maximum(%5, %0) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %7 = tensor.minimum(%6, %0) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %8 = tensor.neg(%7) : (tensor<4xf32>) -> tensor<4xf32>
+  %9 = tensor.abs(%8) : (tensor<4xf32>) -> tensor<4xf32>
+  %10 = tensor.exp(%9) : (tensor<4xf32>) -> tensor<4xf32>
+  %11 = tensor.log(%10) : (tensor<4xf32>) -> tensor<4xf32>
+  %12 = tensor.tanh(%11) : (tensor<4xf32>) -> tensor<4xf32>
+  %13 = tensor.erf(%12) : (tensor<4xf32>) -> tensor<4xf32>
+  %14 = tensor.rsqrt(%13) : (tensor<4xf32>) -> tensor<4xf32>
+  %15 = tensor.reciprocal(%14) : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%15) : (tensor<4xf32>) -> ()
+}
+
+// -----
+// Constants stay.
+// CHECK: tensor.constant() {value = dense<[2, 2] x f32: [1.0, -0.5, 1e-7, inf]>}
+func.func @constants() -> (tensor<2x2xf32>, tensor<3xsi32>, tensor<f32>, tensor<2xbf16>, tensor<2xf32>, tensor<1xf32>, tensor<2xi1>, tensor<2xf8e4m3>, tensor<0xf32>) {
+  %0 = tensor.constant() {value = dense<[2, 2] x f32: [1.0, -0.5, 1e-7, inf]>} : () -> tensor<2x2xf32>
+  %1 = tensor.constant() {value = dense<[3] x si32: 0>} : () -> tensor<3xsi32>
+  %2 = tensor.constant() {value = dense<[] x f32: 0.5>} : () -> tensor<f32>
+  %3 = tensor.constant() {value = dense<[2] x bf16: [1.0, 3.140625]>} : () -> tensor<2xbf16>
+  %4 = tensor.constant() {value = dense<[2] x f32: [-0.0, -inf]>} : () -> tensor<2xf32>
+  %5 = tensor.constant() {value = dense<[1] x f32: 0x0000c07f>} : () -> tensor<1xf32>
+  %6 = tensor.constant() {value = dense<[2] x i1: [true, false]>} : () -> tensor<2xi1>
+  %7 = tensor.constant() {value = dense<[2] x f8e4m3: 0x3840>} : () -> tensor<2xf8e4m3>
+  %8 = tensor.constant() {value = dense<[0] x f32: []>} : () -> tensor<0xf32>
+  func.return(%0, %1, %2, %3, %4, %5, %6, %7, %8) : (tensor<2x2xf32>, tensor<3xsi32>, tensor<f32>, tensor<2xbf16>, tensor<2xf32>, tensor<1xf32>, tensor<2xi1>, tensor<2xf8e4m3>, tensor<0xf32>) -> ()
+}
+
+// -----
+// CHECK: arith.less(%0, %1)
+// CHECK-NOT: tensor.
+func.func @compare(%0: tensor<4xf32>, %1: tensor<4xf32>) -> (tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>) {
+  %2 = tensor.less(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  %3 = tensor.less_equal(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  %4 = tensor.equal(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  %5 = tensor.greater_equal(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  %6 = tensor.greater(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  %7 = tensor.not_equal(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  func.return(%2, %3, %4, %5, %6, %7) : (tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>) -> ()
+}
+
+// -----
+// CHECK: iters = [par 2, par {T}]
+// CHECK: arith.greater_equal(%0, %1) : (si32, si32) -> i1
+// CHECK-NOT: tensor.
+func.func @compare_si32(%0: tensor<2x{T}xsi32>, %1: tensor<2x{T}xsi32>) -> tensor<2x{T}xi1> {
+  %2 = tensor.greater_equal(%0, %1) : (tensor<2x{T}xsi32>, tensor<2x{T}xsi32>) -> tensor<2x{T}xi1>
+  func.return(%2) : (tensor<2x{T}xi1>) -> ()
+}
+
+// -----
+// CHECK: reads = [$0[d0, d1], $1[d0, d1], $2[d0, d1]]
+// CHECK: arith.select(%0, %1, %2) : (i1, f32, f32) -> f32
+// CHECK-NOT: tensor.
+func.func @select(%0: tensor<2x{T}xi1>, %1: tensor<2x{T}xf32>, %2: tensor<2x{T}xf32>) -> tensor<2x{T}xf32> {
+  %3 = tensor.select(%0, %1, %2) : (tensor<2x{T}xi1>, tensor<2x{T}xf32>, tensor<2x{T}xf32>) -> tensor<2x{T}xf32>
+  func.return(%3) : (tensor<2x{T}xf32>) -> ()
+}
+
+// -----
+// CHECK: arith.cast(%0) {to = f32} : (bf16) -> f32
+// CHECK: arith.cast(%0) {to = i1} : (si32) -> i1
+// CHECK-NOT: tensor.
+func.func @cast(%0: tensor<2x3xbf16>, %1: tensor<4xsi32>) -> (tensor<2x3xf32>, tensor<4xi1>, tensor<4xsi32>) {
+  %2 = tensor.cast(%0) {to = f32} : (tensor<2x3xbf16>) -> tensor<2x3xf32>
+  %3 = tensor.cast(%1) {to = i1} : (tensor<4xsi32>) -> tensor<4xi1>
+  %4 = tensor.cast(%1) {to = si32} : (tensor<4xsi32>) -> tensor<4xsi32>
+  func.return(%2, %3, %4) : (tensor<2x3xf32>, tensor<4xi1>, tensor<4xsi32>) -> ()
+}
+
+// -----
+// `stop_gradient` is its input.
+// CHECK: func.return(%0)
+func.func @stop_gradient(%0: tensor<2x{T}xf32>) -> tensor<2x{T}xf32> {
+  %1 = tensor.stop_gradient(%0) : (tensor<2x{T}xf32>) -> tensor<2x{T}xf32>
+  func.return(%1) : (tensor<2x{T}xf32>) -> ()
+}
+
+// -----
+// The ops that compute on bits, and sin and cos.
+// `x & x` reads one operand twice.
+// CHECK: tile.block(%0) {iters = [par 4], reads = [$0[d0], $0[d0]], folds = [none -> [d0]]}
+// CHECK: arith.and
+// CHECK: arith.shift_right_arithmetic
+// CHECK: arith.not({{%[0-9]+}}) : (i1) -> i1
+// CHECK-NOT: tensor.
+func.func @bits(%0: tensor<4xui8>, %1: tensor<4xi1>, %2: tensor<4xf64>) -> (tensor<4xui8>, tensor<4xi1>, tensor<4xf64>) {
+  %3 = tensor.and(%0, %0) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+  %4 = tensor.or(%3, %0) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+  %5 = tensor.xor(%4, %0) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+  %6 = tensor.shift_left(%5, %0) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+  %7 = tensor.shift_right_logical(%6, %0) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+  %8 = tensor.shift_right_arithmetic(%7, %0) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+  %9 = tensor.not(%8) : (tensor<4xui8>) -> tensor<4xui8>
+  %10 = tensor.not(%1) : (tensor<4xi1>) -> tensor<4xi1>
+  %11 = tensor.sin(%2) : (tensor<4xf64>) -> tensor<4xf64>
+  %12 = tensor.cos(%11) : (tensor<4xf64>) -> tensor<4xf64>
+  func.return(%9, %10, %12) : (tensor<4xui8>, tensor<4xi1>, tensor<4xf64>) -> ()
+}
+
+// -----
+// Casts between the integer widths, and to the fnuz floats.
+// CHECK: arith.cast(%0) {to = ui64} : (si16) -> ui64
+// CHECK: arith.cast(%0) {to = f8e4m3fnuz}
+// CHECK: arith.cast(%0) {to = f8e5m2fnuz}
+// CHECK-NOT: tensor.
+func.func @casts(%0: tensor<4xsi16>, %1: tensor<4xf32>) -> (tensor<4xui64>, tensor<4xf8e4m3fnuz>, tensor<4xf8e5m2fnuz>) {
+  %2 = tensor.cast(%0) {to = ui64} : (tensor<4xsi16>) -> tensor<4xui64>
+  %3 = tensor.cast(%1) {to = f8e4m3fnuz} : (tensor<4xf32>) -> tensor<4xf8e4m3fnuz>
+  %4 = tensor.cast(%1) {to = f8e5m2fnuz} : (tensor<4xf32>) -> tensor<4xf8e5m2fnuz>
+  func.return(%2, %3, %4) : (tensor<4xui64>, tensor<4xf8e4m3fnuz>, tensor<4xf8e5m2fnuz>) -> ()
+}

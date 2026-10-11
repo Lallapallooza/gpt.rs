@@ -14,10 +14,12 @@ use anyhow::{ensure, Result};
 use gpt_rs_ir::dialects::tensor::DotGeneral;
 
 use crate::backend::PortableBackend;
-use crate::ops::functional::attention::MASKED_BIAS;
 use crate::ops::functional::matmul;
 use crate::tensor::{DType, DeviceTensor, Shape};
 use crate::{ensure_dtype, ensure_rank, ensure_same_shape, functional, s};
+
+/// Additive bias of the masked entries of a decay matrix: `exp` maps it to exactly 0.
+const MASKED_BIAS: f32 = -1e9;
 
 /// Chunk length of the WY-form evaluation in [`gated_delta_rule`].
 const CHUNK: usize = 64;
@@ -171,7 +173,8 @@ struct DeltaRulePlan {
 ///
 /// The implementation evaluates this recurrence in fixed-length chunks in the WY form, as the FLA
 /// chunked kernels do. So the recorded graph uses only dense core ops. Its size grows with the
-/// number of chunks, not with the number of tokens.
+/// number of chunks, not with the number of tokens. A chunk of one token, such as a decode step,
+/// has no intra-chunk system, so it records the recurrence above for its token.
 #[functional]
 pub fn gated_delta_rule(
     q: &Tensor,
@@ -338,48 +341,108 @@ fn gated_delta_rule_chunked<B: PortableBackend + 'static>(
         let gc = g_all.slice(s![.., start..start + l]);
         let bc = beta_all.slice(s![.., start..start + l]);
 
-        // Inclusive cumulative sum over the chunk: G = g @ U with U[j, i] = [i >= j].
-        let lower = tril_mask(&gc, l, 0, 1.0, 0.0);
-        let upper = lower.transpose([1, 0]);
-        let cum = gc.dot_general(&upper, DotGeneral::contract([1], [0]));
-
-        // The bias is 0 on and below the diagonal and a large negative value above it. `exp` maps
-        // the masked entries to exactly 0, and their positive differences never overflow.
-        let causal_bias = tril_mask(&gc, l, 0, 0.0, MASKED_BIAS);
-        let strict = tril_mask(&gc, l, -1, 1.0, 0.0);
-        let diff = cum.reshape([hv, l, 1]) - cum.reshape([hv, 1, l]);
-        // exp(G_i - G_j) on and below the diagonal, 0 above.
-        let decay = (diff + causal_bias).exp();
-
         let beta_col = bc.reshape([hv, l, 1]);
-        let a = batched_dot(&kc, &kc, 2, 2) * &decay * &beta_col * strict;
-        let eye = &lower * &upper;
-        let mut inv = eye - &a * off_diagonal_block_mask(&gc, l, 1);
-        let mut block = 2usize;
-        while block < l {
-            let coupling = &a * off_diagonal_block_mask(&gc, l, block);
-            inv = &inv - matmul(&matmul(&inv, &coupling), &inv);
-            block *= 2;
-        }
-
-        let exp_cum = cum.exp().reshape([hv, l, 1]);
-        let v_beta = &vc * &beta_col;
-        let k_beta_decay = &kc * (beta_col * &exp_cum);
-        let u = matmul(&inv, &v_beta);
-        let w = matmul(&inv, &k_beta_decay);
+        let ChunkTerms {
+            exp_cum,
+            u,
+            w,
+            scores,
+            k_tail,
+        } = if l == 1 {
+            one_token_terms(&qc, &kc, &vc, &gc, &beta_col)
+        } else {
+            wy_terms(&qc, &kc, &vc, &gc, &beta_col, l)
+        };
         let v_new = u - matmul(&w, &s);
         let o_inter = matmul(&(&qc * &exp_cum), &s);
-        let qk = batched_dot(&qc, &kc, 2, 2) * decay;
-        outputs.push(o_inter + matmul(&qk, &v_new));
+        outputs.push(o_inter + matmul(&scores, &v_new));
 
-        let last = cum.slice(s![.., l - 1..l]);
-        let tail_decay = (&last - &cum).exp().reshape([hv, l, 1]);
-        let k_tail = kc * tail_decay;
-        let carry = last.exp().reshape([hv, 1, 1]);
+        let carry = exp_cum.slice(s![.., l - 1..l, ..]);
         s = s * carry + batched_dot(&k_tail, &v_new, 1, 1);
         start += l;
     }
 
     let outputs: Vec<_> = outputs.iter().collect();
     (DeviceTensor::concat(1, &outputs), s)
+}
+
+/// What a chunk contributes besides the carried state: the cumulative decays `exp(G)` (`[Hv, L, 1]`),
+/// `U` and `W` with `V_new = U - W S`, the decayed scores `(Q K^T) * exp(G_i - G_j)` that weigh
+/// `V_new`, and the keys decayed to the chunk's end, which update the state.
+struct ChunkTerms<B: PortableBackend + 'static> {
+    exp_cum: DeviceTensor<B>,
+    u: DeviceTensor<B>,
+    w: DeviceTensor<B>,
+    scores: DeviceTensor<B>,
+    k_tail: DeviceTensor<B>,
+}
+
+/// The terms of a chunk of `l` tokens: the intra-chunk system `(I + A) X = B` of
+/// [`gated_delta_rule_chunked`], solved by doubling.
+fn wy_terms<B: PortableBackend + 'static>(
+    qc: &DeviceTensor<B>,
+    kc: &DeviceTensor<B>,
+    vc: &DeviceTensor<B>,
+    gc: &DeviceTensor<B>,
+    beta_col: &DeviceTensor<B>,
+    l: usize,
+) -> ChunkTerms<B> {
+    let hv = gc.shape().dims()[0];
+    // Inclusive cumulative sum over the chunk: G = g @ U with U[j, i] = [i >= j].
+    let lower = tril_mask(gc, l, 0, 1.0, 0.0);
+    let upper = lower.transpose([1, 0]);
+    let cum = gc.dot_general(&upper, DotGeneral::contract([1], [0]));
+
+    // The bias is 0 on and below the diagonal and a large negative value above it. `exp` maps
+    // the masked entries to exactly 0, and their positive differences never overflow.
+    let causal_bias = tril_mask(gc, l, 0, 0.0, MASKED_BIAS);
+    let strict = tril_mask(gc, l, -1, 1.0, 0.0);
+    let diff = cum.reshape([hv, l, 1]) - cum.reshape([hv, 1, l]);
+    // exp(G_i - G_j) on and below the diagonal, 0 above.
+    let decay = (diff + causal_bias).exp();
+
+    let a = batched_dot(kc, kc, 2, 2) * &decay * beta_col * strict;
+    let eye = &lower * &upper;
+    let mut inv = eye - &a * off_diagonal_block_mask(gc, l, 1);
+    let mut block = 2usize;
+    while block < l {
+        let coupling = &a * off_diagonal_block_mask(gc, l, block);
+        inv = &inv - matmul(&matmul(&inv, &coupling), &inv);
+        block *= 2;
+    }
+
+    let exp_cum = cum.exp().reshape([hv, l, 1]);
+    let v_beta = vc * beta_col;
+    let k_beta_decay = kc * (beta_col * &exp_cum);
+    let last = cum.slice(s![.., l - 1..l]);
+    let tail_decay = (&last - &cum).exp().reshape([hv, l, 1]);
+    ChunkTerms {
+        u: matmul(&inv, &v_beta),
+        w: matmul(&inv, &k_beta_decay),
+        scores: batched_dot(qc, kc, 2, 2) * decay,
+        k_tail: kc * tail_decay,
+        exp_cum,
+    }
+}
+
+/// The terms of a chunk of one token, the recurrent step. The cumulative log-decay of the chunk is
+/// the log-decay of its one token.
+/// `A` has no entry below the diagonal, so `I + A` is `I`. The decay from the token to itself and
+/// to the chunk's end is `exp(0) = 1`.
+fn one_token_terms<B: PortableBackend + 'static>(
+    qc: &DeviceTensor<B>,
+    kc: &DeviceTensor<B>,
+    vc: &DeviceTensor<B>,
+    gc: &DeviceTensor<B>,
+    beta_col: &DeviceTensor<B>,
+) -> ChunkTerms<B> {
+    let hv = gc.shape().dims()[0];
+    let exp_g = gc.exp().reshape([hv, 1, 1]);
+    ChunkTerms {
+        u: vc * beta_col,
+        w: kc * (beta_col * &exp_g),
+        scores: batched_dot(qc, kc, 2, 2),
+        k_tail: kc.clone(),
+        exp_cum: exp_g,
+    }
 }

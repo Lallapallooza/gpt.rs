@@ -1,87 +1,56 @@
-//! Semantics of the ops in `ir/elementwise.rs`.
+//! Semantics of the elementwise ops.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{anyhow, bail, Result};
 
-use super::kernels::{cast, from_f32, from_f64, from_ints, values, Chunks, Values};
-use crate::attr::Mnemonic;
-use crate::dialects::tensor::ir::{
-    Binary, BinaryKind, BinaryOperands, BinaryResults, Cast, CastOperands, CastResults, Compare,
-    CompareKind, CompareOperands, CompareResults, ReduceKind, Select, SelectOperands,
-    SelectResults, StopGradient, StopGradientOperands, StopGradientResults, Unary, UnaryKind,
-    UnaryOperands, UnaryResults,
-};
+use super::kernels::{cast, from_f32, from_f64, from_ints, rounder, values, Chunks, Values};
+use crate::dialects::tensor::ir::*;
 use crate::host::{Buffer, HostTensor, TensorData};
 use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
+use crate::scalar::{BinaryMath, Combiner, CompareMath, UnaryMath};
 use crate::types::{DType, IntFormat};
 
 /// The arithmetic of the types the interpreter computes in: f32, f64, and i128 for the integer
 /// dtypes and `i1`, whose results the caller wraps to the dtype.
-pub(super) trait Arith: Copy {
-    /// `kind` on one element, or `None` when the type has no such op.
-    fn unary(kind: UnaryKind) -> Option<fn(Self) -> Self>;
-    /// `kind` on one pair of elements, or `None` when the type has no such op. The shifts depend
-    /// on the dtype's width, which [`shift`] reads.
-    fn binary(kind: BinaryKind) -> Option<fn(Self, Self) -> Self>;
-    /// The value a `kind` reduction of no `dtype` elements gives, which every reduction starts
-    /// from.
-    fn reduce_init(kind: ReduceKind, dtype: DType) -> Option<Self>;
+pub(crate) trait Arith: Copy {
+    /// The op `T` on one element of `dtype`.
+    fn unary<T: UnaryMath>(dtype: DType) -> Result<impl Fn(Self) -> Self>;
+    /// The op `T` on two elements of `dtype`, `None` for operands it leaves undefined.
+    fn binary<T: BinaryMath>(dtype: DType) -> Result<impl Fn(Self, Self) -> Option<Self>>;
+    /// The value a fold with `C` of no elements of `dtype` gives, which every fold starts from.
+    fn fold_init<C: Combiner>(dtype: DType) -> Result<Self>;
     /// `a` against `b`, with NaN above every number and equal to NaN.
     fn order(a: Self, b: Self) -> Ordering;
+    /// The elements of `values` when the type computes them.
+    fn of<'a>(values: &'a Values<'_>) -> Option<&'a [Self]>;
+    /// `values` as the elements of a tensor.
+    fn into_values(values: Vec<Self>) -> Values<'static>;
+    /// What a value of `dtype` keeps of a result: the result wrapped into an integer dtype's
+    /// range, or rounded to a float dtype.
+    fn rounder(dtype: DType) -> Result<impl Fn(Self) -> Self>;
 }
 
-/// The float arithmetic: IEEE 754 operations. `maximum` and `minimum` give NaN when either
-/// operand is NaN, and order `-0.0` below `0.0`.
+/// The error of an op that has no form for `dtype`.
+fn missing(op: &str, dtype: DType) -> anyhow::Error {
+    anyhow!("the interpreter has no {dtype} {op}")
+}
+
 macro_rules! float_arith {
-    ($t:ty, $erf:path) => {
+    ($t:ty, $variant:ident, $round:expr) => {
         impl Arith for $t {
-            fn unary(kind: UnaryKind) -> Option<fn($t) -> $t> {
-                Some(match kind {
-                    UnaryKind::Neg => |x| -x,
-                    UnaryKind::Abs => <$t>::abs,
-                    UnaryKind::Exp => <$t>::exp,
-                    UnaryKind::Log => <$t>::ln,
-                    UnaryKind::Tanh => <$t>::tanh,
-                    UnaryKind::Erf => $erf,
-                    UnaryKind::Rsqrt => |x| 1.0 / x.sqrt(),
-                    UnaryKind::Reciprocal => |x| 1.0 / x,
-                    UnaryKind::Sin => <$t>::sin,
-                    UnaryKind::Cos => <$t>::cos,
-                    UnaryKind::Not => return None,
-                })
+            fn unary<T: UnaryMath>(dtype: DType) -> Result<impl Fn($t) -> $t> {
+                T::float::<$t>().ok_or_else(|| missing(T::INFO.name, dtype))
             }
 
-            fn binary(kind: BinaryKind) -> Option<fn($t, $t) -> $t> {
-                Some(match kind {
-                    BinaryKind::Add => |x, y| x + y,
-                    BinaryKind::Sub => |x, y| x - y,
-                    BinaryKind::Mul => |x, y| x * y,
-                    BinaryKind::Div => |x, y| x / y,
-                    // Equal operands differ at most in the sign of a zero.
-                    BinaryKind::Maximum => |x, y| match (x.is_nan() || y.is_nan(), x == y) {
-                        (true, _) => <$t>::NAN,
-                        (false, true) if x.is_sign_negative() => y,
-                        (false, _) if x >= y => x,
-                        _ => y,
-                    },
-                    BinaryKind::Minimum => |x, y| match (x.is_nan() || y.is_nan(), x == y) {
-                        (true, _) => <$t>::NAN,
-                        (false, true) if x.is_sign_negative() => x,
-                        (false, _) if x < y => x,
-                        _ => y,
-                    },
-                    _ => return None,
-                })
+            fn binary<T: BinaryMath>(dtype: DType) -> Result<impl Fn($t, $t) -> Option<$t>> {
+                let op = T::float::<$t>().ok_or_else(|| missing(T::INFO.name, dtype))?;
+                Ok(move |x, y| Some(op(x, y)))
             }
 
-            fn reduce_init(kind: ReduceKind, _dtype: DType) -> Option<$t> {
-                Some(match kind {
-                    ReduceKind::Sum => 0.0,
-                    ReduceKind::Max => <$t>::NEG_INFINITY,
-                    ReduceKind::Min => <$t>::INFINITY,
-                    ReduceKind::And | ReduceKind::Or => return None,
-                })
+            fn fold_init<C: Combiner>(dtype: DType) -> Result<$t> {
+                C::float_init::<$t>().ok_or_else(|| missing(C::INFO.name, dtype))
             }
 
             fn order(a: $t, b: $t) -> Ordering {
@@ -92,189 +61,122 @@ macro_rules! float_arith {
                     (false, false) => a.partial_cmp(&b).expect("neither is NaN"),
                 }
             }
+
+            fn of<'a>(values: &'a Values<'_>) -> Option<&'a [$t]> {
+                match values {
+                    Values::$variant(v) => Some(v),
+                    _ => None,
+                }
+            }
+
+            fn into_values(values: Vec<$t>) -> Values<'static> {
+                Values::$variant(Cow::Owned(values))
+            }
+
+            fn rounder(dtype: DType) -> Result<impl Fn($t) -> $t> {
+                Ok($round(dtype))
+            }
         }
     };
 }
 
-float_arith!(f32, libm::erff);
-float_arith!(f64, libm::erf);
+float_arith!(f32, F32, rounder);
+float_arith!(f64, F64, |_| |x| x);
 
-/// The integer arithmetic on exact values. `div` truncates toward zero and needs a divisor other
-/// than 0.
+/// The integer arithmetic on exact values.
 impl Arith for i128 {
-    fn unary(kind: UnaryKind) -> Option<fn(i128) -> i128> {
-        Some(match kind {
-            UnaryKind::Neg => i128::wrapping_neg,
-            UnaryKind::Abs => i128::wrapping_abs,
-            UnaryKind::Not => |x| !x,
-            _ => return None,
-        })
+    fn unary<T: UnaryMath>(dtype: DType) -> Result<impl Fn(i128) -> i128> {
+        T::int().ok_or_else(|| missing(T::INFO.name, dtype))
     }
 
-    fn binary(kind: BinaryKind) -> Option<fn(i128, i128) -> i128> {
-        Some(match kind {
-            BinaryKind::Add => i128::wrapping_add,
-            BinaryKind::Sub => i128::wrapping_sub,
-            BinaryKind::Mul => i128::wrapping_mul,
-            BinaryKind::Div => |x, y| x / y,
-            BinaryKind::Maximum => i128::max,
-            BinaryKind::Minimum => i128::min,
-            BinaryKind::And => |x, y| x & y,
-            BinaryKind::Or => |x, y| x | y,
-            BinaryKind::Xor => |x, y| x ^ y,
-            _ => return None,
-        })
+    fn binary<T: BinaryMath>(dtype: DType) -> Result<impl Fn(i128, i128) -> Option<i128>> {
+        let op = T::int().ok_or_else(|| missing(T::INFO.name, dtype))?;
+        let format = int_format(dtype)?;
+        Ok(move |x, y| op(x, y, format))
     }
 
-    fn reduce_init(kind: ReduceKind, dtype: DType) -> Option<i128> {
-        let int = dtype.int_format()?;
-        Some(match kind {
-            ReduceKind::Sum | ReduceKind::Or => 0,
-            ReduceKind::Max => int.min(),
-            ReduceKind::Min => int.max(),
-            ReduceKind::And => -1,
-        })
+    fn fold_init<C: Combiner>(dtype: DType) -> Result<i128> {
+        Ok(C::int_init(int_format(dtype)?))
     }
 
     fn order(a: i128, b: i128) -> Ordering {
         a.cmp(&b)
     }
-}
 
-/// `x` shifted as `kind` says by `amount`, both integers of `int`. The amount reads as unsigned;
-/// shifting by at least the width gives 0, or the sign in every bit for an arithmetic right shift.
-fn shift(kind: BinaryKind, int: IntFormat, x: i128, amount: i128) -> i128 {
-    let amount = int.pattern(amount);
-    let outside = amount >= i128::from(int.bits);
-    match (kind, outside) {
-        (BinaryKind::ShiftLeft, false) => x << amount,
-        (BinaryKind::ShiftRightLogical, false) => int.pattern(x) >> amount,
-        (BinaryKind::ShiftRightArithmetic, false) => x >> amount,
-        (BinaryKind::ShiftRightArithmetic, true) if x < 0 => -1,
-        _ => 0,
+    fn of<'a>(values: &'a Values<'_>) -> Option<&'a [i128]> {
+        match values {
+            Values::Int(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    fn into_values(values: Vec<i128>) -> Values<'static> {
+        Values::Int(values)
+    }
+
+    fn rounder(dtype: DType) -> Result<impl Fn(i128) -> i128> {
+        let int = int_format(dtype)?;
+        Ok(move |x| int.wrap(x))
     }
 }
 
-impl Eval for Unary {
-    fn eval(
-        &self,
-        ins: UnaryOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
-    ) -> Result<UnaryResults<OwnedHost>> {
-        let input = ins.input;
-        let dtype = input.dtype();
-        let missing = || anyhow!("the interpreter has no {dtype} {}", self.kind.mnemonic());
-        let data = match values(&input.data) {
-            Values::Int(x) => {
-                let (f, int) = (
-                    i128::unary(self.kind).ok_or_else(missing)?,
-                    int_format(dtype)?,
-                );
-                from_ints(dtype, x.into_iter().map(|x| int.wrap(f(x))))?
-            }
-            Values::F32(x) => {
-                let f = f32::unary(self.kind).ok_or_else(missing)?;
-                from_f32(dtype, x.iter().map(|&x| f(x)))?
-            }
-            Values::F64(x) => {
-                let f = f64::unary(self.kind).ok_or_else(missing)?;
-                from_f64(dtype, x.iter().map(|&x| f(x)))?
-            }
-        };
-        Ok(UnaryResults {
-            output: HostTensor::new(input.dims.clone(), data)?,
-        })
+/// The op `T` on each element of `x`, rounded to its dtype.
+pub(crate) fn unary_data<T: UnaryMath>(x: &TensorData) -> Result<TensorData> {
+    let dtype = x.dtype();
+    match values(x) {
+        Values::Int(x) => {
+            let (op, int) = (i128::unary::<T>(dtype)?, int_format(dtype)?);
+            from_ints(dtype, x.into_iter().map(|x| int.wrap(op(x))))
+        }
+        Values::F32(x) => {
+            let op = f32::unary::<T>(dtype)?;
+            from_f32(dtype, x.iter().map(|&x| op(x)))
+        }
+        Values::F64(x) => {
+            let op = f64::unary::<T>(dtype)?;
+            from_f64(dtype, x.iter().map(|&x| op(x)))
+        }
     }
 }
 
 /// The width and signedness of the integer dtype `dtype`.
-pub(super) fn int_format(dtype: DType) -> Result<IntFormat> {
+pub(crate) fn int_format(dtype: DType) -> Result<IntFormat> {
     dtype
         .int_format()
         .ok_or_else(|| anyhow!("{dtype} is not an integer dtype"))
 }
 
-impl Eval for Binary {
-    fn eval(
-        &self,
-        ins: BinaryOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
-    ) -> Result<BinaryResults<OwnedHost>> {
-        let dtype = ins.lhs.dtype();
-        let kind = self.kind;
-        let missing = || anyhow!("the interpreter has no {dtype} {}", kind.mnemonic());
-        let data = match (values(&ins.lhs.data), values(&ins.rhs.data)) {
-            (Values::Int(a), Values::Int(b)) => {
-                let int = int_format(dtype)?;
-                let pairs = a.into_iter().zip(b);
-                let results: Vec<i128> = match kind {
-                    BinaryKind::ShiftLeft
-                    | BinaryKind::ShiftRightLogical
-                    | BinaryKind::ShiftRightArithmetic => {
-                        pairs.map(|(x, y)| shift(kind, int, x, y)).collect()
-                    }
-                    _ => {
-                        let f = i128::binary(kind).ok_or_else(missing)?;
-                        let pairs: Vec<(i128, i128)> = pairs.collect();
-                        ensure!(
-                            kind != BinaryKind::Div || pairs.iter().all(|&(_, y)| y != 0),
-                            "integer division by zero"
-                        );
-                        pairs.into_iter().map(|(x, y)| f(x, y)).collect()
-                    }
-                };
-                from_ints(dtype, results.into_iter().map(|x| int.wrap(x)))?
-            }
-            (Values::F32(a), Values::F32(b)) => {
-                let f = f32::binary(kind).ok_or_else(missing)?;
-                from_f32(dtype, a.iter().zip(b.iter()).map(|(&x, &y)| f(x, y)))?
-            }
-            (Values::F64(a), Values::F64(b)) => {
-                let f = f64::binary(kind).ok_or_else(missing)?;
-                from_f64(dtype, a.iter().zip(b.iter()).map(|(&x, &y)| f(x, y)))?
-            }
-            _ => bail!("{} operands differ in dtype", kind.mnemonic()),
-        };
-        Ok(BinaryResults {
-            output: HostTensor::new(ins.lhs.dims.clone(), data)?,
-        })
-    }
-}
-
-impl Eval for Compare {
-    fn eval(
-        &self,
-        ins: CompareOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
-    ) -> Result<CompareResults<OwnedHost>> {
-        let flags = match (values(&ins.lhs.data), values(&ins.rhs.data)) {
-            (Values::Int(a), Values::Int(b)) => self.kind.flags(&a, &b),
-            (Values::F32(a), Values::F32(b)) => self.kind.flags(&a, &b),
-            (Values::F64(a), Values::F64(b)) => self.kind.flags(&a, &b),
-            _ => bail!("compared operands differ in dtype"),
-        };
-        Ok(CompareResults {
-            output: HostTensor::new(ins.lhs.dims.clone(), TensorData::I1(flags))?,
-        })
-    }
-}
-
-impl CompareKind {
-    /// 1 where the comparison holds between the elements of `a` and `b` at a position, else 0.
-    /// Every comparison with NaN fails, except `not_equal`.
-    fn flags<T: PartialOrd>(self, a: &[T], b: &[T]) -> Buffer<u8> {
-        let holds = |x, y| match self {
-            CompareKind::Less => x < y,
-            CompareKind::LessEqual => x <= y,
-            CompareKind::Equal => x == y,
-            CompareKind::GreaterEqual => x >= y,
-            CompareKind::Greater => x > y,
-            CompareKind::NotEqual => x != y,
-        };
-        a.iter()
-            .zip(b)
-            .map(|(x, y)| u8::from(holds(x, y)))
-            .collect()
+/// The op `T` on each pair of elements of `a` and `b`, of one dtype, rounded to it.
+pub(crate) fn binary_data<T: BinaryMath>(a: &TensorData, b: &TensorData) -> Result<TensorData> {
+    let dtype = a.dtype();
+    let name = T::INFO.name;
+    match (values(a), values(b)) {
+        (Values::Int(a), Values::Int(b)) => {
+            let (op, int) = (i128::binary::<T>(dtype)?, int_format(dtype)?);
+            let results = a
+                .into_iter()
+                .zip(b)
+                .map(|(x, y)| op(x, y).ok_or_else(|| anyhow!("{name}: integer division by zero")))
+                .collect::<Result<Vec<i128>>>()?;
+            from_ints(dtype, results.into_iter().map(|x| int.wrap(x)))
+        }
+        (Values::F32(a), Values::F32(b)) => {
+            let op = f32::binary::<T>(dtype)?;
+            let results = a.iter().zip(b.iter()).map(|(&x, &y)| op(x, y));
+            from_f32(
+                dtype,
+                results.map(|x| x.expect("float ops are defined everywhere")),
+            )
+        }
+        (Values::F64(a), Values::F64(b)) => {
+            let op = f64::binary::<T>(dtype)?;
+            let results = a.iter().zip(b.iter()).map(|(&x, &y)| op(x, y));
+            from_f64(
+                dtype,
+                results.map(|x| x.expect("float ops are defined everywhere")),
+            )
+        }
+        _ => bail!("{name} operands differ in dtype"),
     }
 }
 
@@ -295,7 +197,7 @@ impl Eval for Select {
             out.set(i, branch.get(i));
         }
         Ok(SelectResults {
-            output: HostTensor::new(ins.on_true.dims.clone(), out.into_data()?)?,
+            output: HostTensor::new(ins.on_true.dims, out.into_data()?)?,
         })
     }
 }
@@ -307,7 +209,7 @@ impl Eval for Cast {
         _cx: &mut EvalCx<'_, NoRegions>,
     ) -> Result<CastResults<OwnedHost>> {
         Ok(CastResults {
-            output: HostTensor::new(ins.input.dims.clone(), cast(&ins.input.data, self.to)?)?,
+            output: HostTensor::new(ins.input.dims, cast(&ins.input.data, self.to)?)?,
         })
     }
 }
@@ -322,4 +224,57 @@ impl Eval for StopGradient {
             output: ins.input.clone(),
         })
     }
+}
+
+/// The semantics of every [`Unary`] op.
+pub(crate) fn unary<T: Unary>(
+    _op: &T,
+    ins: UnaryOperands<Host<'_>>,
+    _cx: &mut EvalCx<'_, NoRegions>,
+) -> Result<UnaryResults<OwnedHost>> {
+    let data = unary_data::<T::Scalar>(&ins.input.data)?;
+    Ok(UnaryResults {
+        output: HostTensor::new(ins.input.dims, data)?,
+    })
+}
+
+/// The semantics of every [`Binary`] op.
+pub(crate) fn binary<T: Binary>(
+    _op: &T,
+    ins: BinaryOperands<Host<'_>>,
+    _cx: &mut EvalCx<'_, NoRegions>,
+) -> Result<BinaryResults<OwnedHost>> {
+    let data = binary_data::<T::Scalar>(&ins.lhs.data, &ins.rhs.data)?;
+    Ok(BinaryResults {
+        output: HostTensor::new(ins.lhs.dims, data)?,
+    })
+}
+
+/// 1 where the relation of `T` holds between the elements of `a` and `b` at a position, else 0.
+pub(crate) fn compare_data<T: CompareMath>(a: &TensorData, b: &TensorData) -> Result<TensorData> {
+    fn flags<T: CompareMath, V: PartialOrd + Copy>(a: &[V], b: &[V]) -> Buffer<u8> {
+        a.iter()
+            .zip(b)
+            .map(|(&lhs, &rhs)| u8::from(T::holds(lhs, rhs)))
+            .collect()
+    }
+    let flags = match (values(a), values(b)) {
+        (Values::Int(a), Values::Int(b)) => flags::<T, _>(&a, &b),
+        (Values::F32(a), Values::F32(b)) => flags::<T, _>(&a, &b),
+        (Values::F64(a), Values::F64(b)) => flags::<T, _>(&a, &b),
+        _ => bail!("compared operands differ in dtype"),
+    };
+    Ok(TensorData::I1(flags))
+}
+
+/// The semantics of every [`Compare`] op.
+pub(crate) fn compare<T: Compare>(
+    _op: &T,
+    ins: CompareOperands<Host<'_>>,
+    _cx: &mut EvalCx<'_, NoRegions>,
+) -> Result<CompareResults<OwnedHost>> {
+    let flags = compare_data::<T::Scalar>(&ins.lhs.data, &ins.rhs.data)?;
+    Ok(CompareResults {
+        output: HostTensor::new(ins.lhs.dims, flags)?,
+    })
 }

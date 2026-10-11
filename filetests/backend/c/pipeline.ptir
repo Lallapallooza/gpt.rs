@@ -18,16 +18,15 @@ func.func @main(%0: tensor<2x4xf32>, %1: tensor<4x128xf32> {param = 1}) -> tenso
 // -----
 
 // The scale of the GEMM result moves into the weight, and the scaled weight is packed at load
-// time. The run-time function keeps none of the scaling it replaced. The weight has one contracted
-// element, so moving the scale changes the rounding of one product only.
+// time. The run-time function keeps none of the scaling it replaced.
 // ROUNDING: the scale rounds into every weight before the sum, instead of into the sum once
-// CHECK: func.func @scaled(%0: tensor<2x1xf32>, %1: tensor<1x128xf32> {param = 1}, %2: tensor<128xf32> {param = 2}, %3: tensor<2x1x64xf32> {param = [[PACKED:[0-9]+]]}) -> tensor<2x128xf32> {
+// CHECK: func.func @scaled(%0: tensor<2x2xf32>, %1: tensor<2x128xf32> {param = 1}, %2: tensor<128xf32> {param = 2}, %3: tensor<2x2x64xf32> {param = [[PACKED:[0-9]+]]}) -> tensor<2x128xf32> {
 // CHECK-NEXT: %[[D:[0-9]+]] = tensor.dot_general(%0, %3) {contract_lhs = [1], contract_rhs = [1]}
 // CHECK-NEXT: %[[Y:[0-9]+]] = tensor.reshape(%[[D]]) {shape = [2, 128]}
 // CHECK-NEXT: func.return(%[[Y]])
-// CHECK: func.func @static.{{[0-9a-f]+}}(%0: tensor<1x128xf32> {param = 1}, %1: tensor<128xf32> {param = 2}) -> (tensor<2x1x64xf32> {param = [[PACKED]]}) {
-func.func @scaled(%0: tensor<2x1xf32>, %1: tensor<1x128xf32> {param = 1}, %2: tensor<128xf32> {param = 2}) -> tensor<2x128xf32> {
-  %3 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x1xf32>, tensor<1x128xf32>) -> tensor<2x128xf32>
+// CHECK: func.func @static.{{[0-9a-f]+}}(%0: tensor<2x128xf32> {param = 1}, %1: tensor<128xf32> {param = 2}) -> (tensor<2x2x64xf32> {param = [[PACKED]]}) {
+func.func @scaled(%0: tensor<2x2xf32>, %1: tensor<2x128xf32> {param = 1}, %2: tensor<128xf32> {param = 2}) -> tensor<2x128xf32> {
+  %3 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x2xf32>, tensor<2x128xf32>) -> tensor<2x128xf32>
   %4 = tensor.broadcast_to(%2) {shape = [2, 128]} : (tensor<128xf32>) -> tensor<2x128xf32>
   %5 = tensor.mul(%3, %4) : (tensor<2x128xf32>, tensor<2x128xf32>) -> tensor<2x128xf32>
   func.return(%5) : (tensor<2x128xf32>) -> ()

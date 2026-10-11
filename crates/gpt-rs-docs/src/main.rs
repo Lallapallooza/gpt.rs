@@ -1,27 +1,31 @@
-//! Writes the reference pages of the IR from the code: `docs/ptir/tensor.md`, the `tensor`
-//! dialect, and `docs/ptir/passes.md`, the passes, what they rewrite and the pipelines of the
-//! backends. With `--check`, it writes nothing and fails when the pages in the repository differ
-//! from what the code gives.
+//! Writes the reference pages of the IR from the code: `docs/ptir/<dialect>.md` for each dialect
+//! with a specification (`tensor`, `arith`, `tile`, `host`), and `docs/ptir/passes.md`, the
+//! passes, what they rewrite and the pipelines of the backends. With `--check`, it writes nothing
+//! and fails when the pages in the repository differ from what the code gives.
 //!
-//! An op's entry comes from its struct: the doc comment, and what `#[derive(Op)]` records of its
-//! groups, attributes, traits and effects. Its example is a roundtrip filetest that uses it, and
+//! An op's entry comes from its struct: the doc comment, and what `#[op]` records of its groups,
+//! attributes, traits and effects. Its example is a roundtrip filetest that uses it, and
 //! its rejections are the messages its verify filetests pin. A pass's entry comes from what
 //! `#[pass]` records, and lists the folds and patterns it applies with their doc comments, which
 //! `#[fold]`, `#[pattern]` and `#[derive(Doc)]` record. The generator runs the pass filetests to
-//! learn where each rewrite fires, and fails on a folder or pattern that fires in none.
+//! learn where each rewrite fires, and fails on a folder or pattern that fires in none. It also
+//! fails on a pass that is not alone in a file named after it.
 
+mod dialect_page;
 mod filetests;
 mod passes_page;
-mod tensor_page;
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use gpt_rs::backend::PortableBackend;
+use gpt_rs_ir::dialects::arith::ArithOp;
 use gpt_rs_ir::dialects::func::FuncOp;
+use gpt_rs_ir::dialects::host::HostOp;
 use gpt_rs_ir::dialects::tensor::TensorOp;
+use gpt_rs_ir::dialects::tile::TileOp;
 use gpt_rs_ir::op::OpInfo;
 use gpt_rs_ir::passes::{self, PassEntry, Pipeline, Rewrites};
 use gpt_rs_ir::rewrite::RootInfo;
@@ -37,19 +41,24 @@ fn main() -> Result<()> {
     let backends = backends();
     let fires = filetests::Fires::record(&filetests, &backends)?;
     let catalog = Catalog::new()?;
-    let pages = [
-        (
-            "docs/ptir/tensor.md",
-            tensor_page::write(&root, &filetests, &catalog)?,
-        ),
-        (
-            "docs/ptir/passes.md",
-            passes_page::write(&root, &filetests, &fires, &catalog, &backends)?,
-        ),
+    let dialects = [
+        ("tensor", TensorOp::infos()),
+        ("arith", ArithOp::infos()),
+        ("tile", TileOp::infos()),
+        ("host", HostOp::infos()),
     ];
+    let mut pages = Vec::new();
+    for (name, infos) in &dialects {
+        let text = dialect_page::write(&root, name, infos, &filetests, &catalog)?;
+        pages.push((format!("docs/ptir/{name}.md"), text));
+    }
+    pages.push((
+        "docs/ptir/passes.md".to_string(),
+        passes_page::write(&root, &filetests, &fires, &catalog, &backends)?,
+    ));
     let mut stale = Vec::new();
     for (path, text) in pages {
-        let file = root.join(path);
+        let file = root.join(&path);
         if check {
             if fs::read_to_string(&file).ok().as_deref() != Some(text.as_str()) {
                 stale.push(path);
@@ -65,6 +74,51 @@ fn main() -> Result<()> {
             stale.join(" and ")
         );
     }
+    Ok(())
+}
+
+/// Fails unless the pass is alone in a file named after it, as a struct named after it: pass
+/// `merge-contracted-axes` is `MergeContractedAxes` in `merge_contracted_axes.rs`, or in
+/// `merge_contracted_axes/mod.rs`. The name of a backend's pass starts with the backend,
+/// `c-pack-weights`, which its file and struct leave out.
+fn check_pass_layout(entry: &PassEntry) -> Result<()> {
+    let path = Path::new(entry.file);
+    let stem = match path.file_stem().and_then(|s| s.to_str()) {
+        Some("mod") => path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|s| s.to_str()),
+        stem => stem,
+    };
+    let backend = entry
+        .file
+        .strip_prefix("crates/gpt-rs-backend-")
+        .and_then(|rest| rest.split('/').next());
+    let name = backend
+        .and_then(|backend| entry.name.strip_prefix(&format!("{backend}-")))
+        .unwrap_or(entry.name);
+    let file = name.replace('-', "_");
+    ensure!(
+        stem == Some(file.as_str()),
+        "pass `{}` is in {}; each pass is alone in a file named after it, `{file}.rs`",
+        entry.name,
+        entry.file
+    );
+    let rust: String = name
+        .split('-')
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_ascii_uppercase().to_string() + chars.as_str()
+            })
+        })
+        .collect();
+    ensure!(
+        entry.rust == rust,
+        "pass `{}` is the struct `{}`; a pass's struct is named after it, `{rust}`",
+        entry.name,
+        entry.rust
+    );
     Ok(())
 }
 
@@ -95,16 +149,18 @@ impl Catalog {
     fn new() -> Result<Self> {
         let mut ops = TensorOp::infos();
         ops.extend(FuncOp::infos());
+        ops.extend(ArithOp::infos());
+        ops.extend(TileOp::infos());
+        ops.extend(HostOp::infos());
         let mut traits = BTreeMap::new();
         for info in &ops {
-            let kinds = (info.kinds)();
-            let kind_traits = kinds.iter().flat_map(|kind| kind.traits.iter());
-            for &t in info.traits.iter().chain(kind_traits) {
+            for &t in info.traits {
                 traits.entry(t.name()).or_insert(t);
             }
         }
         let mut entries = Vec::new();
         for entry in passes::registered() {
+            check_pass_layout(entry)?;
             let pipeline = passes::parse(entry.name)?;
             let [pass] = pipeline.passes() else {
                 bail!("`{}` is not one pass", entry.name);
@@ -118,12 +174,10 @@ impl Catalog {
         })
     }
 
-    /// How an entry heading names the op struct `rust`: `tensor.transpose`, or for a family
-    /// `tensor.{kind}` with its struct.
+    /// How a page names the op struct `rust`: `tensor.transpose`.
     pub fn op_label(&self, rust: &str) -> String {
         match self.ops.iter().find(|info| info.rust == rust) {
-            Some(info) if (info.kinds)().is_empty() => format!("`{}`", info.name),
-            Some(info) => format!("`{}` (`{rust}`)", info.name),
+            Some(info) => format!("`{}`", info.name),
             None => format!("`{rust}`"),
         }
     }
@@ -135,13 +189,17 @@ impl Catalog {
         }
     }
 
-    /// The patterns rooted at `root`, each with the pass that runs it, once each.
-    pub fn patterns_at(&self, root: RootInfo) -> Vec<(&'static str, &'static str)> {
+    /// The patterns whose root `at` takes, each with the pass that runs it and its root, once
+    /// each.
+    pub fn patterns_at(
+        &self,
+        at: impl Fn(RootInfo) -> bool,
+    ) -> Vec<(&'static str, &'static str, RootInfo)> {
         let mut found = Vec::new();
         for (entry, rewrites) in &self.passes {
             for pattern in rewrites.patterns.iter() {
-                let item = (pattern.name(), entry.name);
-                if pattern.root() == root && !found.contains(&item) {
+                let item = (pattern.name(), entry.name, pattern.root());
+                if at(item.2) && !found.contains(&item) {
                     found.push(item);
                 }
             }

@@ -11,11 +11,13 @@
 //! plus two bits.
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use half::{bf16, f16};
 
+use super::elementwise::Arith;
 use crate::float8::F8E4M3;
 use crate::host::TensorData;
 use crate::minifloat::{e8m0_decode, Format, Overflow};
@@ -38,6 +40,33 @@ pub fn unravel(mut index: usize, dims: &[usize]) -> Vec<usize> {
         index /= dims[axis];
     }
     coord
+}
+
+/// The element offset of every point of a loop nest, in row-major order: loop `i` runs
+/// `extents[i]` times and steps `steps[i]` elements.
+pub fn offsets(extents: &[usize], steps: &[usize]) -> Vec<usize> {
+    let count: usize = extents.iter().product();
+    (0..count)
+        .map(|i| {
+            unravel(i, extents)
+                .iter()
+                .zip(steps)
+                .map(|(coord, step)| coord * step)
+                .sum()
+        })
+        .collect()
+}
+
+/// The elements of `data` at `start` plus each of `offsets(extents, steps)`, in order: a strided
+/// view of the elements, such as a transpose, broadcast or slice reads.
+pub fn strided(
+    data: &TensorData,
+    start: usize,
+    extents: &[usize],
+    steps: &[usize],
+) -> Result<TensorData> {
+    let at = offsets(extents, steps);
+    gather_elements(data, at.len(), |i| start + at[i])
 }
 
 /// The elements of a tensor as equal-size chunks, for the ops that only move elements: the
@@ -130,6 +159,25 @@ pub enum Values<'a> {
     F64(Cow<'a, [f64]>),
 }
 
+impl Values<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            Values::Int(v) => v.len(),
+            Values::F32(v) => v.len(),
+            Values::F64(v) => v.len(),
+        }
+    }
+
+    /// The values, owned.
+    pub fn into_owned(self) -> Values<'static> {
+        match self {
+            Values::Int(v) => Values::Int(v),
+            Values::F32(v) => Values::F32(Cow::Owned(v.into_owned())),
+            Values::F64(v) => Values::F64(Cow::Owned(v.into_owned())),
+        }
+    }
+}
+
 /// The elements of `data` in the type the interpreter computes with. Every dtype decodes exactly.
 pub fn values(data: &TensorData) -> Values<'_> {
     let ints = |v: &mut dyn Iterator<Item = i128>| Values::Int(v.collect());
@@ -205,8 +253,17 @@ pub fn from_f32(dtype: DType, values: impl Iterator<Item = f32>) -> Result<Tenso
         DType::F32 => TensorData::F32(values.collect()),
         DType::F16 => TensorData::F16(values.map(f16::from_f32).collect()),
         DType::Bf16 => TensorData::Bf16(values.map(bf16::from_f32).collect()),
-        other => narrow(other, values.map(f64::from))?,
+        other => narrow(other, values.map(f64::from), Overflow::Saturate)?,
     })
+}
+
+/// `values`, each a value of the float dtype `dtype`, as its data. Unlike [`from_f32`], which
+/// converts, it keeps every value, infinities among them.
+pub fn encode_f32(dtype: DType, values: impl Iterator<Item = f32>) -> Result<TensorData> {
+    match dtype {
+        DType::F32 | DType::F16 | DType::Bf16 => from_f32(dtype, values),
+        other => narrow(other, values.map(f64::from), Overflow::Infinity),
+    }
 }
 
 /// `values` converted to the float dtype `dtype`, as [`from_f32`] converts.
@@ -225,18 +282,20 @@ pub fn from_f64(dtype: DType, values: impl Iterator<Item = f64>) -> Result<Tenso
                 .map(|x| bf16::from_bits(ieee(Format::BF16, x)))
                 .collect(),
         ),
-        other => narrow(other, values)?,
+        other => narrow(other, values, Overflow::Saturate)?,
     })
 }
 
-/// `values` rounded into a float dtype narrower than 16 bits, saturating.
-fn narrow(dtype: DType, values: impl Iterator<Item = f64>) -> Result<TensorData> {
+/// `values` rounded into a float dtype narrower than 16 bits, with `overflow` beyond its range.
+fn narrow(
+    dtype: DType,
+    values: impl Iterator<Item = f64>,
+    overflow: Overflow,
+) -> Result<TensorData> {
     let Some(format) = Format::of(dtype) else {
         bail!("{dtype} is not a float dtype");
     };
-    let codes: Vec<u8> = values
-        .map(|x| format.encode(x, Overflow::Saturate) as u8)
-        .collect();
+    let codes: Vec<u8> = values.map(|x| format.encode(x, overflow) as u8).collect();
     Ok(match dtype {
         DType::F8E4M3 => TensorData::F8E4M3(codes.into_iter().map(F8E4M3).collect()),
         DType::F8E5M2 => TensorData::F8E5M2(codes.into()),
@@ -263,15 +322,6 @@ pub fn rounder(dtype: DType) -> fn(f32) -> f32 {
         DType::Bf16 => |x| bf16::from_f32(x).to_f32(),
         DType::F16 => |x| f16::from_f32(x).to_f32(),
         _ => |x| x,
-    }
-}
-
-/// The bits of the significand of the float dtype `dtype`, its implicit bit included.
-pub(super) fn significand_bits(dtype: DType) -> Option<u32> {
-    match dtype {
-        DType::F64 => Some(53),
-        DType::F32 => Some(24),
-        other => Format::of(other).map(|format| format.man_bits + 1),
     }
 }
 
@@ -322,7 +372,7 @@ pub fn cast(data: &TensorData, to: DType) -> Result<TensorData> {
             Values::F64(v) => from_ints(to, v.iter().map(|&x| saturate(x as i128))),
         };
     }
-    let Some(bits) = significand_bits(to) else {
+    let Some(bits) = to.significand_bits() else {
         bail!("the interpreter casts nothing into {to}");
     };
     match values(data) {
@@ -342,4 +392,76 @@ pub fn packed(dtype: DType, codes: &[u8]) -> Result<TensorData> {
         packed.set(i, code);
     }
     Ok(data)
+}
+
+/// A computation that accumulates: from its inputs as elements of the accumulator's computation
+/// type, it gives the result elements, rounding every step with `round`.
+pub(super) trait Accumulation {
+    fn run<T: Arith>(
+        &self,
+        inputs: &[&[T]],
+        accum: DType,
+        round: impl Fn(T) -> T,
+    ) -> Result<Vec<T>>;
+}
+
+/// `kernel` on `inputs` cast to `accum`, with its result cast to `out`: how the contractions,
+/// reductions and scatters compute.
+pub(super) fn accumulate(
+    inputs: &[&TensorData],
+    accum: DType,
+    out: DType,
+    kernel: &impl Accumulation,
+) -> Result<TensorData> {
+    let data: Vec<TensorData> = inputs
+        .iter()
+        .map(|&data| cast(data, accum))
+        .collect::<Result<_>>()?;
+    let decoded: Vec<Values<'_>> = data.iter().map(values).collect();
+    let result = match decoded.first() {
+        Some(Values::Int(_)) => run::<i128>(kernel, &decoded, accum)?,
+        Some(Values::F32(_)) => run::<f32>(kernel, &decoded, accum)?,
+        Some(Values::F64(_)) => run::<f64>(kernel, &decoded, accum)?,
+        None => bail!("an accumulation reads a tensor"),
+    };
+    cast(&from_values(accum, result)?, out)
+}
+
+fn run<T: Arith>(
+    kernel: &impl Accumulation,
+    decoded: &[Values<'_>],
+    accum: DType,
+) -> Result<Values<'static>> {
+    let inputs = decoded
+        .iter()
+        .map(|values| T::of(values).ok_or_else(|| anyhow!("the inputs of {accum} differ")))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(T::into_values(kernel.run(
+        &inputs,
+        accum,
+        T::rounder(accum)?,
+    )?))
+}
+
+/// The positions of the `k` best of `count` candidates, best first: the largest by `order` with
+/// `largest`, else the smallest. Of candidates that order equal, the one at the smaller position
+/// comes first.
+pub(crate) fn best_k(
+    count: usize,
+    k: usize,
+    largest: bool,
+    order: impl Fn(usize, usize) -> Ordering,
+) -> Vec<usize> {
+    let mut ranking: Vec<usize> = (0..count).collect();
+    // A stable sort keeps equal candidates in position order.
+    ranking.sort_by(|&first, &second| {
+        let ordering = order(first, second);
+        if largest {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    });
+    ranking.truncate(k);
+    ranking
 }

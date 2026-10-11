@@ -18,7 +18,7 @@ func.func @while(%0: tensor<si32>, %1: tensor<4xf32>) -> (tensor<si32>, tensor<4
   %2, %3 = tensor.while(%0, %1) ({
   ^cond(%4: tensor<si32>, %5: tensor<4xf32>):
     %6 = tensor.constant() {value = dense<[] x si32: 10>} : () -> tensor<si32>
-    %7 = tensor.compare(%4, %6) {kind = less} : (tensor<si32>, tensor<si32>) -> tensor<i1>
+    %7 = tensor.less(%4, %6) : (tensor<si32>, tensor<si32>) -> tensor<i1>
     tensor.yield(%7, %4, %5) : (tensor<i1>, tensor<si32>, tensor<4xf32>) -> ()
   }, {
   ^body(%8: tensor<si32>, %9: tensor<4xf32>):

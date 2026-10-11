@@ -26,7 +26,7 @@ func.func @argmax_empty_axis(%0: tensor<2x0xf32>) -> tensor<2xsi32> {
 
 // ERROR: tensor.top_k: k = 6 exceeds axis 1 of tensor<2x5xf32>
 func.func @top_k_too_many(%0: tensor<2x5xf32>) -> (tensor<2x6xf32>, tensor<2x6xsi32>) {
-  %1, %2 = tensor.top_k(%0) {k = 6, axis = 1, largest = true, indices = si32} : (tensor<2x5xf32>) -> (tensor<2x6xf32>, tensor<2x6xsi32>)
+  %1, %2 = tensor.top_k(%0) {k = 6, axis = 1, indices = si32} : (tensor<2x5xf32>) -> (tensor<2x6xf32>, tensor<2x6xsi32>)
   func.return(%1, %2) : (tensor<2x6xf32>, tensor<2x6xsi32>) -> ()
 }
 
@@ -34,7 +34,7 @@ func.func @top_k_too_many(%0: tensor<2x5xf32>) -> (tensor<2x6xf32>, tensor<2x6xs
 
 // ERROR: tensor.top_k: indices must be si32 or si64, got f32
 func.func @top_k_float_indices(%0: tensor<2x5xf32>) -> (tensor<2x2xf32>, tensor<2x2xf32>) {
-  %1, %2 = tensor.top_k(%0) {k = 2, axis = 1, largest = true, indices = f32} : (tensor<2x5xf32>) -> (tensor<2x2xf32>, tensor<2x2xf32>)
+  %1, %2 = tensor.top_k(%0) {k = 2, axis = 1, indices = f32} : (tensor<2x5xf32>) -> (tensor<2x2xf32>, tensor<2x2xf32>)
   func.return(%1, %2) : (tensor<2x2xf32>, tensor<2x2xf32>) -> ()
 }
 

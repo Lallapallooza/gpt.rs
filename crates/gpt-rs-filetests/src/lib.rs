@@ -1,7 +1,8 @@
 //! The filetest runner. It runs the `.ptir` files under `filetests/` at the repository root.
 //!
 //! Each crate whose passes have filetests runs its own directory from its `tests/filetests.rs`:
-//! `gpt-rs-ir` runs `filetests/tensor/`, and a backend crate runs `filetests/backend/<backend>/`
+//! `gpt-rs-ir` runs `filetests/tensor/` and `filetests/tile/`, and a backend crate runs
+//! `filetests/backend/<backend>/`
 //! through `backend::run` (feature `backend`). A pass case names the passes that `#[pass]`
 //! registers in the linked crates, and in a backend's filetests `default` names the backend's
 //! pipeline.
@@ -9,8 +10,9 @@
 //! A file starts with `// RUN: <mode>` and holds cases separated by `// -----`. A case starts at
 //! its first non-blank line, and the line numbers of parse errors count from there. Modes:
 //!
-//! - `roundtrip`: the case is canonical text. It must parse, verify, and print back unchanged. A
-//!   case that starts with the spec version prints with it, as a stored program does.
+//! - `roundtrip`: the case is canonical text. It must parse, verify, and print back unchanged,
+//!   with the locations of its ops. A case that starts with the spec version prints with it, as a
+//!   stored program does.
 //! - `parse`: the case fails to parse with exactly the message of its `// ERROR: <message>` line.
 //! - `verify`: the case parses and fails verification with exactly the message of its
 //!   `// ERROR: <message>` line.
@@ -21,6 +23,9 @@
 //!   same results before and after on random inputs, as [`bits_eq`] compares them, unless the case
 //!   has a `// NO-INTERP: <reason>` line.
 //!
+//!   A pass case with an `// ERROR: <message>` line instead fails in its passes with exactly that
+//!   message.
+//!
 //!   The inputs start with the special values of [`Specials::All`]. When the function before the
 //!   passes cannot run on them, as when they are out-of-range indices, plain random values replace
 //!   them. Every parameter that a function reads gets one value before and after, and the
@@ -28,6 +33,8 @@
 //!   `// ROUNDING: <reason>` line is for a pass whose rewrite holds in real arithmetic but rounds
 //!   differently. Its inputs start with [`Specials::Finite`], and f32 results may differ by up to
 //!   1e-5 relative plus 1e-6 absolute error.
+//!
+//! `GPTRS_FILETEST=<text>` runs only the files whose path contains `<text>`.
 //!
 //! CHECK lines: `CHECK:` finds the pattern after the previous match, `CHECK-NEXT:` on the next
 //! line, `CHECK-NOT:` nowhere between the previous match and the next one. Any other comment line
@@ -44,6 +51,7 @@ use std::path::{Path, PathBuf};
 
 use gpt_rs_ir::module::Module;
 use gpt_rs_ir::passes::{self, Pipeline};
+use gpt_rs_ir::text::TextOptions;
 use gpt_rs_ir::verify::verify;
 
 pub use self::differential::{bits_eq, random_value, rotation, run_dims, Specials, ROUNDS};
@@ -126,6 +134,9 @@ pub fn run(dir: &str, default: DefaultPipeline<'_>) {
     let mut files = Vec::new();
     collect(&root.join(dir), &mut files);
     assert!(!files.is_empty(), "no filetests under filetests/{dir}");
+    if let Ok(filter) = std::env::var("GPTRS_FILETEST") {
+        files.retain(|path| path.to_string_lossy().contains(&filter));
+    }
     let mut failures = Vec::new();
     let mut cases = 0;
     for path in &files {
@@ -194,11 +205,10 @@ fn run_case(mode: &str, case: &Case, default: DefaultPipeline<'_>) -> Result<(),
         "roundtrip" => {
             verify(&module).map_err(|err| format!("verify error: {err}"))?;
             let expected = code_lines(&case.text);
-            let printed = if expected.starts_with("spec_version") {
-                module.to_versioned_text()
-            } else {
-                module.to_text()
-            };
+            let printed = module.print(TextOptions {
+                versioned: expected.starts_with("spec_version"),
+                locations: true,
+            });
             if printed != expected {
                 return Err(format!(
                     "printed text differs\n--- expected\n{expected}--- printed\n{printed}"
@@ -219,10 +229,6 @@ fn pass_case(
     default: DefaultPipeline<'_>,
 ) -> Result<(), String> {
     verify(&before).map_err(|err| format!("the input does not verify: {err}"))?;
-    let checks = check::check_lines(&case.text)?;
-    if checks.is_empty() {
-        return Err("a pass case needs a CHECK line".into());
-    }
     let pipeline = match (list, default) {
         ("default", Some(default)) => default(),
         ("default", None) => {
@@ -230,6 +236,14 @@ fn pass_case(
         }
         (list, _) => passes::parse(list).map_err(|err| format!("pass list: {err:#}"))?,
     };
+    if !directive(&case.text, "ERROR").is_empty() {
+        let mut after = before.clone();
+        return expect_error(&case.text, pipeline.run(&mut after));
+    }
+    let checks = check::check_lines(&case.text)?;
+    if checks.is_empty() {
+        return Err("a pass case needs a CHECK line".into());
+    }
     let mut after = before.clone();
     let changed = pipeline.run(&mut after).map_err(|err| format!("{err:#}"))?;
     let output = after.to_text();

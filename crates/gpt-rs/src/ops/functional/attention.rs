@@ -11,10 +11,6 @@ use crate::ops::functional::{apply_rope, softmax};
 use crate::tensor::{DType, DeviceTensor, HostTensor, Shape};
 use crate::{ensure_dtype, ensure_rank, ensure_same_dtype, ensure_same_shape, functional, s};
 
-/// Additive attention-score bias for masked positions. After the softmax subtracts the maximum,
-/// `exp` maps this bias to exactly 0.
-pub(crate) const MASKED_BIAS: f32 = -1e9;
-
 /// Fixed-capacity KV cache that [`attention_kv_cache`] reads and writes.
 ///
 /// The cache keeps a stable backing shape, so lazy execution can reuse compiled plans across
@@ -147,8 +143,9 @@ impl<B: PortableBackend + 'static> AttentionPositions<B> {
 ///
 /// The functional writes the new keys and values at the first position with
 /// `dynamic_update_slice`. Query `t` then attends to the cache rows up to its own position, with
-/// scale `D^-1/2`. The causal mask compares the positions with an integer iota. The functional
-/// returns the context as `[T, Hq * D]` (query-head major) and the extended cache.
+/// scale `D^-1/2`: the mask selects `-inf` for every score whose key position, an iota, exceeds
+/// the query's position, the first position plus an iota. The functional returns the context as
+/// `[T, Hq * D]` (query-head major) and the extended cache.
 ///
 /// Shapes depend only on `(T, capacity)`, so all positions reuse the same compiled programs.
 #[functional]
@@ -214,15 +211,15 @@ pub fn attention_kv_cache(
         .reshape([hkv, group * t, d])
         .dot_general(&keys, DotGeneral::contract([2], [2]).batch([0], [0]))
         * scale;
+    let start = token_positions.slice(s![..1]);
+    let query_pos = DeviceTensor::iota(&q, [t, c], 0, DType::Si32).add(&start);
     let key_pos = DeviceTensor::iota(&q, [t, c], 1, DType::Si32);
-    let bias = token_positions
-        .reshape([t, 1])
+    let visible = query_pos
         .greater_equal(&key_pos)
-        .select(0.0, MASKED_BIAS)
         .reshape([1, 1, t, c])
         .broadcast_to([hkv, group, t, c])
         .reshape([hkv, group * t, c]);
-    let probs = softmax(&(scores + bias), -1);
+    let probs = softmax(&visible.select(&scores, f32::NEG_INFINITY), -1);
     let output = probs
         .dot_general(&values, DotGeneral::contract([2], [1]).batch([0], [0]))
         .reshape([hkv, group, t, d])

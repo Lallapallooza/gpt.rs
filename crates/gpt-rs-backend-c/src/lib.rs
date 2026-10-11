@@ -10,6 +10,7 @@ use std::time::Duration;
 use anyhow::{anyhow, ensure, Result};
 use gpt_rs::backend::hashing::FingerprintHasher;
 use gpt_rs::backend::{ParamStore, PortableBackend};
+use gpt_rs_ir::dialects::func::Func;
 use gpt_rs_ir::host::HostTensor;
 use gpt_rs_ir::module::Module;
 use gpt_rs_ir::passes::Pipeline;
@@ -21,7 +22,7 @@ use crate::dtype::dtype_tag;
 mod codegen;
 mod dtype;
 mod kernels;
-mod optimizer;
+mod passes;
 mod targets;
 
 pub use self::codegen::generate_c_module;
@@ -105,7 +106,7 @@ impl PortableBackend for CBackend {
     }
 
     fn pipeline(&self) -> Pipeline {
-        optimizer::pipeline()
+        passes::pipeline()
     }
 
     fn params(&self) -> &ParamStore<HostTensor> {
@@ -118,7 +119,7 @@ impl PortableBackend for CBackend {
             .ok_or_else(|| anyhow!("the module has no function @{func}"))?;
         let outputs = module
             .op(inst)
-            .as_func()
+            .get::<Func>()
             .expect("a function")
             .results
             .iter()

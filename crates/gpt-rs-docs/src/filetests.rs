@@ -48,6 +48,14 @@ impl Fires {
             let Some(list) = case.mode.strip_prefix("pass ") else {
                 continue;
             };
+            // A case with an `ERROR:` line fails in its passes, so nothing fires to the end.
+            if case
+                .text
+                .lines()
+                .any(|l| l.trim_start().starts_with("// ERROR:"))
+            {
+                continue;
+            }
             let parsed;
             let pipeline = if list == "default" {
                 let (_, pipeline) = backends

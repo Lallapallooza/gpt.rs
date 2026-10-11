@@ -1,12 +1,15 @@
-//! Semantics of the ops in `ir/random.rs`.
+//! Semantics of the random ops.
 
 use anyhow::{bail, Result};
 
 use super::kernels::{from_f64, from_ints};
-use crate::dialects::tensor::ir::{Distribution, Rng, RngOperands, RngResults};
+use crate::dialects::arith;
+use crate::dialects::tensor::ir::*;
+use crate::dialects::tensor::utils::random::uniform_bits;
 use crate::host::{HostTensor, TensorData};
-use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
-use crate::types::DType;
+use crate::op::{EvalCx, Host, NoRegions, OwnedHost};
+use crate::scalar::{Draw, Drawn};
+use crate::types::{DType, IntFormat};
 
 /// One block of Philox4x32-10: the four words of `counter` under `key`.
 fn philox(counter: [u32; 4], key: [u32; 2]) -> [u32; 4] {
@@ -47,16 +50,6 @@ fn stream(key: u64, counter: u64, count: usize) -> (Vec<u32>, u64) {
     (words, counter.wrapping_add(blocks as u64))
 }
 
-/// The bits of the significand of a float dtype that has uniform floats.
-fn significand_bits(dtype: DType) -> Result<u32> {
-    match dtype {
-        DType::F64 | DType::F32 | DType::F16 | DType::Bf16 => {
-            Ok(super::kernels::significand_bits(dtype).expect("a float dtype"))
-        }
-        other => bail!("{other} has no uniform floats"),
-    }
-}
-
 /// A uniform value on `[0, 1)` with `bits` significant bits, from the top bits of `words`, the
 /// first word least significant.
 fn unit(words: &[u32], bits: u32) -> f64 {
@@ -68,55 +61,108 @@ fn unit(words: &[u32], bits: u32) -> f64 {
     (value >> (total - bits)) as f64 * 2f64.powi(-(bits as i32))
 }
 
-impl Eval for Rng {
-    fn eval(
-        &self,
-        ins: RngOperands<Host<'_>>,
-        cx: &mut EvalCx<'_, NoRegions>,
-    ) -> Result<RngResults<OwnedHost>> {
-        let TensorData::Ui64(state) = &ins.state.data else {
-            bail!("the state must be ui64, got {}", ins.state.dtype());
-        };
-        let (key, counter) = (state[0], state[1]);
-        let dims = cx.result_dims(1)?;
-        let count: usize = dims.iter().product();
-        let dtype = self.dtype;
-        let (data, counter) = match (self.distribution, dtype.int_format()) {
-            (Distribution::Uniform, Some(int)) => {
-                // Each element takes the low bits of its words.
-                let per = (int.bits as usize).div_ceil(32);
-                let (words, counter) = stream(key, counter, count * per);
-                let values = words.chunks(per).map(|w| {
-                    let bits = w
-                        .iter()
-                        .rev()
-                        .fold(0i128, |acc, &x| acc << 32 | i128::from(x));
-                    int.wrap(bits)
-                });
-                (from_ints(dtype, values)?, counter)
-            }
-            (Distribution::Uniform, None) => {
-                let bits = significand_bits(dtype)?;
-                let per = (bits as usize).div_ceil(32);
-                let (words, counter) = stream(key, counter, count * per);
-                let values = words.chunks(per).map(|w| unit(w, bits));
-                (from_f64(dtype, values)?, counter)
-            }
-            (Distribution::Normal, _) => {
-                // Box-Muller on two uniforms, with `1 - u` in (0, 1] under the logarithm.
-                let bits = significand_bits(dtype)?;
-                let per = (bits as usize).div_ceil(32);
-                let (words, counter) = stream(key, counter, count * 2 * per);
-                let values = words.chunks(2 * per).map(|w| {
-                    let (u1, u2) = (1.0 - unit(&w[..per], bits), unit(&w[per..], bits));
-                    (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
-                });
-                (from_f64(dtype, values)?, counter)
-            }
-        };
-        Ok(RngResults {
-            new_state: HostTensor::new(vec![2], TensorData::Ui64(vec![key, counter].into()))?,
-            output: HostTensor::new(dims, data)?,
+/// The `per` words of element `index` of the stream of the state `(key, counter)`: the words at
+/// positions `index * per ..`, word `p` being word `p % 4` of block `counter + p / 4`.
+pub(crate) fn element_words(key: u64, counter: u64, index: u64, per: usize) -> Vec<u32> {
+    let key = [key as u32, (key >> 32) as u32];
+    (0..per as u64)
+        .map(|w| {
+            let position = u128::from(index) * per as u128 + u128::from(w);
+            let block = u128::from(counter) + position / 4;
+            let words_of = [0, 32, 64, 96].map(|shift| (block >> shift) as u32);
+            philox(words_of, key)[(position % 4) as usize]
+        })
+        .collect()
+}
+
+/// The integer that `words` give, the first word least significant, wrapped to `int`.
+fn int_from_words(int: IntFormat, words: &[u32]) -> i128 {
+    let bits = words
+        .iter()
+        .rev()
+        .fold(0i128, |acc, &x| acc << 32 | i128::from(x));
+    int.wrap(bits)
+}
+
+/// An integer takes the low bits of its words, and a float the top bits of its significand.
+impl Draw for arith::RngUniform {
+    fn words_per_element(dtype: DType) -> Result<usize> {
+        Ok(match dtype.int_format() {
+            Some(int) => (int.bits as usize).div_ceil(32),
+            None => (uniform_bits(dtype)? as usize).div_ceil(32),
         })
     }
+
+    fn draw(dtype: DType, words: &[u32]) -> Result<Drawn> {
+        Ok(match dtype.int_format() {
+            Some(int) => Drawn::Int(int_from_words(int, words)),
+            None => Drawn::Float(unit(words, uniform_bits(dtype)?)),
+        })
+    }
+}
+
+/// Box-Muller on two uniforms, with `1 - u` in (0, 1] under the logarithm.
+impl Draw for arith::RngNormal {
+    fn words_per_element(dtype: DType) -> Result<usize> {
+        Ok(2 * (uniform_bits(dtype)? as usize).div_ceil(32))
+    }
+
+    fn draw(dtype: DType, words: &[u32]) -> Result<Drawn> {
+        let bits = uniform_bits(dtype)?;
+        let per = words.len() / 2;
+        let (u1, u2) = (1.0 - unit(&words[..per], bits), unit(&words[per..], bits));
+        Ok(Drawn::Float(
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos(),
+        ))
+    }
+}
+
+/// The new state and the elements of `dims` in `dtype` that `T` draws from the state `state`.
+pub(crate) fn draw_tensor<T: Draw>(
+    state: &HostTensor,
+    dtype: DType,
+    dims: Vec<usize>,
+) -> Result<(HostTensor, HostTensor)> {
+    let TensorData::Ui64(state) = &state.data else {
+        bail!("the state must be ui64, got {}", state.dtype());
+    };
+    let (key, counter) = (state[0], state[1]);
+    let count: usize = dims.iter().product();
+    let per = T::words_per_element(dtype)?;
+    let (words, counter) = stream(key, counter, count * per);
+    let drawn = words
+        .chunks(per)
+        .map(|element| T::draw(dtype, element))
+        .collect::<Result<Vec<_>>>()?;
+    let data = if dtype.int_format().is_some() {
+        from_ints(
+            dtype,
+            drawn.into_iter().map(|d| match d {
+                Drawn::Int(x) => x,
+                Drawn::Float(_) => unreachable!("integers draw integers"),
+            }),
+        )?
+    } else {
+        from_f64(
+            dtype,
+            drawn.into_iter().map(|d| match d {
+                Drawn::Float(x) => x,
+                Drawn::Int(_) => unreachable!("floats draw floats"),
+            }),
+        )?
+    };
+    Ok((
+        HostTensor::new(vec![2], TensorData::Ui64(vec![key, counter].into()))?,
+        HostTensor::new(dims, data)?,
+    ))
+}
+
+/// The semantics of every [`Rng`] op.
+pub(crate) fn rng<T: Rng>(
+    op: &T,
+    ins: RngOperands<Host<'_>>,
+    cx: &mut EvalCx<'_, NoRegions>,
+) -> Result<RngResults<OwnedHost>> {
+    let (new_state, output) = draw_tensor::<T::Scalar>(ins.state, op.dtype, cx.result_dims(1)?)?;
+    Ok(RngResults { new_state, output })
 }

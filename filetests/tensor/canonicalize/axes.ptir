@@ -6,7 +6,7 @@
 // CHECK-NEXT: tensor.reduce_max(%0) {axes = [0, 1]} :
 // CHECK-NEXT: tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} :
 // CHECK-NEXT: tensor.argmax(%0) {axis = 1, out = si32} :
-// CHECK-NEXT: tensor.top_k(%0) {k = 2, axis = 1, largest = true, indices = si32} :
+// CHECK-NEXT: tensor.top_k(%0) {k = 2, axis = 1, indices = si32} :
 // CHECK-NEXT: tensor.concat(%0, %0) {axis = 1} :
 // CHECK-NEXT: tensor.iota() {shape = [2, 3], dtype = si32, axis = 1} :
 // CHECK-NEXT: tensor.gather(%0, %2) {axis = 1} :
@@ -15,7 +15,7 @@ func.func @axes(%0: tensor<2x3xf32>, %1: tensor<3x4xf32>, %2: tensor<2x3xsi32>) 
   %3 = tensor.reduce_max(%0) {axes = [-1, 0]} : (tensor<2x3xf32>) -> tensor<f32>
   %4 = tensor.dot_general(%0, %1) {contract_lhs = [-1], contract_rhs = [-2]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
   %5 = tensor.argmax(%0) {axis = -1, out = si32} : (tensor<2x3xf32>) -> tensor<2xsi32>
-  %6, %7 = tensor.top_k(%0) {k = 2, axis = -1, largest = true, indices = si32} : (tensor<2x3xf32>) -> (tensor<2x2xf32>, tensor<2x2xsi32>)
+  %6, %7 = tensor.top_k(%0) {k = 2, axis = -1, indices = si32} : (tensor<2x3xf32>) -> (tensor<2x2xf32>, tensor<2x2xsi32>)
   %8 = tensor.concat(%0, %0) {axis = -1} : (tensor<2x3xf32>, tensor<2x3xf32>) -> tensor<2x6xf32>
   %9 = tensor.iota() {shape = [2, 3], dtype = si32, axis = -1} : () -> tensor<2x3xsi32>
   %10 = tensor.gather(%0, %2) {axis = -1} : (tensor<2x3xf32>, tensor<2x3xsi32>) -> tensor<2x3xf32>

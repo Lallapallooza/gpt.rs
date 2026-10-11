@@ -4,6 +4,11 @@
 
 use crate::types::DType;
 
+/// `floor(log2(x))` of a finite `x > 0` whose f64 is normal, exactly: its exponent.
+pub fn floor_log2(x: f64) -> i32 {
+    ((x.to_bits() >> 52) & 0x7ff) as i32 - 1023
+}
+
 /// What the special codes of a [`Format`] encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Specials {
@@ -80,6 +85,14 @@ impl Format {
         man_bits: 2,
         bias: 16,
         specials: Specials::Fnuz,
+    };
+    /// IEEE binary64, whose bit fields the block builders read; [`Format::of`] leaves f32 and f64
+    /// out, as no quantized dtype is one.
+    pub const F64: Format = Format {
+        exp_bits: 11,
+        man_bits: 52,
+        bias: 1023,
+        specials: Specials::Ieee,
     };
     pub const F16: Format = Format {
         exp_bits: 5,

@@ -5,6 +5,7 @@
 use std::ops::{Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive};
 
 use gpt_rs_ir::dialects::tensor::Slice;
+use gpt_rs_ir::types::Ranked;
 use smallvec::SmallVec;
 
 /// One entry of a Python-style index, as [`s!`](crate::s) writes it.
@@ -152,7 +153,7 @@ macro_rules! s {
 /// The strided slice that `index` takes of a tensor of `dims`, and the extents of the result once
 /// the axes of single positions are dropped and new axes added.
 #[track_caller]
-pub(super) fn resolve(dims: &[usize], index: &[AxisIndex]) -> (Slice, SmallVec<[usize; 4]>) {
+pub(super) fn resolve(dims: &[usize], index: &[AxisIndex]) -> (Slice, Vec<usize>) {
     let rank = dims.len();
     let taken = index
         .iter()
@@ -182,12 +183,8 @@ pub(super) fn resolve(dims: &[usize], index: &[AxisIndex]) -> (Slice, SmallVec<[
     if ellipses == 0 {
         entries.extend(std::iter::repeat_n(whole, rank - taken));
     }
-    let (mut starts, mut sizes, mut strides, mut out) = (
-        SmallVec::new(),
-        SmallVec::new(),
-        SmallVec::<[usize; 4]>::new(),
-        SmallVec::new(),
-    );
+    let (mut starts, mut sizes, mut strides, mut out) =
+        (Ranked::new(), Ranked::new(), Ranked::new(), Vec::new());
     let mut axis = 0;
     for entry in entries {
         match entry {

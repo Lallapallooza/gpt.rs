@@ -24,7 +24,7 @@ fn covers(float: bool, dtype: DType) -> bool {
 }
 
 /// `f(a, b) = f(b, a)`. Folding puts a run-time operand first and a constant last (see
-/// `Module::is_static`), so the other folds, the patterns and CSE see a constant on the right.
+/// `Module::known_before_run`), so the other folds, the patterns and CSE see a constant on the right.
 #[derive(Debug, Doc)]
 pub struct Commutative;
 
@@ -39,7 +39,12 @@ impl OpTrait for Commutative {
         let &[lhs, rhs] = op.operands else {
             return None;
         };
-        let rank = |v| (op.module.is_static(v), op.module.constant(v).is_some());
+        let rank = |v| {
+            (
+                op.module.known_before_run(v),
+                op.module.constant(v).is_some(),
+            )
+        };
         (rank(lhs) > rank(rhs)).then(|| FoldResult::Operands(vec![rhs, lhs]))
     }
 
@@ -156,6 +161,10 @@ impl PerClass {
     }
 }
 
+/// `-0.0`, the float right identity of addition: `x + -0.0` is `x` for every `x`, while
+/// `-0.0 + 0.0` is `0.0`.
+pub const NEG_ZERO: f64 = -0.0;
+
 /// `f(a, e) = a`. A commutative op has `e` on the left too, since folding moves constants to the
 /// right.
 #[derive(Debug, Doc)]
@@ -200,18 +209,18 @@ impl OpTrait for RightIdentity {
         let &[lhs, _] = op.operands else {
             return None;
         };
-        let e = self.0.bytes(op.dtype()?)?;
-        op.is_splat(1, &e)
+        let identity = self.0.bytes(op.dtype()?)?;
+        op.is_splat(1, &identity)
             .then(|| FoldResult::Results(vec![Folded::Value(lhs)]))
     }
 
     fn laws(&self, arity: usize, dtype: DType) -> Vec<Law> {
-        let Some(e) = self.0.bytes(dtype).filter(|_| arity == 2) else {
+        let Some(identity) = self.0.bytes(dtype).filter(|_| arity == 2) else {
             return Vec::new();
         };
         vec![Law {
             name: "f(a, e) = a",
-            lhs: apply([A, Term::Splat(e)]),
+            lhs: apply([A, Term::Splat(identity)]),
             rhs: A,
         }]
     }
@@ -246,19 +255,19 @@ impl OpTrait for Absorbing {
         let &[_, rhs] = op.operands else {
             return None;
         };
-        let z = self.bytes(op.dtype()?)?;
-        op.is_splat(1, &z)
+        let absorbing = self.bytes(op.dtype()?)?;
+        op.is_splat(1, &absorbing)
             .then(|| FoldResult::Results(vec![Folded::Value(rhs)]))
     }
 
     fn laws(&self, arity: usize, dtype: DType) -> Vec<Law> {
-        let Some(z) = self.bytes(dtype).filter(|_| arity == 2) else {
+        let Some(absorbing) = self.bytes(dtype).filter(|_| arity == 2) else {
             return Vec::new();
         };
         vec![Law {
             name: "f(a, z) = z",
-            lhs: apply([A, Term::Splat(z.clone())]),
-            rhs: Term::Splat(z),
+            lhs: apply([A, Term::Splat(absorbing.clone())]),
+            rhs: Term::Splat(absorbing),
         }]
     }
 }
@@ -339,9 +348,22 @@ pub struct DistributesOver {
 }
 
 impl DistributesOver {
+    /// Distributes over the op `over` on integers.
+    pub const fn int<T: Copy + Default + Into<Op>>(_over: T) -> Self {
+        Self {
+            over: build::<T>,
+            float: false,
+        }
+    }
+
     pub fn covers(&self, dtype: DType) -> bool {
         covers(self.float, dtype)
     }
+}
+
+/// The op `T`, for a trait that names another op.
+fn build<T: Default + Into<Op>>() -> Op {
+    T::default().into()
 }
 
 impl fmt::Display for DistributesOver {
@@ -356,11 +378,11 @@ impl OpTrait for DistributesOver {
         if arity != 2 || !self.covers(dtype) {
             return Vec::new();
         }
-        let g = |x: Term, y: Term| Term::Other(Box::new((self.over)()), vec![x, y]);
+        let over = |lhs: Term, rhs: Term| Term::Other(Box::new((self.over)()), vec![lhs, rhs]);
         vec![Law {
             name: "f(a, g(b, c)) = g(f(a, b), f(a, c))",
-            lhs: apply([A, g(B, C)]),
-            rhs: g(apply([A, B]), apply([A, C])),
+            lhs: apply([A, over(B, C)]),
+            rhs: over(apply([A, B]), apply([A, C])),
         }]
     }
 }

@@ -1,4 +1,4 @@
-//! Semantics of the ops in `ir/control.rs`.
+//! Semantics of the control-flow ops.
 
 use anyhow::{anyhow, Result};
 
@@ -11,24 +11,6 @@ use crate::host::{HostTensor, HostValue};
 use crate::module::Region;
 use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
 use crate::types::TensorType;
-
-fn values(tensors: &[&HostTensor]) -> Vec<HostValue> {
-    tensors
-        .iter()
-        .map(|&t| HostValue::Tensor(t.clone()))
-        .collect()
-}
-
-fn tensor(value: HostValue) -> Result<HostTensor> {
-    match value {
-        HostValue::Tensor(tensor) => Ok(tensor),
-        other => Err(anyhow!("a region yielded the non-tensor {}", other.ty())),
-    }
-}
-
-fn tensors(values: Vec<HostValue>) -> Result<Vec<HostTensor>> {
-    values.into_iter().map(tensor).collect()
-}
 
 impl Eval for Yield {
     fn eval(
@@ -51,7 +33,7 @@ impl Eval for Cond {
             _ => cx.regions.then_branch,
         };
         Ok(CondResults {
-            outputs: tensors(cx.run(branch, values(&ins.args))?)?,
+            outputs: HostValue::into_tensors(cx.run(branch, HostValue::of_tensors(&ins.args))?)?,
         })
     }
 }
@@ -63,18 +45,17 @@ impl Eval for While {
         cx: &mut EvalCx<'_, WhileRegions<Region>>,
     ) -> Result<WhileResults<OwnedHost>> {
         let (cond, body) = (cx.regions.cond, cx.regions.body);
-        let mut carried = values(&ins.init);
+        let mut carried = HostValue::of_tensors(&ins.init);
         loop {
             let mut yielded = cx.run(cond, carried)?.into_iter();
-            let pred = tensor(
-                yielded
-                    .next()
-                    .ok_or_else(|| anyhow!("cond yields no predicate"))?,
-            )?;
+            let pred = yielded
+                .next()
+                .ok_or_else(|| anyhow!("cond yields no predicate"))?
+                .into_tensor()?;
             carried = yielded.collect();
             if pred.as_i1()?[0] == 0 {
                 return Ok(WhileResults {
-                    outputs: tensors(carried)?,
+                    outputs: HostValue::into_tensors(carried)?,
                 });
             }
             carried = cx.run(body, carried)?;
@@ -90,7 +71,7 @@ impl Eval for Scan {
     ) -> Result<ScanResults<OwnedHost>> {
         let (carried, scanned) = ins.inputs.split_at(self.carry_count);
         let steps = scanned[0].dims[0];
-        let mut carried = values(carried);
+        let mut carried = HostValue::of_tensors(carried);
         let mut outputs: Vec<Vec<HostTensor>> = vec![Vec::with_capacity(steps); self.outputs.len()];
         for step in 0..steps {
             let slices = scanned
@@ -106,7 +87,7 @@ impl Eval for Scan {
             let per_step = yielded.split_off(self.carry_count);
             carried = yielded;
             for (stack, output) in outputs.iter_mut().zip(per_step) {
-                stack.push(tensor(output)?);
+                stack.push(output.into_tensor()?);
             }
         }
         let stacked = outputs
@@ -115,7 +96,10 @@ impl Eval for Scan {
             .map(|(stack, ty)| stack_steps(stack, ty, steps))
             .collect::<Result<Vec<_>>>()?;
         Ok(ScanResults {
-            outputs: tensors(carried)?.into_iter().chain(stacked).collect(),
+            outputs: HostValue::into_tensors(carried)?
+                .into_iter()
+                .chain(stacked)
+                .collect(),
         })
     }
 }

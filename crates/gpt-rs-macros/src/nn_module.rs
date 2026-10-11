@@ -449,28 +449,41 @@ fn visit_field(field: &Visited, mutable: bool) -> TokenStream {
 }
 
 /// Generates the method that runs a sublayer field (`self.up_proj(x)`). Only plain and optional
-/// sublayers get one.
+/// sublayers get one. It runs the sublayer in the module path scope of its parameter name, unless
+/// the field is flattened: its parameters, and the scopes that name them, come from inside it.
 fn call_method(field: &Visited) -> Option<TokenStream> {
     if field.kind != Kind::Layer {
         return None;
     }
-    let Visited { ident, inner, .. } = field;
+    let Visited {
+        ident, inner, name, ..
+    } = field;
     let layer = quote!(::gpt_rs::module::Layer<B>);
     let args = quote!(<#inner as #layer>::Args<'_>);
     let output = quote!(<#inner as #layer>::Output);
     let call = quote!(::gpt_rs::module::Layer::<B>::call);
+    let path = if field.flatten {
+        quote!(())
+    } else {
+        quote!(::gpt_rs::nn::capture::scope(
+            ::core::format_args!("{}", #name)
+        ))
+    };
     match field.wrap {
         Wrap::Plain => Some(quote! {
-            /// Runs the sublayer inside its profiling scope (`Layer::call`).
+            /// Runs the sublayer inside its profiling scope (`Layer::call`) and its module path.
             #[allow(dead_code)]
             fn #ident(&self, args: #args) -> #output {
+                let _path = #path;
                 #call(&self.#ident, args)
             }
         }),
         Wrap::Option => Some(quote! {
-            /// Runs the sublayer, when present, inside its profiling scope (`Layer::call`).
+            /// Runs the sublayer, when present, inside its profiling scope (`Layer::call`) and its
+            /// module path.
             #[allow(dead_code)]
             fn #ident(&self, args: #args) -> Option<#output> {
+                let _path = #path;
                 self.#ident.as_ref().map(|layer| #call(layer, args))
             }
         }),

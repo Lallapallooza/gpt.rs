@@ -954,6 +954,7 @@ dependencies = [
  "linkme",
  "rand 0.8.6",
  "smallvec",
+ "tinyvec",
 ]
 
 [[package]]

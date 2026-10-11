@@ -6,9 +6,10 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{anyhow, bail, Result};
 use gpt_rs_ir::dense::Dense;
 use gpt_rs_ir::dialects::tensor::{BroadcastTo, Constant};
+use gpt_rs_ir::location::Location;
 use gpt_rs_ir::module::Module;
 use gpt_rs_ir::op::{InOp, OpDyn};
-use gpt_rs_ir::types::{DType, Dim, TensorType, Type};
+use gpt_rs_ir::types::{DType, Dim, Ranked, TensorType, Type};
 use smallvec::SmallVec;
 
 use super::arena::GraphArena;
@@ -27,9 +28,16 @@ fn empty_module() -> &'static Module {
 pub(crate) struct GraphBuilder<'a, B: PortableBackend + 'static> {
     pub(super) arena: &'a Arc<GraphArena<B>>,
     pub(super) inner: &'a mut GraphInner<B>,
+    /// The location of the ops it records.
+    pub(super) location: Option<Location>,
 }
 
 impl<'a, B: PortableBackend + 'static> GraphBuilder<'a, B> {
+    /// Gives the ops recorded from here on the location `location`.
+    pub fn set_location(&mut self, location: Option<Location>) {
+        self.location = location;
+    }
+
     /// Imports a tensor into the graph, returning the associated value identifier.
     /// Existing handles are reused so repeated captures share parameters.
     pub fn import(&mut self, tensor: &DeviceTensor<B>) -> Result<ValueId> {
@@ -65,21 +73,21 @@ impl<'a, B: PortableBackend + 'static> GraphBuilder<'a, B> {
         let mut bits = [0u8; 8];
         bits[..element.len()].copy_from_slice(element);
         let bits = u64::from_le_bytes(bits);
-        let constant = match self.pending_scalar(&(dtype, bits, SmallVec::new())) {
+        let constant = match self.pending_scalar(&(dtype, bits, Ranked::new())) {
             Some(constant) => constant,
             None => {
                 let value = Dense::splat(dtype, [], element);
                 let constant = ValueId(self.emit(Constant { value }, &[])?.start);
                 self.inner
                     .scalars
-                    .insert((dtype, bits, SmallVec::new()), constant);
+                    .insert((dtype, bits, Ranked::new()), constant);
                 constant
             }
         };
         if dims.is_empty() {
             return Ok(constant);
         }
-        let key = (dtype, bits, SmallVec::from_slice(dims));
+        let key = (dtype, bits, dims.iter().copied().collect());
         if let Some(value) = self.pending_scalar(&key) {
             return Ok(value);
         }
@@ -141,6 +149,7 @@ impl<'a, B: PortableBackend + 'static> GraphBuilder<'a, B> {
             op: op.into(),
             operands: (start, self.inner.operands.len() as u32),
             first: ValueId(first),
+            location: self.location.clone(),
         });
         self.inner.bump_version();
         Ok(first..self.inner.values.len() as u32)

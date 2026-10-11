@@ -1,7 +1,7 @@
 //! `rng_uniform` of f32 values: the Philox4x32-10 stream of the state, as the spec defines it.
 
-use anyhow::{ensure, Result};
-use gpt_rs_ir::dialects::tensor::{Distribution, TensorOp};
+use anyhow::{bail, ensure, Result};
+use gpt_rs_ir::dialects::tensor::TensorOp;
 use gpt_rs_ir::types::DType;
 
 use super::super::profile::register_op_profile_generic;
@@ -20,13 +20,17 @@ pub(super) fn emit_instruction(
         matmul_profile,
         ..
     } = ctx;
-    let &Kind::Op(TensorOp::Rng(spec)) = &inst.kind else {
+    let &Kind::Op(op) = &inst.kind else {
         return Ok(None);
     };
+    let spec = match op {
+        TensorOp::RngUniform(spec) => spec,
+        TensorOp::RngNormal(_) => bail!("the C backend draws only uniform values, not normal"),
+        _ => return Ok(None),
+    };
     ensure!(
-        spec.distribution == Distribution::Uniform && spec.dtype == DType::F32,
-        "the C backend draws only uniform f32 values, not {:?} {}",
-        spec.distribution,
+        spec.dtype == DType::F32,
+        "the C backend draws only f32 values, not {}",
         spec.dtype
     );
     let inputs = operand_types(&inst.operands, value_infos)?;

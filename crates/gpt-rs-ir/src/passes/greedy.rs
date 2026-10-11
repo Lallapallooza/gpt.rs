@@ -1,21 +1,44 @@
 //! The greedy driver: removes dead ops, folds, and applies patterns until nothing changes.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{ensure, Result};
 
-use crate::doc::{fired, Fired};
+use super::stats::Stat;
 use crate::fold::fold_inst;
-use crate::module::{Inst, Module};
-use crate::rewrite::{PatternSet, Rewriter};
+use crate::module::{Inst, Module, OpKey, Region};
+use crate::rewrite::{Applied, Editor, PatternSet};
+use crate::traits::IsolatedFromAbove;
 
 /// The folds and patterns a greedy rewrite applies.
 #[derive(Default)]
 pub struct Rewrites {
-    /// Whether ops fold: by their `#[fold]` folders, and by their traits.
+    /// Whether ops fold: by their `#[fold]` folders, and by their traits. The constants of a
+    /// function then go to its start, and equal ones become one.
     pub folds: bool,
     /// The patterns to apply.
     pub patterns: PatternSet,
+}
+
+impl Rewrites {
+    /// The patterns that `populate` adds, without folds: the rewrites of a pass that applies
+    /// patterns.
+    pub fn patterns(populate: fn(&mut PatternSet)) -> Rewrites {
+        let mut patterns = PatternSet::new();
+        populate(&mut patterns);
+        Rewrites {
+            folds: false,
+            patterns,
+        }
+    }
+}
+
+/// Runs `rewrites` to a fixpoint with the greedy driver, erasing dead ops, adds the rewrites to
+/// `stat`, and returns whether the module changed: the `run` of a pass that applies patterns.
+pub fn run_patterns(module: &mut Module, rewrites: Rewrites, stat: &Stat) -> Result<bool> {
+    let report = Greedy::new(rewrites).erase_dead().run(module)?;
+    stat.add(report.rewritten);
+    Ok(report.changed())
 }
 
 /// The driver of the passes made of folds and patterns. It erases each op it visits that is dead,
@@ -81,6 +104,7 @@ impl Greedy {
         // run past this bound.
         let bound = (queue.len() + 1) * (self.rewrites.patterns.len() + 3);
         let mut report = GreedyReport::default();
+        let mut constants = Constants::default();
         let mut steps = 0usize;
         while let Some(inst) = queue.pop_front() {
             if self.fuel != 0 && steps as u64 == self.fuel {
@@ -90,8 +114,7 @@ impl Greedy {
             if module.is_erased(inst) {
                 continue;
             }
-            let mut rw = Rewriter::new(module);
-            let Some(step) = self.step(inst, &mut rw)? else {
+            let Some((step, touched)) = self.step(module, inst, &mut constants)? else {
                 continue;
             };
             match step {
@@ -101,7 +124,7 @@ impl Greedy {
             }
             steps += 1;
             ensure!(steps <= bound, "did not converge within {bound} steps");
-            for touched in rw.touched {
+            for touched in touched {
                 if queued.insert(touched) {
                     queue.push_back(touched);
                 }
@@ -110,23 +133,113 @@ impl Greedy {
         Ok(report)
     }
 
-    /// Applies the first step that changes `inst`, and returns it.
-    fn step(&self, inst: Inst, rw: &mut Rewriter<'_>) -> Result<Option<Step>> {
-        if self.erase_dead && rw.module.is_trivially_dead(inst) {
-            rw.erase(inst)?;
-            return Ok(Some(Step::Erased));
+    /// Applies the first step that changes `inst`, and returns it with the instructions it
+    /// touched.
+    fn step(
+        &self,
+        module: &mut Module,
+        inst: Inst,
+        constants: &mut Constants,
+    ) -> Result<Option<(Step, Vec<Inst>)>> {
+        if self.erase_dead && module.is_trivially_dead(inst) {
+            let mut editor = Editor::new(module);
+            editor.erase(inst)?;
+            return Ok(Some((Step::Erased, editor.touched)));
         }
-        let fold = self.rewrites.folds.then(|| fold_inst(rw.module, inst));
-        if let Some(fold) = fold.flatten() {
-            rw.apply_fold_result(inst, fold)?;
-            return Ok(Some(Step::Folded));
-        }
-        for pattern in self.rewrites.patterns.iter() {
-            if pattern.try_rewrite(inst, rw)? {
-                fired(Fired::Pattern(pattern.name()));
-                return Ok(Some(Step::Rewritten));
+        if self.rewrites.folds {
+            if let Some(touched) = constants.place(module, inst)? {
+                return Ok(Some((Step::Folded, touched)));
             }
         }
-        Ok(None)
+        let fold = self.rewrites.folds.then(|| fold_inst(module, inst));
+        if let Some(fold) = fold.flatten() {
+            let mut editor = Editor::new(module);
+            editor.apply_fold(inst, fold)?;
+            return Ok(Some((Step::Folded, editor.touched)));
+        }
+        Ok(match self.rewrites.patterns.apply(module, inst, false)? {
+            Applied::Rewritten { touched, .. } => Some((Step::Rewritten, touched)),
+            Applied::NoMatch(_) => None,
+        })
     }
+}
+
+/// The constants the driver has seen, one for each value in each home. A constant's home is the
+/// body of the nearest op isolated from above that holds it.
+#[derive(Default)]
+struct Constants(HashMap<(Region, OpKey), Inst>);
+
+impl Constants {
+    /// Puts the constant `inst` with the constants at the start of its home, and merges it with
+    /// an equal constant there. Every use of a constant is an op that is not a constant. So a
+    /// constant placed with the first instructions of its home is defined before every use of it,
+    /// in the home and in the regions the home holds. Gives the instructions the step touched, or
+    /// `None` when `inst` is not a constant or is in place already.
+    fn place(&mut self, module: &mut Module, inst: Inst) -> Result<Option<Vec<Inst>>> {
+        if module.op(inst).as_constant().is_none() {
+            return Ok(None);
+        }
+        let (Some(home), Some(key)) = (home(module, inst), module.cse_key(inst)) else {
+            return Ok(None);
+        };
+        if let Some(&kept) = self.0.get(&(home, key.clone())) {
+            if kept != inst && !module.is_erased(kept) {
+                if !leads(module, kept, home) {
+                    lead(module, kept, home);
+                }
+                let mut editor = Editor::new(module);
+                let kept_value = editor.module.results(kept)[0];
+                editor.replace(inst, &[kept_value])?;
+                return Ok(Some(editor.touched));
+            }
+        }
+        self.0.insert((home, key), inst);
+        if leads(module, inst, home) {
+            return Ok(None);
+        }
+        lead(module, inst, home);
+        Ok(Some(Vec::new()))
+    }
+}
+
+/// The body of the nearest op isolated from above that holds `inst`, such as its function's.
+fn home(module: &Module, inst: Inst) -> Option<Region> {
+    let mut region = module.parent_region(inst)?;
+    loop {
+        let op = module.parent_op(region)?;
+        if module.op(op).has_trait::<IsolatedFromAbove>() {
+            return Some(region);
+        }
+        region = module.parent_region(op)?;
+    }
+}
+
+/// Whether `inst` is in `home` with only constants before it.
+fn leads(module: &Module, inst: Inst, home: Region) -> bool {
+    if module.parent_region(inst) != Some(home) {
+        return false;
+    }
+    for placed in module.insts(home) {
+        if placed == inst {
+            return true;
+        }
+        if module.op(placed).as_constant().is_none() {
+            return false;
+        }
+    }
+    false
+}
+
+/// Moves the constant `inst` after the constants at the start of `home`, so they keep the order
+/// the driver placed them in. It reads nothing, so it may go anywhere before its uses.
+fn lead(module: &mut Module, inst: Inst, home: Region) {
+    let mut after_constants = None;
+    for placed in module.insts(home) {
+        if placed != inst && module.op(placed).as_constant().is_none() {
+            after_constants = Some(placed);
+            break;
+        }
+    }
+    let anchor = after_constants.expect("a region ends with its terminator");
+    module.move_before(inst, anchor);
 }

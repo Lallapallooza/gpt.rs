@@ -42,7 +42,7 @@ func.func @int_defaults(%0: tensor<2x3xsi32>, %1: tensor<3x2xsi32>, %2: tensor<4
 // CHECK-NEXT: [[E:%[0-9]+]] = tensor.exp([[M]]) : (tensor<3xbf16>) -> tensor<3xbf16>
 // CHECK-NEXT: [[C:%[0-9]+]] = tensor.cast([[E]]) {to = si32} : (tensor<3xbf16>) -> tensor<3xsi32>
 // CHECK-NEXT: [[X:%[0-9]+]] = tensor.broadcast_to([[C]]) {shape = [2, 3]}
-// CHECK-NEXT: [[L:%[0-9]+]] = tensor.compare([[M]], [[E]]) {kind = less} : (tensor<3xbf16>, tensor<3xbf16>) -> tensor<3xi1>
+// CHECK-NEXT: [[L:%[0-9]+]] = tensor.less([[M]], [[E]]) : (tensor<3xbf16>, tensor<3xbf16>) -> tensor<3xi1>
 // CHECK-NEXT: [[B:%[0-9]+]] = tensor.cast([[L]]) {to = bf16} : (tensor<3xi1>) -> tensor<3xbf16>
 // CHECK-NEXT: [[Y:%[0-9]+]] = tensor.broadcast_to([[B]]) {shape = [2, 3]}
 // CHECK-NEXT: func.return([[X]], [[Y]])
@@ -52,7 +52,7 @@ func.func @bf16_hoist(%0: tensor<3xbf16>, %1: tensor<3xbf16>) -> (tensor<2x3xsi3
   %4 = tensor.mul(%2, %3) : (tensor<2x3xbf16>, tensor<2x3xbf16>) -> tensor<2x3xbf16>
   %5 = tensor.exp(%4) : (tensor<2x3xbf16>) -> tensor<2x3xbf16>
   %6 = tensor.cast(%5) {to = si32} : (tensor<2x3xbf16>) -> tensor<2x3xsi32>
-  %7 = tensor.compare(%4, %5) {kind = less} : (tensor<2x3xbf16>, tensor<2x3xbf16>) -> tensor<2x3xi1>
+  %7 = tensor.less(%4, %5) : (tensor<2x3xbf16>, tensor<2x3xbf16>) -> tensor<2x3xi1>
   %8 = tensor.cast(%7) {to = bf16} : (tensor<2x3xi1>) -> tensor<2x3xbf16>
   func.return(%6, %8) : (tensor<2x3xsi32>, tensor<2x3xbf16>) -> ()
 }

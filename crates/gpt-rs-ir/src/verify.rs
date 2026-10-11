@@ -11,26 +11,19 @@
 
 use anyhow::{anyhow, bail, ensure, Result};
 
-use crate::module::{Inst, Module, Region, Value};
+use crate::module::{Inst, Module, Region};
 use crate::op::{OpDyn, RegionSig};
-use crate::scope::ScopedMap;
-use crate::traits::{IsolatedFromAbove, Terminator};
+use crate::traits::Terminator;
 use crate::types::{type_list, Type};
 use crate::{Dialect, Op};
 
 struct Verifier<'m> {
     module: &'m Module,
-    /// The values defined so far, in the scopes that see them.
-    defined: ScopedMap<Value, ()>,
 }
 
 impl Verifier<'_> {
-    fn region(&mut self, region: Region, isolated: bool) -> Result<()> {
+    fn region(&self, region: Region) -> Result<()> {
         let module = self.module;
-        self.defined.push(isolated);
-        for &arg in module.args(region) {
-            self.defined.insert(arg, ());
-        }
         let top = module.parent_op(region).is_none();
         let mut insts = module.insts(region).peekable();
         while let Some(inst) = insts.next() {
@@ -38,13 +31,9 @@ impl Verifier<'_> {
             self.check(inst, insts.peek().is_none(), top)
                 .map_err(|err| anyhow!("{}: {err:#}", op.name()))?;
             for &inner in module.regions(inst) {
-                self.region(inner, op.has_trait::<IsolatedFromAbove>())?;
-            }
-            for &result in module.results(inst) {
-                self.defined.insert(result, ());
+                self.region(inner)?;
             }
         }
-        self.defined.pop();
         Ok(())
     }
 
@@ -53,11 +42,11 @@ impl Verifier<'_> {
         let module = self.module;
         let op = module.op(inst);
         ensure!(
-            !top || op.as_func().is_some(),
-            "only func.func may appear at the top level"
+            !top || op.symbol_name().is_some(),
+            "only func.func and tile.dispatch may appear at the top level"
         );
-        let defined = |&v: &Value| self.defined.get(&v).is_some();
-        if let Some(i) = module.operands(inst).iter().position(|v| !defined(v)) {
+        let operands = module.operands(inst);
+        if let Some(i) = operands.iter().position(|&v| !module.dominates(v, inst)) {
             bail!("operand {i} is not defined before this op");
         }
         ensure!(
@@ -65,11 +54,10 @@ impl Verifier<'_> {
             "a terminator must be the last op of its region"
         );
 
-        let operand_types = module.operand_types(inst);
         let segments = module.operand_segments(inst);
         let regions = module.regions(inst);
         let (types, result_segments) =
-            op.dyn_result_types(&operand_types, segments, regions, module)?;
+            module.infer_results(op, module.operands(inst), segments, regions)?;
         let stored = module.result_types(inst);
         let inferred: Vec<&Type> = types.iter().collect();
         ensure!(
@@ -83,7 +71,7 @@ impl Verifier<'_> {
             "result segments do not match the result groups"
         );
 
-        let sigs = op.dyn_region_signatures(&operand_types, segments)?;
+        let sigs = op.dyn_region_signatures(&module.operand_types(inst), segments)?;
         for (index, (&region, sig)) in regions.iter().zip(&sigs).enumerate() {
             self.check_region(op, index, region, sig)?;
         }
@@ -106,8 +94,11 @@ impl Verifier<'_> {
             .last_inst(region)
             .filter(|&last| op.is_region_terminator(index, module.op(last)))
             .ok_or_else(|| anyhow!("region {index} does not end with its terminator"))?;
+        let Some(expected) = &sig.yields else {
+            return Ok(());
+        };
         let yields = module.operand_types(terminator);
-        let expected: Vec<&Type> = sig.yields.iter().collect();
+        let expected: Vec<&Type> = expected.iter().collect();
         ensure!(
             yields == expected,
             "region {index} yields {}, expected {}",
@@ -120,24 +111,10 @@ impl Verifier<'_> {
 
 /// The first verifier error in `module`, outer ops first, as `<op name>: <message>`.
 pub fn verify(module: &Module) -> Result<()> {
-    Verifier {
-        module,
-        defined: ScopedMap::new(),
-    }
-    .region(module.body(), true)
+    Verifier { module }.region(module.body())
 }
 
 /// Fails when an op of a dialect outside `allowed` remains.
 pub fn check_legal(module: &Module, allowed: &[Dialect]) -> Result<()> {
-    for inst in module.walk(module.body()) {
-        let op = module.op(inst);
-        if !allowed.contains(&op.dialect()) {
-            bail!(
-                "{}: the {:?} dialect is not allowed here",
-                op.name(),
-                op.dialect()
-            );
-        }
-    }
-    Ok(())
+    crate::conversion::ConversionTarget::of_dialects(allowed).check(module)
 }

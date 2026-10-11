@@ -5,11 +5,11 @@ use std::collections::{HashMap, HashSet};
 
 use gpt_rs::ops::functional::{linear_weight, WeightLayout};
 use gpt_rs_ir::dialects::tensor::{
-    Binary, BinaryKind, BroadcastTo, DotGeneral, ExtractPatches, Reshape, TensorOp, Transpose,
+    Add, BroadcastTo, DotGeneral, ExtractPatches, Maximum, Minimum, Reshape, Transpose,
 };
-use gpt_rs_ir::module::{Inst, Module, Value};
+use gpt_rs_ir::module::{Inst, Module, Value, ValueRef};
+use gpt_rs_ir::rewrite::matched;
 use gpt_rs_ir::types::DType;
-use gpt_rs_ir::Op;
 
 pub(crate) struct Step {
     pub kind: StepKind,
@@ -41,7 +41,7 @@ pub(crate) struct Conv2d {
     /// The bias, one value per output channel.
     pub bias: Option<Value>,
     /// The window, strides, dilation and padding of the convolution.
-    pub patches: ExtractPatches,
+    pub patches: Box<ExtractPatches>,
     /// Whether each channel convolves with its own filter alone.
     pub depthwise: bool,
     /// The result, after the bias add when there is one.
@@ -162,7 +162,7 @@ fn kernel(module: &Module, inst: Inst) -> Option<Fused> {
 fn f32_dims(module: &Module, value: Value) -> Option<Vec<usize>> {
     let ty = module.ty(value).as_tensor()?;
     let dims = ty.static_dims().filter(|_| ty.dtype == DType::F32)?;
-    Some(dims.into_vec())
+    Some(dims.to_vec())
 }
 
 /// Whether the faer convolution kernels read patches with these attributes: two spatial axes,
@@ -175,34 +175,34 @@ fn conv_patches(patches: &ExtractPatches) -> bool {
 /// `w [K, C_out]`, the form `merge-contracted-axes` gives a convolution without groups.
 fn conv2d(module: &Module, inst: Inst) -> Option<Fused> {
     let dot = module.op_as::<DotGeneral>(inst)?;
-    let patches = module.def_as::<ExtractPatches>(dot.operands.lhs)?;
-    let attrs = &dot.attrs;
+    let patches = dot.lhs().defining_op::<ExtractPatches>()?;
+    let attrs = dot.attrs();
     let plain = attrs.batch_lhs.is_empty()
         && attrs.batch_rhs.is_empty()
         && attrs.contract_lhs[..] == [3]
         && attrs.contract_rhs[..] == [0];
-    let input = patches.operands.input;
-    let weight = dot.operands.rhs;
-    let &[_, _, _, k] = f32_dims(module, patches.results.output)?.as_slice() else {
+    let input = patches.input().id();
+    let weight = dot.rhs().id();
+    let &[_, _, _, k] = f32_dims(module, patches.output().id())?.as_slice() else {
         return None;
     };
     let &[k_w, c_out] = f32_dims(module, weight)?.as_slice() else {
         return None;
     };
-    let &[_, _, _, out_c] = f32_dims(module, dot.results.output)?.as_slice() else {
+    let &[_, _, _, out_c] = f32_dims(module, dot.output().id())?.as_slice() else {
         return None;
     };
     let shapes = k == k_w && c_out == out_c && f32_dims(module, input)?.len() == 4;
-    (plain && shapes && conv_patches(&patches.attrs)).then(|| Fused {
+    (plain && shapes && conv_patches(patches.attrs())).then(|| Fused {
         kind: StepKind::Conv2d(Conv2d {
             input,
             weight,
             bias: None,
-            patches: patches.attrs.clone(),
+            patches: Box::new(patches.attrs().clone()),
             depthwise: false,
-            output: dot.results.output,
+            output: dot.output().id(),
         }),
-        covers: vec![patches.inst],
+        covers: vec![patches.inst()],
     })
 }
 
@@ -213,40 +213,43 @@ fn conv2d(module: &Module, inst: Inst) -> Option<Fused> {
 /// transpose and the reshape put back.
 fn depthwise_conv2d(module: &Module, inst: Inst) -> Option<Fused> {
     let reshape = module.op_as::<Reshape>(inst)?;
-    let transpose = module.def_as::<Transpose>(reshape.operands.input)?;
-    let dot = module.def_as::<DotGeneral>(transpose.operands.input)?;
-    let patches_reshape = module.def_as::<Reshape>(dot.operands.lhs)?;
-    let patches = module.def_as::<ExtractPatches>(patches_reshape.operands.input)?;
-    let input = patches.operands.input;
-    let weight = dot.operands.rhs;
+    matched!(let transpose @ Transpose(dot @ DotGeneral(patches_reshape @ Reshape(patches @ ExtractPatches(input)), weight)) = reshape.input() else {
+        return None;
+    });
+    let (input, weight) = (input.id(), weight.id());
     let &[n, _, _, c] = f32_dims(module, input)?.as_slice() else {
         return None;
     };
-    let &[k_h, k_w] = patches.attrs.window.as_slice() else {
+    let &[k_h, k_w] = patches.window.as_slice() else {
         return None;
     };
-    let &[_, out_h, out_w, _] = f32_dims(module, reshape.results.output)?.as_slice() else {
+    let &[_, out_h, out_w, _] = f32_dims(module, reshape.output().id())?.as_slice() else {
         return None;
     };
-    let depthwise = conv_patches(&patches.attrs)
-        && f32_dims(module, reshape.results.output)? == [n, out_h, out_w, c]
-        && f32_dims(module, patches_reshape.results.output)? == [n, out_h, out_w, k_h, k_w, c, 1]
+    let depthwise = conv_patches(patches.attrs())
+        && f32_dims(module, reshape.output().id())? == [n, out_h, out_w, c]
+        && f32_dims(module, patches_reshape.output().id())? == [n, out_h, out_w, k_h, k_w, c, 1]
         && f32_dims(module, weight)? == [c, 1, 1, k_h, k_w]
-        && dot.attrs.batch_lhs[..] == [5]
-        && dot.attrs.batch_rhs[..] == [0]
-        && dot.attrs.contract_lhs[..] == [3, 4, 6]
-        && dot.attrs.contract_rhs[..] == [3, 4, 2]
-        && transpose.attrs.perm[..] == [1, 2, 3, 0, 4];
+        && dot.batch_lhs[..] == [5]
+        && dot.batch_rhs[..] == [0]
+        && dot.contract_lhs[..] == [3, 4, 6]
+        && dot.contract_rhs[..] == [3, 4, 2]
+        && transpose.perm[..] == [1, 2, 3, 0, 4];
     depthwise.then(|| Fused {
         kind: StepKind::Conv2d(Conv2d {
             input,
             weight,
             bias: None,
-            patches: patches.attrs.clone(),
+            patches: Box::new(patches.attrs().clone()),
             depthwise: true,
-            output: reshape.results.output,
+            output: reshape.output().id(),
         }),
-        covers: vec![patches.inst, patches_reshape.inst, dot.inst, transpose.inst],
+        covers: vec![
+            patches.inst(),
+            patches_reshape.inst(),
+            dot.inst(),
+            transpose.inst(),
+        ],
     })
 }
 
@@ -273,35 +276,30 @@ fn linear(module: &Module, inst: Inst) -> Option<Fused> {
 /// at the `minimum`. The fused loop computes with the constants, so a -0.0 scalar, which keeps a
 /// -0.0 input, does not match.
 fn relu6(module: &Module, inst: Inst) -> Option<Fused> {
-    let binary = |inst: Inst, kind: BinaryKind| -> Option<[Value; 2]> {
-        let Op::Tensor(TensorOp::Binary(op)) = module.op(inst) else {
-            return None;
-        };
-        let &[lhs, rhs] = module.operands(inst) else {
-            return None;
-        };
-        (op.kind == kind).then_some([lhs, rhs])
-    };
     // The broadcast of an f32 scalar constant that is `scalar` by bits.
-    let broadcast_of = |value: Value, scalar: f32| -> Option<Inst> {
-        let broadcast = module.def_as::<BroadcastTo>(value)?;
-        let constant = module.constant(broadcast.operands.input)?;
-        (constant.dims.is_empty() && constant.is_splat(scalar)).then_some(broadcast.inst)
+    let broadcast_of = |value: ValueRef<'_>, scalar: f32| -> Option<Inst> {
+        let broadcast = value.defining_op::<BroadcastTo>()?;
+        let constant = broadcast.input().constant()?;
+        (constant.dims.is_empty() && constant.is_splat(scalar)).then_some(broadcast.inst())
     };
-    let [low, high] = binary(inst, BinaryKind::Minimum)?;
+    let minimum = module.op_as::<Minimum>(inst)?;
+    let (low, high) = (minimum.lhs(), minimum.rhs());
     let (clamped, six) = [(low, high), (high, low)]
         .into_iter()
         .find_map(|(clamped, six)| Some((clamped, broadcast_of(six, 6.0)?)))?;
-    let maximum = module.def_inst(clamped)?;
-    let [a, b] = binary(maximum, BinaryKind::Maximum)?;
-    let (input, zero) = [(a, b), (b, a)]
+    let maximum = clamped.defining_op::<Maximum>()?;
+    let (left, right) = (maximum.lhs(), maximum.rhs());
+    let (input, zero) = [(left, right), (right, left)]
         .into_iter()
         .find_map(|(input, zero)| Some((input, broadcast_of(zero, 0.0)?)))?;
-    let output = module.results(inst)[0];
-    let f32_input = f32_dims(module, input).is_some();
-    (f32_input && module.ty(input) == module.ty(output)).then_some(Fused {
-        kind: StepKind::Relu6 { input, output },
-        covers: vec![maximum, zero, six],
+    let output = minimum.output();
+    let f32_input = f32_dims(module, input.id()).is_some();
+    (f32_input && input.value_type() == output.value_type()).then_some(Fused {
+        kind: StepKind::Relu6 {
+            input: input.id(),
+            output: output.id(),
+        },
+        covers: vec![maximum.inst(), zero, six],
     })
 }
 
@@ -313,11 +311,8 @@ fn bias_add(
     add: Inst,
     fused: &HashMap<Inst, Fused>,
 ) -> Option<(Inst, Value, Inst)> {
-    let add = module.op_as::<Binary>(add)?;
-    if add.attrs.kind != BinaryKind::Add {
-        return None;
-    }
-    let (lhs, rhs) = (add.operands.lhs, add.operands.rhs);
+    let add = module.op_as::<Add>(add)?;
+    let (lhs, rhs) = (add.lhs().id(), add.rhs().id());
     let (conv, other) = [(lhs, rhs), (rhs, lhs)]
         .into_iter()
         .find_map(|(conv, other)| {
@@ -331,10 +326,10 @@ fn bias_add(
             );
             (is_conv && module.uses(conv).len() == 1).then_some((root, other))
         })?;
-    let broadcast = module.def_as::<BroadcastTo>(other)?;
-    let bias = broadcast.operands.input;
-    let &channels = f32_dims(module, add.results.output)?.last()?;
+    let broadcast = module.value_ref(other).defining_op::<BroadcastTo>()?;
+    let bias = broadcast.input().id();
+    let &channels = f32_dims(module, add.output().id())?.last()?;
     let dims = f32_dims(module, bias)?;
     let per_channel = dims.last() == Some(&channels) && dims.iter().product::<usize>() == channels;
-    per_channel.then_some((conv, bias, broadcast.inst))
+    per_channel.then_some((conv, bias, broadcast.inst()))
 }

@@ -15,6 +15,7 @@ half = { version = "2.6", features = ["bytemuck"] }
 libm = "0.2"
 linkme = "0.3"
 smallvec = { workspace = true }
+tinyvec = { workspace = true }
 
 [dev-dependencies]
 gpt-rs-filetests = { path = "../gpt-rs-filetests" }

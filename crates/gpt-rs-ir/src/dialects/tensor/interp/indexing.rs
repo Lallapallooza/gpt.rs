@@ -1,23 +1,19 @@
-//! Semantics of the ops in `ir/indexing.rs`.
+//! Semantics of the indexing ops.
 
-use std::borrow::Cow;
+use std::marker::PhantomData;
 
 use anyhow::{anyhow, bail, Result};
 
-use super::elementwise::{int_format, Arith};
+use super::elementwise::Arith;
 use super::kernels::{
-    cast, from_ints, from_values, gather_elements, rounder, strides, unravel, values, Chunks,
-    Values,
+    accumulate, cast, from_ints, gather_elements, offsets, strided, strides, unravel, Accumulation,
+    Chunks,
 };
-use crate::dialects::tensor::ir::shape::{axis_index, check_size};
-use crate::dialects::tensor::ir::{
-    BinaryKind, DynamicSlice, DynamicSliceOperands, DynamicSliceResults, DynamicUpdateSlice,
-    DynamicUpdateSliceOperands, DynamicUpdateSliceResults, Gather, GatherOperands, GatherResults,
-    Iota, IotaOperands, IotaResults, Scatter, ScatterKind, ScatterOperands, ScatterResults, Take,
-    TakeOperands, TakeResults,
-};
+use crate::dialects::tensor::ir::*;
+use crate::dialects::tensor::utils::shape::{axis_index, check_size};
 use crate::host::HostTensor;
 use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
+use crate::scalar::Combiner;
 use crate::types::DType;
 
 impl Eval for Iota {
@@ -86,16 +82,10 @@ impl Eval for DynamicSlice {
         let input = ins.input;
         let starts = clamped_starts(&input.dims, &self.sizes, &ins.starts.as_indices()?)?;
         let in_strides = strides(&input.dims);
-        let count: usize = self.sizes.iter().product();
-        let source = |out_index: usize| -> usize {
-            unravel(out_index, &self.sizes)
-                .iter()
-                .enumerate()
-                .map(|(axis, &coord)| (starts[axis] + coord) * in_strides[axis])
-                .sum()
-        };
+        let start = starts.iter().zip(&in_strides).map(|(s, n)| s * n).sum();
+        let data = strided(&input.data, start, &self.sizes, &in_strides)?;
         Ok(DynamicSliceResults {
-            output: HostTensor::new(&self.sizes, gather_elements(&input.data, count, source)?)?,
+            output: HostTensor::new(self.sizes, data)?,
         })
     }
 }
@@ -109,20 +99,17 @@ impl Eval for DynamicUpdateSlice {
         let base = ins.base;
         let starts = clamped_starts(&base.dims, &ins.update.dims, &ins.starts.as_indices()?)?;
         let base_strides = strides(&base.dims);
-        let dest = |update_index: usize| -> usize {
-            unravel(update_index, &ins.update.dims)
-                .iter()
-                .enumerate()
-                .map(|(axis, &coord)| (starts[axis] + coord) * base_strides[axis])
-                .sum()
-        };
+        let start: usize = starts.iter().zip(&base_strides).map(|(s, n)| s * n).sum();
         let update = Chunks::of(&ins.update.data);
         let mut out = Chunks::of(&base.data);
-        for i in 0..update.len() {
-            out.set(dest(i), update.get(i));
+        for (i, offset) in offsets(&ins.update.dims, &base_strides)
+            .into_iter()
+            .enumerate()
+        {
+            out.set(start + offset, update.get(i));
         }
         Ok(DynamicUpdateSliceResults {
-            output: HostTensor::new(base.dims.clone(), out.into_data()?)?,
+            output: HostTensor::new(base.dims, out.into_data()?)?,
         })
     }
 }
@@ -177,85 +164,100 @@ impl Eval for Gather {
             .collect::<Result<Vec<_>>>()?;
         Ok(GatherResults {
             output: HostTensor::new(
-                index_dims.clone(),
+                index_dims,
                 gather_elements(&input.data, sources.len(), |i| sources[i])?,
             )?,
         })
     }
 }
 
-impl Eval for Scatter {
+/// The element of `input` that each update goes to, along `axis` as `indices` say.
+fn scatter_targets(axis: i64, input: &HostTensor, indices: &HostTensor) -> Result<Vec<usize>> {
+    let axis = axis_index(axis, input.dims.len())?;
+    indices
+        .as_indices()?
+        .iter()
+        .enumerate()
+        .map(|(i, &index)| indexed_element(i, index, axis, &indices.dims, &input.dims))
+        .collect()
+}
+
+/// `input` with each update folded into its element with `C`, in the default accumulator of the
+/// dtype.
+pub(crate) fn scatter_fold<C: Combiner>(
+    attrs: &ScatterAttrs,
+    input: &HostTensor,
+    indices: &HostTensor,
+    updates: &HostTensor,
+) -> Result<HostTensor> {
+    let targets = scatter_targets(attrs.axis, input, indices)?;
+    let dtype = input.dtype();
+    let fold = ScatterFold::<C> {
+        targets,
+        combiner: PhantomData,
+    };
+    let data = accumulate(
+        &[&input.data, &updates.data],
+        dtype.default_accumulator(),
+        dtype,
+        &fold,
+    )?;
+    HostTensor::new(input.dims, data)
+}
+
+impl Eval for ScatterReplace {
     fn eval(
         &self,
-        ins: ScatterOperands<Host<'_>>,
+        ins: ScatterReplaceOperands<Host<'_>>,
         _cx: &mut EvalCx<'_, NoRegions>,
-    ) -> Result<ScatterResults<OwnedHost>> {
+    ) -> Result<ScatterReplaceResults<OwnedHost>> {
         let input = ins.input;
-        let index_dims = &ins.indices.dims;
-        let axis = axis_index(self.axis, input.dims.len())?;
-        let targets = ins
-            .indices
-            .as_indices()?
-            .iter()
-            .enumerate()
-            .map(|(i, &index)| indexed_element(i, index, axis, index_dims, &input.dims))
-            .collect::<Result<Vec<_>>>()?;
-        let combine = match self.kind {
-            ScatterKind::Add => BinaryKind::Add,
-            ScatterKind::Max => BinaryKind::Maximum,
-            ScatterKind::Min => BinaryKind::Minimum,
-            ScatterKind::Replace => {
-                let updates = Chunks::of(&ins.updates.data);
-                let mut out = Chunks::of(&input.data);
-                for (i, &target) in targets.iter().enumerate() {
-                    out.set(target, updates.get(i));
-                }
-                return Ok(ScatterResults {
-                    output: HostTensor::new(input.dims.clone(), out.into_data()?)?,
-                });
-            }
-        };
-        // The elements and the updates accumulate in the default accumulator of their dtype.
-        let dtype = input.dtype();
-        let accum = dtype.default_accumulator();
-        let (x, u) = (cast(&input.data, accum)?, cast(&ins.updates.data, accum)?);
-        let folded = match (values(&x), values(&u)) {
-            (Values::Int(x), Values::Int(u)) => {
-                let int = int_format(accum)?;
-                Values::Int(scatter_fold(&x, &u, &targets, combine, |v| int.wrap(v))?)
-            }
-            (Values::F32(x), Values::F32(u)) => Values::F32(Cow::Owned(scatter_fold(
-                &x,
-                &u,
-                &targets,
-                combine,
-                rounder(accum),
-            )?)),
-            (Values::F64(x), Values::F64(u)) => {
-                Values::F64(Cow::Owned(scatter_fold(&x, &u, &targets, combine, |v| v)?))
-            }
-            _ => bail!("the interpreter cannot accumulate {dtype} in {accum}"),
-        };
-        let data = cast(&from_values(accum, folded)?, dtype)?;
-        Ok(ScatterResults {
-            output: HostTensor::new(input.dims.clone(), data)?,
+        let targets = scatter_targets(self.axis, input, ins.indices)?;
+        let updates = Chunks::of(&ins.updates.data);
+        let mut out = Chunks::of(&input.data);
+        for (i, &target) in targets.iter().enumerate() {
+            out.set(target, updates.get(i));
+        }
+        Ok(ScatterReplaceResults {
+            output: HostTensor::new(input.dims, out.into_data()?)?,
         })
     }
 }
 
-/// `x` with update `i` combined into element `targets[i]`, in order, each step rounded with
-/// `round`.
-fn scatter_fold<T: Arith>(
-    x: &[T],
-    updates: &[T],
-    targets: &[usize],
-    kind: BinaryKind,
-    round: impl Fn(T) -> T,
-) -> Result<Vec<T>> {
-    let combine = T::binary(kind).ok_or_else(|| anyhow!("the interpreter has no {kind:?}"))?;
-    let mut out = x.to_vec();
-    for (&update, &target) in updates.iter().zip(targets) {
-        out[target] = round(combine(out[target], update));
+/// The input with update `i` folded into element `targets[i]` with `C`, in order, each step
+/// rounded.
+struct ScatterFold<C> {
+    targets: Vec<usize>,
+    combiner: PhantomData<C>,
+}
+
+impl<C: Combiner> Accumulation for ScatterFold<C> {
+    fn run<T: Arith>(
+        &self,
+        inputs: &[&[T]],
+        accum: DType,
+        round: impl Fn(T) -> T,
+    ) -> Result<Vec<T>> {
+        let &[x, updates] = inputs else {
+            bail!("a scatter reads its input and its updates");
+        };
+        let combine = T::binary::<C::Scalar>(accum)?;
+        let mut out = x.to_vec();
+        for (&update, &target) in updates.iter().zip(&self.targets) {
+            let combined = combine(out[target], update).expect("a fold is defined on every pair");
+            out[target] = round(combined);
+        }
+        Ok(out)
     }
-    Ok(out)
+}
+
+/// The semantics of every [`Scatter`] op.
+pub(crate) fn scatter<T: Scatter>(
+    op: &T,
+    ins: ScatterOperands<Host<'_>>,
+    _cx: &mut EvalCx<'_, NoRegions>,
+) -> Result<ScatterResults<OwnedHost>> {
+    Ok(ScatterResults {
+        output: scatter_fold::<T::Combiner>(op, ins.input, ins.indices, ins.updates)?,
+    })
 }

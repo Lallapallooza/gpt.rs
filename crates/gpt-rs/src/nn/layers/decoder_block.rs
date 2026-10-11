@@ -63,6 +63,7 @@ impl<N: DecoderNames> Mixer<N> {
         cache: &LayerCache<B>,
         positions: &AttentionPositions<B>,
     ) -> (Tensor, LayerCache<B>) {
+        let _path = capture::scope(format_args!("{}", self.name()));
         match (self, cache) {
             (Mixer::Attention(attn), LayerCache::Attention(kv)) => {
                 let (out, kv) = attn.call((x, kv, positions));

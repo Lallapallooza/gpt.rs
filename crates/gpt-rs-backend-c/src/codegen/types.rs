@@ -1,4 +1,4 @@
-use gpt_rs_ir::dialects::tensor::{BinaryKind, ExtractPatches, TensorOp, UnaryKind};
+use gpt_rs_ir::dialects::tensor::{ExtractPatches, TensorOp};
 use gpt_rs_ir::module::Value;
 use gpt_rs_ir::types::TensorType;
 
@@ -80,15 +80,10 @@ pub(super) struct ElementwiseInput {
 }
 
 pub(super) struct Node {
-    pub(super) op: NodeOp,
+    /// An elementwise op that has a C expression: of one operand, or of two with `rhs`.
+    pub(super) op: TensorOp,
     pub(super) lhs: NodeRef,
     pub(super) rhs: Option<NodeRef>,
-}
-
-#[derive(Clone, Copy)]
-pub(super) enum NodeOp {
-    Unary(UnaryKind),
-    Binary(BinaryKind),
 }
 
 #[derive(Clone, Copy)]

@@ -1,15 +1,14 @@
-//! Semantics of the ops in `ir/window.rs`.
+//! Semantics of the window ops.
 
 use anyhow::Result;
 
-use super::contraction::reduce;
+use super::contraction::fold_groups;
 use super::kernels::{cast, strides, unravel, Chunks};
-use crate::dialects::tensor::ir::{
-    ExtractPatches, ExtractPatchesOperands, ExtractPatchesResults, ReduceWindow,
-    ReduceWindowOperands, ReduceWindowResults,
-};
+use crate::dialects::tensor::ir::*;
+use crate::dialects::tensor::Accumulates;
 use crate::host::{HostTensor, TensorData};
 use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
+use crate::scalar::Combiner;
 
 impl Eval for ExtractPatches {
     fn eval(
@@ -59,35 +58,44 @@ impl Eval for ExtractPatches {
     }
 }
 
-impl Eval for ReduceWindow {
-    fn eval(
-        &self,
-        ins: ReduceWindowOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
-    ) -> Result<ReduceWindowResults<OwnedHost>> {
-        let input = ins.input;
-        let (windowed, out_dims) = self.geometry(&input.tensor_type())?;
-        let in_strides = strides(&input.dims);
-        let offsets: Vec<Vec<usize>> = (0..self.window_dims.iter().product())
-            .map(|k| unravel(k, &self.window_dims))
-            .collect();
-        // Each output folds its window elements in row-major order, skipping the ones in the
-        // padding or between dilated input elements.
-        let groups: Vec<Vec<usize>> = (0..out_dims.iter().product())
-            .map(|o| {
-                let at = unravel(o, &out_dims);
-                let source = |offset: &Vec<usize>| {
-                    windowed.iter().enumerate().try_fold(0, |src, (i, axis)| {
-                        Some(src + axis.source(at[i], offset[i])? * in_strides[i])
-                    })
-                };
-                offsets.iter().filter_map(source).collect()
-            })
-            .collect();
-        let out = self.out.unwrap_or(input.dtype());
-        let data = reduce(input, &groups, self.kind, self.accum, out)?;
-        Ok(ReduceWindowResults {
-            output: HostTensor::new(out_dims, data)?,
+/// Every window of `input` that `attrs` places, folded with `C`.
+pub(crate) fn reduce_windows<C: Combiner>(
+    attrs: &ReduceWindowAttrs,
+    input: &HostTensor,
+) -> Result<HostTensor> {
+    let (windowed, out_dims) = attrs.geometry(&input.tensor_type())?;
+    let in_strides = strides(&input.dims);
+    let offsets: Vec<Vec<usize>> = (0..attrs.window_dims.iter().product())
+        .map(|k| unravel(k, &attrs.window_dims))
+        .collect();
+    // Each output folds its window elements in row-major order, skipping the ones in the padding
+    // or between dilated input elements.
+    let groups: Vec<Vec<usize>> = (0..out_dims.iter().product())
+        .map(|o| {
+            let at = unravel(o, &out_dims);
+            let source = |offset: &Vec<usize>| {
+                windowed.iter().enumerate().try_fold(0, |src, (i, axis)| {
+                    Some(src + axis.source(at[i], offset[i])? * in_strides[i])
+                })
+            };
+            offsets.iter().filter_map(source).collect()
         })
-    }
+        .collect();
+    let (accum, out) = (
+        attrs.accum_dtype(input.dtype()),
+        attrs.out_dtype(input.dtype()),
+    );
+    let data = fold_groups::<C>(input, &groups, accum, out)?;
+    HostTensor::new(out_dims, data)
+}
+
+/// The semantics of every [`ReduceWindow`] op.
+pub(crate) fn reduce_window<T: ReduceWindow>(
+    op: &T,
+    ins: ReduceWindowOperands<Host<'_>>,
+    _cx: &mut EvalCx<'_, NoRegions>,
+) -> Result<ReduceWindowResults<OwnedHost>> {
+    Ok(ReduceWindowResults {
+        output: reduce_windows::<T::Combiner>(op, ins.input)?,
+    })
 }

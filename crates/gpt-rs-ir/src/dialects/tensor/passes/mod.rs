@@ -1,10 +1,8 @@
-//! Rewrites of `tensor` ops.
+//! The passes of the `tensor` dialect: its canonical patterns, and one file per pass.
 
-mod broadcast;
 mod canonicalize;
-mod contract;
-mod dot_scale;
-mod reduce;
+mod dot_scale_fold;
+mod merge_contracted_axes;
 
-pub use self::contract::{populate_merge_dot_axes_patterns, MergeContractedAxes};
-pub use self::dot_scale::{populate_dot_scale_patterns, DotScaleFold};
+pub use self::dot_scale_fold::DotScaleFold;
+pub use self::merge_contracted_axes::MergeContractedAxes;

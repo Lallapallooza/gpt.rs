@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, ensure, Result};
-use gpt_rs_ir::dialects::tensor::{BinaryKind, CompareKind, TensorOp, UnaryKind};
+use gpt_rs_ir::dialects::tensor::TensorOp;
 use gpt_rs_ir::module::Value;
 use gpt_rs_ir::types::DType;
 
 use super::super::profile::{
     register_op_profile_binary, register_op_profile_generic, register_op_profile_unary,
 };
-use super::super::types::{Elementwise, Instruction, Kind, NodeOp, NodeRef, ValueInfo};
+use super::super::types::{Elementwise, Instruction, Kind, NodeRef, ValueInfo};
 use super::super::utils::{
     c_type, dims_usize, emit_flat_loop, emit_memcpy, emit_parallel_loops_with_indices,
     linear_index_expr, push_block,
@@ -34,7 +34,7 @@ pub(super) fn emit_instruction(
         return Ok(None);
     };
     let op_id = match op {
-        TensorOp::Unary(unary) => {
+        op if unary_expr(op, "").is_some() => {
             let out_info = output_info(value_infos, inst.result())?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             ensure_dtype(
@@ -52,16 +52,10 @@ pub(super) fn emit_instruction(
             let op_id =
                 register_op_profile_unary(matmul_profile, label, &out_info.ty, &input_spec)?;
             let input = operand_expr(&inst.operands[0], value_infos)?;
-            emit_unary(
-                module,
-                unary.kind,
-                &out_info.var,
-                &input,
-                out_info.elem_count,
-            )?;
+            emit_unary(module, op, &out_info.var, &input, out_info.elem_count)?;
             op_id
         }
-        TensorOp::Binary(binary) => {
+        op if binary_expr(op, "", "").is_some() => {
             let out_info = output_info(value_infos, inst.result())?;
             let lhs_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             let rhs_dtype = operand_dtype(&inst.operands[1], value_infos)?;
@@ -84,7 +78,7 @@ pub(super) fn emit_instruction(
             let rhs = operand_expr(&inst.operands[1], value_infos)?;
             emit_binary(
                 module,
-                binary.kind,
+                op,
                 dtype,
                 &out_info.var,
                 (&lhs, &rhs),
@@ -113,7 +107,12 @@ pub(super) fn emit_instruction(
             )?;
             op_id
         }
-        TensorOp::Compare(compare) => {
+        TensorOp::Less(_)
+        | TensorOp::LessEqual(_)
+        | TensorOp::Equal(_)
+        | TensorOp::GreaterEqual(_)
+        | TensorOp::Greater(_)
+        | TensorOp::NotEqual(_) => {
             let out_info = output_info(value_infos, inst.result())?;
             let lhs_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             let rhs_dtype = operand_dtype(&inst.operands[1], value_infos)?;
@@ -139,7 +138,7 @@ pub(super) fn emit_instruction(
             let rhs = operand_expr(&inst.operands[1], value_infos)?;
             emit_compare(
                 module,
-                compare.kind,
+                op,
                 &out_info.var,
                 &lhs,
                 &rhs,
@@ -181,12 +180,12 @@ pub(super) fn emit_instruction(
 
 fn emit_unary(
     module: &mut String,
-    op: UnaryKind,
+    op: &TensorOp,
     out: &str,
     input: &str,
     elem_count: usize,
 ) -> Result<()> {
-    let expr = unary_expr(op, "src[i]");
+    let expr = unary_expr(op, "src[i]").expect("an op with a C expression");
     emit_flat_loop(
         module,
         &[("float", "src", input)],
@@ -198,7 +197,7 @@ fn emit_unary(
 }
 fn emit_binary(
     module: &mut String,
-    op: BinaryKind,
+    op: &TensorOp,
     dtype: DType,
     out: &str,
     (lhs, rhs): (&str, &str),
@@ -206,7 +205,10 @@ fn emit_binary(
 ) -> Result<()> {
     let (ctype, expr) = match dtype {
         DType::Si32 => ("int32_t", int_binary_expr(op, "lhs_ptr[i]", "rhs_ptr[i]")?),
-        _ => ("float", binary_expr(op, "lhs_ptr[i]", "rhs_ptr[i]")),
+        _ => (
+            "float",
+            binary_expr(op, "lhs_ptr[i]", "rhs_ptr[i]").expect("an op with a C expression"),
+        ),
     };
     emit_flat_loop(
         module,
@@ -220,15 +222,15 @@ fn emit_binary(
 
 /// `lhs op rhs` of `int32_t` operands. Sums, differences and products wrap, as the spec says, so
 /// they compute on `uint32_t`.
-fn int_binary_expr(op: BinaryKind, lhs: &str, rhs: &str) -> Result<String> {
+fn int_binary_expr(op: &TensorOp, lhs: &str, rhs: &str) -> Result<String> {
     let wrapping = |symbol: &str| format!("(int32_t)((uint32_t){lhs} {symbol} (uint32_t){rhs})");
     Ok(match op {
-        BinaryKind::Add => wrapping("+"),
-        BinaryKind::Sub => wrapping("-"),
-        BinaryKind::Mul => wrapping("*"),
-        BinaryKind::Maximum => format!("({lhs} > {rhs} ? {lhs} : {rhs})"),
-        BinaryKind::Minimum => format!("({lhs} < {rhs} ? {lhs} : {rhs})"),
-        other => bail!("the C backend has no si32 {other:?}"),
+        TensorOp::Add(_) => wrapping("+"),
+        TensorOp::Sub(_) => wrapping("-"),
+        TensorOp::Mul(_) => wrapping("*"),
+        TensorOp::Maximum(_) => format!("({lhs} > {rhs} ? {lhs} : {rhs})"),
+        TensorOp::Minimum(_) => format!("({lhs} < {rhs} ? {lhs} : {rhs})"),
+        other => bail!("the C backend has no si32 {}", other.name()),
     })
 }
 fn emit_cast(
@@ -315,20 +317,21 @@ fn emit_cast(
 }
 fn emit_compare(
     module: &mut String,
-    kind: CompareKind,
+    op: &TensorOp,
     out: &str,
     lhs: &str,
     rhs: &str,
     elem_count: usize,
     dtype: DType,
 ) -> Result<()> {
-    let expr = match kind {
-        CompareKind::Less => "lhs[i] < rhs[i]",
-        CompareKind::LessEqual => "lhs[i] <= rhs[i]",
-        CompareKind::Equal => "lhs[i] == rhs[i]",
-        CompareKind::GreaterEqual => "lhs[i] >= rhs[i]",
-        CompareKind::Greater => "lhs[i] > rhs[i]",
-        CompareKind::NotEqual => "lhs[i] != rhs[i]",
+    let expr = match op {
+        TensorOp::Less(_) => "lhs[i] < rhs[i]",
+        TensorOp::LessEqual(_) => "lhs[i] <= rhs[i]",
+        TensorOp::Equal(_) => "lhs[i] == rhs[i]",
+        TensorOp::GreaterEqual(_) => "lhs[i] >= rhs[i]",
+        TensorOp::Greater(_) => "lhs[i] > rhs[i]",
+        TensorOp::NotEqual(_) => "lhs[i] != rhs[i]",
+        other => bail!("{} is not a comparison", other.name()),
     };
     let ctype = match dtype {
         DType::F32 => "float",
@@ -430,11 +433,11 @@ pub(super) fn emit_elementwise(
         .iter()
         .map(|node| {
             let lhs = reference(node.lhs);
-            match (node.op, node.rhs) {
-                (NodeOp::Unary(kind), _) => unary_expr(kind, &lhs),
-                (NodeOp::Binary(kind), Some(rhs)) => binary_expr(kind, &lhs, &reference(rhs)),
-                (NodeOp::Binary(_), None) => unreachable!("a binary node has two operands"),
-            }
+            let expr = match node.rhs {
+                None => unary_expr(&node.op, &lhs),
+                Some(rhs) => binary_expr(&node.op, &lhs, &reference(rhs)),
+            };
+            expr.expect("a node is an op with a C expression")
         })
         .collect();
     let node_count = node_exprs.len();

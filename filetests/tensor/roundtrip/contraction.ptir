@@ -65,8 +65,8 @@ func.func @segment(%0: tensor<6x4xf32>, %1: tensor<6xsi32>) -> (tensor<3x4xf32>,
 // -----
 
 func.func @top_k(%0: tensor<2x5xf32>) -> (tensor<2x3xf32>, tensor<2x3xsi32>, tensor<1x5xf32>, tensor<1x5xsi64>) {
-  %1, %2 = tensor.top_k(%0) {k = 3, axis = 1, largest = true, indices = si32} : (tensor<2x5xf32>) -> (tensor<2x3xf32>, tensor<2x3xsi32>)
-  %3, %4 = tensor.top_k(%0) {k = 1, axis = 0, largest = false, indices = si64} : (tensor<2x5xf32>) -> (tensor<1x5xf32>, tensor<1x5xsi64>)
+  %1, %2 = tensor.top_k(%0) {k = 3, axis = 1, indices = si32} : (tensor<2x5xf32>) -> (tensor<2x3xf32>, tensor<2x3xsi32>)
+  %3, %4 = tensor.bottom_k(%0) {k = 1, axis = 0, indices = si64} : (tensor<2x5xf32>) -> (tensor<1x5xf32>, tensor<1x5xsi64>)
   func.return(%1, %2, %3, %4) : (tensor<2x3xf32>, tensor<2x3xsi32>, tensor<1x5xf32>, tensor<1x5xsi64>) -> ()
 }
 

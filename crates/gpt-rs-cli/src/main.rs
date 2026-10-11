@@ -1,3 +1,5 @@
+mod ir;
+
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,6 +16,7 @@ use gpt_rs::profiling;
 use gpt_rs::runtime::{LoadOptions, LoadedModel, ModelHandle};
 use gpt_rs::tensor::HostTensor;
 use gpt_rs::tokenizer::{StreamDecoder, Tokenizer};
+use gpt_rs_ir::dialects::func::Func;
 use gpt_rs_ir::module::Module;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -165,6 +168,12 @@ enum Command {
 
     /// Write the C source that the C backend generates for a PTIR program.
     Convert(ConvertArgs),
+
+    /// Print what the functions of a PTIR program cost, op by op.
+    IrStats(ir::IrStatsArgs),
+
+    /// Print how the ops of two versions of a PTIR program and their cost differ.
+    IrDiff(ir::IrDiffArgs),
 }
 
 /// Checkpoint loading options shared by every command that loads a model.
@@ -461,12 +470,12 @@ fn main() -> Result<()> {
         profiling::reset();
     }
 
-    if matches!(args.command, Command::Convert(_)) {
-        return run_conversion(match args.command {
-            Command::Convert(convert) => convert,
-            _ => unreachable!(),
-        });
-    }
+    let command = match args.command {
+        Command::Convert(convert) => return run_conversion(convert),
+        Command::IrStats(stats) => return ir::run_stats(stats),
+        Command::IrDiff(diff) => return ir::run_diff(diff),
+        command => command,
+    };
 
     let backend = args
         .backend
@@ -474,7 +483,7 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| gpt_rs_backends::DEFAULT.to_string());
     let profile_consumed = run(
         backend.trim(),
-        args.command,
+        command,
         profile_enabled,
         args.profile_full,
         &artifact_config,
@@ -526,7 +535,9 @@ fn run(
             run_forward(backend, &args, profile)?;
             Ok(false)
         }
-        Command::Convert(_) => unreachable!(),
+        Command::Convert(_) | Command::IrStats(_) | Command::IrDiff(_) => {
+            unreachable!("main runs the commands that load no model")
+        }
     }
 }
 
@@ -914,7 +925,7 @@ fn run_conversion(args: ConvertArgs) -> Result<()> {
     let run_time: Vec<String> = module
         .funcs()
         .into_iter()
-        .filter_map(|f| module.op(f).as_func().filter(|f| !f.is_load_time()))
+        .filter_map(|f| module.op(f).get::<Func>().filter(|f| !f.is_load_time()))
         .map(|f| f.name.clone())
         .collect();
     let [func] = &run_time[..] else {

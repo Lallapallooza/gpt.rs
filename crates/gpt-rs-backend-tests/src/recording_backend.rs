@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 use gpt_rs::backend::{ParamStore, PortableBackend};
+use gpt_rs::gpt_rs_ir::dialects::func::Func;
 use gpt_rs::gpt_rs_ir::host::HostTensor;
 use gpt_rs::gpt_rs_ir::module::Module;
 
@@ -41,7 +42,12 @@ impl PortableBackend for RecordingBackend {
         let inst = module
             .func(func)
             .ok_or_else(|| anyhow!("the module has no function @{func}"))?;
-        let results = module.op(inst).as_func().expect("a function").results.len();
+        let results = module
+            .op(inst)
+            .get::<Func>()
+            .expect("a function")
+            .results
+            .len();
         *self.last.lock().expect("backend mutex poisoned") =
             Some((Arc::clone(module), func.to_string()));
         Ok(results)

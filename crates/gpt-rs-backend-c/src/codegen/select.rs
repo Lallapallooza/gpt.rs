@@ -7,16 +7,16 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{anyhow, Result};
 use gpt_rs::ops::functional::{linear_weight, WeightLayout};
 use gpt_rs_ir::dialects::tensor::{
-    Binary, BinaryKind, BroadcastTo, Cast, DotGeneral, ExtractPatches, Reshape, Slice, Transpose,
-    Unary,
+    Add, BroadcastTo, Cast, DotGeneral, ExtractPatches, Reshape, Slice, TensorOp, Transpose,
 };
 use gpt_rs_ir::module::{Inst, Module, Value};
+use gpt_rs_ir::rewrite::matched;
 use gpt_rs_ir::types::DType;
 use gpt_rs_ir::Op;
 
-use super::types::{Elementwise, ElementwiseInput, Instruction, Kind, Node, NodeOp, NodeRef};
+use super::types::{Elementwise, ElementwiseInput, Instruction, Kind, Node, NodeRef};
 use crate::kernels::PANEL_N;
-use crate::targets::{fused_input_fits, linear_kernel};
+use crate::targets::{binary_expr, fused_input_fits, linear_kernel, unary_expr};
 
 /// A kernel, and the ops it covers besides the op whose result it gives.
 struct Fused<'m> {
@@ -110,7 +110,7 @@ fn op(module: &Module, inst: Inst) -> Result<Instruction<'_>> {
 pub(super) fn f32_dims(module: &Module, value: Value) -> Option<Vec<usize>> {
     let ty = module.ty(value).as_tensor()?;
     let dims = ty.static_dims().filter(|_| ty.dtype == DType::F32)?;
-    Some(dims.into_vec())
+    Some(dims.to_vec())
 }
 
 /// `dot_general(extract_patches(x), w)`: the patches `[N, OH, OW, K]` of an f32 NHWC `x`, padded
@@ -118,29 +118,29 @@ pub(super) fn f32_dims(module: &Module, value: Value) -> Option<Vec<usize>> {
 /// `[C_out / PANEL_N, K, PANEL_N]`. The convolution kernel reads `x` and `w`.
 fn conv2d(module: &Module, inst: Inst) -> Option<Fused<'_>> {
     let dot = module.op_as::<DotGeneral>(inst)?;
-    let patches = module.def_as::<ExtractPatches>(dot.operands.lhs)?;
-    let attrs = &dot.attrs;
-    let weight = dot.operands.rhs;
+    let patches = dot.lhs().defining_op::<ExtractPatches>()?;
+    let attrs = dot.attrs();
+    let weight = dot.rhs().id();
     let w_dims = f32_dims(module, weight)?;
     let layout = matches!(
         (w_dims.as_slice(), attrs.contract_rhs.as_slice()),
         ([_, _], [0]) | ([_, _, PANEL_N], [1])
     );
-    let input = patches.operands.input;
+    let input = patches.input().id();
     let plain =
         attrs.batch_lhs.is_empty() && attrs.batch_rhs.is_empty() && attrs.contract_lhs[..] == [3];
-    let zero_padded = patches.attrs.window.len() == 2 && patches.attrs.pad_value.0 == 0.0;
+    let zero_padded = patches.window.len() == 2 && patches.pad_value.0 == 0.0;
     let f32_operands = f32_dims(module, input)?.len() == 4
-        && f32_dims(module, patches.results.output)?.len() == 4
-        && f32_dims(module, dot.results.output).is_some();
+        && f32_dims(module, patches.output().id())?.len() == 4
+        && f32_dims(module, dot.output().id()).is_some();
     (layout && plain && zero_padded && f32_operands).then(|| Fused {
         instruction: Instruction {
-            kind: Kind::Conv2d(patches.attrs.clone()),
+            kind: Kind::Conv2d(patches.attrs().clone()),
             operands: vec![input, weight],
-            results: vec![dot.results.output],
+            results: vec![dot.output().id()],
             label: gpt_rs::profiling::intern_label("backend.c.conv2d"),
         },
-        covers: vec![patches.inst],
+        covers: vec![patches.inst()],
     })
 }
 
@@ -152,29 +152,28 @@ fn conv2d(module: &Module, inst: Inst) -> Option<Fused<'_>> {
 /// and `w` and writes the last.
 fn grouped_conv2d(module: &Module, inst: Inst) -> Option<Fused<'_>> {
     let reshape = module.op_as::<Reshape>(inst)?;
-    let transpose = module.def_as::<Transpose>(reshape.operands.input)?;
-    let dot = module.def_as::<DotGeneral>(transpose.operands.input)?;
-    let patches_reshape = module.def_as::<Reshape>(dot.operands.lhs)?;
-    let patches = module.def_as::<ExtractPatches>(patches_reshape.operands.input)?;
-    let (input, weight) = (patches.operands.input, dot.operands.rhs);
+    matched!(let transpose @ Transpose(dot @ DotGeneral(patches_reshape @ Reshape(patches @ ExtractPatches(input)), weight)) = reshape.input() else {
+        return None;
+    });
+    let (input, weight) = (input.id(), weight.id());
     let &[n, _, _, c_in] = f32_dims(module, input)?.as_slice() else {
         return None;
     };
-    let &[k_h, k_w] = patches.attrs.window.as_slice() else {
+    let &[k_h, k_w] = patches.window.as_slice() else {
         return None;
     };
     let &[w_h, w_w, group_in, groups, group_out] = f32_dims(module, weight)?.as_slice() else {
         return None;
     };
-    let &[out_n, out_h, out_w, c_out] = f32_dims(module, reshape.results.output)?.as_slice() else {
+    let &[out_n, out_h, out_w, c_out] = f32_dims(module, reshape.output().id())?.as_slice() else {
         return None;
     };
-    let attrs = &dot.attrs;
+    let attrs = dot.attrs();
     let shapes = [w_h, w_w] == [k_h, k_w]
         && groups * group_in == c_in
         && groups * group_out == c_out
         && out_n == n
-        && f32_dims(module, patches_reshape.results.output)?
+        && f32_dims(module, patches_reshape.output().id())?
             == [n, out_h, out_w, k_h, k_w, groups, group_in];
     let axes = attrs.batch_lhs[..] == [5]
         && attrs.batch_rhs[..] == [3]
@@ -182,19 +181,24 @@ fn grouped_conv2d(module: &Module, inst: Inst) -> Option<Fused<'_>> {
         && attrs.contract_rhs[..] == [0, 1, 2]
         && attrs.accum.is_none()
         && attrs.out.is_none()
-        && transpose.attrs.perm[..] == [1, 2, 3, 0, 4];
-    let zero_padded = patches.attrs.pad_value.0 == 0.0;
+        && transpose.perm[..] == [1, 2, 3, 0, 4];
+    let zero_padded = patches.pad_value.0 == 0.0;
     (shapes && axes && zero_padded).then(|| Fused {
         instruction: Instruction {
             kind: Kind::GroupedConv2d {
-                patches: patches.attrs.clone(),
+                patches: patches.attrs().clone(),
                 groups,
             },
             operands: vec![input, weight],
-            results: vec![reshape.results.output],
+            results: vec![reshape.output().id()],
             label: gpt_rs::profiling::intern_label("backend.c.grouped_conv2d"),
         },
-        covers: vec![patches.inst, patches_reshape.inst, dot.inst, transpose.inst],
+        covers: vec![
+            patches.inst(),
+            patches_reshape.inst(),
+            dot.inst(),
+            transpose.inst(),
+        ],
     })
 }
 
@@ -229,10 +233,7 @@ fn bias_add(
     add: Inst,
     fused: &HashMap<Inst, Fused<'_>>,
 ) -> Option<(Inst, Value, Vec<Inst>)> {
-    let add = module.op_as::<Binary>(add)?;
-    if add.attrs.kind != BinaryKind::Add {
-        return None;
-    }
+    let add = module.op_as::<Add>(add)?;
     let is_conv = |inst: Inst| {
         let Some(Fused { instruction, .. }) = fused.get(&inst) else {
             return false;
@@ -251,20 +252,20 @@ fn bias_add(
             return single_use(value).then_some((def, None));
         }
         let reshape = module.op_as::<Reshape>(def)?;
-        let inner = reshape.operands.input;
+        let inner = reshape.input().id();
         let conv = module.def_inst(inner)?;
         (is_conv(conv) && single_use(inner) && single_use(value)).then_some((conv, Some(def)))
     };
-    let (lhs, rhs) = (add.operands.lhs, add.operands.rhs);
+    let (lhs, rhs) = (add.lhs().id(), add.rhs().id());
     let ((conv, reshape), other) = [(lhs, rhs), (rhs, lhs)]
         .into_iter()
         .find_map(|(conv, other)| Some((conv_of(conv)?, other)))?;
-    let broadcast = module.def_as::<BroadcastTo>(other)?;
-    let bias = broadcast.operands.input;
-    let &channels = f32_dims(module, add.results.output)?.last()?;
+    let broadcast = module.value_ref(other).defining_op::<BroadcastTo>()?;
+    let bias = broadcast.input().id();
+    let &channels = f32_dims(module, add.output().id())?.last()?;
     let dims = f32_dims(module, bias)?;
     let per_channel = dims.last() == Some(&channels) && dims.iter().product::<usize>() == channels;
-    let covers = std::iter::once(broadcast.inst).chain(reshape).collect();
+    let covers = std::iter::once(broadcast.inst()).chain(reshape).collect();
     per_channel.then_some((conv, bias, covers))
 }
 
@@ -275,10 +276,10 @@ fn bias_add(
 fn elementwise<'m>(module: &'m Module, inst: Inst, claimed: &HashSet<Inst>) -> Option<Fused<'m>> {
     let (root, store_bf16) = match module.op_as::<Cast>(inst) {
         Some(cast) => {
-            let value = cast.operands.input;
+            let value = cast.input().id();
             let root = module.def_inst(value)?;
             let single = module.uses(value).len() == 1;
-            let narrowing = cast.attrs.to == DType::Bf16;
+            let narrowing = cast.to == DType::Bf16;
             (single && narrowing && !claimed.contains(&root)).then_some((root, true))?
         }
         None => (inst, false),
@@ -317,17 +318,17 @@ fn elementwise<'m>(module: &'m Module, inst: Inst, claimed: &HashSet<Inst>) -> O
     })
 }
 
-/// The op of an elementwise node and its operands, when `inst` is a unary or binary op.
-fn node_op(module: &Module, inst: Inst) -> Option<(NodeOp, Value, Option<Value>)> {
-    if let Some(op) = module.op_as::<Unary>(inst) {
-        return Some((NodeOp::Unary(op.attrs.kind), op.operands.input, None));
+/// The op of an elementwise node and its operands, when `inst` is an elementwise op of one or
+/// two operands that has a C expression.
+fn node_op(module: &Module, inst: Inst) -> Option<(TensorOp, Value, Option<Value>)> {
+    let Op::Tensor(op) = module.op(inst) else {
+        return None;
+    };
+    match *module.operands(inst) {
+        [input] if unary_expr(op, "").is_some() => Some((op.clone(), input, None)),
+        [lhs, rhs] if binary_expr(op, "", "").is_some() => Some((op.clone(), lhs, Some(rhs))),
+        _ => None,
     }
-    let op = module.op_as::<Binary>(inst)?;
-    Some((
-        NodeOp::Binary(op.attrs.kind),
-        op.operands.lhs,
-        Some(op.operands.rhs),
-    ))
 }
 
 /// An elementwise chain, collected from its last op back to its inputs.
@@ -377,17 +378,17 @@ impl<'a> Chain<'a> {
 
     /// Reads the source of a `slice` at an offset instead of materializing the slice.
     fn add_sliced_input(&mut self, value: Value) -> Option<NodeRef> {
-        let slice = self.module.def_as::<Slice>(value)?;
-        if slice.attrs.sizes[..] != self.root_dims[..] {
+        let slice = self.module.value_ref(value).defining_op::<Slice>()?;
+        if slice.sizes[..] != self.root_dims[..] {
             return None;
         }
-        let source = slice.operands.input;
+        let source = slice.input().id();
         let source_dims = f32_dims(self.module, source)?;
-        if !fused_input_fits(&self.root_dims, &source_dims, Some(&slice.attrs.starts[..])) {
+        if !fused_input_fits(&self.root_dims, &source_dims, Some(&slice.starts[..])) {
             return None;
         }
         self.views.push(value);
-        Some(self.input(source, Some(slice.attrs.starts.to_vec())))
+        Some(self.input(source, Some(slice.starts.to_vec())))
     }
 
     fn collect(&mut self, value: Value, is_root: bool) -> Option<NodeRef> {
@@ -408,7 +409,7 @@ impl<'a> Chain<'a> {
         if self.claimed.contains(&inst) {
             return self.add_input(value);
         }
-        if module.is::<Slice>(inst) {
+        if module.op(inst).get::<Slice>().is_some() {
             return self
                 .add_sliced_input(value)
                 .or_else(|| self.add_input(value));
@@ -419,7 +420,7 @@ impl<'a> Chain<'a> {
             }
             // Reading the broadcast source in place never costs more than reading a materialized
             // copy. Other readers keep the broadcast if they need it.
-            return match self.collect(broadcast.operands.input, false) {
+            return match self.collect(broadcast.input().id(), false) {
                 Some(node) => {
                     self.views.push(value);
                     Some(node)

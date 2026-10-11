@@ -98,7 +98,7 @@ fn gather(
 ) -> Result<HostTensor> {
     let mut out = HostTensor::zeros(ty)?;
     let elem = elem_bytes(input)?;
-    let dims = out.dims.clone();
+    let dims = out.dims;
     let dst_strides = strides(&dims);
     copy_strided(
         out.bytes_mut(),

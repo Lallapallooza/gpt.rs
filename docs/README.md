@@ -19,6 +19,8 @@ Doc policy:
 ## Reference
 - [backends/README.md](backends/README.md): the backend interface, and how each backend executes PTIR (ref-cpu, faer, c).
 - [ptir/tensor.md](ptir/tensor.md): the `tensor` dialect, the PTIR spec, generated from the code.
+- [ptir/arith.md](ptir/arith.md), [ptir/tile.md](ptir/tile.md) and [ptir/host.md](ptir/host.md): the scalar, tile and
+  host dialects, generated from the code.
 - [ops.md](ops.md): ops/recording/graph execution architecture (implementation-oriented).
 - [ptir/passes.md](ptir/passes.md): the passes and the pipeline of each backend, generated from
   the code.

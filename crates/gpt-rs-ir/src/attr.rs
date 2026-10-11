@@ -7,15 +7,31 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 use smallvec::{Array, SmallVec};
+use tinyvec::ArrayVec;
 
 use crate::text::{is_ident_char, is_ident_start, Cursor};
-use crate::types::{DType, Dim, Sym, TensorType, Type};
+use crate::types::{ranked, DType, Dim, Perm, Ranked, Sym, TensorType, Type};
 
 pub trait Attr: Sized + Clone + PartialEq + Eq + Hash + fmt::Debug {
     fn print(&self, out: &mut String);
     fn parse(c: &mut Cursor<'_>) -> Result<Self>;
+}
+
+/// The attributes that the ops of a family share, held in one struct: each op of the family is a
+/// newtype over it. `#[derive(AttrGroup)]` implements it from the struct's fields, which are the
+/// ops' attributes, written as an op's own fields are.
+pub trait AttrGroup: Sized {
+    const INFOS: &'static [crate::op::AttrInfo];
+    /// Pushes `(name, text)` for every attribute, except an `#[attr(default)]` attribute at its
+    /// default.
+    fn print_attrs(&self, out: &mut Vec<(&'static str, String)>);
+    /// Parses the optional attribute dictionary of the op `op`.
+    fn parse_attrs(op: &str, c: &mut Cursor<'_>) -> Result<Self>;
+    /// Parses the optional parameters, `<key = value, ...>`, after `name`, the name of a variant of
+    /// an attribute enum that holds the group.
+    fn parse_params(name: &str, c: &mut Cursor<'_>) -> Result<Self>;
 }
 
 /// An enum attribute type, which `#[derive(Attr)]` registers so that the generated docs can list
@@ -152,6 +168,36 @@ where
     }
 }
 
+impl<A: tinyvec::Array + Clone> Attr for ArrayVec<A>
+where
+    A::Item: Attr,
+{
+    fn print(&self, out: &mut String) {
+        print_list(self, out);
+    }
+    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
+        let items = Vec::parse(c)?;
+        ensure!(
+            items.len() <= A::CAPACITY,
+            c.error(format!(
+                "a list of {} entries, above its limit of {}",
+                items.len(),
+                A::CAPACITY
+            ))
+        );
+        Ok(items.into_iter().collect())
+    }
+}
+
+impl Attr for Perm {
+    fn print(&self, out: &mut String) {
+        print_list(self, out);
+    }
+    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
+        Ranked::<usize>::parse(c).map(Perm::from_iter)
+    }
+}
+
 impl<T: Attr> Attr for Option<T> {
     fn print(&self, out: &mut String) {
         match self {
@@ -178,11 +224,11 @@ impl<A: Attr, B: Attr> Attr for (A, B) {
     }
     fn parse(c: &mut Cursor<'_>) -> Result<Self> {
         c.expect("(")?;
-        let a = A::parse(c)?;
+        let first = A::parse(c)?;
         c.expect(",")?;
-        let b = B::parse(c)?;
+        let second = B::parse(c)?;
         c.expect(")")?;
-        Ok((a, b))
+        Ok((first, second))
     }
 }
 
@@ -223,6 +269,20 @@ impl<T: Attr> Attr for BTreeMap<String, T> {
             Ok(())
         })?;
         Ok(map)
+    }
+}
+
+/// The name of a top-level symbol, such as a `tile.dispatch`, written `@name`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SymbolRef(pub String);
+
+impl Attr for SymbolRef {
+    fn print(&self, out: &mut String) {
+        out.push('@');
+        out.push_str(&self.0);
+    }
+    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
+        Ok(SymbolRef(c.sigil_name('@')?.to_string()))
     }
 }
 
@@ -310,10 +370,8 @@ fn parse_tensor_body(c: &Cursor<'_>, body: &str) -> Result<TensorType> {
                 .ok_or_else(|| c.error(format!("bad dimension `{}` in tensor type", part.trim())))
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(TensorType {
-        dtype,
-        dims: dims.into(),
-    })
+    let dims = ranked(dims).map_err(|err| c.error(format!("tensor type: {err}")))?;
+    Ok(TensorType { dtype, dims })
 }
 
 impl Attr for TensorType {

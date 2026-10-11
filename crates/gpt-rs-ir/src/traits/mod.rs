@@ -1,11 +1,11 @@
 //! Op traits: facts that hold for every instance of an op, each with the generic behavior that
 //! follows from it.
 //!
-//! An op lists its traits in `#[op(..., traits(...))]`, and an op family lists more on each kind
-//! with `#[traits(...)]` on the kind's variant. Folding calls every trait's [`OpTrait::fold`], and
-//! a pattern rooted at [`Has<T>`](crate::rewrite::Has) runs on every op that has `T`. Each
-//! algebraic trait states the equations it claims in [`OpTrait::laws`], which a test checks against
-//! the op's `Eval` on random inputs.
+//! An op lists its traits in `#[op(..., traits(...))]`, and an op family lists those its ops share
+//! in `#[family(..., traits(...))]`. Folding calls every trait's [`OpTrait::fold`], and a pattern
+//! rooted at [`Has<T>`](crate::rewrite::Has) runs on every op that has `T`. Each algebraic trait
+//! states the equations it claims in [`OpTrait::laws`], which a test checks against the op's `Eval`
+//! on random inputs.
 
 mod algebra;
 mod patterns;
@@ -16,7 +16,7 @@ use std::fmt;
 
 pub use self::algebra::{
     Absorbing, Associative, Commutative, DistributesOver, Idempotent, IntValue, Involution,
-    PerClass, RightIdentity,
+    PerClass, RightIdentity, NEG_ZERO,
 };
 pub use self::structure::{Elementwise, IsolatedFromAbove, Movement, Terminator};
 use crate::dense::Dense;
@@ -41,23 +41,19 @@ pub trait OpTrait: Any + Sync + fmt::Debug + fmt::Display + Doc {
     }
 }
 
-/// The traits of one op: those the op lists, then those of its kind.
+/// The traits of one op: those of its family, then those the op lists.
 #[derive(Clone, Copy)]
 pub struct Traits {
-    op: &'static [&'static dyn OpTrait],
-    kind: &'static [&'static dyn OpTrait],
+    traits: &'static [&'static dyn OpTrait],
 }
 
 impl Traits {
-    pub const fn new(
-        op: &'static [&'static dyn OpTrait],
-        kind: &'static [&'static dyn OpTrait],
-    ) -> Self {
-        Self { op, kind }
+    pub const fn new(traits: &'static [&'static dyn OpTrait]) -> Self {
+        Self { traits }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &'static dyn OpTrait> {
-        self.op.iter().chain(self.kind).copied()
+        self.traits.iter().copied()
     }
 
     /// The trait `T`, with its parameters, when the op has it.
@@ -71,12 +67,6 @@ impl Traits {
     pub fn has<T: OpTrait>(&self) -> bool {
         self.get::<T>().is_some()
     }
-}
-
-/// The traits of one kind of an op family, from `#[traits(...)]` on the kind's variant.
-/// `#[derive(Attr)]` implements it.
-pub trait KindTraits: Copy {
-    fn traits(self) -> &'static [&'static dyn OpTrait];
 }
 
 /// An op with its operands, as a trait's fold sees it.
@@ -106,14 +96,14 @@ impl OpRef<'_> {
         (self.module.op(inst) == self.op).then(|| self.module.operands(inst))
     }
 
-    /// The dtype of the first operand, when it is a tensor.
+    /// The dtype of the first operand: its element dtype, or its own as a scalar.
     pub fn dtype(&self) -> Option<DType> {
         first_dtype(self.module, self.operands)
     }
 }
 
 fn first_dtype(module: &Module, operands: &[Value]) -> Option<DType> {
-    Some(module.ty(*operands.first()?).as_tensor()?.dtype)
+    module.ty(*operands.first()?).dtype()
 }
 
 /// A side of a law.

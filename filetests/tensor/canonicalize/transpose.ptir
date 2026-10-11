@@ -45,3 +45,48 @@ func.func @cube(%0: tensor<3x3x3xf32>) -> tensor<3x3x3xf32> {
   %2 = tensor.transpose(%1) {perm = [0, 2, 1]} : (tensor<3x3x3xf32>) -> tensor<3x3x3xf32>
   func.return(%2) : (tensor<3x3x3xf32>) -> ()
 }
+
+// -----
+
+// A transpose that moves only axes of extent 1 is a reshape.
+// CHECK: func.func @unit_axes
+// CHECK-NOT: tensor.transpose
+// CHECK: tensor.reshape(%0) {shape = [16, 1, 128]}
+func.func @unit_axes(%0: tensor<1x16x128xf32>) -> tensor<16x1x128xf32> {
+  %1 = tensor.transpose(%0) {perm = [1, 0, 2]} : (tensor<1x16x128xf32>) -> tensor<16x1x128xf32>
+  func.return(%1) : (tensor<16x1x128xf32>) -> ()
+}
+
+// -----
+
+// A transpose that reorders axes of more than one element stays, unit axes or not.
+// CHECK: func.func @unit_axes_reordered
+// CHECK: tensor.transpose(%0) {perm = [2, 0, 1]}
+func.func @unit_axes_reordered(%0: tensor<1x3x4xf32>) -> tensor<4x1x3xf32> {
+  %1 = tensor.transpose(%0) {perm = [2, 0, 1]} : (tensor<1x3x4xf32>) -> tensor<4x1x3xf32>
+  func.return(%1) : (tensor<4x1x3xf32>) -> ()
+}
+
+// -----
+
+// A transpose that keeps the order of the free axes folds into the dot, which reads its input.
+// CHECK: func.func @into_dot
+// CHECK-NOT: tensor.transpose
+// CHECK: tensor.dot_general(%0, %1) {batch_lhs = [0], batch_rhs = [0], contract_lhs = [1], contract_rhs = [1]}
+func.func @into_dot(%0: tensor<2x5x3xf32>, %1: tensor<2x5x4xf32>) -> tensor<2x3x4xf32> {
+  %2 = tensor.transpose(%0) {perm = [0, 2, 1]} : (tensor<2x5x3xf32>) -> tensor<2x3x5xf32>
+  %3 = tensor.dot_general(%2, %1) {batch_lhs = [0], batch_rhs = [0], contract_lhs = [2], contract_rhs = [1]} : (tensor<2x3x5xf32>, tensor<2x5x4xf32>) -> tensor<2x3x4xf32>
+  func.return(%3) : (tensor<2x3x4xf32>) -> ()
+}
+
+// -----
+
+// A transpose that reorders the free axes stays: the result's axes follow them.
+// CHECK: func.func @into_dot_reordered
+// CHECK: [[T:%[0-9]+]] = tensor.transpose(%0) {perm = [1, 0, 2]}
+// CHECK: tensor.dot_general([[T]], %1)
+func.func @into_dot_reordered(%0: tensor<3x4x5xf32>, %1: tensor<5x2xf32>) -> tensor<4x3x2xf32> {
+  %2 = tensor.transpose(%0) {perm = [1, 0, 2]} : (tensor<3x4x5xf32>) -> tensor<4x3x5xf32>
+  %3 = tensor.dot_general(%2, %1) {contract_lhs = [2], contract_rhs = [0]} : (tensor<4x3x5xf32>, tensor<5x2xf32>) -> tensor<4x3x2xf32>
+  func.return(%3) : (tensor<4x3x2xf32>) -> ()
+}

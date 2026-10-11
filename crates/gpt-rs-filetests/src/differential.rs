@@ -226,7 +226,7 @@ fn funcs(module: &Module) -> Vec<Func> {
     module
         .funcs()
         .into_iter()
-        .map(|f| module.op(f).as_func().expect("a function").clone())
+        .map(|f| module.op(f).get::<Func>().expect("a function").clone())
         .collect()
 }
 

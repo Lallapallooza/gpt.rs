@@ -15,20 +15,23 @@ use std::sync::Arc;
 use gpt_rs_ir::attr::F64;
 use gpt_rs_ir::dense::Dense;
 use gpt_rs_ir::dialects::tensor::{
-    ArgMax, Binary, BinaryKind, BroadcastTo, Cast, Compare, CompareKind, Concat, Constant,
-    Distribution, DotGeneral, DynamicSlice, DynamicUpdateSlice, ExtractPatches, Iota, Reduce,
-    ReduceKind, ReduceWindow, Reshape, Rng, Select, Take, TopK, Transpose, Unary, UnaryKind,
+    self, ArgMax, Binary, BroadcastTo, Cast, Concat, Constant, DotGeneral, DynamicSlice,
+    DynamicUpdateSlice, ExtractPatches, Iota, Reduce, ReduceAttrs, ReduceWindow, ReduceWindowAttrs,
+    Reshape, RngAttrs, RngUniform, Select, SelectKAttrs, Take, TopK, Transpose, Unary,
 };
 use gpt_rs_ir::host::HostTensor;
+use gpt_rs_ir::location::Location;
 use gpt_rs_ir::op::{InOp, OpDyn};
-use gpt_rs_ir::types::{DType, Dim};
+use gpt_rs_ir::types::{ranked, DType, Dim, Ranked};
 use half::{bf16, f16};
 use smallvec::SmallVec;
 
 use super::slicing::{self, AxisIndex};
 use super::{DeviceTensor, Shape};
 use crate::backend::PortableBackend;
+use crate::nn::capture;
 use crate::ops::graph::{context, GraphArena, GraphBuilder, ValueId};
+use crate::ops::trace;
 
 /// What a binary op or `select` takes besides a tensor: another tensor, or an `f32` scalar, which
 /// becomes a constant.
@@ -123,8 +126,24 @@ fn graph_of<B: PortableBackend + 'static>(
         .unwrap_or_else(|| GraphArena::new(Arc::clone(backend)))
 }
 
-fn static_dims(dims: impl AsRef<[usize]>) -> SmallVec<[Dim; 4]> {
-    dims.as_ref().iter().map(|&dim| Dim::Static(dim)).collect()
+/// `items` as an attribute indexed by axis. Panics, at the caller, when `items` has more than
+/// `MAX_RANK` entries, the most axes a tensor can have.
+#[track_caller]
+fn axis_list<T: Copy + Default>(items: impl AsRef<[T]>) -> Ranked<T> {
+    match ranked(items.as_ref().iter().copied()) {
+        Ok(list) => list,
+        Err(err) => panic!("{err}"),
+    }
+}
+
+#[track_caller]
+fn static_dims(dims: impl AsRef<[usize]>) -> Ranked<Dim> {
+    let dims = axis_list(dims);
+    let mut shape = Ranked::new();
+    for &extent in &dims {
+        shape.push(Dim::Static(extent));
+    }
+    shape
 }
 
 /// The value `value` of `builder`'s graph with the static shape of its type.
@@ -133,14 +152,27 @@ fn recorded<B: PortableBackend + 'static>(
     value: ValueId,
 ) -> anyhow::Result<Recorded> {
     let ty = builder.type_of(value)?;
-    let mut dims = SmallVec::<[usize; 4]>::new();
+    let mut dims = Ranked::<usize>::new();
     for dim in &ty.dims {
         let Some(extent) = dim.as_static() else {
             anyhow::bail!("{value:?} has the dynamic type {ty}");
         };
         dims.push(extent);
     }
-    Ok((value, Shape::new(&dims), ty.dtype))
+    Ok((value, Shape::new(dims), ty.dtype))
+}
+
+/// Where the op being recorded comes from, while a trace sink keeps locations: the code that
+/// called the `#[track_caller]` chain of op methods and functionals, in the module path of the
+/// enclosing layers.
+#[track_caller]
+fn recording_location() -> Option<Location> {
+    // Not `bool::then`: a closure would end the `#[track_caller]` chain at itself.
+    if trace::sink_installed() {
+        Some(Location::caller(capture::path()))
+    } else {
+        None
+    }
 }
 
 /// The extents that `lhs` and `rhs` broadcast to, aligned from the last axis.
@@ -177,7 +209,9 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
 
     #[track_caller]
     fn record_in<T: InOp + OpDyn>(graph: &Arc<GraphArena<B>>, op: T, operands: &[&Self]) -> Self {
+        let location = recording_location();
         let recorded = Self::capture(graph, operands, |builder, operands| {
+            builder.set_location(location);
             let results = builder.emit(op, operands)?;
             anyhow::ensure!(results.len() == 1, "the op gives {} results", results.len());
             recorded(builder, ValueId(results.start))
@@ -192,8 +226,10 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
         op: T,
         operands: &[&Self],
     ) -> SmallVec<[Self; 2]> {
+        let location = recording_location();
         let recorded: SmallVec<[Recorded; 2]> =
             Self::capture(graph, operands, |builder, operands| {
+                builder.set_location(location);
                 builder
                     .emit(op, operands)?
                     .map(|value| recorded(builder, ValueId(value)))
@@ -267,13 +303,12 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     }
 
     #[track_caller]
-    fn binary(&self, rhs: impl Operand<B>, kind: BinaryKind) -> Self {
+    fn binary(&self, rhs: impl Operand<B>, op: impl Binary + OpDyn) -> Self {
         let dims = match rhs.dims() {
             Some(dims) => broadcast_dims(self.shape().dims(), dims),
             None => self.shape().clone(),
         };
         let rhs = rhs.tensor(self, self.dtype(), dims.dims());
-        let op = Binary { kind };
         Self::record(
             op,
             &[
@@ -284,8 +319,8 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     }
 
     #[track_caller]
-    fn unary(&self, kind: UnaryKind) -> Self {
-        Self::record(Unary { kind }, &[self])
+    fn unary(&self, op: impl Unary + OpDyn) -> Self {
+        Self::record(op, &[self])
     }
 
     /// A tensor of `dims` whose elements count up along `axis`, in the graph of `like`.
@@ -321,91 +356,88 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
 
     #[track_caller]
     pub fn add(&self, rhs: impl Operand<B>) -> Self {
-        self.binary(rhs, BinaryKind::Add)
+        self.binary(rhs, tensor::Add)
     }
 
     #[track_caller]
     pub fn sub(&self, rhs: impl Operand<B>) -> Self {
-        self.binary(rhs, BinaryKind::Sub)
+        self.binary(rhs, tensor::Sub)
     }
 
     #[track_caller]
     pub fn mul(&self, rhs: impl Operand<B>) -> Self {
-        self.binary(rhs, BinaryKind::Mul)
+        self.binary(rhs, tensor::Mul)
     }
 
     #[track_caller]
     pub fn div(&self, rhs: impl Operand<B>) -> Self {
-        self.binary(rhs, BinaryKind::Div)
+        self.binary(rhs, tensor::Div)
     }
 
     #[track_caller]
     pub fn maximum(&self, rhs: impl Operand<B>) -> Self {
-        self.binary(rhs, BinaryKind::Maximum)
+        self.binary(rhs, tensor::Maximum)
     }
 
     #[track_caller]
     pub fn minimum(&self, rhs: impl Operand<B>) -> Self {
-        self.binary(rhs, BinaryKind::Minimum)
+        self.binary(rhs, tensor::Minimum)
     }
 
     #[track_caller]
     pub fn neg(&self) -> Self {
-        self.unary(UnaryKind::Neg)
+        self.unary(tensor::Neg)
     }
 
     #[track_caller]
     pub fn abs(&self) -> Self {
-        self.unary(UnaryKind::Abs)
+        self.unary(tensor::Abs)
     }
 
     #[track_caller]
     pub fn exp(&self) -> Self {
-        self.unary(UnaryKind::Exp)
+        self.unary(tensor::Exp)
     }
 
     #[track_caller]
     pub fn log(&self) -> Self {
-        self.unary(UnaryKind::Log)
+        self.unary(tensor::Log)
     }
 
     #[track_caller]
     pub fn tanh(&self) -> Self {
-        self.unary(UnaryKind::Tanh)
+        self.unary(tensor::Tanh)
     }
 
     #[track_caller]
     pub fn erf(&self) -> Self {
-        self.unary(UnaryKind::Erf)
+        self.unary(tensor::Erf)
     }
 
     #[track_caller]
     pub fn sin(&self) -> Self {
-        self.unary(UnaryKind::Sin)
+        self.unary(tensor::Sin)
     }
 
     #[track_caller]
     pub fn cos(&self) -> Self {
-        self.unary(UnaryKind::Cos)
+        self.unary(tensor::Cos)
     }
 
     #[track_caller]
     pub fn rsqrt(&self) -> Self {
-        self.unary(UnaryKind::Rsqrt)
+        self.unary(tensor::Rsqrt)
     }
 
     #[track_caller]
     pub fn reciprocal(&self) -> Self {
-        self.unary(UnaryKind::Reciprocal)
+        self.unary(tensor::Reciprocal)
     }
 
     /// `1` where this tensor is at least `rhs`, `0` elsewhere.
     #[track_caller]
     pub fn greater_equal(&self, rhs: &Self) -> Self {
-        let op = Compare {
-            kind: CompareKind::GreaterEqual,
-        };
-        self.broadcast_binary(rhs, op)
+        self.broadcast_binary(rhs, tensor::GreaterEqual)
     }
 
     /// `when_true` where this predicate holds and `when_false` elsewhere, all three broadcast to
@@ -446,8 +478,7 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
 
     #[track_caller]
     pub fn transpose(&self, perm: impl AsRef<[usize]>) -> Self {
-        let perm = SmallVec::from_slice(perm.as_ref());
-        Self::record(Transpose { perm }, &[self])
+        Self::record(Transpose::new(perm.as_ref().iter().copied()), &[self])
     }
 
     /// This tensor broadcast to `dims`, aligned from the last axis.
@@ -481,7 +512,7 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     #[track_caller]
     pub fn dynamic_slice(&self, starts: &Self, sizes: impl AsRef<[usize]>) -> Self {
         let op = DynamicSlice {
-            sizes: SmallVec::from_slice(sizes.as_ref()),
+            sizes: axis_list(sizes),
         };
         Self::record(op, &[self, starts])
     }
@@ -500,25 +531,24 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     }
 
     #[track_caller]
-    fn reduce(&self, kind: ReduceKind, axes: &[i64], keepdims: bool) -> Self {
-        let op = Reduce {
-            kind,
-            axes: SmallVec::from_slice(axes),
+    fn reduce<T: Reduce + OpDyn>(&self, axes: &[i64], keepdims: bool) -> Self {
+        let op = T::from(ReduceAttrs {
+            axes: axis_list(axes),
             keepdims,
             accum: None,
             out: None,
-        };
+        });
         Self::record(op, &[self])
     }
 
     #[track_caller]
     pub fn reduce_sum(&self, axes: impl AsRef<[i64]>, keepdims: bool) -> Self {
-        self.reduce(ReduceKind::Sum, axes.as_ref(), keepdims)
+        self.reduce::<tensor::ReduceSum>(axes.as_ref(), keepdims)
     }
 
     #[track_caller]
     pub fn reduce_max(&self, axes: impl AsRef<[i64]>, keepdims: bool) -> Self {
-        self.reduce(ReduceKind::Max, axes.as_ref(), keepdims)
+        self.reduce::<tensor::ReduceMax>(axes.as_ref(), keepdims)
     }
 
     /// The windows of `window` extents that slide over the spatial axes of an NHWC tensor, as
@@ -533,37 +563,36 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
         pad_value: f64,
     ) -> Self {
         let op = ExtractPatches {
-            window: SmallVec::from_slice(window.as_ref()),
-            strides: SmallVec::from_slice(strides.as_ref()),
-            dilation: SmallVec::from_slice(dilation.as_ref()),
-            padding: SmallVec::from_slice(padding.as_ref()),
+            window: axis_list(window),
+            strides: axis_list(strides),
+            dilation: axis_list(dilation),
+            padding: axis_list(padding),
             pad_value: F64(pad_value),
         };
         Self::record(op, &[self])
     }
 
-    /// The `kind` reduction of each window of `window` extents that slides by `strides` over this
-    /// tensor, padded by `padding` (`(before, after)` per axis) with the reduction's identity.
+    /// The reduction `T` of each window of `window` extents that slides by `strides` over this
+    /// tensor, padded by `padding` (`(before, after)` per axis), which adds nothing to a window.
     #[track_caller]
-    pub fn reduce_window(
+    pub fn reduce_window<T: ReduceWindow + OpDyn>(
         &self,
-        kind: ReduceKind,
         window: impl AsRef<[usize]>,
         strides: impl AsRef<[usize]>,
         padding: impl AsRef<[(usize, usize)]>,
     ) -> Self {
-        let window_dims = SmallVec::from_slice(window.as_ref());
-        let ones = SmallVec::from_elem(1, window_dims.len());
-        let op = ReduceWindow {
-            kind,
+        let window_dims = axis_list(window);
+        let mut ones = Ranked::new();
+        ones.resize(window_dims.len(), 1);
+        let op = T::from(ReduceWindowAttrs {
             window_dims,
-            strides: SmallVec::from_slice(strides.as_ref()),
-            padding: SmallVec::from_slice(padding.as_ref()),
-            base_dilation: ones.clone(),
+            strides: axis_list(strides),
+            padding: axis_list(padding),
+            base_dilation: ones,
             window_dilation: ones,
             accum: None,
             out: None,
-        };
+        });
         Self::record(op, &[self])
     }
 
@@ -595,12 +624,11 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     /// The `k` largest elements along `axis`, largest first, and their `si32` indices.
     #[track_caller]
     pub fn top_k(&self, k: usize, axis: i64) -> (Self, Self) {
-        let op = TopK {
+        let op = TopK(SelectKAttrs {
             k,
             axis,
-            largest: true,
             indices: DType::Si32,
-        };
+        });
         let graph = graph_of(&self.backend, &[self]);
         let Ok([values, indices]) = Self::record_results(&graph, op, &[self]).into_inner() else {
             unreachable!("top_k gives two results")
@@ -612,11 +640,10 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     /// state this tensor holds (`ui64 [2]`), and the state after them.
     #[track_caller]
     pub fn rng_uniform(&self, dims: impl AsRef<[usize]>, dtype: DType) -> (Self, Self) {
-        let op = Rng {
-            distribution: Distribution::Uniform,
+        let op = RngUniform(RngAttrs {
             shape: static_dims(dims),
             dtype,
-        };
+        });
         let graph = graph_of(&self.backend, &[self]);
         let Ok([state, values]) = Self::record_results(&graph, op, &[self]).into_inner() else {
             unreachable!("rng_uniform gives two results")

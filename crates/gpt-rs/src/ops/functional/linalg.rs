@@ -1,8 +1,8 @@
 //! Matrix products: [`matmul`] and the [`linear`] projection, and [`linear_weight`], which finds
 //! the projections that [`linear`] records.
 
-use gpt_rs_ir::dialects::tensor::{Binary, BinaryKind, BroadcastTo, Cast, DotGeneral};
-use gpt_rs_ir::module::{Inst, Module, Value};
+use gpt_rs_ir::dialects::tensor::{BroadcastTo, Cast, DotGeneral, Mul};
+use gpt_rs_ir::module::{Inst, Module, Value, ValueRef};
 
 use crate::tensor::DType;
 use crate::{ensure_dtype, ensure_rank, ensure_same_dtype, functional};
@@ -105,39 +105,38 @@ impl LinearWeight {
 /// in either operand order and cast to the dtype of `x` or not. `x` and `w` have static extents.
 pub fn linear_weight(module: &Module, inst: Inst) -> Option<LinearWeight> {
     let dot = module.op_as::<DotGeneral>(inst)?;
-    let attrs = &dot.attrs;
-    let layout = match attrs.contract_rhs.as_slice() {
+    let layout = match dot.contract_rhs.as_slice() {
         [1] => WeightLayout::OutIn,
         [0] => WeightLayout::InOut,
         _ => return None,
     };
-    if !attrs.batch_lhs.is_empty()
-        || !attrs.batch_rhs.is_empty()
-        || attrs.contract_lhs[..] != [1]
-        || !matches!(attrs.accum, None | Some(DType::F32))
-        || module.ty(dot.results.output).as_tensor()?.dtype != DType::F32
+    if !dot.batch_lhs.is_empty()
+        || !dot.batch_rhs.is_empty()
+        || dot.contract_lhs[..] != [1]
+        || !matches!(dot.accum, None | Some(DType::F32))
+        || dot.output().tensor_type().dtype != DType::F32
     {
         return None;
     }
     let mut chain = Vec::new();
-    let mut read = dot.operands.rhs;
-    if let Some(cast) = module.def_as::<Cast>(read) {
-        chain.push(cast.inst);
-        read = cast.operands.input;
+    let mut read = dot.rhs();
+    if let Some(cast) = read.defining_op::<Cast>() {
+        chain.push(cast.inst());
+        read = cast.input();
     }
-    let (weight, scale) = match dequantized(module, read, &mut chain) {
-        Some((weight, scale)) => (weight, Some(scale)),
+    let (weight, scale) = match dequantized(read, &mut chain) {
+        Some((weight, scale)) => (weight, Some(scale.id())),
         None => (read, None),
     };
-    let x = dot.operands.lhs;
-    let static_rank2 = |value| {
-        let dims = module.ty(value).as_tensor().and_then(|ty| ty.static_dims());
+    let x = dot.lhs();
+    let static_rank2 = |value: ValueRef<'_>| {
+        let dims = value.tensor_type().static_dims();
         dims.is_some_and(|dims| dims.len() == 2)
     };
     (static_rank2(x) && static_rank2(weight)).then_some(LinearWeight {
         layout,
-        x,
-        weight,
+        x: x.id(),
+        weight: weight.id(),
         scale,
         chain,
     })
@@ -145,22 +144,20 @@ pub fn linear_weight(module: &Module, inst: Inst) -> Option<LinearWeight> {
 
 /// `(w, s)` when `value` is `cast(w) * broadcast_to(s)` in either operand order, with `s` one
 /// element. Adds the three ops to `chain`.
-fn dequantized(module: &Module, value: Value, chain: &mut Vec<Inst>) -> Option<(Value, Value)> {
-    let mul = module.def_as::<Binary>(value)?;
-    if mul.attrs.kind != BinaryKind::Mul {
-        return None;
-    }
-    let (lhs, rhs) = (mul.operands.lhs, mul.operands.rhs);
-    let (cast, broadcast) = match module.def_as::<Cast>(lhs) {
-        Some(cast) => (cast, rhs),
-        None => (module.def_as::<Cast>(rhs)?, lhs),
+fn dequantized<'m>(
+    value: ValueRef<'m>,
+    chain: &mut Vec<Inst>,
+) -> Option<(ValueRef<'m>, ValueRef<'m>)> {
+    let mul = value.defining_op::<Mul>()?;
+    let (cast, broadcast) = match mul.lhs().defining_op::<Cast>() {
+        Some(cast) => (cast, mul.rhs()),
+        None => (mul.rhs().defining_op::<Cast>()?, mul.lhs()),
     };
-    let broadcast = module.def_as::<BroadcastTo>(broadcast)?;
-    let scale = broadcast.operands.input;
-    let elements = module.ty(scale).as_tensor()?.element_count()?;
-    if elements != 1 {
+    let broadcast = broadcast.defining_op::<BroadcastTo>()?;
+    let scale = broadcast.input();
+    if scale.tensor_type().element_count()? != 1 {
         return None;
     }
-    chain.extend([mul.inst, cast.inst, broadcast.inst]);
-    Some((cast.operands.input, scale))
+    chain.extend([mul.inst(), cast.inst(), broadcast.inst()]);
+    Some((cast.input(), scale))
 }

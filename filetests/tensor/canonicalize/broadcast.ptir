@@ -16,15 +16,17 @@ func.func @hoist(%0: tensor<3xf32>, %1: tensor<3xf32>) -> tensor<4x3xf32> {
 
 // -----
 
-// A splat constant operand is rebuilt in the smaller shape, and a compare broadcasts its i1 result.
+// A splat constant operand is splatted to the smaller shape, and a compare broadcasts its i1
+// result.
 // CHECK: func.func @splat_operand
-// CHECK: [[C:%[0-9]+]] = tensor.constant() {value = dense<[3] x f32: 2.0>}
-// CHECK: [[P:%[0-9]+]] = tensor.compare(%0, [[C]]) {kind = less} : (tensor<3xf32>, tensor<3xf32>) -> tensor<3xi1>
+// CHECK: [[C:%[0-9]+]] = tensor.constant() {value = dense<[] x f32: 2.0>}
+// CHECK-NEXT: [[S:%[0-9]+]] = tensor.broadcast_to([[C]]) {shape = [3]}
+// CHECK-NEXT: [[P:%[0-9]+]] = tensor.less(%0, [[S]]) : (tensor<3xf32>, tensor<3xf32>) -> tensor<3xi1>
 // CHECK-NEXT: tensor.broadcast_to([[P]]) {shape = [4, 3]} : (tensor<3xi1>) -> tensor<4x3xi1>
 func.func @splat_operand(%0: tensor<3xf32>) -> tensor<4x3xi1> {
   %1 = tensor.broadcast_to(%0) {shape = [4, 3]} : (tensor<3xf32>) -> tensor<4x3xf32>
   %2 = tensor.constant() {value = dense<[4, 3] x f32: 2.0>} : () -> tensor<4x3xf32>
-  %3 = tensor.compare(%1, %2) {kind = less} : (tensor<4x3xf32>, tensor<4x3xf32>) -> tensor<4x3xi1>
+  %3 = tensor.less(%1, %2) : (tensor<4x3xf32>, tensor<4x3xf32>) -> tensor<4x3xi1>
   func.return(%3) : (tensor<4x3xi1>) -> ()
 }
 
@@ -52,4 +54,16 @@ func.func @non_splat(%0: tensor<2xf32>) -> tensor<2x2xf32> {
   %2 = tensor.constant() {value = dense<[2, 2] x f32: [1.0, 2.0, 3.0, 4.0]>} : () -> tensor<2x2xf32>
   %3 = tensor.mul(%1, %2) : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
   func.return(%3) : (tensor<2x2xf32>) -> ()
+}
+
+// -----
+
+// A reshape that only adds leading axes of extent 1 adds nothing to a broadcast.
+// CHECK: func.func @leading_unit_axes
+// CHECK-NEXT: [[B:%[0-9]+]] = tensor.broadcast_to(%0) {shape = [5, 16]}
+// CHECK-NEXT: func.return([[B]])
+func.func @leading_unit_axes(%0: tensor<16xf32>) -> tensor<5x16xf32> {
+  %1 = tensor.reshape(%0) {shape = [1, 16]} : (tensor<16xf32>) -> tensor<1x16xf32>
+  %2 = tensor.broadcast_to(%1) {shape = [5, 16]} : (tensor<1x16xf32>) -> tensor<5x16xf32>
+  func.return(%2) : (tensor<5x16xf32>) -> ()
 }

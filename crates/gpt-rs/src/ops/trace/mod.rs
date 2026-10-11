@@ -11,9 +11,16 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 use gpt_rs_ir::module::Module;
+use gpt_rs_ir::text::TextOptions;
 use serde::Serialize;
 
 use crate::ops::graph::ValueId;
+
+/// Dumped programs are stored programs, with the location of each op.
+const DUMPED_TEXT: TextOptions = TextOptions {
+    versioned: true,
+    locations: true,
+};
 
 /// Describes the kind of PTIR program being executed.
 #[derive(Debug, Clone, Serialize)]
@@ -145,9 +152,14 @@ pub fn install_global_sink(sink: Arc<dyn ExecutionTraceSink>) -> TraceGuard {
     }
 }
 
+/// Whether a global sink is installed, so recording keeps the locations of ops for it.
+pub fn sink_installed() -> bool {
+    SINK_INSTALLED.load(Ordering::Acquire)
+}
+
 /// Returns the currently installed global sink, if any.
 pub fn current_sink() -> Option<Arc<dyn ExecutionTraceSink>> {
-    if !SINK_INSTALLED.load(Ordering::Acquire) {
+    if !sink_installed() {
         return None;
     }
     GLOBAL_TRACE_SINK
@@ -283,7 +295,7 @@ struct ExecutionRecord<'a> {
 impl ExecutionTraceSink for FileTraceSink {
     fn before_program(&self, context: &ProgramContext, module: &Module) {
         let should_dump = self.should_dump_execution(context);
-        let ir = || module.to_versioned_text();
+        let ir = || module.print(DUMPED_TEXT);
         let mut record = RunRecord {
             dir: None,
             dumped: false,
@@ -369,7 +381,7 @@ impl ExecutionTraceSink for FileTraceSink {
         let _ = std::fs::create_dir_all(&pass_dir);
         let idx = self.sequence.fetch_add(1, Ordering::Relaxed);
         let file_name = format!("{idx:05}_{}.ptir", sanitize_file_fragment(pass));
-        let _ = std::fs::write(pass_dir.join(file_name), module.to_versioned_text());
+        let _ = std::fs::write(pass_dir.join(file_name), module.print(DUMPED_TEXT));
     }
 }
 

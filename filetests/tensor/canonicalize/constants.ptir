@@ -1,0 +1,63 @@
+// RUN: pass canonicalize
+
+// The constants of a function go to its start, and equal ones become the first of them, so ops
+// on them see one value: a comparison of two equal constants is a comparison of a value with
+// itself.
+// CHECK: func.func @equal_constants
+// CHECK: [[C:%[0-9]+]] = tensor.constant() {value = dense<[4] x si32: 3>}
+// CHECK-NOT: tensor.constant() {value = dense<[4] x si32: 3>}
+// CHECK: tensor.add(%0, [[C]])
+// CHECK: tensor.mul(%0, [[C]])
+// CHECK-NOT: tensor.equal
+func.func @equal_constants(%0: tensor<4xsi32>) -> (tensor<4xsi32>, tensor<4xsi32>, tensor<4xi1>) {
+  %1 = tensor.constant() {value = dense<[4] x si32: 3>} : () -> tensor<4xsi32>
+  %2 = tensor.add(%0, %1) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  %3 = tensor.constant() {value = dense<[4] x si32: 3>} : () -> tensor<4xsi32>
+  %4 = tensor.mul(%0, %3) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  %5 = tensor.equal(%1, %3) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xi1>
+  func.return(%2, %4, %5) : (tensor<4xsi32>, tensor<4xsi32>, tensor<4xi1>) -> ()
+}
+
+// -----
+
+// Constants that differ in a value or a dtype stay apart.
+// CHECK: func.func @different_constants
+// CHECK: tensor.constant() {value = dense<[4] x si32: 3>}
+// CHECK: tensor.constant() {value = dense<[4] x si32: 4>}
+// CHECK: tensor.constant() {value = dense<[4] x f32: 3.0>}
+func.func @different_constants(%0: tensor<4xsi32>, %1: tensor<4xf32>) -> (tensor<4xsi32>, tensor<4xsi32>, tensor<4xf32>) {
+  %2 = tensor.constant() {value = dense<[4] x si32: 3>} : () -> tensor<4xsi32>
+  %3 = tensor.add(%0, %2) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  %4 = tensor.constant() {value = dense<[4] x si32: 4>} : () -> tensor<4xsi32>
+  %5 = tensor.add(%0, %4) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  %6 = tensor.constant() {value = dense<[4] x f32: 3.0>} : () -> tensor<4xf32>
+  %7 = tensor.add(%1, %6) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%3, %5, %7) : (tensor<4xsi32>, tensor<4xsi32>, tensor<4xf32>) -> ()
+}
+
+// -----
+
+// A constant in a region of an op that is not isolated from above goes to the start of its
+// function too, and becomes the equal constant there.
+// CHECK: func.func @nested
+// CHECK-NEXT: [[C:%[0-9]+]] = tensor.constant() {value = dense<[] x si32: 2>}
+// CHECK-NEXT: tensor.constant() {value = dense<[] x si32: 3>}
+// CHECK-NOT: tensor.constant
+// CHECK: tensor.cond
+// CHECK: tensor.add({{%[0-9]+}}, [[C]])
+func.func @nested(%0: tensor<i1>, %1: tensor<si32>) -> (tensor<si32>, tensor<si32>) {
+  %2 = tensor.constant() {value = dense<[] x si32: 2>} : () -> tensor<si32>
+  %3 = tensor.mul(%1, %2) : (tensor<si32>, tensor<si32>) -> tensor<si32>
+  %4 = tensor.cond(%0, %3) {results = [tensor<si32>]} ({
+  ^then_branch(%5: tensor<si32>):
+    %6 = tensor.constant() {value = dense<[] x si32: 2>} : () -> tensor<si32>
+    %7 = tensor.add(%5, %6) : (tensor<si32>, tensor<si32>) -> tensor<si32>
+    tensor.yield(%7) : (tensor<si32>) -> ()
+  }, {
+  ^else_branch(%8: tensor<si32>):
+    %9 = tensor.constant() {value = dense<[] x si32: 3>} : () -> tensor<si32>
+    %10 = tensor.sub(%8, %9) : (tensor<si32>, tensor<si32>) -> tensor<si32>
+    tensor.yield(%10) : (tensor<si32>) -> ()
+  }) : (tensor<i1>, tensor<si32>) -> tensor<si32>
+  func.return(%3, %4) : (tensor<si32>, tensor<si32>) -> ()
+}

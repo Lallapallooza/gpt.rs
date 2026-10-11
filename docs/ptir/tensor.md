@@ -15,16 +15,18 @@ Together they are the normative contract between producers and consumers.
   dialect's `passes/`) and the backend crates, such as `crates/gpt-rs-backend-ref-cpu`,
   `crates/gpt-rs-backend-faer` and `crates/gpt-rs-backend-c`.
 - Normative keywords: MUST / SHOULD / MAY.
-- Each op's attributes and type rule (`OpDef::result_types`) are in `ir/`. Its semantics are its
-  `Eval` impl in `interp/`. The reference backend runs them, and every pass is checked against
-  them.
+- Each op is defined in `ir.rs`: its struct, its attributes and its groups. Its type rule
+  (`OpDef::result_types`) is in `verify/`. Its semantics, its `Eval` impl, are in `interp/`. Its
+  folder is in `fold/`, and its cost is in `cost/`. Each is in the file named after the op's section
+  of `ir.rs`. Helpers are in `utils/`. The reference backend runs the semantics, and every pass
+  is checked against them.
 - Each op's documentation states what the op means, independent of any specific backend
   implementation strategy. The dialect holds no op outside this specification. If an op's
   documentation and its code disagree, fix the documentation or fix the code.
 - Notation: `T[shape]` means a tensor of dtype `T` and the given shape.
-- Extension ops (`extract_patches`, the random ops, `top_k`, the segment ops and the quantization
-  ops) go beyond the core ops, for broader model coverage. A backend MAY reject an extension op
-  other than `extract_patches` as unimplemented.
+- Extension ops (`extract_patches`, the random ops, `top_k`, `bottom_k`, the segment ops and the
+  quantization ops) go beyond the core ops, for broader model coverage. A backend MAY reject an
+  extension op other than `extract_patches` as unimplemented.
 - LLM attention is expressed as a **pattern** over core ops (no dedicated attention op), as
   "Canonical library forms" shows.
 - Backend implementation notes (how each backend executes PTIR) are in `docs/backends/README.md`.
@@ -51,6 +53,8 @@ line or without it, and rejects a module that names another version.
 
 4. Shapes and dynamic dims
    - Shapes are ordered tuples of non-negative integers.
+   - A tensor MUST have at most 8 axes. The text form rejects a type of higher rank, and an op
+     whose result would have a higher rank is rejected.
    - Dims MAY be dynamic at compile time, written as a symbol in braces in the text form, such as
      `{T}`.
    - Runtime dims MUST be non-negative and satisfy op constraints.
@@ -82,7 +86,7 @@ Ops that accept an `axis` (or list of axes) MUST accept negative indices interpr
 PTIR uses **explicit** broadcasting:
 
 - `broadcast_to` is the only operation that changes shapes by broadcasting.
-- Elementwise ops (`add`, `mul`, `compare`, `select`, ...) require operands to have the **same
+- Elementwise ops (`add`, `mul`, `less`, `select`, ...) require operands to have the **same
   shape** (after any explicit `broadcast_to`).
 
 `broadcast_to` follows a standard right-aligned compatibility rule:
@@ -145,13 +149,13 @@ The classes each op takes:
 | `exp`, `log`, `tanh`, `erf`, `rsqrt`, `reciprocal`, `sin`, `cos` | float |
 | `not`, `and`, `or`, `xor` | bool, integer |
 | `shift_left`, `shift_right_logical`, `shift_right_arithmetic` | integer |
-| `compare` | bool, integer, float |
+| `less`, `less_equal`, `equal`, `greater_equal`, `greater`, `not_equal` | bool, integer, float |
 | `cast` | every dtype in; every dtype but scale out |
-| `reduce_{sum,max,min}`, `reduce_window_{sum,max,min}`, `segment_{sum,max,min}`, `scatter_{add,max,min}`, `argmax`, `top_k`, `iota` | integer, float |
+| `reduce_{sum,max,min}`, `reduce_window_{sum,max,min}`, `segment_{sum,max,min}`, `scatter_{add,max,min}`, `argmax`, `top_k`, `bottom_k`, `iota` | integer, float |
 | `reduce_{and,or}`, `reduce_window_{and,or}`, `segment_{and,or}` | bool, integer |
 | `dot_general` | integer with integer; float or narrow float with float or narrow float |
 | `rng_uniform` | integer, float; `rng_normal`: float |
-| `quantize`, `quantize_dynamic`, `dequantize` | as "Quantization" states |
+| `quantize`, `quantize_stochastic`, `quantize_table`, `dequantize`, `block_scale_*`, `block_scale_range` | as "Quantization" states |
 
 The `accum` and `out` dtypes of a reduction are of the input's class. A `dot_general` of floats or narrow floats
 accumulates in a float and returns a float or a narrow float.
@@ -170,8 +174,8 @@ accumulates in a float and returns a float or a narrow float.
   value, as `tensor.quantize` does. Infinities saturate. NaN maps to NaN in a dtype that has one,
   and to 0 otherwise.
 - Into `i1`: 1 for every value but zero, NaN included.
-- Nothing casts into `e8m0`: `tensor.quantize_dynamic` computes e8m0 scales and states how it
-  rounds them.
+- Nothing casts into `e8m0`: the power-of-two `tensor.block_scale_*` ops compute e8m0 scales and
+  state how they round them.
 
 ## Accumulator/output dtype policy
 
@@ -213,10 +217,20 @@ real values. One scaling scheme covers, for training as well as inference:
 - `cast` decodes any element dtype.
 - `mul` and `add` apply scales and offsets, and a scale can itself be dequantized.
 
-The ops `tensor.dequantize`, `tensor.quantize` and `tensor.quantize_dynamic` name the common
-schemes, so that backends see their structure, and each is the composition its semantics states.
-A new format starts as a composition and becomes an attribute of these ops when a backend needs
-its structure.
+The quantization ops name the common schemes, so that backends see their structure, and each is
+the composition its semantics states:
+
+- `tensor.quantize`, `tensor.quantize_stochastic` and `tensor.quantize_table` quantize with given
+  scales, rounding to the nearest value, rounding at random, or to the nearest entry of a code
+  table;
+- `tensor.dequantize` maps quantized elements, or the values `take` read from a code table, back
+  to real values;
+- the `tensor.block_scale_*` ops and `tensor.block_scale_range` compute the scales, and offsets,
+  of the blocks of a tensor: dynamic quantization is one of them followed by a quantize op.
+
+Each op computes one thing: a rounding or a scale formula is an op of its own, never an attribute
+that switches what an op computes. A new format starts as a composition and becomes an op when a
+backend needs its structure.
 
 **Scale layout.** The attribute `block` gives one extent per axis of `x`. Element `x[i]` uses
 scale `scale[i / block]`, dividing per axis and rounding down, so the scale has the rank of `x` and
@@ -235,8 +249,7 @@ a `mul` by a scalar around these ops.
 
 The quantized elements `Q` are integers or narrow floats. Scales `S` are floats, narrow floats or
 `e8m0`; offsets are floats; a table holds floats or narrow floats along one axis. The real values
-that the ops read and write are `f32`, `bf16` or `f16`. The optional operands come in the order
-the ops list them, and the text form names which are present with `operand_segments`.
+that the ops read and write are `f32`, `bf16` or `f16`. The offset is the one optional operand.
 
 Requantizing is `tensor.quantize(tensor.dequantize(q, scale), new_scale)`; it has no op of its
 own.
@@ -267,7 +280,7 @@ For `q,k,v` in `[B,H,S,D]`:
 - `tensor.constant`
 - `tensor.neg`, `tensor.abs`, `tensor.exp`, `tensor.log`, `tensor.tanh`, `tensor.erf`, `tensor.rsqrt`, `tensor.reciprocal`, `tensor.sin`, `tensor.cos`, `tensor.not`
 - `tensor.add`, `tensor.sub`, `tensor.mul`, `tensor.div`, `tensor.maximum`, `tensor.minimum`, `tensor.and`, `tensor.or`, `tensor.xor`, `tensor.shift_left`, `tensor.shift_right_logical`, `tensor.shift_right_arithmetic`
-- `tensor.compare`
+- `tensor.less`, `tensor.less_equal`, `tensor.equal`, `tensor.greater_equal`, `tensor.greater`, `tensor.not_equal`
 - `tensor.select`
 - `tensor.cast`
 - `tensor.dot_general`
@@ -288,9 +301,10 @@ For `q,k,v` in `[B,H,S,D]`:
 - `tensor.stop_gradient`
 - `tensor.argmax`
 - `tensor.segment_sum`, `tensor.segment_max`, `tensor.segment_min`, `tensor.segment_and`, `tensor.segment_or`
-- `tensor.top_k`
+- `tensor.top_k`, `tensor.bottom_k`
 - `tensor.gather`
-- `tensor.scatter_add`, `tensor.scatter_max`, `tensor.scatter_min`, `tensor.scatter_replace`
+- `tensor.scatter_add`, `tensor.scatter_max`, `tensor.scatter_min`
+- `tensor.scatter_replace`
 - `tensor.rng_uniform`, `tensor.rng_normal`
 - `tensor.yield`
 - `tensor.cond`
@@ -298,7 +312,10 @@ For `q,k,v` in `[B,H,S,D]`:
 - `tensor.scan`
 - `tensor.dequantize`
 - `tensor.quantize`
-- `tensor.quantize_dynamic`
+- `tensor.quantize_stochastic`
+- `tensor.quantize_table`
+- `tensor.block_scale_amax`, `tensor.block_scale_pow2_floor`, `tensor.block_scale_pow2_ceil`
+- `tensor.block_scale_range`
 
 ### `tensor.constant`
 
@@ -310,7 +327,7 @@ A tensor whose elements are an attribute.
 - In the text form, elements narrower than a byte are written in hex, packed as tensors store
   them.
 
-Defined by `Constant` in [crates/gpt-rs-ir/src/dialects/tensor/ir/constant.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/constant.rs).
+Defined by `Constant` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -338,15 +355,15 @@ func.func @constants() -> (tensor<2x2xf32>, tensor<3xsi32>, tensor<f32>, tensor<
 
 Rejected, as the verify filetests pin it:
 
-- `tensor.constant: only func.func may appear at the top level`
+- `tensor.constant: only func.func and tile.dispatch may appear at the top level`
 
-### `tensor.{kind}` (`Unary`)
+### `Unary`: `tensor.neg`, `tensor.abs`, `tensor.exp`, `tensor.log`, `tensor.tanh`, `tensor.erf`, `tensor.rsqrt`, `tensor.reciprocal`, `tensor.sin`, `tensor.cos`, `tensor.not`
 
-Applies `kind` to every element.
+Applies the function of the op to every element.
 
 - The result has the input's shape and dtype.
 
-Defined by `Unary` in [crates/gpt-rs-ir/src/dialects/tensor/ir/elementwise.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/elementwise.rs).
+Defined by `Unary` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -354,20 +371,21 @@ Defined by `Unary` in [crates/gpt-rs-ir/src/dialects/tensor/ir/elementwise.rs](.
 | Results | `output`: tensor |
 | Traits | elementwise |
 | Effects | none |
+| Patterns | `FoldIndexArith` (`canonicalize`, at `tensor.neg`); `UnaryToTile` (`tensor-to-tile`) |
 
-| Kind | Traits | |
+| Op | Traits | |
 |---|---|---|
-| `neg` | involution | `-x`. Integers wrap, so the negation of the smallest signed integer is itself. |
-| `abs` | idempotent | `abs(x)`. Integers wrap, so the absolute value of the smallest signed integer is itself. |
-| `exp` |  | `e^x`. |
-| `log` |  | The natural logarithm, `ln(x)`. |
-| `tanh` |  | The hyperbolic tangent. |
-| `erf` |  | The error function. |
-| `rsqrt` |  | `1 / sqrt(x)`. |
-| `reciprocal` |  | `1 / x`. |
-| `sin` |  | The sine of `x` radians. |
-| `cos` |  | The cosine of `x` radians. |
-| `not` | involution | Flips every bit; on `i1`, logical not. |
+| `tensor.neg` | involution | `-x`. Integers wrap, so the negation of the smallest signed integer is itself. |
+| `tensor.abs` | idempotent | `abs(x)`. Integers wrap, so the absolute value of the smallest signed integer is itself. |
+| `tensor.exp` |  | `e^x`. |
+| `tensor.log` |  | The natural logarithm, `ln(x)`. |
+| `tensor.tanh` |  | The hyperbolic tangent. |
+| `tensor.erf` |  | The error function. |
+| `tensor.rsqrt` |  | `1 / sqrt(x)`. |
+| `tensor.reciprocal` |  | `1 / x`. |
+| `tensor.sin` |  | The sine of `x` radians. |
+| `tensor.cos` |  | The cosine of `x` radians. |
+| `tensor.not` | involution | Flips every bit; on `i1`, logical not. |
 
 Example, from `filetests/tensor/roundtrip/elementwise.ptir`:
 
@@ -397,16 +415,19 @@ Rejected, as the verify filetests pin it:
 - `tensor.not: the input must be an i1 or integer tensor, got tensor<4xf32>`
 - `tensor.neg: the input must be an integer or float tensor, got tensor<4xi1>`
 
-### `tensor.{kind}` (`Binary`)
+### `Binary`: `tensor.add`, `tensor.sub`, `tensor.mul`, `tensor.div`, `tensor.maximum`, `tensor.minimum`, `tensor.and`, `tensor.or`, `tensor.xor`, `tensor.shift_left`, `tensor.shift_right_logical`, `tensor.shift_right_arithmetic`
 
-Combines two tensors of equal type element by element:
-`out[i] = kind(lhs[i], rhs[i])`.
+Combines two tensors of equal type element by element with the
+function of the op: `out[i] = op(lhs[i], rhs[i])`.
 
 - `lhs` and `rhs` MUST have the same dtype and the same shape, which the result has.
 - Integer results wrap modulo `2^bits`, two's complement for the signed dtypes.
 - A NaN result has no specified sign or payload.
+- The identities of their traits hold for every float, `-0.0` included: `x + 0.0` is not `x`,
+  since `-0.0 + 0.0` is `0.0`. Floats have no absorbing element: `inf * 0` and
+  `maximum(NaN, inf)` are NaN.
 
-Defined by `Binary` in [crates/gpt-rs-ir/src/dialects/tensor/ir/elementwise.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/elementwise.rs).
+Defined by `Binary` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -414,22 +435,22 @@ Defined by `Binary` in [crates/gpt-rs-ir/src/dialects/tensor/ir/elementwise.rs](
 | Results | `output`: tensor |
 | Traits | elementwise |
 | Effects | none |
-| Patterns | `ScaleIntoDot` (`dot-scale-fold`) |
+| Patterns | `FoldIndexArith` (`canonicalize`, at `tensor.add`, `tensor.sub`, `tensor.mul`, `tensor.maximum`, `tensor.minimum`); `BinaryToTile` (`tensor-to-tile`); `ScaleIntoDot` (`dot-scale-fold`, at `tensor.mul`) |
 
-| Kind | Traits | |
+| Op | Traits | |
 |---|---|---|
-| `add` | commutative; associative on integers; right identity -0.0 on floats, 0 on integers | `lhs + rhs`. |
-| `sub` | right identity 0.0 on floats, 0 on integers | `lhs - rhs`. |
-| `mul` | commutative; associative on integers; right identity 1.0 on floats, 1 on integers; absorbing 0 on integers; distributes over `tensor.add` on integers | `lhs * rhs`. |
-| `div` | right identity 1.0 on floats, 1 on integers | `lhs / rhs`. Integer division truncates toward zero, and backends MUST reject an integer division by zero as a spec violation. Float division follows IEEE 754, so it can give Inf or NaN. |
-| `maximum` | commutative; associative; idempotent; right identity -inf on floats, min on integers; absorbing max on integers | The larger operand. A float NaN operand gives NaN, and `-0.0` orders below `0.0`. |
-| `minimum` | commutative; associative; idempotent; right identity inf on floats, max on integers; absorbing min on integers | The smaller operand. A float NaN operand gives NaN, and `-0.0` orders below `0.0`. |
-| `and` | commutative; associative on integers; idempotent; right identity all ones on integers; absorbing 0 on integers; distributes over `tensor.or` on integers | Bitwise and; on `i1`, logical and. |
-| `or` | commutative; associative on integers; idempotent; right identity 0 on integers; absorbing all ones on integers; distributes over `tensor.and` on integers | Bitwise or; on `i1`, logical or. |
-| `xor` | commutative; associative on integers; right identity 0 on integers | Bitwise exclusive or; on `i1`, logical exclusive or. |
-| `shift_left` | right identity 0 on integers | `lhs` shifted left by `rhs` bits, shifting in zeros. `rhs` reads as unsigned, and a shift by at least the bit width gives 0. |
-| `shift_right_logical` | right identity 0 on integers | `lhs` shifted right by `rhs` bits, shifting in zeros, into a signed dtype too. `rhs` reads as unsigned, and a shift by at least the bit width gives 0. |
-| `shift_right_arithmetic` | right identity 0 on integers | `lhs` shifted right by `rhs` bits, shifting in copies of the sign bit. `rhs` reads as unsigned, and a shift by at least the bit width gives -1 for a negative `lhs`, else 0. |
+| `tensor.add` | commutative; associative on integers; right identity -0.0 on floats, 0 on integers | `lhs + rhs`. |
+| `tensor.sub` | right identity 0.0 on floats, 0 on integers | `lhs - rhs`. |
+| `tensor.mul` | commutative; associative on integers; right identity 1.0 on floats, 1 on integers; absorbing 0 on integers; distributes over `tensor.add` on integers | `lhs * rhs`. |
+| `tensor.div` | right identity 1.0 on floats, 1 on integers | `lhs / rhs`. Integer division truncates toward zero, and backends MUST reject an integer division by zero as a spec violation. Float division follows IEEE 754, so it can give Inf or NaN. |
+| `tensor.maximum` | commutative; associative; idempotent; right identity -inf on floats, min on integers; absorbing max on integers | The larger operand. A float NaN operand gives NaN, and `-0.0` orders below `0.0`. |
+| `tensor.minimum` | commutative; associative; idempotent; right identity inf on floats, max on integers; absorbing min on integers | The smaller operand. A float NaN operand gives NaN, and `-0.0` orders below `0.0`. |
+| `tensor.and` | commutative; associative on integers; idempotent; right identity all ones on integers; absorbing 0 on integers; distributes over `tensor.or` on integers | Bitwise and; on `i1`, logical and. |
+| `tensor.or` | commutative; associative on integers; idempotent; right identity 0 on integers; absorbing all ones on integers; distributes over `tensor.and` on integers | Bitwise or; on `i1`, logical or. |
+| `tensor.xor` | commutative; associative on integers; right identity 0 on integers | Bitwise exclusive or; on `i1`, logical exclusive or. |
+| `tensor.shift_left` | right identity 0 on integers | `lhs` shifted left by `rhs` bits, shifting in zeros. `rhs` reads as unsigned, and a shift by at least the bit width gives 0. |
+| `tensor.shift_right_logical` | right identity 0 on integers | `lhs` shifted right by `rhs` bits, shifting in zeros, into a signed dtype too. `rhs` reads as unsigned, and a shift by at least the bit width gives 0. |
+| `tensor.shift_right_arithmetic` | right identity 0 on integers | `lhs` shifted right by `rhs` bits, shifting in copies of the sign bit. `rhs` reads as unsigned, and a shift by at least the bit width gives -1 for a negative `lhs`, else 0. |
 
 Example, from `filetests/tensor/roundtrip/elementwise.ptir`:
 
@@ -458,49 +479,55 @@ Rejected, as the verify filetests pin it:
 - `tensor.add: each operand must be an integer or float tensor, got tensor<4xf8e4m3>`
 - `tensor.add: result types are (tensor<8xf32>), but the op gives (tensor<4xf32>)`
 
-### `tensor.compare`
+### `Compare`: `tensor.less`, `tensor.less_equal`, `tensor.equal`, `tensor.greater_equal`, `tensor.greater`, `tensor.not_equal`
 
-Compares two tensors of equal type element by element into an `i1` tensor.
+Compares two tensors of equal type element by element into
+an `i1` tensor.
 
-- `out[i]` is 1 where `kind` holds between `lhs[i]` and `rhs[i]`, and 0 elsewhere. The result
-  has the operands' shape.
+- `out[i]` is 1 where the relation of the op holds between `lhs[i]` and `rhs[i]`, and 0
+  elsewhere. The result has the operands' shape.
 - `lhs` and `rhs` MUST have the same dtype and the same shape.
 - Unsigned integers order as unsigned numbers, and `i1` orders false below true.
-- Floats compare as IEEE does: `less`, `less_equal`, `equal`, `greater_equal` and `greater` are
-  false if either operand is NaN, and `not_equal` is true if either operand is NaN.
+- Floats compare as IEEE does: every relation but `not_equal` is false if either operand is NaN,
+  and `not_equal` is true.
 
-Defined by `Compare` in [crates/gpt-rs-ir/src/dialects/tensor/ir/elementwise.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/elementwise.rs).
+Defined by `Compare` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
 | Operands | `lhs`: tensor; `rhs`: tensor |
 | Results | `output`: tensor |
-| Attributes | `kind`: `CompareKind` |
 | Traits | elementwise |
 | Effects | none |
+| Patterns | `CompareWithItself` (`canonicalize`); `CompareToTile` (`tensor-to-tile`) |
 
-| `kind` | |
+| Op | |
 |---|---|
-| `less` | `lhs < rhs`. |
-| `less_equal` | `lhs <= rhs`. |
-| `equal` | `lhs == rhs`. |
-| `greater_equal` | `lhs >= rhs`. |
-| `greater` | `lhs > rhs`. |
-| `not_equal` | `lhs != rhs`. |
+| `tensor.less` | `lhs < rhs`. |
+| `tensor.less_equal` | `lhs <= rhs`. |
+| `tensor.equal` | `lhs == rhs`. |
+| `tensor.greater_equal` | `lhs >= rhs`. |
+| `tensor.greater` | `lhs > rhs`. |
+| `tensor.not_equal` | `lhs != rhs`. |
 
 Example, from `filetests/tensor/roundtrip/elementwise.ptir`:
 
 ```text
-func.func @compare_si32(%0: tensor<2x{T}xsi32>, %1: tensor<2x{T}xsi32>) -> tensor<2x{T}xi1> {
-  %2 = tensor.compare(%0, %1) {kind = greater_equal} : (tensor<2x{T}xsi32>, tensor<2x{T}xsi32>) -> tensor<2x{T}xi1>
-  func.return(%2) : (tensor<2x{T}xi1>) -> ()
+func.func @compare(%0: tensor<4xf32>, %1: tensor<4xf32>) -> (tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>) {
+  %2 = tensor.less(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  %3 = tensor.less_equal(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  %4 = tensor.equal(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  %5 = tensor.greater_equal(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  %6 = tensor.greater(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  %7 = tensor.not_equal(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  func.return(%2, %3, %4, %5, %6, %7) : (tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>) -> ()
 }
 ```
 
 Rejected, as the verify filetests pin it:
 
-- `tensor.compare: operands must have equal types, got tensor<4xf32> and tensor<4xsi32>`
-- `tensor.compare: each operand must be an i1, integer or float tensor, got tensor<4xe8m0>`
+- `tensor.less: operands must have equal types, got tensor<4xf32> and tensor<4xsi32>`
+- `tensor.less: each operand must be an i1, integer or float tensor, got tensor<4xe8m0>`
 
 ### `tensor.select`
 
@@ -510,7 +537,7 @@ Picks `on_true` where `pred` is set and `on_false` elsewhere.
 - `pred` is `i1`. All operands MUST have the same shape, and `on_true` and `on_false` MUST have
   the same dtype, which the result has.
 
-Defined by `Select` in [crates/gpt-rs-ir/src/dialects/tensor/ir/elementwise.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/elementwise.rs).
+Defined by `Select` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -519,6 +546,7 @@ Defined by `Select` in [crates/gpt-rs-ir/src/dialects/tensor/ir/elementwise.rs](
 | Traits | elementwise |
 | Effects | none |
 | Folds | `select(pred, on_true, on_false)` is `on_true` when `pred` is all true or both branches are the same value, and `on_false` when `pred` is all false. |
+| Patterns | `SelectToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/elementwise.ptir`:
 
@@ -543,7 +571,7 @@ Converts every element to `to`.
 - The conversion rules are those of `cast(x; to=dst)` in "DTypes and casting" of the
   dialect documentation.
 
-Defined by `Cast` in [crates/gpt-rs-ir/src/dialects/tensor/ir/elementwise.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/elementwise.rs).
+Defined by `Cast` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -553,6 +581,7 @@ Defined by `Cast` in [crates/gpt-rs-ir/src/dialects/tensor/ir/elementwise.rs](..
 | Traits | elementwise |
 | Effects | none |
 | Folds | A cast to the input's own type is the input. |
+| Patterns | `CastToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/elementwise.ptir`:
 
@@ -587,7 +616,7 @@ and free coordinates, over every coordinate of the contracting axes.
   gives their defaults. A wider `accum` holds the products of narrower inputs exactly, for
   example bf16 x bf16 with f32 accumulation.
 
-Defined by `DotGeneral` in [crates/gpt-rs-ir/src/dialects/tensor/ir/contraction.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/contraction.rs).
+Defined by `DotGeneral` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -595,7 +624,7 @@ Defined by `DotGeneral` in [crates/gpt-rs-ir/src/dialects/tensor/ir/contraction.
 | Results | `output`: tensor |
 | Attributes | `batch_lhs`: `[i64]`, optional; `batch_rhs`: `[i64]`, optional; `contract_lhs`: `[i64]`; `contract_rhs`: `[i64]`; `accum`: `dtype`, optional; `out`: `dtype`, optional |
 | Effects | none |
-| Patterns | `PackGemmWeight` (`c-pack-weights`); `GroupedConvWeight` (`c-pack-weights`); `DropDefaultDotDtypes` (`canonicalize`); `NonNegativeDotAxes` (`canonicalize`); `MergeDotAxes` (`merge-contracted-axes`) |
+| Patterns | `PackGemmWeight` (`c-pack-weights`); `GroupedConvWeight` (`c-pack-weights`); `DotOfOneProduct` (`canonicalize`); `DropDefaultDtypes` (`canonicalize`); `NonNegativeDotAxes` (`canonicalize`); `TransposeIntoDot` (`canonicalize`); `MergeDotAxes` (`merge-contracted-axes`); `DotToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/contraction.ptir`:
 
@@ -611,6 +640,7 @@ Rejected, as the verify filetests pin it:
 - `tensor.dot_general: operands of different dtypes, tensor<2x3xf32> and tensor<3x2xbf16>, need accum and out`
 - `tensor.dot_general: lhs must be an integer, float or narrow float tensor, got tensor<2x3xi1>`
 - `tensor.dot_general: accum must be a float dtype, got i1`
+- `tensor.dot_general: rank 10 is above the largest rank, 8`
 - `tensor.dot_general: batch_lhs [0] and batch_rhs [] differ in length`
 - `tensor.dot_general: contract_lhs [1] and contract_rhs [0, 1] differ in length`
 - `tensor.dot_general: contract_rhs axis 2 is out of range for rank 2`
@@ -623,18 +653,19 @@ Rejected, as the verify filetests pin it:
 - `tensor.dot_general: rhs must be an integer tensor, got tensor<3x2xf32>`
 - `tensor.dot_general: out must be a float or narrow float dtype, got i1`
 
-### `tensor.reduce_{kind}` (`Reduce`)
+### `Reduce`: `tensor.reduce_sum`, `tensor.reduce_max`, `tensor.reduce_min`, `tensor.reduce_and`, `tensor.reduce_or`
 
-Reduces the input over `axes` with `kind`.
+Reduces the input over `axes`, folding its
+elements with the binary op and from the initial value that the op states.
 
 - `axes` MUST be unique and in range. A negative axis counts from the end, and the order of
   `axes` does not matter.
 - If `keepdims` is true, the reduced axes remain with extent 1; otherwise they are removed.
 - It accumulates in `accum` and casts the result to `out`. The accumulator policy gives their
   defaults.
-- When a reduced axis has extent 0, each result element is the identity of `kind`.
+- When a reduced axis has extent 0, each result element is the initial value.
 
-Defined by `Reduce` in [crates/gpt-rs-ir/src/dialects/tensor/ir/contraction.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/contraction.rs).
+Defined by `Reduce` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -642,15 +673,15 @@ Defined by `Reduce` in [crates/gpt-rs-ir/src/dialects/tensor/ir/contraction.rs](
 | Results | `output`: tensor |
 | Attributes | `axes`: `[i64]`; `keepdims`: `bool`, optional; `accum`: `dtype`, optional; `out`: `dtype`, optional |
 | Effects | none |
-| Patterns | `DropDefaultReduceDtypes` (`canonicalize`); `MergeReductions` (`canonicalize`); `ReduceOfBroadcast` (`canonicalize`); `ReduceOfConcat` (`canonicalize`); `SortedReduceAxes` (`canonicalize`) |
+| Patterns | `DropDefaultDtypes` (`canonicalize`); `MergeReductions` (`canonicalize`); `ReduceOfBroadcast` (`canonicalize`); `ReduceOfConcat` (`canonicalize`); `SortedReduceAxes` (`canonicalize`); `ReduceToTile` (`tensor-to-tile`) |
 
-| Kind | |
+| Op | |
 |---|---|
-| `sum` | Folds with `add`. The initial value is 0. |
-| `max` | Folds with `maximum`. The initial value is `-inf` for floats and the smallest value of the dtype for integers. |
-| `min` | Folds with `minimum`. The initial value is `+inf` for floats and the largest value of the dtype for integers. |
-| `and` | Folds with `and`. The initial value has every bit set, true for `i1`, so on `i1` it is "all". |
-| `or` | Folds with `or`. The initial value is 0, so on `i1` it is "any". |
+| `tensor.reduce_sum` | Folds with `add`. The initial value is 0. |
+| `tensor.reduce_max` | Folds with `maximum`. The initial value is `-inf` for floats and the smallest value of the dtype for integers. |
+| `tensor.reduce_min` | Folds with `minimum`. The initial value is `+inf` for floats and the largest value of the dtype for integers. |
+| `tensor.reduce_and` | Folds with `and`. The initial value has every bit set, true for `i1`, so on `i1` it is "all". |
+| `tensor.reduce_or` | Folds with `or`. The initial value is 0, so on `i1` it is "any". |
 
 Example, from `filetests/tensor/roundtrip/contraction.ptir`:
 
@@ -681,7 +712,7 @@ The same elements in row-major order, with a new shape.
 
 - `shape` gives every extent explicitly, and the element count MUST be preserved.
 
-Defined by `Reshape` in [crates/gpt-rs-ir/src/dialects/tensor/ir/layout.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/layout.rs).
+Defined by `Reshape` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -691,7 +722,7 @@ Defined by `Reshape` in [crates/gpt-rs-ir/src/dialects/tensor/ir/layout.rs](../.
 | Traits | movement |
 | Effects | none |
 | Folds | A reshape to the input's own type is the input, and a reshape of a constant is that constant with the new extents, its elements in the same row-major order. |
-| Patterns | `CollapseReshapeChain` (`canonicalize`) |
+| Patterns | `CollapseChain` (`canonicalize`); `ReshapeToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/layout.ptir`:
 
@@ -715,17 +746,17 @@ Permutes the axes. Output axis `i` is input axis `perm[i]`.
 
 - `perm` MUST be a permutation of `[0, rank)`.
 
-Defined by `Transpose` in [crates/gpt-rs-ir/src/dialects/tensor/ir/layout.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/layout.rs).
+Defined by `Transpose` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
 | Operands | `input`: tensor |
 | Results | `output`: tensor |
-| Attributes | `perm`: `[usize]` |
+| Attributes | `perm`: `Perm` |
 | Traits | movement |
 | Effects | none |
 | Folds | A transpose by the identity `perm` is the input. |
-| Patterns | `CollapseTransposeChain` (`canonicalize`) |
+| Patterns | `CollapseChain` (`canonicalize`); `TransposeOfUnitAxes` (`canonicalize`); `TransposeToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/layout.ptir`:
 
@@ -751,7 +782,7 @@ every axis where the input has extent 1 or no axis.
   extent of `shape` on its axis. Backends MUST reject shapes that are not broadcast-compatible
   as a spec violation.
 
-Defined by `BroadcastTo` in [crates/gpt-rs-ir/src/dialects/tensor/ir/layout.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/layout.rs).
+Defined by `BroadcastTo` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -761,7 +792,7 @@ Defined by `BroadcastTo` in [crates/gpt-rs-ir/src/dialects/tensor/ir/layout.rs](
 | Traits | movement |
 | Effects | none |
 | Folds | A broadcast to the input's own type is the input. |
-| Patterns | `CollapseBroadcastChain` (`canonicalize`) |
+| Patterns | `BroadcastOfLeadingUnitAxes` (`canonicalize`); `CollapseChain` (`canonicalize`); `BroadcastToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/layout.ptir`:
 
@@ -792,7 +823,7 @@ element along axis `i`.
   `span` is `(sizes[i] - 1) * strides[i] + 1`, or 0 when `sizes[i]` is 0. With unit stride,
   that is `starts[i] + sizes[i] <= in_shape[i]`.
 
-Defined by `Slice` in [crates/gpt-rs-ir/src/dialects/tensor/ir/layout.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/layout.rs).
+Defined by `Slice` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -802,7 +833,7 @@ Defined by `Slice` in [crates/gpt-rs-ir/src/dialects/tensor/ir/layout.rs](../../
 | Traits | movement |
 | Effects | none |
 | Folds | A slice with the input's extents covers the whole input, so it is the input. |
-| Patterns | `CollapseSliceChain` (`canonicalize`); `UnitStrides` (`canonicalize`) |
+| Patterns | `CollapseChain` (`canonicalize`); `SliceOfConcat` (`canonicalize`); `UnitStrides` (`canonicalize`); `SliceToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/layout.ptir`:
 
@@ -834,7 +865,7 @@ The bits of the input read as elements of `to`.
 - It reads published packings in place: GPTQ and AWQ pack eight 4-bit codes into each int32,
   and gpt-oss stores MXFP4 blocks and their e8m0 scales as bytes.
 
-Defined by `Bitcast` in [crates/gpt-rs-ir/src/dialects/tensor/ir/layout.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/layout.rs).
+Defined by `Bitcast` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -843,6 +874,7 @@ Defined by `Bitcast` in [crates/gpt-rs-ir/src/dialects/tensor/ir/layout.rs](../.
 | Attributes | `to`: `dtype` |
 | Effects | none |
 | Folds | A bitcast to the input's own type is the input. |
+| Patterns | `BitcastToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/layout.ptir`:
 
@@ -869,7 +901,7 @@ Joins the inputs along `axis`.
   result's extent on `axis` is the sum of the inputs' extents.
 - All dtypes MUST match, and all shapes MUST match on the axes other than `axis`.
 
-Defined by `Concat` in [crates/gpt-rs-ir/src/dialects/tensor/ir/layout.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/layout.rs).
+Defined by `Concat` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -879,7 +911,7 @@ Defined by `Concat` in [crates/gpt-rs-ir/src/dialects/tensor/ir/layout.rs](../..
 | Traits | movement |
 | Effects | none |
 | Folds | A concat of one input is that input. |
-| Patterns | `NonNegativeAxis` (`canonicalize`) |
+| Patterns | `ConcatOfConcat` (`canonicalize`); `NonNegativeAxis` (`canonicalize`); `ConcatToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/layout.ptir`:
 
@@ -910,7 +942,7 @@ A tensor of `shape` whose elements count up along `axis`.
 - Each value is its integer index converted to `dtype` as `tensor.cast` converts an integer: a
   float rounds it once, to nearest-even, and a narrow integer saturates it.
 
-Defined by `Iota` in [crates/gpt-rs-ir/src/dialects/tensor/ir/indexing.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/indexing.rs).
+Defined by `Iota` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -918,7 +950,7 @@ Defined by `Iota` in [crates/gpt-rs-ir/src/dialects/tensor/ir/indexing.rs](../..
 | Results | `output`: tensor |
 | Attributes | `shape`: `[dim]`; `dtype`: `dtype`; `axis`: `i64` |
 | Effects | none |
-| Patterns | `NonNegativeAxis` (`canonicalize`) |
+| Patterns | `IotaOfUnitAxis` (`canonicalize`); `NonNegativeAxis` (`canonicalize`); `IotaToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/indexing.ptir`:
 
@@ -944,7 +976,7 @@ followed by the table's trailing axes.
 - `indices` are `si32` or `si64`, and each MUST satisfy `0 <= index < N`, where `N` is the
   extent of the table's leading axis.
 
-Defined by `Take` in [crates/gpt-rs-ir/src/dialects/tensor/ir/indexing.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/indexing.rs).
+Defined by `Take` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -952,6 +984,7 @@ Defined by `Take` in [crates/gpt-rs-ir/src/dialects/tensor/ir/indexing.rs](../..
 | Results | `output`: tensor |
 | Traits | movement of operand 0 |
 | Effects | none |
+| Patterns | `TakeToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/indexing.ptir`:
 
@@ -966,7 +999,7 @@ func.func @take(%0: tensor<50x8xf32> {param = 3}, %1: tensor<2x3xsi32>, %2: tens
 Rejected, as the verify filetests pin it:
 
 - `tensor.take: the table must have rank at least 1, got tensor<f32>`
-- `tensor.take: indices must be si32 or si64, got tensor<3xf32>`
+- `tensor.take: indices must be si32 or si64, got f32`
 
 ### `tensor.dynamic_slice`
 
@@ -980,7 +1013,7 @@ unit stride.
 - If a size exceeds its axis's extent at run time, backends MUST reject the op as a spec
   violation.
 
-Defined by `DynamicSlice` in [crates/gpt-rs-ir/src/dialects/tensor/ir/indexing.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/indexing.rs).
+Defined by `DynamicSlice` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -990,6 +1023,7 @@ Defined by `DynamicSlice` in [crates/gpt-rs-ir/src/dialects/tensor/ir/indexing.r
 | Traits | movement of operand 0 |
 | Effects | none |
 | Folds | A slice as large as its input starts at 0 whatever `starts` holds, so it is the input. |
+| Patterns | `DynamicSliceToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/indexing.ptir`:
 
@@ -1018,7 +1052,7 @@ Rejected, as the verify filetests pin it:
 - `starts` holds one `si32` or `si64` start per axis, of shape `[rank]`, clamped as in
   `tensor.dynamic_slice`: into `[0, extent - size]`.
 
-Defined by `DynamicUpdateSlice` in [crates/gpt-rs-ir/src/dialects/tensor/ir/indexing.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/indexing.rs).
+Defined by `DynamicUpdateSlice` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -1027,6 +1061,7 @@ Defined by `DynamicUpdateSlice` in [crates/gpt-rs-ir/src/dialects/tensor/ir/inde
 | Traits | movement of operands 0 to 1 |
 | Effects | none |
 | Folds | An update as large as the base replaces all of it, so the result is the update. |
+| Patterns | `DynamicUpdateSliceToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/indexing.ptir`:
 
@@ -1059,7 +1094,7 @@ Gathers every `window` patch of the padded input into its own row
 - Backends SHOULD fuse `extract_patches` + `dot_general` into convolution kernels.
 - An extension op.
 
-Defined by `ExtractPatches` in [crates/gpt-rs-ir/src/dialects/tensor/ir/window.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/window.rs).
+Defined by `ExtractPatches` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -1067,6 +1102,7 @@ Defined by `ExtractPatches` in [crates/gpt-rs-ir/src/dialects/tensor/ir/window.r
 | Results | `output`: tensor |
 | Attributes | `window`: `[usize]`; `strides`: `[usize]`; `dilation`: `[usize]`; `padding`: `[(usize, usize)]`; `pad_value`: `f64` |
 | Effects | none |
+| Patterns | `ExtractPatchesToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/window.ptir`:
 
@@ -1092,7 +1128,7 @@ Rejected, as the verify filetests pin it:
 - `tensor.extract_patches: patch size overflows`
 - `tensor.extract_patches: pad_value 0.5 is not representable in si32`
 
-### `tensor.reduce_window_{kind}` (`ReduceWindow`)
+### `ReduceWindow`: `tensor.reduce_window_sum`, `tensor.reduce_window_max`, `tensor.reduce_window_min`, `tensor.reduce_window_and`, `tensor.reduce_window_or`
 
 Reduces every window of the
 padded, dilated input, the pooling primitive.
@@ -1105,10 +1141,11 @@ padded, dilated input, the pooling primitive.
   `span = (window - 1) * window_dilation + 1`, and the result has
   `(padded - span) / stride + 1` positions.
 - Padding and the holes between dilated elements add nothing to a window.
-- It reduces with `kind` and accumulates in `accum` as `tensor.reduce_*` does, by the
-  accumulator policy; the result dtype is `out`, by default the input's.
+- It folds with the binary op and from the initial value that the op states, and accumulates
+  in `accum` as `tensor.reduce_*` does, by the accumulator policy; the result dtype is `out`,
+  by default the input's.
 
-Defined by `ReduceWindow` in [crates/gpt-rs-ir/src/dialects/tensor/ir/window.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/window.rs).
+Defined by `ReduceWindow` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -1116,15 +1153,15 @@ Defined by `ReduceWindow` in [crates/gpt-rs-ir/src/dialects/tensor/ir/window.rs]
 | Results | `output`: tensor |
 | Attributes | `window_dims`: `[usize]`; `strides`: `[usize]`; `padding`: `[(usize, usize)]`; `base_dilation`: `[usize]`; `window_dilation`: `[usize]`; `accum`: `dtype`, optional; `out`: `dtype`, optional |
 | Effects | none |
-| Patterns | `DropDefaultWindowAccum` (`canonicalize`) |
+| Patterns | `DropDefaultDtypes` (`canonicalize`); `ReduceWindowToTile` (`tensor-to-tile`) |
 
-| Kind | |
+| Op | |
 |---|---|
-| `sum` | Folds with `add`. The initial value is 0. |
-| `max` | Folds with `maximum`. The initial value is `-inf` for floats and the smallest value of the dtype for integers. |
-| `min` | Folds with `minimum`. The initial value is `+inf` for floats and the largest value of the dtype for integers. |
-| `and` | Folds with `and`. The initial value has every bit set, true for `i1`, so on `i1` it is "all". |
-| `or` | Folds with `or`. The initial value is 0, so on `i1` it is "any". |
+| `tensor.reduce_window_sum` | Sums each window, from 0: average pooling divides it. |
+| `tensor.reduce_window_max` | The largest element of each window, from `-inf` or the smallest integer: max pooling. |
+| `tensor.reduce_window_min` | The smallest element of each window, from `+inf` or the largest integer. |
+| `tensor.reduce_window_and` | Folds each window with `and`, from every bit set. |
+| `tensor.reduce_window_or` | Folds each window with `or`, from 0. |
 
 Example, from `filetests/tensor/roundtrip/window.ptir`:
 
@@ -1175,7 +1212,7 @@ creates the call knows them.
   strings) and arrays of primitives. Backends SHOULD reject unknown or malformed attributes as
   a spec violation.
 
-Defined by `CustomCall` in [crates/gpt-rs-ir/src/dialects/tensor/ir/custom_call.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/custom_call.rs).
+Defined by `CustomCall` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -1207,13 +1244,14 @@ Its input, unchanged, as a derivative barrier.
   autodiff runs there, so no pass folds it away. Backends that run no autodiff MAY treat it as a
   pure no-op.
 
-Defined by `StopGradient` in [crates/gpt-rs-ir/src/dialects/tensor/ir/elementwise.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/elementwise.rs).
+Defined by `StopGradient` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
 | Operands | `input`: tensor |
 | Results | `output`: tensor |
 | Effects | none |
+| Patterns | `StopGradientToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/elementwise.ptir`:
 
@@ -1234,7 +1272,7 @@ the end.
   have the dtype `out`, `si32` or `si64`.
 - If `axis` has extent 0, backends MUST reject the op as a spec violation.
 
-Defined by `ArgMax` in [crates/gpt-rs-ir/src/dialects/tensor/ir/contraction.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/contraction.rs).
+Defined by `ArgMax` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -1242,7 +1280,7 @@ Defined by `ArgMax` in [crates/gpt-rs-ir/src/dialects/tensor/ir/contraction.rs](
 | Results | `output`: tensor |
 | Attributes | `axis`: `i64`; `keepdims`: `bool`, optional; `out`: `dtype` |
 | Effects | none |
-| Patterns | `NonNegativeAxis` (`canonicalize`) |
+| Patterns | `NonNegativeAxis` (`canonicalize`); `ArgMaxToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/contraction.ptir`:
 
@@ -1260,21 +1298,22 @@ Rejected, as the verify filetests pin it:
 - `tensor.argmax: indices must be si32 or si64, got f32`
 - `tensor.argmax: axis 1 of tensor<2x0xf32> is empty`
 
-### `tensor.segment_{kind}` (`Segment`)
+### `Segment`: `tensor.segment_sum`, `tensor.segment_max`, `tensor.segment_min`, `tensor.segment_and`, `tensor.segment_or`
 
 Reduces the rows of `data` into
-`num_segments` rows, row `i` into row `segment_ids[i]`.
+`num_segments` rows, row `i` into row `segment_ids[i]`, folding them with the binary op that the
+op states.
 
 - `segment_ids` holds one `si32` or `si64` id per row of `data`, along its leading axis. The
   result has the shape of `data` with `num_segments` rows: `[num_segments, ...]`.
 - Each id MUST lie in `[0, num_segments)`. A segment that no row reaches holds the initial
-  value of `kind`, as `ReduceKind` states.
+  value of the fold, as the `tensor.reduce_*` op of the same fold states.
 - It accumulates in the default accumulator of the dtype of `data` and returns that dtype.
 - `indices_are_sorted` and `unique` state facts about the ids that MUST hold when set, so
   kernels MAY rely on them.
 - An extension op: a backend MAY reject it as unimplemented.
 
-Defined by `Segment` in [crates/gpt-rs-ir/src/dialects/tensor/ir/contraction.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/contraction.rs).
+Defined by `Segment` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -1282,14 +1321,15 @@ Defined by `Segment` in [crates/gpt-rs-ir/src/dialects/tensor/ir/contraction.rs]
 | Results | `output`: tensor |
 | Attributes | `num_segments`: `usize`; `indices_are_sorted`: `bool`, optional; `unique`: `bool`, optional |
 | Effects | none |
+| Patterns | `SegmentToTile` (`tensor-to-tile`) |
 
-| Kind | |
+| Op | |
 |---|---|
-| `sum` | Folds with `add`. The initial value is 0. |
-| `max` | Folds with `maximum`. The initial value is `-inf` for floats and the smallest value of the dtype for integers. |
-| `min` | Folds with `minimum`. The initial value is `+inf` for floats and the largest value of the dtype for integers. |
-| `and` | Folds with `and`. The initial value has every bit set, true for `i1`, so on `i1` it is "all". |
-| `or` | Folds with `or`. The initial value is 0, so on `i1` it is "any". |
+| `tensor.segment_sum` | Folds with `add`, from 0. |
+| `tensor.segment_max` | Folds with `maximum`, from `-inf` or the smallest integer. |
+| `tensor.segment_min` | Folds with `minimum`, from `+inf` or the largest integer. |
+| `tensor.segment_and` | Folds with `and`, from every bit set. |
+| `tensor.segment_or` | Folds with `or`, from 0. |
 
 Example, from `filetests/tensor/roundtrip/contraction.ptir`:
 
@@ -1307,34 +1347,38 @@ Rejected, as the verify filetests pin it:
 - `tensor.segment_sum: segment ids must be si32 or si64 with one id per row of tensor<6x4xf32>, got tensor<5xsi32>`
 - `tensor.segment_sum: data must have rank at least 1, got tensor<f32>`
 
-### `tensor.top_k`
+### `SelectK`: `tensor.top_k`, `tensor.bottom_k`
 
-The top-k values along `axis` and their indices.
+The `k` extreme elements along `axis`, and their indices.
 
-- With `largest`, the `k` largest elements along `axis`, largest first; otherwise the `k`
-  smallest, smallest first. A negative axis counts from the end.
+- A negative axis counts from the end.
 - Of equal elements, the one with the smaller index comes first, and NaN is larger than every
   number.
 - The values have the input's shape with extent `k` on `axis`, and their indices along `axis`
   have the same shape and the dtype that the attribute `indices` names, `si32` or `si64`.
 - An extension op: a backend MAY reject it as unimplemented.
 
-Defined by `TopK` in [crates/gpt-rs-ir/src/dialects/tensor/ir/contraction.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/contraction.rs).
+Defined by `SelectK` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
 | Operands | `input`: tensor |
 | Results | `values`: tensor; `indices`: tensor |
-| Attributes | `k`: `usize`; `axis`: `i64`; `largest`: `bool`; `indices`: `dtype` |
+| Attributes | `k`: `usize`; `axis`: `i64`; `indices`: `dtype` |
 | Effects | none |
-| Patterns | `NonNegativeAxis` (`canonicalize`) |
+| Patterns | `NonNegativeAxis` (`canonicalize`); `SelectKToTile` (`tensor-to-tile`) |
+
+| Op | |
+|---|---|
+| `tensor.top_k` | The `k` largest elements along `axis`, largest first. |
+| `tensor.bottom_k` | The `k` smallest elements along `axis`, smallest first. |
 
 Example, from `filetests/tensor/roundtrip/contraction.ptir`:
 
 ```text
 func.func @top_k(%0: tensor<2x5xf32>) -> (tensor<2x3xf32>, tensor<2x3xsi32>, tensor<1x5xf32>, tensor<1x5xsi64>) {
-  %1, %2 = tensor.top_k(%0) {k = 3, axis = 1, largest = true, indices = si32} : (tensor<2x5xf32>) -> (tensor<2x3xf32>, tensor<2x3xsi32>)
-  %3, %4 = tensor.top_k(%0) {k = 1, axis = 0, largest = false, indices = si64} : (tensor<2x5xf32>) -> (tensor<1x5xf32>, tensor<1x5xsi64>)
+  %1, %2 = tensor.top_k(%0) {k = 3, axis = 1, indices = si32} : (tensor<2x5xf32>) -> (tensor<2x3xf32>, tensor<2x3xsi32>)
+  %3, %4 = tensor.bottom_k(%0) {k = 1, axis = 0, indices = si64} : (tensor<2x5xf32>) -> (tensor<1x5xf32>, tensor<1x5xsi64>)
   func.return(%1, %2, %3, %4) : (tensor<2x3xf32>, tensor<2x3xsi32>, tensor<1x5xf32>, tensor<1x5xsi64>) -> ()
 }
 ```
@@ -1354,7 +1398,7 @@ coordinate on `axis` replaced by `indices[i]`.
 - The result has the shape of `indices`.
 - Each index MUST satisfy `0 <= index < in_shape[axis]`.
 
-Defined by `Gather` in [crates/gpt-rs-ir/src/dialects/tensor/ir/indexing.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/indexing.rs).
+Defined by `Gather` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -1362,7 +1406,7 @@ Defined by `Gather` in [crates/gpt-rs-ir/src/dialects/tensor/ir/indexing.rs](../
 | Results | `output`: tensor |
 | Attributes | `axis`: `i64` |
 | Effects | none |
-| Patterns | `NonNegativeAxis` (`canonicalize`) |
+| Patterns | `NonNegativeAxis` (`canonicalize`); `GatherToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/indexing.ptir`:
 
@@ -1376,24 +1420,25 @@ func.func @gather(%0: tensor<3x4xf32>, %1: tensor<3x2xsi32>, %2: tensor<5x4xsi32
 
 Rejected, as the verify filetests pin it:
 
-- `tensor.gather: indices must be si32 or si64, got tensor<3x2xf32>`
+- `tensor.gather: indices must be si32 or si64, got f32`
 - `tensor.gather: indices tensor<2x2xsi32> must match tensor<3x4xf32> on every axis but 1`
 - `tensor.gather: axis 2 is out of range for rank 2`
 
-### `tensor.scatter_{kind}` (`Scatter`)
+### `Scatter`: `tensor.scatter_add`, `tensor.scatter_max`, `tensor.scatter_min`
 
-`torch.scatter_reduce` of the same-rank form.
+`torch.scatter_reduce` of the
+same-rank form, folding each update into its element with the binary op that the op states.
 
-- The result is `input` with element `i` of `updates` combined by `kind` into the element whose
-  coordinate on `axis` is `indices[i]`, in row-major order of `updates`.
+- The result is `input` with element `i` of `updates` folded into the element whose coordinate
+  on `axis` is `indices[i]`, in row-major order of `updates`.
 - `indices` are `si32` or `si64`, and `updates` MUST have their shape and the input's dtype.
   Both MUST have the input's rank and its extents on every axis but `axis`, a negative axis
   counting from the end; along `axis` they MAY differ.
 - Each index MUST be in range.
-- `scatter_add`, `scatter_max` and `scatter_min` accumulate in the default accumulator of the
-  dtype, then return the dtype.
+- The elements and the updates accumulate in the default accumulator of the dtype, then return
+  the dtype.
 
-Defined by `Scatter` in [crates/gpt-rs-ir/src/dialects/tensor/ir/indexing.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/indexing.rs).
+Defined by `Scatter` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -1401,14 +1446,13 @@ Defined by `Scatter` in [crates/gpt-rs-ir/src/dialects/tensor/ir/indexing.rs](..
 | Results | `output`: tensor |
 | Attributes | `axis`: `i64` |
 | Effects | none |
-| Patterns | `NonNegativeAxis` (`canonicalize`) |
+| Patterns | `NonNegativeAxis` (`canonicalize`); `ScatterToTile` (`tensor-to-tile`) |
 
-| Kind | |
+| Op | |
 |---|---|
-| `add` | Accumulates the sum of the element and its updates. |
-| `max` | Accumulates the maximum of the element and its updates. |
-| `min` | Accumulates the minimum of the element and its updates. |
-| `replace` | Replaces the element: of several updates to one element, the last in row-major order of `updates` wins. |
+| `tensor.scatter_add` | Accumulates the sum of the element and its updates. |
+| `tensor.scatter_max` | Accumulates the maximum of the element and its updates. |
+| `tensor.scatter_min` | Accumulates the minimum of the element and its updates. |
 
 Example, from `filetests/tensor/roundtrip/indexing.ptir`:
 
@@ -1426,7 +1470,37 @@ Rejected, as the verify filetests pin it:
 
 - `tensor.scatter_add: updates must have the dtype of tensor<3x4xf32> and the shape of tensor<3x2xsi32>, got tensor<3x3xf32>`
 
-### `tensor.rng_{distribution}` (`Rng`)
+### `tensor.scatter_replace`
+
+`input` with element `i` of `updates` written to the element whose
+coordinate on `axis` is `indices[i]`. Of several updates to one element, the last in row-major
+order of `updates` wins.
+
+- The operands follow the rules of `tensor.scatter_add`, of any dtype.
+
+Defined by `ScatterReplace` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
+
+| | |
+|---|---|
+| Operands | `input`: tensor; `indices`: tensor; `updates`: tensor |
+| Results | `output`: tensor |
+| Attributes | `axis`: `i64` |
+| Effects | none |
+| Patterns | `NonNegativeAxis` (`canonicalize`); `ScatterReplaceToTile` (`tensor-to-tile`) |
+
+Example, from `filetests/tensor/roundtrip/indexing.ptir`:
+
+```text
+func.func @scatter(%0: tensor<3x4xf32>, %1: tensor<3x2xsi32>, %2: tensor<3x2xf32>) -> (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) {
+  %3 = tensor.scatter_add(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  %4 = tensor.scatter_max(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  %5 = tensor.scatter_min(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  %6 = tensor.scatter_replace(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  func.return(%3, %4, %5, %6) : (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) -> ()
+}
+```
+
+### `Rng`: `tensor.rng_uniform`, `tensor.rng_normal`
 
 A tensor of `shape` whose elements are random, and
 the state after them.
@@ -1447,7 +1521,7 @@ the state after them.
 - Uniform `ui32` values are the draws of stochastic rounding (`tensor.quantize`).
 - An extension op: a backend MAY reject it as unimplemented.
 
-Defined by `Rng` in [crates/gpt-rs-ir/src/dialects/tensor/ir/random.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/random.rs).
+Defined by `Rng` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -1455,11 +1529,12 @@ Defined by `Rng` in [crates/gpt-rs-ir/src/dialects/tensor/ir/random.rs](../../cr
 | Results | `new_state`: tensor; `output`: tensor |
 | Attributes | `shape`: `[dim]`; `dtype`: `dtype` |
 | Effects | none |
+| Patterns | `RngToTile` (`tensor-to-tile`) |
 
-| Kind | |
+| Op | |
 |---|---|
-| `uniform` | Each value of an integer dtype equally likely, or a float on `[0, 1)`. |
-| `normal` | The standard normal distribution, of a float dtype. |
+| `tensor.rng_uniform` | Each value of an integer dtype equally likely, or a float on `[0, 1)`. |
+| `tensor.rng_normal` | The standard normal distribution, of a float dtype. |
 
 Example, from `filetests/tensor/roundtrip/random.ptir`:
 
@@ -1485,7 +1560,7 @@ Ends a region of a control-flow op. Its operands are the region's results.
 - Each region of a control-flow op has its own arguments and ends with a `tensor.yield`. The
   ops compute on whole tensor values, like the rest of the dialect.
 
-Defined by `Yield` in [crates/gpt-rs-ir/src/dialects/tensor/ir/control.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/control.rs).
+Defined by `Yield` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -1515,7 +1590,7 @@ and gives the results that the branch yields, of the types `results`.
 - `pred` is an `i1` scalar, `i1[]`.
 - Both branches take arguments of the types of `args` and MUST yield the types `results`.
 
-Defined by `Cond` in [crates/gpt-rs-ir/src/dialects/tensor/ir/control.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/control.rs).
+Defined by `Cond` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -1556,7 +1631,7 @@ A loop over the carried values `init`.
   carry...`, and the loop repeats with the values `body` yields.
 - If the scalar is false, the results are the carried values `cond` yielded.
 
-Defined by `While` in [crates/gpt-rs-ir/src/dialects/tensor/ir/control.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/control.rs).
+Defined by `While` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -1572,7 +1647,7 @@ func.func @while(%0: tensor<si32>, %1: tensor<4xf32>) -> (tensor<si32>, tensor<4
   %2, %3 = tensor.while(%0, %1) ({
   ^cond(%4: tensor<si32>, %5: tensor<4xf32>):
     %6 = tensor.constant() {value = dense<[] x si32: 10>} : () -> tensor<si32>
-    %7 = tensor.compare(%4, %6) {kind = less} : (tensor<si32>, tensor<si32>) -> tensor<i1>
+    %7 = tensor.less(%4, %6) : (tensor<si32>, tensor<si32>) -> tensor<i1>
     tensor.yield(%7, %4, %5) : (tensor<i1>, tensor<si32>, tensor<4xf32>) -> ()
   }, {
   ^body(%8: tensor<si32>, %9: tensor<4xf32>):
@@ -1600,7 +1675,7 @@ A loop over the leading axis of the scanned inputs, like a functional for-loop.
 - The results are the final carried values, then each output stacked along a new leading axis
   over the steps, `[T, ...]`.
 
-Defined by `Scan` in [crates/gpt-rs-ir/src/dialects/tensor/ir/control.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/control.rs).
+Defined by `Scan` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
@@ -1630,13 +1705,14 @@ Rejected, as the verify filetests pin it:
 
 ### `tensor.dequantize`
 
-`out[i] = to(value(q[i]) * scale[i / block] + offset[i / block])`,
-computed in f32, then rounded to nearest-even in `to`.
+`out[i] = to(q[i] * scale[i / block] + offset[i / block])`, computed in
+f32, then rounded to nearest-even in `to`.
 
 - `to` is `f32`, `bf16` or `f16`. The scale and the offset follow the scale layout of
-  "Quantization" in the dialect documentation.
-- `value(q)` is `table[q]` with a table, whose codes `q` are integers in `[0, n)`, and the value
-  of `q` otherwise. Without an offset, the sum adds nothing.
+  "Quantization" in the dialect documentation. Without an offset, the sum adds nothing.
+- `q` holds quantized elements, integers or narrow floats, or the values of a code table that
+  `tensor.take` read at the codes: NF4 weights dequantize as `take(table, codes)` and then this
+  op.
 - The offset carries asymmetric quantization: the zero points of GPTQ and AWQ as
   `offset = -zero_point * scale`, computed once at load time, and the block minimums of GGUF.
 - A backend SHOULD read `q` and `scale` in place inside the op that consumes the result, such
@@ -1645,14 +1721,15 @@ computed in f32, then rounded to nearest-even in `to`.
   `dequantize(quantize(x))` passes gradients through unchanged.
 - An extension op: a backend MAY reject it as unimplemented.
 
-Defined by `Dequantize` in [crates/gpt-rs-ir/src/dialects/tensor/ir/quant.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/quant.rs).
+Defined by `Dequantize` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
-| Operands | `q`: tensor; `scale`: tensor; `offset`: optional tensor; `table`: optional tensor |
+| Operands | `q`: tensor; `scale`: tensor; `offset`: optional tensor |
 | Results | `output`: tensor |
 | Attributes | `block`: `[usize]`; `to`: `dtype` |
 | Effects | none |
+| Patterns | `DequantizeToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/quant.ptir`:
 
@@ -1666,55 +1743,44 @@ func.func @mxfp4(%0: tensor<4x64xf4e2m1>, %1: tensor<4x2xe8m0>) -> tensor<4x64xb
 Rejected, as the verify filetests pin it:
 
 - `tensor.dequantize: the scale must have the extents [4, 2] for block [1, 32], got tensor<4x3xe8m0>`
-- `tensor.dequantize: q must be an integer or narrow float tensor, got tensor<4x64xf32>`
-- `tensor.dequantize: codes with a table must be an integer dtype, got f4e2m1`
-- `tensor.dequantize: the table must have rank 1, got tensor<4x4xf32>`
+- `tensor.dequantize: q must be an integer, narrow float or float tensor, got tensor<4x64xe8m0>`
 - `tensor.dequantize: the offset must have the scale's extents, got tensor<4x1xf16> and tensor<4x2xf16>`
 - `tensor.dequantize: the offset must be a float tensor, got tensor<4x2xe8m0>`
 
 ### `tensor.quantize`
 
-Quantizes `x` into `to` with given scales and offsets, or into the indices
-of a table.
+Quantizes `x` into `to` with given scales and offsets, to the nearest value.
 
-- `x` is `f32`, `bf16` or `f16`, and `scale` holds static scales, for example parameters. The
-  scale and the offset follow the scale layout of "Quantization" in the dialect documentation.
+- `x` is `f32`, `bf16` or `f16`. `scale` holds static scales, for example parameters, or the
+  scales that a `tensor.block_scale_*` op computes from `x`: dynamic quantization is the two
+  ops. The scale and the offset follow the scale layout of "Quantization" in the dialect
+  documentation.
 - `y[i] = (x[i] - offset[i / block]) / scale[i / block]`, computed in f32. A zero scale gives
-  `y[i] = 0`, so without a table `q[i] = 0`.
-- Without a table, `q[i] = to(y[i])`, rounded as `rounding` says and saturated to the largest
+  `y[i] = 0`.
+- `q[i] = to(y[i])`, the nearest value of `to`, the even one on a tie, saturated to the largest
   finite value of `to`. Infinities saturate. NaN maps to NaN in a dtype that has one, and to 0
   otherwise.
-- With a table, `q[i]` is the index of the table value nearest to `y[i]`, the lowest index on
-  a tie, and 0 for NaN. `to` MUST be an integer dtype and `rounding` `nearest_even`. NF4 weights
-  and 8-bit optimizer states quantize this way.
-- `random` is present exactly when `rounding` is `stochastic`, and holds one `ui32` draw per
-  element of `x`. The draws come from `tensor.rng_uniform` with `dtype = ui32`, so a state
-  reproduces the rounding.
 - Autodiff MUST differentiate it as division by the scale, ignoring the rounding: the
   straight-through estimator of quantization-aware training.
 - An extension op: a backend MAY reject it as unimplemented.
 
-Defined by `Quantize` in [crates/gpt-rs-ir/src/dialects/tensor/ir/quant.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/quant.rs).
+Defined by `Quantize` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
-| Operands | `x`: tensor; `scale`: tensor; `offset`: optional tensor; `table`: optional tensor; `random`: optional tensor |
+| Operands | `x`: tensor; `scale`: tensor; `offset`: optional tensor |
 | Results | `output`: tensor |
-| Attributes | `block`: `[usize]`; `to`: `dtype`; `rounding`: `Rounding`, optional |
+| Attributes | `block`: `[usize]`; `to`: `dtype` |
 | Effects | none |
-
-| `rounding` | |
-|---|---|
-| `nearest_even` | The nearest value of the quantized dtype, the even one on a tie. |
-| `stochastic` | Rounds `abs(y)` to one of its two neighbors `lo` and `lo + q` in the quantized dtype, where `q` is their spacing. It picks `lo + q` when the element's draw `r` from the `random` operand satisfies `r < floor((abs(y) - lo) / q * 2^32)`, else `lo`, and keeps the sign of `y`. So rounding picks `lo + q` with probability `(abs(y) - lo) / q`. FP8 and FP4 training round gradients this way. |
+| Patterns | `QuantizeToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/quant.ptir`:
 
 ```text
 func.func @quantize_options(%0: tensor<8x16xf32>, %1: tensor<8x1xf32>, %2: tensor<8x16xui32>, %3: tensor<16xf32>) -> (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) {
-  %4 = tensor.quantize(%0, %1, %2) {block = [1, 16], to = f8e4m3, rounding = stochastic, operand_segments = [1, 1, 0, 0, 1]} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x16xui32>) -> tensor<8x16xf8e4m3>
-  %5 = tensor.quantize(%0, %1, %1) {block = [1, 16], to = ui8, operand_segments = [1, 1, 1, 0, 0]} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x1xf32>) -> tensor<8x16xui8>
-  %6 = tensor.quantize(%0, %1, %3) {block = [1, 16], to = ui4, operand_segments = [1, 1, 0, 1, 0]} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<16xf32>) -> tensor<8x16xui4>
+  %4 = tensor.quantize_stochastic(%0, %1, %2) {block = [1, 16], to = f8e4m3} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x16xui32>) -> tensor<8x16xf8e4m3>
+  %5 = tensor.quantize(%0, %1, %1) {block = [1, 16], to = ui8} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x1xf32>) -> tensor<8x16xui8>
+  %6 = tensor.quantize_table(%0, %1, %3) {block = [1, 16], to = ui4} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<16xf32>) -> tensor<8x16xui4>
   func.return(%4, %5, %6) : (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) -> ()
 }
 ```
@@ -1723,68 +1789,168 @@ Rejected, as the verify filetests pin it:
 
 - `tensor.quantize: block [32] must have one extent per axis of rank 2`
 - `tensor.quantize: to must be an integer or narrow float dtype, got bf16`
-- `tensor.quantize: stochastic rounding needs a random operand`
-- `tensor.quantize: only stochastic rounding reads random bits`
-- `tensor.quantize: the random bits must be tensor<8x16xui32>, got tensor<8x16xsi32>`
-- `tensor.quantize: a table quantizes to the nearest value`
 
-### `tensor.quantize_dynamic`
+### `tensor.quantize_stochastic`
 
-Computes each block's scale, and with `asymmetric` its offset, from
-the block's values, then quantizes as `tensor.quantize` does.
+Quantizes `x` as `tensor.quantize` does, rounding each `y[i]` up
+or down at random.
 
-- `x` is `f32`, `bf16` or `f16`. The blocks, and the shape of the scales and offsets, follow
-  the scale layout of "Quantization" in the dialect documentation.
-- It quantizes `x` as `tensor.quantize` does with the scales and offsets as stored, in
-  `scale_dtype`. The scales and offsets ignore NaN elements.
-- A symmetric scale comes from the block's largest magnitude `amax`, as `scale_rule` says.
-- An asymmetric scale maps the block's range `[lo, hi]`, widened to hold 0, onto the range of
-  `to`: `scale = (hi - lo) / (max(to) - min(to))`. The integer zero point is
-  `zero_point = round(min(to) - lo / scale)`, rounded to nearest-even and clamped into the range
-  of `to`, so that 0 quantizes exactly. The offset is `offset = -zero_point * scale`. `max(to)`
-  and `min(to)` are the largest and smallest finite values of `to`. `scale_dtype` is a float,
-  and `scale_rule` is `amax`.
-- Its results are the quantized tensor `q`, of dtype `to`, the scales, and with `asymmetric`
-  the offsets, both of dtype `scale_dtype`.
-- `rounding` and `random` are those of `tensor.quantize`.
+- It rounds `abs(y)` to one of its two neighbors `lo` and `lo + q` in `to`, where `q` is their
+  spacing. It picks `lo + q` when the element's draw `r` satisfies
+  `r < floor((abs(y) - lo) / q * 2^32)`, else `lo`, and keeps the sign of `y`. So rounding picks
+  `lo + q` with probability `(abs(y) - lo) / q`. FP8 and FP4 training round gradients this way.
+- `random` holds one `ui32` draw per element of `x`. The draws come from `tensor.rng_uniform`
+  with `dtype = ui32`, so a state reproduces the rounding.
+- Scales, offsets, saturation, infinities, NaN and autodiff are those of `tensor.quantize`.
 - An extension op: a backend MAY reject it as unimplemented.
 
-Defined by `QuantizeDynamic` in [crates/gpt-rs-ir/src/dialects/tensor/ir/quant.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir/quant.rs).
+Defined by `QuantizeStochastic` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
 
 | | |
 |---|---|
-| Operands | `x`: tensor; `random`: optional tensor |
-| Results | `q`: tensor; `scale`: tensor; `offset`: optional tensor |
-| Attributes | `block`: `[usize]`; `to`: `dtype`; `scale_dtype`: `dtype`; `scale_rule`: `ScaleRule`, optional; `asymmetric`: `bool`, optional; `rounding`: `Rounding`, optional |
+| Operands | `x`: tensor; `scale`: tensor; `offset`: optional tensor; `random`: tensor |
+| Results | `output`: tensor |
+| Attributes | `block`: `[usize]`; `to`: `dtype` |
 | Effects | none |
-
-| `scale_rule` | |
-|---|---|
-| `amax` | `scale_dtype(amax / max(to))`, rounded to nearest-even, so `amax` maps to the largest value of `to`; a block whose `amax` is 0 gets the scale 0. NVFP4 takes its `f8e4m3` block scales this way, and per-tensor, per-channel and per-token scales are `f32` or `bf16`. |
-| `pow2_floor` | `2^(floor(log2(amax)) - emax)`, the microscaling (MX) rule, where `emax = floor(log2(max(to)))` is the exponent of the largest power of two `to` holds (`f4e2m1`: 2, `f6e2m3`: 2, `f6e3m2`: 4, `f8e4m3`: 8, `f8e5m2`: 15). Values above `max(to)` times the scale saturate. |
-| `pow2_ceil` | `2^ceil(log2(amax / max(to)))`, the smallest power of two that maps `amax` into `to`, as DeepSeek's UE8M0 scales are. |
-
-| `rounding` | |
-|---|---|
-| `nearest_even` | The nearest value of the quantized dtype, the even one on a tie. |
-| `stochastic` | Rounds `abs(y)` to one of its two neighbors `lo` and `lo + q` in the quantized dtype, where `q` is their spacing. It picks `lo + q` when the element's draw `r` from the `random` operand satisfies `r < floor((abs(y) - lo) / q * 2^32)`, else `lo`, and keeps the sign of `y`. So rounding picks `lo + q` with probability `(abs(y) - lo) / q`. FP8 and FP4 training round gradients this way. |
+| Patterns | `QuantizeStochasticToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/quant.ptir`:
 
 ```text
-func.func @dynamic(%0: tensor<{T}x64xf32>) -> (tensor<{T}x64xf4e2m1>, tensor<{T}x4xf8e4m3>, tensor<{T}x64xf6e3m2>, tensor<{T}x2xe8m0>) {
-  %1, %2 = tensor.quantize_dynamic(%0) {block = [1, 16], to = f4e2m1, scale_dtype = f8e4m3} : (tensor<{T}x64xf32>) -> (tensor<{T}x64xf4e2m1>, tensor<{T}x4xf8e4m3>)
-  %3, %4 = tensor.quantize_dynamic(%0) {block = [1, 32], to = f6e3m2, scale_dtype = e8m0, scale_rule = pow2_floor} : (tensor<{T}x64xf32>) -> (tensor<{T}x64xf6e3m2>, tensor<{T}x2xe8m0>)
-  func.return(%1, %2, %3, %4) : (tensor<{T}x64xf4e2m1>, tensor<{T}x4xf8e4m3>, tensor<{T}x64xf6e3m2>, tensor<{T}x2xe8m0>) -> ()
+func.func @quantize_options(%0: tensor<8x16xf32>, %1: tensor<8x1xf32>, %2: tensor<8x16xui32>, %3: tensor<16xf32>) -> (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) {
+  %4 = tensor.quantize_stochastic(%0, %1, %2) {block = [1, 16], to = f8e4m3} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x16xui32>) -> tensor<8x16xf8e4m3>
+  %5 = tensor.quantize(%0, %1, %1) {block = [1, 16], to = ui8} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x1xf32>) -> tensor<8x16xui8>
+  %6 = tensor.quantize_table(%0, %1, %3) {block = [1, 16], to = ui4} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<16xf32>) -> tensor<8x16xui4>
+  func.return(%4, %5, %6) : (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) -> ()
 }
 ```
 
 Rejected, as the verify filetests pin it:
 
-- `tensor.quantize_dynamic: e8m0 scales are powers of two: they need scale_rule pow2_floor or pow2_ceil`
-- `tensor.quantize_dynamic: a block of 2 needs a static extent, got {T}`
-- `tensor.quantize_dynamic: an asymmetric scale_dtype must be a float dtype, got e8m0`
-- `tensor.quantize_dynamic: an asymmetric scale maps the block's range, not a power of two`
+- `tensor.quantize_stochastic: the random bits must be tensor<8x16xui32>, got tensor<8x16xsi32>`
+
+### `tensor.quantize_table`
+
+Quantizes `x` into the indices of a code table.
+
+- `y[i]` is that of `tensor.quantize`. `q[i]` is the index of the `table` value nearest to
+  `y[i]`, the lowest index on a tie, and 0 for NaN. NF4 weights and 8-bit optimizer states
+  quantize this way.
+- `table` is a rank-1 tensor of floats or narrow floats, and `to` an integer dtype.
+- Autodiff is that of `tensor.quantize`.
+- An extension op: a backend MAY reject it as unimplemented.
+
+Defined by `QuantizeTable` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
+
+| | |
+|---|---|
+| Operands | `x`: tensor; `scale`: tensor; `offset`: optional tensor; `table`: tensor |
+| Results | `output`: tensor |
+| Attributes | `block`: `[usize]`; `to`: `dtype` |
+| Effects | none |
+| Patterns | `QuantizeTableToTile` (`tensor-to-tile`) |
+
+Example, from `filetests/tensor/roundtrip/quant.ptir`:
+
+```text
+func.func @quantize_options(%0: tensor<8x16xf32>, %1: tensor<8x1xf32>, %2: tensor<8x16xui32>, %3: tensor<16xf32>) -> (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) {
+  %4 = tensor.quantize_stochastic(%0, %1, %2) {block = [1, 16], to = f8e4m3} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x16xui32>) -> tensor<8x16xf8e4m3>
+  %5 = tensor.quantize(%0, %1, %1) {block = [1, 16], to = ui8} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x1xf32>) -> tensor<8x16xui8>
+  %6 = tensor.quantize_table(%0, %1, %3) {block = [1, 16], to = ui4} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<16xf32>) -> tensor<8x16xui4>
+  func.return(%4, %5, %6) : (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) -> ()
+}
+```
+
+Rejected, as the verify filetests pin it:
+
+- `tensor.quantize_table: to must be an integer dtype, got f4e2m1`
+- `tensor.quantize_table: the table must have rank 1, got tensor<4x4xf32>`
+
+### `BlockScale`: `tensor.block_scale_amax`, `tensor.block_scale_pow2_floor`, `tensor.block_scale_pow2_ceil`
+
+The symmetric scale of each
+block of `x`, for `tensor.quantize` into `to`, from the block's largest magnitude `amax`.
+
+- `x` is `f32`, `bf16` or `f16`. The blocks, and the shape of the scales, follow the scale
+  layout of "Quantization" in the dialect documentation. The scales have dtype `scale_dtype`.
+- `amax` ignores NaN elements. `max(to)` is the largest finite value of `to`.
+- A power-of-two scale has its exponent clamped to `[-127, 127]`, and a block whose `amax` is 0
+  gets the smallest one, `2^-127`. `e8m0` scales need a power-of-two op.
+- An extension op: a backend MAY reject it as unimplemented.
+
+Defined by `BlockScale` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
+
+| | |
+|---|---|
+| Operands | `x`: tensor |
+| Results | `scale`: tensor |
+| Attributes | `block`: `[usize]`; `to`: `dtype`; `scale_dtype`: `dtype` |
+| Effects | none |
+| Patterns | `BlockScaleToTile` (`tensor-to-tile`) |
+
+| Op | |
+|---|---|
+| `tensor.block_scale_amax` | `scale_dtype(amax / max(to))`, rounded to nearest-even, so `amax` maps to the largest value of `to`; a block whose `amax` is 0 gets the scale 0. NVFP4 takes its `f8e4m3` block scales this way, and per-tensor, per-channel and per-token scales are `f32` or `bf16`. |
+| `tensor.block_scale_pow2_floor` | `2^(floor(log2(amax)) - emax)`, the microscaling (MX) rule, where `emax = floor(log2(max(to)))` is the exponent of the largest power of two `to` holds (`f4e2m1`: 2, `f6e2m3`: 2, `f6e3m2`: 4, `f8e4m3`: 8, `f8e5m2`: 15). Values above `max(to)` times the scale saturate. |
+| `tensor.block_scale_pow2_ceil` | `2^ceil(log2(amax / max(to)))`, the smallest power of two that maps `amax` into `to`, as DeepSeek's UE8M0 scales are. |
+
+Example, from `filetests/tensor/roundtrip/quant.ptir`:
+
+```text
+func.func @dynamic(%0: tensor<{T}x64xf32>) -> (tensor<{T}x64xf4e2m1>, tensor<{T}x4xf8e4m3>, tensor<{T}x64xf6e3m2>, tensor<{T}x2xe8m0>) {
+  %1 = tensor.block_scale_amax(%0) {block = [1, 16], to = f4e2m1, scale_dtype = f8e4m3} : (tensor<{T}x64xf32>) -> tensor<{T}x4xf8e4m3>
+  %2 = tensor.quantize(%0, %1) {block = [1, 16], to = f4e2m1} : (tensor<{T}x64xf32>, tensor<{T}x4xf8e4m3>) -> tensor<{T}x64xf4e2m1>
+  %3 = tensor.block_scale_pow2_floor(%0) {block = [1, 32], to = f6e3m2, scale_dtype = e8m0} : (tensor<{T}x64xf32>) -> tensor<{T}x2xe8m0>
+  %4 = tensor.quantize(%0, %3) {block = [1, 32], to = f6e3m2} : (tensor<{T}x64xf32>, tensor<{T}x2xe8m0>) -> tensor<{T}x64xf6e3m2>
+  func.return(%2, %1, %4, %3) : (tensor<{T}x64xf4e2m1>, tensor<{T}x4xf8e4m3>, tensor<{T}x64xf6e3m2>, tensor<{T}x2xe8m0>) -> ()
+}
+```
+
+Rejected, as the verify filetests pin it:
+
+- `tensor.block_scale_amax: e8m0 scales are powers of two, which this op does not give`
+- `tensor.block_scale_amax: a block of 2 needs a static extent, got {T}`
+
+### `tensor.block_scale_range`
+
+The asymmetric scale and offset of each block of `x`, for
+`tensor.quantize` into `to`.
+
+- `x`, the blocks and the shapes are those of the `tensor.block_scale_*` ops. The scale and the
+  offset ignore NaN elements, and `scale_dtype` is a float.
+- The scale maps the block's range `[lo, hi]`, widened to hold 0, onto the range of `to`:
+  `scale = (hi - lo) / (max(to) - min(to))`. The integer zero point is
+  `zero_point = round(min(to) - lo / scale)`, rounded to nearest-even and clamped into the range
+  of `to`, so that 0 quantizes exactly; a zero scale gives the zero point 0. The offset is
+  `offset = -zero_point * scale`, with the scale as stored. `max(to)` and `min(to)` are the
+  largest and smallest finite values of `to`.
+- An extension op: a backend MAY reject it as unimplemented.
+
+Defined by `BlockScaleRange` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gpt-rs-ir/src/dialects/tensor/ir.rs).
+
+| | |
+|---|---|
+| Operands | `x`: tensor |
+| Results | `scale`: tensor; `offset`: tensor |
+| Attributes | `block`: `[usize]`; `to`: `dtype`; `scale_dtype`: `dtype` |
+| Effects | none |
+| Patterns | `BlockScaleRangeToTile` (`tensor-to-tile`) |
+
+Example, from `filetests/tensor/roundtrip/quant.ptir`:
+
+```text
+func.func @dynamic_options(%0: tensor<4x64xf32>, %1: tensor<4x64xui32>) -> (tensor<4x64xui8>, tensor<4x2xf32>, tensor<4x2xf32>, tensor<4x64xf8e4m3>, tensor<4x2xe8m0>) {
+  %2, %3 = tensor.block_scale_range(%0) {block = [1, 32], to = ui8, scale_dtype = f32} : (tensor<4x64xf32>) -> (tensor<4x2xf32>, tensor<4x2xf32>)
+  %4 = tensor.quantize(%0, %2, %3) {block = [1, 32], to = ui8} : (tensor<4x64xf32>, tensor<4x2xf32>, tensor<4x2xf32>) -> tensor<4x64xui8>
+  %5 = tensor.block_scale_pow2_ceil(%0) {block = [1, 32], to = f8e4m3, scale_dtype = e8m0} : (tensor<4x64xf32>) -> tensor<4x2xe8m0>
+  %6 = tensor.quantize_stochastic(%0, %5, %1) {block = [1, 32], to = f8e4m3} : (tensor<4x64xf32>, tensor<4x2xe8m0>, tensor<4x64xui32>) -> tensor<4x64xf8e4m3>
+  func.return(%4, %2, %3, %6, %5) : (tensor<4x64xui8>, tensor<4x2xf32>, tensor<4x2xf32>, tensor<4x64xf8e4m3>, tensor<4x2xe8m0>) -> ()
+}
+```
+
+Rejected, as the verify filetests pin it:
+
+- `tensor.block_scale_range: scale_dtype must be a float dtype, got e8m0`
 
 ## Traits
 
@@ -1812,7 +1978,7 @@ Patterns rooted at it: `GroupStatic` (`canonicalize`).
 ### `Commutative`
 
 `f(a, b) = f(b, a)`. Folding puts a run-time operand first and a constant last (see
-`Module::is_static`), so the other folds, the patterns and CSE see a constant on the right.
+`Module::known_before_run`), so the other folds, the patterns and CSE see a constant on the right.
 
 Defined by `Commutative` in [crates/gpt-rs-ir/src/traits/algebra.rs](../../crates/gpt-rs-ir/src/traits/algebra.rs).
 
@@ -1836,7 +2002,7 @@ operand and result has one shape.
 
 Defined by `Elementwise` in [crates/gpt-rs-ir/src/traits/structure.rs](../../crates/gpt-rs-ir/src/traits/structure.rs).
 
-Ops: `tensor.neg`, `tensor.abs`, `tensor.exp`, `tensor.log`, `tensor.tanh`, `tensor.erf`, `tensor.rsqrt`, `tensor.reciprocal`, `tensor.sin`, `tensor.cos`, `tensor.not`, `tensor.add`, `tensor.sub`, `tensor.mul`, `tensor.div`, `tensor.maximum`, `tensor.minimum`, `tensor.and`, `tensor.or`, `tensor.xor`, `tensor.shift_left`, `tensor.shift_right_logical`, `tensor.shift_right_arithmetic`, `tensor.compare`, `tensor.select`, `tensor.cast`.
+Ops: `tensor.neg`, `tensor.abs`, `tensor.exp`, `tensor.log`, `tensor.tanh`, `tensor.erf`, `tensor.rsqrt`, `tensor.reciprocal`, `tensor.sin`, `tensor.cos`, `tensor.not`, `tensor.add`, `tensor.sub`, `tensor.mul`, `tensor.div`, `tensor.maximum`, `tensor.minimum`, `tensor.and`, `tensor.or`, `tensor.xor`, `tensor.shift_left`, `tensor.shift_right_logical`, `tensor.shift_right_arithmetic`, `tensor.less`, `tensor.less_equal`, `tensor.equal`, `tensor.greater_equal`, `tensor.greater`, `tensor.not_equal`, `tensor.select`, `tensor.cast`.
 
 Patterns rooted at it: `HoistBroadcast` (`canonicalize`).
 

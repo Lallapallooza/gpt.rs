@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
-use gpt_rs_ir::dialects::tensor::{Reduce, ReduceKind, ReduceWindow, TensorOp};
+use gpt_rs_ir::dialects::tensor::{ReduceAttrs, ReduceWindowAttrs, TensorOp};
+use gpt_rs_ir::dialects::tile::CombineKind;
 use gpt_rs_ir::types::{DType, TensorType};
 
 use super::super::profile::register_op_profile_unary;
@@ -27,8 +28,8 @@ pub(super) fn emit_instruction(
     let &Kind::Op(op) = &inst.kind else {
         return Ok(None);
     };
-    let op_id = match op {
-        TensorOp::Reduce(spec) => {
+    let op_id = if let Some((spec, fold)) = reduction(op) {
+        {
             let out_info = output_info(value_infos, inst.result())?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             ensure_dtype(input_dtype, DType::F32, "reduce input must be f32")?;
@@ -47,13 +48,14 @@ pub(super) fn emit_instruction(
                 module,
                 &out_info.var,
                 &input,
-                &out_info.ty,
-                &input_spec,
+                (&out_info.ty, &input_spec),
                 spec,
+                &fold,
             )?;
             op_id
         }
-        TensorOp::ReduceWindow(spec) => {
+    } else if let Some((spec, fold)) = window_reduction(op) {
+        {
             let out_info = output_info(value_infos, inst.result())?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             ensure_dtype(input_dtype, DType::F32, "reduce_window input must be f32")?;
@@ -71,25 +73,49 @@ pub(super) fn emit_instruction(
             let in_spec = operand_type(&inst.operands[0], value_infos)?;
             let op_id = register_op_profile_unary(matmul_profile, label, &out_info.ty, &in_spec)?;
             let input = operand_expr(&inst.operands[0], value_infos)?;
-            emit_reduce_window(module, &out_info.var, &input, &out_info.ty, &in_spec, spec)?;
+            let types = (&out_info.ty, &in_spec);
+            emit_reduce_window(module, &out_info.var, &input, types, spec, &fold)?;
             op_id
         }
-        _ => return Ok(None),
+    } else {
+        return Ok(None);
     };
 
     Ok(Some(op_id))
 }
 
-/// Why the f32 reductions here meet no `and` or `or`: those reduce integers and `i1`.
-const F32_ONLY: &str = "and and or reduce integers, not f32";
+/// The attributes and the fold of a reduction that the C backend emits: an f32 sum, maximum or
+/// minimum.
+fn reduction(op: &TensorOp) -> Option<(&ReduceAttrs, CombineKind)> {
+    Some(match op {
+        TensorOp::ReduceSum(spec) => (&spec.0, CombineKind::Sum),
+        TensorOp::ReduceMax(spec) => (&spec.0, CombineKind::Max),
+        TensorOp::ReduceMin(spec) => (&spec.0, CombineKind::Min),
+        _ => return None,
+    })
+}
+
+/// As [`reduction`], for a reduction of windows.
+fn window_reduction(op: &TensorOp) -> Option<(&ReduceWindowAttrs, CombineKind)> {
+    Some(match op {
+        TensorOp::ReduceWindowSum(spec) => (&spec.0, CombineKind::Sum),
+        TensorOp::ReduceWindowMax(spec) => (&spec.0, CombineKind::Max),
+        TensorOp::ReduceWindowMin(spec) => (&spec.0, CombineKind::Min),
+        _ => return None,
+    })
+}
+
+/// The panic message for a combine kind other than `sum`, `max` and `min`: the C backend reduces
+/// f32 only.
+const F32_ONLY: &str = "the C backend's reductions sum, max or min f32 values";
 
 fn emit_reduce(
     module: &mut String,
     out: &str,
     input: &str,
-    out_spec: &TensorType,
-    in_spec: &TensorType,
-    spec: &Reduce,
+    (out_spec, in_spec): (&TensorType, &TensorType),
+    spec: &ReduceAttrs,
+    fold: &CombineKind,
 ) -> Result<()> {
     let in_dims = dims_usize(in_spec)?;
     let out_dims = dims_usize(out_spec)?;
@@ -119,7 +145,7 @@ fn emit_reduce(
     }
 
     emit_parallel_loops_with_indices(module, &out_dims, 2, "o", |module, out_indices, indent| {
-        push_block(module, indent, accumulator_decl(spec.kind));
+        push_block(module, indent, accumulator_decl(fold));
         let update = |module: &mut String, red_indices: &[String], indent: usize| {
             let mut in_indices = vec!["0".to_string(); rank];
             for axis in 0..rank {
@@ -132,7 +158,7 @@ fn emit_reduce(
                 }
             }
             let in_idx = linear_index_expr(&in_dims, &in_indices);
-            let update = accumulator_update(spec.kind, &format!("{input}[{in_idx}]"));
+            let update = accumulator_update(fold, &format!("{input}[{in_idx}]"));
             push_block(module, indent, &update);
         };
         match reduce_dims.split_last() {
@@ -143,11 +169,11 @@ fn emit_reduce(
                     // this one accumulator, so the loop vectorizes. That is exact for the order
                     // keys of `max` and `min`. No other value in the module is reassociated.
                     if reduce_axes.last() == Some(&(rank - 1)) {
-                        let op = match spec.kind {
-                            ReduceKind::Sum => "+",
-                            ReduceKind::Max => "max",
-                            ReduceKind::Min => "min",
-                            ReduceKind::And | ReduceKind::Or => unreachable!("{F32_ONLY}"),
+                        let op = match fold {
+                            CombineKind::Sum => "+",
+                            CombineKind::Max => "max",
+                            CombineKind::Min => "min",
+                            _ => unreachable!("{F32_ONLY}"),
                         };
                         push_block(
                             module,
@@ -170,7 +196,7 @@ fn emit_reduce(
         }
 
         let out_idx = linear_index_expr(&out_dims, out_indices);
-        let result = accumulator_result(spec.kind);
+        let result = accumulator_result(fold);
         push_block(module, indent, &format!("{out}[{out_idx}] = {result};"));
     });
     Ok(())
@@ -179,35 +205,35 @@ fn emit_reduce(
 /// Declares the accumulator `acc` of a reduction, holding its identity. `max` and `min`
 /// accumulate the order keys from the kernel preamble, whose unsigned max and min propagate NaN
 /// and order `-0.0` below `+0.0`.
-fn accumulator_decl(kind: ReduceKind) -> &'static str {
+fn accumulator_decl(kind: &CombineKind) -> &'static str {
     match kind {
-        ReduceKind::Sum => "float acc = 0.0f;",
-        ReduceKind::Max => "uint32_t acc = gpt_rs_f32_to_max_key(-INFINITY);",
-        ReduceKind::Min => "uint32_t acc = gpt_rs_f32_to_min_key(INFINITY);",
-        ReduceKind::And | ReduceKind::Or => unreachable!("{F32_ONLY}"),
+        CombineKind::Sum => "float acc = 0.0f;",
+        CombineKind::Max => "uint32_t acc = gpt_rs_f32_to_max_key(-INFINITY);",
+        CombineKind::Min => "uint32_t acc = gpt_rs_f32_to_min_key(INFINITY);",
+        _ => unreachable!("{F32_ONLY}"),
     }
 }
 
 /// Folds the f32 expression `value` into `acc`.
-fn accumulator_update(kind: ReduceKind, value: &str) -> String {
+fn accumulator_update(kind: &CombineKind, value: &str) -> String {
     match kind {
-        ReduceKind::Sum => format!("acc += {value};"),
-        ReduceKind::Max => format!(
+        CombineKind::Sum => format!("acc += {value};"),
+        CombineKind::Max => format!(
             "{{ uint32_t key = gpt_rs_f32_to_max_key({value}); acc = key > acc ? key : acc; }}"
         ),
-        ReduceKind::Min => format!(
+        CombineKind::Min => format!(
             "{{ uint32_t key = gpt_rs_f32_to_min_key({value}); acc = key < acc ? key : acc; }}"
         ),
-        ReduceKind::And | ReduceKind::Or => unreachable!("{F32_ONLY}"),
+        _ => unreachable!("{F32_ONLY}"),
     }
 }
 
 /// The f32 value of `acc`.
-fn accumulator_result(kind: ReduceKind) -> &'static str {
+fn accumulator_result(kind: &CombineKind) -> &'static str {
     match kind {
-        ReduceKind::Sum => "acc",
-        ReduceKind::Max | ReduceKind::Min => "gpt_rs_key_to_f32(acc)",
-        ReduceKind::And | ReduceKind::Or => unreachable!("{F32_ONLY}"),
+        CombineKind::Sum => "acc",
+        CombineKind::Max | CombineKind::Min => "gpt_rs_key_to_f32(acc)",
+        _ => unreachable!("{F32_ONLY}"),
     }
 }
 
@@ -215,9 +241,9 @@ fn emit_reduce_window(
     module: &mut String,
     out: &str,
     input: &str,
-    out_spec: &TensorType,
-    in_spec: &TensorType,
-    spec: &ReduceWindow,
+    (out_spec, in_spec): (&TensorType, &TensorType),
+    spec: &ReduceWindowAttrs,
+    fold: &CombineKind,
 ) -> Result<()> {
     let in_dims = dims_usize(in_spec)?;
     let out_dims = dims_usize(out_spec)?;
@@ -234,7 +260,7 @@ fn emit_reduce_window(
     }
 
     emit_parallel_loops_with_indices(module, &out_dims, 2, "o", |module, out_indices, indent| {
-        push_block(module, indent, accumulator_decl(spec.kind));
+        push_block(module, indent, accumulator_decl(fold));
         // Every window of an empty input is empty, so each output is the value `acc` starts with.
         if !in_dims.contains(&0) {
             emit_loops_with_indices(
@@ -244,13 +270,13 @@ fn emit_reduce_window(
                 "w",
                 |module, win_indices, indent| {
                     let indices = (out_indices, win_indices);
-                    let fold = window_fold(spec, input, &in_dims, &out_dims, indices);
-                    push_block(module, indent, &fold);
+                    let step = window_fold(spec, fold, input, &in_dims, &out_dims, indices);
+                    push_block(module, indent, &step);
                 },
             );
         }
         let out_idx = linear_index_expr(&out_dims, out_indices);
-        let result = accumulator_result(spec.kind);
+        let result = accumulator_result(fold);
         push_block(module, indent, &format!("{out}[{out_idx}] = {result};"));
     });
 
@@ -262,7 +288,8 @@ fn emit_reduce_window(
 /// select replaces an element outside the input with the reduction's identity. The statements
 /// have no branch, so the loop over the innermost output axis vectorizes.
 fn window_fold(
-    spec: &ReduceWindow,
+    spec: &ReduceWindowAttrs,
+    fold: &CombineKind,
     input: &str,
     in_dims: &[usize],
     out_dims: &[usize],
@@ -291,14 +318,14 @@ fn window_fold(
     let value = if inside.is_empty() {
         "x".to_string()
     } else {
-        format!("(({}) ? x : {})", inside.join(" & "), identity(spec.kind))
+        format!("(({}) ? x : {})", inside.join(" & "), identity(fold))
     };
-    lines.push(accumulator_update(spec.kind, &value));
+    lines.push(accumulator_update(fold, &value));
     lines.join("\n")
 }
 
 /// Whether every window of `axis` reads inside the input, so its index needs no bounds check.
-fn always_inside(spec: &ReduceWindow, axis: usize, out_dim: usize, in_dim: usize) -> bool {
+fn always_inside(spec: &ReduceWindowAttrs, axis: usize, out_dim: usize, in_dim: usize) -> bool {
     let (Some(out_last), Some(window_last)) = (
         out_dim.checked_sub(1),
         spec.window_dims[axis].checked_sub(1),
@@ -309,11 +336,11 @@ fn always_inside(spec: &ReduceWindow, axis: usize, out_dim: usize, in_dim: usize
 }
 
 /// The f32 value that leaves any accumulator of `kind` unchanged.
-fn identity(kind: ReduceKind) -> &'static str {
+fn identity(kind: &CombineKind) -> &'static str {
     match kind {
-        ReduceKind::Sum => "-0.0f",
-        ReduceKind::Max => "-INFINITY",
-        ReduceKind::Min => "INFINITY",
-        ReduceKind::And | ReduceKind::Or => unreachable!("{F32_ONLY}"),
+        CombineKind::Sum => "-0.0f",
+        CombineKind::Max => "-INFINITY",
+        CombineKind::Min => "INFINITY",
+        _ => unreachable!("{F32_ONLY}"),
     }
 }

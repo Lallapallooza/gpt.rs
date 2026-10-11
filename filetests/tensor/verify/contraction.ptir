@@ -24,6 +24,14 @@ func.func @i1_accum(%0: tensor<2x3xf32>, %1: tensor<3x2xf32>) -> tensor<2x2xf32>
 
 // -----
 
+// ERROR: tensor.dot_general: rank 10 is above the largest rank, 8
+func.func @result_rank(%0: tensor<1x1x1x1x1xf32>, %1: tensor<1x1x1x1x1xf32>) -> tensor<f32> {
+  %2 = tensor.dot_general(%0, %1) {contract_lhs = [], contract_rhs = []} : (tensor<1x1x1x1x1xf32>, tensor<1x1x1x1x1xf32>) -> tensor<f32>
+  func.return(%2) : (tensor<f32>) -> ()
+}
+
+// -----
+
 // ERROR: tensor.dot_general: batch_lhs [0] and batch_rhs [] differ in length
 func.func @batch_count(%0: tensor<2x3x4xf32>, %1: tensor<4x5xf32>) -> tensor<2x3x5xf32> {
   %2 = tensor.dot_general(%0, %1) {batch_lhs = [0], contract_lhs = [2], contract_rhs = [0]} : (tensor<2x3x4xf32>, tensor<4x5xf32>) -> tensor<2x3x5xf32>

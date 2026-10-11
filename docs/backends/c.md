@@ -39,7 +39,7 @@ The generated module is intentionally self-contained:
 Code generation lives in:
 - [../../crates/gpt-rs-backend-c/src/codegen/mod.rs](../../crates/gpt-rs-backend-c/src/codegen/mod.rs)
 
-`c-pack-weights` ([optimizer/pack.rs](../../crates/gpt-rs-backend-c/src/optimizer/pack.rs)) runs
+`c-pack-weights` ([passes/pack_weights.rs](../../crates/gpt-rs-backend-c/src/passes/pack_weights.rs)) runs
 before `outline-static`. It rewrites an f32 `dot_general` that goes to the packed GEMM. A reshape
 and a transpose put its weight `w`, `[K, N]` or `[N, K]`, in the GEMM's panel layout
 `[N / 64, K, 64]`. The dot then contracts `x` with the panels into `[.., N / 64, 64]`, and a reshape
@@ -101,9 +101,11 @@ layers ([../../crates/gpt-rs-backend-c/src/codegen/outline.rs](../../crates/gpt-
   [../../crates/gpt-rs-backend-c/src/lib.rs](../../crates/gpt-rs-backend-c/src/lib.rs).
 - `dot_kernel` in [codegen/emit/dot.rs](../../crates/gpt-rs-backend-c/src/codegen/emit/dot.rs) sends
   each dot whose operands are both contiguous along K to
-  [kernels/linear.inc.c](../../crates/gpt-rs-backend-c/src/kernels/linear.inc.c). The exceptions
-  are an f32 dot with at least `LINEAR_PACK_MIN_ROWS` rows and every bf16 x bf16 dot: they go to
-  the packed GEMM with every other f32 dot, and the GEMM packing absorbs the operand strides.
+  [kernels/linear.inc.c](../../crates/gpt-rs-backend-c/src/kernels/linear.inc.c). The exception
+  is an f32 dot with at least `LINEAR_PACK_MIN_ROWS` rows, which goes to the packed GEMM. The
+  packed GEMM also takes every other f32 or bf16 x bf16 dot, and its packing absorbs the operand
+  strides. A bf16 x bf16 linear kernel packs its own operands for `vdpbf16ps` from half that many
+  rows.
 - Threads: the default is one thread per physical core. Each entry call sets the team size to
   `GPTRS_NUM_THREADS`, a define that the build computes from the physical core count. A team with
   one thread per SMT sibling stalls at every barrier whenever another process is runnable. When

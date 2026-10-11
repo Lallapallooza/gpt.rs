@@ -25,13 +25,17 @@ Each category answers a different question:
 
 ## 1) Filetests and the law test
 
-Filetests live under `filetests/` at the repository root: `filetests/tensor/<topic>/*.ptir` for the
-IR passes and the text form, and `filetests/backend/<backend>/*.ptir` for the passes that a backend
-adds to its pipeline (`PortableBackend::pipeline()`). One runner, the `gpt-rs-filetests` crate,
-runs them, and its crate doc gives the format. `gpt-rs-ir` runs `filetests/tensor/` from its
-`tests/filetests.rs`. A backend crate with passes of its own runs its directory from its
-`tests/filetests.rs`, with each pass of its pipeline under its name and the whole pipeline as
-`default`.
+Filetests live under `filetests/` at the repository root:
+
+- `filetests/tensor/<topic>/*.ptir` and `filetests/tile/<topic>/*.ptir`, for the IR passes and the
+  text form;
+- `filetests/backend/<backend>/*.ptir`, for the passes that a backend adds to its pipeline
+  (`PortableBackend::pipeline()`).
+
+One runner, the `gpt-rs-filetests` crate, runs them, and its crate doc gives the format. `gpt-rs-ir`
+runs `filetests/tensor/` and `filetests/tile/` from its `tests/filetests.rs`. A backend crate with
+passes of its own runs its directory from its `tests/filetests.rs`, with each pass of its pipeline
+under its name and the whole pipeline as `default`.
 
 The cases of a backend start from the IR that the functionals record. A run with `--dump-dir`
 writes the module after each pass to `passes/`.
@@ -212,7 +216,11 @@ uv run python scripts/rebuild_py.py --features faer
 The canonical entrypoint is `scripts/eval.py`, which runs both gpt-rs and a Torch baseline on the
 same Hugging Face checkpoint (`--hf-model`, a Hub id or a local directory) for:
 
-- `validate`: compare logits
+- `validate`: compare logits. The projections take f32 inputs, so the logits match a float32
+  reference to f32 precision. Outside validate, a bf16 checkpoint runs the projections in bf16 by
+  default. Qwen3.5's `--matmul-input-dtype bf16` validates that path. The logits then move by up
+  to bf16 rounding, about 3e-3 of their maximum on four layers, so that run needs a larger
+  `--max-rel-diff`. The top-1 tokens must still agree.
 - `bench`: compare throughput/latency
 - `run`: run gpt-rs alone (generation, or a forward pass of an image model)
 - `all`: every workload the case supports
@@ -235,7 +243,7 @@ Qwen3.5 models, for example `Qwen/Qwen3.8-27B`, mix Gated DeltaNet and gated att
 uv run python scripts/eval.py --model qwen3_8_27b --workload validate --backend c \
   --prompt-tokens 300 --generate-tokens 3
 uv run python scripts/eval.py --model qwen3_8_27b --workload bench --backend c --threads 8 \
-  --matmul-input-dtype bf16 --prompt-tokens 256 --bench-tokens 8
+  --prompt-tokens 256 --bench-tokens 8
 ```
 
 See `uv run python scripts/eval.py --help` for the remaining flags.

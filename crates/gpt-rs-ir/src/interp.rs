@@ -13,12 +13,12 @@ use crate::host::HostValue;
 use crate::module::{Inst, Module, Region, Value};
 use crate::op::{OpDyn, RegionRunner};
 use crate::traits::Terminator;
-use crate::types::{Dim, Sym, Type};
+use crate::types::{Dim, Sym, SymBindings, TensorType, Type};
 
 struct Interp<'m> {
     module: &'m Module,
     env: HashMap<Value, Rc<HostValue>>,
-    syms: HashMap<Sym, usize>,
+    syms: SymBindings,
 }
 
 impl<'m> Interp<'m> {
@@ -26,7 +26,7 @@ impl<'m> Interp<'m> {
         Self {
             module,
             env: HashMap::new(),
-            syms: HashMap::new(),
+            syms: SymBindings::default(),
         }
     }
 
@@ -37,44 +37,14 @@ impl<'m> Interp<'m> {
             ensure!(actual == *ty, "the value has type {actual}, not {ty}");
             return Ok(());
         };
-        ensure!(
-            tensor.dtype == host.dtype() && tensor.rank() == host.dims.len(),
-            "a {} tensor of shape {:?} is not a {tensor}",
-            host.dtype(),
-            host.dims
-        );
-        for (dim, &extent) in tensor.dims.iter().zip(&host.dims) {
-            let bound = match dim {
-                Dim::Static(n) => *n,
-                Dim::Dynamic(sym) => *self.syms.entry(sym.clone()).or_insert(extent),
-            };
-            ensure!(
-                bound == extent,
-                "a tensor of shape {:?} is not a {tensor} with {dim} = {bound}",
-                host.dims
-            );
-        }
-        Ok(())
+        let actual = TensorType::new(host.dtype(), host.dims.iter().copied());
+        self.syms.bind(tensor, &actual)
     }
 
     /// `ty` with every bound dynamic dimension replaced by its extent.
     fn resolve(&self, ty: &Type) -> Type {
         match ty {
-            Type::Tensor(tensor) => Type::Tensor(
-                tensor.with_dims(
-                    tensor
-                        .dims
-                        .iter()
-                        .map(|dim| match dim {
-                            Dim::Dynamic(sym) => self
-                                .syms
-                                .get(sym)
-                                .map_or_else(|| dim.clone(), |&n| Dim::Static(n)),
-                            Dim::Static(_) => dim.clone(),
-                        })
-                        .collect(),
-                ),
-            ),
+            Type::Tensor(tensor) => Type::Tensor(self.syms.resolve(tensor)),
             other => other.clone(),
         }
     }
@@ -114,6 +84,23 @@ impl<'m> Interp<'m> {
 }
 
 impl RegionRunner for Interp<'_> {
+    fn module(&self) -> &Module {
+        self.module
+    }
+
+    fn sym(&self, sym: &Sym) -> Option<usize> {
+        self.syms.get(sym).and_then(Dim::as_static)
+    }
+
+    fn call(&mut self, callee: &str, args: Vec<HostValue>) -> Result<Vec<HostValue>> {
+        let module = self.module;
+        let inst = module
+            .symbol(callee)
+            .ok_or_else(|| anyhow!("no symbol @{callee}"))?;
+        let body = module.regions(inst)[0];
+        Interp::new(module).run_region(body, args)
+    }
+
     fn run_region(&mut self, region: Region, args: Vec<HostValue>) -> Result<Vec<HostValue>> {
         let module = self.module;
         let block_args = module.args(region);

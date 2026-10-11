@@ -10,10 +10,9 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, ensure, Result};
 use bytemuck::{Pod, Zeroable};
 use half::{bf16, f16};
-use smallvec::SmallVec;
 
 use crate::float8::F8E4M3;
-use crate::types::{DType, TensorType, Type};
+use crate::types::{ranked, DType, Ranked, TensorType, Type};
 
 /// Read-only little-endian bytes that another allocation owns, such as a memory-mapped checkpoint.
 #[derive(Clone)]
@@ -548,29 +547,31 @@ impl TensorData {
 }
 
 /// The extents of `ty` and the bytes its elements take. Fails unless every extent is static.
-fn layout(ty: &TensorType) -> Result<(SmallVec<[usize; 4]>, usize)> {
+fn layout(ty: &TensorType) -> Result<(Ranked<usize>, usize)> {
     let dims = ty
         .static_dims()
         .ok_or_else(|| anyhow!("a host tensor has static extents, not {ty}"))?;
     let bytes = dims
         .iter()
-        .try_fold(1usize, |n, &d| n.checked_mul(d))
+        .try_fold(1usize, |count, &extent| count.checked_mul(extent))
         .and_then(|count| ty.dtype.bytes_for(count))
         .ok_or_else(|| anyhow!("{ty} takes more bytes than fit in usize"))?;
     Ok((dims, bytes))
 }
 
-/// A dense row-major tensor with static extents, inline up to rank 4.
+/// A dense row-major tensor with static extents.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HostTensor {
-    pub dims: SmallVec<[usize; 4]>,
+    pub dims: Ranked<usize>,
     pub data: TensorData,
 }
 
 impl HostTensor {
     pub fn new(dims: impl AsRef<[usize]>, data: TensorData) -> Result<Self> {
-        let dims = SmallVec::from_slice(dims.as_ref());
-        let count = dims.iter().try_fold(1usize, |n, &d| n.checked_mul(d));
+        let dims = ranked(dims.as_ref().iter().copied())?;
+        let count = dims
+            .iter()
+            .try_fold(1usize, |count, &extent| count.checked_mul(extent));
         ensure!(
             count == Some(data.len()),
             "a tensor of shape {dims:?} does not hold {} elements",
@@ -687,23 +688,26 @@ impl HostTensor {
     }
 }
 
-/// A scalar run-time value.
+/// A scalar run-time value: a value of `dtype`, held in the type the interpreter computes that
+/// dtype in. The `scalar` module gives its arithmetic.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum HostScalar {
+pub struct HostScalar {
+    pub dtype: DType,
+    pub value: ScalarValue,
+}
+
+/// A scalar in the type the interpreter computes with: `i128` for the integers and `i1`, f64 for
+/// f64, and f32 for every other float and `e8m0`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScalarValue {
+    Int(i128),
     F32(f32),
-    Bf16(bf16),
-    Si32(i32),
-    I1(bool),
+    F64(f64),
 }
 
 impl HostScalar {
     pub fn dtype(&self) -> DType {
-        match self {
-            HostScalar::F32(_) => DType::F32,
-            HostScalar::Bf16(_) => DType::Bf16,
-            HostScalar::Si32(_) => DType::Si32,
-            HostScalar::I1(_) => DType::I1,
-        }
+        self.dtype
     }
 }
 
@@ -730,5 +734,26 @@ impl HostValue {
             HostValue::Tensor(t) => Some(t),
             _ => None,
         }
+    }
+
+    /// The tensor this value holds.
+    pub fn into_tensor(self) -> Result<HostTensor> {
+        match self {
+            HostValue::Tensor(t) => Ok(t),
+            other => Err(anyhow!("expected a tensor, got {}", other.ty())),
+        }
+    }
+
+    /// The tensors `values` hold, such as the values a region gives.
+    pub fn into_tensors(values: Vec<HostValue>) -> Result<Vec<HostTensor>> {
+        values.into_iter().map(HostValue::into_tensor).collect()
+    }
+
+    /// `tensors` as values, such as the arguments of a region.
+    pub fn of_tensors(tensors: &[&HostTensor]) -> Vec<HostValue> {
+        tensors
+            .iter()
+            .map(|&t| HostValue::Tensor(t.clone()))
+            .collect()
     }
 }

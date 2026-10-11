@@ -54,8 +54,8 @@ fn argmax_prefers_nan_then_the_first_maximum() {
 fn top_k_orders_ties_by_index() {
     let out = eval(
         "func.func @main(%0: tensor<5xf32>) -> (tensor<2xf32>, tensor<2xsi32>, tensor<2xf32>, tensor<2xsi32>) {
-  %1, %2 = tensor.top_k(%0) {k = 2, axis = 0, largest = true, indices = si32} : (tensor<5xf32>) -> (tensor<2xf32>, tensor<2xsi32>)
-  %3, %4 = tensor.top_k(%0) {k = 2, axis = 0, largest = false, indices = si32} : (tensor<5xf32>) -> (tensor<2xf32>, tensor<2xsi32>)
+  %1, %2 = tensor.top_k(%0) {k = 2, axis = 0, indices = si32} : (tensor<5xf32>) -> (tensor<2xf32>, tensor<2xsi32>)
+  %3, %4 = tensor.bottom_k(%0) {k = 2, axis = 0, indices = si32} : (tensor<5xf32>) -> (tensor<2xf32>, tensor<2xsi32>)
   func.return(%1, %2, %3, %4) : (tensor<2xf32>, tensor<2xsi32>, tensor<2xf32>, tensor<2xsi32>) -> ()
 }",
         vec![f32s(&[5], &[5.0, 1.0, 5.0, 3.0, 1.0])],
@@ -132,7 +132,7 @@ fn while_loops_until_cond_fails() {
   %2, %3 = tensor.while(%0, %1) ({
   ^cond(%4: tensor<si32>, %5: tensor<f32>):
     %6 = tensor.constant() {value = dense<[] x si32: 5>} : () -> tensor<si32>
-    %7 = tensor.compare(%4, %6) {kind = less} : (tensor<si32>, tensor<si32>) -> tensor<i1>
+    %7 = tensor.less(%4, %6) : (tensor<si32>, tensor<si32>) -> tensor<i1>
     tensor.yield(%7, %4, %5) : (tensor<i1>, tensor<si32>, tensor<f32>) -> ()
   }, {
   ^body(%8: tensor<si32>, %9: tensor<f32>):
@@ -192,9 +192,10 @@ fn mx_scales_map_the_block_maximum_to_the_top_power_of_two() {
     // e8m0 code 128. Every element divided by 2 is an f4e2m1 value.
     let out = eval(
         "func.func @main(%0: tensor<4xf32>) -> (tensor<4xf32>, tensor<1xe8m0>) {
-  %1, %2 = tensor.quantize_dynamic(%0) {block = [4], to = f4e2m1, scale_dtype = e8m0, scale_rule = pow2_floor} : (tensor<4xf32>) -> (tensor<4xf4e2m1>, tensor<1xe8m0>)
-  %3 = tensor.dequantize(%1, %2) {block = [4], to = f32} : (tensor<4xf4e2m1>, tensor<1xe8m0>) -> tensor<4xf32>
-  func.return(%3, %2) : (tensor<4xf32>, tensor<1xe8m0>) -> ()
+  %1 = tensor.block_scale_pow2_floor(%0) {block = [4], to = f4e2m1, scale_dtype = e8m0} : (tensor<4xf32>) -> tensor<1xe8m0>
+  %2 = tensor.quantize(%0, %1) {block = [4], to = f4e2m1} : (tensor<4xf32>, tensor<1xe8m0>) -> tensor<4xf4e2m1>
+  %3 = tensor.dequantize(%2, %1) {block = [4], to = f32} : (tensor<4xf4e2m1>, tensor<1xe8m0>) -> tensor<4xf32>
+  func.return(%3, %1) : (tensor<4xf32>, tensor<1xe8m0>) -> ()
 }",
         vec![f32s(&[4], &[1.0, -2.0, 3.0, 12.0])],
     );
@@ -378,7 +379,7 @@ fn logic_on_i1_and_its_reductions() {
 fn unsigned_integers_order_as_unsigned() {
     let out = eval(
         "func.func @main(%0: tensor<2xui64>, %1: tensor<2xui64>) -> (tensor<2xi1>, tensor<2xui64>) {
-  %2 = tensor.compare(%0, %1) {kind = greater} : (tensor<2xui64>, tensor<2xui64>) -> tensor<2xi1>
+  %2 = tensor.greater(%0, %1) : (tensor<2xui64>, tensor<2xui64>) -> tensor<2xi1>
   %3 = tensor.maximum(%0, %1) : (tensor<2xui64>, tensor<2xui64>) -> tensor<2xui64>
   func.return(%2, %3) : (tensor<2xi1>, tensor<2xui64>) -> ()
 }",
@@ -489,7 +490,7 @@ fn philox_gives_its_known_answer() {
 fn stochastic_rounding_compares_the_draw_with_the_fraction() {
     let out = eval(
         "func.func @main(%0: tensor<4xf32>, %1: tensor<1xf32>, %2: tensor<4xui32>) -> tensor<4xsi8> {
-  %3 = tensor.quantize(%0, %1, %2) {block = [4], to = si8, rounding = stochastic, operand_segments = [1, 1, 0, 0, 1]} : (tensor<4xf32>, tensor<1xf32>, tensor<4xui32>) -> tensor<4xsi8>
+  %3 = tensor.quantize_stochastic(%0, %1, %2) {block = [4], to = si8} : (tensor<4xf32>, tensor<1xf32>, tensor<4xui32>) -> tensor<4xsi8>
   func.return(%3) : (tensor<4xsi8>) -> ()
 }",
         vec![
@@ -510,9 +511,10 @@ fn stochastic_rounding_compares_the_draw_with_the_fraction() {
 fn asymmetric_quantization_keeps_zero_exact() {
     let out = eval(
         "func.func @main(%0: tensor<4xf32>) -> (tensor<4xui8>, tensor<4xf32>) {
-  %1, %2, %3 = tensor.quantize_dynamic(%0) {block = [4], to = ui8, scale_dtype = f32, asymmetric = true} : (tensor<4xf32>) -> (tensor<4xui8>, tensor<1xf32>, tensor<1xf32>)
-  %4 = tensor.dequantize(%1, %2, %3) {block = [4], to = f32, operand_segments = [1, 1, 1, 0]} : (tensor<4xui8>, tensor<1xf32>, tensor<1xf32>) -> tensor<4xf32>
-  func.return(%1, %4) : (tensor<4xui8>, tensor<4xf32>) -> ()
+  %1, %2 = tensor.block_scale_range(%0) {block = [4], to = ui8, scale_dtype = f32} : (tensor<4xf32>) -> (tensor<1xf32>, tensor<1xf32>)
+  %3 = tensor.quantize(%0, %1, %2) {block = [4], to = ui8} : (tensor<4xf32>, tensor<1xf32>, tensor<1xf32>) -> tensor<4xui8>
+  %4 = tensor.dequantize(%3, %1, %2) {block = [4], to = f32} : (tensor<4xui8>, tensor<1xf32>, tensor<1xf32>) -> tensor<4xf32>
+  func.return(%3, %4) : (tensor<4xui8>, tensor<4xf32>) -> ()
 }",
         vec![f32s(&[4], &[-1.0, 0.0, 1.0, 3.0])],
     );
@@ -526,9 +528,11 @@ fn asymmetric_quantization_keeps_zero_exact() {
 fn tables_map_codes_to_their_values() {
     let out = eval(
         "func.func @main(%0: tensor<4xf32>, %1: tensor<1xf32>, %2: tensor<5xf32>) -> (tensor<4xui8>, tensor<4xf32>) {
-  %3 = tensor.quantize(%0, %1, %2) {block = [4], to = ui8, operand_segments = [1, 1, 0, 1, 0]} : (tensor<4xf32>, tensor<1xf32>, tensor<5xf32>) -> tensor<4xui8>
-  %4 = tensor.dequantize(%3, %1, %2) {block = [4], to = f32, operand_segments = [1, 1, 0, 1]} : (tensor<4xui8>, tensor<1xf32>, tensor<5xf32>) -> tensor<4xf32>
-  func.return(%3, %4) : (tensor<4xui8>, tensor<4xf32>) -> ()
+  %3 = tensor.quantize_table(%0, %1, %2) {block = [4], to = ui8} : (tensor<4xf32>, tensor<1xf32>, tensor<5xf32>) -> tensor<4xui8>
+  %4 = tensor.cast(%3) {to = si32} : (tensor<4xui8>) -> tensor<4xsi32>
+  %5 = tensor.take(%2, %4) : (tensor<5xf32>, tensor<4xsi32>) -> tensor<4xf32>
+  %6 = tensor.dequantize(%5, %1) {block = [4], to = f32} : (tensor<4xf32>, tensor<1xf32>) -> tensor<4xf32>
+  func.return(%3, %6) : (tensor<4xui8>, tensor<4xf32>) -> ()
 }",
         vec![
             f32s(&[4], &[0.3, -0.75, 1.2, f32::NAN]),
@@ -545,10 +549,12 @@ fn tables_map_codes_to_their_values() {
 fn power_of_two_scales_round_the_exponent_down_or_up() {
     let out = eval(
         "func.func @main(%0: tensor<1xf32>) -> (tensor<1xf32>, tensor<1xf32>) {
-  %1, %2 = tensor.quantize_dynamic(%0) {block = [1], to = f8e4m3, scale_dtype = e8m0, scale_rule = pow2_floor} : (tensor<1xf32>) -> (tensor<1xf8e4m3>, tensor<1xe8m0>)
-  %3 = tensor.dequantize(%1, %2) {block = [1], to = f32} : (tensor<1xf8e4m3>, tensor<1xe8m0>) -> tensor<1xf32>
-  %4, %5 = tensor.quantize_dynamic(%0) {block = [1], to = f8e4m3, scale_dtype = e8m0, scale_rule = pow2_ceil} : (tensor<1xf32>) -> (tensor<1xf8e4m3>, tensor<1xe8m0>)
-  %6 = tensor.dequantize(%4, %5) {block = [1], to = f32} : (tensor<1xf8e4m3>, tensor<1xe8m0>) -> tensor<1xf32>
+  %1 = tensor.block_scale_pow2_floor(%0) {block = [1], to = f8e4m3, scale_dtype = e8m0} : (tensor<1xf32>) -> tensor<1xe8m0>
+  %2 = tensor.quantize(%0, %1) {block = [1], to = f8e4m3} : (tensor<1xf32>, tensor<1xe8m0>) -> tensor<1xf8e4m3>
+  %3 = tensor.dequantize(%2, %1) {block = [1], to = f32} : (tensor<1xf8e4m3>, tensor<1xe8m0>) -> tensor<1xf32>
+  %4 = tensor.block_scale_pow2_ceil(%0) {block = [1], to = f8e4m3, scale_dtype = e8m0} : (tensor<1xf32>) -> tensor<1xe8m0>
+  %5 = tensor.quantize(%0, %4) {block = [1], to = f8e4m3} : (tensor<1xf32>, tensor<1xe8m0>) -> tensor<1xf8e4m3>
+  %6 = tensor.dequantize(%5, %4) {block = [1], to = f32} : (tensor<1xf8e4m3>, tensor<1xe8m0>) -> tensor<1xf32>
   func.return(%3, %6) : (tensor<1xf32>, tensor<1xf32>) -> ()
 }",
         vec![f32s(&[1], &[500.0])],

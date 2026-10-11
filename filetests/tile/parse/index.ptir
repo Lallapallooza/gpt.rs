@@ -1,0 +1,22 @@
+// RUN: parse
+
+// ERROR: 5:33: the expression of tile.index reads no operand, not $0
+func.func @index_reads_operand(%0: tensor<4xsi32>) -> tensor<4xsi32> {
+  %1 = tile.block(%0) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0]]} ({
+  ^body(%0: si32):
+    %1 = tile.index() {expr = $0[d0], dtype = si32} : () -> si32
+    tile.yield(%1) : (si32) -> ()
+  }) : (tensor<4xsi32>) -> tensor<4xsi32>
+  func.return(%1) : (tensor<4xsi32>) -> ()
+}
+
+// -----
+
+// ERROR: 3:54: `i` is no iterator: an iterator is `d` and its position, such as d0
+func.func @named_iterator(%0: tensor<4xf32>) -> tensor<4xf32> {
+  %1 = tile.block(%0) {iters = [par 4], reads = [$0[i]], folds = [none -> [i]]} ({
+  ^body(%0: f32):
+    tile.yield(%0) : (f32) -> ()
+  }) : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%1) : (tensor<4xf32>) -> ()
+}

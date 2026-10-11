@@ -1,4 +1,4 @@
-//! Semantics of the ops in `ir/constant.rs`.
+//! Semantics of `tensor.constant`.
 
 use std::sync::Arc;
 

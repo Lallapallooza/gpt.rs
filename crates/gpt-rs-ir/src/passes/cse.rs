@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use super::{pass, Pass};
 use crate::module::{Inst, Module, OpKey, Region};
-use crate::rewrite::Rewriter;
+use crate::rewrite::Editor;
 use crate::scope::ScopedMap;
 use crate::traits::IsolatedFromAbove;
 
@@ -39,7 +39,8 @@ fn cse(module: &mut Module, region: Region, seen: &mut ScopedMap<OpKey, Inst>) -
         };
         match seen.get(&key) {
             Some(earlier) => {
-                Rewriter::new(module).replace_with_inst(inst, earlier)?;
+                let values = module.results(earlier).to_vec();
+                Editor::new(module).replace(inst, &values)?;
                 replaced += 1;
             }
             None => {

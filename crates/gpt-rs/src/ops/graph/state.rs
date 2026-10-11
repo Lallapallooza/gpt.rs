@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use foldhash::fast::FixedState;
-use gpt_rs_ir::types::{DType, TensorType, Type};
+use gpt_rs_ir::location::Location;
+use gpt_rs_ir::types::{DType, Ranked, TensorType, Type};
 use gpt_rs_ir::Op;
-use smallvec::SmallVec;
 
 use crate::backend::PortableBackend;
 use crate::ops::graph::ValueId;
@@ -22,7 +22,7 @@ pub(super) type IdMap<K, V> = HashMap<K, V, FixedState>;
 pub(super) type ValueSet = HashSet<ValueId, FixedState>;
 
 /// A scalar operand broadcast to some extents: its dtype, its little-endian bits and the extents.
-pub(super) type ScalarKey = (DType, u64, SmallVec<[usize; 4]>);
+pub(super) type ScalarKey = (DType, u64, Ranked<usize>);
 
 /// Mutable graph storage protected by a mutex inside [`GraphArena`](super::arena::GraphArena).
 /// A value's id is its index in `values`.
@@ -188,6 +188,8 @@ pub(super) struct OpRecord {
     pub(super) op: Op,
     pub(super) operands: (u32, u32),
     pub(super) first: ValueId,
+    /// Where the op comes from, kept while a trace sink is installed.
+    pub(super) location: Option<Location>,
 }
 
 /// Current materialization state of a recorded node.

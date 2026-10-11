@@ -38,3 +38,32 @@ func.func @strided_chain(%0: tensor<16xf32>) -> tensor<3xf32> {
   %2 = tensor.slice(%1) {starts = [1], sizes = [3], strides = [2]} : (tensor<7xf32>) -> tensor<3xf32>
   func.return(%2) : (tensor<3xf32>) -> ()
 }
+
+// -----
+
+// A slice of a concat that reads one input reads that input: a part of it, or all of it. A slice
+// that spans both inputs stays, so the concat does.
+// CHECK: func.func @slice_of_concat
+// CHECK: [[BOTH:%[0-9]+]] = tensor.concat(%0, %1) {axis = 0}
+// CHECK: [[HEAD:%[0-9]+]] = tensor.slice(%0) {starts = [0, 0], sizes = [1, 6]}
+// CHECK: [[NEXT:%[0-9]+]] = tensor.slice([[BOTH]]) {starts = [1, 0], sizes = [3, 6]}
+// CHECK: func.return([[HEAD]], %1, [[NEXT]])
+func.func @slice_of_concat(%0: tensor<3x6xf32>, %1: tensor<1x6xf32>) -> (tensor<1x6xf32>, tensor<1x6xf32>, tensor<3x6xf32>) {
+  %2 = tensor.concat(%0, %1) {axis = 0} : (tensor<3x6xf32>, tensor<1x6xf32>) -> tensor<4x6xf32>
+  %3 = tensor.slice(%2) {starts = [0, 0], sizes = [1, 6]} : (tensor<4x6xf32>) -> tensor<1x6xf32>
+  %4 = tensor.slice(%2) {starts = [3, 0], sizes = [1, 6]} : (tensor<4x6xf32>) -> tensor<1x6xf32>
+  %5 = tensor.slice(%2) {starts = [1, 0], sizes = [3, 6]} : (tensor<4x6xf32>) -> tensor<3x6xf32>
+  func.return(%3, %4, %5) : (tensor<1x6xf32>, tensor<1x6xf32>, tensor<3x6xf32>) -> ()
+}
+
+// -----
+
+// A concat of a concat on the same axis is one concat.
+// CHECK: func.func @concat_of_concat
+// CHECK-NEXT: [[C:%[0-9]+]] = tensor.concat(%0, %1, %2) {axis = 1}
+// CHECK-NEXT: func.return([[C]])
+func.func @concat_of_concat(%0: tensor<2x3xf32>, %1: tensor<2x1xf32>, %2: tensor<2x4xf32>) -> tensor<2x8xf32> {
+  %3 = tensor.concat(%0, %1) {axis = 1} : (tensor<2x3xf32>, tensor<2x1xf32>) -> tensor<2x4xf32>
+  %4 = tensor.concat(%3, %2) {axis = -1} : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x8xf32>
+  func.return(%4) : (tensor<2x8xf32>) -> ()
+}

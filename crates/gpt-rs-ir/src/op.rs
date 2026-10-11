@@ -1,8 +1,8 @@
-//! What an op is: the traits `#[derive(Op)]` implements and the ones an op author implements.
+//! What an op is: the traits `#[op]` implements and the ones an op author implements.
 //!
 //! An op is a struct whose fields are its attributes. `#[op(...)]` declares its named operand,
-//! result and region groups, its effects and its traits. The derive generates `<Op>Operands<V>`
-//! and `<Op>Results<V>` structs with one field per group. A [`View`] `V` says what each element is.
+//! result and region groups, its effects and its traits. It generates `<Op>Operands<V>` and
+//! `<Op>Results<V>` structs with one field per group. A [`View`] `V` says what each element is.
 
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
@@ -15,7 +15,8 @@ use smallvec::SmallVec;
 
 use crate::dense::Dense;
 use crate::host::{HostScalar, HostTensor, HostValue};
-use crate::module::{Module, Region, Value};
+use crate::index::IndexEnv;
+use crate::module::{Inst, Module, Region, RegionRef, Value, ValueRef};
 use crate::text::Cursor;
 use crate::traits::Traits;
 use crate::types::{DType, Element, TensorType, Type};
@@ -245,11 +246,12 @@ impl Effects {
     }
 }
 
-/// The block arguments a region must have and the types its terminator must yield.
+/// The block arguments a region must have and the types its terminator must yield. A region whose
+/// yields are `None` may yield any types, and its op's `result_types` checks them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegionSig {
     pub args: Vec<Type>,
-    pub yields: Vec<Type>,
+    pub yields: Option<Vec<Type>>,
 }
 
 impl RegionSig {
@@ -259,7 +261,15 @@ impl RegionSig {
     ) -> Self {
         Self {
             args: args.into_iter().collect(),
-            yields: yields.into_iter().collect(),
+            yields: Some(yields.into_iter().collect()),
+        }
+    }
+
+    /// A region with these block arguments that may yield any types.
+    pub fn args_only(args: impl IntoIterator<Item = Type>) -> Self {
+        Self {
+            args: args.into_iter().collect(),
+            yields: None,
         }
     }
 }
@@ -268,29 +278,20 @@ impl RegionSig {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoRegions;
 
-/// Implemented by `#[derive(Op)]`.
-pub trait OpKind: Clone + PartialEq + Eq + Hash + fmt::Debug + 'static {
+/// The operand, result and region groups of an op, in one struct each. The ops of a family share
+/// their family's; `#[family]` implements it for the family, and `#[op]` for an op of its own.
+pub trait Groups: 'static {
     type Operands<V: View>;
     type Results<V: View>;
     type Regions<R>;
+    /// What creating the op gives: its result for an op of one result, the list for an op of
+    /// one variadic result group, nothing for an op without results, and its named result groups
+    /// otherwise.
+    type Created;
 
     const OPERANDS: &'static [Group];
     const RESULTS: &'static [Group];
     const REGIONS: &'static [&'static str];
-    /// What the reference of the dialect shows about the op.
-    const INFO: OpInfo;
-
-    fn name(&self) -> Cow<'static, str>;
-    fn effects(&self) -> Effects;
-    /// The op's traits: those `#[op(..., traits(...))]` lists, then those of its kind.
-    fn traits(&self) -> Traits;
-
-    /// Pushes `(name, text)` for every attribute, except an `#[attr(default)]` attribute at its
-    /// default.
-    fn print_attrs(&self, out: &mut Vec<(&'static str, String)>);
-    /// Returns `None` when `name` is not this op. Otherwise parses the optional attribute
-    /// dictionary that follows.
-    fn parse(name: &str, c: &mut Cursor<'_>) -> Option<Result<Self>>;
 
     fn split_operands<V: View>(
         flat: impl ExactSizeIterator<Item = V::Any>,
@@ -303,17 +304,82 @@ pub trait OpKind: Clone + PartialEq + Eq + Hash + fmt::Debug + 'static {
     ) -> Result<Self::Results<V>>;
     fn flatten_results<V: Embed>(groups: Self::Results<V>) -> (Flat<V::Any>, Option<Vec<usize>>);
     fn split_regions<R>(flat: Vec<R>) -> Result<Self::Regions<R>>;
+    /// The results of a created op as `create` gives them.
+    fn created(results: Self::Results<Values>) -> Self::Created;
     fn flatten_regions<R>(regions: Self::Regions<R>) -> Vec<R>;
 
     /// Whether `op` is the terminator that region `index` must end with.
     fn is_region_terminator(index: usize, op: &Op) -> bool;
 }
 
-/// What the reference of a dialect shows about an op, which `#[derive(Op)]` writes from its
-/// declaration and its doc comment.
+/// The operand groups of the op `T` under the view `V`.
+pub type Operands<T, V> = <<T as OpKind>::Groups as Groups>::Operands<V>;
+/// The result groups of the op `T` under the view `V`.
+pub type Results<T, V> = <<T as OpKind>::Groups as Groups>::Results<V>;
+/// The region groups of the op `T`, each an `R`.
+pub type Regions<T, R> = <<T as OpKind>::Groups as Groups>::Regions<R>;
+/// What creating the op `T` gives.
+pub type Created<T> = <<T as OpKind>::Groups as Groups>::Created;
+
+/// Implemented by `#[op]`.
+pub trait OpKind: Clone + PartialEq + Eq + Hash + fmt::Debug + 'static {
+    /// The op's groups: its own, or its family's.
+    type Groups: Groups;
+
+    /// What the reference of the dialect shows about the op.
+    const INFO: OpInfo;
+
+    fn name(&self) -> Cow<'static, str>;
+    fn effects(&self) -> Effects;
+    /// The op's traits: those of its family, then those `#[op(..., traits(...))]` lists.
+    fn traits(&self) -> Traits;
+
+    /// Pushes `(name, text)` for every attribute, except an `#[attr(default)]` attribute at its
+    /// default.
+    fn print_attrs(&self, out: &mut Vec<(&'static str, String)>);
+    /// Returns `None` when `name` is not this op. Otherwise parses the optional attribute
+    /// dictionary that follows.
+    fn parse(name: &str, c: &mut Cursor<'_>) -> Option<Result<Self>>;
+    /// Returns `None` unless this op is a [`SymbolOp`] named `name`. Otherwise parses its
+    /// signature.
+    fn parse_symbol(_name: &str, _c: &mut Cursor<'_>) -> Option<Result<ParsedSymbol<Self>>> {
+        None
+    }
+}
+
+/// A symbol op read from its signature, and the names and types of its body's arguments.
+pub type ParsedSymbol<T> = (T, Vec<(String, Type)>);
+
+/// An op that holds a constant value, which constant queries and folds read. `#[op(..., constant)]`
+/// declares an op as one.
+pub trait ConstantOp {
+    fn value(&self) -> &Dense;
+}
+
+/// An op that defines a top-level symbol: its text form is its signature, then its body,
+/// `func.func @main(%0: tensor<4xf32>, ...) -> tensor<4xf32> { ... }`. `#[op(..., symbol)]`
+/// declares an op as one, and the printer and the parser write and read its signature through
+/// this trait.
+pub trait SymbolOp {
+    /// The symbol's name, without its `@`.
+    fn symbol(&self) -> &str;
+    /// The text after the type of argument `index`, such as ` {param = 3}`.
+    fn arg_suffix(&self, index: usize) -> String;
+    /// The text of the results, after `->`.
+    fn results_text(&self) -> String;
+    /// The entries of the attribute dictionary after the results.
+    fn attr_entries(&self) -> Vec<String>;
+    /// The signature after the op's name, up to its body: the op, and the names and types of the
+    /// body's arguments.
+    fn parse_signature(c: &mut Cursor<'_>) -> Result<ParsedSymbol<Self>>
+    where
+        Self: Sized;
+}
+
+/// What the reference of a dialect shows about an op, which `#[op]` writes from its declaration and
+/// its doc comment.
 #[derive(Clone, Copy)]
 pub struct OpInfo {
-    /// The name, or for a family the pattern with `{kind}`: `tensor.{kind}`.
     pub name: &'static str,
     /// The struct of the op, and the file that defines it, relative to the workspace.
     pub rust: &'static str,
@@ -323,11 +389,11 @@ pub struct OpInfo {
     pub results: &'static [Group],
     pub regions: &'static [&'static str],
     pub attrs: &'static [AttrInfo],
-    /// The traits of every op of the family. Each kind may add its own.
+    /// The traits of its family, then its own.
     pub traits: &'static [&'static dyn crate::traits::OpTrait],
     pub effects: Effects,
-    /// The kinds of a family, or none.
-    pub kinds: fn() -> Vec<KindInfo>,
+    /// The family of the op, if it is in one.
+    pub family: Option<FamilyInfo>,
 }
 
 /// An attribute of an op: a field of its struct.
@@ -340,39 +406,40 @@ pub struct AttrInfo {
     pub default: bool,
 }
 
-/// One kind of an op family.
-pub struct KindInfo {
-    pub mnemonic: &'static str,
+/// An op family: ops that share their operands, results, type rule and semantics, and differ in
+/// what the family trait gives each, such as the `arith` op a `tensor` elementwise op applies.
+#[derive(Clone, Copy)]
+pub struct FamilyInfo {
+    /// The family trait.
+    pub name: &'static str,
+    /// Its doc comment: the rules every op of the family follows.
     pub doc: &'static str,
-    pub traits: &'static [&'static dyn crate::traits::OpTrait],
 }
-
-/// The op's type rule, implemented next to the op in its dialect's `ir/`.
+/// The op's type rule, implemented in its dialect's `verify/`.
 pub trait OpDef: OpKind {
     /// The op's shape and dtype rule: the result types for these operand types, or why the op is
     /// invalid.
     fn result_types(
         &self,
-        ins: Self::Operands<Types<'_>>,
-        cx: &TypeCx<'_, Self::Regions<Region>>,
-    ) -> Result<Self::Results<OwnedTypes>>;
+        ins: Operands<Self, Types<'_>>,
+        cx: &TypeCx<'_, Regions<Self, Region>>,
+    ) -> Result<Results<Self, OwnedTypes>>;
 }
 
 /// The op's semantics, implemented in its dialect's `interp/`. The interpreter runs it, and the
-/// filetests check every pass against it. `#[derive(Op)]` calls it, so an op without it does not
-/// compile.
+/// filetests check every pass against it. `#[op]` calls it, so an op without it does not compile.
 pub trait Eval: OpKind {
     fn eval(
         &self,
-        ins: Self::Operands<Host<'_>>,
-        cx: &mut EvalCx<'_, Self::Regions<Region>>,
-    ) -> Result<Self::Results<OwnedHost>>;
+        ins: Operands<Self, Host<'_>>,
+        cx: &mut EvalCx<'_, Regions<Self, Region>>,
+    ) -> Result<Results<Self, OwnedHost>>;
 }
 
 /// What an op author implements in addition for an op that declares regions.
 pub trait RegionOpDef: OpKind + DeclaresRegions {
-    fn region_signatures(&self, ins: Self::Operands<Types<'_>>)
-        -> Result<Self::Regions<RegionSig>>;
+    fn region_signatures(&self, ins: Operands<Self, Types<'_>>)
+        -> Result<Regions<Self, RegionSig>>;
 }
 
 pub struct TypeCx<'a, R> {
@@ -383,6 +450,16 @@ pub struct TypeCx<'a, R> {
 /// Runs a region of the op being evaluated.
 pub trait RegionRunner {
     fn run_region(&mut self, region: Region, args: Vec<HostValue>) -> Result<Vec<HostValue>>;
+    /// The module being run.
+    fn module(&self) -> &Module;
+    /// The extent this run bound to the dimension symbol `sym`.
+    fn sym(&self, sym: &crate::types::Sym) -> Option<usize>;
+    /// Runs the top-level function-like op named `callee` on `args` and returns its results.
+    fn call(&mut self, callee: &str, args: Vec<HostValue>) -> Result<Vec<HostValue>>;
+    /// The point of the enclosing `tile.block` that a body op runs at, which `tile.index` reads.
+    fn index_env(&self) -> Option<&dyn IndexEnv> {
+        None
+    }
 }
 
 pub struct EvalCx<'a, R> {
@@ -397,13 +474,45 @@ impl<R> EvalCx<'_, R> {
         self.runner.run_region(region, args)
     }
 
+    /// The module being run.
+    pub fn module(&self) -> &Module {
+        self.runner.module()
+    }
+
+    /// The extent this run bound to the dimension symbol `sym`.
+    pub fn sym(&self, sym: &crate::types::Sym) -> Option<usize> {
+        self.runner.sym(sym)
+    }
+
+    /// Runs the top-level function-like op named `callee` on `args`.
+    pub fn call(&mut self, callee: &str, args: Vec<HostValue>) -> Result<Vec<HostValue>> {
+        self.runner.call(callee, args)
+    }
+
+    /// The point of the enclosing `tile.block`, for an op of its body.
+    pub fn index_env(&self) -> Option<&dyn IndexEnv> {
+        self.runner.index_env()
+    }
+
+    /// The result types, with this run's dimensions bound.
+    pub fn result_types(&self) -> &[Type] {
+        self.results
+    }
+
     /// The extents of tensor result `index`. Fails when one is a dimension this run has not
     /// bound.
     pub fn result_dims(&self, index: usize) -> Result<Vec<usize>> {
         match &self.results[index] {
-            Type::Tensor(tensor) => tensor.static_dims().map(SmallVec::into_vec).ok_or_else(|| {
-                anyhow::anyhow!("result {index} is {tensor}, whose extents this run has not bound")
-            }),
+            Type::Tensor(tensor) => {
+                tensor
+                    .static_dims()
+                    .map(|dims| dims.to_vec())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "result {index} is {tensor}, whose extents this run has not bound"
+                        )
+                    })
+            }
             other => anyhow::bail!("result {index} is {other}, not a tensor"),
         }
     }
@@ -452,6 +561,12 @@ pub enum Folded {
     Constant(Dense),
 }
 
+impl From<FoldIn<'_>> for Folded {
+    fn from(input: FoldIn<'_>) -> Self {
+        Folded::Value(input.value)
+    }
+}
+
 /// Results as a folder returns them.
 pub struct FoldOut;
 
@@ -492,16 +607,22 @@ impl FoldCx<'_> {
         &self.results[index]
     }
 
+    /// `input` itself, when it has the type of the op's one result: the fold of an op that leaves
+    /// its input as it is.
+    pub fn identity(&self, input: FoldIn<'_>) -> Option<Folded> {
+        (input.ty == self.result_type(0)).then(|| input.into())
+    }
+
     /// The extents of tensor result `index`, when they are all static.
     pub fn result_dims(&self, index: usize) -> Option<Vec<usize>> {
         self.results[index]
             .as_tensor()?
             .static_dims()
-            .map(SmallVec::into_vec)
+            .map(|dims| dims.to_vec())
     }
 }
 
-/// Implemented by `#[derive(Op)]` for an op that declares `regions(..)`.
+/// Implemented by `#[op]` for an op that declares `regions(..)`.
 pub trait DeclaresRegions {}
 
 /// An op's own folder, for folds no trait implies. `#[fold]` on the impl registers it, with its
@@ -511,9 +632,9 @@ pub trait Fold: OpKind {
     /// The folded results, or `None` when the op does not fold.
     fn fold(
         &self,
-        ins: Self::Operands<Folding<'_>>,
+        ins: Operands<Self, Folding<'_>>,
         cx: &FoldCx<'_>,
-    ) -> Option<Self::Results<FoldOut>>;
+    ) -> Option<Results<Self, FoldOut>>;
 }
 
 /// A folder behind a signature without the op's types: the op, its operands, their segments and
@@ -551,17 +672,21 @@ pub fn fold_erased<T: Fold + 'static>(
     results: &[Type],
 ) -> Option<Vec<Folded>> {
     let op = op.downcast_ref::<T>()?;
-    let typed = T::split_operands::<Folding<'_>>(ins.iter().cloned(), segments).ok()?;
+    let typed = T::Groups::split_operands::<Folding<'_>>(ins.iter().cloned(), segments).ok()?;
     let out = op.fold(typed, &FoldCx { results })?;
     crate::doc::fired(crate::doc::Fired::Fold(crate::doc::short_name::<T>()));
-    Some(T::flatten_results::<FoldOut>(out).0.into_vec())
+    Some(T::Groups::flatten_results::<FoldOut>(out).0.into_vec())
 }
 
 pub use gpt_rs_ir_macros::fold;
 
-/// The non-generic entry points, called through [`Op`](enum@crate::Op). `#[derive(Op)]` implements
-/// it on top of [`OpDef`] and, for ops with regions, [`RegionOpDef`].
+/// The non-generic entry points, called through [`Op`](enum@crate::Op). `#[op]` implements it on
+/// top of [`OpDef`] and, for ops with regions, [`RegionOpDef`].
 pub trait OpDyn {
+    /// The op struct itself, for the facts that registries keep by its `TypeId`, such as its
+    /// `#[cost]`.
+    fn dyn_any(&self) -> &dyn Any;
+
     fn dyn_result_types(
         &self,
         ins: &[&Type],
@@ -594,6 +719,16 @@ pub trait OpDyn {
         results: &[Type],
         runner: &mut dyn RegionRunner,
     ) -> Result<Vec<HostValue>>;
+
+    /// The value of a [`ConstantOp`].
+    fn dyn_constant(&self) -> Option<&Dense> {
+        None
+    }
+
+    /// The op as a [`SymbolOp`], when it is one.
+    fn dyn_symbol(&self) -> Option<&dyn SymbolOp> {
+        None
+    }
 }
 
 /// An op that has a place in the [`Op`](enum@crate::Op) union. `#[derive(Dialect)]` implements it.
@@ -601,13 +736,108 @@ pub trait InOp: OpKind + Into<Op> {
     fn cast(op: &Op) -> Option<&Self>;
 }
 
-/// An op found in a module, with its attributes and named operand and result groups. It owns its
-/// data, so a pattern can hold it while it edits the module.
-pub struct Matched<T: OpKind> {
-    pub inst: crate::module::Inst,
-    pub attrs: T,
-    pub operands: T::Operands<Values>,
-    pub results: T::Results<Values>,
+/// An op of a module as a `T`, read together with the module. Its attributes are the fields of
+/// `T`, through `Deref`. It has one accessor per operand, result and region group, named as the
+/// op or its family declares them. The accessors return [`ValueRef`]s and [`RegionRef`]s.
+/// `#[op]` and `#[family]` implement them on the groups `G`, so code generic over the ops of a
+/// family can call them too. It holds references only, so it is free to make and pass around.
+pub struct Matched<'m, T: OpKind, G: Groups = <T as OpKind>::Groups> {
+    inst: Inst,
+    op: &'m T,
+    module: &'m Module,
+    pub(crate) operands: G::Operands<Refs<'m>>,
+    pub(crate) results: G::Results<Refs<'m>>,
+    pub(crate) regions: G::Regions<RegionRef<'m>>,
+}
+
+impl<'m, T: InOp> Matched<'m, T> {
+    /// The op of `inst` as a `T`, when it is one.
+    pub(crate) fn new(module: &'m Module, inst: Inst) -> Option<Self> {
+        let op = T::cast(module.op(inst))?;
+        let refs = |values: &[Value]| {
+            values
+                .iter()
+                .map(|&value| module.value_ref(value))
+                .collect::<Vec<_>>()
+        };
+        let operands = T::Groups::split_operands::<Refs<'m>>(
+            refs(module.operands(inst)).into_iter(),
+            module.operand_segments(inst),
+        )
+        .ok()?;
+        let results = T::Groups::split_results::<Refs<'m>>(
+            refs(module.results(inst)).into_iter(),
+            module.result_segments(inst),
+        )
+        .ok()?;
+        let regions = module
+            .regions(inst)
+            .iter()
+            .map(|&region| module.region_ref(region))
+            .collect();
+        let regions = T::Groups::split_regions(regions).ok()?;
+        Some(Self {
+            inst,
+            op,
+            module,
+            operands,
+            results,
+            regions,
+        })
+    }
+}
+
+impl<'m, T: OpKind, G: Groups> Matched<'m, T, G> {
+    pub fn inst(&self) -> Inst {
+        self.inst
+    }
+
+    /// The op's attributes.
+    pub fn attrs(&self) -> &'m T {
+        self.op
+    }
+
+    pub fn module(&self) -> &'m Module {
+        self.module
+    }
+
+    /// Operand `index` of all the op's operands, in order: for code generic over the op.
+    pub fn operand(&self, index: usize) -> ValueRef<'m> {
+        self.module
+            .value_ref(self.module.operands(self.inst)[index])
+    }
+
+    /// Result `index` of all the op's results, in order: for code generic over the op.
+    pub fn result(&self, index: usize) -> ValueRef<'m> {
+        self.module.value_ref(self.module.results(self.inst)[index])
+    }
+}
+
+impl<T: OpKind, G: Groups> std::ops::Deref for Matched<'_, T, G> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.op
+    }
+}
+
+/// Operand and result values read together with their module, as [`Matched`] holds them.
+pub struct Refs<'m>(PhantomData<&'m ()>);
+
+impl<'m> View for Refs<'m> {
+    type Any = ValueRef<'m>;
+    type Tensor = ValueRef<'m>;
+    type Index = ValueRef<'m>;
+    type Scalar = ValueRef<'m>;
+    fn tensor(x: ValueRef<'m>) -> Option<ValueRef<'m>> {
+        Some(x)
+    }
+    fn index(x: ValueRef<'m>) -> Option<ValueRef<'m>> {
+        Some(x)
+    }
+    fn scalar(x: ValueRef<'m>) -> Option<ValueRef<'m>> {
+        Some(x)
+    }
 }
 
 /// The values of an op's operand or result groups in one list, inline up to four.

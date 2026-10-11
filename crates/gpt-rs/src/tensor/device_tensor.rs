@@ -43,7 +43,7 @@ impl<B: PortableBackend + 'static> AsRef<DeviceTensor<B>> for DeviceTensor<B> {
 impl<B: PortableBackend + 'static> DeviceTensor<B> {
     /// Transfers a host tensor into backend memory, producing a fresh device tensor.
     pub fn from_host(backend: Arc<B>, tensor: HostTensor) -> Result<Self> {
-        let shape = Shape::new(&tensor.dims);
+        let shape = Shape::new(tensor.dims);
         let dtype = tensor.dtype();
         let handle = backend.upload(tensor)?;
         Ok(DeviceTensor {

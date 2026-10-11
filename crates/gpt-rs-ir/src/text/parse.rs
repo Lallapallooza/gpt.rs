@@ -1,10 +1,11 @@
+use std::sync::Arc;
+
 use anyhow::{bail, ensure, Result};
 
 use super::Cursor;
 use crate::attr::Attr;
-use crate::dialects::func::{Func, ParamId};
+use crate::location::{Location, SourcePosition};
 use crate::module::{Module, NewInst, Region, Value};
-use crate::rewrite::bound_params;
 use crate::scope::ScopedMap;
 use crate::traits::IsolatedFromAbove;
 use crate::types::Type;
@@ -17,22 +18,25 @@ struct Parser<'a> {
 }
 
 /// A block argument or function argument: `%name: type`.
-fn arg(c: &mut Cursor<'_>) -> Result<(String, Type)> {
+pub(crate) fn named_arg(c: &mut Cursor<'_>) -> Result<(String, Type)> {
     let name = c.sigil_name('%')?.to_string();
     c.expect(":")?;
     Ok((name, Type::parse(c)?))
 }
 
-/// An optional ` {param = id}` after an argument or result type.
-fn param_binding(c: &mut Cursor<'_>) -> Result<Option<ParamId>> {
-    if !c.eat("{") {
-        return Ok(None);
+/// `(T, ...)`.
+fn types_list(c: &mut Cursor<'_>) -> Result<Vec<Type>> {
+    c.expect("(")?;
+    c.list(")", Type::parse)
+}
+
+/// The result types of an op: one type, or several in parentheses.
+pub(crate) fn parse_result_types(c: &mut Cursor<'_>) -> Result<Vec<Type>> {
+    if c.peek() == Some('(') {
+        types_list(c)
+    } else {
+        Ok(vec![Type::parse(c)?])
     }
-    c.expect("param")?;
-    c.expect("=")?;
-    let param = ParamId::parse(c)?;
-    c.expect("}")?;
-    Ok(Some(param))
 }
 
 impl<'a> Parser<'a> {
@@ -41,19 +45,6 @@ impl<'a> Parser<'a> {
             bail!(self.c.error(format!("%{name} is defined twice")));
         }
         Ok(())
-    }
-
-    fn types_list(&mut self) -> Result<Vec<Type>> {
-        self.c.expect("(")?;
-        self.c.list(")", Type::parse)
-    }
-
-    fn result_types(&mut self) -> Result<Vec<Type>> {
-        if self.c.peek() == Some('(') {
-            self.types_list()
-        } else {
-            Ok(vec![Type::parse(&mut self.c)?])
-        }
     }
 
     /// Parses ops into `region` until `}` or the end of input.
@@ -76,12 +67,16 @@ impl<'a> Parser<'a> {
             self.c.expect("=")?;
         }
         let name = self.c.ident()?;
-        if name == "func.func" {
+        if let Some(signature) = Op::parse_symbol(name, &mut self.c) {
             ensure!(
                 result_names.is_empty(),
-                self.c.error("func.func has no results")
+                self.c.error(format!("{name} has no results"))
             );
-            return self.parse_func(region);
+            let (op, args) = signature?;
+            self.c.expect("{")?;
+            let body = self.block(&args, true)?;
+            self.append_symbol(region, op, body);
+            return Ok(());
         }
 
         self.c.expect("(")?;
@@ -116,9 +111,10 @@ impl<'a> Parser<'a> {
         }
 
         self.c.expect(":")?;
-        let operand_types = self.types_list()?;
+        let operand_types = types_list(&mut self.c)?;
         self.c.expect("->")?;
-        let result_types = self.result_types()?;
+        let result_types = parse_result_types(&mut self.c)?;
+        let location = self.location()?;
         ensure!(
             operand_types.len() == operands.len(),
             self.c.error(format!(
@@ -152,6 +148,7 @@ impl<'a> Parser<'a> {
             result_types,
             result_segments,
             regions,
+            location,
         });
         self.module.append(region, inst);
         for (name, value) in result_names.iter().zip(self.module.results(inst).to_vec()) {
@@ -173,7 +170,7 @@ impl<'a> Parser<'a> {
                 );
             }
             self.c.expect("(")?;
-            args = self.c.list(")", arg)?;
+            args = self.c.list(")", named_arg)?;
             self.c.expect(":")?;
         }
         self.block(&args, isolated)
@@ -195,50 +192,64 @@ impl<'a> Parser<'a> {
         Ok(region)
     }
 
-    /// A function's result types, and each result's parameter when it is a load-time function.
-    /// A single run-time result may be written without parentheses.
-    fn func_results(&mut self) -> Result<(Vec<Type>, Vec<ParamId>)> {
-        if self.c.peek() != Some('(') {
-            return Ok((vec![Type::parse(&mut self.c)?], Vec::new()));
-        }
-        self.c.expect("(")?;
-        let results = self
-            .c
-            .list(")", |c| Ok((Type::parse(c)?, param_binding(c)?)))?;
-        let (types, params) = results.into_iter().unzip();
-        let params = bound_params(params).into_iter().collect::<Option<_>>();
-        let unbound = "a load-time function binds every result to a parameter";
-        Ok((types, params.ok_or_else(|| self.c.error(unbound))?))
-    }
-
-    fn parse_func(&mut self, parent: Region) -> Result<()> {
-        let name = self.c.sigil_name('@')?.to_string();
-        self.c.expect("(")?;
-        let bound = self.c.list(")", |c| Ok((arg(c)?, param_binding(c)?)))?;
-        let (named, params): (Vec<(String, Type)>, Vec<Option<ParamId>>) =
-            bound.into_iter().unzip();
-        self.c.expect("->")?;
-        let (results, result_params) = self.func_results()?;
-        self.c.expect("{")?;
-        let body = self.block(&named, true)?;
-
-        let func = Func {
-            name,
-            args: named.into_iter().map(|(_, ty)| ty).collect(),
-            results,
-            params: bound_params(params),
-            result_params,
-        };
+    /// Appends to `parent` the symbol op `op` with its `body`.
+    fn append_symbol(&mut self, parent: Region, op: Op, body: Region) {
         let inst = self.module.create_inst(NewInst {
-            op: func.into(),
+            op,
             operands: Vec::new(),
             operand_segments: None,
             result_types: Vec::new(),
             result_segments: None,
             regions: vec![body],
+            location: None,
         });
         self.module.append(parent, inst);
-        Ok(())
+    }
+
+    /// The location after an op's signature, if it has one: `loc("scope"("file":line:column))`,
+    /// `loc("scope")` or `loc("file":line:column)`.
+    fn location(&mut self) -> Result<Option<Location>> {
+        if !self.c.eat("loc") {
+            return Ok(None);
+        }
+        self.c.expect("(")?;
+        let first = self.c.string()?;
+        let location = if self.c.eat(":") {
+            Location {
+                scope: None,
+                source: Some(self.source_position(first)?),
+            }
+        } else {
+            let source = if self.c.eat("(") {
+                let file = self.c.string()?;
+                self.c.expect(":")?;
+                let position = self.source_position(file)?;
+                self.c.expect(")")?;
+                Some(position)
+            } else {
+                None
+            };
+            Location {
+                scope: Some(Arc::from(first)),
+                source,
+            }
+        };
+        self.c.expect(")")?;
+        Ok(Some(location))
+    }
+
+    /// `line:column` after the `file` of a location and its colon.
+    fn source_position(&mut self, file: String) -> Result<SourcePosition> {
+        let line = self.c.int()?;
+        self.c.expect(":")?;
+        let column = self.c.int()?;
+        let in_range =
+            |n: i128| u32::try_from(n).map_err(|_| self.c.error("position out of range"));
+        Ok(SourcePosition {
+            file: Arc::from(file),
+            line: in_range(line)?,
+            column: in_range(column)?,
+        })
     }
 }
 

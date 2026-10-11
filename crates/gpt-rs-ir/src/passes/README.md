@@ -1,78 +1,33 @@
 # Passes
 
 The graph arena optimizes every program it compiles with the backend's pipeline of these passes
-before the backend runs it. The passes work on any dialect; the ones that only rewrite `tensor` ops
-live in `crates/gpt-rs-ir/src/dialects/tensor/passes/`. The ops' semantics are their `Eval` impls,
-which the filetests run before and after each case's pass list. The pass catalog,
-`docs/ptir/passes.md`, is generated from the code. It lists the pipeline of each backend, and every
-pass with its options, statistics, folds and patterns.
+before the backend runs it. The ops' semantics are their `Eval` impls, which the filetests run
+before and after each case's pass list. The pass catalog, `docs/ptir/passes.md`, is generated from
+the code. It lists the pipeline of each backend, and every pass with its options, statistics, folds
+and patterns.
+
+Each pass is one file, named after the pass: `merge-contracted-axes` is `MergeContractedAxes` in
+`merge_contracted_axes.rs`. The passes over any dialect are in this directory, a dialect's own in
+`dialects/<dialect>/passes/`, next to its canonical patterns in `canonicalize.rs`, a conversion
+between dialects in `conversion/<from>_to_<to>/`, and a backend's in the `passes` module of its
+crate.
 
 ## Writing a pass
 
-A pass is a struct with `#[pass]` and an `impl Pass`. This one walks the module itself: it
-matches one op, checks it, rewrites it and counts what it did. The two full examples on this page
-compile as doc tests. They are not passes of the crate.
+A pass is a struct with `#[pass]` and an `impl Pass`. Most passes apply patterns: local rewrites
+that the `Greedy` driver applies to each op until nothing changes. A pattern is a struct with
+`#[pattern]` and an `impl Pattern`, rooted at one op type, or at every op with a trait
+(`type Root = Has<Commutative>`). The example on this page compiles as a doc test. It is not a
+pass of the crate.
 
 ```rust,no_run
 use anyhow::Result;
-use gpt_rs_ir::dialects::tensor::StopGradient;
-use gpt_rs_ir::module::Module;
-use gpt_rs_ir::passes::{pass, Pass};
-use gpt_rs_ir::rewrite::Rewriter;
-
-/// Replaces each `tensor.stop_gradient` by its input: a forward pass computes no gradients, so
-/// the op only copies its input.
-#[pass(
-    name = "strip-stop-gradient",
-    stats(stripped = "stop_gradient ops replaced by their input")
-)]
-pub struct StripStopGradient;
-
-impl Pass for StripStopGradient {
-    fn run(&self, module: &mut Module) -> Result<bool> {
-        let mut stripped = 0;
-        // `walk` lists every op, those in regions too, before the loop changes anything.
-        for inst in module.walk(module.body()) {
-            // Match: `op_as` gives the op with its attributes, operands and results by name.
-            let Some(op) = module.op_as::<StopGradient>(inst) else {
-                continue;
-            };
-            // Rewrite: the uses of the result read the input, and the op is erased.
-            Rewriter::new(module).replace(inst, &[op.operands.input])?;
-            stripped += 1;
-        }
-        Self::STRIPPED.add(stripped);
-        Ok(stripped > 0)
-    }
-}
-# fn main() {}
-```
-
-- The doc comment is required. Its first paragraph is the pass's summary in the catalog.
-- `run` returns whether the module changed; the filetest runner checks that against the text.
-  The pipeline verifies the module after every pass.
-- `stats(name = "doc")` declares a counter, the constant `Self::NAME` of type `Stat`. The pass adds
-  to it as it runs, and with `--dump-dir`, `GPTRS_PASS_STATS=1` logs it.
-- The fields of the struct are its options, each with a doc comment, their defaults from
-  `Default`. A pipeline sets them in code (`Canonicalize { fuel: 10 }`); a filetest sets them in
-  the text form of op attributes (`// RUN: pass canonicalize {fuel = 10}, cse`).
-- `#[pass]` registers the pass in the crate that defines it, so filetests can name it once the
-  crate is linked. Two passes with one name are an error.
-
-## Writing a pattern
-
-Most rewrites are patterns: local rewrites that the `Greedy` driver applies to each op until
-nothing changes. A pattern is a struct with `#[pattern]` and an `impl Pattern`, rooted at one op
-type, or at every op with a trait (`type Root = Has<Commutative>`). It returns `Ok(false)` and
-leaves the IR alone when it does not apply, and `Ok(true)` once it has rewritten.
-
-```rust,no_run
-use anyhow::Result;
-use gpt_rs_ir::dialects::tensor::{Binary, BinaryKind, Unary, UnaryKind};
+use gpt_rs_ir::dialects::tensor::{Div, Mul, Reciprocal};
 use gpt_rs_ir::module::Module;
 use gpt_rs_ir::op::Matched;
-use gpt_rs_ir::passes::{pass, Greedy, Pass, Rewrites};
-use gpt_rs_ir::rewrite::{pattern, Pattern, PatternSet, Rewriter};
+use gpt_rs_ir::passes::{pass, run_patterns, Pass, Rewrites};
+use gpt_rs_ir::require;
+use gpt_rs_ir::rewrite::{pattern, NoMatch, Pattern, PatternSet, Rewriter};
 
 /// `x / s` is `x * reciprocal(s)` for a static float `s`: the backend computes the reciprocal
 /// once at load time, and a run multiplies, which costs less than dividing.
@@ -80,34 +35,20 @@ use gpt_rs_ir::rewrite::{pattern, Pattern, PatternSet, Rewriter};
 struct DivideByStatic;
 
 impl Pattern for DivideByStatic {
-    // `Binary` roots the whole family of binary ops; the pattern checks the kind.
-    type Root = Binary;
+    type Root = Div;
 
-    fn rewrite(&self, div: Matched<Binary>, rw: &mut Rewriter<'_>) -> Result<bool> {
-        // Match: a division.
-        if div.attrs.kind != BinaryKind::Div {
-            return Ok(false);
-        }
-        let (x, s) = (div.operands.lhs, div.operands.rhs);
-        // Check: floats only, as an integer division truncates; and a static divisor, computed
-        // from constants and parameters alone, so that the reciprocal moves to load time.
-        let float = rw.module.ty(s).as_tensor().is_some_and(|t| t.dtype.is_float());
-        if !float || !rw.module.is_static(s) {
-            return Ok(false);
-        }
-        // Rewrite: build the new ops before the root, then send the root's uses to the product.
+    fn rewrite(&self, div: Matched<'_, Div>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+        // Match: the op and its operands, read through the module.
+        let (dividend, divisor) = (div.lhs(), div.rhs());
+        require!(divisor.tensor_type().dtype.is_float(), "an integer division truncates");
+        require!(divisor.known_before_run(), "the divisor changes at run time");
+        // Rewrite: create the new ops before the root, then replace the root by the product.
         // The result types come from the ops' type rules.
-        let at = div.inst;
-        let r = rw.insert_before(at, Unary { kind: UnaryKind::Reciprocal }, s)?.output;
-        let product = rw.insert_before(at, Binary { kind: BinaryKind::Mul }, (x, r))?.output;
-        rw.replace(at, &[product])?;
-        Ok(true)
+        let reciprocal = rewriter.create(Reciprocal, divisor);
+        let product = rewriter.create(Mul, (dividend, reciprocal));
+        rewriter.replace_op(&div, product);
+        Ok(())
     }
-}
-
-/// Adds the patterns that turn a division by a static value into a multiplication.
-pub fn populate_divide_by_static_patterns(set: &mut PatternSet) {
-    set.add(DivideByStatic);
 }
 
 /// Multiplies by the reciprocal of a static divisor instead of dividing by it.
@@ -121,49 +62,73 @@ pub fn populate_divide_by_static_patterns(set: &mut PatternSet) {
 )]
 pub struct MultiplyByReciprocal;
 
+fn populate_multiply_by_reciprocal_patterns(set: &mut PatternSet) {
+    set.add(DivideByStatic);
+}
+
 impl Pass for MultiplyByReciprocal {
     // What the pass applies: `run` passes it to the driver, and the catalog lists it.
     fn rewrites(&self) -> Rewrites {
-        let mut patterns = PatternSet::new();
-        populate_divide_by_static_patterns(&mut patterns);
-        Rewrites {
-            folds: false,
-            patterns,
-        }
+        Rewrites::patterns(populate_multiply_by_reciprocal_patterns)
     }
 
     fn run(&self, module: &mut Module) -> Result<bool> {
-        let report = Greedy::new(self.rewrites()).erase_dead().run(module)?;
-        Self::REWRITTEN.add(report.rewritten);
-        Ok(report.changed())
+        run_patterns(module, self.rewrites(), &Self::REWRITTEN)
     }
 }
 # fn main() {}
 ```
 
+The pass:
+
+- The doc comment is required. Its first paragraph is the pass's summary in the catalog.
+- `run` returns whether the module changed; the filetest runner checks that against the text.
+  The pipeline verifies the module after every pass.
+- `stats(name = "doc")` declares a counter, the constant `Self::NAME` of type `Stat`. The pass adds
+  to it as it runs, and with `--dump-dir`, `GPTRS_PASS_STATS=1` logs it.
+- The fields of the struct are its options, each with a doc comment, their defaults from
+  `Default`. A pipeline sets them in code (`Canonicalize { fuel: 10 }`); a filetest sets them in
+  the text form of op attributes (`// RUN: pass canonicalize {fuel = 10}, cse`).
+- `#[pass]` registers the pass in the crate that defines it, so filetests can name it once the
+  crate is linked. Two passes with one name are an error.
+
+The pattern:
+
 - The doc comment of the pattern is required: it states the rewrite, and the catalog shows it.
-- `rw.def_as::<T>(value)` matches the op that defines an operand, `rw.module` answers the queries
-  (`ty`, `uses`, `constant`, `is_static`), and `rw.insert_before`, `rw.replace`, `rw.set_op` and
-  `rw.erase` change the IR. The driver visits every op that a rewrite touched again.
+- It is rooted at an op type, such as `Div`; at each op of a family through a pattern generic over
+  the family trait, `struct ReduceToTile<T>` with `impl<T: Reduce> Pattern for ReduceToTile<T>`;
+  or at every op with a trait, `type Root = Has<Commutative>`.
+- It reads the IR through its root, a `Matched` op with its attributes and an accessor per
+  operand, result and region group, and through the `ValueRef`s those give: `defining_op::<T>()`,
+  `uses()`, `has_one_use()`, `tensor_type()`, `constant()`, `splat()`, `known_before_run()` and
+  `depends_on_parameter()`.
+- It changes the IR only through the rewriter: `create`, `create_op`, `create_with_regions`,
+  `replace_op`, `replace_all_uses`, `set_op`, `set_operands`, `erase` and `remove_arg`. New ops go
+  before the root unless `set_insertion_point` moves them. The rewriter stages the changes, and
+  the driver applies them when the pattern returns `Ok`.
+- When it does not apply it returns `Err(NoMatch)` with the reason: `require!(cond, "reason")`,
+  `require!(let Some(x) = .., "reason")` or `.ok_or("reason")?`. The driver drops what it staged,
+  so a pattern that does not apply changes nothing. A failing conversion reports the reasons.
+- Creating an op its type rule rejects is a bug in the pattern, and panics.
 - A pattern that does not keep every result bit for bit, or that chooses a layout for one backend,
-  belongs to the passes that add it, through a `populate_*_patterns` function, so that several
-  passes can share it.
+  belongs to the pass that adds it, through the pass's `populate_<pass>_patterns`.
 
 ## Canonical patterns and folds
 
-A pattern that keeps every result bit for bit (apart from a NaN's sign and payload) and leads to
-one normal form is canonical: `#[pattern(canonical)]` registers it, and `canonicalize` applies
-every registered one. A pattern generic over its root op names the ops it registers for, as in
-`#[pattern(canonical(ArgMax, Concat))]`.
+A pattern is canonical when it keeps every result bit for bit, apart from a NaN's sign and payload.
+It must also hold on every backend, never add work and lead to one normal form, so it needs no cost
+model. `#[pattern(canonical)]` registers it, and `canonicalize` applies every registered one. A
+rewrite that can add work or move it between ops, such as fusing an op into its readers, is a pass
+of its own. A pattern generic over its root op names the ops it registers for:
 
 ```rust,ignore
-/// `transpose(transpose(x, p1), p2)` is `transpose(x, q)` with `q[i] = p1[p2[i]]`.
-#[pattern(canonical)]
-struct CollapseTransposeChain;
+/// `t(t(x))` is one `t` of `x` for a movement op `t`.
+#[pattern(canonical(Reshape, BroadcastTo, Slice, Transpose))]
+struct CollapseChain<T>(PhantomData<T>);
 ```
 
-An op's own folder is `#[fold]` on `impl Fold for <op>`, next to the op, with a doc comment that
-says what the op folds to. The traits of an op fold it too, by the laws they state.
+An op's own folder is `#[fold]` on `impl Fold for <op>`, in its dialect's `fold/`, with a doc
+comment that says what the op folds to. The traits of an op fold it too, by the laws they state.
 
 ```rust,ignore
 /// A transpose by the identity `perm` is the input.
@@ -176,7 +141,7 @@ impl Fold for Transpose {
     ) -> Option<TransposeResults<FoldOut>> {
         let identity = self.perm.iter().copied().eq(0..self.perm.len());
         identity.then_some(TransposeResults {
-            output: Folded::Value(ins.input.value),
+            output: ins.input.into(),
         })
     }
 }

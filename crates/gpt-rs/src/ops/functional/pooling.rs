@@ -1,6 +1,6 @@
 //! Pooling over the spatial axes of NHWC activations.
 
-use gpt_rs_ir::dialects::tensor::ReduceKind;
+use gpt_rs_ir::dialects::tensor::ReduceWindowMax;
 
 use crate::ops::functional::Padding2d;
 use crate::{ensure_rank, functional};
@@ -15,8 +15,7 @@ pub fn max_pool2d(
 ) -> Tensor {
     ensure_rank!(x, 4);
     let [height, width] = padding.as_hw_pairs();
-    x.reduce_window(
-        ReduceKind::Max,
+    x.reduce_window::<ReduceWindowMax>(
         [1, window[0], window[1], 1],
         [1, stride[0], stride[1], 1],
         [(0, 0), height, width, (0, 0)],

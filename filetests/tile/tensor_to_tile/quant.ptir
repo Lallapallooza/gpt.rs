@@ -1,0 +1,87 @@
+// RUN: pass tensor-to-tile
+
+// CHECK: tile.block(%0, %1) {iters = [par 4, par 64], reads = [$0[d0, d1], $1[d0, d1 floordiv 32]], folds = [none -> [d0, d1]]}
+// CHECK: arith.cast(%0) {to = f32} : (f4e2m1) -> f32
+// CHECK-NEXT: arith.cast(%1) {to = f32} : (e8m0) -> f32
+// CHECK-NEXT: arith.mul
+// CHECK-NEXT: arith.cast({{%[0-9]+}}) {to = bf16}
+// CHECK-NOT: tensor.
+func.func @mxfp4(%0: tensor<4x64xf4e2m1>, %1: tensor<4x2xe8m0>) -> tensor<4x64xbf16> {
+  %2 = tensor.dequantize(%0, %1) {block = [1, 32], to = bf16} : (tensor<4x64xf4e2m1>, tensor<4x2xe8m0>) -> tensor<4x64xbf16>
+  func.return(%2) : (tensor<4x64xbf16>) -> ()
+}
+
+// -----
+// CHECK: reads = [$0[d0, d1], $1[d0 floordiv 8, d1 floordiv 16]]
+// CHECK: arith.cast({{%[0-9]+}}) {to = f8e4m3}
+// Rounding to an integer adds and subtracts 2^23.
+// CHECK: arith.constant() {value = 8388608.0 : f32}
+// CHECK: arith.cast({{%[0-9]+}}) {to = si8}
+// CHECK-NOT: tensor.
+func.func @per_tensor(%0: tensor<8x16xf32>, %1: tensor<1x1xf32>) -> (tensor<8x16xf8e4m3>, tensor<8x16xsi8>) {
+  %2 = tensor.quantize(%0, %1) {block = [8, 16], to = f8e4m3} : (tensor<8x16xf32>, tensor<1x1xf32>) -> tensor<8x16xf8e4m3>
+  %3 = tensor.quantize(%0, %1) {block = [8, 16], to = si8} : (tensor<8x16xf32>, tensor<1x1xf32>) -> tensor<8x16xsi8>
+  func.return(%2, %3) : (tensor<8x16xf8e4m3>, tensor<8x16xsi8>) -> ()
+}
+
+// -----
+// CHECK: reads = [$0[d0, d1], $1[d0, d1 floordiv 32], $2[d0, d1 floordiv 32]]
+// CHECK: arith.add
+// A table is read at the code by `take`; its values dequantize as any element.
+// CHECK: [[V:%[0-9]+]] = tile.block(%3, {{%[0-9]+}}) {iters = [par 4, par 64], reads = [$0[$1[d0, d1]]]
+// CHECK: tile.block([[V]], %1) {iters = [par 4, par 64], reads = [$0[d0, d1], $1[d0, d1 floordiv 32]]
+// CHECK-NOT: tensor.
+func.func @offset_and_table(%0: tensor<4x64xui4>, %1: tensor<4x2xf16>, %2: tensor<4x2xf16>, %3: tensor<16xf32>) -> (tensor<4x64xbf16>, tensor<4x64xbf16>) {
+  %4 = tensor.dequantize(%0, %1, %2) {block = [1, 32], to = bf16} : (tensor<4x64xui4>, tensor<4x2xf16>, tensor<4x2xf16>) -> tensor<4x64xbf16>
+  %5 = tensor.cast(%0) {to = si32} : (tensor<4x64xui4>) -> tensor<4x64xsi32>
+  %6 = tensor.take(%3, %5) : (tensor<16xf32>, tensor<4x64xsi32>) -> tensor<4x64xf32>
+  %7 = tensor.dequantize(%6, %1) {block = [1, 32], to = bf16} : (tensor<4x64xf32>, tensor<4x2xf16>) -> tensor<4x64xbf16>
+  func.return(%4, %7) : (tensor<4x64xbf16>, tensor<4x64xbf16>) -> ()
+}
+
+// -----
+// Stochastic rounding reads one draw per element and compares it in f64.
+// CHECK: tile.block(%0, %1, %2) {iters = [par 8, par 16], reads = [$0[d0, d1], $1[d0, d1 floordiv 16], $2[d0, d1]]
+// CHECK: arith.cast({{%[0-9]+}}) {to = f64} : (ui32) -> f64
+// The scale and the offset are one value here, so one operand.
+// CHECK: tile.block(%0, %1) {iters = [par 8, par 16], reads = [$0[d0, d1], $1[d0, d1 floordiv 16], $1[d0, d1 floordiv 16]]
+// A table quantizes to the index of the nearest entry, folded with `argmin`.
+// CHECK: [[D:%[0-9]+]], [[I:%[0-9]+]] = tile.block(%0, %1, %3) {iters = [par 8, par 16, red 16], reads = [$0[d0, d1], $1[d0, d1 floordiv 16], $2[d2], $2[0]], folds = [argmin -> [d0, d1], [d0, d1]]}
+// CHECK: tile.block([[I]])
+// CHECK: arith.cast({{%[0-9]+}}) {to = ui4}
+// CHECK-NOT: tensor.
+func.func @quantize_options(%0: tensor<8x16xf32>, %1: tensor<8x1xf32>, %2: tensor<8x16xui32>, %3: tensor<16xf32>) -> (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) {
+  %4 = tensor.quantize_stochastic(%0, %1, %2) {block = [1, 16], to = f8e4m3} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x16xui32>) -> tensor<8x16xf8e4m3>
+  %5 = tensor.quantize(%0, %1, %1) {block = [1, 16], to = ui8} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x1xf32>) -> tensor<8x16xui8>
+  %6 = tensor.quantize_table(%0, %1, %3) {block = [1, 16], to = ui4} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<16xf32>) -> tensor<8x16xui4>
+  func.return(%4, %5, %6) : (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) -> ()
+}
+
+// -----
+// Each block's range, then its scale, then the quantization with the scale as stored.
+// CHECK: [[LO:%[0-9]+]], [[HI:%[0-9]+]] = tile.block(%0) {iters = [par {T}, par 4, red 1, red 16], reads = [$0[d0 + d2, d1 * 16 + d3] pad 0.0], folds = [min -> [d0, d1], max -> [d0, d1]]}
+// CHECK: [[S:%[0-9]+]] = tile.block([[LO]], [[HI]])
+// CHECK: tile.block(%0, [[S]]) {iters = [par {T}, par 64], reads = [$0[d0, d1], $1[d0, d1 floordiv 16]]
+// e8m0 scales are their exponent codes.
+// CHECK: arith.bitcast({{%[0-9]+}}) {to = e8m0} : (ui8) -> e8m0
+// CHECK-NOT: tensor.
+func.func @dynamic(%0: tensor<{T}x64xf32>) -> (tensor<{T}x64xf4e2m1>, tensor<{T}x4xf8e4m3>, tensor<{T}x64xf6e3m2>, tensor<{T}x2xe8m0>) {
+  %1 = tensor.block_scale_amax(%0) {block = [1, 16], to = f4e2m1, scale_dtype = f8e4m3} : (tensor<{T}x64xf32>) -> tensor<{T}x4xf8e4m3>
+  %2 = tensor.quantize(%0, %1) {block = [1, 16], to = f4e2m1} : (tensor<{T}x64xf32>, tensor<{T}x4xf8e4m3>) -> tensor<{T}x64xf4e2m1>
+  %3 = tensor.block_scale_pow2_floor(%0) {block = [1, 32], to = f6e3m2, scale_dtype = e8m0} : (tensor<{T}x64xf32>) -> tensor<{T}x2xe8m0>
+  %4 = tensor.quantize(%0, %3) {block = [1, 32], to = f6e3m2} : (tensor<{T}x64xf32>, tensor<{T}x2xe8m0>) -> tensor<{T}x64xf6e3m2>
+  func.return(%2, %1, %4, %3) : (tensor<{T}x64xf4e2m1>, tensor<{T}x4xf8e4m3>, tensor<{T}x64xf6e3m2>, tensor<{T}x2xe8m0>) -> ()
+}
+
+// -----
+// An asymmetric block gives a scale and an offset.
+// CHECK: [[S:%[0-9]+]], [[O:%[0-9]+]] = tile.block({{%[0-9]+}}, {{%[0-9]+}}) {iters = [par 4, par 2], reads = [$0[d0, d1], $1[d0, d1]], folds = [none -> [d0, d1], none -> [d0, d1]]}
+// CHECK: tile.block(%0, [[S]], [[O]])
+// CHECK-NOT: tensor.
+func.func @dynamic_options(%0: tensor<4x64xf32>, %1: tensor<4x64xui32>) -> (tensor<4x64xui8>, tensor<4x2xf32>, tensor<4x2xf32>, tensor<4x64xf8e4m3>, tensor<4x2xe8m0>) {
+  %2, %3 = tensor.block_scale_range(%0) {block = [1, 32], to = ui8, scale_dtype = f32} : (tensor<4x64xf32>) -> (tensor<4x2xf32>, tensor<4x2xf32>)
+  %4 = tensor.quantize(%0, %2, %3) {block = [1, 32], to = ui8} : (tensor<4x64xf32>, tensor<4x2xf32>, tensor<4x2xf32>) -> tensor<4x64xui8>
+  %5 = tensor.block_scale_pow2_ceil(%0) {block = [1, 32], to = f8e4m3, scale_dtype = e8m0} : (tensor<4x64xf32>) -> tensor<4x2xe8m0>
+  %6 = tensor.quantize_stochastic(%0, %5, %1) {block = [1, 32], to = f8e4m3} : (tensor<4x64xf32>, tensor<4x2xe8m0>, tensor<4x64xui32>) -> tensor<4x64xf8e4m3>
+  func.return(%4, %2, %3, %6, %5) : (tensor<4x64xui8>, tensor<4x2xf32>, tensor<4x2xf32>, tensor<4x64xf8e4m3>, tensor<4x2xe8m0>) -> ()
+}

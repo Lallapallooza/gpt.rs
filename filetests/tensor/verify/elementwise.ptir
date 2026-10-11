@@ -7,9 +7,9 @@ func.func @mismatch(%0: tensor<4xf32>, %1: tensor<3xf32>) -> tensor<4xf32> {
 }
 
 // -----
-// ERROR: tensor.compare: operands must have equal types, got tensor<4xf32> and tensor<4xsi32>
+// ERROR: tensor.less: operands must have equal types, got tensor<4xf32> and tensor<4xsi32>
 func.func @compare_mismatch(%0: tensor<4xf32>, %1: tensor<4xsi32>) -> tensor<4xi1> {
-  %2 = tensor.compare(%0, %1) {kind = less} : (tensor<4xf32>, tensor<4xsi32>) -> tensor<4xi1>
+  %2 = tensor.less(%0, %1) : (tensor<4xf32>, tensor<4xsi32>) -> tensor<4xi1>
   func.return(%2) : (tensor<4xi1>) -> ()
 }
 
@@ -77,9 +77,9 @@ func.func @add_narrow(%0: tensor<4xf8e4m3>) -> tensor<4xf8e4m3> {
 }
 
 // -----
-// ERROR: tensor.compare: each operand must be an i1, integer or float tensor, got tensor<4xe8m0>
+// ERROR: tensor.less: each operand must be an i1, integer or float tensor, got tensor<4xe8m0>
 func.func @compare_scales(%0: tensor<4xe8m0>) -> tensor<4xi1> {
-  %1 = tensor.compare(%0, %0) {kind = less} : (tensor<4xe8m0>, tensor<4xe8m0>) -> tensor<4xi1>
+  %1 = tensor.less(%0, %0) : (tensor<4xe8m0>, tensor<4xe8m0>) -> tensor<4xi1>
   func.return(%1) : (tensor<4xi1>) -> ()
 }
 

@@ -6,6 +6,7 @@ use anyhow::Result;
 
 use super::{pass, Pass};
 use crate::dialects::func::{Func, ParamId};
+use crate::location::Location;
 use crate::module::{Inst, Module, Region, Value, ValueDef};
 use crate::traits::{Movement, Terminator};
 use crate::types::Type;
@@ -54,7 +55,7 @@ struct Root {
 fn outline(module: &mut Module, func: Inst) -> Result<usize> {
     if module
         .op(func)
-        .as_func()
+        .get::<Func>()
         .expect("a function")
         .is_load_time()
     {
@@ -101,7 +102,7 @@ fn roots(module: &Module, body: Region) -> Vec<Root> {
     let mut statics: HashSet<Value> = module
         .insts(body)
         .flat_map(|inst| module.results(inst).iter().copied())
-        .filter(|&v| module.is_static(v))
+        .filter(|&v| module.known_before_run(v))
         .collect();
     loop {
         let roots = roots_among(module, body, &statics);
@@ -217,7 +218,7 @@ fn subgraph(module: &Module, output: Value) -> Subgraph {
         match module.def(value) {
             ValueDef::Arg(region, index) => {
                 let func = module.parent_op(region).expect("a function argument");
-                let id = module.op(func).as_func().and_then(|f| f.param(index));
+                let id = module.op(func).get::<Func>().and_then(|f| f.param(index));
                 let id = id.expect("a static argument is a parameter");
                 params.push((value, id, module.ty(value).clone()));
             }
@@ -246,6 +247,7 @@ struct CopiedOp {
     operands: Vec<Value>,
     segments: Option<Vec<usize>>,
     results: Vec<Value>,
+    location: Option<Location>,
 }
 
 fn copy_ops(module: &Module, graph: &Subgraph) -> Vec<CopiedOp> {
@@ -257,6 +259,7 @@ fn copy_ops(module: &Module, graph: &Subgraph) -> Vec<CopiedOp> {
             operands: module.operands(inst).to_vec(),
             segments: module.operand_segments(inst).map(<[usize]>::to_vec),
             results: module.results(inst).to_vec(),
+            location: module.location(inst).cloned(),
         })
         .collect()
 }
@@ -280,24 +283,18 @@ fn emit(
             .map(|(&(value, _, _), &arg)| (value, arg))
             .collect();
         for copied in ops {
-            let operands = copied.operands.iter().map(|v| map[v]).collect();
-            let inst = b.build_op(
+            b.set_location(copied.location.clone());
+            b.create_mapped(
                 copied.op.clone(),
-                operands,
+                &copied.operands,
                 copied.segments.clone(),
-                Vec::new(),
+                &copied.results,
+                &mut map,
             )?;
-            map.extend(
-                copied
-                    .results
-                    .iter()
-                    .copied()
-                    .zip(b.module.results(inst).to_vec()),
-            );
         }
         Ok(vec![map[&graph.output]])
     })?;
-    let mut attrs: Func = dst.op(func).as_func().expect("a function").clone();
+    let mut attrs: Func = dst.op(func).get::<Func>().expect("a function").clone();
     attrs.result_params = vec![id];
     dst.set_op(func, attrs.into());
     Ok(())
@@ -327,7 +324,7 @@ fn load_time_function(module: &mut Module, value: Value) -> Result<Option<ParamI
 fn add_param_arg(module: &mut Module, func: Inst, ty: Type, id: ParamId) -> Value {
     let body = module.regions(func)[0];
     let arg = module.append_arg(body, ty.clone());
-    let mut attrs: Func = module.op(func).as_func().expect("a function").clone();
+    let mut attrs: Func = module.op(func).get::<Func>().expect("a function").clone();
     attrs.params.resize(attrs.args.len(), None);
     attrs.args.push(ty);
     attrs.params.push(Some(id));

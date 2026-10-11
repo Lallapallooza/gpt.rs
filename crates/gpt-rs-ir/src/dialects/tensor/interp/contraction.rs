@@ -1,26 +1,26 @@
-//! Semantics of the ops in `ir/contraction.rs`.
+//! Semantics of the contraction ops.
 //!
 //! A sum, product or extremum accumulates in its accumulator dtype: each operand element enters it
 //! as `tensor.cast` converts it, each step rounds to it, and the result is cast to the result
 //! dtype.
 
-use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::marker::PhantomData;
 
 use anyhow::{anyhow, bail, ensure, Result};
 
-use super::elementwise::{int_format, Arith};
+use super::elementwise::Arith;
 use super::kernels::{
-    cast, from_values, gather_elements, rounder, strides, unravel, values, Values,
+    accumulate, best_k, from_ints, gather_elements, offsets, strides, values, Accumulation, Values,
 };
-use crate::dialects::tensor::ir::shape::{axis_index, free_axes};
-use crate::dialects::tensor::ir::{
-    ArgMax, ArgMaxOperands, ArgMaxResults, BinaryKind, DotGeneral, DotGeneralOperands,
-    DotGeneralResults, Reduce, ReduceKind, ReduceOperands, ReduceResults, Segment, SegmentOperands,
-    SegmentResults, TopK, TopKOperands, TopKResults,
-};
+use crate::dialects::arith;
+use crate::dialects::tensor::ir::*;
+use crate::dialects::tensor::utils::contraction::Side;
+use crate::dialects::tensor::utils::shape::{axis_index, pick};
+use crate::dialects::tensor::Accumulates;
 use crate::host::{HostTensor, TensorData};
 use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
+use crate::scalar::Combiner;
 use crate::types::DType;
 
 impl Eval for DotGeneral {
@@ -30,15 +30,14 @@ impl Eval for DotGeneral {
         _cx: &mut EvalCx<'_, NoRegions>,
     ) -> Result<DotGeneralResults<OwnedHost>> {
         let (lhs, rhs) = (ins.lhs, ins.rhs);
-        let accum = self.accum.unwrap_or(lhs.dtype().default_accumulator());
-        let out = self.out.unwrap_or(lhs.dtype());
+        let (accum, out) = (self.accum_dtype(lhs.dtype()), self.out_dtype(lhs.dtype()));
         let (lhs_dims, rhs_dims) = (&lhs.dims, &rhs.dims);
         let (lhs_strides, rhs_strides) = (strides(lhs_dims), strides(rhs_dims));
         let axes = self.axes(lhs_dims.len(), rhs_dims.len())?;
 
         // The result axes, with the steps each takes through lhs and through rhs.
-        let lhs_free = free_axes(lhs_dims.len(), &axes.batch_lhs, &axes.contract_lhs);
-        let rhs_free = free_axes(rhs_dims.len(), &axes.batch_rhs, &axes.contract_rhs);
+        let lhs_free = axes.free(Side::Lhs);
+        let rhs_free = axes.free(Side::Rhs);
         let out_dims = [
             pick(lhs_dims, &axes.batch_lhs),
             pick(lhs_dims, &lhs_free),
@@ -69,143 +68,116 @@ impl Eval for DotGeneral {
                 &pick(&rhs_strides, &axes.contract_rhs),
             ))
             .collect();
-        let (l, r) = (cast(&lhs.data, accum)?, cast(&rhs.data, accum)?);
-        let sums = match (values(&l), values(&r)) {
-            (Values::Int(l), Values::Int(r)) => {
-                let int = int_format(accum)?;
-                Values::Int(dot(&l, &r, &rows, &terms, accum, |x| int.wrap(x)))
-            }
-            (Values::F32(l), Values::F32(r)) => Values::F32(Cow::Owned(dot(
-                &l,
-                &r,
-                &rows,
-                &terms,
-                accum,
-                rounder(accum),
-            ))),
-            (Values::F64(l), Values::F64(r)) => {
-                Values::F64(Cow::Owned(dot(&l, &r, &rows, &terms, accum, |x| x)))
-            }
-            _ => bail!("the interpreter cannot accumulate in {accum}"),
-        };
+        let data = accumulate(&[&lhs.data, &rhs.data], accum, out, &Dot { rows, terms })?;
         Ok(DotGeneralResults {
-            output: HostTensor::new(out_dims, cast(&from_values(accum, sums)?, out)?)?,
+            output: HostTensor::new(out_dims, data)?,
         })
     }
 }
 
 /// Each result element sums its products from 0, in row-major order of the contracting axes
-/// taken in `contract_lhs` order, rounding each product and each sum with `round` to `accum`.
-/// `rows` and `terms` hold offsets into `lhs` and `rhs`.
-fn dot<T: Arith>(
-    lhs: &[T],
-    rhs: &[T],
-    rows: &[(usize, usize)],
-    terms: &[(usize, usize)],
-    accum: DType,
-    round: impl Fn(T) -> T,
-) -> Vec<T> {
-    let add = T::binary(BinaryKind::Add).expect("every computation type adds");
-    let mul = T::binary(BinaryKind::Mul).expect("every computation type multiplies");
-    let zero = T::reduce_init(ReduceKind::Sum, accum).expect("an arithmetic accumulator");
-    rows.iter()
-        .map(|&(lhs_row, rhs_row)| {
-            terms.iter().fold(zero, |sum, &(l, r)| {
-                round(add(sum, round(mul(lhs[lhs_row + l], rhs[rhs_row + r]))))
-            })
-        })
-        .collect()
+/// taken in `contract_lhs` order, rounding each product and each sum. `rows` and `terms` hold
+/// offsets into `lhs` and `rhs`.
+struct Dot {
+    rows: Vec<(usize, usize)>,
+    terms: Vec<(usize, usize)>,
 }
 
-impl Eval for Reduce {
-    fn eval(
+impl Accumulation for Dot {
+    fn run<T: Arith>(
         &self,
-        ins: ReduceOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
-    ) -> Result<ReduceResults<OwnedHost>> {
-        let dims = &ins.input.dims;
-        let in_strides = strides(dims);
-        let axes = self.reduced_axes(dims.len())?;
-        let kept = free_axes(dims.len(), &axes, &[]);
-        let rows = offsets(&pick(dims, &kept), &pick(&in_strides, &kept));
-        // Each result element folds its inputs in row-major order of the reduced axes.
-        let terms = offsets(&pick(dims, &axes), &pick(&in_strides, &axes));
-        let groups: Vec<Vec<usize>> = rows
+        inputs: &[&[T]],
+        accum: DType,
+        round: impl Fn(T) -> T,
+    ) -> Result<Vec<T>> {
+        let &[lhs, rhs] = inputs else {
+            bail!("a dot reads two tensors");
+        };
+        let add = T::binary::<arith::Add>(accum)?;
+        let mul = T::binary::<arith::Mul>(accum)?;
+        let zero = T::fold_init::<Add>(accum)?;
+        let defined = "add and mul are defined on every pair";
+        Ok(self
+            .rows
             .iter()
-            .map(|row| terms.iter().map(|term| row + term).collect())
-            .collect();
-        let out = self.out.unwrap_or(ins.input.dtype());
-        let data = reduce(ins.input, &groups, self.kind, self.accum, out)?;
-        Ok(ReduceResults {
-            output: HostTensor::new(self.reduced_dims(&axes, dims, 1).into_vec(), data)?,
-        })
+            .map(|&(lhs_row, rhs_row)| {
+                self.terms.iter().fold(zero, |sum, &(l, r)| {
+                    let product = round(mul(lhs[lhs_row + l], rhs[rhs_row + r]).expect(defined));
+                    round(add(sum, product).expect(defined))
+                })
+            })
+            .collect())
     }
 }
 
-/// The `kind` reduction of the elements of `input` at each group of indices, accumulated in
+/// The reduction of `input` over the axes of `attrs`, folding with `C`.
+pub(crate) fn reduce_axes<C: Combiner>(
+    attrs: &ReduceAttrs,
+    input: &HostTensor,
+) -> Result<HostTensor> {
+    let dims = &input.dims;
+    let in_strides = strides(dims);
+    let axes = attrs.reduced_axes(dims.len())?;
+    let kept = attrs.kept_axes(dims.len())?;
+    let rows = offsets(&pick(dims, &kept), &pick(&in_strides, &kept));
+    // Each result element folds its inputs in row-major order of the reduced axes.
+    let terms = offsets(&pick(dims, &axes), &pick(&in_strides, &axes));
+    let groups: Vec<Vec<usize>> = rows
+        .iter()
+        .map(|row| terms.iter().map(|term| row + term).collect())
+        .collect();
+    let (accum, out) = (
+        attrs.accum_dtype(input.dtype()),
+        attrs.out_dtype(input.dtype()),
+    );
+    let data = fold_groups::<C>(input, &groups, accum, out)?;
+    HostTensor::new(attrs.reduced_dims(&axes, dims, 1), data)
+}
+
+/// The fold with `C` of the elements of `input` at each group of indices, accumulated in
 /// `accum`, by default the input's default accumulator, and cast to `out`.
-pub(super) fn reduce(
+pub(super) fn fold_groups<C: Combiner>(
     input: &HostTensor,
     groups: &[Vec<usize>],
-    kind: ReduceKind,
-    accum: Option<DType>,
+    accum: DType,
     out: DType,
 ) -> Result<TensorData> {
-    let accum = accum.unwrap_or(input.dtype().default_accumulator());
-    let data = cast(&input.data, accum)?;
-    let folded = match values(&data) {
-        Values::Int(x) => {
-            let int = int_format(accum)?;
-            Values::Int(fold_groups(&x, groups, kind, accum, |v| int.wrap(v))?)
-        }
-        Values::F32(x) => Values::F32(Cow::Owned(fold_groups(
-            &x,
-            groups,
-            kind,
-            accum,
-            rounder(accum),
-        )?)),
-        Values::F64(x) => Values::F64(Cow::Owned(fold_groups(&x, groups, kind, accum, |v| v)?)),
+    let fold = Fold::<C> {
+        groups,
+        combiner: PhantomData,
     };
-    cast(&from_values(accum, folded)?, out)
+    accumulate(&[&input.data], accum, out, &fold)
 }
 
-/// The `kind` reduction of the elements of `x`, of `dtype`, at each group of indices, folded into
-/// the reduction's initial value in order, each step rounded with `round`.
-fn fold_groups<T: Arith>(
-    x: &[T],
-    groups: &[Vec<usize>],
-    kind: ReduceKind,
-    dtype: DType,
-    round: impl Fn(T) -> T,
-) -> Result<Vec<T>> {
-    let missing = || anyhow!("the interpreter has no {dtype} reduction {kind:?}");
-    let init = T::reduce_init(kind, dtype).ok_or_else(missing)?;
-    let combine = T::binary(kind.combiner()).ok_or_else(missing)?;
-    Ok(groups
-        .iter()
-        .map(|group| group.iter().fold(init, |acc, &i| round(combine(acc, x[i]))))
-        .collect())
+/// Each group of indices folds its elements with `C`, from its initial value, in order.
+struct Fold<'a, C> {
+    groups: &'a [Vec<usize>],
+    combiner: PhantomData<C>,
 }
 
-/// `values[axis]` for each of `axes`.
-fn pick(values: &[usize], axes: &[usize]) -> Vec<usize> {
-    axes.iter().map(|&axis| values[axis]).collect()
-}
-
-/// The element offset of every point of a loop nest, in row-major order: loop `i` runs
-/// `extents[i]` times and steps `steps[i]` elements.
-fn offsets(extents: &[usize], steps: &[usize]) -> Vec<usize> {
-    let count: usize = extents.iter().product();
-    (0..count)
-        .map(|i| {
-            unravel(i, extents)
-                .iter()
-                .zip(steps)
-                .map(|(coord, step)| coord * step)
-                .sum()
-        })
-        .collect()
+impl<C: Combiner> Accumulation for Fold<'_, C> {
+    fn run<T: Arith>(
+        &self,
+        inputs: &[&[T]],
+        accum: DType,
+        round: impl Fn(T) -> T,
+    ) -> Result<Vec<T>> {
+        let &[x] = inputs else {
+            bail!("a reduction reads one tensor");
+        };
+        let init = T::fold_init::<C>(accum)?;
+        let combine = T::binary::<C::Scalar>(accum)?;
+        let defined = "a fold is defined on every pair";
+        Ok(self
+            .groups
+            .iter()
+            .map(|group| {
+                group
+                    .iter()
+                    .fold(init, |acc, &i| round(combine(acc, x[i]).expect(defined)))
+            })
+            .collect())
+    }
 }
 
 /// How element `a` of `data` orders against element `b`, with NaN above every number.
@@ -241,114 +213,121 @@ impl Eval for ArgMax {
     ) -> Result<ArgMaxResults<OwnedHost>> {
         let compare = order(&ins.input.data);
         let axis = axis_index(self.axis, ins.input.dims.len())?;
-        let indices = lines(&ins.input.dims, axis)
-            .map(|line| {
-                (0..line.len())
-                    .reduce(|best, j| match compare(line[j], line[best]) {
-                        Ordering::Greater => j,
-                        _ => best,
-                    })
-                    .expect("the axis is not empty")
-            })
-            .collect::<Vec<usize>>();
+        let mut indices = Vec::new();
+        for line in lines(&ins.input.dims, axis) {
+            let best = best_k(line.len(), 1, true, |first, second| {
+                compare(line[first], line[second])
+            });
+            indices.push(best[0]);
+        }
         Ok(ArgMaxResults {
             output: index_tensor(cx.result_dims(0)?, &indices, self.out)?,
         })
     }
 }
 
-impl Eval for TopK {
-    fn eval(
-        &self,
-        ins: TopKOperands<Host<'_>>,
-        cx: &mut EvalCx<'_, NoRegions>,
-    ) -> Result<TopKResults<OwnedHost>> {
-        let input = ins.input;
-        let compare = order(&input.data);
-        // The positions of the kept elements, line by line, then reordered to the result's
-        // row-major order, where the `k` kept elements of a line run along `axis`.
-        let axis = axis_index(self.axis, input.dims.len())?;
-        let (outer, _, inner) = split_axis(&input.dims, axis);
-        let mut picked = vec![0usize; outer * self.k * inner];
-        let mut indices = vec![0usize; outer * self.k * inner];
-        for (line_index, line) in lines(&input.dims, axis).enumerate() {
-            let mut order: Vec<usize> = (0..line.len()).collect();
-            order.sort_by(|&a, &b| {
-                let ordering = compare(line[a], line[b]);
-                if self.largest {
-                    ordering.reverse()
-                } else {
-                    ordering
-                }
-            });
-            let (o, i) = (line_index / inner, line_index % inner);
-            for (rank, &j) in order[..self.k].iter().enumerate() {
-                let at = (o * self.k + rank) * inner + i;
-                picked[at] = line[j];
-                indices[at] = j;
-            }
-        }
-        let dims = cx.result_dims(0)?;
-        Ok(TopKResults {
-            values: HostTensor::new(
-                dims.clone(),
-                gather_elements(&input.data, picked.len(), |at| picked[at])?,
-            )?,
-            indices: index_tensor(dims, &indices, self.indices)?,
-        })
+/// The rows of `data` folded with `C` into the segments of `attrs` that `ids` name.
+pub(crate) fn reduce_segments<C: Combiner>(
+    attrs: &SegmentAttrs,
+    data: &HostTensor,
+    ids: &HostTensor,
+) -> Result<HostTensor> {
+    let ids = ids.as_indices()?;
+    if attrs.indices_are_sorted {
+        ensure!(
+            ids.windows(2).all(|pair| pair[0] <= pair[1]),
+            "the segment ids are not sorted"
+        );
     }
-}
-
-impl Eval for Segment {
-    fn eval(
-        &self,
-        ins: SegmentOperands<Host<'_>>,
-        cx: &mut EvalCx<'_, NoRegions>,
-    ) -> Result<SegmentResults<OwnedHost>> {
-        let (data, ids) = (ins.data, ins.segment_ids.as_indices()?);
-        if self.indices_are_sorted {
-            ensure!(
-                ids.windows(2).all(|pair| pair[0] <= pair[1]),
-                "the segment ids are not sorted"
-            );
-        }
-        if self.unique {
-            let mut seen = std::collections::HashSet::new();
-            ensure!(
-                ids.iter().all(|id| seen.insert(id)),
-                "the segment ids repeat"
-            );
-        }
-        let row: usize = data.dims[1..].iter().product();
-        // Element `e` of segment `s` folds element `e` of every row that `s` holds, in order.
-        let mut groups = vec![Vec::new(); self.num_segments * row];
-        for (r, &id) in ids.iter().enumerate() {
-            let segment = usize::try_from(id)
-                .ok()
-                .filter(|&segment| segment < self.num_segments)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "segment id {id} is out of range for {} segments",
-                        self.num_segments
-                    )
-                })?;
-            for e in 0..row {
-                groups[segment * row + e].push(r * row + e);
-            }
-        }
-        let out = reduce(data, &groups, self.kind, None, data.dtype())?;
-        Ok(SegmentResults {
-            output: HostTensor::new(cx.result_dims(0)?, out)?,
-        })
+    if attrs.unique {
+        let mut seen = std::collections::HashSet::new();
+        ensure!(
+            ids.iter().all(|id| seen.insert(id)),
+            "the segment ids repeat"
+        );
     }
+    let row: usize = data.dims[1..].iter().product();
+    // Element `e` of segment `s` folds element `e` of every row that `s` holds, in order.
+    let mut groups = vec![Vec::new(); attrs.num_segments * row];
+    for (row_index, &id) in ids.iter().enumerate() {
+        let segment = usize::try_from(id)
+            .ok()
+            .filter(|&segment| segment < attrs.num_segments)
+            .ok_or_else(|| {
+                anyhow!(
+                    "segment id {id} is out of range for {} segments",
+                    attrs.num_segments
+                )
+            })?;
+        for element in 0..row {
+            groups[segment * row + element].push(row_index * row + element);
+        }
+    }
+    let accum = data.dtype().default_accumulator();
+    let out = fold_groups::<C>(data, &groups, accum, data.dtype())?;
+    let dims = [&[attrs.num_segments], &data.dims[1..]].concat();
+    HostTensor::new(dims, out)
 }
 
 /// A tensor of `indices` in the index dtype `dtype`, si32 or si64.
 fn index_tensor(dims: Vec<usize>, indices: &[usize], dtype: DType) -> Result<HostTensor> {
-    let data = match dtype {
-        DType::Si32 => TensorData::Si32(indices.iter().map(|&i| i as i32).collect()),
-        DType::Si64 => TensorData::Si64(indices.iter().map(|&i| i as i64).collect()),
-        other => bail!("{other} holds no indices"),
-    };
+    let data = from_ints(dtype, indices.iter().map(|&i| i as i128))?;
     HostTensor::new(dims, data)
+}
+
+/// The semantics of every [`Reduce`] op.
+pub(crate) fn reduce<T: Reduce>(
+    op: &T,
+    ins: ReduceOperands<Host<'_>>,
+    _cx: &mut EvalCx<'_, NoRegions>,
+) -> Result<ReduceResults<OwnedHost>> {
+    Ok(ReduceResults {
+        output: reduce_axes::<T::Combiner>(op, ins.input)?,
+    })
+}
+
+/// The semantics of every [`Segment`] op.
+pub(crate) fn segment<T: Segment>(
+    op: &T,
+    ins: SegmentOperands<Host<'_>>,
+    _cx: &mut EvalCx<'_, NoRegions>,
+) -> Result<SegmentResults<OwnedHost>> {
+    Ok(SegmentResults {
+        output: reduce_segments::<T::Combiner>(op, ins.data, ins.segment_ids)?,
+    })
+}
+
+/// The semantics of every [`SelectK`] op.
+pub(crate) fn select_k<T: SelectK>(
+    op: &T,
+    ins: SelectKOperands<Host<'_>>,
+    cx: &mut EvalCx<'_, NoRegions>,
+) -> Result<SelectKResults<OwnedHost>> {
+    let input = ins.input;
+    let compare = order(&input.data);
+    // The positions of the kept elements, line by line, then reordered to the result's row-major
+    // order, where the `k` kept elements of a line run along `axis`.
+    let axis = axis_index(op.axis, input.dims.len())?;
+    let (outer, _, inner) = split_axis(&input.dims, axis);
+    let mut picked = vec![0usize; outer * op.k * inner];
+    let mut indices = vec![0usize; outer * op.k * inner];
+    for (line_index, line) in lines(&input.dims, axis).enumerate() {
+        let ranking = best_k(line.len(), op.k, T::LARGEST, |first, second| {
+            compare(line[first], line[second])
+        });
+        let (outer_index, inner_index) = (line_index / inner, line_index % inner);
+        for (rank, &position) in ranking.iter().enumerate() {
+            let at = (outer_index * op.k + rank) * inner + inner_index;
+            picked[at] = line[position];
+            indices[at] = position;
+        }
+    }
+    let dims = cx.result_dims(0)?;
+    Ok(SelectKResults {
+        values: HostTensor::new(
+            dims.clone(),
+            gather_elements(&input.data, picked.len(), |at| picked[at])?,
+        )?,
+        indices: index_tensor(dims, &indices, op.indices)?,
+    })
 }

@@ -1,0 +1,15 @@
+// RUN: pass tensor-to-tile
+
+// Element `i` draws word block `i` of the stream; the new state advances the counter.
+// CHECK: tile.block(%0) {iters = [par 2, par 3], reads = [$0[0], $0[1]], folds = [none -> [d0, d1]]}
+// CHECK: tile.index() {expr = d0 * 3 + d1, dtype = ui64}
+// CHECK-NEXT: arith.rng_uniform(%0, %1, {{%[0-9]+}}) {dtype = f32}
+// CHECK: tile.index() {expr = 2, dtype = ui64}
+// CHECK: arith.rng_normal
+// CHECK-NOT: tensor.
+func.func @rng(%0: tensor<2xui64>) -> (tensor<2x3xf32>, tensor<4xbf16>, tensor<2xui64>, tensor<4xui32>) {
+  %1, %2 = tensor.rng_uniform(%0) {shape = [2, 3], dtype = f32} : (tensor<2xui64>) -> (tensor<2xui64>, tensor<2x3xf32>)
+  %3, %4 = tensor.rng_normal(%1) {shape = [4], dtype = bf16} : (tensor<2xui64>) -> (tensor<2xui64>, tensor<4xbf16>)
+  %5, %6 = tensor.rng_uniform(%3) {shape = [4], dtype = ui32} : (tensor<2xui64>) -> (tensor<2xui64>, tensor<4xui32>)
+  func.return(%2, %4, %5, %6) : (tensor<2x3xf32>, tensor<4xbf16>, tensor<2xui64>, tensor<4xui32>) -> ()
+}

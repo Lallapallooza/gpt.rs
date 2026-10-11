@@ -1,0 +1,8 @@
+// RUN: roundtrip
+
+func.func @located(%0: tensor<4xf32>) -> tensor<4xf32> {
+  %1 = tensor.exp(%0) : (tensor<4xf32>) -> tensor<4xf32> loc("model.layers.3.mlp"("crates/gpt-rs/src/nn/layers/mlp.rs":42:9))
+  %2 = tensor.neg(%1) : (tensor<4xf32>) -> tensor<4xf32> loc("model.layers.3.mlp")
+  %3 = tensor.abs(%2) : (tensor<4xf32>) -> tensor<4xf32> loc("crates/gpt-rs/src/nn/layers/mlp.rs":43:9)
+  func.return(%3) : (tensor<4xf32>) -> ()
+}

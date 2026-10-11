@@ -21,7 +21,7 @@ func.func @take_scalar_table(%0: tensor<f32>, %1: tensor<3xsi32>) -> tensor<3xf3
 }
 
 // -----
-// ERROR: tensor.take: indices must be si32 or si64, got tensor<3xf32>
+// ERROR: tensor.take: indices must be si32 or si64, got f32
 func.func @take_float_indices(%0: tensor<10x4xf32>, %1: tensor<3xf32>) -> tensor<3x4xf32> {
   %2 = tensor.take(%0, %1) : (tensor<10x4xf32>, tensor<3xf32>) -> tensor<3x4xf32>
   func.return(%2) : (tensor<3x4xf32>) -> ()
@@ -84,7 +84,7 @@ func.func @dynamic_update_slice_dynamic_update(%0: tensor<4x8xf32>, %1: tensor<1
 }
 
 // -----
-// ERROR: tensor.gather: indices must be si32 or si64, got tensor<3x2xf32>
+// ERROR: tensor.gather: indices must be si32 or si64, got f32
 func.func @gather_float_indices(%0: tensor<3x4xf32>, %1: tensor<3x2xf32>) -> tensor<3x2xf32> {
   %2 = tensor.gather(%0, %1) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xf32>) -> tensor<3x2xf32>
   func.return(%2) : (tensor<3x2xf32>) -> ()

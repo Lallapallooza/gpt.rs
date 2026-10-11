@@ -60,17 +60,17 @@ pub fn registered() -> Vec<&'static PassEntry> {
 /// The passes of a pass list such as `canonicalize {fuel = 10}, cse`, in order.
 pub fn parse(text: &str) -> Result<Pipeline> {
     let entries = registered();
-    let mut c = Cursor::new(text);
+    let mut cursor = Cursor::new(text);
     let mut pipeline = Pipeline::new();
     loop {
-        let name = c.word()?;
+        let name = cursor.word()?;
         let Some(entry) = entries.iter().find(|entry| entry.name == name) else {
-            return Err(c.error(format!("unknown pass `{name}`")));
+            return Err(cursor.error(format!("unknown pass `{name}`")));
         };
-        pipeline.passes.push((entry.make)(&mut c)?);
-        if c.at_end() {
+        pipeline.passes.push((entry.make)(&mut cursor)?);
+        if cursor.at_end() {
             return Ok(pipeline);
         }
-        c.expect(",")?;
+        cursor.expect(",")?;
     }
 }

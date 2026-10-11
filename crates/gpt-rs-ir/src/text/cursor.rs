@@ -64,11 +64,32 @@ impl<'a> Cursor<'a> {
         self.rest().chars().next()
     }
 
+    /// The character right after the next one, with no whitespace skipped between them.
+    pub fn peek_second(&mut self) -> Option<char> {
+        self.skip_ws();
+        self.rest().chars().nth(1)
+    }
+
     /// True when the next two tokens are `first` and `second`, with only whitespace between.
     pub fn peek_pair(&mut self, first: char, second: char) -> bool {
         self.skip_ws();
         let mut chars = self.rest().chars();
         chars.next() == Some(first) && chars.as_str().trim_start().starts_with(second)
+    }
+
+    /// True when an attribute dictionary comes next: `{` then a key and `=`, not `==`.
+    pub fn peek_attr_dict(&mut self) -> bool {
+        self.skip_ws();
+        let Some(inner) = self.rest().strip_prefix('{') else {
+            return false;
+        };
+        let inner = inner.trim_start();
+        let end = inner.find(|c| !is_ident_char(c)).unwrap_or(inner.len());
+        if end == 0 || !inner.starts_with(is_ident_start) {
+            return false;
+        }
+        let after = inner[end..].trim_start();
+        after.starts_with('=') && !after.starts_with("==")
     }
 
     /// True when the next token starts with `s`.
@@ -152,7 +173,9 @@ impl<'a> Cursor<'a> {
         let end = rest[digits_start..]
             .find(|c: char| !c.is_ascii_digit())
             .map_or(rest.len(), |i| i + digits_start);
-        if end == digits_start || rest[end..].starts_with('.') {
+        // A `.` after the digits makes a float, but `..` ends the integer, as in `$1..$4`.
+        let float = rest[end..].starts_with('.') && !rest[end..].starts_with("..");
+        if end == digits_start || float {
             return Err(self.error("expected an integer"));
         }
         let value = rest[..end]
@@ -204,6 +227,33 @@ impl<'a> Cursor<'a> {
             .map_err(|_| self.error("expected a float"))?;
         self.pos += end;
         Ok(value)
+    }
+
+    /// The text of the next number token, integer or float, as [`Cursor::float`] reads it.
+    pub fn number(&mut self) -> Result<&'a str> {
+        self.skip_ws();
+        let rest = self.rest();
+        let is_word =
+            |word: &&str| rest.starts_with(*word) && !rest[word.len()..].starts_with(is_ident_char);
+        let end = match ["-inf", "inf", "NaN", "-NaN"].into_iter().find(is_word) {
+            Some(word) => word.len(),
+            None => rest
+                .char_indices()
+                .find(|&(i, c)| {
+                    !(c.is_ascii_digit()
+                        || c == '.'
+                        || c == 'e'
+                        || c == 'E'
+                        || ((c == '-' || c == '+')
+                            && (i == 0 || matches!(&rest[i - 1..i], "e" | "E"))))
+                })
+                .map_or(rest.len(), |(i, _)| i),
+        };
+        if end == 0 {
+            return Err(self.error("expected a number"));
+        }
+        self.pos += end;
+        Ok(&rest[..end])
     }
 
     /// True when the next number token has a fractional part, an exponent or is `inf`/`NaN`.

@@ -28,19 +28,23 @@ The loader:
    build their layers through `nn::Params`, which reads each tensor by its parameter name. Shapes
    come from the checkpoint, and the functionals check them when the model runs. For names and
    layouts, see [formats.md](formats.md#parameter-names-and-layouts).
-4. Wraps the model in a `ModelHandle` with the checkpoint's `eos_token_ids`.
+4. Wraps the model in a `ModelHandle` with the checkpoint's `eos_token_ids` and the runtime
+   settings it runs with.
 
 `load_model_with_options(backend, path, options)` is the general form. `LoadOptions` in
-`crates/gpt-rs/src/runtime/loader.rs` holds the parameter namespace, the runtime settings
-(`ModelRuntimeConfig`: `matmul_input_dtype`), and config keys that replace the checkpoint's. The keys
-are those of the model's config struct, so `num_hidden_layers` truncates a Ministral or Qwen3.5
-model and `n_layer` truncates a GPT-2 model.
+`crates/gpt-rs/src/runtime/loader.rs` holds the parameter namespace, plus runtime settings
+(`ModelRuntimeConfig`: `matmul_input_dtype`) and config keys, both of which replace what the
+checkpoint declares. The keys are those of the model's config struct, so `num_hidden_layers`
+truncates a Ministral or Qwen3.5 model and `n_layer` truncates a GPT-2 model.
 
 `nn::Params` passes `matmul_input_dtype` to every projection layer (`nn::Linear`) it builds. With
 `bf16`, each layer casts its input to bf16 before `functional::linear`, which multiplies with f32
 accumulation and f32 outputs. Norms, attention and the recurrent state stay in f32. These numerics
-differ from a PyTorch bf16 model, which also rounds matmul outputs and residuals to bf16. The
-default keeps activations in f32 and widens bf16 weights exactly.
+differ from a PyTorch bf16 model, which also rounds matmul outputs and residuals to bf16. A
+checkpoint whose config declares bf16 (`dtype`, or `torch_dtype` in configs saved before
+transformers 4.56) gets `bf16` by default. Any other checkpoint keeps f32 inputs, and the matmul
+widens bf16 weights to f32 exactly. This includes an f16 checkpoint, since f16 activations can
+overflow. The CLI's `--matmul-input-dtype` and the Qwen3.5 eval case's flag override it.
 
 ## Dynamic model interface (`LoadedModel`)
 

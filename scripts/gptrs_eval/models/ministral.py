@@ -122,7 +122,8 @@ class MinistralCase:
         prompt = str(cfg.params.get("prompt", "Hello"))
         generate_tokens = int(cfg.params.get("generate_tokens", 0))
         max_prompt_tokens = int(cfg.params.get("max_prompt_tokens", 64))
-        rs_model = load_gpt_rs(cfg)
+        # Use f32 projection inputs, so the logits match the float32 reference to f32 precision.
+        rs_model = load_gpt_rs(cfg, matmul_input_dtype="f32")
         tokenizer, torch_model = self._build_hf(cfg)
 
         prompt_tokens = encode_prompt(tokenizer, prompt, max_prompt_tokens)

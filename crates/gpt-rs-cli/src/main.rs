@@ -170,7 +170,8 @@ enum Command {
 /// Checkpoint loading options shared by every command that loads a model.
 #[derive(ClapArgs, Clone)]
 struct LoadArgs {
-    /// Input dtype of the projection matmuls (f32 or bf16).
+    /// Input dtype of the projection matmuls (f32 or bf16). The default is bf16 for a checkpoint
+    /// that declares bf16, else f32.
     #[arg(long, value_name = "DTYPE")]
     matmul_input_dtype: Option<gpt_rs::DType>,
 }

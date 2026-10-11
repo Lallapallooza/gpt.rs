@@ -217,7 +217,8 @@ class Qwen35Case:
             "--matmul-input-dtype",
             choices=["f32", "bf16"],
             default=None,
-            help="gpt-rs projection matmul input precision (default: f32).",
+            help="Input dtype of the gpt-rs projection matmuls. The default is f32 for validate. "
+            "For bench and run it is bf16 when the checkpoint declares bf16, else f32.",
         )
         parser.add_argument(
             "--max-rel-diff",
@@ -236,10 +237,12 @@ class Qwen35Case:
             help="Compile the Torch baseline forward with torch.compile (inductor) for bench.",
         )
 
-    def _gpt_rs_model(self, cfg: RunConfig) -> Any:
+    def _gpt_rs_model(self, cfg: RunConfig, input_dtype: str | None) -> Any:
+        """The gpt-rs model with projection inputs in `input_dtype`, or in the loader's default
+        when it is `None`: bf16 for a bf16 checkpoint, else f32."""
         return load_gpt_rs(
             cfg,
-            matmul_input_dtype=cfg.params.get("matmul_input_dtype"),
+            matmul_input_dtype=input_dtype,
             config_overrides={"num_hidden_layers": self._num_layers(cfg)},
         )
 
@@ -270,7 +273,12 @@ class Qwen35Case:
         return tokenizer, text, tokens
 
     def validate(self, cfg: RunConfig) -> ValidationResult:
-        """Compares logits, greedy continuation and tokenizer with the streamed float32 HF reference."""
+        """Compares logits, greedy continuation and tokenizer with the streamed float32 HF reference.
+
+        The projections take f32 inputs, because the reference computes in float32.
+        `--matmul-input-dtype` sets another dtype. With bf16 inputs, a tiny difference can flip
+        one bf16 rounding. That flip moves every later logit by up to one bf16 ulp.
+        """
         model_dir = hf_model_dir(cfg)
         num_layers = self._num_layers(cfg)
         tokenizer, text, tokens = self._prompt(cfg, model_dir)
@@ -279,7 +287,8 @@ class Qwen35Case:
             model_dir, tokenizer, [text, chat_text, *_TOKENIZER_SAMPLES]
         )
 
-        rs_model = self._gpt_rs_model(cfg)
+        input_dtype = cfg.params.get("matmul_input_dtype") or "f32"
+        rs_model = self._gpt_rs_model(cfg, input_dtype)
         with debug_context(cfg.params):
             rs_logits = np.asarray(rs_model.forward_tokens(tokens), dtype=np.float32)
         steps = int(cfg.params.get("generate_tokens", 0))
@@ -314,6 +323,7 @@ class Qwen35Case:
         extra: dict[str, Any] = {
             "prompt_len": len(tokens),
             "num_layers": num_layers,
+            "matmul_input_dtype": input_dtype,
             "rel_max_abs_diff": rel_diff,
             "max_rel_diff": max_rel_diff,
             "allclose": res.ok,
@@ -369,9 +379,13 @@ class Qwen35Case:
             )
             return prefill, total, marks[1] - marks[0] + marks[3] - marks[2]
 
+        input_dtype = "f32"
+
         def measure_gpt_rs() -> tuple[list[float], list[float], int]:
             # Scoped so the gpt-rs model is released before the HF model loads.
-            rs_model = self._gpt_rs_model(cfg)
+            nonlocal input_dtype
+            rs_model = self._gpt_rs_model(cfg, cfg.params.get("matmul_input_dtype"))
+            input_dtype = rs_model.matmul_input_dtype or "f32"
             return measure(
                 lambda n: rs_model.generate_tokens(
                     tokens,
@@ -430,13 +444,13 @@ class Qwen35Case:
                 "prompt_len": len(tokens),
                 "bench_tokens": steps,
                 "num_layers": num_layers,
-                "matmul_input_dtype": cfg.params.get("matmul_input_dtype") or "f32",
+                "matmul_input_dtype": input_dtype,
             },
         )
 
     def run(self, cfg: RunConfig) -> CliRunResult:
         tokenizer, _, tokens = self._prompt(cfg, hf_model_dir(cfg))
-        rs_model = self._gpt_rs_model(cfg)
+        rs_model = self._gpt_rs_model(cfg, cfg.params.get("matmul_input_dtype"))
         max_tokens = int(cfg.params.get("max_tokens", 64))
         temperature = float(cfg.params.get("temperature", 0.0))
         t0 = time.perf_counter()

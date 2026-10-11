@@ -44,7 +44,8 @@ fn upload_entry<B: PortableBackend + 'static>(
 pub struct LoadOptions {
     /// Parameter namespace. `None` allocates a fresh one.
     pub namespace: Option<ModelNamespaceId>,
-    /// How the runtime executes the model (see [`ModelRuntimeConfig`]).
+    /// How the runtime executes the model (see [`ModelRuntimeConfig`]). A field that is set
+    /// replaces what the checkpoint declares.
     pub runtime: ModelRuntimeConfig,
     /// Keys that replace those of the model config (the text config of a multimodal checkpoint).
     /// For example, `num_hidden_layers` loads only the first layers of a Ministral or Qwen3.5
@@ -70,7 +71,9 @@ pub fn load_model_with_options<B: PortableBackend + 'static>(
     let checkpoint = checkpoint::open(&path)
         .with_context(|| format!("failed to open checkpoint {}", path.as_ref().display()))?;
     let mut config = checkpoint.config().clone();
-    config.runtime = options.runtime;
+    if let Some(dtype) = options.runtime.matmul_input_dtype {
+        config.runtime.matmul_input_dtype = Some(dtype);
+    }
     if !options.config_overrides.is_empty() {
         let fields = config
             .config
@@ -113,5 +116,9 @@ pub fn load_model_with_options<B: PortableBackend + 'static>(
             path.as_ref().display()
         );
     }
-    Ok(ModelHandle::new(model, config.eos_token_ids))
+    Ok(ModelHandle::new(
+        model,
+        config.eos_token_ids,
+        config.runtime,
+    ))
 }

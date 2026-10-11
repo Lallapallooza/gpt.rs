@@ -11,6 +11,7 @@ use serde_json::{Map, Value};
 
 use super::{load_dtype, widen_to_f32, Checkpoint, TensorEntry, FP8_SCALE};
 use crate::io::safetensors::{runtime_dtype, SafetensorsFile, StoredTensor};
+use crate::model::config::ModelRuntimeConfig;
 use crate::model::ModelConfig;
 use crate::tensor::DType;
 
@@ -225,10 +226,28 @@ fn model_config(
         // Where the config was loaded from, not part of the model.
         fields.remove("_name_or_path");
     }
+    let runtime = ModelRuntimeConfig {
+        matmul_input_dtype: matmul_input_dtype(&config, raw),
+    };
     Ok(ModelConfig {
         kind,
         config,
-        runtime: Default::default(),
+        runtime,
         eos_token_ids,
     })
+}
+
+/// The input dtype of the projections. It is bf16 when the checkpoint declares bf16, so the
+/// matmuls round their inputs as the published model does. The config key is `dtype`, or
+/// `torch_dtype` in configs saved before transformers 4.56. bf16 keeps the exponent range of f32.
+/// An f16 checkpoint keeps f32 inputs, since f16 activations can overflow.
+fn matmul_input_dtype(config: &Value, raw: &Value) -> Option<DType> {
+    for source in [config, raw] {
+        for key in ["dtype", "torch_dtype"] {
+            if let Some(name) = source.get(key).and_then(Value::as_str) {
+                return (name == "bfloat16").then_some(DType::Bf16);
+            }
+        }
+    }
+    None
 }

@@ -191,6 +191,16 @@ impl PyLoadedModel {
     fn backend(&self) -> &str {
         &self.backend_name
     }
+
+    /// Input dtype of the projection matmuls that the checkpoint or the load options set, such as
+    /// `"bf16"` or `"f32"`, or `None` when neither sets one. `None` keeps the f32 input.
+    #[getter]
+    fn matmul_input_dtype(&self) -> Option<String> {
+        self.model
+            .runtime()
+            .matmul_input_dtype
+            .map(|dtype| dtype.to_string())
+    }
 }
 
 /// Loads the Hugging Face model directory `checkpoint`. `config_overrides` replaces keys of the

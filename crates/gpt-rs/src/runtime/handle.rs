@@ -2,6 +2,7 @@ use anyhow::Result;
 
 use crate::inference::vision::VisionModel;
 use crate::inference::CausalLanguageModel;
+use crate::model::config::ModelRuntimeConfig;
 
 /// A model loaded from a checkpoint. Its capabilities tell what it runs on: token ids for a
 /// causal language model, pixels for an image model.
@@ -18,23 +19,35 @@ pub trait LoadedModel: Send + Sync {
     }
 }
 
-/// A model loaded from a checkpoint, with the checkpoint's generation metadata.
+/// A model loaded from a checkpoint, with the checkpoint's generation metadata and the settings it
+/// runs with.
 pub struct ModelHandle {
     inner: Box<dyn LoadedModel>,
     eos_token_ids: Vec<usize>,
+    runtime: ModelRuntimeConfig,
 }
 
 impl ModelHandle {
-    pub fn new(inner: Box<dyn LoadedModel>, eos_token_ids: Vec<usize>) -> Self {
+    pub fn new(
+        inner: Box<dyn LoadedModel>,
+        eos_token_ids: Vec<usize>,
+        runtime: ModelRuntimeConfig,
+    ) -> Self {
         Self {
             inner,
             eos_token_ids,
+            runtime,
         }
     }
 
     /// Token ids that end a generated sequence, as the checkpoint declares them.
     pub fn eos_token_ids(&self) -> &[usize] {
         &self.eos_token_ids
+    }
+
+    /// How the model runs: what the checkpoint declares, or what the load options set.
+    pub fn runtime(&self) -> &ModelRuntimeConfig {
+        &self.runtime
     }
 
     /// The model as a causal language model, or an error naming its kind.

@@ -6,7 +6,8 @@ use anyhow::Result;
 use smallvec::SmallVec;
 
 use crate::dialects::func::Return;
-use crate::index::{Constraint, IndexExpr, IterList, Iters, Read, SymFact, Write};
+use crate::index::{Constraint, IndexExpr, IterList, Iters, OperandRef, Read, SymFact, Write};
+use crate::schedule::Schedule;
 use crate::traits::{IsolatedFromAbove, Terminator};
 use crate::types::{DType, Dim, Type};
 use crate::Attr;
@@ -50,12 +51,15 @@ pub struct Block {
 /// One group of the values that the body of a `tile.block` yields: the combine kind that folds
 /// them over the reduction iterators, the write of each of its results, and the operands that
 /// hold the state the fold starts from, one per state component, or none. Its text form is
-/// `kind -> write, ...`, then `init $k, ...` when it has a start state.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// `kind -> write` or `kind -> (write, ...)`, then `init $k` or `init ($k, ...)` when it has a
+/// start state.
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
+#[attr(format = "$combine `->` tuple($writes) (`init` tuple($init)^)?")]
 pub struct Fold {
     pub combine: CombineKind,
     pub writes: SmallVec<[Write; 1]>,
-    pub init: SmallVec<[usize; 1]>,
+    #[attr(default)]
+    pub init: SmallVec<[OperandRef; 1]>,
 }
 
 /// `tile.index`: the value of `expr` at the current point of the enclosing block, converted to
@@ -184,6 +188,7 @@ pub struct Group {
 /// - Its body's block arguments are its arguments, and its `func.return` gives its results.
 /// - `grid` lists the parallel iterators, by position, that its blocks share. `facts` gives a
 ///   range and a divisor of each dimension symbol of its arguments.
+/// - `schedule` says how it runs, which changes no value it computes.
 #[crate::op(
     "tile.dispatch",
     regions(body(Block(Return))),
@@ -198,6 +203,8 @@ pub struct Dispatch {
     pub grid: IterList,
     #[attr(default)]
     pub facts: BTreeMap<String, SymFact>,
+    #[attr(default)]
+    pub schedule: Schedule,
 }
 
 // ------------------------------------------------------------------------------------------------

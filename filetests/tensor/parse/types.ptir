@@ -1,21 +1,28 @@
 // RUN: parse
 
-// ERROR: 2:42: bad dimension `{}` in tensor type
+// ERROR: 2:35: expected a name, found `}`
 func.func @braces(%input: tensor<{}x3xf32>) -> tensor<{}x3xf32> {
   func.return(%input) : (tensor<{}x3xf32>) -> ()
 }
 
 // -----
 
-// ERROR: 2:38: bad dimension `+3` in tensor type
+// ERROR: 2:32: expected an extent or a dtype, found `+`
 func.func @plus(%input: tensor<+3xf32>) -> tensor<+3xf32> {
   func.return(%input) : (tensor<+3xf32>) -> ()
 }
 
 // -----
 
-// ERROR: 2:53: tensor type: rank 9 is above the largest rank, 8
+// ERROR: 2:32: rank 9 is above the largest rank, 8
 func.func @rank(%input: tensor<1x1x1x1x1x1x1x1x1xf32>) -> tensor<f32> {
   %scalar = tensor.reshape(%input) {shape = []} : (tensor<1x1x1x1x1x1x1x1x1xf32>) -> tensor<f32>
   func.return(%scalar) : (tensor<f32>) -> ()
+}
+
+// -----
+
+// ERROR: 2:36: a shape is written without spaces, as `4x{T}xf32`
+func.func @spaced(%input: tensor<4 x f32>) -> tensor<4xf32> {
+  func.return(%input) : (tensor<4xf32>) -> ()
 }

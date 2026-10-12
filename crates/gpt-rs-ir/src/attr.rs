@@ -1,22 +1,74 @@
-//! Attribute values: the fields of an op struct.
+//! Attribute values: the fields of an op struct, and their text forms.
 //!
-//! Every field type implements [`Attr`], which gives its text form. `#[derive(Attr)]` implements
-//! it for fieldless enums, printed as their snake_case variant names.
+//! Every field type implements [`Attr`]: it prints its text form and reads it back with a
+//! [`Cursor`], one token at a time. The impls in this module are the leaves, each one token or a
+//! list of attributes: integers, floats, strings, names, `[a, b]`, `(a, b)`, `{key = value}` and
+//! `none`. Every other attribute declares its text form with `#[derive(Attr)]`, which generates
+//! the printer and the parser from one declaration:
+//!
+//! - A fieldless enum is written by the snake_case name of each variant: `red_ordered`.
+//! - A variant with named fields, or one that holds an [`AttrGroup`], is written by its name and
+//!   its fields as parameters, each left out at its default: `top_k<k = 3>`.
+//! - `#[attr(format = "...")]` on a struct or on a variant gives its text form as a sequence of
+//!   elements, MLIR's declarative format:
+//!   - `` `by` `` is a literal: one token, a keyword, a name with its sigil (`!loop.buf`,
+//!     `#sched`) or punctuation (`->`, `[`).
+//!   - `$extent` is the text form of the field `extent`, and `$0` that of the first field of a
+//!     tuple struct or variant.
+//!   - `` (`pad` $pad^)? `` is an optional group: it is printed when its anchor, the field marked `^`,
+//!     is not at its default (an `Option` field is `Some`), and read when the token its first
+//!     element starts with comes next. A field of a group that is not its anchor has a default.
+//!   - `shape($dims, $dtype)` is the extents and the dtype of a tensor: `4x{T}xf32`.
+//!   - `tuple($writes)` is a list written as op results are: one item alone, any other number in
+//!     parentheses.
+//!   - `struct($nest, ...)` is `key = value` for each field, in any order, a field at its default
+//!     left out. A closing `>`, `}`, `)` or `]` follows it.
+//!   - ``` `` ``` removes the space between the elements around it.
+//!
+//!   The printer puts one space between elements, except after `(`, `[`, `<` and `{`, and before
+//!   `)`, `]`, `>`, `}`, `,`, `(`, `[`, `<`, and on either side of `..`.
+//!
+//!   The next token decides each choice, and `#[derive(Attr)]` rejects a format where it cannot:
+//!   two variants that start with one literal, or an optional group that starts with the literal
+//!   that follows it. The parser tries the variants in order and reads the first whose first
+//!   token comes next, so a variant that starts with a field goes after every variant whose
+//!   first token the field could also start with.
+//! - `#[attr(via = Text)]` on a type whose text form is that of the type `Text`, a struct that
+//!   declares it: `From<&T> for Text` writes it, and `TryFrom<Text> for T` checks and builds the
+//!   value, failing at the start of its text.
+//!
+//! Fields take `#[attr(default)]`, the type's default, or `#[attr(default = expr)]`. A type with
+//! a format or a via also gets `Display`, its text form.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use anyhow::{bail, ensure, Result};
 use smallvec::{Array, SmallVec};
 use tinyvec::ArrayVec;
 
-use crate::text::{is_ident_char, is_ident_start, Cursor};
-use crate::types::{ranked, DType, Dim, Perm, Ranked, Sym, TensorType, Type};
+use crate::text::{is_ident_start, is_name_char, Cursor, TokenKind};
+use crate::types::{ranked, DType, Dim, Ranked, Sym};
 
 pub trait Attr: Sized + Clone + PartialEq + Eq + Hash + fmt::Debug {
+    /// The name of the type whose values the text writes: the type of the items of a list, a map
+    /// or an option, else the type itself. The generated docs show the values or the format of
+    /// the type of this name.
+    const ITEM: &'static str;
+
+    /// The type as the reference pages name it: `[Fold]` for a list of folds, the type of its
+    /// value for an option, else its own name.
+    fn type_name() -> String {
+        Self::ITEM.to_string()
+    }
+
     fn print(&self, out: &mut String);
     fn parse(c: &mut Cursor<'_>) -> Result<Self>;
+    /// Whether the next token can start the text form. An optional group of a format, or a
+    /// variant of an enum, that starts with this attribute is read only when it does.
+    fn peek(c: &Cursor<'_>) -> bool;
 }
 
 /// The attributes that the ops of a family share, held in one struct: each op of the family is a
@@ -27,8 +79,13 @@ pub trait AttrGroup: Sized {
     /// Pushes `(name, text)` for every attribute, except an `#[attr(default)]` attribute at its
     /// default.
     fn print_attrs(&self, out: &mut Vec<(&'static str, String)>);
-    /// Parses the optional attribute dictionary of the op `op`.
-    fn parse_attrs(op: &str, c: &mut Cursor<'_>) -> Result<Self>;
+    /// Parses the optional attribute dictionary of the op `op`. A key the group does not have is
+    /// handed to `other`, with its position.
+    fn parse_attrs(
+        op: &str,
+        c: &mut Cursor<'_>,
+        other: &mut dyn FnMut(&str, &mut Cursor<'_>, usize) -> Result<()>,
+    ) -> Result<Self>;
     /// Parses the optional parameters, `<key = value, ...>`, after `name`, the name of a variant of
     /// an attribute enum that holds the group.
     fn parse_params(name: &str, c: &mut Cursor<'_>) -> Result<Self>;
@@ -46,6 +103,21 @@ pub struct AttrEnum {
 /// Every enum that `#[derive(Attr)]` defines.
 #[linkme::distributed_slice]
 pub static ATTR_ENUMS: [AttrEnum];
+
+/// An attribute type with a format or a via, which `#[derive(Attr)]` registers so that the
+/// generated docs can show its text form.
+pub struct AttrFormat {
+    /// The name of the type, or `Type::Variant` for a variant of an enum.
+    pub name: &'static str,
+    /// The format, as declared, or empty for a type with a via.
+    pub format: &'static str,
+    /// The types of the fields it writes, as declared, or its via.
+    pub fields: &'static [&'static str],
+}
+
+/// Every format that `#[derive(Attr)]` declares.
+#[linkme::distributed_slice]
+pub static ATTR_FORMATS: [AttrFormat];
 
 /// The text name and the doc comment of each value of `T`, in order.
 pub fn enum_values<T: Mnemonic>() -> Vec<(&'static str, &'static str)> {
@@ -70,24 +142,46 @@ pub trait Mnemonic: Sized + Copy + 'static {
     }
 }
 
+/// Reads a value of the fieldless enum `T`, written by its name.
+pub fn parse_mnemonic<T: Mnemonic>(c: &mut Cursor<'_>, what: &str) -> Result<T> {
+    let start = c.position();
+    let name = c.ident()?;
+    T::from_mnemonic(name).ok_or_else(|| c.error_at(start, format!("unknown {what} `{name}`")))
+}
+
+/// Whether the next token is the name of a value of the fieldless enum `T`.
+pub fn peek_mnemonic<T: Mnemonic>(c: &Cursor<'_>) -> bool {
+    let next = c.peek();
+    next.kind == TokenKind::Ident && T::from_mnemonic(next.text).is_some()
+}
+
 macro_rules! int_attr {
     ($($t:ty),*) => {$(
         impl Attr for $t {
+            const ITEM: &'static str = stringify!($t);
+
             fn print(&self, out: &mut String) {
                 out.push_str(&self.to_string());
             }
             fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-                let value = c.int()?;
-                <$t>::try_from(value)
-                    .map_err(|_| c.error(format!("{value} does not fit {}", stringify!($t))))
+                let start = c.position();
+                let text = c.int_text()?;
+                text.parse().map_err(|_| {
+                    c.error_at(start, format!("{text} does not fit {}", stringify!($t)))
+                })
+            }
+            fn peek(c: &Cursor<'_>) -> bool {
+                c.peek_unsigned().kind == TokenKind::Int
             }
         }
     )*};
 }
 
-int_attr!(usize, isize, i8, u8, i16, u16, i32, u32, i64, u64);
+int_attr!(usize, isize, i8, u8, i16, u16, i32, u32, i64, u64, u128);
 
 impl Attr for bool {
+    const ITEM: &'static str = "bool";
+
     fn print(&self, out: &mut String) {
         out.push_str(if *self { "true" } else { "false" });
     }
@@ -97,8 +191,11 @@ impl Attr for bool {
         } else if c.eat("false") {
             Ok(false)
         } else {
-            Err(c.error("expected `true` or `false`"))
+            Err(c.unexpected("`true` or `false`"))
         }
+    }
+    fn peek(c: &Cursor<'_>) -> bool {
+        c.peek_is("true") || c.peek_is("false")
     }
 }
 
@@ -116,21 +213,62 @@ pub(crate) fn print_string(s: &str, out: &mut String) {
 }
 
 impl Attr for String {
+    const ITEM: &'static str = "String";
+
     fn print(&self, out: &mut String) {
         print_string(self, out);
     }
     fn parse(c: &mut Cursor<'_>) -> Result<Self> {
         c.string()
     }
+    fn peek(c: &Cursor<'_>) -> bool {
+        c.peek_kind(TokenKind::String)
+    }
+}
+
+impl Attr for Arc<str> {
+    const ITEM: &'static str = "String";
+
+    fn print(&self, out: &mut String) {
+        print_string(self, out);
+    }
+    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
+        c.string().map(Arc::from)
+    }
+    fn peek(c: &Cursor<'_>) -> bool {
+        c.peek_kind(TokenKind::String)
+    }
 }
 
 impl Attr for DType {
+    const ITEM: &'static str = "DType";
+
     fn print(&self, out: &mut String) {
         out.push_str(self.mnemonic());
     }
     fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        let name = c.ident()?;
-        DType::from_mnemonic(name).ok_or_else(|| c.error(format!("unknown dtype `{name}`")))
+        if !c.peek_kind(TokenKind::Ident) {
+            return Err(c.unexpected("a dtype"));
+        }
+        parse_mnemonic(c, "dtype")
+    }
+    fn peek(c: &Cursor<'_>) -> bool {
+        peek_mnemonic::<DType>(c)
+    }
+}
+
+/// The name of a dimension symbol, written `{T}` where it is an extent.
+impl Attr for Sym {
+    const ITEM: &'static str = "Sym";
+
+    fn print(&self, out: &mut String) {
+        out.push_str(self.as_str());
+    }
+    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
+        c.ident().map(Sym::new)
+    }
+    fn peek(c: &Cursor<'_>) -> bool {
+        c.peek_kind(TokenKind::Ident)
     }
 }
 
@@ -147,6 +285,12 @@ fn print_list<T: Attr>(items: &[T], out: &mut String) {
 }
 
 impl<T: Attr> Attr for Vec<T> {
+    const ITEM: &'static str = T::ITEM;
+
+    fn type_name() -> String {
+        format!("[{}]", T::type_name())
+    }
+
     fn print(&self, out: &mut String) {
         print_list(self, out);
     }
@@ -154,17 +298,29 @@ impl<T: Attr> Attr for Vec<T> {
         c.expect("[")?;
         c.list("]", T::parse)
     }
+    fn peek(c: &Cursor<'_>) -> bool {
+        c.peek_is("[")
+    }
 }
 
 impl<A: Array> Attr for SmallVec<A>
 where
     A::Item: Attr,
 {
+    const ITEM: &'static str = A::Item::ITEM;
+
+    fn type_name() -> String {
+        format!("[{}]", A::Item::type_name())
+    }
+
     fn print(&self, out: &mut String) {
         print_list(self, out);
     }
     fn parse(c: &mut Cursor<'_>) -> Result<Self> {
         Vec::parse(c).map(SmallVec::from_vec)
+    }
+    fn peek(c: &Cursor<'_>) -> bool {
+        c.peek_is("[")
     }
 }
 
@@ -172,33 +328,43 @@ impl<A: tinyvec::Array + Clone> Attr for ArrayVec<A>
 where
     A::Item: Attr,
 {
+    const ITEM: &'static str = <A::Item as Attr>::ITEM;
+
+    fn type_name() -> String {
+        format!("[{}]", <A::Item as Attr>::type_name())
+    }
+
     fn print(&self, out: &mut String) {
         print_list(self, out);
     }
     fn parse(c: &mut Cursor<'_>) -> Result<Self> {
+        let start = c.position();
         let items = Vec::parse(c)?;
         ensure!(
             items.len() <= A::CAPACITY,
-            c.error(format!(
-                "a list of {} entries, above its limit of {}",
-                items.len(),
-                A::CAPACITY
-            ))
+            c.error_at(
+                start,
+                format!(
+                    "a list of {} entries, above its limit of {}",
+                    items.len(),
+                    A::CAPACITY
+                )
+            )
         );
         Ok(items.into_iter().collect())
     }
-}
-
-impl Attr for Perm {
-    fn print(&self, out: &mut String) {
-        print_list(self, out);
-    }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        Ranked::<usize>::parse(c).map(Perm::from_iter)
+    fn peek(c: &Cursor<'_>) -> bool {
+        c.peek_is("[")
     }
 }
 
 impl<T: Attr> Attr for Option<T> {
+    const ITEM: &'static str = T::ITEM;
+
+    fn type_name() -> String {
+        T::type_name()
+    }
+
     fn print(&self, out: &mut String) {
         match self {
             Some(value) => value.print(out),
@@ -212,9 +378,18 @@ impl<T: Attr> Attr for Option<T> {
             T::parse(c).map(Some)
         }
     }
+    fn peek(c: &Cursor<'_>) -> bool {
+        c.peek_is("none") || T::peek(c)
+    }
 }
 
 impl<A: Attr, B: Attr> Attr for (A, B) {
+    const ITEM: &'static str = "tuple";
+
+    fn type_name() -> String {
+        format!("({}, {})", A::type_name(), B::type_name())
+    }
+
     fn print(&self, out: &mut String) {
         out.push('(');
         self.0.print(out);
@@ -230,18 +405,65 @@ impl<A: Attr, B: Attr> Attr for (A, B) {
         c.expect(")")?;
         Ok((first, second))
     }
+    fn peek(c: &Cursor<'_>) -> bool {
+        c.peek_is("(")
+    }
+}
+
+/// Reads `key = value, ...`: a key is a name or a string, and `entry` reads the value of each,
+/// given the key and its position. It reads entries while a key comes next, and none when none
+/// does.
+pub fn parse_entries<'a>(
+    c: &mut Cursor<'a>,
+    mut entry: impl FnMut(&mut Cursor<'a>, &str, usize) -> Result<()>,
+) -> Result<()> {
+    while c.peek_kind(TokenKind::Ident) || c.peek_kind(TokenKind::String) {
+        let at = c.position();
+        let key = if c.peek_kind(TokenKind::String) {
+            c.string()?
+        } else {
+            c.ident()?.to_string()
+        };
+        c.expect("=")?;
+        entry(c, &key, at)?;
+        if !c.eat(",") {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Reads `{key = value, ...}` when `{` comes next, handing each key to `entry`.
+pub fn parse_dict<'a>(
+    c: &mut Cursor<'a>,
+    entry: impl FnMut(&mut Cursor<'a>, &str, usize) -> Result<()>,
+) -> Result<()> {
+    if c.eat("{") {
+        parse_entries(c, entry)?;
+        c.expect("}")?;
+    }
+    Ok(())
 }
 
 /// Printed as `{key = value, ...}`. A key that is not an identifier without dots is printed in
 /// quotes.
 impl<T: Attr> Attr for BTreeMap<String, T> {
+    const ITEM: &'static str = T::ITEM;
+
+    fn type_name() -> String {
+        format!("{{name = {}}}", T::type_name())
+    }
+
     fn print(&self, out: &mut String) {
         out.push('{');
         for (i, (key, value)) in self.iter().enumerate() {
             if i > 0 {
                 out.push_str(", ");
             }
-            if key.starts_with(is_ident_start) && key.chars().all(|c| c != '.' && is_ident_char(c))
+            if key.starts_with(is_ident_start)
+                && key
+                    .chars()
+                    .all(|character| character != '.' && is_name_char(character))
             {
                 out.push_str(key);
             } else {
@@ -253,23 +475,104 @@ impl<T: Attr> Attr for BTreeMap<String, T> {
         out.push('}');
     }
     fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        c.expect("{")?;
         let mut map = BTreeMap::new();
-        c.list("}", |c| {
-            let key = if c.peek() == Some('"') {
-                c.string()?
-            } else {
-                c.ident()?.to_string()
-            };
-            c.expect("=")?;
+        c.expect("{")?;
+        parse_entries(c, |c, key, at| {
             let value = T::parse(c)?;
-            if map.insert(key.clone(), value).is_some() {
-                bail!(c.error(format!("duplicate key `{key}`")));
+            if map.insert(key.to_string(), value).is_some() {
+                bail!(c.error_at(at, format!("duplicate key `{key}`")));
             }
             Ok(())
         })?;
+        c.expect("}")?;
         Ok(map)
     }
+    fn peek(c: &Cursor<'_>) -> bool {
+        c.peek_is("{")
+    }
+}
+
+/// A list attribute, which `tuple(..)` writes: one item alone, any other number in parentheses.
+pub trait AttrList: FromIterator<Self::Item> {
+    type Item: Attr;
+    fn items(&self) -> &[Self::Item];
+}
+
+impl<T: Attr> AttrList for Vec<T> {
+    type Item = T;
+    fn items(&self) -> &[T] {
+        self
+    }
+}
+
+impl<A: Array> AttrList for SmallVec<A>
+where
+    A::Item: Attr,
+{
+    type Item = A::Item;
+    fn items(&self) -> &[A::Item] {
+        self
+    }
+}
+
+/// `item`, or `(a, b, ...)` for any number of items but one.
+pub fn print_tuple<'t, T: Attr + 't>(items: impl IntoIterator<Item = &'t T>, out: &mut String) {
+    let items: Vec<&T> = items.into_iter().collect();
+    if let [item] = items.as_slice() {
+        item.print(out);
+        return;
+    }
+    out.push('(');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        item.print(out);
+    }
+    out.push(')');
+}
+
+/// Reads what [`print_tuple`] writes.
+pub fn parse_tuple<L: AttrList>(c: &mut Cursor<'_>) -> Result<L> {
+    if c.eat("(") {
+        return Ok(c.list(")", L::Item::parse)?.into_iter().collect());
+    }
+    Ok(std::iter::once(L::Item::parse(c)?).collect())
+}
+
+/// Whether what [`print_tuple`] writes comes next.
+pub fn peek_tuple<L: AttrList>(c: &Cursor<'_>) -> bool {
+    c.peek_is("(") || L::Item::peek(c)
+}
+
+/// `4x{T}xf32`: the extents of a tensor, each followed by `x`, then its dtype.
+pub fn print_shape(dims: &[Dim], dtype: &DType, out: &mut String) {
+    for dim in dims {
+        dim.print(out);
+        out.push('x');
+    }
+    dtype.print(out);
+}
+
+/// Reads what [`print_shape`] writes.
+pub fn parse_shape(c: &mut Cursor<'_>) -> Result<(Ranked<Dim>, DType)> {
+    let start = c.position();
+    let mut dims = Vec::new();
+    while Dim::peek(c) {
+        dims.push(Dim::parse(c)?);
+        c.shape_x()?;
+    }
+    if !c.peek_kind(TokenKind::Ident) {
+        return Err(c.unexpected("an extent or a dtype"));
+    }
+    let dtype = DType::parse(c)?;
+    let dims = ranked(dims).map_err(|err| c.error_at(start, err))?;
+    Ok((dims, dtype))
+}
+
+/// Whether what [`print_shape`] writes comes next.
+pub fn peek_shape(c: &Cursor<'_>) -> bool {
+    Dim::peek(c) || DType::peek(c)
 }
 
 /// The name of a top-level symbol, such as a `tile.dispatch`, written `@name`.
@@ -277,12 +580,19 @@ impl<T: Attr> Attr for BTreeMap<String, T> {
 pub struct SymbolRef(pub String);
 
 impl Attr for SymbolRef {
+    const ITEM: &'static str = "SymbolRef";
+
     fn print(&self, out: &mut String) {
         out.push('@');
         out.push_str(&self.0);
     }
     fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        Ok(SymbolRef(c.sigil_name('@')?.to_string()))
+        Ok(SymbolRef(
+            c.sigil_name(TokenKind::Symbol, "a symbol")?.to_string(),
+        ))
+    }
+    fn peek(c: &Cursor<'_>) -> bool {
+        c.peek_kind(TokenKind::Symbol)
     }
 }
 
@@ -314,94 +624,44 @@ pub(crate) fn print_float(value: impl fmt::Debug, out: &mut String) {
     }
 }
 
+/// Printed as a float, `0.5`, `-inf`; read from an integer too. It starts an optional group or a
+/// variant only as a float.
 impl Attr for F64 {
+    const ITEM: &'static str = "F64";
+
     fn print(&self, out: &mut String) {
         print_float(self.0, out);
     }
     fn parse(c: &mut Cursor<'_>) -> Result<Self> {
         c.float().map(F64)
     }
+    fn peek(c: &Cursor<'_>) -> bool {
+        c.peek_float()
+    }
 }
 
-impl Attr for Dim {
+/// A number as written, its sign included: `-1.5`, `3`, `-inf`, `NaN`. The text form of a value
+/// whose dtype says how to read it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Number(pub String);
+
+impl Number {
+    /// Whether it is written as a float: with a fraction or an exponent, or `inf` or `NaN`.
+    pub fn is_float(&self) -> bool {
+        self.0.contains(['.', 'e', 'E', 'i', 'N'])
+    }
+}
+
+impl Attr for Number {
+    const ITEM: &'static str = "Number";
+
     fn print(&self, out: &mut String) {
-        out.push_str(&self.to_string());
+        out.push_str(&self.0);
     }
     fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        if c.eat("{") {
-            let name = c.ident()?;
-            c.expect("}")?;
-            Ok(Dim::Dynamic(Sym::new(name)))
-        } else {
-            usize::parse(c).map(Dim::Static)
-        }
+        c.number().map(Number)
     }
-}
-
-fn parse_tensor_body(c: &Cursor<'_>, body: &str) -> Result<TensorType> {
-    let mut parts = Vec::new();
-    let mut depth = 0usize;
-    let mut start = 0usize;
-    for (i, ch) in body.char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => depth = depth.saturating_sub(1),
-            'x' if depth == 0 => {
-                parts.push(&body[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&body[start..]);
-    let (dtype_name, dims) = parts
-        .split_last()
-        .expect("one part more than there are `x`s");
-    let dtype_name = dtype_name.trim();
-    let dtype = DType::from_mnemonic(dtype_name)
-        .ok_or_else(|| c.error(format!("unknown dtype `{dtype_name}` in tensor type")))?;
-    let dims = dims
-        .iter()
-        .map(|part| {
-            let mut dim = Cursor::new(part);
-            Dim::parse(&mut dim)
-                .ok()
-                .filter(|_| dim.at_end())
-                .ok_or_else(|| c.error(format!("bad dimension `{}` in tensor type", part.trim())))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let dims = ranked(dims).map_err(|err| c.error(format!("tensor type: {err}")))?;
-    Ok(TensorType { dtype, dims })
-}
-
-impl Attr for TensorType {
-    fn print(&self, out: &mut String) {
-        out.push_str(&self.to_string());
-    }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        c.expect("tensor")?;
-        c.expect("<")?;
-        let body = c.until_close_angle()?;
-        let tensor = parse_tensor_body(c, body)?;
-        c.expect(">")?;
-        Ok(tensor)
-    }
-}
-
-impl Attr for Type {
-    fn print(&self, out: &mut String) {
-        out.push_str(&self.to_string());
-    }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        if c.peek_str("tensor<") {
-            return TensorType::parse(c).map(Type::Tensor);
-        }
-        if c.eat("index") {
-            return Ok(Type::Index);
-        }
-        let name = c.ident()?;
-        DType::from_mnemonic(name)
-            .map(Type::Scalar)
-            .ok_or_else(|| c.error(format!("unknown type `{name}`")))
+    fn peek(c: &Cursor<'_>) -> bool {
+        c.peek_number()
     }
 }

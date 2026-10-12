@@ -4,7 +4,7 @@ use anyhow::{ensure, Result};
 
 use crate::dialects::arith::ir::*;
 use crate::dialects::tensor::utils::class::{
-    ensure_dtype_class, ensure_equal_types, CASTABLE, INTEGERS, ORDERED,
+    ensure_dtype_class, ensure_equal_types, ARITHMETIC, CASTABLE, INTEGERS, ORDERED,
 };
 use crate::op::{NoRegions, OpDef, OwnedTypes, TypeCx, Types};
 use crate::types::DType;
@@ -43,6 +43,28 @@ impl OpDef for Cast {
     ) -> Result<CastResults<OwnedTypes>> {
         ensure_dtype_class("to", self.to, CASTABLE)?;
         Ok(CastResults { output: self.to })
+    }
+}
+
+impl OpDef for FromIndex {
+    fn result_types(
+        &self,
+        _ins: FromIndexOperands<Types<'_>>,
+        _cx: &TypeCx<'_, NoRegions>,
+    ) -> Result<FromIndexResults<OwnedTypes>> {
+        ensure_dtype_class("dtype", self.dtype, ARITHMETIC)?;
+        Ok(FromIndexResults { output: self.dtype })
+    }
+}
+
+impl OpDef for ToIndex {
+    fn result_types(
+        &self,
+        ins: ToIndexOperands<Types<'_>>,
+        _cx: &TypeCx<'_, NoRegions>,
+    ) -> Result<ToIndexResults<OwnedTypes>> {
+        ensure_dtype_class("the input", ins.input, INTEGERS)?;
+        Ok(ToIndexResults { output: () })
     }
 }
 

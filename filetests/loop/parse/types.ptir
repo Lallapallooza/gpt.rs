@@ -1,0 +1,20 @@
+// RUN: parse
+
+// ERROR: 2:50: unknown space `shared`
+loop.func @shared_space(%input: !loop.buf<4xf32, shared>) attributes {access = [in]} {
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: 2:44: expected `,`, found `>`
+loop.func @no_space(%input: !loop.buf<4xf32>) attributes {access = [in]} {
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: 2:66: loop.func has no attribute `results`
+loop.func @results(%input: !loop.buf<4xf32, global>) attributes {results = [], access = [in]} {
+  loop.return() : () -> ()
+}

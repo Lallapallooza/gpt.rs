@@ -24,6 +24,7 @@ pub mod op;
 pub mod passes;
 pub mod rewrite;
 pub mod scalar;
+pub mod schedule;
 mod scope;
 pub mod text;
 pub mod traits;

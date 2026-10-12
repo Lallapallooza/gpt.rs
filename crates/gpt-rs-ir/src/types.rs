@@ -348,10 +348,12 @@ impl Sym {
     }
 }
 
-/// One tensor axis.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// One tensor axis: a static extent, `4`, or the extent a dimension symbol binds, `{T}`.
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Dim {
+    #[attr(format = "$0")]
     Static(usize),
+    #[attr(format = "`{` $0 `}`")]
     Dynamic(Sym),
 }
 
@@ -406,17 +408,9 @@ impl From<usize> for Dim {
     }
 }
 
-impl fmt::Display for Dim {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Dim::Static(n) => write!(f, "{n}"),
-            Dim::Dynamic(sym) => write!(f, "{{{}}}", sym.as_str()),
-        }
-    }
-}
-
-/// Dense row-major tensor type, of rank at most [`MAX_RANK`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Dense row-major tensor type, of rank at most [`MAX_RANK`]: `tensor<4x{T}xf32>`.
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
+#[attr(format = "`tensor` `<` shape($dims, $dtype) `>`")]
 pub struct TensorType {
     pub dtype: DType,
     pub dims: Ranked<Dim>,
@@ -478,19 +472,52 @@ impl TensorType {
     }
 }
 
-impl fmt::Display for TensorType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("tensor<")?;
-        for dim in &self.dims {
-            write!(f, "{dim}x")?;
+/// The memory a buffer of the `loop` dialect lives in: who owns it, and for how long.
+#[derive(crate::Attr, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Space {
+    /// Memory that the caller of a launch owns: the parameters of a `loop.func`.
+    Global,
+    /// Scratch memory of one unit of work, which lives as long as the region that allocates it.
+    Private,
+}
+
+/// A buffer of the `loop` dialect: elements of `dtype` at the coordinates of `dims`, row-major, in
+/// memory of `space`. Its text form is `!loop.buf<4x{T}xf32, global>`.
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
+#[attr(format = "`!loop.buf` `<` shape($dims, $dtype) `,` $space `>`")]
+pub struct BufferType {
+    pub dtype: DType,
+    pub dims: Ranked<Dim>,
+    pub space: Space,
+}
+
+impl BufferType {
+    /// The buffer of `space` that holds the elements of a tensor of type `tensor`.
+    pub fn of(tensor: &TensorType, space: Space) -> Self {
+        Self {
+            dtype: tensor.dtype,
+            dims: tensor.dims.clone(),
+            space,
         }
-        write!(f, "{}>", self.dtype)
+    }
+
+    /// The type of the tensor its elements make.
+    pub fn tensor_type(&self) -> TensorType {
+        TensorType {
+            dtype: self.dtype,
+            dims: self.dims.clone(),
+        }
+    }
+
+    pub fn rank(&self) -> usize {
+        self.dims.len()
     }
 }
 
 /// A permutation of axes: result axis `i` is input axis `self[i]`, as `tensor.transpose` reads
 /// its input. It may name axes out of range or twice until [`Perm::is_permutation_of`] checks it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(crate::Attr, Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[attr(format = "$0")]
 pub struct Perm(Ranked<usize>);
 
 impl Perm {
@@ -585,11 +612,16 @@ impl FromIterator<usize> for Perm {
 }
 
 /// The type of an SSA value.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
+    #[attr(format = "`index`")]
     Index,
+    #[attr(format = "$0")]
     Scalar(DType),
+    #[attr(format = "$0")]
     Tensor(TensorType),
+    #[attr(format = "$0")]
+    Buffer(BufferType),
 }
 
 impl Type {
@@ -600,12 +632,20 @@ impl Type {
         }
     }
 
-    /// The element dtype of a tensor, or the dtype of a scalar.
+    pub fn as_buffer(&self) -> Option<&BufferType> {
+        match self {
+            Type::Buffer(buffer) => Some(buffer),
+            _ => None,
+        }
+    }
+
+    /// The element dtype of a tensor or a buffer, or the dtype of a scalar.
     pub fn dtype(&self) -> Option<DType> {
         match self {
             Type::Tensor(tensor) => Some(tensor.dtype),
+            Type::Buffer(buffer) => Some(buffer.dtype),
             Type::Scalar(dtype) => Some(*dtype),
-            _ => None,
+            Type::Index => None,
         }
     }
 
@@ -624,16 +664,6 @@ impl Type {
 impl From<TensorType> for Type {
     fn from(tensor: TensorType) -> Self {
         Type::Tensor(tensor)
-    }
-}
-
-impl fmt::Display for Type {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Type::Index => f.write_str("index"),
-            Type::Scalar(dtype) => write!(f, "{dtype}"),
-            Type::Tensor(tensor) => write!(f, "{tensor}"),
-        }
     }
 }
 

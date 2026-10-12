@@ -19,13 +19,13 @@ func.func @hoist(%lhs: tensor<3xf32>, %rhs: tensor<3xf32>) -> tensor<4x3xf32> {
 // A splat constant operand is splatted to the smaller shape, and a compare broadcasts its i1
 // result.
 // CHECK: func.func @splat_operand([[INPUT:%[0-9]+]]: tensor<3xf32>) -> tensor<4x3xi1> {
-// CHECK: [[TWO:%[0-9]+]] = tensor.constant() {value = dense<[] x f32: 2.0>}
+// CHECK: [[TWO:%[0-9]+]] = tensor.constant() {value = dense<f32: 2.0>}
 // CHECK-NEXT: [[TWOS:%[0-9]+]] = tensor.broadcast_to([[TWO]]) {shape = [3]}
 // CHECK-NEXT: [[BELOW_TWO:%[0-9]+]] = tensor.less([[INPUT]], [[TWOS]]) : (tensor<3xf32>, tensor<3xf32>) -> tensor<3xi1>
 // CHECK-NEXT: tensor.broadcast_to([[BELOW_TWO]]) {shape = [4, 3]} : (tensor<3xi1>) -> tensor<4x3xi1>
 func.func @splat_operand(%input: tensor<3xf32>) -> tensor<4x3xi1> {
   %wide_input = tensor.broadcast_to(%input) {shape = [4, 3]} : (tensor<3xf32>) -> tensor<4x3xf32>
-  %twos = tensor.constant() {value = dense<[4, 3] x f32: 2.0>} : () -> tensor<4x3xf32>
+  %twos = tensor.constant() {value = dense<4x3xf32: 2.0>} : () -> tensor<4x3xf32>
   %below_two = tensor.less(%wide_input, %twos) : (tensor<4x3xf32>, tensor<4x3xf32>) -> tensor<4x3xi1>
   func.return(%below_two) : (tensor<4x3xi1>) -> ()
 }
@@ -51,7 +51,7 @@ func.func @stays(%row: tensor<3xf32>, %column: tensor<4x1xf32>, %matrix: tensor<
 // CHECK: tensor.mul({{%[0-9]+}}, {{%[0-9]+}}) : (tensor<2x2xf32>, tensor<2x2xf32>)
 func.func @non_splat(%input: tensor<2xf32>) -> tensor<2x2xf32> {
   %wide_input = tensor.broadcast_to(%input) {shape = [2, 2]} : (tensor<2xf32>) -> tensor<2x2xf32>
-  %coefficients = tensor.constant() {value = dense<[2, 2] x f32: [1.0, 2.0, 3.0, 4.0]>} : () -> tensor<2x2xf32>
+  %coefficients = tensor.constant() {value = dense<2x2xf32: [1.0, 2.0, 3.0, 4.0]>} : () -> tensor<2x2xf32>
   %product = tensor.mul(%wide_input, %coefficients) : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
   func.return(%product) : (tensor<2x2xf32>) -> ()
 }

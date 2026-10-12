@@ -10,6 +10,7 @@ description = "The gpt.rs IR: dialects, text form, verifier, interpreter and rew
 anyhow = { workspace = true }
 blake3 = "1.5"
 bytemuck = { version = "1", features = ["derive"] }
+gpt-rs-ir-lexer = { path = "../gpt-rs-ir-lexer", version = "0.1.0" }
 gpt-rs-ir-macros = { path = "../gpt-rs-ir-macros", version = "0.1.0" }
 half = { version = "2.6", features = ["bytemuck"] }
 libm = "0.2"

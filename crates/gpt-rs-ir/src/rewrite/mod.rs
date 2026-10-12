@@ -16,7 +16,6 @@ use anyhow::{bail, Result};
 pub use gpt_rs_ir_macros::{matched, pattern};
 
 pub use self::build::{Build, Chain};
-pub(crate) use self::builder::bound_params;
 pub use self::builder::Builder;
 pub(crate) use self::editor::Editor;
 pub use self::rewriter::{Rewriter, Staged};
@@ -159,7 +158,7 @@ pub trait Root {
 /// What a pattern is rooted at, as the reference pages show it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootInfo {
-    /// The ops of the op struct of this name.
+    /// The ops of this name: `tile.dispatch`.
     Op(&'static str),
     /// Every op with the op trait of this name.
     Trait(&'static str),
@@ -171,7 +170,7 @@ impl<T: InOp> Root for T {
         module.op_as(inst)
     }
     fn info() -> RootInfo {
-        RootInfo::Op(T::INFO.rust)
+        RootInfo::Op(T::INFO.name)
     }
 }
 

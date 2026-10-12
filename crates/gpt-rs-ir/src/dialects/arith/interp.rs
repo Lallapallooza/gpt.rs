@@ -270,6 +270,30 @@ impl Eval for Cast {
     }
 }
 
+impl Eval for FromIndex {
+    fn eval(
+        &self,
+        ins: FromIndexOperands<Host<'_>>,
+        _cx: &mut EvalCx<'_, NoRegions>,
+    ) -> Result<FromIndexResults<OwnedHost>> {
+        Ok(FromIndexResults {
+            output: scalar::from_index(ins.input, self.dtype)?,
+        })
+    }
+}
+
+impl Eval for ToIndex {
+    fn eval(
+        &self,
+        ins: ToIndexOperands<Host<'_>>,
+        _cx: &mut EvalCx<'_, NoRegions>,
+    ) -> Result<ToIndexResults<OwnedHost>> {
+        Ok(ToIndexResults {
+            output: ins.input.as_index()?,
+        })
+    }
+}
+
 impl Eval for Bitcast {
     fn eval(
         &self,

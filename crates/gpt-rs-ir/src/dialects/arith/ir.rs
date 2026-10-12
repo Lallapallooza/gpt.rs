@@ -13,7 +13,8 @@ use crate::types::DType;
 
 /// A scalar value of a dtype, written `0.5 : f32`, `-3 : si32` or `1 : i1`. It is held as a
 /// rank-0 dense constant, so constant queries and folds see it as they see `tensor.constant`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
+#[attr(via = super::utils::LiteralText)]
 pub struct Literal(pub(super) Dense);
 
 /// `arith.constant`: the scalar `value`.
@@ -280,6 +281,17 @@ pub struct Bitcast {
     pub to: DType,
 }
 
+/// `arith.from_index`: the index as an element of `dtype`, converted as `tensor.iota` converts its
+/// indices: as an si64 cast to `dtype`.
+#[crate::op("arith.from_index", operands(input(Index)), results(output(Scalar)))]
+pub struct FromIndex {
+    pub dtype: DType,
+}
+
+/// `arith.to_index`: the integer as an index. Its value MUST fit `i64`.
+#[crate::op("arith.to_index", operands(input(Scalar)), results(output(Index)))]
+pub struct ToIndex;
+
 /// The attributes of `arith.rng_uniform` and `arith.rng_normal`.
 #[derive(crate::AttrGroup, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RngAttrs {
@@ -345,6 +357,8 @@ pub enum ArithOp {
     Select(Select),
     Cast(Cast),
     Bitcast(Bitcast),
+    FromIndex(FromIndex),
+    ToIndex(ToIndex),
     RngUniform(RngUniform),
     RngNormal(RngNormal),
 }

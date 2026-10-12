@@ -6,8 +6,8 @@
 // CHECK: [[PLUS_THREE:%[0-9]+]] = tensor.add([[INPUT]], {{%[0-9]+}})
 // CHECK-NEXT: tensor.add([[PLUS_THREE]], {{%[0-9]+}})
 func.func @constants_stay(%input: tensor<4xsi32>) -> tensor<4xsi32> {
-  %three = tensor.constant() {value = dense<[4] x si32: 3>} : () -> tensor<4xsi32>
-  %five = tensor.constant() {value = dense<[4] x si32: 5>} : () -> tensor<4xsi32>
+  %three = tensor.constant() {value = dense<4xsi32: 3>} : () -> tensor<4xsi32>
+  %five = tensor.constant() {value = dense<4xsi32: 5>} : () -> tensor<4xsi32>
   %plus_three = tensor.add(%input, %three) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
   %plus_eight = tensor.add(%plus_three, %five) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
   func.return(%plus_eight) : (tensor<4xsi32>) -> ()

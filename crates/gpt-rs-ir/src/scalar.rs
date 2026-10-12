@@ -425,6 +425,12 @@ pub fn order(x: HostScalar, y: HostScalar) -> Ordering {
     }
 }
 
+/// The index `value` as an element of `dtype`, converted as `tensor.iota` converts its indices: as
+/// an si64 cast to `dtype`.
+pub fn from_index(value: i64, dtype: DType) -> Result<HostScalar> {
+    cast(HostScalar::int(DType::Si64, i128::from(value))?, dtype)
+}
+
 /// `x` converted to `to` as `tensor.cast` converts an element.
 pub fn cast(x: HostScalar, to: DType) -> Result<HostScalar> {
     if x.dtype == to {

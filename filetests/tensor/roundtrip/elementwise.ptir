@@ -38,27 +38,27 @@ func.func @kinds(%lhs: tensor<4xf32>, %rhs: tensor<4xf32>) -> tensor<4xf32> {
 
 // -----
 // CHECK: func.func @constants() -> (tensor<2x2xf32>, tensor<3xsi32>, tensor<f32>, tensor<2xbf16>, tensor<2xf32>, tensor<1xf32>, tensor<2xi1>, tensor<2xf8e4m3>, tensor<0xf32>) {
-// CHECK-NEXT: [[MATRIX:%[0-9]+]] = tensor.constant() {value = dense<[2, 2] x f32: [1.0, -0.5, 1e-7, inf]>} : () -> tensor<2x2xf32>
-// CHECK-NEXT: [[ZEROS:%[0-9]+]] = tensor.constant() {value = dense<[3] x si32: 0>} : () -> tensor<3xsi32>
-// CHECK-NEXT: [[HALF:%[0-9]+]] = tensor.constant() {value = dense<[] x f32: 0.5>} : () -> tensor<f32>
-// CHECK-NEXT: [[ONE_AND_PI:%[0-9]+]] = tensor.constant() {value = dense<[2] x bf16: [1.0, 3.140625]>} : () -> tensor<2xbf16>
-// CHECK-NEXT: [[NEG_ZERO_AND_NEG_INF:%[0-9]+]] = tensor.constant() {value = dense<[2] x f32: [-0.0, -inf]>} : () -> tensor<2xf32>
-// CHECK-NEXT: [[NAN:%[0-9]+]] = tensor.constant() {value = dense<[1] x f32: 0x0000c07f>} : () -> tensor<1xf32>
-// CHECK-NEXT: [[FLAGS:%[0-9]+]] = tensor.constant() {value = dense<[2] x i1: [true, false]>} : () -> tensor<2xi1>
-// CHECK-NEXT: [[FP8_VALUES:%[0-9]+]] = tensor.constant() {value = dense<[2] x f8e4m3: 0x3840>} : () -> tensor<2xf8e4m3>
-// CHECK-NEXT: [[EMPTY:%[0-9]+]] = tensor.constant() {value = dense<[0] x f32: []>} : () -> tensor<0xf32>
+// CHECK-NEXT: [[MATRIX:%[0-9]+]] = tensor.constant() {value = dense<2x2xf32: [1.0, -0.5, 1e-7, inf]>} : () -> tensor<2x2xf32>
+// CHECK-NEXT: [[ZEROS:%[0-9]+]] = tensor.constant() {value = dense<3xsi32: 0>} : () -> tensor<3xsi32>
+// CHECK-NEXT: [[HALF:%[0-9]+]] = tensor.constant() {value = dense<f32: 0.5>} : () -> tensor<f32>
+// CHECK-NEXT: [[ONE_AND_PI:%[0-9]+]] = tensor.constant() {value = dense<2xbf16: [1.0, 3.140625]>} : () -> tensor<2xbf16>
+// CHECK-NEXT: [[NEG_ZERO_AND_NEG_INF:%[0-9]+]] = tensor.constant() {value = dense<2xf32: [-0.0, -inf]>} : () -> tensor<2xf32>
+// CHECK-NEXT: [[NAN:%[0-9]+]] = tensor.constant() {value = dense<1xf32: "0x0000c07f">} : () -> tensor<1xf32>
+// CHECK-NEXT: [[FLAGS:%[0-9]+]] = tensor.constant() {value = dense<2xi1: [true, false]>} : () -> tensor<2xi1>
+// CHECK-NEXT: [[FP8_VALUES:%[0-9]+]] = tensor.constant() {value = dense<2xf8e4m3: "0x3840">} : () -> tensor<2xf8e4m3>
+// CHECK-NEXT: [[EMPTY:%[0-9]+]] = tensor.constant() {value = dense<0xf32: []>} : () -> tensor<0xf32>
 // CHECK-NEXT: func.return([[MATRIX]], [[ZEROS]], [[HALF]], [[ONE_AND_PI]], [[NEG_ZERO_AND_NEG_INF]], [[NAN]], [[FLAGS]], [[FP8_VALUES]], [[EMPTY]]) : (tensor<2x2xf32>, tensor<3xsi32>, tensor<f32>, tensor<2xbf16>, tensor<2xf32>, tensor<1xf32>, tensor<2xi1>, tensor<2xf8e4m3>, tensor<0xf32>) -> ()
 // CHECK-NEXT: }
 func.func @constants() -> (tensor<2x2xf32>, tensor<3xsi32>, tensor<f32>, tensor<2xbf16>, tensor<2xf32>, tensor<1xf32>, tensor<2xi1>, tensor<2xf8e4m3>, tensor<0xf32>) {
-  %matrix = tensor.constant() {value = dense<[2, 2] x f32: [1.0, -0.5, 1e-7, inf]>} : () -> tensor<2x2xf32>
-  %zeros = tensor.constant() {value = dense<[3] x si32: 0>} : () -> tensor<3xsi32>
-  %half = tensor.constant() {value = dense<[] x f32: 0.5>} : () -> tensor<f32>
-  %one_and_pi = tensor.constant() {value = dense<[2] x bf16: [1.0, 3.140625]>} : () -> tensor<2xbf16>
-  %neg_zero_and_neg_inf = tensor.constant() {value = dense<[2] x f32: [-0.0, -inf]>} : () -> tensor<2xf32>
-  %nan = tensor.constant() {value = dense<[1] x f32: 0x0000c07f>} : () -> tensor<1xf32>
-  %flags = tensor.constant() {value = dense<[2] x i1: [true, false]>} : () -> tensor<2xi1>
-  %fp8_values = tensor.constant() {value = dense<[2] x f8e4m3: 0x3840>} : () -> tensor<2xf8e4m3>
-  %empty = tensor.constant() {value = dense<[0] x f32: []>} : () -> tensor<0xf32>
+  %matrix = tensor.constant() {value = dense<2x2xf32: [1.0, -0.5, 1e-7, inf]>} : () -> tensor<2x2xf32>
+  %zeros = tensor.constant() {value = dense<3xsi32: 0>} : () -> tensor<3xsi32>
+  %half = tensor.constant() {value = dense<f32: 0.5>} : () -> tensor<f32>
+  %one_and_pi = tensor.constant() {value = dense<2xbf16: [1.0, 3.140625]>} : () -> tensor<2xbf16>
+  %neg_zero_and_neg_inf = tensor.constant() {value = dense<2xf32: [-0.0, -inf]>} : () -> tensor<2xf32>
+  %nan = tensor.constant() {value = dense<1xf32: "0x0000c07f">} : () -> tensor<1xf32>
+  %flags = tensor.constant() {value = dense<2xi1: [true, false]>} : () -> tensor<2xi1>
+  %fp8_values = tensor.constant() {value = dense<2xf8e4m3: "0x3840">} : () -> tensor<2xf8e4m3>
+  %empty = tensor.constant() {value = dense<0xf32: []>} : () -> tensor<0xf32>
   func.return(%matrix, %zeros, %half, %one_and_pi, %neg_zero_and_neg_inf, %nan, %flags, %fp8_values, %empty) : (tensor<2x2xf32>, tensor<3xsi32>, tensor<f32>, tensor<2xbf16>, tensor<2xf32>, tensor<1xf32>, tensor<2xi1>, tensor<2xf8e4m3>, tensor<0xf32>) -> ()
 }
 

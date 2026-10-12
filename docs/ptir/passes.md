@@ -318,7 +318,7 @@ Patterns:
 | `DropUnitIters` | `tile.block` | The pattern removes an iterator of extent 1, which is always 0. It writes 0 for it in every expression and write, and moves the later iterators down one position. | [tile/canonicalize/bodies.ptir](../../filetests/tile/canonicalize/bodies.ptir) |
 | `EraseIdentityBlock` | `tile.block` | A block that reads its operand at its own iterators, in the order it writes them, into a result of the operand's type, and yields what it reads, is that operand. | [tile/canonicalize/bodies.ptir](../../filetests/tile/canonicalize/bodies.ptir) |
 | `Factor` | every op with `DistributesOver` | `g(f(a, b), f(a, c))` is `f(a, g(b, c))` when `f` distributes over `g`, which saves an `f`. For a commutative `f` the shared operand may be on either side. The pattern is rooted at either `f` and rewrites its only use, `g`. | [tensor/canonicalize/algebra.ptir](../../filetests/tensor/canonicalize/algebra.ptir) |
-| `FoldIndexArith` | `tensor.add`, `tensor.sub`, `tensor.mul`, `tensor.minimum`, `tensor.maximum`, `tensor.neg` | Integer `arith` on `tile.index` values and constants is one `tile.index` of the combined expression, so that index math is in the index language. It folds where no value leaves the range of the dtype: always for si64, and for another dtype where the block's iterator extents bound the values. | [tile/canonicalize/index.ptir](../../filetests/tile/canonicalize/index.ptir) |
+| `FoldIndexArith` | `arith.add`, `arith.sub`, `arith.mul`, `arith.minimum`, `arith.maximum`, `arith.neg` | Integer `arith` on `tile.index` values and constants is one `tile.index` of the combined expression, so that index math is in the index language. It folds where no value leaves the range of the dtype: always for si64, and for another dtype where the block's iterator extents bound the values. | [tile/canonicalize/index.ptir](../../filetests/tile/canonicalize/index.ptir) |
 | `GroupStatic` | every op with `Associative` | `f(f(x, a), b)` is `f(x, f(a, b))` when `f` is associative, `a` and `b` are static, and one of them reads a parameter. The backend then computes `f(a, b)` once at load time, so a run computes one `f` where it computed two. | [tensor/canonicalize/algebra.ptir](../../filetests/tensor/canonicalize/algebra.ptir) |
 | `HoistBroadcast` | every op with `Elementwise` | `f(broadcast_to(a), broadcast_to(b))` is `broadcast_to(f(a, b))` when `a` and `b` have the same shape, so `f` computes on fewer elements. The pattern splats a splat constant operand to that shape. | [tensor/canonicalize/broadcast.ptir](../../filetests/tensor/canonicalize/broadcast.ptir), [tensor/canonicalize/dot.ptir](../../filetests/tensor/canonicalize/dot.ptir), [tensor/canonicalize/integer_and_narrow.ptir](../../filetests/tensor/canonicalize/integer_and_narrow.ptir), [tensor/canonicalize/masks.ptir](../../filetests/tensor/canonicalize/masks.ptir) |
 | `IotaOfUnitAxis` | `tensor.iota` | A `tensor.iota` along an axis of extent 1 counts no further than 0: it is 0, broadcast. | [tensor/canonicalize/masks.ptir](../../filetests/tensor/canonicalize/masks.ptir) |
@@ -461,6 +461,28 @@ Defined by `PruneParams` in [crates/gpt-rs-ir/src/passes/prune_params.rs](../../
 
 Filetests: [tensor/prune_params/prune_params.ptir](../../filetests/tensor/prune_params/prune_params.ptir).
 
+### `seal-dispatches`
+
+Outlines each group of blocks into a `tile.dispatch` that the function calls with
+`host.dispatch`.
+
+- Each `tile.group` becomes a dispatch, and so does each `tile.block` outside a group, as a
+  group of its own.
+- The dispatch takes the values its blocks read from outside the group, in the order they are
+  first read, and gives what the group yields. When a block uses a dimension symbol that none
+  of those values binds, the dispatch also takes the nearest region argument that does: one of
+  the function, or of a region of control flow around the group.
+- Its name is a hash of its text, so equal groups share one dispatch: layers that compute the
+  same blocks call one.
+
+Defined by `SealDispatches` in [crates/gpt-rs-ir/src/dialects/tile/passes/seal_dispatches.rs](../../crates/gpt-rs-ir/src/dialects/tile/passes/seal_dispatches.rs).
+
+| Statistic | |
+|---|---|
+| `sealed` | groups outlined into dispatches |
+
+Filetests: [loop/tile_to_loop/fold.ptir](../../filetests/loop/tile_to_loop/fold.ptir), [loop/tile_to_loop/indexing.ptir](../../filetests/loop/tile_to_loop/indexing.ptir), [loop/tile_to_loop/map.ptir](../../filetests/loop/tile_to_loop/map.ptir), [loop/tile_to_loop/pipeline.ptir](../../filetests/loop/tile_to_loop/pipeline.ptir), [loop/tile_to_loop/softmax.ptir](../../filetests/loop/tile_to_loop/softmax.ptir), [tile/seal_dispatches/seal.ptir](../../filetests/tile/seal_dispatches/seal.ptir).
+
 ### `tensor-to-tile`
 
 Converts the `tensor` ops that compute on elements to `tile.block`s that compute the same
@@ -489,16 +511,16 @@ Patterns:
 
 | Pattern | Root | Rewrite | Fires in |
 |---|---|---|---|
-| `UnaryToTile` | `tensor.neg`, `tensor.abs`, `tensor.exp`, `tensor.log`, `tensor.tanh`, `tensor.erf`, `tensor.rsqrt`, `tensor.reciprocal`, `tensor.sin`, `tensor.cos`, `tensor.not` | A `tensor` op of one operand is a parallel block with the `arith` op it applies. | [tile/canonicalize/bodies.ptir](../../filetests/tile/canonicalize/bodies.ptir), [tile/tensor_to_tile/control.ptir](../../filetests/tile/tensor_to_tile/control.ptir), [tile/tensor_to_tile/elementwise.ptir](../../filetests/tile/tensor_to_tile/elementwise.ptir) |
-| `BinaryToTile` | `tensor.add`, `tensor.sub`, `tensor.mul`, `tensor.div`, `tensor.maximum`, `tensor.minimum`, `tensor.and`, `tensor.or`, `tensor.xor`, `tensor.shift_left`, `tensor.shift_right_logical`, `tensor.shift_right_arithmetic` | A `tensor` op of two operands is a parallel block with the `arith` op it applies. | [tile/canonicalize/bodies.ptir](../../filetests/tile/canonicalize/bodies.ptir), [tile/tensor_to_tile/control.ptir](../../filetests/tile/tensor_to_tile/control.ptir), [tile/tensor_to_tile/elementwise.ptir](../../filetests/tile/tensor_to_tile/elementwise.ptir) |
+| `UnaryToTile` | `tensor.neg`, `tensor.abs`, `tensor.exp`, `tensor.log`, `tensor.tanh`, `tensor.erf`, `tensor.rsqrt`, `tensor.reciprocal`, `tensor.sin`, `tensor.cos`, `tensor.not` | A `tensor` op of one operand is a parallel block with the `arith` op it applies. | [loop/tile_to_loop/pipeline.ptir](../../filetests/loop/tile_to_loop/pipeline.ptir), [tile/canonicalize/bodies.ptir](../../filetests/tile/canonicalize/bodies.ptir), [tile/tensor_to_tile/control.ptir](../../filetests/tile/tensor_to_tile/control.ptir), [tile/tensor_to_tile/elementwise.ptir](../../filetests/tile/tensor_to_tile/elementwise.ptir) |
+| `BinaryToTile` | `tensor.add`, `tensor.sub`, `tensor.mul`, `tensor.div`, `tensor.maximum`, `tensor.minimum`, `tensor.and`, `tensor.or`, `tensor.xor`, `tensor.shift_left`, `tensor.shift_right_logical`, `tensor.shift_right_arithmetic` | A `tensor` op of two operands is a parallel block with the `arith` op it applies. | [loop/tile_to_loop/pipeline.ptir](../../filetests/loop/tile_to_loop/pipeline.ptir), [tile/canonicalize/bodies.ptir](../../filetests/tile/canonicalize/bodies.ptir), [tile/tensor_to_tile/control.ptir](../../filetests/tile/tensor_to_tile/control.ptir), [tile/tensor_to_tile/elementwise.ptir](../../filetests/tile/tensor_to_tile/elementwise.ptir) |
 | `CompareToTile` | `tensor.less`, `tensor.less_equal`, `tensor.equal`, `tensor.greater_equal`, `tensor.greater`, `tensor.not_equal` | A `tensor` comparison is a parallel block with the `arith` comparison it applies. | [tile/tensor_to_tile/control.ptir](../../filetests/tile/tensor_to_tile/control.ptir), [tile/tensor_to_tile/elementwise.ptir](../../filetests/tile/tensor_to_tile/elementwise.ptir) |
 | `SelectToTile` | `tensor.select` | `tensor.select` is a parallel block with `arith.select`. | [tile/tensor_to_tile/elementwise.ptir](../../filetests/tile/tensor_to_tile/elementwise.ptir) |
-| `CastToTile` | `tensor.cast` | `tensor.cast` is a parallel block with `arith.cast`. | [tile/tensor_to_tile/elementwise.ptir](../../filetests/tile/tensor_to_tile/elementwise.ptir), [tile/tensor_to_tile/quant.ptir](../../filetests/tile/tensor_to_tile/quant.ptir) |
-| `DotToTile` | `tensor.dot_general` | `tensor.dot_general` is a block with one reduction iterator per contracted pair, in `contract_lhs` order, that sums the products in the accumulator dtype; a parallel block casts the sums to the result dtype. | [tile/tensor_to_tile/contraction.ptir](../../filetests/tile/tensor_to_tile/contraction.ptir) |
+| `CastToTile` | `tensor.cast` | `tensor.cast` is a parallel block with `arith.cast`. | [loop/tile_to_loop/pipeline.ptir](../../filetests/loop/tile_to_loop/pipeline.ptir), [tile/tensor_to_tile/elementwise.ptir](../../filetests/tile/tensor_to_tile/elementwise.ptir), [tile/tensor_to_tile/quant.ptir](../../filetests/tile/tensor_to_tile/quant.ptir) |
+| `DotToTile` | `tensor.dot_general` | `tensor.dot_general` is a block with one reduction iterator per contracted pair, in `contract_lhs` order, that sums the products in the accumulator dtype; a parallel block casts the sums to the result dtype. | [loop/tile_to_loop/pipeline.ptir](../../filetests/loop/tile_to_loop/pipeline.ptir), [tile/tensor_to_tile/contraction.ptir](../../filetests/tile/tensor_to_tile/contraction.ptir) |
 | `ReduceToTile` | `tensor.reduce_sum`, `tensor.reduce_max`, `tensor.reduce_min`, `tensor.reduce_and`, `tensor.reduce_or` | A `tensor.reduce_*` op is a block whose reduced axes are reduction iterators, in axis order, folding with the combine of its `arith` op in the accumulator dtype; a parallel block casts to the result dtype. | [tile/canonicalize/bodies.ptir](../../filetests/tile/canonicalize/bodies.ptir), [tile/tensor_to_tile/contraction.ptir](../../filetests/tile/tensor_to_tile/contraction.ptir) |
 | `ReshapeToTile` | `tensor.reshape` | `tensor.reshape` is a copy block that reads the input at the row-major position of each result element. | [tile/canonicalize/bodies.ptir](../../filetests/tile/canonicalize/bodies.ptir), [tile/tensor_to_tile/layout.ptir](../../filetests/tile/tensor_to_tile/layout.ptir) |
 | `TransposeToTile` | `tensor.transpose` | `tensor.transpose` is a copy block with permuted read coordinates. | [tile/canonicalize/bodies.ptir](../../filetests/tile/canonicalize/bodies.ptir), [tile/tensor_to_tile/layout.ptir](../../filetests/tile/tensor_to_tile/layout.ptir) |
-| `BroadcastToTile` | `tensor.broadcast_to` | `tensor.broadcast_to` is a copy block that reads coordinate 0 on each broadcast axis. | [tile/tensor_to_tile/layout.ptir](../../filetests/tile/tensor_to_tile/layout.ptir) |
+| `BroadcastToTile` | `tensor.broadcast_to` | `tensor.broadcast_to` is a copy block that reads coordinate 0 on each broadcast axis. | [loop/tile_to_loop/pipeline.ptir](../../filetests/loop/tile_to_loop/pipeline.ptir), [tile/tensor_to_tile/layout.ptir](../../filetests/tile/tensor_to_tile/layout.ptir) |
 | `SliceToTile` | `tensor.slice` | `tensor.slice` is a copy block that reads `start + k * stride` on each axis. | [tile/tensor_to_tile/layout.ptir](../../filetests/tile/tensor_to_tile/layout.ptir) |
 | `BitcastToTile` | `tensor.bitcast` | `tensor.bitcast` of equal widths is a parallel block with `arith.bitcast`. Otherwise each result element ors together, in a `ui64`, the shifted bits of the input elements that overlap it in the row's bit stream, and a second block cuts them to the result's width. | [tile/tensor_to_tile/layout.ptir](../../filetests/tile/tensor_to_tile/layout.ptir) |
 | `ConcatToTile` | `tensor.concat` | `tensor.concat` is a block that reads every input shifted by its offset, padded outside it, and selects the input whose range holds the point. | [tile/tensor_to_tile/layout.ptir](../../filetests/tile/tensor_to_tile/layout.ptir) |
@@ -523,4 +545,34 @@ Patterns:
 | `BlockScaleToTile` | `tensor.block_scale_amax`, `tensor.block_scale_pow2_floor`, `tensor.block_scale_pow2_ceil` | A `tensor.block_scale_*` op is a block that folds each block's range, then a block that computes each block's scale from its largest magnitude and stores it. | [tile/tensor_to_tile/quant.ptir](../../filetests/tile/tensor_to_tile/quant.ptir) |
 | `BlockScaleRangeToTile` | `tensor.block_scale_range` | `tensor.block_scale_range` is a block that folds each block's range, then a block that computes each block's scale and offset from it. | [tile/tensor_to_tile/quant.ptir](../../filetests/tile/tensor_to_tile/quant.ptir) |
 
-Filetests: [tile/canonicalize/bodies.ptir](../../filetests/tile/canonicalize/bodies.ptir), [tile/tensor_to_tile/contraction.ptir](../../filetests/tile/tensor_to_tile/contraction.ptir), [tile/tensor_to_tile/control.ptir](../../filetests/tile/tensor_to_tile/control.ptir), [tile/tensor_to_tile/elementwise.ptir](../../filetests/tile/tensor_to_tile/elementwise.ptir), [tile/tensor_to_tile/errors.ptir](../../filetests/tile/tensor_to_tile/errors.ptir), [tile/tensor_to_tile/indexing.ptir](../../filetests/tile/tensor_to_tile/indexing.ptir), [tile/tensor_to_tile/layout.ptir](../../filetests/tile/tensor_to_tile/layout.ptir), [tile/tensor_to_tile/quant.ptir](../../filetests/tile/tensor_to_tile/quant.ptir), [tile/tensor_to_tile/random.ptir](../../filetests/tile/tensor_to_tile/random.ptir), [tile/tensor_to_tile/window.ptir](../../filetests/tile/tensor_to_tile/window.ptir).
+Filetests: [loop/tile_to_loop/pipeline.ptir](../../filetests/loop/tile_to_loop/pipeline.ptir), [tile/canonicalize/bodies.ptir](../../filetests/tile/canonicalize/bodies.ptir), [tile/tensor_to_tile/contraction.ptir](../../filetests/tile/tensor_to_tile/contraction.ptir), [tile/tensor_to_tile/control.ptir](../../filetests/tile/tensor_to_tile/control.ptir), [tile/tensor_to_tile/elementwise.ptir](../../filetests/tile/tensor_to_tile/elementwise.ptir), [tile/tensor_to_tile/errors.ptir](../../filetests/tile/tensor_to_tile/errors.ptir), [tile/tensor_to_tile/indexing.ptir](../../filetests/tile/tensor_to_tile/indexing.ptir), [tile/tensor_to_tile/layout.ptir](../../filetests/tile/tensor_to_tile/layout.ptir), [tile/tensor_to_tile/quant.ptir](../../filetests/tile/tensor_to_tile/quant.ptir), [tile/tensor_to_tile/random.ptir](../../filetests/tile/tensor_to_tile/random.ptir), [tile/tensor_to_tile/window.ptir](../../filetests/tile/tensor_to_tile/window.ptir).
+
+### `tile-to-loop`
+
+Lowers each `tile.dispatch` to a `loop.func` of the same name that computes the same values, bit
+for bit, with the loops that its schedule record asks for. A dispatch whose schedule record has
+no nest gets the reference schedule: one sequential loop per iterator, in the order of the
+block.
+
+- The function takes each argument of the dispatch in an `in` buffer, and gives each result in
+  an `out` buffer. A block result that no result gives lives in `private` scratch, and its
+  extents must be static.
+- Each fold of a block is a loop nest of its own, which runs the reads and the body at each
+  point. Without a nest, a fold into a new result walks the parallel iterators, then the
+  reduction iterators inside them. It folds into private scratch as the combine kind's reference
+  does. A fold into an operand copies the operand, then walks every point in order.
+- `tile.block` and `tile.group` outside a dispatch are errors: `seal-dispatches` outlines them.
+
+Defined by `TileToLoop` in [crates/gpt-rs-ir/src/conversion/tile_to_loop/mod.rs](../../crates/gpt-rs-ir/src/conversion/tile_to_loop/mod.rs).
+
+| Statistic | |
+|---|---|
+| `lowered` | dispatches lowered |
+
+Patterns:
+
+| Pattern | Root | Rewrite | Fires in |
+|---|---|---|---|
+| `DispatchToLoop` | `tile.dispatch` | `tile.dispatch` becomes the `loop.func` of its name: an `in` buffer for each argument, an `out` buffer for each result, and its blocks lowered in order. | [loop/tile_to_loop/fold.ptir](../../filetests/loop/tile_to_loop/fold.ptir), [loop/tile_to_loop/indexing.ptir](../../filetests/loop/tile_to_loop/indexing.ptir), [loop/tile_to_loop/map.ptir](../../filetests/loop/tile_to_loop/map.ptir), [loop/tile_to_loop/nest.ptir](../../filetests/loop/tile_to_loop/nest.ptir), [loop/tile_to_loop/pipeline.ptir](../../filetests/loop/tile_to_loop/pipeline.ptir), [loop/tile_to_loop/softmax.ptir](../../filetests/loop/tile_to_loop/softmax.ptir) |
+
+Filetests: [loop/tile_to_loop/errors.ptir](../../filetests/loop/tile_to_loop/errors.ptir), [loop/tile_to_loop/fold.ptir](../../filetests/loop/tile_to_loop/fold.ptir), [loop/tile_to_loop/indexing.ptir](../../filetests/loop/tile_to_loop/indexing.ptir), [loop/tile_to_loop/map.ptir](../../filetests/loop/tile_to_loop/map.ptir), [loop/tile_to_loop/nest.ptir](../../filetests/loop/tile_to_loop/nest.ptir), [loop/tile_to_loop/pipeline.ptir](../../filetests/loop/tile_to_loop/pipeline.ptir), [loop/tile_to_loop/softmax.ptir](../../filetests/loop/tile_to_loop/softmax.ptir).

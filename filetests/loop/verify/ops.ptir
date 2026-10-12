@@ -1,0 +1,104 @@
+// RUN: verify
+
+// ERROR: loop.if: the condition is si32, not i1
+loop.func @integer_condition(%flag: !loop.buf<si32, global>) attributes {access = [in]} {
+  %value = loop.load(%flag) : (!loop.buf<si32, global>) -> si32
+  loop.if(%value) ({
+    loop.yield() : () -> ()
+  }) : (si32) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.index: the expression names d1, but the op's operand count is 1
+loop.func @index_operand(%input: !loop.buf<f32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %sum = loop.index(%zero) {expr = d0 + d1} : (index) -> index
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.predicate: a constraint reads an operand element
+loop.func @predicate_read(%input: !loop.buf<f32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %holds = loop.predicate(%zero) {constraints = [$0[d0] < 4]} : (index) -> i1
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.predicate: the expression names d2, but the op's operand count is 1
+loop.func @predicate_operand(%input: !loop.buf<f32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %holds = loop.predicate(%zero) {constraints = [d0 < d2]} : (index) -> i1
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.load: the index count is 1, but !loop.buf<4x4xf32, global> has rank 2
+loop.func @load_rank(%input: !loop.buf<4x4xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %element = loop.load(%input, %zero) : (!loop.buf<4x4xf32, global>, index) -> f32
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.load: it pads with 0.5, which si32 cannot hold
+loop.func @load_pad(%input: !loop.buf<4xsi32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %element = loop.load(%input, %zero) {pad = 0.5} : (!loop.buf<4xsi32, global>, index) -> si32
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.store: the index count is 0, but !loop.buf<4xf32, private> has rank 1
+loop.func @store_rank(%input: !loop.buf<f32, global>) attributes {access = [in]} {
+  %value = loop.load(%input) : (!loop.buf<f32, global>) -> f32
+  %scratch = loop.alloc() {shape = [4], dtype = f32} : () -> !loop.buf<4xf32, private>
+  loop.store(%value, %scratch) : (f32, !loop.buf<4xf32, private>) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.store: the value is f32, but !loop.buf<si32, private> holds si32
+loop.func @store_dtype(%input: !loop.buf<f32, global>) attributes {access = [in]} {
+  %value = loop.load(%input) : (!loop.buf<f32, global>) -> f32
+  %scratch = loop.alloc() {shape = [], dtype = si32} : () -> !loop.buf<si32, private>
+  loop.store(%value, %scratch) : (f32, !loop.buf<si32, private>) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: arith.from_index: dtype must be an integer or float dtype, got i1
+loop.func @from_index_dtype(%input: !loop.buf<f32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %flag = arith.from_index(%zero) {dtype = i1} : (index) -> i1
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: arith.to_index: the input must be an integer dtype, got f32
+loop.func @to_index_float(%input: !loop.buf<f32, global>) attributes {access = [in]} {
+  %value = loop.load(%input) : (!loop.buf<f32, global>) -> f32
+  %index = arith.to_index(%value) : (f32) -> index
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: host.dispatch: @double is not a tile.dispatch or a loop.func
+func.func @double(%input: tensor<4xf32>) -> tensor<4xf32> {
+  func.return(%input) : (tensor<4xf32>) -> ()
+}
+func.func @main(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %output = host.dispatch(%input) {callee = @double} : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%output) : (tensor<4xf32>) -> ()
+}

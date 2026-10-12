@@ -50,7 +50,7 @@ func.func @offset_and_table(%codes: tensor<4x64xui4>, %scales: tensor<4x2xf16>, 
 // The scale and the offset are one value here, so one operand.
 // CHECK: tile.block([[INPUT]], [[SCALES]]) {iters = [par 8, par 16], reads = [$0[d0, d1], $1[d0, d1 floordiv 16], $1[d0, d1 floordiv 16]]
 // A table quantizes to the index of the nearest entry, folded with `argmin`.
-// CHECK: [[DISTANCES:%[0-9]+]], [[NEAREST:%[0-9]+]] = tile.block([[INPUT]], [[SCALES]], [[TABLE]]) {iters = [par 8, par 16, red 16], reads = [$0[d0, d1], $1[d0, d1 floordiv 16], $2[d2], $2[0]], folds = [argmin -> [d0, d1], [d0, d1]]}
+// CHECK: [[DISTANCES:%[0-9]+]], [[NEAREST:%[0-9]+]] = tile.block([[INPUT]], [[SCALES]], [[TABLE]]) {iters = [par 8, par 16, red 16], reads = [$0[d0, d1], $1[d0, d1 floordiv 16], $2[d2], $2[0]], folds = [argmin -> ([d0, d1], [d0, d1])]}
 // CHECK: tile.block([[NEAREST]])
 // CHECK: arith.cast({{%[0-9]+}}) {to = ui4}
 // CHECK-NOT: tensor.

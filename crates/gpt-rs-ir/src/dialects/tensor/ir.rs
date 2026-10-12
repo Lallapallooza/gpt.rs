@@ -1148,17 +1148,33 @@ pub struct Scan {
 // ------------------------------------------------------------------------------------------------
 // `tensor.custom_call`: a call into a backend kernel by name.
 
-/// A value in a custom call's attribute map.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// A value in a custom call's attribute map: `3`, `1.5`, `true`, `"s"`, or a list with its element
+/// type, `array<i64: [1, 2]>`.
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CustomAttr {
+    #[attr(format = "$0")]
     I64(i64),
+    #[attr(format = "$0")]
     F64(F64),
+    #[attr(format = "$0")]
     Bool(bool),
+    #[attr(format = "$0")]
     String(String),
-    I64Array(Vec<i64>),
-    F64Array(Vec<F64>),
-    BoolArray(Vec<bool>),
-    StringArray(Vec<String>),
+    #[attr(format = "`array` `<` $0 `>`")]
+    Array(CustomArray),
+}
+
+/// A list in a custom call's attribute map, after its element type.
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CustomArray {
+    #[attr(format = "`i64` `` `:` $0")]
+    I64(Vec<i64>),
+    #[attr(format = "`f64` `` `:` $0")]
+    F64(Vec<F64>),
+    #[attr(format = "`bool` `` `:` $0")]
+    Bool(Vec<bool>),
+    #[attr(format = "`str` `` `:` $0")]
+    String(Vec<String>),
 }
 
 /// `tensor.custom_call`: runs the backend kernel `target` on operands that the target defines, with

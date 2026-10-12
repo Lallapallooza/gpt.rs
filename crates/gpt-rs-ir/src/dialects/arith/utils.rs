@@ -1,14 +1,13 @@
 //! Literals of the `arith` dialect, their values and their text form, and the value of
 //! `arith.constant`.
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{anyhow, ensure, Result};
 
 use super::ir::*;
-use crate::attr::{print_float, Attr};
+use crate::attr::{print_float, Number};
 use crate::dense::Dense;
 use crate::host::{HostScalar, ScalarValue};
 use crate::op::ConstantOp;
-use crate::text::Cursor;
 use crate::types::DType;
 
 impl Literal {
@@ -31,46 +30,56 @@ impl Literal {
     }
 }
 
-impl Attr for Literal {
-    fn print(&self, out: &mut String) {
-        let scalar = self.scalar();
-        match scalar.value {
-            ScalarValue::Int(x) => out.push_str(&x.to_string()),
-            ScalarValue::F32(x) => print_float(x, out),
-            ScalarValue::F64(x) => print_float(x, out),
-        }
-        out.push_str(" : ");
-        out.push_str(&scalar.dtype.to_string());
-    }
+/// The text form of a literal: its value, then its dtype, `0.5 : f32`.
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
+#[attr(format = "$value `:` $dtype")]
+pub(super) struct LiteralText {
+    value: Number,
+    dtype: DType,
+}
 
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        let text = c.number()?;
-        c.expect(":")?;
-        let dtype = DType::parse(c)?;
-        let is_float = text.contains(['.', 'e', 'E', 'i', 'N']);
+impl From<&Literal> for LiteralText {
+    fn from(literal: &Literal) -> Self {
+        let scalar = literal.scalar();
+        let mut value = String::new();
+        match scalar.value {
+            ScalarValue::Int(x) => value.push_str(&x.to_string()),
+            ScalarValue::F32(x) => print_float(x, &mut value),
+            ScalarValue::F64(x) => print_float(x, &mut value),
+        }
+        LiteralText {
+            value: Number(value),
+            dtype: scalar.dtype,
+        }
+    }
+}
+
+impl TryFrom<LiteralText> for Literal {
+    type Error = anyhow::Error;
+
+    fn try_from(text: LiteralText) -> Result<Self> {
+        let (dtype, number) = (text.dtype, &text.value.0);
         let scalar = if dtype == DType::I1 || dtype.int_format().is_some() {
-            if is_float {
-                bail!(c.error(format!("`{text}` is not a {dtype} value")));
-            }
-            let value: i128 = text
+            ensure!(!text.value.is_float(), "`{number}` is not a {dtype} value");
+            let value: i128 = number
                 .parse()
-                .map_err(|err| c.error(format!("bad integer `{text}`: {err}")))?;
+                .map_err(|err| anyhow!("bad integer `{number}`: {err}"))?;
             let scalar = HostScalar::int(dtype, value)?;
             ensure!(
                 scalar.as_int() == Some(value),
-                c.error(format!("{value} is not a {dtype} value"))
+                "{value} is not a {dtype} value"
             );
             scalar
         } else if dtype == DType::F64 {
-            let value: f64 = text
+            let value: f64 = number
                 .parse()
-                .map_err(|_| c.error(format!("bad float `{text}`")))?;
+                .map_err(|_| anyhow!("bad float `{number}`"))?;
             HostScalar::from_f64(dtype, value)?
         } else {
             // The text of an f32-computed value is its shortest f32 decimal, so it reads as f32.
-            let value: f32 = text
+            let value: f32 = number
                 .parse()
-                .map_err(|_| c.error(format!("bad float `{text}`")))?;
+                .map_err(|_| anyhow!("bad float `{number}`"))?;
             HostScalar::from_f64(dtype, f64::from(value))?
         };
         Literal::new(scalar)

@@ -1,7 +1,7 @@
 //! The verifier, run after every pass.
 //!
 //! It checks that:
-//! - the module's body holds only `func.func` ops
+//! - the module's body holds only symbol ops: `func.func`, `tile.dispatch` and `loop.func`
 //! - each value is defined before it is used, and isolated regions read nothing from outside
 //! - each op gets the operand counts and kinds its groups declare, and its `result_types` agree
 //!   with the stored result types and result segments
@@ -43,7 +43,7 @@ impl Verifier<'_> {
         let op = module.op(inst);
         ensure!(
             !top || op.symbol_name().is_some(),
-            "only func.func and tile.dispatch may appear at the top level"
+            "only func.func, tile.dispatch and loop.func may appear at the top level"
         );
         let operands = module.operands(inst);
         if let Some(i) = operands.iter().position(|&v| !module.dominates(v, inst)) {

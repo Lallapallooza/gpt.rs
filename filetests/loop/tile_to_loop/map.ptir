@@ -1,0 +1,66 @@
+// RUN: pass seal-dispatches, tile-to-loop
+
+// A map over a symbolic extent: one loop per iterator, the reads and the body at each point, and
+// the store into the result's buffer.
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}([[INPUT:%[0-9]+]]: !loop.buf<{N}x4xf32, global>, [[FACTOR:%[0-9]+]]: !loop.buf<4xf32, global>, [[SCALED:%[0-9]+]]: !loop.buf<{N}x4xf32, global>) attributes {access = [in, in, out]} {
+// CHECK-NEXT: [[ZERO:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[ROWS:%[0-9]+]] = loop.index() {expr = {N}} : () -> index
+// CHECK-NEXT: loop.for([[ZERO]], [[ROWS]]) ({
+// CHECK-NEXT: ^body([[ROW:%[0-9]+]]: index):
+// CHECK-NEXT: [[START:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[COLUMNS:%[0-9]+]] = loop.index() {expr = 4} : () -> index
+// CHECK-NEXT: loop.for([[START]], [[COLUMNS]]) ({
+// CHECK-NEXT: ^body([[COLUMN:%[0-9]+]]: index):
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load([[INPUT]], [[ROW]], [[COLUMN]]) : (!loop.buf<{N}x4xf32, global>, index, index) -> f32
+// CHECK-NEXT: [[SCALE:%[0-9]+]] = loop.load([[FACTOR]], [[COLUMN]]) : (!loop.buf<4xf32, global>, index) -> f32
+// CHECK-NEXT: [[PRODUCT:%[0-9]+]] = arith.mul([[ELEMENT]], [[SCALE]]) : (f32, f32) -> f32
+// CHECK-NEXT: loop.store([[PRODUCT]], [[SCALED]], [[ROW]], [[COLUMN]]) : (f32, !loop.buf<{N}x4xf32, global>, index, index) -> ()
+// CHECK-NEXT: loop.yield() : () -> ()
+// CHECK-NEXT: }) : (index, index) -> ()
+// CHECK-NEXT: loop.yield() : () -> ()
+// CHECK-NEXT: }) : (index, index) -> ()
+// CHECK-NEXT: loop.return() : () -> ()
+// CHECK-NEXT: }
+// CHECK: host.dispatch({{%[0-9]+}}, {{%[0-9]+}}) {callee = @dispatch.{{[0-9a-f]+}}}
+func.func @scale(%input: tensor<{N}x4xf32>, %factor: tensor<4xf32>) -> tensor<{N}x4xf32> {
+  %scaled = tile.block(%input, %factor) {iters = [par {N}, par 4], reads = [$0[d0, d1], $1[d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32, %scale: f32):
+    %product = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%product) : (f32) -> ()
+  }) : (tensor<{N}x4xf32>, tensor<4xf32>) -> tensor<{N}x4xf32>
+  func.return(%scaled) : (tensor<{N}x4xf32>) -> ()
+}
+
+// -----
+
+// A group of two blocks is one dispatch. The value between them lives in private scratch. The
+// dispatch returns its argument and one value twice, which it copies into their buffers.
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}([[INPUT:%[0-9]+]]: !loop.buf<2x3xf32, global>, [[SQUARES:%[0-9]+]]: !loop.buf<2x3xf32, global>, [[AGAIN:%[0-9]+]]: !loop.buf<2x3xf32, global>, [[SAME:%[0-9]+]]: !loop.buf<2x3xf32, global>) attributes {access = [in, out, out, out]} {
+// CHECK-NEXT: [[DOUBLED:%[0-9]+]] = loop.alloc() {shape = [2, 3], dtype = f32} : () -> !loop.buf<2x3xf32, private>
+// CHECK: [[ELEMENT:%[0-9]+]] = loop.load([[INPUT]], [[ROW:%[0-9]+]], [[COLUMN:%[0-9]+]])
+// CHECK-NEXT: [[SUM:%[0-9]+]] = arith.add([[ELEMENT]], [[ELEMENT]])
+// CHECK-NEXT: loop.store([[SUM]], [[DOUBLED]], [[ROW]], [[COLUMN]])
+// CHECK: [[STAGED:%[0-9]+]] = loop.load([[DOUBLED]], [[ROW:%[0-9]+]], [[COLUMN:%[0-9]+]])
+// CHECK-NEXT: [[PRODUCT:%[0-9]+]] = arith.mul([[STAGED]], [[STAGED]])
+// CHECK-NEXT: loop.store([[PRODUCT]], [[SQUARES]], [[ROW]], [[COLUMN]])
+// CHECK: [[SQUARE:%[0-9]+]] = loop.load([[SQUARES]], [[ROW:%[0-9]+]], [[COLUMN:%[0-9]+]])
+// CHECK-NEXT: loop.store([[SQUARE]], [[AGAIN]], [[ROW]], [[COLUMN]])
+// CHECK: [[COPIED:%[0-9]+]] = loop.load([[INPUT]], [[ROW:%[0-9]+]], [[COLUMN:%[0-9]+]])
+// CHECK-NEXT: loop.store([[COPIED]], [[SAME]], [[ROW]], [[COLUMN]])
+// CHECK: host.dispatch({{%[0-9]+}}) {callee = @dispatch.{{[0-9a-f]+}}} : (tensor<2x3xf32>) -> (tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>)
+func.func @grouped(%input: tensor<2x3xf32>) -> (tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>) {
+  %squares, %again, %same = tile.group() ({
+    %doubled = tile.block(%input) {iters = [par 2, par 3], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+    ^body(%element: f32):
+      %sum = arith.add(%element, %element) : (f32, f32) -> f32
+      tile.yield(%sum) : (f32) -> ()
+    }) : (tensor<2x3xf32>) -> tensor<2x3xf32>
+    %squared = tile.block(%doubled) {iters = [par 2, par 3], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+    ^body(%element: f32):
+      %product = arith.mul(%element, %element) : (f32, f32) -> f32
+      tile.yield(%product) : (f32) -> ()
+    }) : (tensor<2x3xf32>) -> tensor<2x3xf32>
+    tile.yield(%squared, %squared, %input) : (tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>) -> ()
+  }) : () -> (tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>)
+  func.return(%squares, %again, %same) : (tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>) -> ()
+}

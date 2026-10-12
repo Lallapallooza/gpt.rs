@@ -12,6 +12,7 @@ use crate::module::{Inst, Module, NewInst, Region, Value};
 use crate::op::{Created, Folded, Groups, InOp, OpDyn, OpKind, Operands, Values};
 use crate::rewrite::build::materialize;
 use crate::rewrite::Build;
+use crate::text::any_items;
 use crate::types::{TensorType, Type};
 use crate::Op;
 
@@ -203,6 +204,22 @@ impl<'m> Builder<'m> {
         Ok(inst)
     }
 
+    /// Creates a copy of `inst` of `source`, with its regions, as [`Module::copy_inst`] makes it:
+    /// its operands are the values `map` gives for its own, and `map` gains its results and
+    /// region arguments.
+    pub fn create_copy(
+        &mut self,
+        source: &Module,
+        inst: Inst,
+        map: &mut HashMap<Value, Value>,
+    ) -> Result<Inst> {
+        let copy = self.module.copy_inst(source, inst, map)?;
+        self.place(copy);
+        let inner = self.module.walk_inst(copy);
+        self.created.extend(inner.into_iter().skip(1));
+        Ok(copy)
+    }
+
     /// The results of `inst` and their groups.
     fn results_of(&self, inst: Inst) -> (Vec<Value>, Option<Vec<usize>>) {
         (
@@ -237,21 +254,12 @@ impl Module {
             name: name.to_string(),
             args,
             results,
-            params: bound_params(params),
+            params: any_items(params),
             result_params: Vec::new(),
         };
         let top = self.body();
         let mut builder = Builder::at_end(self, top);
         Ok(builder.create_op(func.into(), Vec::new(), None, vec![region]))
-    }
-}
-
-/// `params`, or an empty list when none of them is bound. A `Func` stores its `params` this way.
-pub(crate) fn bound_params(params: Vec<Option<ParamId>>) -> Vec<Option<ParamId>> {
-    if params.iter().any(Option::is_some) {
-        params
-    } else {
-        Vec::new()
     }
 }
 

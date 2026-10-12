@@ -4,4 +4,3 @@
 mod block;
 pub(crate) mod build;
 mod combine;
-mod dispatch;

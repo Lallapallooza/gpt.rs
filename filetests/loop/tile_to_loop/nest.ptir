@@ -1,0 +1,106 @@
+// RUN: pass tile-to-loop
+
+// A projection whose columns run as units on cores, four per unit, the last unit with the two
+// left over. The loop over tiles of the contracted axis is outside the inner column tiles, so the
+// sums of a unit's three rows and four columns stay in a private buffer while it walks them.
+// CHECK: loop.func @project([[INPUT:%[0-9]+]]: !loop.buf<3x8xf32, global>, [[WEIGHT:%[0-9]+]]: !loop.buf<6x8xf32, global>, [[PRODUCT:%[0-9]+]]: !loop.buf<3x6xf32, global>) attributes {access = [in, in, out]} {
+// CHECK-NEXT: [[START:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[COLUMNS:%[0-9]+]] = loop.index() {expr = 6} : () -> index
+// CHECK-NEXT: [[UNITS:%[0-9]+]] = loop.index([[START]], [[COLUMNS]]) {expr = (d1 - d0 + 3) floordiv 4} : (index, index) -> index
+// CHECK-NEXT: [[ZERO:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: loop.forall([[ZERO]], [[UNITS]]) {level = core} ({
+// CHECK-NEXT: ^body([[UNIT:%[0-9]+]]: index):
+// CHECK-NEXT: [[FIRST_COLUMN:%[0-9]+]] = loop.index([[START]], [[UNIT]]) {expr = d0 + d1 * 4} : (index, index) -> index
+// CHECK-NEXT: [[END_COLUMN:%[0-9]+]] = loop.index([[FIRST_COLUMN]], [[COLUMNS]]) {expr = min(d0 + 4, d1)} : (index, index) -> index
+// CHECK-NEXT: [[SUMS:%[0-9]+]] = loop.alloc() {shape = [3, 4], dtype = f32} : () -> !loop.buf<3x4xf32, private>
+// CHECK: [[COLUMNS_HERE:%[0-9]+]] = loop.index([[FIRST_COLUMN]], [[END_COLUMN]]) {expr = min(4, d1 - d0)} : (index, index) -> index
+// CHECK: loop.store({{%[0-9]+}}, [[SUMS]], [[ROW_OFFSET:%[0-9]+]], [[COLUMN_OFFSET:%[0-9]+]])
+// CHECK: [[DEPTH:%[0-9]+]] = loop.index() {expr = 8} : () -> index
+// CHECK-NEXT: [[DEPTH_TILES:%[0-9]+]] = loop.index({{%[0-9]+}}, [[DEPTH]]) {expr = (d1 - d0 + 3) floordiv 4} : (index, index) -> index
+// CHECK: loop.for({{%[0-9]+}}, [[DEPTH_TILES]]) ({
+// CHECK-NEXT: ^body([[DEPTH_TILE:%[0-9]+]]: index):
+// CHECK-NEXT: [[FIRST_DEPTH:%[0-9]+]] = loop.index({{%[0-9]+}}, [[DEPTH_TILE]]) {expr = d0 + d1 * 4} : (index, index) -> index
+// CHECK-NEXT: [[END_DEPTH:%[0-9]+]] = loop.index([[FIRST_DEPTH]], [[DEPTH]]) {expr = min(d0 + 4, d1)} : (index, index) -> index
+// CHECK-NEXT: [[PAIRS:%[0-9]+]] = loop.index([[FIRST_COLUMN]], [[END_COLUMN]]) {expr = (d1 - d0 + 1) floordiv 2} : (index, index) -> index
+// CHECK: loop.for({{%[0-9]+}}, [[PAIRS]]) ({
+// CHECK-NEXT: ^body([[PAIR:%[0-9]+]]: index):
+// CHECK-NEXT: [[FIRST_OF_PAIR:%[0-9]+]] = loop.index([[FIRST_COLUMN]], [[PAIR]]) {expr = d0 + d1 * 2} : (index, index) -> index
+// CHECK-NEXT: [[END_OF_PAIR:%[0-9]+]] = loop.index([[FIRST_OF_PAIR]], [[END_COLUMN]]) {expr = min(d0 + 2, d1)} : (index, index) -> index
+// CHECK: ^body([[ROW:%[0-9]+]]: index):
+// CHECK-NEXT: loop.for([[FIRST_OF_PAIR]], [[END_OF_PAIR]]) ({
+// CHECK-NEXT: ^body([[COLUMN:%[0-9]+]]: index):
+// CHECK-NEXT: loop.for([[FIRST_DEPTH]], [[END_DEPTH]]) ({
+// CHECK-NEXT: ^body([[POINT:%[0-9]+]]: index):
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load([[INPUT]], [[ROW]], [[POINT]])
+// CHECK-NEXT: [[SCALE:%[0-9]+]] = loop.load([[WEIGHT]], [[COLUMN]], [[POINT]])
+// CHECK-NEXT: [[TERM:%[0-9]+]] = arith.mul([[ELEMENT]], [[SCALE]])
+// CHECK-NEXT: [[ROW_IN_TILE:%[0-9]+]] = loop.index([[ROW]], {{%[0-9]+}}) {expr = d0 - d1} : (index, index) -> index
+// CHECK-NEXT: [[COLUMN_IN_TILE:%[0-9]+]] = loop.index([[COLUMN]], [[FIRST_COLUMN]]) {expr = d0 - d1} : (index, index) -> index
+// CHECK-NEXT: [[SO_FAR:%[0-9]+]] = loop.load([[SUMS]], [[ROW_IN_TILE]], [[COLUMN_IN_TILE]])
+// CHECK-NEXT: [[SUM:%[0-9]+]] = arith.add([[SO_FAR]], [[TERM]])
+// CHECK-NEXT: loop.store([[SUM]], [[SUMS]], [[ROW_IN_TILE]], [[COLUMN_IN_TILE]])
+// CHECK: [[FINAL:%[0-9]+]] = loop.load([[SUMS]], [[ROW_OFFSET:%[0-9]+]], [[COLUMN_OFFSET:%[0-9]+]])
+// CHECK-NEXT: loop.store([[FINAL]], [[PRODUCT]], {{%[0-9]+}}, {{%[0-9]+}})
+tile.dispatch @project(%input: tensor<3x8xf32>, %weight: tensor<6x8xf32>) -> tensor<3x6xf32> attributes {schedule = #sched<nest = [d1 by 4 : par<level = core>, d2 by 4 : seq, d1 by 2 : seq]>} {
+  %product = tile.block(%input, %weight) {iters = [par 3, par 6, red 8], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<3x8xf32>, tensor<6x8xf32>) -> tensor<3x6xf32>
+  func.return(%product) : (tensor<3x6xf32>) -> ()
+}
+func.func @main(%input: tensor<3x8xf32>, %weight: tensor<6x8xf32>) -> tensor<3x6xf32> {
+  %product = host.dispatch(%input, %weight) {callee = @project} : (tensor<3x8xf32>, tensor<6x8xf32>) -> tensor<3x6xf32>
+  func.return(%product) : (tensor<3x6xf32>) -> ()
+}
+
+// -----
+
+// Two units run the five rows of a map, a contiguous run of three and then of two. Each row runs
+// its columns on the cores of its unit.
+// CHECK: loop.func @rows({{%[0-9]+}}: !loop.buf<5x4xf32, global>, {{%[0-9]+}}: !loop.buf<5x4xf32, global>) attributes {access = [in, out]} {
+// CHECK: [[ROW_TILES:%[0-9]+]] = loop.index({{%[0-9]+}}, {{%[0-9]+}}) {expr = d1 - d0} : (index, index) -> index
+// CHECK: [[UNITS:%[0-9]+]] = loop.index() {expr = 2} : () -> index
+// CHECK-NEXT: loop.forall({{%[0-9]+}}, [[UNITS]]) {level = l3} ({
+// CHECK-NEXT: ^body([[UNIT:%[0-9]+]]: index):
+// CHECK-NEXT: [[PER_UNIT:%[0-9]+]] = loop.index([[ROW_TILES]]) {expr = (d0 + 1) floordiv 2} : (index) -> index
+// CHECK-NEXT: [[RUN_START:%[0-9]+]] = loop.index([[UNIT]], [[PER_UNIT]]) {expr = d0 * d1} : (index, index) -> index
+// CHECK-NEXT: [[RUN_END:%[0-9]+]] = loop.index([[RUN_START]], [[PER_UNIT]], [[ROW_TILES]]) {expr = min(d0 + d1, d2)} : (index, index, index) -> index
+// CHECK-NEXT: loop.for([[RUN_START]], [[RUN_END]]) ({
+// CHECK: loop.forall({{%[0-9]+}}, {{%[0-9]+}}) {level = core} ({
+tile.dispatch @rows(%input: tensor<5x4xf32>) -> tensor<5x4xf32> attributes {schedule = #sched<nest = [d0 by 1 : par<level = l3, units = 2>, d1 by 2 : par<level = core>]>} {
+  %negated = tile.block(%input) {iters = [par 5, par 4], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    %negative = arith.neg(%element) : (f32) -> f32
+    tile.yield(%negative) : (f32) -> ()
+  }) : (tensor<5x4xf32>) -> tensor<5x4xf32>
+  func.return(%negated) : (tensor<5x4xf32>) -> ()
+}
+func.func @main(%input: tensor<5x4xf32>) -> tensor<5x4xf32> {
+  %negated = host.dispatch(%input) {callee = @rows} : (tensor<5x4xf32>) -> tensor<5x4xf32>
+  func.return(%negated) : (tensor<5x4xf32>) -> ()
+}
+
+// -----
+
+// `top_k` over tiles of the reduced axis, inside units of rows: the state keeps each row's held
+// candidates while the loop walks the tiles of the scores.
+// CHECK: loop.func @best({{%[0-9]+}}: !loop.buf<4x7xf32, global>, [[VALUES:%[0-9]+]]: !loop.buf<4x2xf32, global>, [[INDICES:%[0-9]+]]: !loop.buf<4x2xsi32, global>) attributes {access = [in, out, out]} {
+// CHECK: loop.forall({{%[0-9]+}}, {{%[0-9]+}}) {level = core} ({
+// CHECK: [[HELD_VALUES:%[0-9]+]] = loop.alloc() {shape = [2, 2], dtype = f32} : () -> !loop.buf<2x2xf32, private>
+// CHECK-NEXT: [[HELD_INDICES:%[0-9]+]] = loop.alloc() {shape = [2, 2], dtype = si32} : () -> !loop.buf<2x2xsi32, private>
+// CHECK-NEXT: [[HELD:%[0-9]+]] = loop.alloc() {shape = [2], dtype = si64} : () -> !loop.buf<2xsi64, private>
+// CHECK: {expr = (d1 - d0 + 2) floordiv 3}
+// CHECK: loop.store({{%[0-9]+}}, [[VALUES]], {{%[0-9]+}}, {{%[0-9]+}}) : (f32, !loop.buf<4x2xf32, global>, index, index) -> ()
+tile.dispatch @best(%scores: tensor<4x7xf32>) -> (tensor<4x2xf32>, tensor<4x2xsi32>) attributes {schedule = #sched<nest = [d0 by 2 : par<level = core>, d1 by 3 : seq]>} {
+  %values, %indices = tile.block(%scores) {iters = [par 4, red 7], reads = [$0[d0, d1]], folds = [top_k<k = 2> -> ([d0], [d0])]} ({
+  ^body(%score: f32):
+    %position = tile.index() {expr = d1, dtype = si32} : () -> si32
+    tile.yield(%score, %position) : (f32, si32) -> ()
+  }) : (tensor<4x7xf32>) -> (tensor<4x2xf32>, tensor<4x2xsi32>)
+  func.return(%values, %indices) : (tensor<4x2xf32>, tensor<4x2xsi32>) -> ()
+}
+func.func @main(%scores: tensor<4x7xf32>) -> (tensor<4x2xf32>, tensor<4x2xsi32>) {
+  %values, %indices = host.dispatch(%scores) {callee = @best} : (tensor<4x7xf32>) -> (tensor<4x2xf32>, tensor<4x2xsi32>)
+  func.return(%values, %indices) : (tensor<4x2xf32>, tensor<4x2xsi32>) -> ()
+}

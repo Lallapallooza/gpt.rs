@@ -1,0 +1,189 @@
+// RUN: pass seal-dispatches, tile-to-loop
+
+// A sum: for each element, a cell of private scratch starts at the identity, and the loop over the
+// reduction iterator folds each point into it; then the element is stored. The reduction iterator
+// comes first among the iterators, and still runs inside the parallel one.
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}([[INPUT:%[0-9]+]]: !loop.buf<5x3xf32, global>, [[SUMS:%[0-9]+]]: !loop.buf<3xf32, global>) attributes {access = [in, out]} {
+// CHECK-NEXT: [[ZERO:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[COLUMNS:%[0-9]+]] = loop.index() {expr = 3} : () -> index
+// CHECK-NEXT: loop.for([[ZERO]], [[COLUMNS]]) ({
+// CHECK-NEXT: ^body([[COLUMN:%[0-9]+]]: index):
+// CHECK-NEXT: [[RUNNING:%[0-9]+]] = loop.alloc() {shape = [], dtype = f32} : () -> !loop.buf<f32, private>
+// CHECK-NEXT: [[IDENTITY:%[0-9]+]] = arith.constant() {value = 0.0 : f32} : () -> f32
+// CHECK-NEXT: loop.store([[IDENTITY]], [[RUNNING]]) : (f32, !loop.buf<f32, private>) -> ()
+// CHECK-NEXT: [[START:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[ROWS:%[0-9]+]] = loop.index() {expr = 5} : () -> index
+// CHECK-NEXT: loop.for([[START]], [[ROWS]]) ({
+// CHECK-NEXT: ^body([[ROW:%[0-9]+]]: index):
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load([[INPUT]], [[ROW]], [[COLUMN]]) : (!loop.buf<5x3xf32, global>, index, index) -> f32
+// CHECK-NEXT: [[SO_FAR:%[0-9]+]] = loop.load([[RUNNING]]) : (!loop.buf<f32, private>) -> f32
+// CHECK-NEXT: [[SUM:%[0-9]+]] = arith.add([[SO_FAR]], [[ELEMENT]]) : (f32, f32) -> f32
+// CHECK-NEXT: loop.store([[SUM]], [[RUNNING]]) : (f32, !loop.buf<f32, private>) -> ()
+// CHECK-NEXT: loop.yield() : () -> ()
+// CHECK-NEXT: }) : (index, index) -> ()
+// CHECK-NEXT: [[TOTAL:%[0-9]+]] = loop.load([[RUNNING]]) : (!loop.buf<f32, private>) -> f32
+// CHECK-NEXT: loop.store([[TOTAL]], [[SUMS]], [[COLUMN]]) : (f32, !loop.buf<3xf32, global>, index) -> ()
+func.func @column_sums(%input: tensor<5x3xf32>) -> tensor<3xf32> {
+  %sums = tile.block(%input) {iters = [red 5, par 3], reads = [$0[d0, d1]], folds = [sum -> [d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<5x3xf32>) -> tensor<3xf32>
+  func.return(%sums) : (tensor<3xf32>) -> ()
+}
+
+// -----
+
+// A fold from an initial state, and folds with their identities: `max` from `-inf`, `and` from 1.
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}([[SCORES:%[0-9]+]]: !loop.buf<2x5xf32, global>, [[START:%[0-9]+]]: !loop.buf<2xf32, global>, [[SUM:%[0-9]+]]: !loop.buf<2xf32, global>) attributes {access = [in, in, out]} {
+// CHECK: ^body([[ROW:%[0-9]+]]: index):
+// CHECK-NEXT: [[RUNNING:%[0-9]+]] = loop.alloc() {shape = [], dtype = f32} : () -> !loop.buf<f32, private>
+// CHECK-NEXT: [[INITIAL:%[0-9]+]] = loop.load([[START]], [[ROW]]) : (!loop.buf<2xf32, global>, index) -> f32
+// CHECK-NEXT: loop.store([[INITIAL]], [[RUNNING]]) : (f32, !loop.buf<f32, private>) -> ()
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}({{%[0-9]+}}: !loop.buf<2x5xf32, global>, {{%[0-9]+}}: !loop.buf<2x5xi1, global>, [[MAX:%[0-9]+]]: !loop.buf<2xf32, global>, [[ALL:%[0-9]+]]: !loop.buf<2xi1, global>) attributes {access = [in, in, out, out]} {
+// CHECK: [[LOWEST:%[0-9]+]] = arith.constant() {value = -inf : f32} : () -> f32
+// CHECK: arith.maximum
+// CHECK: [[EVERY:%[0-9]+]] = arith.constant() {value = 1 : i1} : () -> i1
+// CHECK: arith.and
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}
+// CHECK: [[NONE:%[0-9]+]] = arith.constant() {value = 0 : si32} : () -> si32
+// CHECK: arith.or
+func.func @identities(%scores: tensor<2x5xf32>, %start: tensor<2xf32>, %flags: tensor<2x5xi1>) -> (tensor<2xf32>, tensor<2xf32>, tensor<2xi1>, tensor<2xsi32>) {
+  %sum = tile.block(%scores, %start) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [sum -> [d0] init $1]} ({
+  ^body(%score: f32):
+    tile.yield(%score) : (f32) -> ()
+  }) : (tensor<2x5xf32>, tensor<2xf32>) -> tensor<2xf32>
+  %max, %all = tile.block(%scores, %flags) {iters = [par 2, red 5], reads = [$0[d0, d1], $1[d0, d1]], folds = [max -> [d0], and -> [d0]]} ({
+  ^body(%score: f32, %flag: i1):
+    tile.yield(%score, %flag) : (f32, i1) -> ()
+  }) : (tensor<2x5xf32>, tensor<2x5xi1>) -> (tensor<2xf32>, tensor<2xi1>)
+  %any_set = tile.block(%flags) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [or -> [d0]]} ({
+  ^body(%flag: i1):
+    %as_count = arith.cast(%flag) {to = si32} : (i1) -> si32
+    tile.yield(%as_count) : (si32) -> ()
+  }) : (tensor<2x5xi1>) -> tensor<2xsi32>
+  func.return(%sum, %max, %all, %any_set) : (tensor<2xf32>, tensor<2xf32>, tensor<2xi1>, tensor<2xsi32>) -> ()
+}
+
+// -----
+
+// `argmax` and `argmin` keep the best value and its index: a candidate takes its place when its
+// value ranks better, with NaN greater than every number, or when the values are equal and its
+// index is smaller.
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}([[SCORES:%[0-9]+]]: !loop.buf<2x5xf32, global>, {{%[0-9]+}}: !loop.buf<2xf32, global>, {{%[0-9]+}}: !loop.buf<2xsi32, global>, {{%[0-9]+}}: !loop.buf<2xf32, global>, {{%[0-9]+}}: !loop.buf<2xsi64, global>) attributes {access = [in, out, out, out, out]} {
+// CHECK: [[VALUES:%[0-9]+]] = loop.alloc() {shape = [1], dtype = f32} : () -> !loop.buf<1xf32, private>
+// CHECK-NEXT: [[INDICES:%[0-9]+]] = loop.alloc() {shape = [1], dtype = si32} : () -> !loop.buf<1xsi32, private>
+// CHECK-NEXT: [[HELD:%[0-9]+]] = loop.alloc() {shape = [], dtype = si64} : () -> !loop.buf<si64, private>
+// CHECK-NEXT: [[FILL:%[0-9]+]] = arith.constant() {value = -inf : f32} : () -> f32
+// CHECK-NEXT: [[MISSING:%[0-9]+]] = arith.constant() {value = -1 : si32} : () -> si32
+// CHECK: [[SCORE:%[0-9]+]] = loop.load([[SCORES]], {{%[0-9]+}}, [[POINT:%[0-9]+]]) : (!loop.buf<2x5xf32, global>, index, index) -> f32
+// CHECK-NEXT: [[POSITION:%[0-9]+]] = arith.from_index([[POINT]]) {dtype = si32} : (index) -> si32
+// CHECK: [[HELD_VALUE:%[0-9]+]] = loop.load([[VALUES]], [[SLOT:%[0-9]+]]) : (!loop.buf<1xf32, private>, index) -> f32
+// CHECK-NEXT: [[HELD_INDEX:%[0-9]+]] = loop.load([[INDICES]], [[SLOT]]) : (!loop.buf<1xsi32, private>, index) -> si32
+// CHECK-NEXT: [[SCORE_NAN:%[0-9]+]] = arith.not_equal([[SCORE]], [[SCORE]]) : (f32, f32) -> i1
+// CHECK-NEXT: [[HELD_NAN:%[0-9]+]] = arith.not_equal([[HELD_VALUE]], [[HELD_VALUE]]) : (f32, f32) -> i1
+// CHECK-NEXT: [[HELD_NUMBER:%[0-9]+]] = arith.not([[HELD_NAN]]) : (i1) -> i1
+// CHECK-NEXT: [[NAN_OVER_NUMBER:%[0-9]+]] = arith.and([[SCORE_NAN]], [[HELD_NUMBER]]) : (i1, i1) -> i1
+// CHECK-NEXT: [[GREATER:%[0-9]+]] = arith.greater([[SCORE]], [[HELD_VALUE]]) : (f32, f32) -> i1
+// CHECK-NEXT: [[BETTER:%[0-9]+]] = arith.or([[NAN_OVER_NUMBER]], [[GREATER]]) : (i1, i1) -> i1
+// CHECK-NEXT: [[BOTH_NAN:%[0-9]+]] = arith.and([[SCORE_NAN]], [[HELD_NAN]]) : (i1, i1) -> i1
+// CHECK-NEXT: [[SAME:%[0-9]+]] = arith.equal([[SCORE]], [[HELD_VALUE]]) : (f32, f32) -> i1
+// CHECK-NEXT: [[EQUAL:%[0-9]+]] = arith.or([[BOTH_NAN]], [[SAME]]) : (i1, i1) -> i1
+// CHECK-NEXT: [[EARLIER:%[0-9]+]] = arith.less([[POSITION]], [[HELD_INDEX]]) : (si32, si32) -> i1
+// CHECK-NEXT: [[TIE_WON:%[0-9]+]] = arith.and([[EQUAL]], [[EARLIER]]) : (i1, i1) -> i1
+// CHECK-NEXT: arith.or([[BETTER]], [[TIE_WON]]) : (i1, i1) -> i1
+// CHECK: arith.less({{%[0-9]+}}, {{%[0-9]+}}) : (si64, si64) -> i1
+func.func @best(%scores: tensor<2x5xf32>) -> (tensor<2xf32>, tensor<2xsi32>, tensor<2xf32>, tensor<2xsi64>) {
+  %argmax_value, %argmax_index, %argmin_value, %argmin_index = tile.block(%scores) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [argmax -> ([d0], [d0]), argmin -> ([d0], [d0])]} ({
+  ^body(%score: f32):
+    %position = tile.index() {expr = d1, dtype = si32} : () -> si32
+    %wide_position = tile.index() {expr = d1, dtype = si64} : () -> si64
+    tile.yield(%score, %position, %score, %wide_position) : (f32, si32, f32, si64) -> ()
+  }) : (tensor<2x5xf32>) -> (tensor<2xf32>, tensor<2xsi32>, tensor<2xf32>, tensor<2xsi64>)
+  func.return(%argmax_value, %argmax_index, %argmin_value, %argmin_index) : (tensor<2xf32>, tensor<2xsi32>, tensor<2xf32>, tensor<2xsi64>) -> ()
+}
+
+// -----
+
+// `top_k` keeps the best candidates in order: a candidate goes after every held one that ranks
+// before or with it, and the ones after it move down by one, the last out.
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}([[SCORES:%[0-9]+]]: !loop.buf<2x5xsi32, global>, [[TOP_VALUES:%[0-9]+]]: !loop.buf<2x3xsi32, global>, [[TOP_INDICES:%[0-9]+]]: !loop.buf<2x3xsi32, global>) attributes {access = [in, out, out]} {
+// CHECK: ^body([[ROW:%[0-9]+]]: index):
+// CHECK-NEXT: [[VALUES:%[0-9]+]] = loop.alloc() {shape = [3], dtype = si32} : () -> !loop.buf<3xsi32, private>
+// CHECK-NEXT: [[INDICES:%[0-9]+]] = loop.alloc() {shape = [3], dtype = si32} : () -> !loop.buf<3xsi32, private>
+// CHECK-NEXT: [[HELD:%[0-9]+]] = loop.alloc() {shape = [], dtype = si64} : () -> !loop.buf<si64, private>
+// CHECK-NEXT: [[FILL:%[0-9]+]] = arith.constant() {value = -2147483648 : si32} : () -> si32
+// CHECK: [[COUNT:%[0-9]+]] = loop.alloc() {shape = [], dtype = si64} : () -> !loop.buf<si64, private>
+// CHECK: [[FILLED:%[0-9]+]] = loop.predicate([[SLOT:%[0-9]+]], [[HELD_COUNT:%[0-9]+]]) {constraints = [d0 < d1]} : (index, index) -> i1
+// CHECK: [[STEP:%[0-9]+]] = arith.select({{%[0-9]+}}, [[ONE:%[0-9]+]], [[ZERO:%[0-9]+]]) : (i1, si64, si64) -> si64
+// CHECK: [[PLACE:%[0-9]+]] = arith.to_index({{%[0-9]+}}) : (si64) -> index
+// CHECK-NEXT: [[SHIFTS:%[0-9]+]] = loop.index() {expr = 2} : () -> index
+// CHECK-NEXT: loop.for({{%[0-9]+}}, [[SHIFTS]]) ({
+// CHECK-NEXT: ^body([[MOVE:%[0-9]+]]: index):
+// CHECK-NEXT: [[TO:%[0-9]+]] = loop.index([[MOVE]]) {expr = 2 - d0} : (index) -> index
+// CHECK-NEXT: [[MOVES:%[0-9]+]] = loop.predicate([[PLACE]], [[TO]]) {constraints = [d0 < d1]} : (index, index) -> i1
+// CHECK-NEXT: loop.if([[MOVES]]) ({
+// CHECK-NEXT: [[FROM:%[0-9]+]] = loop.index([[TO]]) {expr = d0 - 1} : (index) -> index
+// CHECK: [[KEPT:%[0-9]+]] = loop.predicate([[PLACE]]) {constraints = [d0 < 3]} : (index) -> i1
+// CHECK-NEXT: loop.if([[KEPT]]) ({
+// CHECK-NEXT: loop.store({{%[0-9]+}}, [[VALUES]], [[PLACE]]) : (si32, !loop.buf<3xsi32, private>, index) -> ()
+// CHECK: [[MOST:%[0-9]+]] = arith.constant() {value = 3 : si64} : () -> si64
+// CHECK-NEXT: [[CAPPED:%[0-9]+]] = arith.minimum({{%[0-9]+}}, [[MOST]]) : (si64, si64) -> si64
+// CHECK-NEXT: loop.store([[CAPPED]], [[HELD]]) : (si64, !loop.buf<si64, private>) -> ()
+// CHECK: [[FIRST:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[BEST:%[0-9]+]] = loop.load([[VALUES]], [[FIRST]]) : (!loop.buf<3xsi32, private>, index) -> si32
+// CHECK: loop.store([[BEST]], [[TOP_VALUES]], [[ROW]], [[FIRST_RANK:%[0-9]+]]) : (si32, !loop.buf<2x3xsi32, global>, index, index) -> ()
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}({{%[0-9]+}}: !loop.buf<2x5xsi32, global>, [[LOWEST:%[0-9]+]]: !loop.buf<2x1xsi32, global>, {{%[0-9]+}}: !loop.buf<2x1xsi32, global>) attributes {access = [in, out, out]} {
+// CHECK: [[HIGHEST:%[0-9]+]] = arith.constant() {value = 2147483647 : si32} : () -> si32
+// CHECK: loop.store({{%[0-9]+}}, [[LOWEST]], {{%[0-9]+}}, {{%[0-9]+}}) : (si32, !loop.buf<2x1xsi32, global>, index, index) -> ()
+func.func @top_three(%scores: tensor<2x5xsi32>) -> (tensor<2x3xsi32>, tensor<2x3xsi32>, tensor<2x1xsi32>, tensor<2x1xsi32>) {
+  %values, %indices = tile.block(%scores) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [top_k<k = 3> -> ([d0], [d0])]} ({
+  ^body(%score: si32):
+    %position = tile.index() {expr = d1, dtype = si32} : () -> si32
+    tile.yield(%score, %position) : (si32, si32) -> ()
+  }) : (tensor<2x5xsi32>) -> (tensor<2x3xsi32>, tensor<2x3xsi32>)
+  %lowest, %lowest_index = tile.block(%scores) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [bottom_k<k = 1> -> ([d0], [d0])]} ({
+  ^body(%score: si32):
+    %position = tile.index() {expr = d1, dtype = si32} : () -> si32
+    tile.yield(%score, %position) : (si32, si32) -> ()
+  }) : (tensor<2x5xsi32>) -> (tensor<2x1xsi32>, tensor<2x1xsi32>)
+  func.return(%values, %indices, %lowest, %lowest_index) : (tensor<2x3xsi32>, tensor<2x3xsi32>, tensor<2x1xsi32>, tensor<2x1xsi32>) -> ()
+}
+
+// -----
+
+// Each constraint guards the point with a `loop.if`, checked once the ones before it hold.
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}([[INPUT:%[0-9]+]]: !loop.buf<5xf32, global>, {{%[0-9]+}}: !loop.buf<5xf32, global>) attributes {access = [in, out]} {
+// CHECK: ^body([[OUTPUT:%[0-9]+]]: index):
+// CHECK: ^body([[TAP:%[0-9]+]]: index):
+// CHECK-NEXT: [[LOW:%[0-9]+]] = loop.predicate([[OUTPUT]], [[TAP]]) {constraints = [0 <= d0 + d1 - 1]} : (index, index) -> i1
+// CHECK-NEXT: loop.if([[LOW]]) ({
+// CHECK-NEXT: [[HIGH:%[0-9]+]] = loop.predicate([[OUTPUT]], [[TAP]]) {constraints = [d0 + d1 - 1 < 5]} : (index, index) -> i1
+// CHECK-NEXT: loop.if([[HIGH]]) ({
+// CHECK-NEXT: [[AT:%[0-9]+]] = loop.index([[OUTPUT]], [[TAP]]) {expr = d0 + d1 - 1} : (index, index) -> index
+// CHECK-NEXT: loop.load([[INPUT]], [[AT]]) : (!loop.buf<5xf32, global>, index) -> f32
+func.func @padded_window(%input: tensor<5xf32>) -> tensor<5xf32> {
+  %sums = tile.block(%input) {iters = [par 5, red 3], reads = [$0[d0 + d1 - 1]], folds = [sum -> [d0]], constraints = [0 <= d0 + d1 - 1, d0 + d1 - 1 < 5]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<5xf32>) -> tensor<5xf32>
+  func.return(%sums) : (tensor<5xf32>) -> ()
+}
+
+// -----
+
+// A prefix fold: each element folds the points up to and including its own.
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}([[COUNTS:%[0-9]+]]: !loop.buf<6xsi32, global>, [[SUMS:%[0-9]+]]: !loop.buf<6xsi32, global>) attributes {access = [in, out]} {
+// CHECK: ^body([[ELEMENT:%[0-9]+]]: index):
+// CHECK: [[START:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[THROUGH:%[0-9]+]] = loop.index([[ELEMENT]]) {expr = d0 + 1} : (index) -> index
+// CHECK-NEXT: loop.for([[START]], [[THROUGH]]) ({
+// CHECK-NEXT: ^body([[POINT:%[0-9]+]]: index):
+// CHECK-NEXT: loop.load([[COUNTS]], [[POINT]]) : (!loop.buf<6xsi32, global>, index) -> si32
+// CHECK: loop.store({{%[0-9]+}}, [[SUMS]], [[ELEMENT]]) : (si32, !loop.buf<6xsi32, global>, index) -> ()
+func.func @running_sums(%counts: tensor<6xsi32>) -> tensor<6xsi32> {
+  %sums = tile.block(%counts) {iters = [prefix 6], reads = [$0[d0]], folds = [sum -> [d0]]} ({
+  ^body(%count: si32):
+    tile.yield(%count) : (si32) -> ()
+  }) : (tensor<6xsi32>) -> tensor<6xsi32>
+  func.return(%sums) : (tensor<6xsi32>) -> ()
+}

@@ -6,7 +6,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{bail, Result};
-use gpt_rs_ir::attr::ATTR_ENUMS;
+use gpt_rs_ir::attr::{AttrFormat, ATTR_ENUMS, ATTR_FORMATS};
 use gpt_rs_ir::op::{Arity, Effects, FamilyInfo, Group, Kind, OpInfo, FOLDS};
 use gpt_rs_ir::rewrite::RootInfo;
 use gpt_rs_ir::traits::OpTrait;
@@ -91,7 +91,7 @@ fn shared_rows(out: &mut String, info: &OpInfo) -> Result<()> {
             .iter()
             .map(|attr| {
                 let optional = if attr.default { ", optional" } else { "" };
-                format!("`{}`: `{}`{optional}", attr.name, pretty_type(attr.ty))
+                format!("`{}`: `{}`{optional}", attr.name, (attr.type_name)())
             })
             .collect();
         writeln!(out, "| Attributes | {} |", attrs.join("; "))?;
@@ -99,15 +99,10 @@ fn shared_rows(out: &mut String, info: &OpInfo) -> Result<()> {
     Ok(())
 }
 
-/// The values of each attribute of `info` whose type is an attribute enum.
+/// The values of each attribute of `info` whose items are of an attribute enum.
 fn attr_enum_tables(out: &mut String, info: &OpInfo) -> Result<()> {
     for attr in info.attrs {
-        let ty = attr
-            .ty
-            .strip_prefix("Option<")
-            .and_then(|ty| ty.strip_suffix('>'))
-            .unwrap_or(attr.ty);
-        let Some(values) = ATTR_ENUMS.iter().find(|entry| entry.name == ty) else {
+        let Some(values) = ATTR_ENUMS.iter().find(|entry| entry.name == attr.item) else {
             continue;
         };
         writeln!(
@@ -124,6 +119,64 @@ fn attr_enum_tables(out: &mut String, info: &OpInfo) -> Result<()> {
     Ok(())
 }
 
+/// The text form of each attribute of `info` whose type declares one, and of the types its
+/// format writes in turn.
+fn attr_format_tables(out: &mut String, info: &OpInfo) -> Result<()> {
+    for attr in info.attrs {
+        let mut rows = Vec::new();
+        let mut seen = Vec::new();
+        format_rows(attr.item, &mut rows, &mut seen);
+        if rows.is_empty() {
+            continue;
+        }
+        writeln!(out, "\n| `{}` | Text form |\n|---|---|", attr.name)?;
+        for (name, format) in rows {
+            writeln!(out, "| `{name}` | {} |", inline_code(format))?;
+        }
+    }
+    Ok(())
+}
+
+/// The types of values and their extents, whose text forms the dialect specs give.
+const VALUE_TYPES: [&str; 4] = ["Type", "TensorType", "BufferType", "Dim"];
+
+/// The formats of the type `ty`, of its variants and of the types they write, each once. A format
+/// that only writes a field, `$0`, gives no row of its own, and neither do [`VALUE_TYPES`].
+fn format_rows(ty: &str, rows: &mut Vec<(&'static str, &'static str)>, seen: &mut Vec<String>) {
+    if seen.iter().any(|done| done == ty) || VALUE_TYPES.contains(&ty) {
+        return;
+    }
+    seen.push(ty.to_string());
+    let variant = format!("{ty}::");
+    let mut entries: Vec<&AttrFormat> = ATTR_FORMATS
+        .iter()
+        .filter(|entry| entry.name == ty || entry.name.starts_with(&variant))
+        .collect();
+    entries.sort_by_key(|entry| entry.name);
+    for entry in &entries {
+        if !matches!(entry.format, "" | "$0") {
+            rows.push((entry.name, entry.format));
+        }
+    }
+    for entry in entries {
+        for field in entry.fields {
+            format_rows(field, rows, seen);
+        }
+    }
+}
+
+/// `text` as markdown inline code, delimited by more backticks than it holds in a row.
+fn inline_code(text: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for character in text.chars() {
+        run = if character == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat(longest + 1);
+    format!("{fence} {text} {fence}")
+}
+
 /// The roundtrip example, the check that a roundtrip case uses each of `names`, and the
 /// rejections of the verify cases of `names`.
 fn cases(out: &mut String, names: &[String], filetests: &[Case]) -> Result<()> {
@@ -132,7 +185,7 @@ fn cases(out: &mut String, names: &[String], filetests: &[Case]) -> Result<()> {
         .filter(|name| {
             !filetests
                 .iter()
-                .any(|case| case.mode == "roundtrip" && uses(&case.text, name))
+                .any(|case| case.mode == "roundtrip" && case.ops.contains(*name))
         })
         .collect();
     if !untested.is_empty() {
@@ -143,7 +196,7 @@ fn cases(out: &mut String, names: &[String], filetests: &[Case]) -> Result<()> {
             out,
             "\nExample, from `{}`:\n\n```text\n{}```",
             example.file,
-            code(&example.text)
+            gpt_rs_filetests::code_lines(&example.text)
         )?;
     }
     let rejections = rejections(names, filetests);
@@ -187,7 +240,7 @@ fn family_section(
     )?;
     let mut folds = Vec::new();
     for op in ops {
-        if let Some(fold) = FOLDS.iter().find(|entry| entry.rust == op.rust) {
+        if let Some(fold) = FOLDS.iter().find(|entry| entry.name == op.name) {
             folds.push(format!("`{}`: {}", op.name, cell(fold.doc)));
         }
     }
@@ -199,6 +252,7 @@ fn family_section(
         writeln!(out, "| Patterns | {} |", patterns.join("; "))?;
     }
     attr_enum_tables(out, ops[0])?;
+    attr_format_tables(out, ops[0])?;
     let own = |op: &OpInfo| -> Vec<&dyn OpTrait> {
         op.traits
             .iter()
@@ -240,7 +294,7 @@ fn has_same_trait(op: &OpInfo, wanted: &dyn OpTrait) -> bool {
 fn family_patterns(catalog: &Catalog, ops: &[&OpInfo]) -> Vec<String> {
     let mut found: Vec<(&str, &str, Vec<&str>)> = Vec::new();
     for op in ops {
-        for (pattern, pass, _) in catalog.patterns_at(|root| root == RootInfo::Op(op.rust)) {
+        for (pattern, pass, _) in catalog.patterns_at(|root| root == RootInfo::Op(op.name)) {
             match found
                 .iter_mut()
                 .find(|(p, s, _)| (*p, *s) == (pattern, pass))
@@ -282,14 +336,15 @@ fn op_section(
         "| Effects | {} |",
         effects(&info.effects, info.operands)
     )?;
-    if let Some(fold) = FOLDS.iter().find(|entry| entry.rust == info.rust) {
+    if let Some(fold) = FOLDS.iter().find(|entry| entry.name == info.name) {
         writeln!(out, "| Folds | {} |", cell(fold.doc))?;
     }
-    let patterns = catalog.patterns_at(|root| root == RootInfo::Op(info.rust));
+    let patterns = catalog.patterns_at(|root| root == RootInfo::Op(info.name));
     if !patterns.is_empty() {
         writeln!(out, "| Patterns | {} |", pattern_list(&patterns))?;
     }
     attr_enum_tables(out, info)?;
+    attr_format_tables(out, info)?;
     cases(out, &names, filetests)
 }
 
@@ -331,19 +386,6 @@ fn traits_section(out: &mut String, infos: &[OpInfo], catalog: &Catalog) -> Resu
     Ok(())
 }
 
-/// Whether `text` uses the op `name`: as `name(`, or as `name @symbol(` for a function-like op.
-fn uses(text: &str, name: &str) -> bool {
-    text.contains(&format!("{name}(")) || text.contains(&format!("{name} @"))
-}
-
-/// The lines of a case that are not comments or blank: the program it holds.
-fn code(case: &str) -> String {
-    case.lines()
-        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with("//"))
-        .map(|line| format!("{line}\n"))
-        .collect()
-}
-
 /// The doc comment without the name it starts with (`` `tensor.transpose`: ``), which the
 /// heading shows.
 fn body(doc: &str) -> String {
@@ -366,51 +408,22 @@ fn groups(groups: &[Group]) -> String {
     groups
         .iter()
         .map(|group| {
-            let kind = match group.kind {
-                Kind::Any => "value",
-                Kind::Tensor => "tensor",
-                Kind::Index => "index",
-                Kind::Scalar => "scalar",
+            let (kind, kinds) = match group.kind {
+                Kind::Any => ("value", "values"),
+                Kind::Tensor => ("tensor", "tensors"),
+                Kind::Buffer => ("buffer", "buffers"),
+                Kind::Index => ("index", "indices"),
+                Kind::Scalar => ("scalar", "scalars"),
             };
             let arity = match group.arity {
                 Arity::One => kind.to_string(),
                 Arity::Optional => format!("optional {kind}"),
-                Arity::Variadic => format!("{kind}s"),
+                Arity::Variadic => kinds.to_string(),
             };
             format!("`{}`: {arity}", group.name)
         })
         .collect::<Vec<_>>()
         .join("; ")
-}
-
-/// A Rust attribute type in the terms of the text form: `Ranked<usize>` and
-/// `SmallVec<[usize;4]>` are `[usize]`.
-fn pretty_type(ty: &str) -> String {
-    if let Some(inner) = ty.strip_prefix("Option<").and_then(|t| t.strip_suffix('>')) {
-        return pretty_type(inner);
-    }
-    if let Some(inner) = ty.strip_prefix("Ranked<").and_then(|t| t.strip_suffix('>')) {
-        return format!("[{}]", pretty_type(inner));
-    }
-    if let Some(inner) = ty
-        .strip_prefix("SmallVec<[")
-        .and_then(|t| t.strip_suffix("]>"))
-    {
-        let element = inner.rsplit_once(';').map_or(inner, |(element, _)| element);
-        return format!("[{}]", pretty_type(element));
-    }
-    if let Some(inner) = ty.strip_prefix("Vec<").and_then(|t| t.strip_suffix('>')) {
-        return format!("[{}]", pretty_type(inner));
-    }
-    match ty {
-        "DType" => "dtype".into(),
-        "Dim" => "dim".into(),
-        "Dense" => "dense".into(),
-        "F64" => "f64".into(),
-        "TensorType" => "tensor type".into(),
-        "(usize,usize)" => "(usize, usize)".into(),
-        other => other.to_string(),
-    }
 }
 
 fn traits(traits: &[&dyn OpTrait]) -> String {
@@ -452,17 +465,17 @@ fn example<'a>(names: &[String], filetests: &'a [Case]) -> Option<&'a Case> {
     filetests
         .iter()
         .filter(|case| case.mode == "roundtrip")
-        .filter(|case| names.iter().any(|name| uses(&case.text, name)))
+        .filter(|case| names.iter().any(|name| case.ops.contains(name)))
         .min_by_key(|case| {
             let named = names.iter().any(|name| {
                 let short = name.rsplit('.').next().unwrap_or(name);
-                case.text.contains(&format!("func.func @{short}"))
+                case.symbols.contains(short)
             });
-            let used = names.iter().filter(|name| uses(&case.text, name)).count();
+            let used = names.iter().filter(|name| case.ops.contains(*name)).count();
             (
                 !named,
                 std::cmp::Reverse(used),
-                code(&case.text).lines().count(),
+                gpt_rs_filetests::code_lines(&case.text).lines().count(),
             )
         })
 }
@@ -472,14 +485,12 @@ fn rejections(names: &[String], filetests: &[Case]) -> Vec<String> {
     filetests
         .iter()
         .filter(|case| case.mode == "verify")
-        .flat_map(|case| case.text.lines())
-        .filter_map(|line| line.trim().strip_prefix("// ERROR:"))
-        .map(str::trim)
+        .flat_map(|case| &case.errors)
         .filter(|message| {
             names
                 .iter()
                 .any(|name| message.starts_with(&format!("{name}: ")))
         })
-        .map(str::to_string)
+        .cloned()
         .collect()
 }

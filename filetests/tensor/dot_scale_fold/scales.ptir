@@ -111,7 +111,7 @@ func.func @run_time_scale(%input: tensor<2x3xf32>, %weight: tensor<3x4xf32> {par
 // CHECK: [[SCALES:%[0-9]+]] = tensor.broadcast_to
 // CHECK: tensor.mul([[PRODUCT]], [[SCALES]])
 func.func @constant_weight(%input: tensor<2x3xf32>, %scale: tensor<4xf32> {param = 1}) -> tensor<2x4xf32> {
-  %weight = tensor.constant() {value = dense<[3, 4] x f32: 0.5>} : () -> tensor<3x4xf32>
+  %weight = tensor.constant() {value = dense<3x4xf32: 0.5>} : () -> tensor<3x4xf32>
   %product = tensor.dot_general(%input, %weight) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
   %scales = tensor.broadcast_to(%scale) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
   %scaled = tensor.mul(%product, %scales) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>

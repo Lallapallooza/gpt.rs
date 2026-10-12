@@ -164,7 +164,8 @@ pub fn run(dir: &str, default: DefaultPipeline<'_>) {
     );
 }
 
-fn directive<'a>(case: &'a str, name: &str) -> Vec<&'a str> {
+/// The text after each `// <name>:` line of a case, such as the message of its `// ERROR:` line.
+pub fn directive<'a>(case: &'a str, name: &str) -> Vec<&'a str> {
     let prefix = format!("// {name}:");
     case.lines()
         .filter_map(|l| l.trim().strip_prefix(prefix.as_str()).map(str::trim))
@@ -172,7 +173,7 @@ fn directive<'a>(case: &'a str, name: &str) -> Vec<&'a str> {
 }
 
 /// The case without comment lines and blank lines: what a canonical printer emits.
-fn code_lines(case: &str) -> String {
+pub fn code_lines(case: &str) -> String {
     let mut out = String::new();
     for line in case.lines() {
         let trimmed = line.trim();
@@ -215,7 +216,7 @@ fn run_case(mode: &str, case: &Case, default: DefaultPipeline<'_>) -> Result<(),
                 return Err("a roundtrip case needs a CHECK line".into());
             }
             let options = TextOptions {
-                versioned: code_lines(&case.text).starts_with("spec_version"),
+                versioned: gpt_rs_ir::text::is_versioned(&case.text),
                 locations: true,
             };
             let printed = module.print(options);

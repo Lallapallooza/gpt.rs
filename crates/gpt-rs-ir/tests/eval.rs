@@ -131,12 +131,12 @@ fn while_loops_until_cond_fails() {
         "func.func @main(%0: tensor<si32>, %1: tensor<f32>) -> (tensor<si32>, tensor<f32>) {
   %2, %3 = tensor.while(%0, %1) ({
   ^cond(%4: tensor<si32>, %5: tensor<f32>):
-    %6 = tensor.constant() {value = dense<[] x si32: 5>} : () -> tensor<si32>
+    %6 = tensor.constant() {value = dense<si32: 5>} : () -> tensor<si32>
     %7 = tensor.less(%4, %6) : (tensor<si32>, tensor<si32>) -> tensor<i1>
     tensor.yield(%7, %4, %5) : (tensor<i1>, tensor<si32>, tensor<f32>) -> ()
   }, {
   ^body(%8: tensor<si32>, %9: tensor<f32>):
-    %10 = tensor.constant() {value = dense<[] x si32: 1>} : () -> tensor<si32>
+    %10 = tensor.constant() {value = dense<si32: 1>} : () -> tensor<si32>
     %11 = tensor.add(%8, %10) : (tensor<si32>, tensor<si32>) -> tensor<si32>
     %12 = tensor.add(%9, %9) : (tensor<f32>, tensor<f32>) -> tensor<f32>
     tensor.yield(%11, %12) : (tensor<si32>, tensor<f32>) -> ()

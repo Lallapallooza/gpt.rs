@@ -7,13 +7,39 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use gpt_rs_ir::doc::{record_fired, Fired};
 use gpt_rs_ir::module::Module;
+use gpt_rs_ir::op::OpDyn;
 use gpt_rs_ir::passes::{self, Pipeline};
 
-/// One filetest case: its file, relative to the repository, its mode and the text of the case.
+/// One filetest case: its file, relative to the repository, its mode, its text, and what the
+/// module it holds names, when it parses.
 pub struct Case {
     pub file: String,
     pub mode: String,
     pub text: String,
+    /// The names of the ops it holds, at any depth.
+    pub ops: BTreeSet<String>,
+    /// The symbols it defines: the names of its functions and dispatches.
+    pub symbols: BTreeSet<String>,
+    /// The messages of its `// ERROR:` lines.
+    pub errors: Vec<String>,
+}
+
+/// The names of the ops and the symbols of the module that `text` holds, or none when it does not
+/// parse.
+fn names(text: &str) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut ops = BTreeSet::new();
+    let mut symbols = BTreeSet::new();
+    let Ok(module) = Module::from_text(text) else {
+        return (ops, symbols);
+    };
+    for inst in module.walk(module.body()) {
+        let op = module.op(inst);
+        ops.insert(op.name().to_string());
+        if let Some(symbol) = op.dyn_symbol() {
+            symbols.insert(symbol.symbol().to_string());
+        }
+    }
+    (ops, symbols)
 }
 
 /// The cases of every filetest, in file order, as the filetest runner splits them.
@@ -27,11 +53,21 @@ pub fn read() -> Result<Vec<Case>> {
         let relative = path.strip_prefix(&root).unwrap_or(&path);
         let file = Path::new("filetests").join(relative).display().to_string();
         let (mode, file_cases) = gpt_rs_filetests::split_cases(&text);
-        cases.extend(file_cases.into_iter().map(|case| Case {
-            file: file.clone(),
-            mode: mode.clone(),
-            text: case.text,
-        }));
+        for case in file_cases {
+            let (ops, symbols) = names(&case.text);
+            let mut errors = Vec::new();
+            for message in gpt_rs_filetests::directive(&case.text, "ERROR") {
+                errors.push(message.to_string());
+            }
+            cases.push(Case {
+                file: file.clone(),
+                mode: mode.clone(),
+                text: case.text,
+                ops,
+                symbols,
+                errors,
+            });
+        }
     }
     Ok(cases)
 }
@@ -49,11 +85,7 @@ impl Fires {
                 continue;
             };
             // A case with an `ERROR:` line fails in its passes, so nothing fires to the end.
-            if case
-                .text
-                .lines()
-                .any(|l| l.trim_start().starts_with("// ERROR:"))
-            {
+            if !case.errors.is_empty() {
                 continue;
             }
             let parsed;

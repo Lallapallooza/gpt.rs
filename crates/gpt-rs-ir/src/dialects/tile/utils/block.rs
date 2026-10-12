@@ -1,15 +1,13 @@
-//! Reading and rewriting the attributes of `tile.block`, and the text form of its folds.
+//! Reading and rewriting the attributes of `tile.block`.
 
 use std::collections::BTreeSet;
 
 use anyhow::{anyhow, Result};
 use smallvec::SmallVec;
 
-use crate::attr::Attr;
 use crate::dialects::tile::ir::*;
-use crate::index::{AccessExpr, Source, Write};
+use crate::index::{AccessExpr, OperandRef, Source, Write};
 use crate::module::{Module, Region, Value};
-use crate::text::Cursor;
 use crate::types::{DType, Dim, Sym};
 
 impl Block {
@@ -101,10 +99,10 @@ impl Block {
         }
         for fold in &mut block.folds {
             for write in &mut fold.writes {
-                write.into = write.into.map(rename);
+                write.into = write.into.map(|operand| OperandRef(rename(operand.0)));
             }
             for operand in &mut fold.init {
-                *operand = rename(*operand);
+                operand.0 = rename(operand.0);
             }
         }
         block
@@ -121,12 +119,12 @@ impl Block {
         }
         for fold in &self.folds {
             for write in &fold.writes {
-                named.extend(write.into);
+                named.extend(write.into.map(|operand| operand.0));
                 for expr in &write.coords {
                     expr.collect_operands(&mut named);
                 }
             }
-            named.extend(fold.init.iter().copied());
+            named.extend(fold.init.iter().map(|operand| operand.0));
         }
         for constraint in &self.constraints {
             for expr in constraint.exprs() {
@@ -209,57 +207,5 @@ impl Fold {
     /// One yielded value, written at each point.
     pub fn plain(write: Write) -> Self {
         Self::new(CombineKind::None, vec![write])
-    }
-}
-
-impl Attr for Fold {
-    fn print(&self, out: &mut String) {
-        self.combine.print(out);
-        out.push_str(" -> ");
-        for (position, write) in self.writes.iter().enumerate() {
-            if position > 0 {
-                out.push_str(", ");
-            }
-            write.print(out);
-        }
-        if !self.init.is_empty() {
-            out.push_str(" init ");
-            for (position, operand) in self.init.iter().enumerate() {
-                if position > 0 {
-                    out.push_str(", ");
-                }
-                out.push_str(&format!("${operand}"));
-            }
-        }
-    }
-
-    /// The writes and the init operands continue past a comma that a write or an operand
-    /// follows; any other comma separates folds.
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        let combine = CombineKind::parse(c)?;
-        c.expect("->")?;
-        let mut writes = SmallVec::new();
-        writes.push(Write::parse(c)?);
-        while c.peek_pair(',', '[') || c.peek_pair(',', '$') {
-            c.expect(",")?;
-            writes.push(Write::parse(c)?);
-        }
-        let mut init = SmallVec::new();
-        if c.eat("init") {
-            loop {
-                c.expect("$")?;
-                let operand = c.int()?;
-                init.push(usize::try_from(operand).map_err(|_| c.error("bad operand number"))?);
-                if !c.peek_pair(',', '$') {
-                    break;
-                }
-                c.expect(",")?;
-            }
-        }
-        Ok(Self {
-            combine,
-            writes,
-            init,
-        })
     }
 }

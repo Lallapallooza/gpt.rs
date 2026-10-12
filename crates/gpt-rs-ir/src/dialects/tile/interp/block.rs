@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use super::combine::Acc;
 use crate::dialects::tile::ir::*;
 use crate::host::{HostScalar, HostTensor, HostValue};
-use crate::index::{AccessExpr, IndexEnv, IterKind, Source, Write};
+use crate::index::{AccessExpr, IndexEnv, IterKind, OperandRef, Source, Write};
 use crate::module::{Module, Region, Value};
 use crate::op::{Eval, EvalCx, Host, NoRegions, OpDyn, OwnedHost, RegionRunner};
 use crate::scalar::{self, Decoded};
@@ -200,15 +200,6 @@ fn bind_syms(block: &Block, cx: &EvalCx<'_, BlockRegions<Region>>) -> Result<Has
         .collect()
 }
 
-/// The pad value of a read, as a scalar of the operand's dtype.
-fn pad_scalar(pad: f64, dtype: DType) -> Result<HostScalar> {
-    if dtype.is_float() {
-        HostScalar::from_f64(dtype, pad)
-    } else {
-        HostScalar::int(dtype, pad as i128)
-    }
-}
-
 /// The storage of one result while the block runs.
 struct Out {
     dims: Vec<usize>,
@@ -295,7 +286,7 @@ impl Eval for Block {
                 .to_vec();
             let count = dims.iter().product();
             let elements = match write.into {
-                Some(operand) => (0..count)
+                Some(OperandRef(operand)) => (0..count)
                     .map(|element| Some(decoded[operand].get(element)))
                     .collect(),
                 None => vec![None; count],
@@ -316,7 +307,7 @@ impl Eval for Block {
                 dtypes: yield_types[first_yield..first_yield + yields].to_vec(),
                 yields: first_yield..first_yield + yields,
                 results: first_result..first_result + results,
-                init: fold.init.to_vec(),
+                init: fold.init.iter().map(|operand| operand.0).collect(),
                 kind,
             });
             first_yield += yields;
@@ -427,7 +418,7 @@ impl Eval for Block {
                     let value = match position(&coords, dims[operand]) {
                         Some(at) => decoded[operand].get(at),
                         None => match read.pad {
-                            Some(pad) => pad_scalar(pad.0, decoded[operand].dtype())?,
+                            Some(pad) => HostScalar::from_f64(decoded[operand].dtype(), pad.0)?,
                             None => bail!(
                                 "read {index} at {coords:?} is outside operand {operand} of \
                                  shape {:?}",
@@ -564,9 +555,8 @@ impl Eval for Index {
         let env = cx
             .index_env()
             .ok_or_else(|| anyhow!("tile.index runs in the body of a tile.block, at its points"))?;
-        let value = self.expr.eval(env)?;
         Ok(IndexResults {
-            output: scalar::cast(HostScalar::int(DType::Si64, i128::from(value))?, self.dtype)?,
+            output: scalar::from_index(self.expr.eval(env)?, self.dtype)?,
         })
     }
 }

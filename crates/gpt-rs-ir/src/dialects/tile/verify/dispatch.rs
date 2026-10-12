@@ -75,11 +75,18 @@ impl OpDef for Dispatch {
                 }
             }
         }
-        for name in self.facts.keys() {
+        for (name, fact) in &self.facts {
             ensure!(
                 bound.contains(name),
                 "facts name {{{name}}}, which no argument binds"
             );
+            ensure!(
+                fact.min <= fact.max,
+                "facts give {{{name}}} the empty range [{}, {}]",
+                fact.min,
+                fact.max
+            );
+            ensure!(fact.divisor > 0, "facts give {{{name}}} the divisor 0");
         }
         // A dispatch runs on its arguments alone, so they bind every symbol its blocks use.
         let module = cx.module;
@@ -95,6 +102,7 @@ impl OpDef for Dispatch {
                 );
             }
         }
+        self.schedule.legal(module, cx.regions.body)?;
         Ok(DispatchResults::default())
     }
 }

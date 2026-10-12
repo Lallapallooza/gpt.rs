@@ -7,7 +7,7 @@ use anyhow::{anyhow, bail, ensure, Result};
 
 use crate::dialects::tensor::utils::class::{ensure_dtype_class, ARITHMETIC};
 use crate::dialects::tile::ir::*;
-use crate::index::{Expr, Iter, IterKind, ReadKind, Write};
+use crate::index::{Expr, Iter, IterKind, OperandRef, ReadKind, Write};
 use crate::module::Region;
 use crate::op::{NoRegions, OpDef, OwnedTypes, RegionOpDef, RegionSig, TypeCx, Types};
 use crate::types::{ranked, DType, Dim, TensorType, Type};
@@ -237,7 +237,7 @@ fn write_type(
     result: usize,
     dtype: DType,
 ) -> Result<TensorType> {
-    if let Some(into) = write.into {
+    if let Some(OperandRef(into)) = write.into {
         let target = scope.operands.get(into).ok_or_else(|| {
             anyhow!(
                 "{what} updates ${into}, but the block has {} operands",
@@ -325,7 +325,7 @@ fn check_init(fold: &Fold, operands: &[&TensorType], outs: &[TensorType]) -> Res
         kind.name(),
         kind.rule().init_count()
     );
-    for (component, &operand) in fold.init.iter().enumerate() {
+    for (component, &OperandRef(operand)) in fold.init.iter().enumerate() {
         let ty = operands.get(operand).ok_or_else(|| {
             anyhow!(
                 "init names ${operand}, but the block has {} operands",

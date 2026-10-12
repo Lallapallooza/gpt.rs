@@ -5,7 +5,8 @@ use crate::types::Type;
 
 /// Stable identity of a model parameter: derived from its checkpoint name, or from the text of the
 /// load-time function that computes it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(crate::Attr, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[attr(format = "$0")]
 pub struct ParamId(pub u128);
 
 /// `func.func`: a named function. Its body's block arguments are the function arguments, and its
@@ -24,11 +25,12 @@ pub struct Func {
     pub name: String,
     pub args: Vec<Type>,
     pub results: Vec<Type>,
-    /// For each argument, the parameter it binds, or `None` for a run-time input.
-    #[attr(default)]
+    /// For each argument, the parameter it binds, or `None` for a run-time input. Empty when no
+    /// argument binds one.
+    #[attr(default, arg(param))]
     pub params: Vec<Option<ParamId>>,
     /// For each result of a load-time function, the parameter it computes. Empty otherwise.
-    #[attr(default)]
+    #[attr(default, result(param))]
     pub result_params: Vec<ParamId>,
 }
 

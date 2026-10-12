@@ -1,342 +1,197 @@
-//! Character-level reader shared by the module parser and the `Attr` parsers.
+//! The reader of tokens that the module parser and the text forms of attributes share.
 
+use std::fmt;
 use std::str::FromStr;
 
 use anyhow::{anyhow, Result};
+use gpt_rs_ir_lexer::{token, Token, TokenKind};
 
-use crate::attr::Attr;
-
+/// A position in a text, read one token at a time.
 pub struct Cursor<'a> {
     src: &'a str,
     pos: usize,
-    /// Set by the attribute dictionary of an op with more than one optional or variadic operand
-    /// group.
-    pub(crate) operand_segments: Option<Vec<usize>>,
-    /// Set by the attribute dictionary of an op with more than one optional or variadic result
-    /// group.
-    pub(crate) result_segments: Option<Vec<usize>>,
-}
-
-pub(crate) fn is_ident_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_'
-}
-
-pub(crate) fn is_ident_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_' || c == '.'
 }
 
 impl<'a> Cursor<'a> {
     pub fn new(src: &'a str) -> Self {
-        Self {
-            src,
-            pos: 0,
-            operand_segments: None,
-            result_segments: None,
+        Self { src, pos: 0 }
+    }
+
+    /// The next token, which stays unread.
+    pub fn peek(&self) -> Token<'a> {
+        token(self.src, self.pos)
+    }
+
+    /// The token after the next one, which stays unread too.
+    pub fn peek_second(&self) -> Token<'a> {
+        token(self.src, self.peek().end())
+    }
+
+    /// The next token after a `-`, if one comes first: what a signed number starts with.
+    pub fn peek_unsigned(&self) -> Token<'a> {
+        let next = self.peek();
+        if next.text == "-" {
+            self.peek_second()
+        } else {
+            next
         }
     }
 
-    fn rest(&self) -> &'a str {
-        &self.src[self.pos..]
+    /// Whether the next token is `text`.
+    pub fn peek_is(&self, text: &str) -> bool {
+        let next = self.peek();
+        next.text == text && next.kind != TokenKind::String
     }
 
-    /// Skips whitespace and `//` comments.
-    fn skip_ws(&mut self) {
-        loop {
-            let rest = self.rest();
-            let trimmed = rest.trim_start();
-            self.pos += rest.len() - trimmed.len();
-            if self.rest().starts_with("//") {
-                let line_end = self.rest().find('\n').unwrap_or(self.rest().len());
-                self.pos += line_end;
-            } else {
-                return;
-            }
-        }
+    /// Whether the next token is of kind `kind`.
+    pub fn peek_kind(&self, kind: TokenKind) -> bool {
+        self.peek().kind == kind
     }
 
-    pub fn at_end(&mut self) -> bool {
-        self.skip_ws();
-        self.pos == self.src.len()
+    pub fn at_end(&self) -> bool {
+        self.peek_kind(TokenKind::End)
     }
 
-    pub fn peek(&mut self) -> Option<char> {
-        self.skip_ws();
-        self.rest().chars().next()
+    /// Reads the next token.
+    pub fn next_token(&mut self) -> Token<'a> {
+        let next = self.peek();
+        self.pos = next.end();
+        next
     }
 
-    /// The character right after the next one, with no whitespace skipped between them.
-    pub fn peek_second(&mut self) -> Option<char> {
-        self.skip_ws();
-        self.rest().chars().nth(1)
+    /// The byte offset of the next token.
+    pub fn position(&self) -> usize {
+        self.peek().start
     }
 
-    /// True when the next two tokens are `first` and `second`, with only whitespace between.
-    pub fn peek_pair(&mut self, first: char, second: char) -> bool {
-        self.skip_ws();
-        let mut chars = self.rest().chars();
-        chars.next() == Some(first) && chars.as_str().trim_start().starts_with(second)
-    }
-
-    /// True when an attribute dictionary comes next: `{` then a key and `=`, not `==`.
-    pub fn peek_attr_dict(&mut self) -> bool {
-        self.skip_ws();
-        let Some(inner) = self.rest().strip_prefix('{') else {
-            return false;
-        };
-        let inner = inner.trim_start();
-        let end = inner.find(|c| !is_ident_char(c)).unwrap_or(inner.len());
-        if end == 0 || !inner.starts_with(is_ident_start) {
+    /// Reads the next token if it is `text`.
+    pub fn eat(&mut self, text: &str) -> bool {
+        if !self.peek_is(text) {
             return false;
         }
-        let after = inner[end..].trim_start();
-        after.starts_with('=') && !after.starts_with("==")
-    }
-
-    /// True when the next token starts with `s`.
-    pub fn peek_str(&mut self, s: &str) -> bool {
-        self.skip_ws();
-        self.rest().starts_with(s)
-    }
-
-    /// Consumes `s` if it comes next. When `s` ends in an identifier character, it matches only a
-    /// whole word.
-    pub fn eat(&mut self, s: &str) -> bool {
-        self.skip_ws();
-        let rest = self.rest();
-        if !rest.starts_with(s) {
-            return false;
-        }
-        if s.chars().last().is_some_and(is_ident_char)
-            && rest[s.len()..].chars().next().is_some_and(is_ident_char)
-        {
-            return false;
-        }
-        self.pos += s.len();
+        self.next_token();
         true
     }
 
-    pub fn expect(&mut self, s: &str) -> Result<()> {
-        if self.eat(s) {
+    /// Reads the next token, which must be `text`.
+    pub fn expect(&mut self, text: &str) -> Result<()> {
+        if self.eat(text) {
             Ok(())
         } else {
-            Err(self.error(format!("expected `{s}`")))
+            Err(self.unexpected(format!("`{text}`")))
         }
     }
 
-    /// An identifier, which may contain dots: `tensor.dot_general`, `f32`, `none`.
+    /// Reads the next token, which must be of kind `kind`; `what` names it in the error.
+    pub fn token(&mut self, kind: TokenKind, what: &str) -> Result<&'a str> {
+        if !self.peek_kind(kind) {
+            return Err(self.unexpected(what));
+        }
+        Ok(self.next_token().text)
+    }
+
+    /// An identifier: `tensor.dot_general`, `f32`, `none`.
     pub fn ident(&mut self) -> Result<&'a str> {
-        self.skip_ws();
-        let rest = self.rest();
-        if !rest.starts_with(is_ident_start) {
-            return Err(self.error("expected an identifier"));
-        }
-        let end = rest.find(|c| !is_ident_char(c)).unwrap_or(rest.len());
-        self.pos += end;
-        Ok(&rest[..end])
+        self.token(TokenKind::Ident, "a name")
     }
 
-    /// A word of letters, digits, `_` and `-`, such as a pass name: `outline-static`.
-    pub fn word(&mut self) -> Result<&'a str> {
-        self.skip_ws();
-        let rest = self.rest();
-        let end = rest
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
-            .unwrap_or(rest.len());
-        if end == 0 {
-            return Err(self.error("expected a name"));
-        }
-        self.pos += end;
-        Ok(&rest[..end])
+    /// The name after the sigil of a token of kind `kind`: `x` of `%x`, `body` of `^body`.
+    pub fn sigil_name(&mut self, kind: TokenKind, what: &str) -> Result<&'a str> {
+        Ok(&self.token(kind, what)?[1..])
     }
 
-    /// A name after `sigil`: `%3`, `%x`, `^body`, `@mlp`.
-    pub fn sigil_name(&mut self, sigil: char) -> Result<&'a str> {
-        self.skip_ws();
-        let rest = self.rest();
-        if !rest.starts_with(sigil) {
-            return Err(self.error(format!("expected `{sigil}`")));
+    /// The text of an integer, its sign included: `-3`.
+    pub fn int_text(&mut self) -> Result<String> {
+        if self.peek_unsigned().kind != TokenKind::Int {
+            return Err(self.unexpected("an integer"));
         }
-        let body = &rest[sigil.len_utf8()..];
-        let end = body.find(|c| !is_ident_char(c)).unwrap_or(body.len());
-        if end == 0 {
-            return Err(self.error(format!("expected a name after `{sigil}`")));
-        }
-        self.pos += sigil.len_utf8() + end;
-        Ok(&body[..end])
+        let sign = if self.eat("-") { "-" } else { "" };
+        Ok(format!("{sign}{}", self.next_token().text))
     }
 
-    /// An integer literal, which may be negative.
-    pub fn int(&mut self) -> Result<i128> {
-        self.skip_ws();
-        let rest = self.rest();
-        let digits_start = usize::from(rest.starts_with('-'));
-        let end = rest[digits_start..]
-            .find(|c: char| !c.is_ascii_digit())
-            .map_or(rest.len(), |i| i + digits_start);
-        // A `.` after the digits makes a float, but `..` ends the integer, as in `$1..$4`.
-        let float = rest[end..].starts_with('.') && !rest[end..].starts_with("..");
-        if end == digits_start || float {
-            return Err(self.error("expected an integer"));
-        }
-        let value = rest[..end]
-            .parse::<i128>()
-            .map_err(|err| self.error(format!("bad integer: {err}")))?;
-        self.pos += end;
-        Ok(value)
+    /// Whether a number comes next: an integer, a float, `inf` or `NaN`, with a sign or without.
+    pub fn peek_number(&self) -> bool {
+        let next = self.peek_unsigned();
+        matches!(next.kind, TokenKind::Int | TokenKind::Float)
+            || (next.kind == TokenKind::Ident && matches!(next.text, "inf" | "NaN"))
     }
 
-    pub fn uint128(&mut self) -> Result<u128> {
-        self.skip_ws();
-        let rest = self.rest();
-        let end = rest
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(rest.len());
-        if end == 0 {
-            return Err(self.error("expected an unsigned integer"));
-        }
-        let value = rest[..end]
-            .parse::<u128>()
-            .map_err(|err| self.error(format!("bad integer: {err}")))?;
-        self.pos += end;
-        Ok(value)
+    /// Whether a float comes next, written as one: with a fraction or an exponent, or `inf` or
+    /// `NaN`, with a sign or without.
+    pub fn peek_float(&self) -> bool {
+        self.peek_number() && self.peek_unsigned().kind != TokenKind::Int
     }
 
-    /// A float literal: `1.0`, `-2.5e-3`, `inf`, `-inf`, `NaN`. Integers are accepted too. The
-    /// decimal is rounded once, to `F`.
+    /// The text of the next number, its sign included: `-1.5`, `3`, `-inf`, `NaN`.
+    pub fn number(&mut self) -> Result<String> {
+        if !self.peek_number() {
+            return Err(self.unexpected("a number"));
+        }
+        let sign = if self.eat("-") { "-" } else { "" };
+        Ok(format!("{sign}{}", self.next_token().text))
+    }
+
+    /// A float, written as a float or an integer. The decimal is rounded once, to `F`.
     pub fn float<F: FromStr>(&mut self) -> Result<F> {
-        self.skip_ws();
-        let rest = self.rest();
-        let is_word =
-            |word: &&str| rest.starts_with(*word) && !rest[word.len()..].starts_with(is_ident_char);
-        let end = match ["-inf", "inf", "NaN"].into_iter().find(is_word) {
-            Some(word) => word.len(),
-            None => rest
-                .char_indices()
-                .find(|&(i, c)| {
-                    !(c.is_ascii_digit()
-                        || c == '.'
-                        || c == 'e'
-                        || c == 'E'
-                        || ((c == '-' || c == '+')
-                            && (i == 0 || matches!(&rest[i - 1..i], "e" | "E"))))
-                })
-                .map_or(rest.len(), |(i, _)| i),
-        };
-        let value = rest[..end]
-            .parse()
-            .map_err(|_| self.error("expected a float"))?;
-        self.pos += end;
-        Ok(value)
+        let start = self.position();
+        let text = self.number()?;
+        text.parse()
+            .map_err(|_| self.error_at(start, format!("`{text}` is not a float")))
     }
 
-    /// The text of the next number token, integer or float, as [`Cursor::float`] reads it.
-    pub fn number(&mut self) -> Result<&'a str> {
-        self.skip_ws();
-        let rest = self.rest();
-        let is_word =
-            |word: &&str| rest.starts_with(*word) && !rest[word.len()..].starts_with(is_ident_char);
-        let end = match ["-inf", "inf", "NaN", "-NaN"].into_iter().find(is_word) {
-            Some(word) => word.len(),
-            None => rest
-                .char_indices()
-                .find(|&(i, c)| {
-                    !(c.is_ascii_digit()
-                        || c == '.'
-                        || c == 'e'
-                        || c == 'E'
-                        || ((c == '-' || c == '+')
-                            && (i == 0 || matches!(&rest[i - 1..i], "e" | "E"))))
-                })
-                .map_or(rest.len(), |(i, _)| i),
-        };
-        if end == 0 {
-            return Err(self.error("expected a number"));
-        }
-        self.pos += end;
-        Ok(&rest[..end])
-    }
-
-    /// True when the next number token has a fractional part, an exponent or is `inf`/`NaN`.
-    pub fn peek_is_float(&mut self) -> bool {
-        self.skip_ws();
-        let rest = self.rest();
-        let rest = rest.strip_prefix('-').unwrap_or(rest);
-        if rest.starts_with("inf") || rest.starts_with("NaN") {
-            return true;
-        }
-        let end = rest
-            .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E'))
-            .unwrap_or(rest.len());
-        rest[..end].contains(['.', 'e', 'E'])
-    }
-
-    /// Hex bytes written as `0x0a1b...`, or `None` when the next token is not hex.
-    pub fn hex_bytes(&mut self) -> Result<Option<Vec<u8>>> {
-        self.skip_ws();
-        let Some(body) = self.rest().strip_prefix("0x") else {
-            return Ok(None);
-        };
-        let end = body
-            .find(|c: char| !c.is_ascii_hexdigit())
-            .unwrap_or(body.len());
-        let digits = &body[..end];
-        if digits.len() % 2 != 0 {
-            return Err(self.error("hex bytes need an even number of digits"));
-        }
-        let bytes = (0..digits.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&digits[i..i + 2], 16).expect("hex digits"))
-            .collect();
-        self.pos += 2 + end;
-        Ok(Some(bytes))
-    }
-
-    /// A double-quoted string with `\"`, `\\` and `\n` escapes.
+    /// A string, without its quotes and with its escapes, `\"`, `\\` and `\n`, replaced.
     pub fn string(&mut self) -> Result<String> {
-        self.expect("\"")?;
+        let start = self.position();
+        let quoted = self.token(TokenKind::String, "a string")?;
         let mut out = String::new();
-        let mut chars = self.rest().char_indices();
-        while let Some((i, c)) = chars.next() {
-            match c {
-                '"' => {
-                    self.pos += i + 1;
-                    return Ok(out);
-                }
-                '\\' => match chars.next() {
-                    Some((_, '"')) => out.push('"'),
-                    Some((_, '\\')) => out.push('\\'),
-                    Some((_, 'n')) => out.push('\n'),
-                    _ => return Err(self.error("bad escape in string")),
-                },
-                c => out.push(c),
+        let mut chars = quoted[1..quoted.len() - 1].chars();
+        while let Some(character) = chars.next() {
+            if character != '\\' {
+                out.push(character);
+                continue;
+            }
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('n') => out.push('\n'),
+                _ => return Err(self.error_at(start, "bad escape in string")),
             }
         }
-        Err(self.error("unterminated string"))
+        Ok(out)
     }
 
-    /// Everything before the `>` that closes an already consumed `<`.
-    pub fn until_close_angle(&mut self) -> Result<&'a str> {
-        let rest = self.rest();
-        let mut depth = 0usize;
-        for (i, c) in rest.char_indices() {
-            match c {
-                '<' => depth += 1,
-                '>' if depth == 0 => {
-                    self.pos += i;
-                    return Ok(&rest[..i]);
-                }
-                '>' => depth -= 1,
-                _ => {}
-            }
+    /// The `x` after an extent of a shape, which touches the extent and what follows it: the
+    /// identifier after the extent starts with `x`, and only the `x` is read.
+    pub fn shape_x(&mut self) -> Result<()> {
+        let next = self.peek();
+        if next.kind != TokenKind::Ident || !next.text.starts_with('x') {
+            return Err(self.unexpected("`x` after an extent"));
         }
-        Err(self.error("unclosed `<`"))
+        let touches_after = next.text.len() > 1 || token(self.src, next.end()).start == next.end();
+        if next.start != self.pos || !touches_after {
+            return Err(self.error("a shape is written without spaces, as `4x{T}xf32`"));
+        }
+        self.pos = next.start + 1;
+        Ok(())
     }
 
-    fn line_col(&self) -> (usize, usize) {
-        let before = &self.src[..self.pos];
-        let line = before.matches('\n').count() + 1;
-        let col = before.len() - before.rfind('\n').map_or(0, |i| i + 1) + 1;
-        (line, col)
+    /// Words joined by `-` with no space between, as pass names are: `outline-static`.
+    pub fn hyphenated(&mut self) -> Result<String> {
+        let mut name = self.ident()?.to_string();
+        loop {
+            let dash = self.peek();
+            let word = self.peek_second();
+            let joined = dash.text == "-"
+                && dash.start == self.pos
+                && word.kind == TokenKind::Ident
+                && word.start == dash.end();
+            if !joined {
+                return Ok(name);
+            }
+            self.next_token();
+            name.push('-');
+            name.push_str(self.next_token().text);
+        }
     }
 
     /// Items separated by `,`, up to and including `close`.
@@ -354,30 +209,36 @@ impl<'a> Cursor<'a> {
             if self.eat(close) {
                 return Ok(items);
             }
-            self.expect(",")?;
+            if !self.eat(",") {
+                return Err(self.unexpected(format!("`,` or `{close}`")));
+            }
         }
     }
 
-    /// Parses the value of `key` in the attribute dictionary of `op` when `key` is
-    /// `operand_segments` or `result_segments`, and keeps it for the module parser.
-    pub fn segment_attr(&mut self, op: &str, key: &str) -> Result<()> {
-        if key != "operand_segments" && key != "result_segments" {
-            return Err(self.error(format!("{op} has no attribute `{key}`")));
-        }
-        let sizes = Vec::<usize>::parse(self)?;
-        let slot = if key == "operand_segments" {
-            &mut self.operand_segments
-        } else {
-            &mut self.result_segments
+    /// The error that `what` was expected where the next token is.
+    pub fn unexpected(&self, what: impl fmt::Display) -> anyhow::Error {
+        let next = self.peek();
+        let found = match next.kind {
+            TokenKind::End => "the end".to_string(),
+            TokenKind::String => next.text.to_string(),
+            TokenKind::Invalid if next.text.starts_with('"') => {
+                "a string without its closing quote".to_string()
+            }
+            _ => format!("`{}`", next.text),
         };
-        if slot.replace(sizes).is_some() {
-            return Err(self.error(format!("duplicate attribute `{key}`")));
-        }
-        Ok(())
+        self.error(format!("expected {what}, found {found}"))
     }
 
-    pub fn error(&self, msg: impl std::fmt::Display) -> anyhow::Error {
-        let (line, col) = self.line_col();
-        anyhow!("{line}:{col}: {msg}")
+    /// An error at the next token.
+    pub fn error(&self, msg: impl fmt::Display) -> anyhow::Error {
+        self.error_at(self.position(), msg)
+    }
+
+    /// An error at byte offset `pos`, as `line:column: msg`.
+    pub fn error_at(&self, pos: usize, msg: impl fmt::Display) -> anyhow::Error {
+        let before = &self.src[..pos];
+        let line = before.matches('\n').count() + 1;
+        let column = before.len() - before.rfind('\n').map_or(0, |newline| newline + 1) + 1;
+        anyhow!("{line}:{column}: {msg}")
     }
 }

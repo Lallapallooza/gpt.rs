@@ -41,7 +41,7 @@ A `tile.block` is a generalized reduction over an iteration domain:
 in index expressions. A block has at most 16.
 
 - `par` iterators index the results.
-- `red` iterators are folded by the folds. `red ordered` iterators are folded in their order: no
+- `red` iterators are folded by the folds. `red_ordered` iterators are folded in their order: no
   schedule may split or reorder them.
 - A `prefix` iterator is folded, and every prefix of the fold is a result: `out[s] = fold(x[0..=s])`.
   A block has at most one, and none together with `red` iterators.
@@ -102,10 +102,11 @@ every element of a result is defined.
 
 ### Folds
 
-`folds` lists one fold per group of yielded values, in yield order: `kind -> write, ...`, then
-`init $k, ...` when the fold starts from given states. A fold takes the values its combine kind
-folds and has one write per result of the kind, so every position in the list states what it is.
-`none -> write` writes its one yielded value per point.
+`folds` lists one fold per group of yielded values, in yield order: `kind -> write`, or
+`kind -> (write, ...)` for a kind with several results, then `init $k`, or `init ($k, ...)`, when
+the fold starts from given states. A fold takes the values its combine kind folds and has one write
+per result of the kind, so every position in the list states what it is. `none -> write` writes
+its one yielded value per point.
 
 | Kind | Body yields | Results | Exact under reassociation |
 |---|---|---|---|
@@ -148,6 +149,9 @@ states in point order, and a state with maximum `-inf` contributes nothing to a 
 top-level symbol that `host.dispatch` calls. A dispatch runs on its arguments alone, so they bind
 every dimension symbol its blocks use.
 
+A dispatch carries its schedule, `#sched<...>`: how it runs, which changes no value it computes.
+`gpt_rs_ir::schedule` defines its fields and the rules a schedule follows.
+
 ## Ops
 
 - `tile.block`
@@ -184,10 +188,25 @@ Defined by `Block` in [crates/gpt-rs-ir/src/dialects/tile/ir.rs](../../crates/gp
 | Operands | `ins`: tensors |
 | Results | `outs`: tensors |
 | Regions | `body` |
-| Attributes | `iters`: `Iters`; `reads`: `[Read]`; `folds`: `[Fold]`; `constraints`: `[Constraint]`, optional |
+| Attributes | `iters`: `[Iter]`; `reads`: `[Read]`; `folds`: `[Fold]`; `constraints`: `[Constraint]`, optional |
 | Traits | isolated from above |
 | Effects | none |
 | Patterns | `CanonicalIndices` (`canonicalize`); `CompactInputs` (`canonicalize`); `DropUnitIters` (`canonicalize`); `EraseIdentityBlock` (`canonicalize`); `SplatReads` (`canonicalize`) |
+
+| `iters` | Text form |
+|---|---|
+| `Iter` | ` $kind $extent ` |
+
+| `reads` | Text form |
+|---|---|
+| `Read` | ``` $source `` $coords (`pad` $pad^)? ``` |
+| `SourceText` | `` $first (`..` $list^)? `` |
+| `OperandList` | `` $last `[` $pick `]` `` |
+
+| `folds` | Text form |
+|---|---|
+| `Fold` | `` $combine `->` tuple($writes) (`init` tuple($init)^)? `` |
+| `Write` | ``` ($into^)? `` $coords ``` |
 
 Example, from `filetests/tile/roundtrip/block.ptir`:
 
@@ -230,20 +249,20 @@ Defined by `Index` in [crates/gpt-rs-ir/src/dialects/tile/ir.rs](../../crates/gp
 |---|---|
 | Operands | none |
 | Results | `output`: scalar |
-| Attributes | `expr`: `IndexExpr`; `dtype`: `dtype` |
+| Attributes | `expr`: `IndexExpr`; `dtype`: `DType` |
 | Effects | none |
 
 Example, from `filetests/tile/roundtrip/block.ptir`:
 
 ```text
 func.func @folds(%scores: tensor<2x5xf32>, %flags: tensor<2x5xi1>) -> (tensor<2xf32>, tensor<2xsi32>, tensor<2xf32>, tensor<2xsi64>, tensor<2x3xf32>, tensor<2x3xsi32>, tensor<2xf32>, tensor<2xf32>, tensor<2xf32>, tensor<2xi1>, tensor<2xi1>) {
-  %argmax_value, %argmax_index, %argmin_value, %argmin_index, %top_values, %top_indices = tile.block(%scores) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [argmax -> [d0], [d0], argmin -> [d0], [d0], top_k<k = 3> -> [d0], [d0]]} ({
+  %argmax_value, %argmax_index, %argmin_value, %argmin_index, %top_values, %top_indices = tile.block(%scores) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [argmax -> ([d0], [d0]), argmin -> ([d0], [d0]), top_k<k = 3> -> ([d0], [d0])]} ({
   ^body(%score: f32):
     %index = tile.index() {expr = d1, dtype = si32} : () -> si32
     %wide_index = tile.index() {expr = d1, dtype = si64} : () -> si64
     tile.yield(%score, %index, %score, %wide_index, %score, %index) : (f32, si32, f32, si64, f32, si32) -> ()
   }) : (tensor<2x5xf32>) -> (tensor<2xf32>, tensor<2xsi32>, tensor<2xf32>, tensor<2xsi64>, tensor<2x3xf32>, tensor<2x3xsi32>)
-  %sum, %max, %min = tile.block(%scores) {iters = [par 2, red ordered 5], reads = [$0[d0, d1]], folds = [sum -> [d0], max -> [d0], min -> [d0]]} ({
+  %sum, %max, %min = tile.block(%scores) {iters = [par 2, red_ordered 5], reads = [$0[d0, d1]], folds = [sum -> [d0], max -> [d0], min -> [d0]]} ({
   ^body(%score: f32):
     tile.yield(%score, %score, %score) : (f32, f32, f32) -> ()
   }) : (tensor<2x5xf32>) -> (tensor<2xf32>, tensor<2xf32>, tensor<2xf32>)
@@ -305,7 +324,7 @@ Defined by `Group` in [crates/gpt-rs-ir/src/dialects/tile/ir.rs](../../crates/gp
 Example, from `filetests/tile/roundtrip/block.ptir`:
 
 ```text
-tile.dispatch @rms(%input: tensor<{T}x8xf32>) -> tensor<{T}xf32> {grid = [d0], facts = {T = [16, 4096] % 16}} {
+tile.dispatch @rms(%input: tensor<{T}x8xf32>) -> tensor<{T}xf32> attributes {grid = [d0], facts = {T = [16, 4096] % 16}} {
   %sum_of_squares = tile.block(%input) {iters = [par {T}, red 8], reads = [$0[d0, d1]], folds = [sum -> [d0]]} ({
   ^body(%element: f32):
     %square = arith.mul(%element, %element) : (f32, f32) -> f32
@@ -335,6 +354,7 @@ symbol, called by `host.dispatch`.
 - Its body's block arguments are its arguments, and its `func.return` gives its results.
 - `grid` lists the parallel iterators, by position, that its blocks share. `facts` gives a
   range and a divisor of each dimension symbol of its arguments.
+- `schedule` says how it runs, which changes no value it computes.
 
 Defined by `Dispatch` in [crates/gpt-rs-ir/src/dialects/tile/ir.rs](../../crates/gpt-rs-ir/src/dialects/tile/ir.rs).
 
@@ -343,38 +363,49 @@ Defined by `Dispatch` in [crates/gpt-rs-ir/src/dialects/tile/ir.rs](../../crates
 | Operands | none |
 | Results | none |
 | Regions | `body` |
-| Attributes | `name`: `String`; `args`: `[Type]`; `results`: `[Type]`; `grid`: `IterList`, optional; `facts`: `BTreeMap<String,SymFact>`, optional |
+| Attributes | `name`: `String`; `args`: `[Type]`; `results`: `[Type]`; `grid`: `IterList`, optional; `facts`: `{name = SymFact}`, optional; `schedule`: `Schedule`, optional |
 | Traits | isolated from above |
 | Effects | none |
+| Patterns | `DispatchToLoop` (`tile-to-loop`) |
 
-Example, from `filetests/tile/roundtrip/block.ptir`:
+| `facts` | Text form |
+|---|---|
+| `SymFact` | `` `[` $min `,` $max `]` (`%` $divisor^)? `` |
+
+| `schedule` | Text form |
+|---|---|
+| `Schedule` | `` `#sched` `<` struct($nest) `>` `` |
+| `Loop` | `` $iter `by` $extent `:` $parallelism `` |
+
+Example, from `filetests/tile/roundtrip/schedule.ptir`:
 
 ```text
-tile.dispatch @rms(%input: tensor<{T}x8xf32>) -> tensor<{T}xf32> {grid = [d0], facts = {T = [16, 4096] % 16}} {
-  %sum_of_squares = tile.block(%input) {iters = [par {T}, red 8], reads = [$0[d0, d1]], folds = [sum -> [d0]]} ({
-  ^body(%element: f32):
-    %square = arith.mul(%element, %element) : (f32, f32) -> f32
-    tile.yield(%square) : (f32) -> ()
-  }) : (tensor<{T}x8xf32>) -> tensor<{T}xf32>
-  func.return(%sum_of_squares) : (tensor<{T}xf32>) -> ()
-}
-func.func @call(%input: tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}x8xf32>) {
-  %sum_of_squares = host.dispatch(%input) {callee = @rms} : (tensor<{T}x8xf32>) -> tensor<{T}xf32>
-  %exponentials = tile.group() {grid = [d0]} ({
-    %block_exponentials = tile.block(%input) {iters = [par {T}, par 8], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
-    ^body(%element: f32):
-      %exponential = arith.exp(%element) : (f32) -> f32
-      tile.yield(%exponential) : (f32) -> ()
-    }) : (tensor<{T}x8xf32>) -> tensor<{T}x8xf32>
-    tile.yield(%block_exponentials) : (tensor<{T}x8xf32>) -> ()
-  }) : () -> tensor<{T}x8xf32>
-  func.return(%sum_of_squares, %exponentials) : (tensor<{T}xf32>, tensor<{T}x8xf32>) -> ()
+tile.dispatch @project(%input: tensor<4x8xf32>, %weight: tensor<6x8xf32>) -> tensor<4x6xf32> attributes {schedule = #sched<nest = [d0 by 2 : par<level = l3, units = 2>, d1 by 3 : par<level = core>, d2 by 4 : seq]>} {
+  %product = tile.block(%input, %weight) {iters = [par 4, par 6, red 8], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<4x8xf32>, tensor<6x8xf32>) -> tensor<4x6xf32>
+  func.return(%product) : (tensor<4x6xf32>) -> ()
 }
 ```
 
 Rejected, as the verify filetests pin it:
 
 - `tile.dispatch: a block uses {T}, which no argument binds`
+- `tile.dispatch: facts give {T} the empty range [8, 4]`
+- `tile.dispatch: facts give {T} the divisor 0`
+- `tile.dispatch: a nest schedules the one block of a dispatch, and this one holds 2`
+- `tile.dispatch: loop 0 walks d2, which the block does not have`
+- `tile.dispatch: loop 0 walks empty tiles`
+- `tile.dispatch: loop 1 walks tiles of 4 points of d1, inside tiles of 2`
+- `tile.dispatch: loop 0 runs on no units`
+- `tile.dispatch: loop 1 runs at level l3, inside a loop at level core`
+- `tile.dispatch: loop 0 runs tiles of d1, a reduction iterator, in parallel: that splits the reduction`
+- `tile.dispatch: loop 0 walks d1, a prefix iterator, which a nest leaves whole`
+- `tile.dispatch: a nest of a block that updates an operand would reorder its writes`
+- `tile.dispatch: a nest of `online_softmax` or `logsumexp` needs their update of a tile`
+- `tile.dispatch: the state of a fold keeps the tile of d0, whose extent {N} is not static`
 
 ## Traits
 

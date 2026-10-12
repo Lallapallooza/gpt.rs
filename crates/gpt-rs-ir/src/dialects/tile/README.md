@@ -39,7 +39,7 @@ A `tile.block` is a generalized reduction over an iteration domain:
 in index expressions. A block has at most 16.
 
 - `par` iterators index the results.
-- `red` iterators are folded by the folds. `red ordered` iterators are folded in their order: no
+- `red` iterators are folded by the folds. `red_ordered` iterators are folded in their order: no
   schedule may split or reorder them.
 - A `prefix` iterator is folded, and every prefix of the fold is a result: `out[s] = fold(x[0..=s])`.
   A block has at most one, and none together with `red` iterators.
@@ -100,10 +100,11 @@ every element of a result is defined.
 
 ### Folds
 
-`folds` lists one fold per group of yielded values, in yield order: `kind -> write, ...`, then
-`init $k, ...` when the fold starts from given states. A fold takes the values its combine kind
-folds and has one write per result of the kind, so every position in the list states what it is.
-`none -> write` writes its one yielded value per point.
+`folds` lists one fold per group of yielded values, in yield order: `kind -> write`, or
+`kind -> (write, ...)` for a kind with several results, then `init $k`, or `init ($k, ...)`, when
+the fold starts from given states. A fold takes the values its combine kind folds and has one write
+per result of the kind, so every position in the list states what it is. `none -> write` writes
+its one yielded value per point.
 
 | Kind | Body yields | Results | Exact under reassociation |
 |---|---|---|---|
@@ -145,3 +146,6 @@ states in point order, and a state with maximum `-inf` contributes nothing to a 
 `tile.group` gathers blocks while dispatches are formed, and `tile.dispatch` is a sealed group: a
 top-level symbol that `host.dispatch` calls. A dispatch runs on its arguments alone, so they bind
 every dimension symbol its blocks use.
+
+A dispatch carries its schedule, `#sched<...>`: how it runs, which changes no value it computes.
+`gpt_rs_ir::schedule` defines its fields and the rules a schedule follows.

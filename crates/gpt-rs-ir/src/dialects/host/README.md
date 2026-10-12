@@ -1,7 +1,8 @@
 # The host dialect
 
-The `host` dialect is the program that runs dispatches. A function calls `tile.dispatch` symbols
-on tensors with `host.dispatch`, and each call is pure: its results depend on its arguments alone.
+The `host` dialect is the program that runs dispatches. A function calls dispatches on tensors with
+`host.dispatch`: `tile.dispatch` symbols, or the `loop.func` symbols they lower to. Each call is
+pure: its results depend on its arguments alone.
 
 ## Conventions
 

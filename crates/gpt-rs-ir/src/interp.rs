@@ -9,16 +9,20 @@ use std::rc::Rc;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 
-use crate::host::HostValue;
+use crate::host::{HostValue, Unit};
 use crate::module::{Inst, Module, Region, Value};
 use crate::op::{OpDyn, RegionRunner};
 use crate::traits::Terminator;
-use crate::types::{Dim, Sym, SymBindings, TensorType, Type};
+use crate::types::{BufferType, Dim, Sym, SymBindings, TensorType, Type};
 
 struct Interp<'m> {
     module: &'m Module,
     env: HashMap<Value, Rc<HostValue>>,
     syms: SymBindings,
+    /// The unit of work the ops run in.
+    unit: Unit,
+    /// How many runs of foralls have started: the number of the next run.
+    runs: u64,
 }
 
 impl<'m> Interp<'m> {
@@ -27,24 +31,42 @@ impl<'m> Interp<'m> {
             module,
             env: HashMap::new(),
             syms: SymBindings::default(),
+            unit: Unit::NONE,
+            runs: 0,
         }
     }
 
     /// Checks `value` against `ty`, binding the dynamic dimensions it fixes.
     fn bind(&mut self, ty: &Type, value: &HostValue) -> Result<()> {
-        let (Type::Tensor(tensor), HostValue::Tensor(host)) = (ty, value) else {
-            let actual = value.ty();
-            ensure!(actual == *ty, "the value has type {actual}, not {ty}");
-            return Ok(());
-        };
-        let actual = TensorType::new(host.dtype(), host.dims.iter().copied());
-        self.syms.bind(tensor, &actual)
+        match (ty, value) {
+            (Type::Tensor(tensor), HostValue::Tensor(host)) => {
+                let actual = TensorType::new(host.dtype(), host.dims.iter().copied());
+                self.syms.bind(tensor, &actual)
+            }
+            (Type::Buffer(buffer), HostValue::Buffer(host)) => {
+                let actual = host.ty();
+                ensure!(
+                    actual.space == buffer.space,
+                    "the value has type {actual}, not {buffer}"
+                );
+                self.syms.bind(&buffer.tensor_type(), &actual.tensor_type())
+            }
+            _ => {
+                let actual = value.ty();
+                ensure!(actual == *ty, "the value has type {actual}, not {ty}");
+                Ok(())
+            }
+        }
     }
 
     /// `ty` with every bound dynamic dimension replaced by its extent.
     fn resolve(&self, ty: &Type) -> Type {
         match ty {
             Type::Tensor(tensor) => Type::Tensor(self.syms.resolve(tensor)),
+            Type::Buffer(buffer) => Type::Buffer(BufferType::of(
+                &self.syms.resolve(&buffer.tensor_type()),
+                buffer.space,
+            )),
             other => other.clone(),
         }
     }
@@ -90,6 +112,23 @@ impl RegionRunner for Interp<'_> {
 
     fn sym(&self, sym: &Sym) -> Option<usize> {
         self.syms.get(sym).and_then(Dim::as_static)
+    }
+
+    fn unit(&self) -> &Unit {
+        &self.unit
+    }
+
+    fn run_units(&mut self, region: Region, start: i64, end: i64) -> Result<()> {
+        let run = self.runs;
+        self.runs += 1;
+        let outer = self.unit.clone();
+        for index in start..end {
+            self.unit = outer.enter(run, index);
+            let ran = self.run_region(region, vec![HostValue::Index(index)]);
+            self.unit = outer.clone();
+            ran?;
+        }
+        Ok(())
     }
 
     fn call(&mut self, callee: &str, args: Vec<HostValue>) -> Result<Vec<HostValue>> {

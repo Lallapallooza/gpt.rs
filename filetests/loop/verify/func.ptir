@@ -1,0 +1,36 @@
+// RUN: verify
+
+// ERROR: loop.func: the access list has length 1, but the parameter list has length 2
+loop.func @missing_access(%input: !loop.buf<4xf32, global>, %output: !loop.buf<4xf32, global>) attributes {access = [in]} {
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.func: parameter 0 is !loop.buf<4xf32, private>, not a global buffer
+loop.func @private_parameter(%input: !loop.buf<4xf32, private>) attributes {access = [in]} {
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.func: parameter 0 is tensor<4xf32>, not a global buffer
+loop.func @tensor_parameter(%input: tensor<4xf32>) attributes {access = [in]} {
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.func: parameter 1 has the extent {N}, which no `in` parameter binds
+loop.func @unbound_extent(%input: !loop.buf<4xf32, global>, %output: !loop.buf<{N}xf32, global>) attributes {access = [in, out]} {
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.func: it stores into parameter 0, which is `in`
+loop.func @store_into_input(%input: !loop.buf<f32, global>) attributes {access = [in]} {
+  %zero = arith.constant() {value = 0.0 : f32} : () -> f32
+  loop.store(%zero, %input) : (f32, !loop.buf<f32, global>) -> ()
+  loop.return() : () -> ()
+}

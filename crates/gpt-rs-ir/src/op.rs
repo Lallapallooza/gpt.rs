@@ -14,21 +14,23 @@ use anyhow::Result;
 use smallvec::SmallVec;
 
 use crate::dense::Dense;
-use crate::host::{HostScalar, HostTensor, HostValue};
+use crate::host::{HostBuffer, HostScalar, HostTensor, HostValue, Unit};
 use crate::index::IndexEnv;
 use crate::module::{Inst, Module, Region, RegionRef, Value, ValueRef};
 use crate::text::Cursor;
 use crate::traits::Traits;
-use crate::types::{DType, Element, TensorType, Type};
+use crate::types::{BufferType, DType, Element, TensorType, Type};
 use crate::Op;
 
 /// What one element of an operand or result group is, under some view.
 pub trait View {
     type Any;
     type Tensor;
+    type Buffer;
     type Index;
     type Scalar;
     fn tensor(x: Self::Any) -> Option<Self::Tensor>;
+    fn buffer(x: Self::Any) -> Option<Self::Buffer>;
     fn index(x: Self::Any) -> Option<Self::Index>;
     fn scalar(x: Self::Any) -> Option<Self::Scalar>;
 }
@@ -36,6 +38,7 @@ pub trait View {
 /// A view whose elements can be turned back into `Any`, needed to flatten a group struct.
 pub trait Embed: View {
     fn from_tensor(x: Self::Tensor) -> Self::Any;
+    fn from_buffer(x: Self::Buffer) -> Self::Any;
     fn from_index(x: Self::Index) -> Self::Any;
     fn from_scalar(x: Self::Scalar) -> Self::Any;
 }
@@ -46,10 +49,14 @@ pub struct Types<'a>(PhantomData<&'a ()>);
 impl<'a> View for Types<'a> {
     type Any = &'a Type;
     type Tensor = &'a TensorType;
+    type Buffer = &'a BufferType;
     type Index = ();
     type Scalar = DType;
     fn tensor(x: &'a Type) -> Option<&'a TensorType> {
         x.as_tensor()
+    }
+    fn buffer(x: &'a Type) -> Option<&'a BufferType> {
+        x.as_buffer()
     }
     fn index(x: &'a Type) -> Option<()> {
         x.is_index().then_some(())
@@ -65,11 +72,18 @@ pub struct OwnedTypes;
 impl View for OwnedTypes {
     type Any = Type;
     type Tensor = TensorType;
+    type Buffer = BufferType;
     type Index = ();
     type Scalar = DType;
     fn tensor(x: Type) -> Option<TensorType> {
         match x {
             Type::Tensor(t) => Some(t),
+            _ => None,
+        }
+    }
+    fn buffer(x: Type) -> Option<BufferType> {
+        match x {
+            Type::Buffer(b) => Some(b),
             _ => None,
         }
     }
@@ -85,6 +99,9 @@ impl Embed for OwnedTypes {
     fn from_tensor(x: TensorType) -> Type {
         Type::Tensor(x)
     }
+    fn from_buffer(x: BufferType) -> Type {
+        Type::Buffer(x)
+    }
     fn from_index(_: ()) -> Type {
         Type::Index
     }
@@ -99,10 +116,17 @@ pub struct Host<'a>(PhantomData<&'a ()>);
 impl<'a> View for Host<'a> {
     type Any = &'a HostValue;
     type Tensor = &'a HostTensor;
+    type Buffer = &'a HostBuffer;
     type Index = i64;
     type Scalar = HostScalar;
     fn tensor(x: &'a HostValue) -> Option<&'a HostTensor> {
         x.as_tensor()
+    }
+    fn buffer(x: &'a HostValue) -> Option<&'a HostBuffer> {
+        match x {
+            HostValue::Buffer(b) => Some(b),
+            _ => None,
+        }
     }
     fn index(x: &'a HostValue) -> Option<i64> {
         match x {
@@ -124,11 +148,18 @@ pub struct OwnedHost;
 impl View for OwnedHost {
     type Any = HostValue;
     type Tensor = HostTensor;
+    type Buffer = HostBuffer;
     type Index = i64;
     type Scalar = HostScalar;
     fn tensor(x: HostValue) -> Option<HostTensor> {
         match x {
             HostValue::Tensor(t) => Some(t),
+            _ => None,
+        }
+    }
+    fn buffer(x: HostValue) -> Option<HostBuffer> {
+        match x {
+            HostValue::Buffer(b) => Some(b),
             _ => None,
         }
     }
@@ -150,6 +181,9 @@ impl Embed for OwnedHost {
     fn from_tensor(x: HostTensor) -> HostValue {
         HostValue::Tensor(x)
     }
+    fn from_buffer(x: HostBuffer) -> HostValue {
+        HostValue::Buffer(x)
+    }
     fn from_index(x: i64) -> HostValue {
         HostValue::Index(x)
     }
@@ -165,9 +199,13 @@ pub struct Values;
 impl View for Values {
     type Any = Value;
     type Tensor = Value;
+    type Buffer = Value;
     type Index = Value;
     type Scalar = Value;
     fn tensor(x: Value) -> Option<Value> {
+        Some(x)
+    }
+    fn buffer(x: Value) -> Option<Value> {
         Some(x)
     }
     fn index(x: Value) -> Option<Value> {
@@ -180,6 +218,9 @@ impl View for Values {
 
 impl Embed for Values {
     fn from_tensor(x: Value) -> Value {
+        x
+    }
+    fn from_buffer(x: Value) -> Value {
         x
     }
     fn from_index(x: Value) -> Value {
@@ -195,6 +236,7 @@ impl Embed for Values {
 pub enum Kind {
     Any,
     Tensor,
+    Buffer,
     Index,
     Scalar,
 }
@@ -338,8 +380,13 @@ pub trait OpKind: Clone + PartialEq + Eq + Hash + fmt::Debug + 'static {
     /// default.
     fn print_attrs(&self, out: &mut Vec<(&'static str, String)>);
     /// Returns `None` when `name` is not this op. Otherwise parses the optional attribute
-    /// dictionary that follows.
-    fn parse(name: &str, c: &mut Cursor<'_>) -> Option<Result<Self>>;
+    /// dictionary that follows, handing a key the op does not have to `other_attr`, with its
+    /// position.
+    fn parse(
+        name: &str,
+        c: &mut Cursor<'_>,
+        other_attr: &mut dyn FnMut(&str, &mut Cursor<'_>, usize) -> Result<()>,
+    ) -> Option<Result<Self>>;
     /// Returns `None` unless this op is a [`SymbolOp`] named `name`. Otherwise parses its
     /// signature.
     fn parse_symbol(_name: &str, _c: &mut Cursor<'_>) -> Option<Result<ParsedSymbol<Self>>> {
@@ -347,8 +394,16 @@ pub trait OpKind: Clone + PartialEq + Eq + Hash + fmt::Debug + 'static {
     }
 }
 
-/// A symbol op read from its signature, and the names and types of its body's arguments.
-pub type ParsedSymbol<T> = (T, Vec<(String, Type)>);
+/// A symbol op read from its signature, and the arguments of its body.
+pub type ParsedSymbol<T> = (T, Vec<NamedArg>);
+
+/// An argument of a region as the text writes it: its name, where the name is, and its type.
+pub struct NamedArg {
+    pub name: String,
+    /// The byte offset of the name, for errors about it.
+    pub at: usize,
+    pub ty: Type,
+}
 
 /// An op that holds a constant value, which constant queries and folds read. `#[op(..., constant)]`
 /// declares an op as one.
@@ -357,20 +412,16 @@ pub trait ConstantOp {
 }
 
 /// An op that defines a top-level symbol: its text form is its signature, then its body,
-/// `func.func @main(%0: tensor<4xf32>, ...) -> tensor<4xf32> { ... }`. `#[op(..., symbol)]`
-/// declares an op as one, and the printer and the parser write and read its signature through
-/// this trait.
+/// `func.func @main(%0: tensor<4xf32>, ...) -> tensor<4xf32> attributes {...} { ... }`.
+/// `#[op(..., symbol)]` declares an op as one and implements this trait from its fields, through
+/// which the printer and the parser write and read its signature.
 pub trait SymbolOp {
     /// The symbol's name, without its `@`.
     fn symbol(&self) -> &str;
-    /// The text after the type of argument `index`, such as ` {param = 3}`.
-    fn arg_suffix(&self, index: usize) -> String;
-    /// The text of the results, after `->`.
-    fn results_text(&self) -> String;
-    /// The entries of the attribute dictionary after the results.
-    fn attr_entries(&self) -> Vec<String>;
-    /// The signature after the op's name, up to its body: the op, and the names and types of the
-    /// body's arguments.
+    /// Writes the signature after the op's name, up to its body: `@name(%a: T, ...) -> ...`,
+    /// with `arg_names` the names of the body's arguments.
+    fn print_signature(&self, arg_names: &[String], out: &mut String);
+    /// The signature after the op's name, up to its body: the op, and the arguments of its body.
     fn parse_signature(c: &mut Cursor<'_>) -> Result<ParsedSymbol<Self>>
     where
         Self: Sized;
@@ -400,8 +451,10 @@ pub struct OpInfo {
 #[derive(Clone, Copy)]
 pub struct AttrInfo {
     pub name: &'static str,
-    /// The field's Rust type.
-    pub ty: &'static str,
+    /// The type as the reference pages name it, [`Attr::type_name`](crate::attr::Attr::type_name).
+    pub type_name: fn() -> String,
+    /// The type whose values the text writes, [`Attr::ITEM`](crate::attr::Attr::ITEM).
+    pub item: &'static str,
     /// Whether the text leaves it out at its default.
     pub default: bool,
 }
@@ -460,6 +513,18 @@ pub trait RegionRunner {
     fn index_env(&self) -> Option<&dyn IndexEnv> {
         None
     }
+
+    /// The unit of work an op runs in: the iteration of each `loop.forall` around it.
+    fn unit(&self) -> &Unit {
+        static OUTSIDE: Unit = Unit::NONE;
+        &OUTSIDE
+    }
+
+    /// Runs `region` once for each index from `start` up to `end`, each as a unit of one run of a
+    /// forall, which may run at the same time as the others.
+    fn run_units(&mut self, _region: Region, _start: i64, _end: i64) -> Result<()> {
+        anyhow::bail!("only a run of a function runs units")
+    }
 }
 
 pub struct EvalCx<'a, R> {
@@ -492,6 +557,16 @@ impl<R> EvalCx<'_, R> {
     /// The point of the enclosing `tile.block`, for an op of its body.
     pub fn index_env(&self) -> Option<&dyn IndexEnv> {
         self.runner.index_env()
+    }
+
+    /// The unit of work the op runs in.
+    pub fn unit(&self) -> &Unit {
+        self.runner.unit()
+    }
+
+    /// Runs `region` once for each index from `start` up to `end`, as units of one run of a forall.
+    pub fn run_units(&mut self, region: Region, start: i64, end: i64) -> Result<()> {
+        self.runner.run_units(region, start, end)
     }
 
     /// The result types, with this run's dimensions bound.
@@ -539,9 +614,13 @@ pub struct Folding<'a>(PhantomData<&'a ()>);
 impl<'a> View for Folding<'a> {
     type Any = FoldIn<'a>;
     type Tensor = FoldIn<'a>;
+    type Buffer = FoldIn<'a>;
     type Index = FoldIn<'a>;
     type Scalar = FoldIn<'a>;
     fn tensor(x: FoldIn<'a>) -> Option<FoldIn<'a>> {
+        Some(x)
+    }
+    fn buffer(x: FoldIn<'a>) -> Option<FoldIn<'a>> {
         Some(x)
     }
     fn index(x: FoldIn<'a>) -> Option<FoldIn<'a>> {
@@ -573,9 +652,13 @@ pub struct FoldOut;
 impl View for FoldOut {
     type Any = Folded;
     type Tensor = Folded;
+    type Buffer = Folded;
     type Index = Folded;
     type Scalar = Folded;
     fn tensor(x: Folded) -> Option<Folded> {
+        Some(x)
+    }
+    fn buffer(x: Folded) -> Option<Folded> {
         Some(x)
     }
     fn index(x: Folded) -> Option<Folded> {
@@ -588,6 +671,9 @@ impl View for FoldOut {
 
 impl Embed for FoldOut {
     fn from_tensor(x: Folded) -> Folded {
+        x
+    }
+    fn from_buffer(x: Folded) -> Folded {
         x
     }
     fn from_index(x: Folded) -> Folded {
@@ -645,6 +731,8 @@ pub type FoldFn = fn(&dyn Any, &[FoldIn<'_>], Option<&[usize]>, &[Type]) -> Opti
 pub struct FoldEntry {
     /// The `TypeId` of the op struct.
     pub op: fn() -> TypeId,
+    /// The name of the op, `tensor.add`.
+    pub name: &'static str,
     /// The name of the op struct, and the file of the folder, relative to the workspace.
     pub rust: &'static str,
     pub file: &'static str,
@@ -674,7 +762,7 @@ pub fn fold_erased<T: Fold + 'static>(
     let op = op.downcast_ref::<T>()?;
     let typed = T::Groups::split_operands::<Folding<'_>>(ins.iter().cloned(), segments).ok()?;
     let out = op.fold(typed, &FoldCx { results })?;
-    crate::doc::fired(crate::doc::Fired::Fold(crate::doc::short_name::<T>()));
+    crate::doc::fired(crate::doc::Fired::Fold(T::INFO.name));
     Some(T::Groups::flatten_results::<FoldOut>(out).0.into_vec())
 }
 
@@ -827,9 +915,13 @@ pub struct Refs<'m>(PhantomData<&'m ()>);
 impl<'m> View for Refs<'m> {
     type Any = ValueRef<'m>;
     type Tensor = ValueRef<'m>;
+    type Buffer = ValueRef<'m>;
     type Index = ValueRef<'m>;
     type Scalar = ValueRef<'m>;
     fn tensor(x: ValueRef<'m>) -> Option<ValueRef<'m>> {
+        Some(x)
+    }
+    fn buffer(x: ValueRef<'m>) -> Option<ValueRef<'m>> {
         Some(x)
     }
     fn index(x: ValueRef<'m>) -> Option<ValueRef<'m>> {
@@ -960,6 +1052,7 @@ fn kind_name(kind: Kind) -> &'static str {
     match kind {
         Kind::Any => "a value",
         Kind::Tensor => "a tensor",
+        Kind::Buffer => "a buffer",
         Kind::Index => "an index",
         Kind::Scalar => "a scalar",
     }

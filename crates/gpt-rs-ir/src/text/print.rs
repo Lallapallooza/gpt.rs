@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
+use crate::attr::print_tuple;
 use crate::module::{Inst, Module, Region, Value};
 use crate::op::{OpDyn, SymbolOp};
 use crate::traits::IsolatedFromAbove;
-use crate::types::{type_list, Type};
+use crate::types::type_list;
 
 struct Printer<'m> {
     module: &'m Module,
@@ -13,14 +14,6 @@ struct Printer<'m> {
     next: usize,
     /// Whether each op with a location ends with it.
     locations: bool,
-}
-
-/// Result types as an op's text writes them: one type alone, several in parentheses.
-pub(crate) fn results_text(types: &[&Type]) -> String {
-    match types {
-        [single] => single.to_string(),
-        _ => type_list(types),
-    }
 }
 
 impl<'m> Printer<'m> {
@@ -93,29 +86,17 @@ impl<'m> Printer<'m> {
         self.out.push('}');
     }
 
-    /// A symbol op: `{op} @{name}(%a: T{arg suffix}, ...) -> {results} {attrs} { body }`.
+    /// A symbol op: its name, its signature, which the op writes, then its body.
     fn print_symbol(&mut self, inst: Inst, depth: usize, symbol: &dyn SymbolOp) {
         let module = self.module;
         let body = module.regions(inst)[0];
         self.isolated(|p| {
-            let _ = write!(p.out, "{} @{}(", module.op(inst).name(), symbol.symbol());
-            for (index, &arg) in module.args(body).iter().enumerate() {
-                if index > 0 {
-                    p.out.push_str(", ");
-                }
-                let arg_name = p.define(arg);
-                let _ = write!(
-                    p.out,
-                    "{arg_name}: {}{}",
-                    module.ty(arg),
-                    symbol.arg_suffix(index)
-                );
+            let mut arg_names = Vec::with_capacity(module.args(body).len());
+            for &arg in module.args(body) {
+                arg_names.push(p.define(arg));
             }
-            let _ = write!(p.out, ") -> {}", symbol.results_text());
-            let attrs = symbol.attr_entries();
-            if !attrs.is_empty() {
-                let _ = write!(p.out, " {{{}}}", attrs.join(", "));
-            }
+            let _ = write!(p.out, "{} ", module.op(inst).name());
+            symbol.print_signature(&arg_names, &mut p.out);
             p.out.push_str(" {\n");
             p.print_insts(body, depth + 1);
             p.indent(depth);
@@ -171,13 +152,8 @@ impl<'m> Printer<'m> {
         }
 
         let operand_types = module.operand_types(inst);
-        let result_tys = module.result_types(inst);
-        let _ = write!(
-            self.out,
-            " : {} -> {}",
-            type_list(&operand_types),
-            results_text(&result_tys)
-        );
+        let _ = write!(self.out, " : {} -> ", type_list(&operand_types));
+        print_tuple(module.result_types(inst), &mut self.out);
         if let Some(location) = module.location(inst).filter(|_| self.locations) {
             let _ = write!(self.out, " {location}");
         }

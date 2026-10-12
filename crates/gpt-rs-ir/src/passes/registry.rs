@@ -63,9 +63,10 @@ pub fn parse(text: &str) -> Result<Pipeline> {
     let mut cursor = Cursor::new(text);
     let mut pipeline = Pipeline::new();
     loop {
-        let name = cursor.word()?;
+        let start = cursor.position();
+        let name = cursor.hyphenated()?;
         let Some(entry) = entries.iter().find(|entry| entry.name == name) else {
-            return Err(cursor.error(format!("unknown pass `{name}`")));
+            return Err(cursor.error_at(start, format!("unknown pass `{name}`")));
         };
         pipeline.passes.push((entry.make)(&mut cursor)?);
         if cursor.at_end() {

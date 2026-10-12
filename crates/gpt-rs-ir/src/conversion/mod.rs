@@ -8,10 +8,12 @@
 //! apply says why, and the conversion fails with that reason.
 
 mod tensor_to_tile;
+mod tile_to_loop;
 
 use anyhow::{bail, Result};
 
 pub use self::tensor_to_tile::TensorToTile;
+pub use self::tile_to_loop::TileToLoop;
 use crate::dialects::Dialect;
 use crate::module::Module;
 use crate::op::InOp;

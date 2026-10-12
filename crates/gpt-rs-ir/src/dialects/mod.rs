@@ -3,6 +3,7 @@
 pub mod arith;
 pub mod func;
 pub mod host;
+pub mod r#loop;
 pub mod tensor;
 pub mod tile;
 
@@ -11,6 +12,7 @@ use anyhow::Result;
 use self::arith::ArithOp;
 use self::func::FuncOp;
 use self::host::HostOp;
+use self::r#loop::LoopOp;
 use self::tensor::TensorOp;
 use self::tile::TileOp;
 use crate::dense::Dense;
@@ -27,6 +29,7 @@ pub enum Op {
     Arith(ArithOp),
     Tile(TileOp),
     Host(HostOp),
+    Loop(LoopOp),
 }
 
 impl Op {

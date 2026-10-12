@@ -948,6 +948,7 @@ dependencies = [
  "blake3",
  "bytemuck",
  "gpt-rs-filetests",
+ "gpt-rs-ir-lexer",
  "gpt-rs-ir-macros",
  "half",
  "libm",
@@ -958,9 +959,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpt-rs-ir-lexer"
+version = "0.1.0"
+
+[[package]]
 name = "gpt-rs-ir-macros"
 version = "0.1.0"
 dependencies = [
+ "gpt-rs-ir-lexer",
  "proc-macro2",
  "quote",
  "syn 2.0.118",

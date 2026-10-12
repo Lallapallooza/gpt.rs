@@ -1,31 +1,31 @@
 // RUN: parse
 
-// ERROR: 3:62: i1 elements are 0 or 1
+// ERROR: 3:39: i1 elements are 0 or 1
 func.func @i1_byte() -> tensor<2xi1> {
-  %flags = tensor.constant() {value = dense<[2] x i1: 0x0205>} : () -> tensor<2xi1>
+  %flags = tensor.constant() {value = dense<2xi1: "0x0205">} : () -> tensor<2xi1>
   func.return(%flags) : (tensor<2xi1>) -> ()
 }
 
 // -----
 
-// ERROR: 3:61: dense<[4] x si4> needs 2 bytes for 4 elements, got 0
+// ERROR: 3:41: dense<4xsi4> needs 2 bytes for 4 elements, got 0
 func.func @si4_bytes() -> tensor<4xsi4> {
-  %nibbles = tensor.constant() {value = dense<[4] x si4: 0x>} : () -> tensor<4xsi4>
+  %nibbles = tensor.constant() {value = dense<4xsi4: "0x">} : () -> tensor<4xsi4>
   func.return(%nibbles) : (tensor<4xsi4>) -> ()
 }
 
 // -----
 
-// ERROR: 3:61: f4e2m1 constants are written in hex
+// ERROR: 3:40: f4e2m1 constants are written in hex
 func.func @f4_list() -> tensor<2xf4e2m1> {
-  %values = tensor.constant() {value = dense<[2] x f4e2m1: [0.5, 1.0]>} : () -> tensor<2xf4e2m1>
+  %values = tensor.constant() {value = dense<2xf4e2m1: [0.5, 1.0]>} : () -> tensor<2xf4e2m1>
   func.return(%values) : (tensor<2xf4e2m1>) -> ()
 }
 
 // -----
 
-// ERROR: 3:76: dense<[4294967296, 4294967296] x f32> takes too many bytes
+// ERROR: 3:39: dense<4294967296x4294967296xf32> takes too many bytes
 func.func @too_many_bytes() -> tensor<4294967296x4294967296xf32> {
-  %zeros = tensor.constant() {value = dense<[4294967296, 4294967296] x f32: 0.0>} : () -> tensor<4294967296x4294967296xf32>
+  %zeros = tensor.constant() {value = dense<4294967296x4294967296xf32: 0.0>} : () -> tensor<4294967296x4294967296xf32>
   func.return(%zeros) : (tensor<4294967296x4294967296xf32>) -> ()
 }

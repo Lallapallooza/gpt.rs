@@ -10,7 +10,7 @@
 // CHECK-NEXT: [[STATIC_DOUBLED:%[0-9]+]] = tensor.mul([[STATIC_WEIGHT]], [[TWO]])
 // CHECK-NEXT: func.return([[STATIC_DOUBLED]])
 func.func @simple(%input: tensor<4xf32>, %weight: tensor<4xf32> {param = 1}) -> tensor<4xf32> {
-  %two = tensor.constant() {value = dense<[4] x f32: 2.0>} : () -> tensor<4xf32>
+  %two = tensor.constant() {value = dense<4xf32: 2.0>} : () -> tensor<4xf32>
   %doubled = tensor.mul(%weight, %two) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
   %sum = tensor.add(%input, %doubled) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
   func.return(%sum) : (tensor<4xf32>) -> ()
@@ -42,8 +42,8 @@ func.func @broadcast(%input: tensor<4x3xf32>, %bias: tensor<3xf32> {param = 1}) 
 // CHECK-NOT: func.func @static.
 func.func @first(%input: tensor<4xf32>, %weight: tensor<4xf32> {param = 1}) -> tensor<4xf32> {
   %exp = tensor.exp(%weight) : (tensor<4xf32>) -> tensor<4xf32>
-  %two = tensor.constant() {value = dense<[4] x f32: 2.0>} : () -> tensor<4xf32>
-  %three = tensor.constant() {value = dense<[4] x f32: 3.0>} : () -> tensor<4xf32>
+  %two = tensor.constant() {value = dense<4xf32: 2.0>} : () -> tensor<4xf32>
+  %three = tensor.constant() {value = dense<4xf32: 3.0>} : () -> tensor<4xf32>
   %six = tensor.mul(%two, %three) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
   %sum = tensor.add(%input, %exp) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
   %shifted = tensor.add(%sum, %six) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>

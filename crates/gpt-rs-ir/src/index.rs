@@ -20,8 +20,8 @@ use anyhow::{anyhow, bail, ensure, Result};
 use smallvec::SmallVec;
 use tinyvec::ArrayVec;
 
-use crate::attr::{print_float, Attr, F64};
-use crate::text::Cursor;
+use crate::attr::{Attr, F64};
+use crate::text::{Cursor, TokenKind};
 use crate::types::{Dim, Sym, MAX_RANK};
 
 /// The largest number of iterators of a `tile.block`.
@@ -30,6 +30,9 @@ pub const MAX_ITERS: usize = 16;
 /// What the reads of an expression name: nothing for an [`IndexExpr`], whose reads are
 /// [`NoRead`], and the operand for an [`AccessExpr`], whose reads are `usize`.
 pub trait ReadKind: Copy + fmt::Debug + PartialEq + Eq + Hash + 'static {
+    /// The name of the expressions whose reads are of this kind.
+    const EXPR: &'static str;
+
     /// The read of operand `operand`, or `None` when the expression reads no operand.
     fn of_operand(operand: usize) -> Option<Self>;
     /// The operand that the read reads.
@@ -41,6 +44,8 @@ pub trait ReadKind: Copy + fmt::Debug + PartialEq + Eq + Hash + 'static {
 pub enum NoRead {}
 
 impl ReadKind for NoRead {
+    const EXPR: &'static str = "IndexExpr";
+
     fn of_operand(_operand: usize) -> Option<Self> {
         None
     }
@@ -51,6 +56,8 @@ impl ReadKind for NoRead {
 }
 
 impl ReadKind for usize {
+    const EXPR: &'static str = "AccessExpr";
+
     fn of_operand(operand: usize) -> Option<Self> {
         Some(operand)
     }
@@ -93,7 +100,17 @@ impl BinaryOp {
         })
     }
 
-    /// Binding strength in the text form: sums bind loosest, and `min` and `max` are calls.
+    /// The operations written between their operands; `min` and `max` are written as calls.
+    const INFIX: [BinaryOp; 5] = [
+        BinaryOp::Add,
+        BinaryOp::Sub,
+        BinaryOp::Mul,
+        BinaryOp::FloorDiv,
+        BinaryOp::Mod,
+    ];
+
+    /// Binding strength in the text form, which the printer and the parser share: sums bind
+    /// loosest, and `min` and `max` are calls.
     fn precedence(self) -> u8 {
         match self {
             BinaryOp::Add | BinaryOp::Sub => 0,
@@ -102,14 +119,14 @@ impl BinaryOp {
         }
     }
 
-    /// The operator between the operands in the text form, or the name before them.
-    fn text(self) -> &'static str {
+    /// The token of the operation: the operator between its operands, or the name of the call.
+    fn symbol(self) -> &'static str {
         match self {
-            BinaryOp::Add => " + ",
-            BinaryOp::Sub => " - ",
-            BinaryOp::Mul => " * ",
-            BinaryOp::FloorDiv => " floordiv ",
-            BinaryOp::Mod => " mod ",
+            BinaryOp::Add => "+",
+            BinaryOp::Sub => "-",
+            BinaryOp::Mul => "*",
+            BinaryOp::FloorDiv => "floordiv",
+            BinaryOp::Mod => "mod",
             BinaryOp::Min => "min",
             BinaryOp::Max => "max",
         }
@@ -947,23 +964,23 @@ impl<R: ReadKind> fmt::Display for Expr<R> {
             let operands = stack.split_off(stack.len() - node.arity());
             let text = match node {
                 Node::Const(value) => value.to_string(),
-                Node::Iter(position) => format!("d{position}"),
+                Node::Iter(position) => IterRef(*position).to_string(),
                 Node::Sym(sym) => format!("{{{}}}", sym.as_str()),
                 Node::Read(read, _) => {
                     let mut coords = Vec::with_capacity(operands.len());
                     for (coord, _) in &operands {
                         coords.push(coord.as_str());
                     }
-                    format!("${}[{}]", read.operand(), coords.join(", "))
+                    format!("{}[{}]", OperandRef(read.operand()), coords.join(", "))
                 }
                 Node::Binary(op @ (BinaryOp::Min | BinaryOp::Max)) => {
-                    format!("{}({}, {})", op.text(), operands[0].0, operands[1].0)
+                    format!("{}({}, {})", op.symbol(), operands[0].0, operands[1].0)
                 }
                 Node::Binary(op) => {
                     let precedence = op.precedence();
                     let lhs = side(&operands[0], precedence);
                     let rhs = side(&operands[1], precedence + 1);
-                    stack.push((format!("{lhs}{}{rhs}", op.text()), precedence));
+                    stack.push((format!("{lhs} {} {rhs}", op.symbol()), precedence));
                     continue;
                 }
                 Node::Neg => format!("-{}", side(&operands[0], 2)),
@@ -980,151 +997,196 @@ impl<R: ReadKind> fmt::Debug for Expr<R> {
     }
 }
 
-/// An iterator: `d` and its position, such as `d0`.
-fn parse_iter(c: &mut Cursor<'_>) -> Result<usize> {
-    let name = c.ident()?;
-    let position = name
-        .strip_prefix('d')
-        .filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
-        .and_then(|digits| digits.parse::<usize>().ok());
-    let Some(position) = position else {
-        bail!(c.error(format!(
-            "`{name}` is no iterator: an iterator is `d` and its position, such as d0"
-        )));
-    };
-    ensure!(
-        position < MAX_ITERS,
-        c.error(format!(
-            "a block has at most {MAX_ITERS} iterators, not {name}"
-        ))
-    );
-    Ok(position)
-}
+/// An iterator of a block by its position, written `d` and the position: `d2`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct IterRef(u8);
 
-fn parse_sum<R: ReadKind>(c: &mut Cursor<'_>) -> Result<Expr<R>> {
-    let mut lhs = parse_product(c)?;
-    loop {
-        if c.peek_str("->") {
-            return Ok(lhs);
-        }
-        if c.eat("+") {
-            lhs = lhs + parse_product(c)?;
-        } else if c.peek() == Some('-') {
-            c.expect("-")?;
-            lhs = lhs - parse_product(c)?;
-        } else {
-            return Ok(lhs);
-        }
+impl IterRef {
+    #[track_caller]
+    pub fn new(position: usize) -> Self {
+        assert!(
+            position < MAX_ITERS,
+            "a block has at most {MAX_ITERS} iterators, not d{position}"
+        );
+        Self(position as u8)
+    }
+
+    pub fn position(self) -> usize {
+        usize::from(self.0)
     }
 }
 
-fn parse_product<R: ReadKind>(c: &mut Cursor<'_>) -> Result<Expr<R>> {
-    let mut lhs = parse_factor(c)?;
-    loop {
-        if c.eat("*") {
-            lhs = lhs * parse_factor(c)?;
-        } else if c.eat("floordiv") {
-            lhs = Expr::floordiv(lhs, parse_factor(c)?);
-        } else if c.eat("mod") {
-            lhs = Expr::modulo(lhs, parse_factor(c)?);
-        } else {
-            return Ok(lhs);
-        }
+/// The position of the iterator that the name `name` writes.
+fn iter_position(name: &str) -> Option<usize> {
+    let digits = name.strip_prefix('d')?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
     }
+    digits.parse().ok()
 }
 
-/// An operand number, after its `$`.
-fn parse_operand(c: &mut Cursor<'_>) -> Result<usize> {
-    usize::try_from(c.int()?).map_err(|_| c.error("bad operand number"))
-}
+impl Attr for IterRef {
+    const ITEM: &'static str = "IterRef";
 
-/// The coordinates of a read, `[e, ...]`.
-fn parse_coords<R: ReadKind>(c: &mut Cursor<'_>) -> Result<Vec<Expr<R>>> {
-    c.expect("[")?;
-    let coords = c.list("]", parse_sum)?;
-    ensure!(
-        coords.len() <= MAX_RANK,
-        c.error(format!(
-            "{} coordinates, but a tensor has at most {MAX_RANK} axes",
-            coords.len()
-        ))
-    );
-    Ok(coords)
-}
-
-fn parse_factor<R: ReadKind>(c: &mut Cursor<'_>) -> Result<Expr<R>> {
-    match c.peek() {
-        Some('(') => {
-            c.expect("(")?;
-            let inner = parse_sum(c)?;
-            c.expect(")")?;
-            Ok(inner)
-        }
-        Some('{') => {
-            c.expect("{")?;
-            let name = c.ident()?;
-            c.expect("}")?;
-            Ok(Expr::sym(Sym::new(name)))
-        }
-        Some('$') => {
-            c.expect("$")?;
-            let operand = parse_operand(c)?;
-            let Some(read) = R::of_operand(operand) else {
-                bail!(c.error(format!(
-                    "the expression of tile.index reads no operand, not ${operand}"
-                )));
-            };
-            let coords = parse_coords(c)?;
-            Ok(Expr::on(Node::Read(read, coords.len() as u8), coords))
-        }
-        Some('-') => {
-            if c.peek_second().is_some_and(|ch| ch.is_ascii_digit()) {
-                Ok(Expr::constant(int64(c)?))
-            } else {
-                c.expect("-")?;
-                Ok(-parse_factor(c)?)
-            }
-        }
-        Some(ch) if ch.is_ascii_digit() => Ok(Expr::constant(int64(c)?)),
-        _ => {
-            if c.eat("min") {
-                let (lhs, rhs) = parse_pair(c)?;
-                return Ok(Expr::min(lhs, rhs));
-            }
-            if c.eat("max") {
-                let (lhs, rhs) = parse_pair(c)?;
-                return Ok(Expr::max(lhs, rhs));
-            }
-            Ok(Expr::iter(parse_iter(c)?))
-        }
-    }
-}
-
-fn parse_pair<R: ReadKind>(c: &mut Cursor<'_>) -> Result<(Expr<R>, Expr<R>)> {
-    c.expect("(")?;
-    let lhs = parse_sum(c)?;
-    c.expect(",")?;
-    let rhs = parse_sum(c)?;
-    c.expect(")")?;
-    Ok((lhs, rhs))
-}
-
-fn int64(c: &mut Cursor<'_>) -> Result<i64> {
-    let value = c.int()?;
-    i64::try_from(value).map_err(|_| c.error(format!("{value} does not fit i64")))
-}
-
-impl<R: ReadKind> Attr for Expr<R> {
     fn print(&self, out: &mut String) {
         out.push_str(&self.to_string());
     }
     fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        parse_sum(c)
+        let start = c.position();
+        let name = c.ident()?;
+        let Some(position) = iter_position(name) else {
+            bail!(c.error_at(
+                start,
+                format!("`{name}` is no iterator: an iterator is `d` and its position, such as d0")
+            ));
+        };
+        ensure!(
+            position < MAX_ITERS,
+            c.error_at(
+                start,
+                format!("a block has at most {MAX_ITERS} iterators, not {name}")
+            )
+        );
+        Ok(Self(position as u8))
+    }
+    fn peek(c: &Cursor<'_>) -> bool {
+        let next = c.peek();
+        next.kind == TokenKind::Ident && iter_position(next.text).is_some()
+    }
+}
+
+impl fmt::Display for IterRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "d{}", self.0)
+    }
+}
+
+/// An operand of an op by its position, written `$` and the position: `$2`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct OperandRef(pub usize);
+
+impl Attr for OperandRef {
+    const ITEM: &'static str = "OperandRef";
+
+    fn print(&self, out: &mut String) {
+        out.push_str(&self.to_string());
+    }
+    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
+        let start = c.position();
+        let text = c.token(TokenKind::Operand, "an operand")?;
+        let operand = text[1..]
+            .parse()
+            .map_err(|_| c.error_at(start, format!("no operand is {text}")))?;
+        Ok(Self(operand))
+    }
+    fn peek(c: &Cursor<'_>) -> bool {
+        c.peek_kind(TokenKind::Operand)
+    }
+}
+
+impl fmt::Display for OperandRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "${}", self.0)
+    }
+}
+
+/// An expression whose infix operations bind at least as tightly as `min`: a factor, then each
+/// infix operation with its right side, left to right.
+fn parse_expr<R: ReadKind>(c: &mut Cursor<'_>, min: u8) -> Result<Expr<R>> {
+    let mut lhs = parse_factor(c)?;
+    loop {
+        let infix = BinaryOp::INFIX
+            .into_iter()
+            .find(|op| op.precedence() >= min && c.peek_is(op.symbol()));
+        let Some(op) = infix else {
+            return Ok(lhs);
+        };
+        c.next_token();
+        let rhs = parse_expr(c, op.precedence() + 1)?;
+        lhs = Expr::binary(op, lhs, rhs);
+    }
+}
+
+/// A factor: an integer, `-` and a factor, an expression in parentheses, a symbol `{T}`, a read
+/// `$k[...]`, a call of `min` or `max`, or an iterator.
+fn parse_factor<R: ReadKind>(c: &mut Cursor<'_>) -> Result<Expr<R>> {
+    if c.eat("(") {
+        let inner = parse_expr(c, 0)?;
+        c.expect(")")?;
+        return Ok(inner);
+    }
+    if c.peek_unsigned().kind == TokenKind::Int {
+        return Ok(Expr::constant(i64::parse(c)?));
+    }
+    if c.eat("-") {
+        return Ok(-parse_factor(c)?);
+    }
+    if c.eat("{") {
+        let sym = Sym::parse(c)?;
+        c.expect("}")?;
+        return Ok(Expr::sym(sym));
+    }
+    if OperandRef::peek(c) {
+        let start = c.position();
+        let operand = OperandRef::parse(c)?;
+        let Some(read) = R::of_operand(operand.0) else {
+            bail!(c.error_at(
+                start,
+                format!("the expression of tile.index reads no operand, not {operand}")
+            ));
+        };
+        let coords = Vec::<Expr<R>>::parse(c)?;
+        ensure!(
+            coords.len() <= MAX_RANK,
+            c.error_at(
+                start,
+                format!(
+                    "{} coordinates, but a tensor has at most {MAX_RANK} axes",
+                    coords.len()
+                )
+            )
+        );
+        return Ok(Expr::on(Node::Read(read, coords.len() as u8), coords));
+    }
+    for op in [BinaryOp::Min, BinaryOp::Max] {
+        if c.eat(op.symbol()) {
+            c.expect("(")?;
+            let lhs = parse_expr(c, 0)?;
+            c.expect(",")?;
+            let rhs = parse_expr(c, 0)?;
+            c.expect(")")?;
+            return Ok(Expr::binary(op, lhs, rhs));
+        }
+    }
+    if c.peek_kind(TokenKind::Ident) {
+        return Ok(Expr::iter(IterRef::parse(c)?.position()));
+    }
+    Err(c.unexpected("an index expression"))
+}
+
+/// The grammar of [`parse_expr`]: the operations take their binding strength from
+/// [`BinaryOp::precedence`], which the printer reads too.
+impl<R: ReadKind> Attr for Expr<R> {
+    const ITEM: &'static str = R::EXPR;
+
+    fn print(&self, out: &mut String) {
+        out.push_str(&self.to_string());
+    }
+    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
+        parse_expr(c, 0)
+    }
+    fn peek(c: &Cursor<'_>) -> bool {
+        let next = c.peek();
+        matches!(
+            next.kind,
+            TokenKind::Int | TokenKind::Operand | TokenKind::Ident
+        ) || matches!(next.text, "(" | "-" | "{")
     }
 }
 
 /// Which operand a read takes its elements from.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
+#[attr(via = SourceText)]
 pub enum Source {
     /// Operand `i`.
     Operand(usize),
@@ -1147,6 +1209,59 @@ impl Source {
     }
 }
 
+/// The text form of a [`Source`]: one operand, `$2`, or a list of operands and the pick,
+/// `$2..$4[$1[d0]]`.
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
+#[attr(format = "$first (`..` $list^)?")]
+struct SourceText {
+    first: OperandRef,
+    list: Option<OperandList>,
+}
+
+/// The last operand of a list and the pick, after `..`.
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
+#[attr(format = "$last `[` $pick `]`")]
+struct OperandList {
+    last: OperandRef,
+    pick: AccessExpr,
+}
+
+impl From<&Source> for SourceText {
+    fn from(source: &Source) -> Self {
+        match source {
+            Source::Operand(operand) => SourceText {
+                first: OperandRef(*operand),
+                list: None,
+            },
+            Source::List { first, count, pick } => SourceText {
+                first: OperandRef(*first),
+                list: Some(OperandList {
+                    last: OperandRef(first + count - 1),
+                    pick: (**pick).clone(),
+                }),
+            },
+        }
+    }
+}
+
+impl TryFrom<SourceText> for Source {
+    type Error = anyhow::Error;
+
+    fn try_from(text: SourceText) -> Result<Self> {
+        let first = text.first.0;
+        let Some(list) = text.list else {
+            return Ok(Source::Operand(first));
+        };
+        let last = list.last.0;
+        ensure!(last >= first, "operand list ${first}..${last} is empty");
+        Ok(Source::List {
+            first,
+            count: last - first + 1,
+            pick: Box::new(list.pick),
+        })
+    }
+}
+
 /// The coordinates of a read or a write, one per axis.
 pub type Coords = SmallVec<[AccessExpr; 4]>;
 
@@ -1158,7 +1273,8 @@ fn coords_of(coords: impl IntoIterator<Item = impl Into<AccessExpr>>) -> Coords 
 /// A read of a `tile.block`: an operand element at index expressions, one per axis. With `pad`, a
 /// point whose coordinates fall outside the operand reads that value; without it, every point
 /// MUST be inside.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
+#[attr(format = "$source `` $coords (`pad` $pad^)?")]
 pub struct Read {
     pub source: Source,
     pub coords: Coords,
@@ -1215,81 +1331,13 @@ impl Read {
     }
 }
 
-/// Writes `[c, ...]`, the coordinates `coords`.
-fn print_coords(coords: &[AccessExpr], f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.write_str("[")?;
-    for (position, coord) in coords.iter().enumerate() {
-        if position > 0 {
-            f.write_str(", ")?;
-        }
-        write!(f, "{coord}")?;
-    }
-    f.write_str("]")
-}
-
-impl fmt::Display for Read {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.source {
-            Source::Operand(operand) => write!(f, "${operand}")?,
-            Source::List { first, count, pick } => {
-                write!(f, "${first}..${}[{pick}]", first + count - 1)?
-            }
-        }
-        print_coords(&self.coords, f)?;
-        if let Some(pad) = &self.pad {
-            let mut text = String::new();
-            print_float(pad.0, &mut text);
-            write!(f, " pad {text}")?;
-        }
-        Ok(())
-    }
-}
-
-impl Attr for Read {
-    fn print(&self, out: &mut String) {
-        out.push_str(&self.to_string());
-    }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        c.expect("$")?;
-        let first = parse_operand(c)?;
-        let source = if c.eat("..") {
-            c.expect("$")?;
-            let last = parse_operand(c)?;
-            ensure!(
-                last >= first,
-                c.error(format!("operand list ${first}..${last} is empty"))
-            );
-            c.expect("[")?;
-            let pick = parse_sum(c)?;
-            c.expect("]")?;
-            Source::List {
-                first,
-                count: last - first + 1,
-                pick: Box::new(pick),
-            }
-        } else {
-            Source::Operand(first)
-        };
-        let coords = parse_coords(c)?.into_iter().collect();
-        let pad = if c.eat("pad") {
-            Some(F64::parse(c)?)
-        } else {
-            None
-        };
-        Ok(Read {
-            source,
-            coords,
-            pad,
-        })
-    }
-}
-
 /// Where a `tile.block` writes one of its results: the coordinates of a new tensor, or of an
 /// operand that the result updates (`into`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
+#[attr(format = "($into^)? `` $coords")]
 pub struct Write {
     /// The operand that the result is an updated copy of.
-    pub into: Option<usize>,
+    pub into: Option<OperandRef>,
     pub coords: Coords,
 }
 
@@ -1305,33 +1353,9 @@ impl Write {
     /// A write of an updated copy of operand `operand`, at `coords`.
     pub fn update(operand: usize, coords: impl IntoIterator<Item = impl Into<AccessExpr>>) -> Self {
         Self {
-            into: Some(operand),
+            into: Some(OperandRef(operand)),
             coords: coords_of(coords),
         }
-    }
-}
-
-impl fmt::Display for Write {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(into) = self.into {
-            write!(f, "${into}")?;
-        }
-        print_coords(&self.coords, f)
-    }
-}
-
-impl Attr for Write {
-    fn print(&self, out: &mut String) {
-        out.push_str(&self.to_string());
-    }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        let into = if c.eat("$") {
-            Some(parse_operand(c)?)
-        } else {
-            None
-        };
-        let coords = parse_coords(c)?.into_iter().collect();
-        Ok(Write { into, coords })
     }
 }
 
@@ -1347,13 +1371,12 @@ pub enum Relation {
 }
 
 impl Relation {
-    /// Every relation, those of two-character symbols first, so that `<=` is not read as `<`.
-    const PARSE_ORDER: [Relation; 6] = [
+    const ALL: [Relation; 6] = [
+        Relation::Less,
         Relation::LessEqual,
-        Relation::GreaterEqual,
         Relation::Equal,
         Relation::NotEqual,
-        Relation::Less,
+        Relation::GreaterEqual,
         Relation::Greater,
     ];
 
@@ -1450,29 +1473,36 @@ impl fmt::Display for Constraint {
 }
 
 impl Attr for Constraint {
+    const ITEM: &'static str = "Constraint";
+
     fn print(&self, out: &mut String) {
         out.push_str(&self.to_string());
     }
+    /// Comparisons joined by `or`, each two expressions of [`parse_expr`] around a relation.
     fn parse(c: &mut Cursor<'_>) -> Result<Self> {
         let mut cmps = SmallVec::new();
         loop {
-            let lhs = parse_sum(c)?;
-            let op = Relation::PARSE_ORDER
+            let lhs = parse_expr(c, 0)?;
+            let op = Relation::ALL
                 .into_iter()
                 .find(|&relation| c.eat(relation.symbol()))
-                .ok_or_else(|| c.error("expected a comparison"))?;
-            let rhs = parse_sum(c)?;
+                .ok_or_else(|| c.unexpected("a comparison"))?;
+            let rhs = parse_expr(c, 0)?;
             cmps.push(Cmp { lhs, op, rhs });
             if !c.eat("or") {
                 return Ok(Constraint(cmps));
             }
         }
     }
+    fn peek(c: &Cursor<'_>) -> bool {
+        AccessExpr::peek(c)
+    }
 }
 
 /// Iterators by position, written by name: `[d0, d2]`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub struct IterList(ArrayVec<[u8; MAX_ITERS]>);
+#[derive(crate::Attr, Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[attr(format = "$0")]
+pub struct IterList(ArrayVec<[IterRef; MAX_ITERS]>);
 
 impl IterList {
     /// The iterators at `positions`.
@@ -1480,18 +1510,14 @@ impl IterList {
     pub fn new(positions: impl IntoIterator<Item = usize>) -> Self {
         let mut list = ArrayVec::new();
         for position in positions {
-            assert!(
-                position < MAX_ITERS,
-                "a block has at most {MAX_ITERS} iterators, not d{position}"
-            );
-            list.push(position as u8);
+            list.push(IterRef::new(position));
         }
         Self(list)
     }
 
     /// The positions, in order.
     pub fn positions(&self) -> impl Iterator<Item = usize> + '_ {
-        self.0.iter().map(|&position| usize::from(position))
+        self.0.iter().map(|iter| iter.position())
     }
 
     pub fn contains(&self, position: usize) -> bool {
@@ -1503,29 +1529,8 @@ impl IterList {
     }
 }
 
-impl Attr for IterList {
-    fn print(&self, out: &mut String) {
-        let mut names = Vec::new();
-        for position in self.positions() {
-            names.push(format!("d{position}"));
-        }
-        out.push('[');
-        out.push_str(&names.join(", "));
-        out.push(']');
-    }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        c.expect("[")?;
-        let positions = c.list("]", parse_iter)?;
-        ensure!(
-            positions.len() <= MAX_ITERS,
-            c.error(format!("a block has at most {MAX_ITERS} iterators"))
-        );
-        Ok(Self::new(positions))
-    }
-}
-
 /// How a `tile.block` treats an iterator.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(crate::Attr, Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum IterKind {
     /// The results are indexed by it.
     #[default]
@@ -1543,20 +1548,12 @@ impl IterKind {
     pub fn is_reduced(self) -> bool {
         matches!(self, IterKind::Red | IterKind::RedOrdered)
     }
-
-    fn text(self) -> &'static str {
-        match self {
-            IterKind::Par => "par",
-            IterKind::Red => "red",
-            IterKind::RedOrdered => "red ordered",
-            IterKind::Prefix => "prefix",
-        }
-    }
 }
 
-/// An iterator of a `tile.block`: a kind and an extent. Its position in the block's list names
-/// it: `d0` is the first.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+/// An iterator of a `tile.block`: a kind and an extent, `red 8`. Its position in the block's list
+/// names it: `d0` is the first.
+#[derive(crate::Attr, Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[attr(format = "$kind $extent")]
 pub struct Iter {
     pub kind: IterKind,
     pub extent: Dim,
@@ -1579,68 +1576,13 @@ impl Iter {
     }
 }
 
-impl fmt::Display for Iter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.kind.text(), self.extent)
-    }
-}
-
-impl Attr for Iter {
-    fn print(&self, out: &mut String) {
-        out.push_str(&self.to_string());
-    }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        let kind = if c.eat("par") {
-            IterKind::Par
-        } else if c.eat("red") {
-            if c.eat("ordered") {
-                IterKind::RedOrdered
-            } else {
-                IterKind::Red
-            }
-        } else if c.eat("prefix") {
-            IterKind::Prefix
-        } else {
-            bail!(c.error("expected `par`, `red` or `prefix`"));
-        };
-        Ok(Iter {
-            kind,
-            extent: Dim::parse(c)?,
-        })
-    }
-}
-
-/// What a dispatch knows of a dimension symbol: a range of extents, and a divisor of every one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// What a dispatch knows of a dimension symbol: a range of extents, and a divisor of every one,
+/// `[1, 64] % 8`.
+#[derive(crate::Attr, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[attr(format = "`[` $min `,` $max `]` (`%` $divisor^)?")]
 pub struct SymFact {
     pub min: u64,
     pub max: u64,
+    #[attr(default = 1)]
     pub divisor: u64,
-}
-
-impl fmt::Display for SymFact {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{}, {}]", self.min, self.max)?;
-        if self.divisor > 1 {
-            write!(f, " % {}", self.divisor)?;
-        }
-        Ok(())
-    }
-}
-
-impl Attr for SymFact {
-    fn print(&self, out: &mut String) {
-        out.push_str(&self.to_string());
-    }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        c.expect("[")?;
-        let min = u64::parse(c)?;
-        c.expect(",")?;
-        let max = u64::parse(c)?;
-        c.expect("]")?;
-        let divisor = if c.eat("%") { u64::parse(c)? } else { 1 };
-        ensure!(min <= max, c.error(format!("empty range [{min}, {max}]")));
-        ensure!(divisor >= 1, c.error("a divisor is at least 1"));
-        Ok(SymFact { min, max, divisor })
-    }
 }

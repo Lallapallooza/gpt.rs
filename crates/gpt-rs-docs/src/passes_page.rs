@@ -87,11 +87,11 @@ fn folds_section(
     writeln!(out, "\n| Op | Folds | Fires in |\n|---|---|---|")?;
     let mut folds: Vec<_> = FOLDS
         .iter()
-        .map(|fold| (catalog.op_label(fold.rust), fold))
+        .map(|fold| (format!("`{}`", fold.name), fold))
         .collect();
     folds.sort_by(|a, b| a.0.cmp(&b.0));
     for (op, fold) in folds {
-        let fired = fired_in(Fired::Fold(fold.rust));
+        let fired = fired_in(Fired::Fold(fold.name));
         if fired == "none" {
             unfired.push(format!("the fold of {op}"));
         }

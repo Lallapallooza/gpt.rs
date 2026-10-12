@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use anyhow::{bail, Result};
 
 use crate::fold::FoldResult;
-use crate::module::{Inst, Module, NewInst, Region, Value};
+use crate::module::{Inst, Module, Region, Value};
 use crate::op::Folded;
 use crate::rewrite::rewriter::{Edit, Staged, Staging};
 use crate::rewrite::Builder;
@@ -65,64 +65,16 @@ impl<'m> Editor<'m> {
         Ok(())
     }
 
-    /// A copy of `inst` of `source`, with its regions, unplaced. Its operands are the values
-    /// `map` gives for its own, and `map` gains its results and region arguments.
+    /// A copy of `inst` of `source`, with its regions, unplaced, as [`Module::copy_inst`] makes it.
+    /// It and the ops of its regions are touched.
     fn copy(
         &mut self,
         source: &Module,
         inst: Inst,
         map: &mut HashMap<Value, Value>,
     ) -> Result<Inst> {
-        let mapped = |values: &[Value], map: &HashMap<Value, Value>| -> Result<Vec<Value>> {
-            values
-                .iter()
-                .map(|value| match map.get(value) {
-                    Some(&mapped) => Ok(mapped),
-                    None => bail!(
-                        "{} reads a value from outside what it copies",
-                        source.op(inst).name()
-                    ),
-                })
-                .collect()
-        };
-        let mut regions = Vec::new();
-        for &region in source.regions(inst) {
-            let arg_types: Vec<Type> = source
-                .args(region)
-                .iter()
-                .map(|&v| source.ty(v).clone())
-                .collect();
-            let copy = self.module.new_region(arg_types);
-            map.extend(
-                source
-                    .args(region)
-                    .iter()
-                    .copied()
-                    .zip(self.module.args(copy).to_vec()),
-            );
-            for inner in source.insts(region) {
-                let inner_copy = self.copy(source, inner, map)?;
-                self.module.append(copy, inner_copy);
-            }
-            regions.push(copy);
-        }
-        let copy = self.module.create_inst(NewInst {
-            op: source.op(inst).clone(),
-            operands: mapped(source.operands(inst), map)?,
-            operand_segments: source.operand_segments(inst).map(<[usize]>::to_vec),
-            result_types: source.result_types(inst).into_iter().cloned().collect(),
-            result_segments: source.result_segments(inst).map(<[usize]>::to_vec),
-            regions,
-            location: source.location(inst).cloned(),
-        });
-        map.extend(
-            source
-                .results(inst)
-                .iter()
-                .copied()
-                .zip(self.module.results(copy).to_vec()),
-        );
-        self.touched.push(copy);
+        let copy = self.module.copy_inst(source, inst, map)?;
+        self.touched.extend(self.module.walk_inst(copy));
         Ok(copy)
     }
 

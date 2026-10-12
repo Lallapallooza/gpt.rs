@@ -1,6 +1,6 @@
 <!-- Generated from the code by `cargo run -p gpt-rs-docs`. Do not edit: change the code and run it again. -->
 
-# The tensor dialect (ptir.v0.5)
+# The tensor dialect (ptir.v0.6)
 
 The `tensor` dialect is the Portable Tensor IR (PTIR): whole-tensor ops with value semantics. The
 ops of `DeviceTensor` and the functionals record it, and the passes and the backends consume it.
@@ -34,7 +34,7 @@ Together they are the normative contract between producers and consumers.
 ## Versioning
 
 In the text form, a stored program, such as a dump, starts with the line
-`spec_version = "ptir.v0.5"` (`Module::to_versioned_text`). The parser reads a module with that
+`spec_version = "ptir.v0.6"` (`Module::to_versioned_text`). The parser reads a module with that
 line or without it, and rejects a module that names another version.
 
 ## Core invariants
@@ -333,29 +333,25 @@ Defined by `Constant` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crat
 |---|---|
 | Operands | none |
 | Results | `output`: tensor |
-| Attributes | `value`: `dense` |
+| Attributes | `value`: `Dense` |
 | Effects | none |
 
-Example, from `filetests/tensor/roundtrip/elementwise.ptir`:
+| `value` | Text form |
+|---|---|
+| `DenseText` | ``` `dense` `<` shape($dims, $dtype) `` `:` $elements `>` ``` |
+
+Example, from `filetests/tensor/roundtrip/floats.ptir`:
 
 ```text
-func.func @constants() -> (tensor<2x2xf32>, tensor<3xsi32>, tensor<f32>, tensor<2xbf16>, tensor<2xf32>, tensor<1xf32>, tensor<2xi1>, tensor<2xf8e4m3>, tensor<0xf32>) {
-  %matrix = tensor.constant() {value = dense<[2, 2] x f32: [1.0, -0.5, 1e-7, inf]>} : () -> tensor<2x2xf32>
-  %zeros = tensor.constant() {value = dense<[3] x si32: 0>} : () -> tensor<3xsi32>
-  %half = tensor.constant() {value = dense<[] x f32: 0.5>} : () -> tensor<f32>
-  %one_and_pi = tensor.constant() {value = dense<[2] x bf16: [1.0, 3.140625]>} : () -> tensor<2xbf16>
-  %neg_zero_and_neg_inf = tensor.constant() {value = dense<[2] x f32: [-0.0, -inf]>} : () -> tensor<2xf32>
-  %nan = tensor.constant() {value = dense<[1] x f32: 0x0000c07f>} : () -> tensor<1xf32>
-  %flags = tensor.constant() {value = dense<[2] x i1: [true, false]>} : () -> tensor<2xi1>
-  %fp8_values = tensor.constant() {value = dense<[2] x f8e4m3: 0x3840>} : () -> tensor<2xf8e4m3>
-  %empty = tensor.constant() {value = dense<[0] x f32: []>} : () -> tensor<0xf32>
-  func.return(%matrix, %zeros, %half, %one_and_pi, %neg_zero_and_neg_inf, %nan, %flags, %fp8_values, %empty) : (tensor<2x2xf32>, tensor<3xsi32>, tensor<f32>, tensor<2xbf16>, tensor<2xf32>, tensor<1xf32>, tensor<2xi1>, tensor<2xf8e4m3>, tensor<0xf32>) -> ()
+func.func @f32_decimal() -> tensor<f32> {
+  %tiny = tensor.constant() {value = dense<f32: 7.038531e-26>} : () -> tensor<f32>
+  func.return(%tiny) : (tensor<f32>) -> ()
 }
 ```
 
 Rejected, as the verify filetests pin it:
 
-- `tensor.constant: only func.func and tile.dispatch may appear at the top level`
+- `tensor.constant: only func.func, tile.dispatch and loop.func may appear at the top level`
 
 ### `Unary`: `tensor.neg`, `tensor.abs`, `tensor.exp`, `tensor.log`, `tensor.tanh`, `tensor.erf`, `tensor.rsqrt`, `tensor.reciprocal`, `tensor.sin`, `tensor.cos`, `tensor.not`
 
@@ -371,7 +367,7 @@ Defined by `Unary` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/
 | Results | `output`: tensor |
 | Traits | elementwise |
 | Effects | none |
-| Patterns | `FoldIndexArith` (`canonicalize`, at `tensor.neg`); `UnaryToTile` (`tensor-to-tile`) |
+| Patterns | `UnaryToTile` (`tensor-to-tile`) |
 
 | Op | Traits | |
 |---|---|---|
@@ -435,7 +431,7 @@ Defined by `Binary` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates
 | Results | `output`: tensor |
 | Traits | elementwise |
 | Effects | none |
-| Patterns | `FoldIndexArith` (`canonicalize`, at `tensor.add`, `tensor.sub`, `tensor.mul`, `tensor.maximum`, `tensor.minimum`); `BinaryToTile` (`tensor-to-tile`); `ScaleIntoDot` (`dot-scale-fold`, at `tensor.mul`) |
+| Patterns | `BinaryToTile` (`tensor-to-tile`); `ScaleIntoDot` (`dot-scale-fold`, at `tensor.mul`) |
 
 | Op | Traits | |
 |---|---|---|
@@ -577,7 +573,7 @@ Defined by `Cast` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/g
 |---|---|
 | Operands | `input`: tensor |
 | Results | `output`: tensor |
-| Attributes | `to`: `dtype` |
+| Attributes | `to`: `DType` |
 | Traits | elementwise |
 | Effects | none |
 | Folds | A cast to the input's own type is the input. |
@@ -622,7 +618,7 @@ Defined by `DotGeneral` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../cr
 |---|---|
 | Operands | `lhs`: tensor; `rhs`: tensor |
 | Results | `output`: tensor |
-| Attributes | `batch_lhs`: `[i64]`, optional; `batch_rhs`: `[i64]`, optional; `contract_lhs`: `[i64]`; `contract_rhs`: `[i64]`; `accum`: `dtype`, optional; `out`: `dtype`, optional |
+| Attributes | `batch_lhs`: `[i64]`, optional; `batch_rhs`: `[i64]`, optional; `contract_lhs`: `[i64]`; `contract_rhs`: `[i64]`; `accum`: `DType`, optional; `out`: `DType`, optional |
 | Effects | none |
 | Patterns | `PackGemmWeight` (`c-pack-weights`); `GroupedConvWeight` (`c-pack-weights`); `DotOfOneProduct` (`canonicalize`); `DropDefaultDtypes` (`canonicalize`); `NonNegativeDotAxes` (`canonicalize`); `TransposeIntoDot` (`canonicalize`); `MergeDotAxes` (`merge-contracted-axes`); `DotToTile` (`tensor-to-tile`) |
 
@@ -671,7 +667,7 @@ Defined by `Reduce` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates
 |---|---|
 | Operands | `input`: tensor |
 | Results | `output`: tensor |
-| Attributes | `axes`: `[i64]`; `keepdims`: `bool`, optional; `accum`: `dtype`, optional; `out`: `dtype`, optional |
+| Attributes | `axes`: `[i64]`; `keepdims`: `bool`, optional; `accum`: `DType`, optional; `out`: `DType`, optional |
 | Effects | none |
 | Patterns | `DropDefaultDtypes` (`canonicalize`); `MergeReductions` (`canonicalize`); `ReduceOfBroadcast` (`canonicalize`); `ReduceOfConcat` (`canonicalize`); `SortedReduceAxes` (`canonicalize`); `ReduceToTile` (`tensor-to-tile`) |
 
@@ -718,7 +714,7 @@ Defined by `Reshape` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crate
 |---|---|
 | Operands | `input`: tensor |
 | Results | `output`: tensor |
-| Attributes | `shape`: `[dim]` |
+| Attributes | `shape`: `[Dim]` |
 | Traits | movement |
 | Effects | none |
 | Folds | A reshape to the input's own type is the input, and a reshape of a constant is that constant with the new extents, its elements in the same row-major order. |
@@ -727,9 +723,11 @@ Defined by `Reshape` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crate
 Example, from `filetests/tensor/roundtrip/layout.ptir`:
 
 ```text
-func.func @reshape_scalar(%input: tensor<1x1xsi32>) -> tensor<si32> {
-  %scalar = tensor.reshape(%input) {shape = []} : (tensor<1x1xsi32>) -> tensor<si32>
-  func.return(%scalar) : (tensor<si32>) -> ()
+func.func @reshape(%input: tensor<2x3x4xf32>) -> (tensor<6x4xf32>, tensor<2x12xf32>, tensor<24xf32>) {
+  %merged_leading = tensor.reshape(%input) {shape = [6, 4]} : (tensor<2x3x4xf32>) -> tensor<6x4xf32>
+  %merged_trailing = tensor.reshape(%input) {shape = [2, 12]} : (tensor<2x3x4xf32>) -> tensor<2x12xf32>
+  %flat = tensor.reshape(%input) {shape = [24]} : (tensor<2x3x4xf32>) -> tensor<24xf32>
+  func.return(%merged_leading, %merged_trailing, %flat) : (tensor<6x4xf32>, tensor<2x12xf32>, tensor<24xf32>) -> ()
 }
 ```
 
@@ -788,7 +786,7 @@ Defined by `BroadcastTo` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../c
 |---|---|
 | Operands | `input`: tensor |
 | Results | `output`: tensor |
-| Attributes | `shape`: `[dim]` |
+| Attributes | `shape`: `[Dim]` |
 | Traits | movement |
 | Effects | none |
 | Folds | A broadcast to the input's own type is the input. |
@@ -797,10 +795,11 @@ Defined by `BroadcastTo` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../c
 Example, from `filetests/tensor/roundtrip/layout.ptir`:
 
 ```text
-func.func @broadcast_to_dynamic(%bias: tensor<1x768xf32>, %column: tensor<{B}x1xf32>) -> (tensor<{B}x768xf32>, tensor<2x{B}x4xf32>) {
-  %batch_bias = tensor.broadcast_to(%bias) {shape = [{B}, 768]} : (tensor<1x768xf32>) -> tensor<{B}x768xf32>
-  %wide_columns = tensor.broadcast_to(%column) {shape = [2, {B}, 4]} : (tensor<{B}x1xf32>) -> tensor<2x{B}x4xf32>
-  func.return(%batch_bias, %wide_columns) : (tensor<{B}x768xf32>, tensor<2x{B}x4xf32>) -> ()
+func.func @broadcast_to(%vector: tensor<3xf32>, %row: tensor<1x3xsi32>, %flag: tensor<i1>) -> (tensor<2x3xf32>, tensor<4x2x3xsi32>, tensor<2x2xi1>) {
+  %matrix = tensor.broadcast_to(%vector) {shape = [2, 3]} : (tensor<3xf32>) -> tensor<2x3xf32>
+  %stacked_rows = tensor.broadcast_to(%row) {shape = [4, 2, 3]} : (tensor<1x3xsi32>) -> tensor<4x2x3xsi32>
+  %flags = tensor.broadcast_to(%flag) {shape = [2, 2]} : (tensor<i1>) -> tensor<2x2xi1>
+  func.return(%matrix, %stacked_rows, %flags) : (tensor<2x3xf32>, tensor<4x2x3xsi32>, tensor<2x2xi1>) -> ()
 }
 ```
 
@@ -871,7 +870,7 @@ Defined by `Bitcast` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crate
 |---|---|
 | Operands | `input`: tensor |
 | Results | `output`: tensor |
-| Attributes | `to`: `dtype` |
+| Attributes | `to`: `DType` |
 | Effects | none |
 | Folds | A bitcast to the input's own type is the input. |
 | Patterns | `BitcastToTile` (`tensor-to-tile`) |
@@ -916,10 +915,11 @@ Defined by `Concat` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates
 Example, from `filetests/tensor/roundtrip/layout.ptir`:
 
 ```text
-func.func @concat_dynamic(%left: tensor<{B}x3xf32>, %right: tensor<{B}x5xf32>, %rows: tensor<{T}x2xf32>) -> (tensor<{B}x8xf32>, tensor<{T}x2xf32>) {
-  %joined = tensor.concat(%left, %right) {axis = 1} : (tensor<{B}x3xf32>, tensor<{B}x5xf32>) -> tensor<{B}x8xf32>
-  %single = tensor.concat(%rows) {axis = 0} : (tensor<{T}x2xf32>) -> tensor<{T}x2xf32>
-  func.return(%joined, %single) : (tensor<{B}x8xf32>, tensor<{T}x2xf32>) -> ()
+func.func @concat(%top: tensor<2x3xf32>, %bottom: tensor<4x3xf32>, %side: tensor<2x1xf32>) -> (tensor<6x3xf32>, tensor<2x4xf32>, tensor<2x3xf32>) {
+  %stacked = tensor.concat(%top, %bottom) {axis = 0} : (tensor<2x3xf32>, tensor<4x3xf32>) -> tensor<6x3xf32>
+  %widened = tensor.concat(%top, %side) {axis = 1} : (tensor<2x3xf32>, tensor<2x1xf32>) -> tensor<2x4xf32>
+  %single = tensor.concat(%top) {axis = 1} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+  func.return(%stacked, %widened, %single) : (tensor<6x3xf32>, tensor<2x4xf32>, tensor<2x3xf32>) -> ()
 }
 ```
 
@@ -948,7 +948,7 @@ Defined by `Iota` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/g
 |---|---|
 | Operands | none |
 | Results | `output`: tensor |
-| Attributes | `shape`: `[dim]`; `dtype`: `dtype`; `axis`: `i64` |
+| Attributes | `shape`: `[Dim]`; `dtype`: `DType`; `axis`: `i64` |
 | Effects | none |
 | Patterns | `IotaOfUnitAxis` (`canonicalize`); `NonNegativeAxis` (`canonicalize`); `IotaToTile` (`tensor-to-tile`) |
 
@@ -1100,7 +1100,7 @@ Defined by `ExtractPatches` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../.
 |---|---|
 | Operands | `input`: tensor |
 | Results | `output`: tensor |
-| Attributes | `window`: `[usize]`; `strides`: `[usize]`; `dilation`: `[usize]`; `padding`: `[(usize, usize)]`; `pad_value`: `f64` |
+| Attributes | `window`: `[usize]`; `strides`: `[usize]`; `dilation`: `[usize]`; `padding`: `[(usize, usize)]`; `pad_value`: `F64` |
 | Effects | none |
 | Patterns | `ExtractPatchesToTile` (`tensor-to-tile`) |
 
@@ -1151,7 +1151,7 @@ Defined by `ReduceWindow` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../
 |---|---|
 | Operands | `input`: tensor |
 | Results | `output`: tensor |
-| Attributes | `window_dims`: `[usize]`; `strides`: `[usize]`; `padding`: `[(usize, usize)]`; `base_dilation`: `[usize]`; `window_dilation`: `[usize]`; `accum`: `dtype`, optional; `out`: `dtype`, optional |
+| Attributes | `window_dims`: `[usize]`; `strides`: `[usize]`; `padding`: `[(usize, usize)]`; `base_dilation`: `[usize]`; `window_dilation`: `[usize]`; `accum`: `DType`, optional; `out`: `DType`, optional |
 | Effects | none |
 | Patterns | `DropDefaultDtypes` (`canonicalize`); `ReduceWindowToTile` (`tensor-to-tile`) |
 
@@ -1218,14 +1218,22 @@ Defined by `CustomCall` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../cr
 |---|---|
 | Operands | `inputs`: tensors |
 | Results | `outputs`: tensors |
-| Attributes | `target`: `String`; `attrs`: `BTreeMap<String,CustomAttr>`, optional; `results`: `[tensor type]` |
+| Attributes | `target`: `String`; `attrs`: `{name = CustomAttr}`, optional; `results`: `[TensorType]` |
 | Effects | opaque |
+
+| `attrs` | Text form |
+|---|---|
+| `CustomAttr::Array` | `` `array` `<` $0 `>` `` |
+| `CustomArray::Bool` | ``` `bool` `` `:` $0 ``` |
+| `CustomArray::F64` | ``` `f64` `` `:` $0 ``` |
+| `CustomArray::I64` | ``` `i64` `` `:` $0 ``` |
+| `CustomArray::String` | ``` `str` `` `:` $0 ``` |
 
 Example, from `filetests/tensor/roundtrip/custom_call.ptir`:
 
 ```text
 func.func @call(%input: tensor<8x16xf32>, %bias: tensor<16xf32>) -> tensor<8x16xf32> {
-  %output = tensor.custom_call(%input, %bias) {target = "gpt_rs.c.conv2d.nhwc.f32.v1", attrs = {alpha = 1.5, "conv.stride" = array<i64: 1, 1>, fused = true, name = "conv"}, results = [tensor<8x16xf32>]} : (tensor<8x16xf32>, tensor<16xf32>) -> tensor<8x16xf32>
+  %output = tensor.custom_call(%input, %bias) {target = "gpt_rs.c.conv2d.nhwc.f32.v1", attrs = {alpha = 1.5, "conv.stride" = array<i64: [1, 1]>, fused = true, name = "conv"}, results = [tensor<8x16xf32>]} : (tensor<8x16xf32>, tensor<16xf32>) -> tensor<8x16xf32>
   func.return(%output) : (tensor<8x16xf32>) -> ()
 }
 ```
@@ -1278,7 +1286,7 @@ Defined by `ArgMax` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates
 |---|---|
 | Operands | `input`: tensor |
 | Results | `output`: tensor |
-| Attributes | `axis`: `i64`; `keepdims`: `bool`, optional; `out`: `dtype` |
+| Attributes | `axis`: `i64`; `keepdims`: `bool`, optional; `out`: `DType` |
 | Effects | none |
 | Patterns | `NonNegativeAxis` (`canonicalize`); `ArgMaxToTile` (`tensor-to-tile`) |
 
@@ -1364,7 +1372,7 @@ Defined by `SelectK` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crate
 |---|---|
 | Operands | `input`: tensor |
 | Results | `values`: tensor; `indices`: tensor |
-| Attributes | `k`: `usize`; `axis`: `i64`; `indices`: `dtype` |
+| Attributes | `k`: `usize`; `axis`: `i64`; `indices`: `DType` |
 | Effects | none |
 | Patterns | `NonNegativeAxis` (`canonicalize`); `SelectKToTile` (`tensor-to-tile`) |
 
@@ -1527,7 +1535,7 @@ Defined by `Rng` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gp
 |---|---|
 | Operands | `state`: tensor |
 | Results | `new_state`: tensor; `output`: tensor |
-| Attributes | `shape`: `[dim]`; `dtype`: `dtype` |
+| Attributes | `shape`: `[Dim]`; `dtype`: `DType` |
 | Effects | none |
 | Patterns | `RngToTile` (`tensor-to-tile`) |
 
@@ -1597,7 +1605,7 @@ Defined by `Cond` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/g
 | Operands | `pred`: tensor; `args`: tensors |
 | Results | `outputs`: tensors |
 | Regions | `then_branch`, `else_branch` |
-| Attributes | `results`: `[tensor type]` |
+| Attributes | `results`: `[TensorType]` |
 | Effects | none |
 
 Example, from `filetests/tensor/roundtrip/control.ptir`:
@@ -1646,12 +1654,12 @@ Example, from `filetests/tensor/roundtrip/control.ptir`:
 func.func @while(%counter: tensor<si32>, %state: tensor<4xf32>) -> (tensor<si32>, tensor<4xf32>) {
   %final_counter, %final_state = tensor.while(%counter, %state) ({
   ^cond(%cond_counter: tensor<si32>, %cond_state: tensor<4xf32>):
-    %limit = tensor.constant() {value = dense<[] x si32: 10>} : () -> tensor<si32>
+    %limit = tensor.constant() {value = dense<si32: 10>} : () -> tensor<si32>
     %keep_going = tensor.less(%cond_counter, %limit) : (tensor<si32>, tensor<si32>) -> tensor<i1>
     tensor.yield(%keep_going, %cond_counter, %cond_state) : (tensor<i1>, tensor<si32>, tensor<4xf32>) -> ()
   }, {
   ^body(%body_counter: tensor<si32>, %body_state: tensor<4xf32>):
-    %one = tensor.constant() {value = dense<[] x si32: 1>} : () -> tensor<si32>
+    %one = tensor.constant() {value = dense<si32: 1>} : () -> tensor<si32>
     %next_counter = tensor.add(%body_counter, %one) : (tensor<si32>, tensor<si32>) -> tensor<si32>
     %doubled = tensor.add(%body_state, %body_state) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
     tensor.yield(%next_counter, %doubled) : (tensor<si32>, tensor<4xf32>) -> ()
@@ -1682,7 +1690,7 @@ Defined by `Scan` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/g
 | Operands | `inputs`: tensors |
 | Results | `outputs`: tensors |
 | Regions | `body` |
-| Attributes | `carry_count`: `usize`; `outputs`: `[tensor type]` |
+| Attributes | `carry_count`: `usize`; `outputs`: `[TensorType]` |
 | Effects | none |
 
 Example, from `filetests/tensor/roundtrip/control.ptir`:
@@ -1727,7 +1735,7 @@ Defined by `Dequantize` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../cr
 |---|---|
 | Operands | `q`: tensor; `scale`: tensor; `offset`: optional tensor |
 | Results | `output`: tensor |
-| Attributes | `block`: `[usize]`; `to`: `dtype` |
+| Attributes | `block`: `[usize]`; `to`: `DType` |
 | Effects | none |
 | Patterns | `DequantizeToTile` (`tensor-to-tile`) |
 
@@ -1770,18 +1778,17 @@ Defined by `Quantize` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crat
 |---|---|
 | Operands | `x`: tensor; `scale`: tensor; `offset`: optional tensor |
 | Results | `output`: tensor |
-| Attributes | `block`: `[usize]`; `to`: `dtype` |
+| Attributes | `block`: `[usize]`; `to`: `DType` |
 | Effects | none |
 | Patterns | `QuantizeToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/quant.ptir`:
 
 ```text
-func.func @quantize_options(%input: tensor<8x16xf32>, %scales: tensor<8x1xf32>, %draws: tensor<8x16xui32>, %table: tensor<16xf32>) -> (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) {
-  %stochastic_codes = tensor.quantize_stochastic(%input, %scales, %draws) {block = [1, 16], to = f8e4m3} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x16xui32>) -> tensor<8x16xf8e4m3>
-  %offset_codes = tensor.quantize(%input, %scales, %scales) {block = [1, 16], to = ui8} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x1xf32>) -> tensor<8x16xui8>
-  %table_codes = tensor.quantize_table(%input, %scales, %table) {block = [1, 16], to = ui4} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<16xf32>) -> tensor<8x16xui4>
-  func.return(%stochastic_codes, %offset_codes, %table_codes) : (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) -> ()
+func.func @per_tensor(%input: tensor<8x16xf32>, %scale: tensor<1x1xf32>) -> (tensor<8x16xf8e4m3>, tensor<8x16xsi8>) {
+  %float_codes = tensor.quantize(%input, %scale) {block = [8, 16], to = f8e4m3} : (tensor<8x16xf32>, tensor<1x1xf32>) -> tensor<8x16xf8e4m3>
+  %int_codes = tensor.quantize(%input, %scale) {block = [8, 16], to = si8} : (tensor<8x16xf32>, tensor<1x1xf32>) -> tensor<8x16xsi8>
+  func.return(%float_codes, %int_codes) : (tensor<8x16xf8e4m3>, tensor<8x16xsi8>) -> ()
 }
 ```
 
@@ -1810,7 +1817,7 @@ Defined by `QuantizeStochastic` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](
 |---|---|
 | Operands | `x`: tensor; `scale`: tensor; `offset`: optional tensor; `random`: tensor |
 | Results | `output`: tensor |
-| Attributes | `block`: `[usize]`; `to`: `dtype` |
+| Attributes | `block`: `[usize]`; `to`: `DType` |
 | Effects | none |
 | Patterns | `QuantizeStochasticToTile` (`tensor-to-tile`) |
 
@@ -1846,7 +1853,7 @@ Defined by `QuantizeTable` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../..
 |---|---|
 | Operands | `x`: tensor; `scale`: tensor; `offset`: optional tensor; `table`: tensor |
 | Results | `output`: tensor |
-| Attributes | `block`: `[usize]`; `to`: `dtype` |
+| Attributes | `block`: `[usize]`; `to`: `DType` |
 | Effects | none |
 | Patterns | `QuantizeTableToTile` (`tensor-to-tile`) |
 
@@ -1884,7 +1891,7 @@ Defined by `BlockScale` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../cr
 |---|---|
 | Operands | `x`: tensor |
 | Results | `scale`: tensor |
-| Attributes | `block`: `[usize]`; `to`: `dtype`; `scale_dtype`: `dtype` |
+| Attributes | `block`: `[usize]`; `to`: `DType`; `scale_dtype`: `DType` |
 | Effects | none |
 | Patterns | `BlockScaleToTile` (`tensor-to-tile`) |
 
@@ -1932,7 +1939,7 @@ Defined by `BlockScaleRange` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../
 |---|---|
 | Operands | `x`: tensor |
 | Results | `scale`: tensor; `offset`: tensor |
-| Attributes | `block`: `[usize]`; `to`: `dtype`; `scale_dtype`: `dtype` |
+| Attributes | `block`: `[usize]`; `to`: `DType`; `scale_dtype`: `DType` |
 | Effects | none |
 | Patterns | `BlockScaleRangeToTile` (`tensor-to-tile`) |
 

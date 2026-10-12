@@ -33,10 +33,10 @@ func.func @gather_shared(%input: tensor<4xf32>, %first_weight: tensor<4xf32> {pa
 // CHECK: [[FLOAT_PARTIAL:%[0-9]+]] = tensor.add([[FLOAT_INPUT]], {{%[0-9]+}})
 // CHECK-NEXT: tensor.add([[FLOAT_PARTIAL]], {{%[0-9]+}})
 func.func @regroup(%int_input: tensor<4xsi32>, %float_input: tensor<4xf32>, %int_weight: tensor<4xsi32> {param = 1}, %float_weight: tensor<4xf32> {param = 2}) -> (tensor<4xsi32>, tensor<4xf32>) {
-  %int_five = tensor.constant() {value = dense<[4] x si32: 5>} : () -> tensor<4xsi32>
+  %int_five = tensor.constant() {value = dense<4xsi32: 5>} : () -> tensor<4xsi32>
   %int_partial = tensor.add(%int_input, %int_weight) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
   %int_sum = tensor.add(%int_partial, %int_five) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
-  %float_five = tensor.constant() {value = dense<[4] x f32: 5.0>} : () -> tensor<4xf32>
+  %float_five = tensor.constant() {value = dense<4xf32: 5.0>} : () -> tensor<4xf32>
   %float_partial = tensor.add(%float_input, %float_weight) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
   %float_sum = tensor.add(%float_partial, %float_five) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
   func.return(%int_sum, %float_sum) : (tensor<4xsi32>, tensor<4xf32>) -> ()

@@ -1,4 +1,4 @@
-# The tensor dialect (ptir.v0.5)
+# The tensor dialect (ptir.v0.6)
 
 The `tensor` dialect is the Portable Tensor IR (PTIR): whole-tensor ops with value semantics. The
 ops of `DeviceTensor` and the functionals record it, and the passes and the backends consume it.
@@ -32,7 +32,7 @@ Together they are the normative contract between producers and consumers.
 ## Versioning
 
 In the text form, a stored program, such as a dump, starts with the line
-`spec_version = "ptir.v0.5"` (`Module::to_versioned_text`). The parser reads a module with that
+`spec_version = "ptir.v0.6"` (`Module::to_versioned_text`). The parser reads a module with that
 line or without it, and rejects a module that names another version.
 
 ## Core invariants

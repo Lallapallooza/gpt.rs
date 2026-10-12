@@ -16,7 +16,7 @@ pub trait Doc {
 /// A rewrite that changed an op.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Fired {
-    /// The `#[fold]` folder of the op struct of this name.
+    /// The `#[fold]` folder of the op of this name.
     Fold(&'static str),
     /// The fold of the op trait of this name.
     TraitFold(&'static str),

@@ -1,5 +1,5 @@
 //! Writes the reference pages of the IR from the code: `docs/ptir/<dialect>.md` for each dialect
-//! with a specification (`tensor`, `arith`, `tile`, `host`), and `docs/ptir/passes.md`, the
+//! with a specification (`tensor`, `arith`, `tile`, `host`, `loop`), and `docs/ptir/passes.md`, the
 //! passes, what they rewrite and the pipelines of the backends. With `--check`, it writes nothing
 //! and fails when the pages in the repository differ from what the code gives.
 //!
@@ -24,6 +24,7 @@ use gpt_rs::backend::PortableBackend;
 use gpt_rs_ir::dialects::arith::ArithOp;
 use gpt_rs_ir::dialects::func::FuncOp;
 use gpt_rs_ir::dialects::host::HostOp;
+use gpt_rs_ir::dialects::r#loop::LoopOp;
 use gpt_rs_ir::dialects::tensor::TensorOp;
 use gpt_rs_ir::dialects::tile::TileOp;
 use gpt_rs_ir::op::OpInfo;
@@ -46,6 +47,7 @@ fn main() -> Result<()> {
         ("arith", ArithOp::infos()),
         ("tile", TileOp::infos()),
         ("host", HostOp::infos()),
+        ("loop", LoopOp::infos()),
     ];
     let mut pages = Vec::new();
     for (name, infos) in &dialects {
@@ -174,17 +176,9 @@ impl Catalog {
         })
     }
 
-    /// How a page names the op struct `rust`: `tensor.transpose`.
-    pub fn op_label(&self, rust: &str) -> String {
-        match self.ops.iter().find(|info| info.rust == rust) {
-            Some(info) => format!("`{}`", info.name),
-            None => format!("`{rust}`"),
-        }
-    }
-
     pub fn root_label(&self, root: RootInfo) -> String {
         match root {
-            RootInfo::Op(rust) => self.op_label(rust),
+            RootInfo::Op(name) => format!("`{name}`"),
             RootInfo::Trait(name) => format!("every op with `{name}`"),
         }
     }

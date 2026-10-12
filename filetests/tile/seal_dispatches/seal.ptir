@@ -1,0 +1,91 @@
+// RUN: pass seal-dispatches
+
+// Equal blocks share one dispatch, named by a hash of its text, which the function calls twice.
+// CHECK: tile.dispatch @[[EXP:dispatch\.[0-9a-f]+]]([[INPUT:%[0-9]+]]: tensor<4xf32>) -> tensor<4xf32> {
+// CHECK-NEXT: [[EXPONENTIAL:%[0-9]+]] = tile.block([[INPUT]]) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0]]} ({
+// CHECK: func.return([[EXPONENTIAL]]) : (tensor<4xf32>) -> ()
+// CHECK: tile.dispatch @[[ADD:dispatch\.[0-9a-f]+]]({{%[0-9]+}}: tensor<4xf32>, {{%[0-9]+}}: tensor<4xf32>) -> tensor<4xf32> {
+// CHECK: func.func @twice([[LHS:%[0-9]+]]: tensor<4xf32>, [[RHS:%[0-9]+]]: tensor<4xf32>) -> tensor<4xf32> {
+// CHECK-NEXT: [[FIRST:%[0-9]+]] = host.dispatch([[LHS]]) {callee = @[[EXP]]} : (tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: [[SECOND:%[0-9]+]] = host.dispatch([[RHS]]) {callee = @[[EXP]]} : (tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: [[SUM:%[0-9]+]] = host.dispatch([[FIRST]], [[SECOND]]) {callee = @[[ADD]]} : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: func.return([[SUM]]) : (tensor<4xf32>) -> ()
+func.func @twice(%lhs: tensor<4xf32>, %rhs: tensor<4xf32>) -> tensor<4xf32> {
+  %first = tile.block(%lhs) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    %exponential = arith.exp(%element) : (f32) -> f32
+    tile.yield(%exponential) : (f32) -> ()
+  }) : (tensor<4xf32>) -> tensor<4xf32>
+  %second = tile.block(%rhs) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    %exponential = arith.exp(%element) : (f32) -> f32
+    tile.yield(%exponential) : (f32) -> ()
+  }) : (tensor<4xf32>) -> tensor<4xf32>
+  %sum = tile.block(%first, %second) {iters = [par 4], reads = [$0[d0], $1[d0]], folds = [none -> [d0]]} ({
+  ^body(%lhs_element: f32, %rhs_element: f32):
+    %added = arith.add(%lhs_element, %rhs_element) : (f32, f32) -> f32
+    tile.yield(%added) : (f32) -> ()
+  }) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%sum) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// A group is one dispatch: its blocks, its grid, and what it yields.
+// CHECK: tile.dispatch @[[GROUP:dispatch\.[0-9a-f]+]]([[INPUT:%[0-9]+]]: tensor<2x3xf32>, [[BIAS:%[0-9]+]]: tensor<3xf32>) -> tensor<2x3xf32> attributes {grid = [d0, d1]} {
+// CHECK-NEXT: [[SHIFTED:%[0-9]+]] = tile.block([[INPUT]], [[BIAS]])
+// CHECK: [[RECTIFIED:%[0-9]+]] = tile.block([[SHIFTED]])
+// CHECK: func.return([[RECTIFIED]]) : (tensor<2x3xf32>) -> ()
+// CHECK: func.func @grouped([[INPUT_ARG:%[0-9]+]]: tensor<2x3xf32>, [[BIAS_ARG:%[0-9]+]]: tensor<3xf32>) -> tensor<2x3xf32> {
+// CHECK-NEXT: [[ACTIVATED:%[0-9]+]] = host.dispatch([[INPUT_ARG]], [[BIAS_ARG]]) {callee = @[[GROUP]]} : (tensor<2x3xf32>, tensor<3xf32>) -> tensor<2x3xf32>
+// CHECK-NEXT: func.return([[ACTIVATED]]) : (tensor<2x3xf32>) -> ()
+// CHECK-NOT: tile.group
+func.func @grouped(%input: tensor<2x3xf32>, %bias: tensor<3xf32>) -> tensor<2x3xf32> {
+  %activated = tile.group() {grid = [d0, d1]} ({
+    %shifted = tile.block(%input, %bias) {iters = [par 2, par 3], reads = [$0[d0, d1], $1[d1]], folds = [none -> [d0, d1]]} ({
+    ^body(%element: f32, %shift: f32):
+      %sum = arith.add(%element, %shift) : (f32, f32) -> f32
+      tile.yield(%sum) : (f32) -> ()
+    }) : (tensor<2x3xf32>, tensor<3xf32>) -> tensor<2x3xf32>
+    %rectified = tile.block(%shifted) {iters = [par 2, par 3], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+    ^body(%element: f32):
+      %zero = arith.constant() {value = 0.0 : f32} : () -> f32
+      %largest = arith.maximum(%element, %zero) : (f32, f32) -> f32
+      tile.yield(%largest) : (f32) -> ()
+    }) : (tensor<2x3xf32>) -> tensor<2x3xf32>
+    tile.yield(%rectified) : (tensor<2x3xf32>) -> ()
+  }) : () -> tensor<2x3xf32>
+  func.return(%activated) : (tensor<2x3xf32>) -> ()
+}
+
+// -----
+
+// A block that reads nothing over a symbolic extent: the dispatch takes an argument that binds the
+// symbol. In a region of control flow, the call stays in the region.
+// CHECK: tile.dispatch @[[COUNT:dispatch\.[0-9a-f]+]]({{%[0-9]+}}: tensor<{T}xf32>) -> tensor<{T}xsi32> {
+// CHECK-NEXT: tile.block() {iters = [par {T}], reads = [], folds = [none -> [d0]]} ({
+// CHECK: tile.dispatch @[[ZEROS:dispatch\.[0-9a-f]+]]({{%[0-9]+}}: tensor<{T}xf32>) -> tensor<{T}xsi32> {
+// CHECK: tensor.cond({{%[0-9]+}}, {{%[0-9]+}}) {results = [tensor<{T}xsi32>]} ({
+// CHECK-NEXT: ^then_branch([[THEN_INPUT:%[0-9]+]]: tensor<{T}xf32>):
+// CHECK-NEXT: [[COUNTED:%[0-9]+]] = host.dispatch([[THEN_INPUT]]) {callee = @[[COUNT]]} : (tensor<{T}xf32>) -> tensor<{T}xsi32>
+// CHECK-NEXT: tensor.yield([[COUNTED]]) : (tensor<{T}xsi32>) -> ()
+// CHECK: ^else_branch([[ELSE_INPUT:%[0-9]+]]: tensor<{T}xf32>):
+// CHECK-NEXT: [[FILLED:%[0-9]+]] = host.dispatch([[ELSE_INPUT]]) {callee = @[[ZEROS]]} : (tensor<{T}xf32>) -> tensor<{T}xsi32>
+func.func @positions(%predicate: tensor<i1>, %input: tensor<{T}xf32>) -> tensor<{T}xsi32> {
+  %positions = tensor.cond(%predicate, %input) {results = [tensor<{T}xsi32>]} ({
+  ^then_branch(%then_input: tensor<{T}xf32>):
+    %counted = tile.block() {iters = [par {T}], reads = [], folds = [none -> [d0]]} ({
+      %position = tile.index() {expr = d0, dtype = si32} : () -> si32
+      tile.yield(%position) : (si32) -> ()
+    }) : () -> tensor<{T}xsi32>
+    tensor.yield(%counted) : (tensor<{T}xsi32>) -> ()
+  }, {
+  ^else_branch(%else_input: tensor<{T}xf32>):
+    %zeros = tile.block() {iters = [par {T}], reads = [], folds = [none -> [d0]]} ({
+      %zero = arith.constant() {value = 0 : si32} : () -> si32
+      tile.yield(%zero) : (si32) -> ()
+    }) : () -> tensor<{T}xsi32>
+    tensor.yield(%zeros) : (tensor<{T}xsi32>) -> ()
+  }) : (tensor<i1>, tensor<{T}xf32>) -> tensor<{T}xsi32>
+  func.return(%positions) : (tensor<{T}xsi32>) -> ()
+}

@@ -1,0 +1,91 @@
+// RUN: pass seal-dispatches, tile-to-loop
+
+// A read through an index element: the element loads, and `arith.to_index` makes it an index of
+// the read. A padded read gives its pad value outside the operand.
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}([[TABLE:%[0-9]+]]: !loop.buf<5x3xf32, global>, [[ROWS:%[0-9]+]]: !loop.buf<4xsi32, global>, [[GATHERED:%[0-9]+]]: !loop.buf<4x3xf32, global>) attributes {access = [in, in, out]} {
+// CHECK: ^body([[ROW:%[0-9]+]]: index):
+// CHECK: ^body([[COLUMN:%[0-9]+]]: index):
+// CHECK-NEXT: [[CODE:%[0-9]+]] = loop.load([[ROWS]], [[ROW]]) : (!loop.buf<4xsi32, global>, index) -> si32
+// CHECK-NEXT: [[PICKED:%[0-9]+]] = arith.to_index([[CODE]]) : (si32) -> index
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load([[TABLE]], [[PICKED]], [[COLUMN]]) : (!loop.buf<5x3xf32, global>, index, index) -> f32
+// CHECK-NEXT: loop.store([[ELEMENT]], [[GATHERED]], [[ROW]], [[COLUMN]])
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}([[INPUT:%[0-9]+]]: !loop.buf<4x3xf32, global>, {{%[0-9]+}}: !loop.buf<4x3xf32, global>) attributes {access = [in, out]} {
+// CHECK: ^body([[ROW:%[0-9]+]]: index):
+// CHECK: ^body([[COLUMN:%[0-9]+]]: index):
+// CHECK-NEXT: [[ABOVE:%[0-9]+]] = loop.index([[ROW]]) {expr = d0 - 1} : (index) -> index
+// CHECK-NEXT: loop.load([[INPUT]], [[ABOVE]], [[COLUMN]]) {pad = -1.5} : (!loop.buf<4x3xf32, global>, index, index) -> f32
+func.func @gather(%table: tensor<5x3xf32>, %rows: tensor<4xsi32>) -> (tensor<4x3xf32>, tensor<4x3xf32>) {
+  %gathered = tile.block(%table, %rows) {iters = [par 4, par 3], reads = [$0[$1[d0], d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<5x3xf32>, tensor<4xsi32>) -> tensor<4x3xf32>
+  %shifted = tile.block(%gathered) {iters = [par 4, par 3], reads = [$0[d0 - 1, d1] pad -1.5], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x3xf32>) -> tensor<4x3xf32>
+  func.return(%gathered, %shifted) : (tensor<4x3xf32>, tensor<4x3xf32>) -> ()
+}
+
+// -----
+
+// A write into a copy of an operand: the copy first, then each point writes its element, or, with
+// a combine, folds into the element it names.
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}([[CACHE:%[0-9]+]]: !loop.buf<6x2xf32, global>, [[UPDATE:%[0-9]+]]: !loop.buf<1x2xf32, global>, [[POSITION:%[0-9]+]]: !loop.buf<si32, global>, [[WRITTEN:%[0-9]+]]: !loop.buf<6x2xf32, global>) attributes {access = [in, in, in, out]} {
+// CHECK: [[KEPT:%[0-9]+]] = loop.load([[CACHE]], [[ROW:%[0-9]+]], [[COLUMN:%[0-9]+]])
+// CHECK-NEXT: loop.store([[KEPT]], [[WRITTEN]], [[ROW]], [[COLUMN]])
+// CHECK: ^body([[OFFSET:%[0-9]+]]: index):
+// CHECK: ^body([[COLUMN:%[0-9]+]]: index):
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load([[UPDATE]], [[OFFSET]], [[COLUMN]])
+// CHECK-NEXT: [[START:%[0-9]+]] = loop.load([[POSITION]]) : (!loop.buf<si32, global>) -> si32
+// CHECK-NEXT: [[FIRST:%[0-9]+]] = arith.to_index([[START]]) : (si32) -> index
+// CHECK-NEXT: [[ROW:%[0-9]+]] = loop.index([[FIRST]], [[OFFSET]]) {expr = min(max(d0, 0), 5) + d1} : (index, index) -> index
+// CHECK-NEXT: loop.store([[ELEMENT]], [[WRITTEN]], [[ROW]], [[COLUMN]])
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}([[TOTALS:%[0-9]+]]: !loop.buf<3xsi32, global>, [[SEGMENTS:%[0-9]+]]: !loop.buf<5xsi32, global>, [[COUNTS:%[0-9]+]]: !loop.buf<5xsi32, global>, [[SUMMED:%[0-9]+]]: !loop.buf<3xsi32, global>) attributes {access = [in, in, in, out]} {
+// CHECK: [[KEPT_TOTAL:%[0-9]+]] = loop.load([[TOTALS]], [[SEGMENT_ROW:%[0-9]+]])
+// CHECK-NEXT: loop.store([[KEPT_TOTAL]], [[SUMMED]], [[SEGMENT_ROW]])
+// CHECK: ^body([[POINT:%[0-9]+]]: index):
+// CHECK-NEXT: [[COUNT:%[0-9]+]] = loop.load([[COUNTS]], [[POINT]])
+// CHECK-NEXT: [[CODE:%[0-9]+]] = loop.load([[SEGMENTS]], [[POINT]])
+// CHECK-NEXT: [[SEGMENT:%[0-9]+]] = arith.to_index([[CODE]]) : (si32) -> index
+// CHECK-NEXT: [[AT:%[0-9]+]] = loop.index([[SEGMENT]]) {expr = min(max(d0, 0), 2)} : (index) -> index
+// CHECK-NEXT: [[CURRENT:%[0-9]+]] = loop.load([[SUMMED]], [[AT]])
+// CHECK: [[SUM:%[0-9]+]] = arith.add({{%[0-9]+}}, [[COUNT]]) : (si32, si32) -> si32
+// CHECK: loop.store({{%[0-9]+}}, [[SUMMED]], [[AT]])
+func.func @updates(%cache: tensor<6x2xf32>, %update: tensor<1x2xf32>, %position: tensor<si32>, %totals: tensor<3xsi32>, %segments: tensor<5xsi32>, %counts: tensor<5xsi32>) -> (tensor<6x2xf32>, tensor<3xsi32>) {
+  %written = tile.block(%cache, %update, %position) {iters = [par 1, par 2], reads = [$1[d0, d1]], folds = [none -> $0[min(max($2[], 0), 5) + d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<6x2xf32>, tensor<1x2xf32>, tensor<si32>) -> tensor<6x2xf32>
+  %summed = tile.block(%totals, %segments, %counts) {iters = [par 5], reads = [$2[d0]], folds = [sum -> $0[min(max($1[d0], 0), 2)]]} ({
+  ^body(%count: si32):
+    tile.yield(%count) : (si32) -> ()
+  }) : (tensor<3xsi32>, tensor<5xsi32>, tensor<5xsi32>) -> tensor<3xsi32>
+  func.return(%written, %summed) : (tensor<6x2xf32>, tensor<3xsi32>) -> ()
+}
+
+// -----
+
+// A read of one of a list of operands: each loads at the coordinates, and the one the pick names
+// is selected.
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}([[INPUT:%[0-9]+]]: !loop.buf<{T}x4xf32, global>, [[CHOICES:%[0-9]+]]: !loop.buf<{T}xsi32, global>, [[FIRST_EXPERT:%[0-9]+]]: !loop.buf<2x4xf32, global>, [[SECOND_EXPERT:%[0-9]+]]: !loop.buf<2x4xf32, global>, [[THIRD_EXPERT:%[0-9]+]]: !loop.buf<2x4xf32, global>, {{%[0-9]+}}: !loop.buf<{T}x2xf32, global>) attributes {access = [in, in, in, in, in, out]} {
+// CHECK: ^body([[TOKEN:%[0-9]+]]: index):
+// CHECK: ^body([[ROW:%[0-9]+]]: index):
+// CHECK: ^body([[COLUMN:%[0-9]+]]: index):
+// CHECK-NEXT: loop.load([[INPUT]], [[TOKEN]], [[COLUMN]])
+// CHECK-NEXT: [[CODE:%[0-9]+]] = loop.load([[CHOICES]], [[TOKEN]])
+// CHECK-NEXT: [[CHOICE:%[0-9]+]] = arith.to_index([[CODE]]) : (si32) -> index
+// CHECK-NEXT: [[FIRST:%[0-9]+]] = loop.load([[FIRST_EXPERT]], [[ROW]], [[COLUMN]])
+// CHECK-NEXT: [[SECOND:%[0-9]+]] = loop.load([[SECOND_EXPERT]], [[ROW]], [[COLUMN]])
+// CHECK-NEXT: [[IS_SECOND:%[0-9]+]] = loop.predicate([[CHOICE]]) {constraints = [d0 == 1]} : (index) -> i1
+// CHECK-NEXT: [[UP_TO_SECOND:%[0-9]+]] = arith.select([[IS_SECOND]], [[SECOND]], [[FIRST]]) : (i1, f32, f32) -> f32
+// CHECK-NEXT: [[THIRD:%[0-9]+]] = loop.load([[THIRD_EXPERT]], [[ROW]], [[COLUMN]])
+// CHECK-NEXT: [[IS_THIRD:%[0-9]+]] = loop.predicate([[CHOICE]]) {constraints = [d0 == 2]} : (index) -> i1
+// CHECK-NEXT: arith.select([[IS_THIRD]], [[THIRD]], [[UP_TO_SECOND]]) : (i1, f32, f32) -> f32
+func.func @experts(%input: tensor<{T}x4xf32>, %choices: tensor<{T}xsi32>, %first_expert: tensor<2x4xf32>, %second_expert: tensor<2x4xf32>, %third_expert: tensor<2x4xf32>) -> tensor<{T}x2xf32> {
+  %output = tile.block(%input, %choices, %first_expert, %second_expert, %third_expert) {iters = [par {T}, par 2, red 4], reads = [$0[d0, d2], $2..$4[$1[d0]][d1, d2]], folds = [sum -> [d0, d1]]} ({
+  ^body(%element: f32, %weight: f32):
+    %product = arith.mul(%element, %weight) : (f32, f32) -> f32
+    tile.yield(%product) : (f32) -> ()
+  }) : (tensor<{T}x4xf32>, tensor<{T}xsi32>, tensor<2x4xf32>, tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<{T}x2xf32>
+  func.return(%output) : (tensor<{T}x2xf32>) -> ()
+}

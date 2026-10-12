@@ -127,20 +127,21 @@ pub fn default_cost(op: &Op, ins: &[&Type], outs: &[&Type]) -> Option<Cost> {
     })
 }
 
-/// The elements of a value of type `ty`: one for a scalar or an index.
+/// The elements of a value of type `ty`: one for a scalar, an index or a buffer, whose value is
+/// where its elements are.
 pub fn elements(ty: &Type) -> Option<u64> {
     match ty {
         Type::Tensor(tensor) => tensor_elements(tensor),
-        Type::Scalar(_) | Type::Index => Some(1),
+        Type::Scalar(_) | Type::Index | Type::Buffer(_) => Some(1),
     }
 }
 
-/// The bytes a value of type `ty` takes.
+/// The bytes a value of type `ty` takes: the address of its elements for a buffer.
 pub fn bytes(ty: &Type) -> Option<u64> {
     match ty {
         Type::Tensor(tensor) => tensor_bytes(tensor),
         Type::Scalar(dtype) => Some((dtype.bits() as u64).div_ceil(8)),
-        Type::Index => Some(8),
+        Type::Index | Type::Buffer(_) => Some(8),
     }
 }
 

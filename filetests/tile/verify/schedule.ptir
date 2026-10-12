@@ -1,0 +1,124 @@
+// RUN: verify
+
+// ERROR: tile.dispatch: a nest schedules the one block of a dispatch, and this one holds 2
+tile.dispatch @two_blocks(%input: tensor<4x6xf32>) -> tensor<4x6xf32> attributes {schedule = #sched<nest = [d0 by 2 : seq]>} {
+  %first = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  %second = tile.block(%first) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%second) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: loop 0 walks d2, which the block does not have
+tile.dispatch @missing_iterator(%input: tensor<4x6xf32>) -> tensor<4x6xf32> attributes {schedule = #sched<nest = [d2 by 2 : seq]>} {
+  %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%output) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: loop 0 walks empty tiles
+tile.dispatch @empty_tiles(%input: tensor<4x6xf32>) -> tensor<4x6xf32> attributes {schedule = #sched<nest = [d0 by 0 : seq]>} {
+  %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%output) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: loop 1 walks tiles of 4 points of d1, inside tiles of 2
+tile.dispatch @growing_tiles(%input: tensor<4x6xf32>) -> tensor<4x6xf32> attributes {schedule = #sched<nest = [d1 by 2 : seq, d1 by 4 : seq]>} {
+  %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%output) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: loop 0 runs on no units
+tile.dispatch @no_units(%input: tensor<4x6xf32>) -> tensor<4x6xf32> attributes {schedule = #sched<nest = [d0 by 1 : par<level = core, units = 0>]>} {
+  %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%output) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: loop 1 runs at level l3, inside a loop at level core
+tile.dispatch @levels(%input: tensor<4x6xf32>) -> tensor<4x6xf32> attributes {schedule = #sched<nest = [d0 by 2 : par<level = core>, d1 by 3 : par<level = l3>]>} {
+  %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%output) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: loop 0 runs tiles of d1, a reduction iterator, in parallel: that splits the reduction
+tile.dispatch @split(%input: tensor<4x6xf32>) -> tensor<4xf32> attributes {schedule = #sched<nest = [d1 by 3 : par<level = core>]>} {
+  %sums = tile.block(%input) {iters = [par 4, red 6], reads = [$0[d0, d1]], folds = [sum -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4xf32>
+  func.return(%sums) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: loop 0 walks d1, a prefix iterator, which a nest leaves whole
+tile.dispatch @prefix(%input: tensor<4x6xf32>) -> tensor<4x6xf32> attributes {schedule = #sched<nest = [d1 by 3 : seq]>} {
+  %sums = tile.block(%input) {iters = [par 4, prefix 6], reads = [$0[d0, d1]], folds = [sum -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%sums) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: a nest of a block that updates an operand would reorder its writes
+tile.dispatch @into(%input: tensor<4x6xf32>, %update: tensor<4xf32>) -> tensor<4x6xf32> attributes {schedule = #sched<nest = [d0 by 2 : seq]>} {
+  %updated = tile.block(%input, %update) {iters = [par 4], reads = [$1[d0]], folds = [none -> $0[d0, 0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>, tensor<4xf32>) -> tensor<4x6xf32>
+  func.return(%updated) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: a nest of `online_softmax` or `logsumexp` needs their update of a tile
+tile.dispatch @logsumexp(%input: tensor<4x6xf32>) -> (tensor<4xf32>, tensor<4xf32>) attributes {schedule = #sched<nest = [d0 by 2 : seq]>} {
+  %max, %sum = tile.block(%input) {iters = [par 4, red 6], reads = [$0[d0, d1]], folds = [logsumexp -> ([d0], [d0])]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> (tensor<4xf32>, tensor<4xf32>)
+  func.return(%max, %sum) : (tensor<4xf32>, tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: the state of a fold keeps the tile of d0, whose extent {N} is not static
+tile.dispatch @symbolic_state(%input: tensor<{N}x6xf32>) -> tensor<{N}xf32> attributes {schedule = #sched<nest = [d1 by 2 : seq]>} {
+  %sums = tile.block(%input) {iters = [par {N}, red 6], reads = [$0[d0, d1]], folds = [sum -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<{N}x6xf32>) -> tensor<{N}xf32>
+  func.return(%sums) : (tensor<{N}xf32>) -> ()
+}

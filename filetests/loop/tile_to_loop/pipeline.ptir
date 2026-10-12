@@ -1,0 +1,33 @@
+// RUN: pass tensor-to-tile, seal-dispatches, tile-to-loop
+
+// From `tensor` ops down to `loop`: each op is a block, sealed alone into a dispatch. The dot folds
+// over the contracted axis. The broadcast of the bias reads nothing that binds {M}, so its
+// dispatch also takes the input, which does.
+// CHECK: loop.func @[[CAST:dispatch\.[0-9a-f]+]]([[WEIGHT:%[0-9]+]]: !loop.buf<6x8xbf16, global>, [[WIDE:%[0-9]+]]: !loop.buf<6x8xf32, global>) attributes {access = [in, out]} {
+// CHECK: [[NARROW:%[0-9]+]] = loop.load([[WEIGHT]], [[ROW:%[0-9]+]], [[COLUMN:%[0-9]+]]) : (!loop.buf<6x8xbf16, global>, index, index) -> bf16
+// CHECK-NEXT: [[CAST_VALUE:%[0-9]+]] = arith.cast([[NARROW]]) {to = f32} : (bf16) -> f32
+// CHECK-NEXT: loop.store([[CAST_VALUE]], [[WIDE]], [[ROW]], [[COLUMN]])
+// CHECK: loop.func @[[DOT:dispatch\.[0-9a-f]+]]([[LHS:%[0-9]+]]: !loop.buf<{M}x8xf32, global>, [[RHS:%[0-9]+]]: !loop.buf<6x8xf32, global>, [[PRODUCT:%[0-9]+]]: !loop.buf<{M}x6xf32, global>) attributes {access = [in, in, out]} {
+// CHECK: ^body([[OUT_ROW:%[0-9]+]]: index):
+// CHECK: ^body([[OUT_COLUMN:%[0-9]+]]: index):
+// CHECK-NEXT: [[RUNNING:%[0-9]+]] = loop.alloc() {shape = [], dtype = f32} : () -> !loop.buf<f32, private>
+// CHECK: ^body([[CONTRACTED:%[0-9]+]]: index):
+// CHECK-NEXT: [[LHS_ELEMENT:%[0-9]+]] = loop.load([[LHS]], [[OUT_ROW]], [[CONTRACTED]])
+// CHECK-NEXT: [[RHS_ELEMENT:%[0-9]+]] = loop.load([[RHS]], [[OUT_COLUMN]], [[CONTRACTED]])
+// CHECK-NEXT: [[TERM:%[0-9]+]] = arith.mul([[LHS_ELEMENT]], [[RHS_ELEMENT]]) : (f32, f32) -> f32
+// CHECK-NEXT: [[SO_FAR:%[0-9]+]] = loop.load([[RUNNING]])
+// CHECK-NEXT: arith.add([[SO_FAR]], [[TERM]]) : (f32, f32) -> f32
+// CHECK: loop.func @[[BROADCAST:dispatch\.[0-9a-f]+]]([[BIAS:%[0-9]+]]: !loop.buf<6xf32, global>, {{%[0-9]+}}: !loop.buf<{M}x8xf32, global>, {{%[0-9]+}}: !loop.buf<{M}x6xf32, global>) attributes {access = [in, in, out]} {
+// CHECK: func.func @project_and_activate([[INPUT:%[0-9]+]]: tensor<{M}x8xf32>, [[WEIGHT_ARG:%[0-9]+]]: tensor<6x8xbf16>, [[BIAS_ARG:%[0-9]+]]: tensor<6xf32>) -> tensor<{M}x6xf32> {
+// CHECK-NEXT: [[WIDE_WEIGHT:%[0-9]+]] = host.dispatch([[WEIGHT_ARG]]) {callee = @[[CAST]]}
+// CHECK-NEXT: [[PROJECTION:%[0-9]+]] = host.dispatch([[INPUT]], [[WIDE_WEIGHT]]) {callee = @[[DOT]]}
+// CHECK-NEXT: [[BROADCAST_BIAS:%[0-9]+]] = host.dispatch([[BIAS_ARG]], [[INPUT]]) {callee = @[[BROADCAST]]}
+func.func @project_and_activate(%input: tensor<{M}x8xf32>, %weight: tensor<6x8xbf16>, %bias: tensor<6xf32>) -> tensor<{M}x6xf32> {
+  %wide_weight = tensor.cast(%weight) {to = f32} : (tensor<6x8xbf16>) -> tensor<6x8xf32>
+  %projection = tensor.dot_general(%input, %wide_weight) {contract_lhs = [1], contract_rhs = [1]} : (tensor<{M}x8xf32>, tensor<6x8xf32>) -> tensor<{M}x6xf32>
+  %bias_rows = tensor.broadcast_to(%bias) {shape = [{M}, 6]} : (tensor<6xf32>) -> tensor<{M}x6xf32>
+  %biased = tensor.add(%projection, %bias_rows) : (tensor<{M}x6xf32>, tensor<{M}x6xf32>) -> tensor<{M}x6xf32>
+  %squared = tensor.mul(%biased, %biased) : (tensor<{M}x6xf32>, tensor<{M}x6xf32>) -> tensor<{M}x6xf32>
+  %activated = tensor.erf(%squared) : (tensor<{M}x6xf32>) -> tensor<{M}x6xf32>
+  func.return(%activated) : (tensor<{M}x6xf32>) -> ()
+}

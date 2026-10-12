@@ -1,0 +1,9 @@
+[package]
+name = "gpt-rs-ir-lexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The tokens of the gpt-rs-ir text form, shared by its parser and by the formats its macros compile."
+
+[dependencies]

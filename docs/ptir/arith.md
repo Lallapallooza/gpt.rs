@@ -28,6 +28,8 @@ dialects agree bit for bit.
 - `arith.select`
 - `arith.cast`
 - `arith.bitcast`
+- `arith.from_index`
+- `arith.to_index`
 - `arith.rng_uniform`, `arith.rng_normal`
 
 ### `arith.constant`
@@ -42,6 +44,10 @@ Defined by `Constant` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crate
 | Results | `output`: scalar |
 | Attributes | `value`: `Literal` |
 | Effects | none |
+
+| `value` | Text form |
+|---|---|
+| `LiteralText` | `` $value `:` $dtype `` |
 
 Example, from `filetests/tile/roundtrip/arith.ptir`:
 
@@ -70,7 +76,7 @@ Defined by `Unary` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates/g
 | Operands | `input`: scalar |
 | Results | `output`: scalar |
 | Effects | none |
-| Patterns | `FoldIndexArith` (`canonicalize`, at `arith.neg`); `UnaryToTile` (`tensor-to-tile`) |
+| Patterns | `FoldIndexArith` (`canonicalize`, at `arith.neg`) |
 
 | Op | Traits | |
 |---|---|---|
@@ -86,25 +92,48 @@ Defined by `Unary` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates/g
 | `arith.cos` |  | As `tensor.cos`, on one scalar. |
 | `arith.not` | involution | As `tensor.not`, on one scalar. |
 
-Example, from `filetests/tile/roundtrip/block.ptir`:
+Example, from `filetests/tile/roundtrip/arith.ptir`:
 
 ```text
-func.func @logsumexp(%logits: tensor<2x16xf32>) -> (tensor<2xf32>, tensor<2xf32>, tensor<2xf32>) {
-  %max, %sum = tile.block(%logits) {iters = [par 2, red 16], reads = [$0[d0, d1]], folds = [logsumexp -> [d0], [d0]]} ({
-  ^body(%logit: f32):
-    tile.yield(%logit) : (f32) -> ()
-  }) : (tensor<2x16xf32>) -> (tensor<2xf32>, tensor<2xf32>)
-  %merged_max, %merged_sum = tile.block(%max, %sum) {iters = [par 2, red 2], reads = [$0[d0], $1[d0]], folds = [logsumexp_merge -> [d0], [d0]]} ({
-  ^body(%partial_max: f32, %partial_sum: f32):
-    tile.yield(%partial_max, %partial_sum) : (f32, f32) -> ()
-  }) : (tensor<2xf32>, tensor<2xf32>) -> (tensor<2xf32>, tensor<2xf32>)
-  %logsumexp = tile.block(%merged_max, %merged_sum) {iters = [par 2], reads = [$0[d0], $1[d0]], folds = [none -> [d0]]} ({
-  ^body(%row_max: f32, %row_sum: f32):
-    %log_sum = arith.log(%row_sum) : (f32) -> f32
-    %log_total = arith.add(%row_max, %log_sum) : (f32, f32) -> f32
-    tile.yield(%log_total) : (f32) -> ()
-  }) : (tensor<2xf32>, tensor<2xf32>) -> tensor<2xf32>
-  func.return(%max, %sum, %logsumexp) : (tensor<2xf32>, tensor<2xf32>, tensor<2xf32>) -> ()
+func.func @scalar_ops(%input: tensor<4xf32>, %integers: tensor<4xsi32>, %state: tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) {
+  %uniforms, %combined_bits, %less_flags, %normals = tile.block(%input, %integers, %state) {iters = [par 4], reads = [$0[d0], $1[d0], $2[0], $2[1]], folds = [none -> [d0], none -> [d0], none -> [d0], none -> [d0]]} ({
+  ^body(%element: f32, %integer: si32, %key: ui64, %counter: ui64):
+    %negated = arith.neg(%element) : (f32) -> f32
+    %absolute = arith.abs(%negated) : (f32) -> f32
+    %exponential = arith.exp(%absolute) : (f32) -> f32
+    %logarithm = arith.log(%exponential) : (f32) -> f32
+    %tanh = arith.tanh(%logarithm) : (f32) -> f32
+    %erf = arith.erf(%tanh) : (f32) -> f32
+    %rsqrt = arith.rsqrt(%erf) : (f32) -> f32
+    %reciprocal = arith.reciprocal(%rsqrt) : (f32) -> f32
+    %sine = arith.sin(%reciprocal) : (f32) -> f32
+    %cosine = arith.cos(%sine) : (f32) -> f32
+    %half = arith.constant() {value = 0.5 : f32} : () -> f32
+    %sum = arith.add(%cosine, %half) : (f32, f32) -> f32
+    %difference = arith.sub(%sum, %half) : (f32, f32) -> f32
+    %product = arith.mul(%difference, %half) : (f32, f32) -> f32
+    %quotient = arith.div(%product, %half) : (f32, f32) -> f32
+    %maximum = arith.maximum(%quotient, %half) : (f32, f32) -> f32
+    %minimum = arith.minimum(%maximum, %half) : (f32, f32) -> f32
+    %three = arith.constant() {value = 3 : si32} : () -> si32
+    %and_bits = arith.and(%integer, %three) : (si32, si32) -> si32
+    %or_bits = arith.or(%and_bits, %three) : (si32, si32) -> si32
+    %xor_bits = arith.xor(%or_bits, %three) : (si32, si32) -> si32
+    %left_shifted = arith.shift_left(%xor_bits, %three) : (si32, si32) -> si32
+    %logical_shifted = arith.shift_right_logical(%left_shifted, %three) : (si32, si32) -> si32
+    %arithmetic_shifted = arith.shift_right_arithmetic(%logical_shifted, %three) : (si32, si32) -> si32
+    %inverted = arith.not(%arithmetic_shifted) : (si32) -> si32
+    %is_less = arith.less(%minimum, %half) : (f32, f32) -> i1
+    %selected = arith.select(%is_less, %minimum, %half) : (i1, f32, f32) -> f32
+    %narrowed = arith.cast(%selected) {to = bf16} : (f32) -> bf16
+    %selected_bits = arith.bitcast(%selected) {to = si32} : (f32) -> si32
+    %combined = arith.add(%inverted, %selected_bits) : (si32, si32) -> si32
+    %index = tile.index() {expr = d0, dtype = ui64} : () -> ui64
+    %uniform = arith.rng_uniform(%key, %counter, %index) {dtype = f32} : (ui64, ui64, ui64) -> f32
+    %normal = arith.rng_normal(%key, %counter, %index) {dtype = bf16} : (ui64, ui64, ui64) -> bf16
+    tile.yield(%uniform, %combined, %is_less, %normal) : (f32, si32, i1, bf16) -> ()
+  }) : (tensor<4xf32>, tensor<4xsi32>, tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>)
+  func.return(%uniforms, %combined_bits, %less_flags, %normals) : (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) -> ()
 }
 ```
 
@@ -120,7 +149,7 @@ Defined by `Binary` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates/
 | Operands | `lhs`: scalar; `rhs`: scalar |
 | Results | `output`: scalar |
 | Effects | none |
-| Patterns | `FoldIndexArith` (`canonicalize`, at `arith.add`, `arith.sub`, `arith.mul`, `arith.maximum`, `arith.minimum`); `BinaryToTile` (`tensor-to-tile`); `ScaleIntoDot` (`dot-scale-fold`, at `arith.mul`) |
+| Patterns | `FoldIndexArith` (`canonicalize`, at `arith.add`, `arith.sub`, `arith.mul`, `arith.maximum`, `arith.minimum`) |
 
 | Op | Traits | |
 |---|---|---|
@@ -199,7 +228,6 @@ Defined by `Compare` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates
 | Operands | `lhs`: scalar; `rhs`: scalar |
 | Results | `output`: scalar |
 | Effects | none |
-| Patterns | `CompareWithItself` (`canonicalize`); `CompareToTile` (`tensor-to-tile`) |
 
 | Op | |
 |---|---|
@@ -244,8 +272,6 @@ Defined by `Select` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates/
 | Operands | `pred`: scalar; `on_true`: scalar; `on_false`: scalar |
 | Results | `output`: scalar |
 | Effects | none |
-| Folds | `select(pred, on_true, on_false)` is `on_true` when `pred` is all true or both branches are the same value, and `on_false` when `pred` is all false. |
-| Patterns | `SelectToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tile/roundtrip/arith.ptir`:
 
@@ -302,10 +328,8 @@ Defined by `Cast` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates/gp
 |---|---|
 | Operands | `input`: scalar |
 | Results | `output`: scalar |
-| Attributes | `to`: `dtype` |
+| Attributes | `to`: `DType` |
 | Effects | none |
-| Folds | A cast to the input's own type is the input. |
-| Patterns | `CastToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tile/roundtrip/block.ptir`:
 
@@ -345,10 +369,8 @@ Defined by `Bitcast` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates
 |---|---|
 | Operands | `input`: scalar |
 | Results | `output`: scalar |
-| Attributes | `to`: `dtype` |
+| Attributes | `to`: `DType` |
 | Effects | none |
-| Folds | A bitcast to the input's own type is the input. |
-| Patterns | `BitcastToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tile/roundtrip/arith.ptir`:
 
@@ -395,6 +417,96 @@ func.func @scalar_ops(%input: tensor<4xf32>, %integers: tensor<4xsi32>, %state: 
 }
 ```
 
+### `arith.from_index`
+
+The index as an element of `dtype`, converted as `tensor.iota` converts its
+indices: as an si64 cast to `dtype`.
+
+Defined by `FromIndex` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates/gpt-rs-ir/src/dialects/arith/ir.rs).
+
+| | |
+|---|---|
+| Operands | `input`: index |
+| Results | `output`: scalar |
+| Attributes | `dtype`: `DType` |
+| Effects | none |
+
+Example, from `filetests/loop/roundtrip/func.ptir`:
+
+```text
+loop.func @shifted_gather(%table: !loop.buf<6x3xf32, global>, %which: !loop.buf<si32, global>, %output: !loop.buf<3xf32, global>) attributes {access = [in, in, out]} {
+  %start = loop.index() {expr = 0} : () -> index
+  %end = loop.index() {expr = 3} : () -> index
+  %scratch = loop.alloc() {shape = [3], dtype = f32} : () -> !loop.buf<3xf32, private>
+  %code = loop.load(%which) : (!loop.buf<si32, global>) -> si32
+  %picked = arith.to_index(%code) : (si32) -> index
+  loop.for(%start, %end) ({
+  ^body(%column: index):
+    %row = loop.index(%picked) {expr = d0 - 1} : (index) -> index
+    %element = loop.load(%table, %row, %column) {pad = 0.0} : (!loop.buf<6x3xf32, global>, index, index) -> f32
+    loop.store(%element, %scratch, %column) : (f32, !loop.buf<3xf32, private>, index) -> ()
+    %first = loop.predicate(%column) {constraints = [d0 == 0]} : (index) -> i1
+    loop.if(%first) ({
+      %position = arith.from_index(%column) {dtype = f32} : (index) -> f32
+      loop.store(%position, %scratch, %column) : (f32, !loop.buf<3xf32, private>, index) -> ()
+      loop.yield() : () -> ()
+    }) : (i1) -> ()
+    %value = loop.load(%scratch, %column) : (!loop.buf<3xf32, private>, index) -> f32
+    loop.store(%value, %output, %column) : (f32, !loop.buf<3xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+```
+
+Rejected, as the verify filetests pin it:
+
+- `arith.from_index: dtype must be an integer or float dtype, got i1`
+
+### `arith.to_index`
+
+The integer as an index. Its value MUST fit `i64`.
+
+Defined by `ToIndex` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates/gpt-rs-ir/src/dialects/arith/ir.rs).
+
+| | |
+|---|---|
+| Operands | `input`: scalar |
+| Results | `output`: index |
+| Effects | none |
+
+Example, from `filetests/loop/roundtrip/func.ptir`:
+
+```text
+loop.func @shifted_gather(%table: !loop.buf<6x3xf32, global>, %which: !loop.buf<si32, global>, %output: !loop.buf<3xf32, global>) attributes {access = [in, in, out]} {
+  %start = loop.index() {expr = 0} : () -> index
+  %end = loop.index() {expr = 3} : () -> index
+  %scratch = loop.alloc() {shape = [3], dtype = f32} : () -> !loop.buf<3xf32, private>
+  %code = loop.load(%which) : (!loop.buf<si32, global>) -> si32
+  %picked = arith.to_index(%code) : (si32) -> index
+  loop.for(%start, %end) ({
+  ^body(%column: index):
+    %row = loop.index(%picked) {expr = d0 - 1} : (index) -> index
+    %element = loop.load(%table, %row, %column) {pad = 0.0} : (!loop.buf<6x3xf32, global>, index, index) -> f32
+    loop.store(%element, %scratch, %column) : (f32, !loop.buf<3xf32, private>, index) -> ()
+    %first = loop.predicate(%column) {constraints = [d0 == 0]} : (index) -> i1
+    loop.if(%first) ({
+      %position = arith.from_index(%column) {dtype = f32} : (index) -> f32
+      loop.store(%position, %scratch, %column) : (f32, !loop.buf<3xf32, private>, index) -> ()
+      loop.yield() : () -> ()
+    }) : (i1) -> ()
+    %value = loop.load(%scratch, %column) : (!loop.buf<3xf32, private>, index) -> f32
+    loop.store(%value, %output, %column) : (f32, !loop.buf<3xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+```
+
+Rejected, as the verify filetests pin it:
+
+- `arith.to_index: the input must be an integer dtype, got f32`
+
 ### `Rng`: `arith.rng_uniform`, `arith.rng_normal`
 
 Element `index` of the stream that the `tensor` op of
@@ -407,9 +519,8 @@ Defined by `Rng` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates/gpt
 |---|---|
 | Operands | `key`: scalar; `counter`: scalar; `index`: scalar |
 | Results | `output`: scalar |
-| Attributes | `dtype`: `dtype` |
+| Attributes | `dtype`: `DType` |
 | Effects | none |
-| Patterns | `RngToTile` (`tensor-to-tile`) |
 
 | Op | |
 |---|---|

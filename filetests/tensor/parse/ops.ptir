@@ -1,0 +1,32 @@
+// RUN: parse
+
+// ERROR: 4:3: %negated is defined twice
+func.func @defined_twice(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %negated = tensor.neg(%input) : (tensor<4xf32>) -> tensor<4xf32>
+  %negated = tensor.neg(%input) : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%negated) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: 3:36: tensor.neg operand 0 is tensor<4xf32>, but the signature says tensor<8xf32>
+func.func @operand_type(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %negated = tensor.neg(%input) : (tensor<8xf32>) -> tensor<4xf32>
+  func.return(%negated) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: 3:54: tensor.neg defines 1 results but its signature has 2 result types
+func.func @result_count(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %negated = tensor.neg(%input) : (tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>)
+  func.return(%negated) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: 3:50: expected a string, found a string without its closing quote
+func.func @unclosed(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %output = tensor.custom_call(%input) {target = "kernel, results = [tensor<4xf32>]} : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%output) : (tensor<4xf32>) -> ()
+}

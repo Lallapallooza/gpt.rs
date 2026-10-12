@@ -66,7 +66,7 @@ Start here:
 Reference:
 - [docs/backends/README.md](docs/backends/README.md) (how each backend works: ref-cpu, faer, c)
 - [docs/ptir/tensor.md](docs/ptir/tensor.md) (the `tensor` dialect: the PTIR spec, generated from the code)
-- [docs/ptir/arith.md](docs/ptir/arith.md), [docs/ptir/tile.md](docs/ptir/tile.md) and [docs/ptir/host.md](docs/ptir/host.md) (the scalar, tile and host dialects, generated from the code)
+- [docs/ptir/arith.md](docs/ptir/arith.md), [docs/ptir/tile.md](docs/ptir/tile.md), [docs/ptir/loop.md](docs/ptir/loop.md) and [docs/ptir/host.md](docs/ptir/host.md) (the scalar, tile, loop and host dialects, generated from the code)
 - [docs/ptir/passes.md](docs/ptir/passes.md) (the passes and the pipeline of each backend)
 - [docs/ops.md](docs/ops.md) (PTIR recording/graphs/execution)
 - [docs/frontend.md](docs/frontend.md) (frontend layering)
@@ -116,6 +116,7 @@ Misc
 - `crates/gpt-rs-macros`: the `#[nn::module]` and `#[functional]` proc macros.
 - `crates/gpt-rs-ir`: the IR: dialects, text form, verifier, interpreter and passes.
 - `crates/gpt-rs-ir-macros`: the macros that define ops, dialects, attributes, passes, patterns and folds.
+- `crates/gpt-rs-ir-lexer`: the tokens of the IR text form, which its parser and the attribute formats share.
 - `crates/gpt-rs-filetests`: the filetest runner.
 - `crates/gpt-rs-docs`: writes the IR reference pages, `docs/ptir/`, from the code.
 - `filetests/`: IR filetests (`cargo test -p gpt-rs-ir --test filetests`) and the C backend's (`cargo test -p gpt-rs-backend-c --test filetests`).

@@ -5,7 +5,7 @@
 //! A region is one block with arguments. Control flow is structured only. The module's body is a
 //! region that holds the `func.func` ops.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, ensure, Result};
 
@@ -14,7 +14,7 @@ use crate::dialects::func::Func;
 use crate::host::HostScalar;
 use crate::location::Location;
 use crate::op::{Flat, InOp, Matched, OpDyn};
-use crate::rewrite::bound_params;
+use crate::text::any_items;
 use crate::traits::{IsolatedFromAbove, Terminator};
 use crate::types::{TensorType, Type};
 use crate::Op;
@@ -286,6 +286,67 @@ impl Module {
         out
     }
 
+    /// A copy of `inst` of `source`, with its regions, unplaced: its operands are the values `map`
+    /// gives for its own, and `map` gains its results and region arguments. Fails when it reads a
+    /// value `map` does not give.
+    pub fn copy_inst(
+        &mut self,
+        source: &Module,
+        inst: Inst,
+        map: &mut HashMap<Value, Value>,
+    ) -> Result<Inst> {
+        let mapped = |values: &[Value], map: &HashMap<Value, Value>| -> Result<Vec<Value>> {
+            values
+                .iter()
+                .map(|value| match map.get(value) {
+                    Some(&mapped) => Ok(mapped),
+                    None => bail!(
+                        "{} reads a value from outside what it copies",
+                        source.op(inst).name()
+                    ),
+                })
+                .collect()
+        };
+        let mut regions = Vec::new();
+        for &region in source.regions(inst) {
+            let arg_types: Vec<Type> = source
+                .args(region)
+                .iter()
+                .map(|&v| source.ty(v).clone())
+                .collect();
+            let copy = self.new_region(arg_types);
+            map.extend(
+                source
+                    .args(region)
+                    .iter()
+                    .copied()
+                    .zip(self.args(copy).to_vec()),
+            );
+            for inner in source.insts(region) {
+                let inner_copy = self.copy_inst(source, inner, map)?;
+                self.append(copy, inner_copy);
+            }
+            regions.push(copy);
+        }
+        let copy = self.create_inst(NewInst {
+            op: source.op(inst).clone(),
+            operands: mapped(source.operands(inst), map)?,
+            operand_segments: source.operand_segments(inst).map(<[usize]>::to_vec),
+            result_types: source.result_types(inst).into_iter().cloned().collect(),
+            result_segments: source.result_segments(inst).map(<[usize]>::to_vec),
+            regions,
+            location: source.location(inst).cloned(),
+        });
+        map.extend(
+            source
+                .results(inst)
+                .iter()
+                .copied()
+                .zip(self.results(copy).to_vec()),
+        );
+        Ok(copy)
+    }
+
     /// `inst` and every live instruction in its regions, outer before inner, in order.
     pub fn walk_inst(&self, inst: Inst) -> Vec<Inst> {
         let mut out = vec![inst];
@@ -377,7 +438,7 @@ impl Module {
         if !attrs.params.is_empty() {
             attrs.params.remove(index);
         }
-        attrs.params = bound_params(attrs.params);
+        attrs.params = any_items(attrs.params);
         self.set_op(func, attrs.into());
         Ok(())
     }

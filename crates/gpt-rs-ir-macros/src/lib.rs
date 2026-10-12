@@ -15,7 +15,10 @@
 //!   `DIALECT` constant to `name`.
 //! - `#[derive(DialectSet)]` with `#[dialect_set(kind(Kind))]` on the `Op` union of the dialects.
 //!   It generates the dispatch over the dialects and `Kind`, the enum that names them.
-//! - `#[derive(Attr)]` on a fieldless enum: one snake_case text name per variant.
+//! - `#[derive(Attr)]` on an attribute type: its text form, which a fieldless enum writes by the
+//!   snake_case name of each variant, and a struct or a variant by its `#[attr(format = "...")]`
+//!   or `#[attr(via = Type)]`. `format.rs` compiles a format into the printer and the parser;
+//!   `gpt_rs_ir::attr` documents the format language.
 //! - `#[pass(name = "...", stats(...))]` on a pass struct. It gives the pass its name and
 //!   statistics, makes its fields options, and registers it with its doc comment.
 //! - `#[pattern]` on a pattern struct records its name and doc comment. `#[pattern(canonical)]`
@@ -34,6 +37,13 @@ use syn::punctuated::Punctuated;
 use syn::{
     parse_macro_input, Data, DeriveInput, Expr, Fields, Ident, LitStr, Token, Type as SynType,
 };
+
+mod format;
+
+/// `CombineKind` as words: `combine kind`, how messages name a value of the type.
+fn words(name: &str) -> String {
+    snake_case(name).replace('_', " ")
+}
 
 fn snake_case(name: &str) -> String {
     let mut out = String::new();
@@ -80,20 +90,251 @@ pub fn derive_attr(input: TokenStream) -> TokenStream {
     }
 }
 
-fn expand_attr(input: &DeriveInput) -> syn::Result<TokenStream2> {
-    let Data::Enum(data) = &input.data else {
-        return Err(syn::Error::new_spanned(
-            input,
-            "#[derive(Attr)] supports enums",
-        ));
-    };
-    if data
-        .variants
-        .iter()
-        .any(|v| !matches!(v.fields, Fields::Unit))
-    {
-        return expand_attr_with_fields(input, data);
+/// `#[attr(format = "...")]` or `#[attr(via = Type)]` on a type or a variant.
+#[derive(Default)]
+struct TypeAttrArgs {
+    format: Option<LitStr>,
+    via: Option<SynType>,
+}
+
+fn type_attr_args(attrs: &[syn::Attribute]) -> syn::Result<TypeAttrArgs> {
+    let mut args = TypeAttrArgs::default();
+    for attr in attrs.iter().filter(|a| a.path().is_ident("attr")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("format") {
+                args.format = Some(meta.value()?.parse()?);
+            } else if meta.path.is_ident("via") {
+                args.via = Some(meta.value()?.parse()?);
+            } else {
+                return Err(meta.error("expected #[attr(format = \"...\")] or #[attr(via = Type)]"));
+            }
+            Ok(())
+        })?;
     }
+    Ok(args)
+}
+
+/// The fields of a struct or variant, as a format writes them.
+fn format_fields(fields: &Fields) -> syn::Result<Vec<format::FormatField>> {
+    let mut out = Vec::new();
+    for (index, field) in fields.iter().enumerate() {
+        let FieldAttrs { default, each } = field_attrs(field)?;
+        if each.is_some() {
+            return Err(syn::Error::new_spanned(
+                field,
+                "only a field of a symbol op is written per argument or result",
+            ));
+        }
+        let name = match &field.ident {
+            Some(ident) => ident.unraw().to_string(),
+            None => index.to_string(),
+        };
+        out.push(format::FormatField::new(name, field.ty.clone(), default));
+    }
+    Ok(out)
+}
+
+/// `path { a: f_a, .. }`, `path(f_0, ..)` or `path`: the pattern that binds `fields` to the
+/// locals a format reads and writes, and the expression that builds the value from them.
+fn bind_fields(path: TokenStream2, fields: &Fields) -> TokenStream2 {
+    match fields {
+        Fields::Named(named) => {
+            let members = named.named.iter().map(|field| {
+                let ident = field.ident.as_ref().expect("a named field");
+                let binding = format_ident!("f_{}", ident.unraw().to_string());
+                quote!(#ident: #binding)
+            });
+            quote!(#path { #(#members),* })
+        }
+        Fields::Unnamed(unnamed) => {
+            let bindings = (0..unnamed.unnamed.len()).map(|index| format_ident!("f_{}", index));
+            quote!(#path(#(#bindings),*))
+        }
+        Fields::Unit => path,
+    }
+}
+
+/// The entry of `ATTR_FORMATS` for the format `format` of `name`, which writes `fields`.
+fn format_entry(name: &str, format: &LitStr, fields: &Fields) -> TokenStream2 {
+    let entry = format_ident!(
+        "__GPT_RS_ATTR_FORMAT_{}",
+        name.replace("::", "_").to_uppercase()
+    );
+    let types = fields.iter().map(|field| {
+        let ty = &field.ty;
+        quote!(<#ty as ::gpt_rs_ir::attr::Attr>::ITEM)
+    });
+    quote! {
+        #[::gpt_rs_ir::linkme::distributed_slice(::gpt_rs_ir::attr::ATTR_FORMATS)]
+        #[linkme(crate = ::gpt_rs_ir::linkme)]
+        static #entry: ::gpt_rs_ir::attr::AttrFormat = ::gpt_rs_ir::attr::AttrFormat {
+            name: #name,
+            format: #format,
+            fields: &[#(#types),*],
+        };
+    }
+}
+
+/// `impl Display` for `input`, its text form.
+fn display_impl(input: &DeriveInput) -> TokenStream2 {
+    let name = &input.ident;
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+    quote! {
+        impl #impl_generics ::std::fmt::Display for #name #ty_generics #where_clause {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                let mut text = ::std::string::String::new();
+                ::gpt_rs_ir::attr::Attr::print(self, &mut text);
+                f.write_str(&text)
+            }
+        }
+    }
+}
+
+/// `impl Attr` for `input` from the three bodies, each of which reads its fields' locals.
+fn attr_impl(
+    input: &DeriveInput,
+    print: TokenStream2,
+    parse: TokenStream2,
+    peek: TokenStream2,
+) -> TokenStream2 {
+    let name = &input.ident;
+    let item = name.to_string();
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+    quote! {
+        impl #impl_generics ::gpt_rs_ir::attr::Attr for #name #ty_generics #where_clause {
+            const ITEM: &'static str = #item;
+
+            #[allow(unused_assignments, unused_mut, unused_variables)]
+            fn print(&self, out: &mut ::std::string::String) {
+                #print
+            }
+
+            #[allow(unused_assignments, unused_mut, unreachable_code)]
+            fn parse(c: &mut ::gpt_rs_ir::text::Cursor<'_>) -> ::anyhow::Result<Self> {
+                #parse
+            }
+
+            fn peek(c: &::gpt_rs_ir::text::Cursor<'_>) -> bool {
+                #peek
+            }
+        }
+    }
+}
+
+fn expand_attr(input: &DeriveInput) -> syn::Result<TokenStream2> {
+    let args = type_attr_args(&input.attrs)?;
+    if let Some(via) = &args.via {
+        if args.format.is_some() {
+            return Err(syn::Error::new_spanned(
+                input,
+                "a type has a format or a via, not both",
+            ));
+        }
+        return Ok(expand_attr_via(input, via));
+    }
+    match &input.data {
+        Data::Struct(data) => {
+            let Some(format) = &args.format else {
+                return Err(syn::Error::new_spanned(
+                    input,
+                    "#[derive(Attr)] on a struct needs #[attr(format = \"...\")] or \
+                     #[attr(via = Type)]",
+                ));
+            };
+            expand_attr_struct(input, data, format)
+        }
+        Data::Enum(data) => {
+            if args.format.is_some() {
+                return Err(syn::Error::new_spanned(
+                    input,
+                    "an enum's format goes on each variant",
+                ));
+            }
+            let mut plain = true;
+            for variant in &data.variants {
+                plain &= matches!(variant.fields, Fields::Unit)
+                    && type_attr_args(&variant.attrs)?.format.is_none();
+            }
+            if plain {
+                expand_attr_mnemonic(input, data)
+            } else {
+                expand_attr_enum(input, data)
+            }
+        }
+        Data::Union(_) => Err(syn::Error::new_spanned(
+            input,
+            "#[derive(Attr)] supports structs and enums",
+        )),
+    }
+}
+
+/// A type whose text form is that of `via`.
+fn expand_attr_via(input: &DeriveInput, via: &SynType) -> TokenStream2 {
+    let name = input.ident.to_string();
+    let entry = format_ident!("__GPT_RS_ATTR_FORMAT_{}", name.to_uppercase());
+    let attr = attr_impl(
+        input,
+        quote! {
+            let text: #via = ::std::convert::From::from(self);
+            <#via as ::gpt_rs_ir::attr::Attr>::print(&text, out);
+        },
+        quote! {
+            let start = c.position();
+            let text = <#via as ::gpt_rs_ir::attr::Attr>::parse(c)?;
+            <Self as ::std::convert::TryFrom<#via>>::try_from(text)
+                .map_err(|err| c.error_at(start, err))
+        },
+        quote!(<#via as ::gpt_rs_ir::attr::Attr>::peek(c)),
+    );
+    let display = display_impl(input);
+    quote! {
+        #attr
+        #display
+
+        #[::gpt_rs_ir::linkme::distributed_slice(::gpt_rs_ir::attr::ATTR_FORMATS)]
+        #[linkme(crate = ::gpt_rs_ir::linkme)]
+        static #entry: ::gpt_rs_ir::attr::AttrFormat = ::gpt_rs_ir::attr::AttrFormat {
+            name: #name,
+            format: "",
+            fields: &[<#via as ::gpt_rs_ir::attr::Attr>::ITEM],
+        };
+    }
+}
+
+/// A struct with a format.
+fn expand_attr_struct(
+    input: &DeriveInput,
+    data: &syn::DataStruct,
+    format: &LitStr,
+) -> syn::Result<TokenStream2> {
+    let fields = format_fields(&data.fields)?;
+    let format::Compiled {
+        print, parse, peek, ..
+    } = format::compile(format, &fields, &words(&input.ident.to_string()), true)?;
+    let bound = bind_fields(quote!(Self), &data.fields);
+    let attr = attr_impl(
+        input,
+        quote! {
+            let #bound = self;
+            #print
+        },
+        quote! {
+            #parse
+            ::std::result::Result::Ok(#bound)
+        },
+        peek,
+    );
+    let display = display_impl(input);
+    let entry = format_entry(&input.ident.to_string(), format, &data.fields);
+    Ok(quote! {
+        #attr
+        #display
+        #entry
+    })
+}
+
+/// A fieldless enum: one snake_case text name per variant.
+fn expand_attr_mnemonic(input: &DeriveInput, data: &syn::DataEnum) -> syn::Result<TokenStream2> {
     let name = &input.ident;
     let mut variants = Vec::new();
     let mut names = Vec::new();
@@ -104,6 +345,7 @@ fn expand_attr(input: &DeriveInput) -> syn::Result<TokenStream2> {
         docs.push(doc_text(&variant.attrs));
     }
     let type_name = name.to_string();
+    let what = words(&type_name);
     let entry = format_ident!("__GPT_RS_ATTR_ENUM_{}", type_name.to_uppercase());
     Ok(quote! {
         impl ::gpt_rs_ir::attr::Mnemonic for #name {
@@ -117,13 +359,16 @@ fn expand_attr(input: &DeriveInput) -> syn::Result<TokenStream2> {
         }
 
         impl ::gpt_rs_ir::attr::Attr for #name {
+            const ITEM: &'static str = #type_name;
+
             fn print(&self, out: &mut ::std::string::String) {
                 out.push_str(::gpt_rs_ir::attr::Mnemonic::mnemonic(*self));
             }
             fn parse(c: &mut ::gpt_rs_ir::text::Cursor<'_>) -> ::anyhow::Result<Self> {
-                let name = c.ident()?;
-                <Self as ::gpt_rs_ir::attr::Mnemonic>::from_mnemonic(name)
-                    .ok_or_else(|| c.error(format!("unknown {} `{}`", #type_name, name)))
+                ::gpt_rs_ir::attr::parse_mnemonic(c, #what)
+            }
+            fn peek(c: &::gpt_rs_ir::text::Cursor<'_>) -> bool {
+                ::gpt_rs_ir::attr::peek_mnemonic::<Self>(c)
             }
         }
 
@@ -136,139 +381,175 @@ fn expand_attr(input: &DeriveInput) -> syn::Result<TokenStream2> {
     })
 }
 
-/// `#[derive(Attr)]` on an enum whose variants have named fields, or hold one attribute group: a
-/// variant is written by its snake-case name, with its fields or the group's attributes after it,
-/// `top_k<k = 3>`. A field with `#[attr(default)]` may be left out, and the printer leaves it out
-/// when it holds its default. The enum gets `name()`, the name of its variant, and `Display`, its
-/// text form.
-fn expand_attr_with_fields(input: &DeriveInput, data: &syn::DataEnum) -> syn::Result<TokenStream2> {
-    let name = &input.ident;
-    let type_name = name.to_string();
-    let mut name_arms = Vec::new();
+/// An enum whose variants have fields or formats. A variant without a format is written by its
+/// snake-case name, with its named fields, or the attributes of the group it holds, as parameters
+/// after it, each left out at its default: `top_k<k = 3>`.
+fn expand_attr_enum(input: &DeriveInput, data: &syn::DataEnum) -> syn::Result<TokenStream2> {
+    let type_name = input.ident.to_string();
     let mut print_arms = Vec::new();
     let mut parse_arms = Vec::new();
+    let mut peeks = Vec::new();
+    let mut name_arms = Vec::new();
+    let mut entries = Vec::new();
+    let mut any_format = false;
+    // The literal each variant starts with: no two may share one, or the next token could not
+    // pick the variant.
+    let mut leading: Vec<(String, &Ident)> = Vec::new();
     for variant in &data.variants {
         let ident = &variant.ident;
         let text = snake_case(&ident.to_string());
-        let fields = match &variant.fields {
-            Fields::Unit => Vec::new(),
-            Fields::Named(named) => named
-                .named
-                .iter()
-                .map(field_spec)
-                .collect::<syn::Result<Vec<_>>>()?,
-            // A variant that holds an attribute group writes the group's attributes as its own.
-            Fields::Unnamed(unnamed) if unnamed.unnamed.len() == 1 => {
-                let group = &unnamed.unnamed[0].ty;
-                name_arms.push(quote! { Self::#ident(_) => #text });
-                print_arms.push(quote! {
-                    Self::#ident(group) => {
-                        let mut attrs = ::std::vec::Vec::new();
-                        ::gpt_rs_ir::attr::AttrGroup::print_attrs(group, &mut attrs);
-                        for (key, value) in attrs {
-                            params.push(format!("{} = {}", key, value));
-                        }
-                    }
-                });
-                parse_arms.push(quote! {
-                    #text => Ok(Self::#ident(<#group as ::gpt_rs_ir::attr::AttrGroup>::parse_params(#text, c)?)),
-                });
-                continue;
-            }
-            Fields::Unnamed(_) => {
+        let bound = bind_fields(quote!(Self::#ident), &variant.fields);
+        let format = type_attr_args(&variant.attrs)?.format;
+        any_format |= format.is_some();
+        name_arms.push(match &variant.fields {
+            Fields::Unit => quote!(Self::#ident => #text),
+            Fields::Named(_) => quote!(Self::#ident { .. } => #text),
+            Fields::Unnamed(_) => quote!(Self::#ident(..) => #text),
+        });
+        // A variant that holds an attribute group writes the group's attributes as its own.
+        if let (None, Fields::Unnamed(unnamed)) = (&format, &variant.fields) {
+            if unnamed.unnamed.len() != 1 {
                 return Err(syn::Error::new_spanned(
                     variant,
-                    "#[derive(Attr)] supports unit variants, variants with named fields, and \
-                     variants that hold one attribute group",
-                ))
+                    "a variant without a format has no fields, named fields, or one attribute \
+                     group",
+                ));
+            }
+            let group = &unnamed.unnamed[0].ty;
+            print_arms.push(quote! {
+                Self::#ident(group) => {
+                    out.push_str(#text);
+                    let mut attrs = ::std::vec::Vec::new();
+                    ::gpt_rs_ir::attr::AttrGroup::print_attrs(group, &mut attrs);
+                    let params: ::std::vec::Vec<::std::string::String> = attrs
+                        .into_iter()
+                        .map(|(key, value)| format!("{} = {}", key, value))
+                        .collect();
+                    if !params.is_empty() {
+                        out.push('<');
+                        out.push_str(&params.join(", "));
+                        out.push('>');
+                    }
+                }
+            });
+            leading.push((text.clone(), ident));
+            let peek = quote!(c.peek_is(#text));
+            parse_arms.push(quote! {
+                if #peek {
+                    c.next_token();
+                    return ::std::result::Result::Ok(Self::#ident(
+                        <#group as ::gpt_rs_ir::attr::AttrGroup>::parse_params(#text, c)?,
+                    ));
+                }
+            });
+            peeks.push(peek);
+            continue;
+        }
+        let fields = format_fields(&variant.fields)?;
+        let compiled = match &format {
+            Some(format) => {
+                entries.push(format_entry(
+                    &format!("{type_name}::{ident}"),
+                    format,
+                    &variant.fields,
+                ));
+                format::compile(format, &fields, &text, false)?
+            }
+            None => {
+                let mut elements = vec![format::Element::Literal(text.clone())];
+                if !fields.is_empty() {
+                    let all: Vec<usize> = (0..fields.len()).collect();
+                    let optional = fields.iter().all(|field| field.has_default());
+                    let params = vec![
+                        format::Element::Literal("<".into()),
+                        format::Element::Struct {
+                            fields: all,
+                            anchor: optional,
+                        },
+                        format::Element::Literal(">".into()),
+                    ];
+                    if optional {
+                        elements.push(format::Element::Optional(params));
+                    } else {
+                        elements.extend(params);
+                    }
+                }
+                format::compile_elements(&elements, &fields, &text, ident.span(), false)?
             }
         };
-        let idents: Vec<&Ident> = fields.iter().map(|f| &f.ident).collect();
-        let keys: Vec<&String> = fields.iter().map(|f| &f.key).collect();
-        let types: Vec<&SynType> = fields.iter().map(|f| &f.ty).collect();
-        name_arms.push(quote! { Self::#ident { .. } => #text });
-        let prints = fields.iter().map(|f| {
-            let (ident, key) = (&f.ident, &f.key);
-            let print = quote! {
-                let mut value = ::std::string::String::new();
-                ::gpt_rs_ir::attr::Attr::print(#ident, &mut value);
-                params.push(format!("{} = {}", #key, value));
-            };
-            if f.default {
-                quote! { if *#ident != ::std::default::Default::default() { #print } }
-            } else {
-                print
-            }
-        });
+        let format::Compiled {
+            print,
+            parse,
+            peek,
+            leading: first,
+        } = compiled;
+        if let Some(first) = first {
+            leading.push((first, ident));
+        }
         print_arms.push(quote! {
-            Self::#ident { #(#idents),* } => { #(#prints)* }
-        });
-        let finish = fields.iter().map(|f| {
-            let (ident, key) = (&f.ident, &f.key);
-            if f.default {
-                quote! { #ident: #ident.unwrap_or_default() }
-            } else {
-                quote! {
-                    #ident: #ident.ok_or_else(|| c.error(format!("{} needs {}", #text, #key)))?
-                }
+            #bound => {
+                #print
             }
         });
         parse_arms.push(quote! {
-            #text => {
-                #(let mut #idents: ::std::option::Option<#types> = None;)*
-                if c.eat("<") {
-                    c.list(">", |c| -> ::anyhow::Result<()> {
-                        let key = c.ident()?;
-                        c.expect("=")?;
-                        match key {
-                            #(#keys => {
-                                #idents = Some(<#types as ::gpt_rs_ir::attr::Attr>::parse(c)?);
-                                Ok(())
-                            })*
-                            other => Err(c.error(format!("{} has no parameter `{}`", #text, other))),
-                        }
-                    })?;
-                }
-                Ok(Self::#ident { #(#finish),* })
+            if #peek {
+                #parse
+                return ::std::result::Result::Ok(#bound);
             }
         });
+        peeks.push(peek);
     }
+    for (index, (first, ident)) in leading.iter().enumerate() {
+        if let Some((_, earlier)) = leading[..index].iter().find(|(other, _)| other == first) {
+            return Err(syn::Error::new(
+                ident.span(),
+                format!("the variants `{earlier}` and `{ident}` both start with `{first}`"),
+            ));
+        }
+    }
+    // A name no variant has is an unknown value, and any other token is out of place.
+    let what = words(&type_name);
+    let unknown = quote! {
+        if c.peek_kind(::gpt_rs_ir::text::TokenKind::Ident) {
+            return ::std::result::Result::Err(
+                c.error(format!("unknown {} `{}`", #what, c.peek().text)),
+            );
+        }
+        ::std::result::Result::Err(c.unexpected(concat!("a ", #what)))
+    };
+    let attr = attr_impl(
+        input,
+        quote! {
+            match self {
+                #(#print_arms)*
+            }
+        },
+        quote! {
+            #(#parse_arms)*
+            #unknown
+        },
+        quote!(#(#peeks)||*),
+    );
+    let display = display_impl(input);
+    // `name()` is the name of a variant that its text starts with, when every variant has one.
+    let names = if any_format {
+        quote!()
+    } else {
+        let name = &input.ident;
+        quote! {
+            impl #name {
+                /// The name of the variant in the text form, without its fields.
+                pub fn name(&self) -> &'static str {
+                    match self { #(#name_arms),* }
+                }
+            }
+        }
+    };
     Ok(quote! {
-        impl #name {
-            /// The name of the variant in the text form, without its fields.
-            pub fn name(&self) -> &'static str {
-                match self { #(#name_arms),* }
-            }
-        }
-
-        impl ::std::fmt::Display for #name {
-            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-                let mut text = ::std::string::String::new();
-                ::gpt_rs_ir::attr::Attr::print(self, &mut text);
-                f.write_str(&text)
-            }
-        }
-
-        impl ::gpt_rs_ir::attr::Attr for #name {
-            fn print(&self, out: &mut ::std::string::String) {
-                out.push_str(self.name());
-                let mut params: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
-                match self { #(#print_arms)* }
-                if !params.is_empty() {
-                    out.push('<');
-                    out.push_str(&params.join(", "));
-                    out.push('>');
-                }
-            }
-
-            fn parse(c: &mut ::gpt_rs_ir::text::Cursor<'_>) -> ::anyhow::Result<Self> {
-                let name = c.ident()?;
-                match name {
-                    #(#parse_arms)*
-                    other => Err(c.error(format!("unknown {} `{}`", #type_name, other))),
-                }
-            }
-        }
+        #attr
+        #display
+        #names
+        #(#entries)*
     })
 }
 
@@ -287,6 +568,7 @@ fn trait_slice(exprs: &[Expr]) -> TokenStream2 {
 enum KindSpec {
     Any,
     Tensor,
+    Buffer,
     Index,
     Scalar,
 }
@@ -362,13 +644,14 @@ fn parse_kind(input: ParseStream) -> syn::Result<(KindSpec, AritySpec)> {
     let kind = match ident.to_string().as_str() {
         "Any" => KindSpec::Any,
         "Tensor" => KindSpec::Tensor,
+        "Buffer" => KindSpec::Buffer,
         "Index" => KindSpec::Index,
         "Scalar" => KindSpec::Scalar,
         other => {
             return Err(syn::Error::new(
                 ident.span(),
                 format!(
-                    "unknown kind `{other}`, expected Any, Tensor, Index, Scalar, \
+                    "unknown kind `{other}`, expected Any, Tensor, Buffer, Index, Scalar, \
                      Optional(..) or Variadic(..)"
                 ),
             ))
@@ -528,20 +811,70 @@ struct FieldSpec {
     ident: Ident,
     key: String,
     ty: SynType,
-    default: bool,
+    /// The value the text form leaves out: `#[attr(default)]`, the type's default, or
+    /// `#[attr(default = expr)]`.
+    default: Option<TokenStream2>,
+    /// On a field of a symbol op, `#[attr(arg(key))]` or `#[attr(result(key))]`: the attribute
+    /// `key` of each argument or result, written after its type.
+    each: Option<(Each, String)>,
+}
+
+/// What a per-item attribute of a symbol op is written after.
+#[derive(Clone, Copy, PartialEq)]
+enum Each {
+    Arg,
+    Result,
+}
+
+/// What the attributes of a field say: `#[attr(default)]`, `#[attr(default = expr)]`,
+/// `#[attr(arg(key))]` and `#[attr(result(key))]`.
+#[derive(Default)]
+struct FieldAttrs {
+    default: Option<TokenStream2>,
+    each: Option<(Each, String)>,
+}
+
+fn field_attrs(field: &syn::Field) -> syn::Result<FieldAttrs> {
+    let ty = &field.ty;
+    let mut default = None;
+    let mut each = None;
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("attr")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("default") {
+                default = Some(match meta.value() {
+                    Ok(value) => {
+                        let expr: Expr = value.parse()?;
+                        quote!(#expr)
+                    }
+                    Err(_) => quote!(<#ty as ::std::default::Default>::default()),
+                });
+                return Ok(());
+            }
+            let role = if meta.path.is_ident("arg") {
+                Each::Arg
+            } else if meta.path.is_ident("result") {
+                Each::Result
+            } else {
+                return Err(meta.error(
+                    "expected #[attr(default)], #[attr(default = ..)], #[attr(arg(key))] or \
+                     #[attr(result(key))]",
+                ));
+            };
+            meta.parse_nested_meta(|key| {
+                let key = key
+                    .path
+                    .get_ident()
+                    .ok_or_else(|| key.error("expected the attribute's name"))?;
+                each = Some((role, key.to_string()));
+                Ok(())
+            })
+        })?;
+    }
+    Ok(FieldAttrs { default, each })
 }
 
 fn field_spec(field: &syn::Field) -> syn::Result<FieldSpec> {
-    let mut default = false;
-    for attr in field.attrs.iter().filter(|a| a.path().is_ident("attr")) {
-        attr.parse_nested_meta(|meta| {
-            if !meta.path.is_ident("default") {
-                return Err(meta.error("expected #[attr(default)]"));
-            }
-            default = true;
-            Ok(())
-        })?;
-    }
+    let FieldAttrs { default, each } = field_attrs(field)?;
     let Some(ident) = field.ident.clone() else {
         return Err(syn::Error::new_spanned(
             field,
@@ -553,6 +886,7 @@ fn field_spec(field: &syn::Field) -> syn::Result<FieldSpec> {
         ident,
         ty: field.ty.clone(),
         default,
+        each,
     })
 }
 
@@ -572,6 +906,7 @@ fn kind_tokens(kind: KindSpec) -> TokenStream2 {
     match kind {
         KindSpec::Any => quote!(::gpt_rs_ir::op::Kind::Any),
         KindSpec::Tensor => quote!(::gpt_rs_ir::op::Kind::Tensor),
+        KindSpec::Buffer => quote!(::gpt_rs_ir::op::Kind::Buffer),
         KindSpec::Index => quote!(::gpt_rs_ir::op::Kind::Index),
         KindSpec::Scalar => quote!(::gpt_rs_ir::op::Kind::Scalar),
     }
@@ -582,6 +917,7 @@ fn element_type(kind: KindSpec) -> TokenStream2 {
     match kind {
         KindSpec::Any => quote!(<V as ::gpt_rs_ir::op::View>::Any),
         KindSpec::Tensor => quote!(<V as ::gpt_rs_ir::op::View>::Tensor),
+        KindSpec::Buffer => quote!(<V as ::gpt_rs_ir::op::View>::Buffer),
         KindSpec::Index => quote!(<V as ::gpt_rs_ir::op::View>::Index),
         KindSpec::Scalar => quote!(<V as ::gpt_rs_ir::op::View>::Scalar),
     }
@@ -592,6 +928,7 @@ fn project(kind: KindSpec) -> TokenStream2 {
     match kind {
         KindSpec::Any => quote!(::std::option::Option::Some),
         KindSpec::Tensor => quote!(<V as ::gpt_rs_ir::op::View>::tensor),
+        KindSpec::Buffer => quote!(<V as ::gpt_rs_ir::op::View>::buffer),
         KindSpec::Index => quote!(<V as ::gpt_rs_ir::op::View>::index),
         KindSpec::Scalar => quote!(<V as ::gpt_rs_ir::op::View>::scalar),
     }
@@ -602,6 +939,7 @@ fn embed(kind: KindSpec) -> TokenStream2 {
     match kind {
         KindSpec::Any => quote!((|x| x)),
         KindSpec::Tensor => quote!(<V as ::gpt_rs_ir::op::Embed>::from_tensor),
+        KindSpec::Buffer => quote!(<V as ::gpt_rs_ir::op::Embed>::from_buffer),
         KindSpec::Index => quote!(<V as ::gpt_rs_ir::op::Embed>::from_index),
         KindSpec::Scalar => quote!(<V as ::gpt_rs_ir::op::Embed>::from_scalar),
     }
@@ -1167,77 +1505,408 @@ struct AttrCode {
     infos: Vec<TokenStream2>,
 }
 
-fn attr_code(fields: &[FieldSpec], (open, close): (&str, &str)) -> AttrCode {
-    // `parse` reads each field into a local `<field>_slot`. The suffix keeps a field named `c`,
-    // `name` or `key` from shadowing a local of `parse`.
-    let slot_of = |f: &FieldSpec| format_ident!("{}_slot", f.ident);
-    let prints = fields.iter().map(|f| {
-        let (fid, key, ty) = (&f.ident, &f.key, &f.ty);
-        let skip = if f.default {
-            quote!(self.#fid == <#ty as ::std::default::Default>::default())
-        } else {
-            quote!(false)
+/// Where attributes held in named fields are written.
+#[derive(Clone, Copy, PartialEq)]
+enum AttrForm {
+    /// The dictionary of an op, `{key = value, ...}`. The parser hands a key no field has to the
+    /// callback `other_attr`.
+    Dict,
+    /// The parameters after the name of a variant, `<key = value, ...>`.
+    Params,
+}
+
+/// The `key = value` entries of `fields`.
+fn field_entries(fields: &[&FieldSpec]) -> Vec<format::Entry> {
+    let mut entries = Vec::with_capacity(fields.len());
+    for field in fields {
+        entries.push(format::Entry {
+            key: field.key.clone(),
+            ty: field.ty.clone(),
+            default: field.default.clone(),
+        });
+    }
+    entries
+}
+
+fn attr_code(fields: &[FieldSpec], form: AttrForm) -> AttrCode {
+    let prints = fields.iter().map(|field| {
+        let (ident, key) = (&field.ident, &field.key);
+        let skip = match &field.default {
+            Some(default) => quote!(self.#ident == #default),
+            None => quote!(false),
         };
         quote! {
             if !(#skip) {
                 let mut text = ::std::string::String::new();
-                ::gpt_rs_ir::attr::Attr::print(&self.#fid, &mut text);
+                ::gpt_rs_ir::attr::Attr::print(&self.#ident, &mut text);
                 out.push((#key, text));
             }
         }
     });
-    let slot_decls = fields.iter().map(|f| {
-        let (slot, ty) = (slot_of(f), &f.ty);
-        quote!(let mut #slot: ::std::option::Option<#ty> = ::std::option::Option::None;)
-    });
-    let key_arms = fields.iter().map(|f| {
-        let (slot, key, ty) = (slot_of(f), &f.key, &f.ty);
-        quote! {
-            #key => {
-                if #slot.is_some() {
-                    ::anyhow::bail!(c.error(format!("duplicate attribute `{}`", #key)));
-                }
-                #slot = ::std::option::Option::Some(<#ty as ::gpt_rs_ir::attr::Attr>::parse(c)?);
-            }
-        }
-    });
-    let field_inits = fields.iter().map(|f| {
-        let (fid, key, slot) = (&f.ident, &f.key, slot_of(f));
-        if f.default {
-            quote!(#fid: #slot.unwrap_or_default())
-        } else {
-            quote!(#fid: #slot.ok_or_else(|| c.error(format!("{} needs attribute `{}`", name, #key)))?)
-        }
-    });
     let infos = fields
         .iter()
-        .map(|f| {
-            let (key, ty, default) = (&f.key, &f.ty, f.default);
-            let ty_text = quote!(#ty).to_string().replace(' ', "");
-            quote!(::gpt_rs_ir::op::AttrInfo { name: #key, ty: #ty_text, default: #default })
+        .map(|field| {
+            let (key, ty, default) = (&field.key, &field.ty, field.default.is_some());
+            quote! {
+                ::gpt_rs_ir::op::AttrInfo {
+                    name: #key,
+                    type_name: <#ty as ::gpt_rs_ir::attr::Attr>::type_name,
+                    item: <#ty as ::gpt_rs_ir::attr::Attr>::ITEM,
+                    default: #default,
+                }
+            }
         })
         .collect();
+    let all: Vec<&FieldSpec> = fields.iter().collect();
+    let entries = field_entries(&all);
+    let owner = quote!(name);
+    let (kind, unknown) = match form {
+        AttrForm::Dict => ("attribute", Some(quote!(other_attr(key, c, at)?))),
+        AttrForm::Params => ("parameter", None),
+    };
+    let (slots, reader) = format::read_entries(&entries, &owner, kind, unknown);
+    let read = match form {
+        AttrForm::Dict => quote!(::gpt_rs_ir::attr::parse_dict(c, #reader)?;),
+        AttrForm::Params => quote! {
+            if c.eat("<") {
+                ::gpt_rs_ir::attr::parse_entries(c, #reader)?;
+                c.expect(">")?;
+            }
+        },
+    };
+    let inits = fields.iter().zip(&entries).map(|(field, entry)| {
+        let ident = &field.ident;
+        let value = format::entry_value(entry, &owner, kind);
+        quote!(#ident: #value)
+    });
     AttrCode {
         print: quote!(#(#prints)*),
         parse: quote! {
             (|| -> ::anyhow::Result<Self> {
-                #(#slot_decls)*
-                if c.eat(#open) {
-                    c.list(#close, |c| {
-                        let key = c.ident()?;
-                        c.expect("=")?;
-                        match key {
-                            #(#key_arms)*
-                            other => c.segment_attr(name, other)?,
-                        }
-                        ::std::result::Result::Ok(())
-                    })?;
-                }
-                ::std::result::Result::Ok(Self { #(#field_inits,)* })
+                #slots
+                #read
+                ::std::result::Result::Ok(Self { #(#inits,)* })
             })()
         },
         infos,
     }
+}
+
+/// `T` when `ty` is `Vec<T>`.
+fn vec_item(ty: &SynType) -> Option<&SynType> {
+    let SynType::Path(path) = ty else {
+        return None;
+    };
+    let segment = path.path.segments.last()?;
+    if segment.ident != "Vec" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+    match args.args.first()? {
+        syn::GenericArgument::Type(item) => Some(item),
+        _ => None,
+    }
+}
+
+/// `impl SymbolOp` for a symbol op with the attributes `fields`: its signature is
+/// `@name(%a: T {key = value}, ...) -> (T {key = value}, ...) attributes {key = value, ...}`.
+///
+/// The field `name: String` is the symbol, `args: Vec<Type>` the argument types and
+/// `results: Vec<Type>`, when the op has it, the result types. A field with
+/// `#[attr(arg(key))]` or `#[attr(result(key))]` holds the attribute `key` of each argument or
+/// result: a `Vec<Option<T>>`, empty when no item has one, or a `Vec<T>`, empty or with one per
+/// item. Results with attributes are written in parentheses, since `{` after one bare type opens
+/// the body. The other fields are the attributes after `attributes`.
+fn symbol_impl(ident: &Ident, op_name: &LitStr, fields: &[FieldSpec]) -> syn::Result<TokenStream2> {
+    let has = |key: &str| fields.iter().any(|field| field.key == key);
+    if !has("name") || !has("args") {
+        return Err(syn::Error::new(
+            ident.span(),
+            "a symbol op has the fields `name: String` and `args: Vec<Type>`",
+        ));
+    }
+    let has_results = has("results");
+    let attr_trait = quote!(::gpt_rs_ir::attr::Attr);
+    // A per-item attribute: its field, its key, the type of one item's value, whether an item
+    // may lack it, whether it is per argument or per result, and the local of the items read.
+    struct ItemAttr<'a> {
+        field: &'a FieldSpec,
+        key: &'a str,
+        item: &'a SynType,
+        optional: bool,
+        role: Each,
+        items: Ident,
+    }
+    let mut item_attrs: Vec<ItemAttr> = Vec::new();
+    let mut others: Vec<&FieldSpec> = Vec::new();
+    for field in fields {
+        if matches!(field.key.as_str(), "name" | "args" | "results") {
+            continue;
+        }
+        let Some((role, key)) = &field.each else {
+            others.push(field);
+            continue;
+        };
+        if *role == Each::Result && !has_results {
+            return Err(syn::Error::new(
+                field.ident.span(),
+                "an attribute per result needs the field `results`",
+            ));
+        }
+        let element = vec_item(&field.ty).ok_or_else(|| {
+            syn::Error::new(field.ident.span(), "an attribute per item is a `Vec`")
+        })?;
+        let (item, optional) = match format::option_inner(element) {
+            Some(inner) => (inner, true),
+            None => (element, false),
+        };
+        item_attrs.push(ItemAttr {
+            field,
+            key,
+            item,
+            optional,
+            role: *role,
+            items: format_ident!("{}_items", field.ident),
+        });
+    }
+    let of = |role: Each| -> Vec<&ItemAttr> {
+        let mut out = Vec::new();
+        for attr in &item_attrs {
+            if attr.role == role {
+                out.push(attr);
+            }
+        }
+        out
+    };
+    let (arg_attrs, result_attrs) = (of(Each::Arg), of(Each::Result));
+
+    // Prints the entries of item `index`, ` {key = value}`, after its type.
+    let print_item_attrs = |attrs: &[&ItemAttr], out: TokenStream2| {
+        let prints = attrs.iter().map(|attr| {
+            let (field, key) = (&attr.field.ident, attr.key);
+            let pattern = if attr.optional {
+                quote!(::std::option::Option::Some(::std::option::Option::Some(
+                    value
+                )))
+            } else {
+                quote!(::std::option::Option::Some(value))
+            };
+            quote! {
+                if let #pattern = self.#field.get(index) {
+                    let mut text = ::std::string::String::from(concat!(#key, " = "));
+                    #attr_trait::print(value, &mut text);
+                    entries.push(text);
+                }
+            }
+        });
+        quote! {
+            let mut entries: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
+            #(#prints)*
+            #out.push_str(&::gpt_rs_ir::text::item_attrs_text(&entries));
+        }
+    };
+    // Reads the optional `{key = value}` after an item, and keeps each attribute's value.
+    let read_item_attrs = |attrs: &[&ItemAttr], what: &str| {
+        let mut entries = Vec::with_capacity(attrs.len());
+        for attr in attrs {
+            entries.push(format::Entry {
+                key: attr.key.to_string(),
+                ty: attr.item.clone(),
+                default: None,
+            });
+        }
+        let owner = quote!(concat!(#op_name, " ", #what));
+        let (slots, reader) = format::read_entries(&entries, &owner, "attribute", None);
+        let pushes = attrs.iter().zip(&entries).map(|(attr, entry)| {
+            let (items, slot) = (&attr.items, entry.slot());
+            quote!(#items.push(#slot);)
+        });
+        quote! {
+            #slots
+            ::gpt_rs_ir::attr::parse_dict(c, #reader)?;
+            #(#pushes)*
+        }
+    };
+    let declare_items = item_attrs.iter().map(|attr| {
+        let (items, item) = (&attr.items, attr.item);
+        quote! {
+            let mut #items: ::std::vec::Vec<::std::option::Option<#item>> = ::std::vec::Vec::new();
+        }
+    });
+    let build_items = item_attrs.iter().map(|attr| {
+        let (field, items, key) = (&attr.field.ident, &attr.items, attr.key);
+        let (at, what) = match attr.role {
+            Each::Arg => (quote!(args_at), "arguments"),
+            Each::Result => (quote!(results_at), "results"),
+        };
+        if attr.optional {
+            quote!(let #field = ::gpt_rs_ir::text::any_items(#items);)
+        } else {
+            quote! {
+                let #field = ::gpt_rs_ir::text::every_item(#items, #key, #what)
+                    .map_err(|err| c.error_at(#at, err))?;
+            }
+        }
+    });
+
+    let print_arg_attrs = print_item_attrs(&arg_attrs, quote!(out));
+    let read_arg_attrs = read_item_attrs(&arg_attrs, "argument");
+    let print_results = if has_results {
+        let print_result_attrs = print_item_attrs(&result_attrs, quote!(text));
+        quote! {
+            let mut items: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
+            let mut attributed = false;
+            for (index, ty) in self.results.iter().enumerate() {
+                let mut text = ::std::string::String::new();
+                #attr_trait::print(ty, &mut text);
+                let before = text.len();
+                #print_result_attrs
+                attributed |= text.len() > before;
+                items.push(text);
+            }
+            out.push_str(" -> ");
+            if items.len() == 1 && !attributed {
+                out.push_str(&items[0]);
+            } else {
+                out.push('(');
+                out.push_str(&items.join(", "));
+                out.push(')');
+            }
+        }
+    } else {
+        quote!()
+    };
+    let read_results = if has_results {
+        let read_result_attrs = read_item_attrs(&result_attrs, "result");
+        let no_attrs = result_attrs.iter().map(|attr| {
+            let items = &attr.items;
+            quote!(#items.push(::std::option::Option::None);)
+        });
+        quote! {
+            c.expect("->")?;
+            results_at = c.position();
+            let results: ::std::vec::Vec<::gpt_rs_ir::types::Type> = if c.eat("(") {
+                c.list(")", |c| {
+                    let ty = <::gpt_rs_ir::types::Type as #attr_trait>::parse(c)?;
+                    #read_result_attrs
+                    ::std::result::Result::Ok(ty)
+                })?
+            } else {
+                #(#no_attrs)*
+                ::std::vec![<::gpt_rs_ir::types::Type as #attr_trait>::parse(c)?]
+            };
+        }
+    } else {
+        quote!()
+    };
+    let results_init = if has_results {
+        quote!(results,)
+    } else {
+        quote!()
+    };
+
+    // The other fields, as the dictionary after `attributes`.
+    let print_others = others.iter().map(|field| {
+        let (ident, key) = (&field.ident, &field.key);
+        let skip = match &field.default {
+            Some(default) => quote!(self.#ident == #default),
+            None => quote!(false),
+        };
+        quote! {
+            if !(#skip) {
+                let mut text = ::std::string::String::from(concat!(#key, " = "));
+                #attr_trait::print(&self.#ident, &mut text);
+                entries.push(text);
+            }
+        }
+    });
+    let other_entries = field_entries(&others);
+    let owner = quote!(#op_name);
+    let (other_slots, other_reader) =
+        format::read_entries(&other_entries, &owner, "attribute", None);
+    let other_inits = others.iter().zip(&other_entries).map(|(field, entry)| {
+        let ident = &field.ident;
+        let value = format::entry_value(entry, &owner, "attribute");
+        quote!(#ident: #value,)
+    });
+    let item_fields = item_attrs.iter().map(|attr| &attr.field.ident);
+
+    Ok(quote! {
+        impl ::gpt_rs_ir::op::SymbolOp for #ident {
+            fn symbol(&self) -> &str {
+                &self.name
+            }
+
+            fn print_signature(&self, arg_names: &[::std::string::String], out: &mut ::std::string::String) {
+                out.push('@');
+                out.push_str(&self.name);
+                out.push('(');
+                for (index, ty) in self.args.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(&arg_names[index]);
+                    out.push_str(": ");
+                    #attr_trait::print(ty, out);
+                    #print_arg_attrs
+                }
+                out.push(')');
+                #print_results
+                let mut entries: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
+                #(#print_others)*
+                if !entries.is_empty() {
+                    out.push_str(" attributes {");
+                    out.push_str(&entries.join(", "));
+                    out.push('}');
+                }
+            }
+
+            #[allow(unreachable_code)]
+            fn parse_signature(
+                c: &mut ::gpt_rs_ir::text::Cursor<'_>,
+            ) -> ::anyhow::Result<::gpt_rs_ir::op::ParsedSymbol<Self>> {
+                let name = c
+                    .sigil_name(::gpt_rs_ir::text::TokenKind::Symbol, "a symbol")?
+                    .to_string();
+                #(#declare_items)*
+                c.expect("(")?;
+                let args_at = c.position();
+                let mut results_at = args_at;
+                let named = c.list(")", |c| {
+                    let at = c.position();
+                    let arg = c
+                        .sigil_name(::gpt_rs_ir::text::TokenKind::Value, "an argument")?
+                        .to_string();
+                    c.expect(":")?;
+                    let ty = <::gpt_rs_ir::types::Type as #attr_trait>::parse(c)?;
+                    #read_arg_attrs
+                    ::std::result::Result::Ok(::gpt_rs_ir::op::NamedArg { name: arg, at, ty })
+                })?;
+                #read_results
+                #other_slots
+                if c.eat("attributes") {
+                    c.expect("{")?;
+                    ::gpt_rs_ir::attr::parse_entries(c, #other_reader)?;
+                    c.expect("}")?;
+                }
+                #(#build_items)*
+                let mut args = ::std::vec::Vec::with_capacity(named.len());
+                for arg in &named {
+                    args.push(arg.ty.clone());
+                }
+                let op = Self {
+                    name,
+                    args,
+                    #results_init
+                    #(#item_fields,)*
+                    #(#other_inits)*
+                };
+                ::std::result::Result::Ok((op, named))
+            }
+        }
+    })
 }
 
 /// Expands `#[op]` on `input`, an op of `family` when it is in one.
@@ -1349,12 +2018,12 @@ fn expand_op_in(
                 print,
                 parse,
                 infos,
-            } = attr_code(fields, ("{", "}"));
+            } = attr_code(fields, AttrForm::Dict);
             (print, parse, quote!(&[#(#infos),*]), quote!())
         }
         AttrSource::Group(group) => (
             quote!(<#group as ::gpt_rs_ir::attr::AttrGroup>::print_attrs(&self.0, out)),
-            quote!(<#group as ::gpt_rs_ir::attr::AttrGroup>::parse_attrs(name, c).map(Self)),
+            quote!(<#group as ::gpt_rs_ir::attr::AttrGroup>::parse_attrs(name, c, other_attr).map(Self)),
             quote!(<#group as ::gpt_rs_ir::attr::AttrGroup>::INFOS),
             quote! {
                 impl ::std::ops::Deref for #ident {
@@ -1431,6 +2100,16 @@ fn expand_op_in(
     } else {
         quote!()
     };
+    let symbol_impl = match (&attrs, symbol) {
+        (AttrSource::Fields(fields), true) => symbol_impl(ident, op_name, fields)?,
+        (AttrSource::Group(_), true) => {
+            return Err(syn::Error::new(
+                op_name.span(),
+                "a symbol op has named fields: its name, arguments and attributes",
+            ))
+        }
+        (_, false) => quote!(),
+    };
     let (symbol_hook, parse_symbol) = if symbol {
         (
             quote! {
@@ -1469,6 +2148,7 @@ fn expand_op_in(
         #declare_regions
         #attrs_deref
         #family_impls
+        #symbol_impl
 
         impl ::gpt_rs_ir::op::OpKind for #ident {
             type Groups = #groups;
@@ -1512,6 +2192,7 @@ fn expand_op_in(
             fn parse(
                 name: &str,
                 c: &mut ::gpt_rs_ir::text::Cursor<'_>,
+                other_attr: &mut dyn FnMut(&str, &mut ::gpt_rs_ir::text::Cursor<'_>, usize) -> ::anyhow::Result<()>,
             ) -> ::std::option::Option<::anyhow::Result<Self>> {
                 if name != #op_name {
                     return ::std::option::Option::None;
@@ -1588,6 +2269,7 @@ fn group_tokens(group: &GroupSpec) -> TokenStream2 {
     let kind = match group.kind {
         KindSpec::Any => quote!(Any),
         KindSpec::Tensor => quote!(Tensor),
+        KindSpec::Buffer => quote!(Buffer),
         KindSpec::Index => quote!(Index),
         KindSpec::Scalar => quote!(Scalar),
     };
@@ -1885,8 +2567,8 @@ fn expand_attr_group(input: &DeriveInput) -> syn::Result<TokenStream2> {
         print,
         parse,
         infos,
-    } = attr_code(&fields, ("{", "}"));
-    let params = attr_code(&fields, ("<", ">")).parse;
+    } = attr_code(&fields, AttrForm::Dict);
+    let params = attr_code(&fields, AttrForm::Params).parse;
     Ok(quote! {
         impl #impl_generics ::gpt_rs_ir::attr::AttrGroup for #ident #ty_generics #where_clause {
             const INFOS: &'static [::gpt_rs_ir::op::AttrInfo] = &[#(#infos),*];
@@ -1898,6 +2580,7 @@ fn expand_attr_group(input: &DeriveInput) -> syn::Result<TokenStream2> {
             fn parse_attrs(
                 name: &str,
                 c: &mut ::gpt_rs_ir::text::Cursor<'_>,
+                other_attr: &mut dyn FnMut(&str, &mut ::gpt_rs_ir::text::Cursor<'_>, usize) -> ::anyhow::Result<()>,
             ) -> ::anyhow::Result<Self> {
                 #parse
             }
@@ -2064,9 +2747,10 @@ fn expand_dialect(input: &DeriveInput) -> syn::Result<TokenStream2> {
             pub fn parse(
                 name: &str,
                 c: &mut ::gpt_rs_ir::text::Cursor<'_>,
+                other_attr: &mut dyn FnMut(&str, &mut ::gpt_rs_ir::text::Cursor<'_>, usize) -> ::anyhow::Result<()>,
             ) -> ::std::option::Option<::anyhow::Result<Self>> {
                 #(
-                    if let ::std::option::Option::Some(result) = <#tys as #op_kind>::parse(name, c) {
+                    if let ::std::option::Option::Some(result) = <#tys as #op_kind>::parse(name, c, other_attr) {
                         return ::std::option::Option::Some(result.map(|op| Self::#variants(#wrap)));
                     }
                 )*
@@ -2279,9 +2963,10 @@ fn expand_dialect_set(input: &DeriveInput) -> syn::Result<TokenStream2> {
             pub fn parse(
                 name: &str,
                 c: &mut ::gpt_rs_ir::text::Cursor<'_>,
+                other_attr: &mut dyn FnMut(&str, &mut ::gpt_rs_ir::text::Cursor<'_>, usize) -> ::anyhow::Result<()>,
             ) -> ::std::option::Option<::anyhow::Result<Self>> {
                 #(
-                    if let ::std::option::Option::Some(result) = <#tys>::parse(name, c) {
+                    if let ::std::option::Option::Some(result) = <#tys>::parse(name, c, other_attr) {
                         return ::std::option::Option::Some(result.map(Self::#variants));
                     }
                 )*
@@ -2489,10 +3174,14 @@ fn expand_pass(args: PassArgs, input: DeriveInput) -> syn::Result<TokenStream2> 
         .map(|(f, ty, _)| format!("{f}: {}", quote!(#ty).to_string().replace(' ', "")))
         .collect::<Vec<_>>()
         .join(", ");
-    let set_arms = options.iter().map(|(f, ty, _)| {
-        let key = f.to_string();
-        quote!(#key => pass.#f = <#ty as ::gpt_rs_ir::attr::Attr>::parse(c)?,)
-    });
+    let mut option_entries = Vec::with_capacity(options.len());
+    for (option, ty, _) in &options {
+        option_entries.push(format::Entry {
+            key: option.to_string(),
+            ty: (*ty).clone(),
+            default: None,
+        });
+    }
     let print_changed = options.iter().map(|(f, ty, _)| {
         let key = f.to_string();
         quote! {
@@ -2535,20 +3224,29 @@ fn expand_pass(args: PassArgs, input: DeriveInput) -> syn::Result<TokenStream2> 
             }
         }
     } else {
-        quote! {
-            if c.eat("{") {
-                c.list("}", |c| {
-                    let key = c.ident()?;
-                    c.expect("=")?;
-                    match key {
-                        #(#set_arms)*
-                        other => return ::std::result::Result::Err(c.error(format!(
-                            "pass `{}` has no option `{other}`; its options: {}", #name, #option_list
-                        ))),
+        let owner = quote!(concat!("pass `", #name, "`"));
+        let unknown = quote! {
+            ::anyhow::bail!(c.error_at(at, format!(
+                "pass `{}` has no option `{key}`; its options: {}", #name, #option_list
+            )))
+        };
+        let (slots, reader) =
+            format::read_entries(&option_entries, &owner, "option", Some(unknown));
+        let sets = options
+            .iter()
+            .zip(&option_entries)
+            .map(|((option, _, _), entry)| {
+                let slot = entry.slot();
+                quote! {
+                    if let ::std::option::Option::Some(value) = #slot {
+                        pass.#option = value;
                     }
-                    ::std::result::Result::Ok(())
-                })?;
-            }
+                }
+            });
+        quote! {
+            #slots
+            ::gpt_rs_ir::attr::parse_dict(c, #reader)?;
+            #(#sets)*
         }
     };
     let options_body = if options.is_empty() {
@@ -2792,6 +3490,7 @@ fn expand_fold(args: TokenStream2, item: syn::ItemImpl) -> syn::Result<TokenStre
         #[linkme(crate = ::gpt_rs_ir::linkme)]
         static #entry: ::gpt_rs_ir::op::FoldEntry = ::gpt_rs_ir::op::FoldEntry {
             op: ::std::any::TypeId::of::<#ty>,
+            name: <#ty as ::gpt_rs_ir::op::OpKind>::INFO.name,
             rust: #name,
             file: ::std::file!(),
             doc: #doc,

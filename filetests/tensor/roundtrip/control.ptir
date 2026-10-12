@@ -28,12 +28,12 @@ func.func @cond(%pred: tensor<i1>, %input: tensor<4xf32>) -> tensor<4xf32> {
 // CHECK: func.func @while([[COUNTER:%[0-9]+]]: tensor<si32>, [[STATE:%[0-9]+]]: tensor<4xf32>) -> (tensor<si32>, tensor<4xf32>) {
 // CHECK-NEXT: [[FINAL_COUNTER:%[0-9]+]], [[FINAL_STATE:%[0-9]+]] = tensor.while([[COUNTER]], [[STATE]]) ({
 // CHECK-NEXT: ^cond([[COND_COUNTER:%[0-9]+]]: tensor<si32>, [[COND_STATE:%[0-9]+]]: tensor<4xf32>):
-// CHECK-NEXT: [[LIMIT:%[0-9]+]] = tensor.constant() {value = dense<[] x si32: 10>} : () -> tensor<si32>
+// CHECK-NEXT: [[LIMIT:%[0-9]+]] = tensor.constant() {value = dense<si32: 10>} : () -> tensor<si32>
 // CHECK-NEXT: [[KEEP_GOING:%[0-9]+]] = tensor.less([[COND_COUNTER]], [[LIMIT]]) : (tensor<si32>, tensor<si32>) -> tensor<i1>
 // CHECK-NEXT: tensor.yield([[KEEP_GOING]], [[COND_COUNTER]], [[COND_STATE]]) : (tensor<i1>, tensor<si32>, tensor<4xf32>) -> ()
 // CHECK-NEXT: }, {
 // CHECK-NEXT: ^body([[BODY_COUNTER:%[0-9]+]]: tensor<si32>, [[BODY_STATE:%[0-9]+]]: tensor<4xf32>):
-// CHECK-NEXT: [[ONE:%[0-9]+]] = tensor.constant() {value = dense<[] x si32: 1>} : () -> tensor<si32>
+// CHECK-NEXT: [[ONE:%[0-9]+]] = tensor.constant() {value = dense<si32: 1>} : () -> tensor<si32>
 // CHECK-NEXT: [[NEXT_COUNTER:%[0-9]+]] = tensor.add([[BODY_COUNTER]], [[ONE]]) : (tensor<si32>, tensor<si32>) -> tensor<si32>
 // CHECK-NEXT: [[DOUBLED:%[0-9]+]] = tensor.add([[BODY_STATE]], [[BODY_STATE]]) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
 // CHECK-NEXT: tensor.yield([[NEXT_COUNTER]], [[DOUBLED]]) : (tensor<si32>, tensor<4xf32>) -> ()
@@ -43,12 +43,12 @@ func.func @cond(%pred: tensor<i1>, %input: tensor<4xf32>) -> tensor<4xf32> {
 func.func @while(%counter: tensor<si32>, %state: tensor<4xf32>) -> (tensor<si32>, tensor<4xf32>) {
   %final_counter, %final_state = tensor.while(%counter, %state) ({
   ^cond(%cond_counter: tensor<si32>, %cond_state: tensor<4xf32>):
-    %limit = tensor.constant() {value = dense<[] x si32: 10>} : () -> tensor<si32>
+    %limit = tensor.constant() {value = dense<si32: 10>} : () -> tensor<si32>
     %keep_going = tensor.less(%cond_counter, %limit) : (tensor<si32>, tensor<si32>) -> tensor<i1>
     tensor.yield(%keep_going, %cond_counter, %cond_state) : (tensor<i1>, tensor<si32>, tensor<4xf32>) -> ()
   }, {
   ^body(%body_counter: tensor<si32>, %body_state: tensor<4xf32>):
-    %one = tensor.constant() {value = dense<[] x si32: 1>} : () -> tensor<si32>
+    %one = tensor.constant() {value = dense<si32: 1>} : () -> tensor<si32>
     %next_counter = tensor.add(%body_counter, %one) : (tensor<si32>, tensor<si32>) -> tensor<si32>
     %doubled = tensor.add(%body_state, %body_state) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
     tensor.yield(%next_counter, %doubled) : (tensor<si32>, tensor<4xf32>) -> ()

@@ -6,7 +6,7 @@
 // CHECK: arith.constant() {value = 2.0 : f32}
 // CHECK-NOT: tensor.constant
 func.func @splat_operand(%input: tensor<4xf32>) -> tensor<4xf32> {
-  %twos = tensor.constant() {value = dense<[4] x f32: 2.0>} : () -> tensor<4xf32>
+  %twos = tensor.constant() {value = dense<4xf32: 2.0>} : () -> tensor<4xf32>
   %doubled = tensor.mul(%input, %twos) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
   func.return(%doubled) : (tensor<4xf32>) -> ()
 }
@@ -17,7 +17,7 @@ func.func @splat_operand(%input: tensor<4xf32>) -> tensor<4xf32> {
 // CHECK: func.func @multiply_by_one([[INPUT:%[0-9]+]]: tensor<4xf32>)
 // CHECK-NEXT: func.return([[INPUT]])
 func.func @multiply_by_one(%input: tensor<4xf32>) -> tensor<4xf32> {
-  %ones = tensor.constant() {value = dense<[4] x f32: 1.0>} : () -> tensor<4xf32>
+  %ones = tensor.constant() {value = dense<4xf32: 1.0>} : () -> tensor<4xf32>
   %product = tensor.mul(%input, %ones) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
   func.return(%product) : (tensor<4xf32>) -> ()
 }
@@ -28,7 +28,7 @@ func.func @multiply_by_one(%input: tensor<4xf32>) -> tensor<4xf32> {
 // CHECK: tile.block() {iters = [par 4], reads = [], folds = [none -> [d0]]}
 // CHECK-NEXT: arith.constant() {value = 0 : si32}
 func.func @multiply_by_zero(%input: tensor<4xsi32>) -> tensor<4xsi32> {
-  %zeros = tensor.constant() {value = dense<[4] x si32: 0>} : () -> tensor<4xsi32>
+  %zeros = tensor.constant() {value = dense<4xsi32: 0>} : () -> tensor<4xsi32>
   %product = tensor.mul(%input, %zeros) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
   func.return(%product) : (tensor<4xsi32>) -> ()
 }

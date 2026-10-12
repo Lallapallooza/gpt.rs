@@ -6,7 +6,7 @@
 // CHECK-NOT: tensor.add
 // CHECK: func.return([[SUM]], [[SUM]])
 func.func @sum(%input: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
-  %two = tensor.constant() {value = dense<[4] x f32: 2.0>} : () -> tensor<4xf32>
+  %two = tensor.constant() {value = dense<4xf32: 2.0>} : () -> tensor<4xf32>
   %two_plus_input = tensor.add(%two, %input) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
   %input_plus_two = tensor.add(%input, %two) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
   func.return(%two_plus_input, %input_plus_two) : (tensor<4xf32>, tensor<4xf32>) -> ()

@@ -1,0 +1,99 @@
+// RUN: pass seal-dispatches, tile-to-loop
+
+// `online_softmax` from a start state takes two sweeps over the points of an element: the maximum,
+// then, after the start state is rescaled to it, the sums of `e^(s - m)` and `e^(s - m) v`. The
+// lane `d1` indexes only the values.
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}([[SCORES:%[0-9]+]]: !loop.buf<{T}x{S}xf32, global>, [[VALUES:%[0-9]+]]: !loop.buf<{S}x4xf32, global>, [[SINK_MAX:%[0-9]+]]: !loop.buf<{T}xf32, global>, [[SINK_SUM:%[0-9]+]]: !loop.buf<{T}xf32, global>, [[SINK_WEIGHTED:%[0-9]+]]: !loop.buf<{T}x4xf32, global>, [[MAX:%[0-9]+]]: !loop.buf<{T}xf32, global>, [[SUM:%[0-9]+]]: !loop.buf<{T}xf32, global>, [[WEIGHTED:%[0-9]+]]: !loop.buf<{T}x4xf32, global>) attributes {access = [in, in, in, in, in, out, out, out]} {
+// CHECK: ^body([[QUERY:%[0-9]+]]: index):
+// CHECK: ^body([[LANE:%[0-9]+]]: index):
+// CHECK-NEXT: [[RUNNING_MAX:%[0-9]+]] = loop.alloc() {shape = [], dtype = f32} : () -> !loop.buf<f32, private>
+// CHECK-NEXT: [[RUNNING_SUM:%[0-9]+]] = loop.alloc() {shape = [], dtype = f32} : () -> !loop.buf<f32, private>
+// CHECK-NEXT: [[RUNNING_WEIGHTED:%[0-9]+]] = loop.alloc() {shape = [], dtype = f32} : () -> !loop.buf<f32, private>
+// CHECK-NEXT: [[KEPT_MAX:%[0-9]+]] = loop.alloc() {shape = [], dtype = f32} : () -> !loop.buf<f32, private>
+// CHECK-NEXT: [[START_MAX:%[0-9]+]] = loop.load([[SINK_MAX]], [[QUERY]]) : (!loop.buf<{T}xf32, global>, index) -> f32
+// CHECK-NEXT: [[START_SUM:%[0-9]+]] = loop.load([[SINK_SUM]], [[QUERY]]) : (!loop.buf<{T}xf32, global>, index) -> f32
+// CHECK-NEXT: [[START_WEIGHTED:%[0-9]+]] = loop.load([[SINK_WEIGHTED]], [[QUERY]], [[LANE]]) : (!loop.buf<{T}x4xf32, global>, index, index) -> f32
+// CHECK-NEXT: loop.store([[START_MAX]], [[RUNNING_MAX]])
+// CHECK-NEXT: loop.store([[START_SUM]], [[RUNNING_SUM]])
+// CHECK-NEXT: loop.store([[START_WEIGHTED]], [[RUNNING_WEIGHTED]])
+// CHECK: ^body([[KEY:%[0-9]+]]: index):
+// CHECK-NEXT: [[SCORE:%[0-9]+]] = loop.load([[SCORES]], [[QUERY]], [[KEY]])
+// CHECK-NEXT: loop.load([[VALUES]], [[KEY]], [[LANE]])
+// CHECK-NEXT: [[SO_FAR:%[0-9]+]] = loop.load([[RUNNING_MAX]])
+// CHECK-NEXT: [[LARGER:%[0-9]+]] = arith.maximum([[SO_FAR]], [[SCORE]]) : (f32, f32) -> f32
+// CHECK-NEXT: loop.store([[LARGER]], [[RUNNING_MAX]])
+// CHECK: [[FIRST:%[0-9]+]] = loop.load([[KEPT_MAX]])
+// CHECK-NEXT: [[FOUND:%[0-9]+]] = loop.load([[RUNNING_MAX]])
+// CHECK-NEXT: [[SHIFT:%[0-9]+]] = arith.sub([[FIRST]], [[FOUND]]) : (f32, f32) -> f32
+// CHECK-NEXT: [[FACTOR:%[0-9]+]] = arith.exp([[SHIFT]]) : (f32) -> f32
+// CHECK-NEXT: [[NONE:%[0-9]+]] = arith.constant() {value = -inf : f32} : () -> f32
+// CHECK-NEXT: [[EMPTY:%[0-9]+]] = arith.equal([[FIRST]], [[NONE]]) : (f32, f32) -> i1
+// CHECK-NEXT: [[ZERO:%[0-9]+]] = arith.constant() {value = 0.0 : f32} : () -> f32
+// CHECK-NEXT: [[RESCALE:%[0-9]+]] = arith.select([[EMPTY]], [[ZERO]], [[FACTOR]]) : (i1, f32, f32) -> f32
+// CHECK: ^body([[SECOND_KEY:%[0-9]+]]: index):
+// CHECK-NEXT: [[SECOND_SCORE:%[0-9]+]] = loop.load([[SCORES]], [[QUERY]], [[SECOND_KEY]])
+// CHECK-NEXT: [[VALUE:%[0-9]+]] = loop.load([[VALUES]], [[SECOND_KEY]], [[LANE]])
+// CHECK-NEXT: [[MAXIMUM:%[0-9]+]] = loop.load([[RUNNING_MAX]])
+// CHECK-NEXT: [[CENTERED:%[0-9]+]] = arith.sub([[SECOND_SCORE]], [[MAXIMUM]]) : (f32, f32) -> f32
+// CHECK-NEXT: [[WEIGHT:%[0-9]+]] = arith.exp([[CENTERED]]) : (f32) -> f32
+// CHECK: [[TERM:%[0-9]+]] = arith.mul([[WEIGHT]], [[VALUE]]) : (f32, f32) -> f32
+// CHECK: loop.store({{%[0-9]+}}, [[MAX]], [[QUERY]])
+// CHECK-NEXT: loop.store({{%[0-9]+}}, [[SUM]], [[QUERY]])
+// CHECK-NEXT: loop.store({{%[0-9]+}}, [[WEIGHTED]], [[QUERY]], [[LANE]])
+func.func @attention(%scores: tensor<{T}x{S}xf32>, %values: tensor<{S}x4xf32>, %sink_max: tensor<{T}xf32>, %sink_sum: tensor<{T}xf32>, %sink_weighted: tensor<{T}x4xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x4xf32>) {
+  %max, %sum, %weighted = tile.block(%scores, %values, %sink_max, %sink_sum, %sink_weighted) {iters = [par {T}, par 4, red {S}], reads = [$0[d0, d2], $1[d2, d1]], folds = [online_softmax<lanes = [d1]> -> ([d0], [d0], [d0, d1]) init ($2, $3, $4)]} ({
+  ^body(%score: f32, %value: f32):
+    tile.yield(%score, %value) : (f32, f32) -> ()
+  }) : (tensor<{T}x{S}xf32>, tensor<{S}x4xf32>, tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x4xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x4xf32>)
+  func.return(%max, %sum, %weighted) : (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x4xf32>) -> ()
+}
+
+// -----
+
+// `online_softmax_merge` merges each point's state into the running one, both rescaled to their
+// common maximum.
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}([[MAXES:%[0-9]+]]: !loop.buf<3x2xf32, global>, [[SUMS:%[0-9]+]]: !loop.buf<3x2xf32, global>, [[PARTS:%[0-9]+]]: !loop.buf<3x2x4xf32, global>, {{%[0-9]+}}: !loop.buf<3xf32, global>, {{%[0-9]+}}: !loop.buf<3xf32, global>, {{%[0-9]+}}: !loop.buf<3x4xf32, global>) attributes {access = [in, in, in, out, out, out]} {
+// CHECK: [[PART_MAX:%[0-9]+]] = loop.load([[MAXES]], {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK-NEXT: [[PART_SUM:%[0-9]+]] = loop.load([[SUMS]], {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK-NEXT: [[PART_WEIGHTED:%[0-9]+]] = loop.load([[PARTS]], {{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK-NEXT: [[HELD_MAX:%[0-9]+]] = loop.load({{%[0-9]+}}) : (!loop.buf<f32, private>) -> f32
+// CHECK-NEXT: [[MERGED_MAX:%[0-9]+]] = arith.maximum([[HELD_MAX]], [[PART_MAX]]) : (f32, f32) -> f32
+// CHECK-NEXT: arith.sub([[HELD_MAX]], [[MERGED_MAX]])
+// CHECK: [[OWN:%[0-9]+]] = arith.select({{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}) : (i1, f32, f32) -> f32
+// CHECK-NEXT: arith.sub([[PART_MAX]], [[MERGED_MAX]])
+// CHECK: [[POINT:%[0-9]+]] = arith.select({{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}) : (i1, f32, f32) -> f32
+// CHECK-NEXT: [[HELD_SUM:%[0-9]+]] = loop.load({{%[0-9]+}}) : (!loop.buf<f32, private>) -> f32
+// CHECK-NEXT: [[KEPT:%[0-9]+]] = arith.mul([[HELD_SUM]], [[OWN]]) : (f32, f32) -> f32
+// CHECK-NEXT: [[ADDED:%[0-9]+]] = arith.mul([[PART_SUM]], [[POINT]]) : (f32, f32) -> f32
+// CHECK-NEXT: arith.add([[KEPT]], [[ADDED]]) : (f32, f32) -> f32
+// CHECK: arith.mul([[PART_WEIGHTED]], [[POINT]]) : (f32, f32) -> f32
+func.func @merge(%maxes: tensor<3x2xf32>, %sums: tensor<3x2xf32>, %weighted: tensor<3x2x4xf32>) -> (tensor<3xf32>, tensor<3xf32>, tensor<3x4xf32>) {
+  %max, %sum, %merged = tile.block(%maxes, %sums, %weighted) {iters = [par 3, par 4, red 2], reads = [$0[d0, d2], $1[d0, d2], $2[d0, d2, d1]], folds = [online_softmax_merge<lanes = [d1]> -> ([d0], [d0], [d0, d1])]} ({
+  ^body(%part_max: f32, %part_sum: f32, %part_weighted: f32):
+    tile.yield(%part_max, %part_sum, %part_weighted) : (f32, f32, f32) -> ()
+  }) : (tensor<3x2xf32>, tensor<3x2xf32>, tensor<3x2x4xf32>) -> (tensor<3xf32>, tensor<3xf32>, tensor<3x4xf32>)
+  func.return(%max, %sum, %merged) : (tensor<3xf32>, tensor<3xf32>, tensor<3x4xf32>) -> ()
+}
+
+// -----
+
+// `logsumexp` and its merge keep `(m, l)` only.
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}({{%[0-9]+}}: !loop.buf<2x6xf32, global>, [[MAX:%[0-9]+]]: !loop.buf<2xf32, global>, [[SUM:%[0-9]+]]: !loop.buf<2xf32, global>) attributes {access = [in, out, out]} {
+// CHECK: arith.maximum
+// CHECK: arith.exp
+// CHECK: loop.store({{%[0-9]+}}, [[MAX]], [[ROW:%[0-9]+]])
+// CHECK-NEXT: loop.store({{%[0-9]+}}, [[SUM]], [[ROW]])
+// CHECK-NEXT: loop.yield
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}({{%[0-9]+}}: !loop.buf<2xf32, global>, {{%[0-9]+}}: !loop.buf<2xf32, global>, {{%[0-9]+}}: !loop.buf<1xf32, global>, {{%[0-9]+}}: !loop.buf<1xf32, global>) attributes {access = [in, in, out, out]} {
+// CHECK: arith.maximum
+func.func @logsumexp(%logits: tensor<2x6xf32>) -> (tensor<1xf32>, tensor<1xf32>) {
+  %max, %sum = tile.block(%logits) {iters = [par 2, red 6], reads = [$0[d0, d1]], folds = [logsumexp -> ([d0], [d0])]} ({
+  ^body(%logit: f32):
+    tile.yield(%logit) : (f32) -> ()
+  }) : (tensor<2x6xf32>) -> (tensor<2xf32>, tensor<2xf32>)
+  %merged_max, %merged_sum = tile.block(%max, %sum) {iters = [par 1, red 2], reads = [$0[d1], $1[d1]], folds = [logsumexp_merge -> ([d0], [d0])]} ({
+  ^body(%part_max: f32, %part_sum: f32):
+    tile.yield(%part_max, %part_sum) : (f32, f32) -> ()
+  }) : (tensor<2xf32>, tensor<2xf32>) -> (tensor<1xf32>, tensor<1xf32>)
+  func.return(%merged_max, %merged_sum) : (tensor<1xf32>, tensor<1xf32>) -> ()
+}

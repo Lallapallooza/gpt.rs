@@ -3,7 +3,7 @@
 // An iota along an axis of extent 1 is 0.
 // CHECK: func.func @iota_unit_axis
 // CHECK-NOT: tensor.iota
-// CHECK: tensor.constant() {value = dense<[] x si32: 0>}
+// CHECK: tensor.constant() {value = dense<si32: 0>}
 // CHECK: tensor.broadcast_to({{%[0-9]+}}) {shape = [1, 16]}
 func.func @iota_unit_axis() -> tensor<1x16xsi32> {
   %row_indices = tensor.iota() {shape = [1, 16], dtype = si32, axis = 0} : () -> tensor<1x16xsi32>
@@ -15,8 +15,8 @@ func.func @iota_unit_axis() -> tensor<1x16xsi32> {
 // An integer compared with itself is equal to it, so `greater_equal` holds and `less` does not.
 // A float is left alone: NaN is not equal to itself.
 // CHECK: func.func @compare_with_itself([[INT_INPUT:%[0-9]+]]: tensor<4xsi32>, [[FLOAT_INPUT:%[0-9]+]]: tensor<4xf32>) -> (tensor<4xi1>, tensor<4xi1>, tensor<4xi1>) {
-// CHECK: tensor.constant() {value = dense<[] x i1: true>}
-// CHECK: tensor.constant() {value = dense<[] x i1: false>}
+// CHECK: tensor.constant() {value = dense<i1: true>}
+// CHECK: tensor.constant() {value = dense<i1: false>}
 // CHECK: tensor.equal([[FLOAT_INPUT]], [[FLOAT_INPUT]])
 func.func @compare_with_itself(%int_input: tensor<4xsi32>, %float_input: tensor<4xf32>) -> (tensor<4xi1>, tensor<4xi1>, tensor<4xi1>) {
   %int_greater_equal = tensor.greater_equal(%int_input, %int_input) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xi1>
@@ -36,8 +36,8 @@ func.func @mask_of_one_position() -> tensor<1x1xf32> {
   %query_positions = tensor.iota() {shape = [1, 1], dtype = si32, axis = 0} : () -> tensor<1x1xsi32>
   %key_positions = tensor.iota() {shape = [1, 1], dtype = si32, axis = 1} : () -> tensor<1x1xsi32>
   %visible = tensor.greater_equal(%query_positions, %key_positions) : (tensor<1x1xsi32>, tensor<1x1xsi32>) -> tensor<1x1xi1>
-  %one = tensor.constant() {value = dense<[1, 1] x f32: 1.0>} : () -> tensor<1x1xf32>
-  %zero = tensor.constant() {value = dense<[1, 1] x f32: 0.0>} : () -> tensor<1x1xf32>
+  %one = tensor.constant() {value = dense<1x1xf32: 1.0>} : () -> tensor<1x1xf32>
+  %zero = tensor.constant() {value = dense<1x1xf32: 0.0>} : () -> tensor<1x1xf32>
   %mask = tensor.select(%visible, %one, %zero) : (tensor<1x1xi1>, tensor<1x1xf32>, tensor<1x1xf32>) -> tensor<1x1xf32>
   func.return(%mask) : (tensor<1x1xf32>) -> ()
 }

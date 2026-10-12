@@ -1,5 +1,5 @@
-//! Runs the filetests of the IR passes, under `filetests/tensor/` and `filetests/tile/`.
-//! `gpt_rs_filetests` gives their format.
+//! Runs the filetests of the IR passes, under `filetests/tensor/`, `filetests/tile/` and
+//! `filetests/loop/`. `gpt_rs_filetests` gives their format.
 
 #[test]
 fn tensor_filetests() {
@@ -9,4 +9,9 @@ fn tensor_filetests() {
 #[test]
 fn tile_filetests() {
     gpt_rs_filetests::run("tile", None);
+}
+
+#[test]
+fn loop_filetests() {
+    gpt_rs_filetests::run("loop", None);
 }

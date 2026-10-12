@@ -79,9 +79,9 @@ func.func @reduce_dtypes(%input: tensor<4x8xbf16>) -> (tensor<4xbf16>, tensor<4x
 // -----
 // The body yields each element with its index along the axis; the values result is unused.
 // CHECK: func.func @argmax([[SCORES:%[0-9]+]]: tensor<2x5xf32>, [[COUNTS:%[0-9]+]]: tensor<4x{T}xsi32>) -> (tensor<2xsi32>, tensor<4x1xsi64>) {
-// CHECK: [[MAXIMA:%[0-9]+]], [[INDICES:%[0-9]+]] = tile.block([[SCORES]]) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [argmax -> [d0], [d0]]}
+// CHECK: [[MAXIMA:%[0-9]+]], [[INDICES:%[0-9]+]] = tile.block([[SCORES]]) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [argmax -> ([d0], [d0])]}
 // CHECK: tile.index() {expr = d1, dtype = si32}
-// CHECK: folds = [argmax -> [d0, 0], [d0, 0]]
+// CHECK: folds = [argmax -> ([d0, 0], [d0, 0])]
 // CHECK: tile.index() {expr = d1, dtype = si64}
 // CHECK: func.return([[INDICES]],
 // CHECK-NOT: tensor.
@@ -103,17 +103,17 @@ func.func @argmax(%scores: tensor<2x5xf32>, %counts: tensor<4x{T}xsi32>) -> (ten
 // CHECK: folds = [min ->
 // CHECK-NOT: tensor.segment
 func.func @segment(%input: tensor<6x4xf32>) -> (tensor<3x4xf32>, tensor<3x4xf32>, tensor<8x4xf32>) {
-  %segment_ids = tensor.constant() {value = dense<[6] x si32: [0, 0, 1, 2, 2, 2]>} : () -> tensor<6xsi32>
+  %segment_ids = tensor.constant() {value = dense<6xsi32: [0, 0, 1, 2, 2, 2]>} : () -> tensor<6xsi32>
   %sums = tensor.segment_sum(%input, %segment_ids) {num_segments = 3} : (tensor<6x4xf32>, tensor<6xsi32>) -> tensor<3x4xf32>
   %maxima = tensor.segment_max(%input, %segment_ids) {num_segments = 3, indices_are_sorted = true} : (tensor<6x4xf32>, tensor<6xsi32>) -> tensor<3x4xf32>
-  %unique_ids = tensor.constant() {value = dense<[6] x si32: [0, 1, 2, 3, 5, 7]>} : () -> tensor<6xsi32>
+  %unique_ids = tensor.constant() {value = dense<6xsi32: [0, 1, 2, 3, 5, 7]>} : () -> tensor<6xsi32>
   %minima = tensor.segment_min(%input, %unique_ids) {num_segments = 8, indices_are_sorted = true, unique = true} : (tensor<6x4xf32>, tensor<6xsi32>) -> tensor<8x4xf32>
   func.return(%sums, %maxima, %minima) : (tensor<3x4xf32>, tensor<3x4xf32>, tensor<8x4xf32>) -> ()
 }
 
 // -----
 // CHECK: func.func @top_k([[SCORES:%[0-9]+]]: tensor<2x5xf32>) -> (tensor<2x3xf32>, tensor<2x3xsi32>, tensor<1x5xf32>, tensor<1x5xsi64>) {
-// CHECK: tile.block([[SCORES]]) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [top_k<k = 3> -> [d0], [d0]]}
+// CHECK: tile.block([[SCORES]]) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [top_k<k = 3> -> ([d0], [d0])]}
 // CHECK: tile.index() {expr = d1, dtype = si32}
 // `k` comes last; copy blocks move it to axis 0.
 // CHECK: [[BOTTOM_VALUES:%[0-9]+]], [[BOTTOM_INDICES:%[0-9]+]] = tile.block([[SCORES]]) {iters = [red 2, par 5], {{.*}} folds = [bottom_k<k = 1> -> {{.*}}]} ({
@@ -147,7 +147,7 @@ func.func @negative_axes(%lhs: tensor<2x3xf32>, %rhs: tensor<3x4xf32>) -> (tenso
 // CHECK: folds = [or -> $2[$1[d0]]]
 // CHECK-NOT: tensor.
 func.func @logic_reductions(%flags: tensor<2x3xi1>, %words: tensor<6xsi32>) -> (tensor<2xi1>, tensor<3xi1>, tensor<2xsi32>, tensor<2xsi32>) {
-  %segment_ids = tensor.constant() {value = dense<[6] x si32: [0, 1, 1, 0, 0, 1]>} : () -> tensor<6xsi32>
+  %segment_ids = tensor.constant() {value = dense<6xsi32: [0, 1, 1, 0, 0, 1]>} : () -> tensor<6xsi32>
   %all_in_row = tensor.reduce_and(%flags) {axes = [1]} : (tensor<2x3xi1>) -> tensor<2xi1>
   %any_in_column = tensor.reduce_or(%flags) {axes = [0]} : (tensor<2x3xi1>) -> tensor<3xi1>
   %segment_and = tensor.segment_and(%words, %segment_ids) {num_segments = 2} : (tensor<6xsi32>, tensor<6xsi32>) -> tensor<2xsi32>

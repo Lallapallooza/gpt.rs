@@ -50,13 +50,13 @@ func.func @linear_bias_gelu(%input: tensor<{M}x8xf32>, %weight: tensor<6x8xbf16>
 // Folds of every kind: argmax and top_k over the last axis, an ordered sum, and the
 // logical folds.
 // CHECK: func.func @folds([[SCORES:%[0-9]+]]: tensor<2x5xf32>, [[FLAGS:%[0-9]+]]: tensor<2x5xi1>) -> (tensor<2xf32>, tensor<2xsi32>, tensor<2xf32>, tensor<2xsi64>, tensor<2x3xf32>, tensor<2x3xsi32>, tensor<2xf32>, tensor<2xf32>, tensor<2xf32>, tensor<2xi1>, tensor<2xi1>) {
-// CHECK-NEXT: [[ARGMAX_VALUE:%[0-9]+]], [[ARGMAX_INDEX:%[0-9]+]], [[ARGMIN_VALUE:%[0-9]+]], [[ARGMIN_INDEX:%[0-9]+]], [[TOP_VALUES:%[0-9]+]], [[TOP_INDICES:%[0-9]+]] = tile.block([[SCORES]]) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [argmax -> [d0], [d0], argmin -> [d0], [d0], top_k<k = 3> -> [d0], [d0]]} ({
+// CHECK-NEXT: [[ARGMAX_VALUE:%[0-9]+]], [[ARGMAX_INDEX:%[0-9]+]], [[ARGMIN_VALUE:%[0-9]+]], [[ARGMIN_INDEX:%[0-9]+]], [[TOP_VALUES:%[0-9]+]], [[TOP_INDICES:%[0-9]+]] = tile.block([[SCORES]]) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [argmax -> ([d0], [d0]), argmin -> ([d0], [d0]), top_k<k = 3> -> ([d0], [d0])]} ({
 // CHECK-NEXT: ^body([[SCORE:%[0-9]+]]: f32):
 // CHECK-NEXT: [[INDEX:%[0-9]+]] = tile.index() {expr = d1, dtype = si32} : () -> si32
 // CHECK-NEXT: [[WIDE_INDEX:%[0-9]+]] = tile.index() {expr = d1, dtype = si64} : () -> si64
 // CHECK-NEXT: tile.yield([[SCORE]], [[INDEX]], [[SCORE]], [[WIDE_INDEX]], [[SCORE]], [[INDEX]]) : (f32, si32, f32, si64, f32, si32) -> ()
 // CHECK-NEXT: }) : (tensor<2x5xf32>) -> (tensor<2xf32>, tensor<2xsi32>, tensor<2xf32>, tensor<2xsi64>, tensor<2x3xf32>, tensor<2x3xsi32>)
-// CHECK-NEXT: [[SUM:%[0-9]+]], [[MAX:%[0-9]+]], [[MIN:%[0-9]+]] = tile.block([[SCORES]]) {iters = [par 2, red ordered 5], reads = [$0[d0, d1]], folds = [sum -> [d0], max -> [d0], min -> [d0]]} ({
+// CHECK-NEXT: [[SUM:%[0-9]+]], [[MAX:%[0-9]+]], [[MIN:%[0-9]+]] = tile.block([[SCORES]]) {iters = [par 2, red_ordered 5], reads = [$0[d0, d1]], folds = [sum -> [d0], max -> [d0], min -> [d0]]} ({
 // CHECK-NEXT: ^body([[SCORE:%[0-9]+]]: f32):
 // CHECK-NEXT: tile.yield([[SCORE]], [[SCORE]], [[SCORE]]) : (f32, f32, f32) -> ()
 // CHECK-NEXT: }) : (tensor<2x5xf32>) -> (tensor<2xf32>, tensor<2xf32>, tensor<2xf32>)
@@ -67,13 +67,13 @@ func.func @linear_bias_gelu(%input: tensor<{M}x8xf32>, %weight: tensor<6x8xbf16>
 // CHECK-NEXT: func.return([[ARGMAX_VALUE]], [[ARGMAX_INDEX]], [[ARGMIN_VALUE]], [[ARGMIN_INDEX]], [[TOP_VALUES]], [[TOP_INDICES]], [[SUM]], [[MAX]], [[MIN]], [[ALL]], [[ANY]]) : (tensor<2xf32>, tensor<2xsi32>, tensor<2xf32>, tensor<2xsi64>, tensor<2x3xf32>, tensor<2x3xsi32>, tensor<2xf32>, tensor<2xf32>, tensor<2xf32>, tensor<2xi1>, tensor<2xi1>) -> ()
 // CHECK-NEXT: }
 func.func @folds(%scores: tensor<2x5xf32>, %flags: tensor<2x5xi1>) -> (tensor<2xf32>, tensor<2xsi32>, tensor<2xf32>, tensor<2xsi64>, tensor<2x3xf32>, tensor<2x3xsi32>, tensor<2xf32>, tensor<2xf32>, tensor<2xf32>, tensor<2xi1>, tensor<2xi1>) {
-  %argmax_value, %argmax_index, %argmin_value, %argmin_index, %top_values, %top_indices = tile.block(%scores) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [argmax -> [d0], [d0], argmin -> [d0], [d0], top_k<k = 3> -> [d0], [d0]]} ({
+  %argmax_value, %argmax_index, %argmin_value, %argmin_index, %top_values, %top_indices = tile.block(%scores) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [argmax -> ([d0], [d0]), argmin -> ([d0], [d0]), top_k<k = 3> -> ([d0], [d0])]} ({
   ^body(%score: f32):
     %index = tile.index() {expr = d1, dtype = si32} : () -> si32
     %wide_index = tile.index() {expr = d1, dtype = si64} : () -> si64
     tile.yield(%score, %index, %score, %wide_index, %score, %index) : (f32, si32, f32, si64, f32, si32) -> ()
   }) : (tensor<2x5xf32>) -> (tensor<2xf32>, tensor<2xsi32>, tensor<2xf32>, tensor<2xsi64>, tensor<2x3xf32>, tensor<2x3xsi32>)
-  %sum, %max, %min = tile.block(%scores) {iters = [par 2, red ordered 5], reads = [$0[d0, d1]], folds = [sum -> [d0], max -> [d0], min -> [d0]]} ({
+  %sum, %max, %min = tile.block(%scores) {iters = [par 2, red_ordered 5], reads = [$0[d0, d1]], folds = [sum -> [d0], max -> [d0], min -> [d0]]} ({
   ^body(%score: f32):
     tile.yield(%score, %score, %score) : (f32, f32, f32) -> ()
   }) : (tensor<2x5xf32>) -> (tensor<2xf32>, tensor<2xf32>, tensor<2xf32>)
@@ -90,12 +90,12 @@ func.func @folds(%scores: tensor<2x5xf32>, %flags: tensor<2x5xi1>) -> (tensor<2x
 // lanes `d1` drop from the states, and a sink starts each fold. The states merge, and the output is
 // `o / l`.
 // CHECK: func.func @attention([[QUERY:%[0-9]+]]: tensor<{T}x8xf32>, [[KEY:%[0-9]+]]: tensor<{S}x8xf32>, [[VALUE:%[0-9]+]]: tensor<{S}x8xf32>, [[SINK_MAX:%[0-9]+]]: tensor<{T}xf32>, [[SINK_SUM:%[0-9]+]]: tensor<{T}xf32>, [[SINK_ACCUMULATED:%[0-9]+]]: tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>, tensor<{T}x8xf32>) {
-// CHECK-NEXT: [[MAX:%[0-9]+]], [[SUM:%[0-9]+]], [[ACCUMULATED:%[0-9]+]] = tile.block([[QUERY]], [[KEY]], [[VALUE]], [[SINK_MAX]], [[SINK_SUM]], [[SINK_ACCUMULATED]]) {iters = [par {T}, par 8, red {S}], reads = [$0[d0, d1], $1[d2, d1], $2[d2, d1]], folds = [online_softmax<lanes = [d1]> -> [d0], [d0], [d0, d1] init $3, $4, $5], constraints = [d2 <= d0 or d2 < 4]} ({
+// CHECK-NEXT: [[MAX:%[0-9]+]], [[SUM:%[0-9]+]], [[ACCUMULATED:%[0-9]+]] = tile.block([[QUERY]], [[KEY]], [[VALUE]], [[SINK_MAX]], [[SINK_SUM]], [[SINK_ACCUMULATED]]) {iters = [par {T}, par 8, red {S}], reads = [$0[d0, d1], $1[d2, d1], $2[d2, d1]], folds = [online_softmax<lanes = [d1]> -> ([d0], [d0], [d0, d1]) init ($3, $4, $5)], constraints = [d2 <= d0 or d2 < 4]} ({
 // CHECK-NEXT: ^body([[QUERY_ELEMENT:%[0-9]+]]: f32, [[KEY_ELEMENT:%[0-9]+]]: f32, [[VALUE_ELEMENT:%[0-9]+]]: f32):
 // CHECK-NEXT: [[PRODUCT:%[0-9]+]] = arith.mul([[QUERY_ELEMENT]], [[KEY_ELEMENT]]) : (f32, f32) -> f32
 // CHECK-NEXT: tile.yield([[PRODUCT]], [[VALUE_ELEMENT]]) : (f32, f32) -> ()
 // CHECK-NEXT: }) : (tensor<{T}x8xf32>, tensor<{S}x8xf32>, tensor<{S}x8xf32>, tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>)
-// CHECK-NEXT: [[MERGED_MAX:%[0-9]+]], [[MERGED_SUM:%[0-9]+]], [[MERGED_ACCUMULATED:%[0-9]+]] = tile.block([[MAX]], [[SUM]], [[ACCUMULATED]]) {iters = [par {T}, par 8], reads = [$0[d0], $1[d0], $2[d0, d1]], folds = [online_softmax_merge<lanes = [d1]> -> [d0], [d0], [d0, d1]]} ({
+// CHECK-NEXT: [[MERGED_MAX:%[0-9]+]], [[MERGED_SUM:%[0-9]+]], [[MERGED_ACCUMULATED:%[0-9]+]] = tile.block([[MAX]], [[SUM]], [[ACCUMULATED]]) {iters = [par {T}, par 8], reads = [$0[d0], $1[d0], $2[d0, d1]], folds = [online_softmax_merge<lanes = [d1]> -> ([d0], [d0], [d0, d1])]} ({
 // CHECK-NEXT: ^body([[PARTIAL_MAX:%[0-9]+]]: f32, [[PARTIAL_SUM:%[0-9]+]]: f32, [[PARTIAL_ACCUMULATED:%[0-9]+]]: f32):
 // CHECK-NEXT: tile.yield([[PARTIAL_MAX]], [[PARTIAL_SUM]], [[PARTIAL_ACCUMULATED]]) : (f32, f32, f32) -> ()
 // CHECK-NEXT: }) : (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>)
@@ -107,12 +107,12 @@ func.func @folds(%scores: tensor<2x5xf32>, %flags: tensor<2x5xi1>) -> (tensor<2x
 // CHECK-NEXT: func.return([[MAX]], [[SUM]], [[ACCUMULATED]], [[OUTPUT]]) : (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>, tensor<{T}x8xf32>) -> ()
 // CHECK-NEXT: }
 func.func @attention(%query: tensor<{T}x8xf32>, %key: tensor<{S}x8xf32>, %value: tensor<{S}x8xf32>, %sink_max: tensor<{T}xf32>, %sink_sum: tensor<{T}xf32>, %sink_accumulated: tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>, tensor<{T}x8xf32>) {
-  %max, %sum, %accumulated = tile.block(%query, %key, %value, %sink_max, %sink_sum, %sink_accumulated) {iters = [par {T}, par 8, red {S}], reads = [$0[d0, d1], $1[d2, d1], $2[d2, d1]], folds = [online_softmax<lanes = [d1]> -> [d0], [d0], [d0, d1] init $3, $4, $5], constraints = [d2 <= d0 or d2 < 4]} ({
+  %max, %sum, %accumulated = tile.block(%query, %key, %value, %sink_max, %sink_sum, %sink_accumulated) {iters = [par {T}, par 8, red {S}], reads = [$0[d0, d1], $1[d2, d1], $2[d2, d1]], folds = [online_softmax<lanes = [d1]> -> ([d0], [d0], [d0, d1]) init ($3, $4, $5)], constraints = [d2 <= d0 or d2 < 4]} ({
   ^body(%query_element: f32, %key_element: f32, %value_element: f32):
     %product = arith.mul(%query_element, %key_element) : (f32, f32) -> f32
     tile.yield(%product, %value_element) : (f32, f32) -> ()
   }) : (tensor<{T}x8xf32>, tensor<{S}x8xf32>, tensor<{S}x8xf32>, tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>)
-  %merged_max, %merged_sum, %merged_accumulated = tile.block(%max, %sum, %accumulated) {iters = [par {T}, par 8], reads = [$0[d0], $1[d0], $2[d0, d1]], folds = [online_softmax_merge<lanes = [d1]> -> [d0], [d0], [d0, d1]]} ({
+  %merged_max, %merged_sum, %merged_accumulated = tile.block(%max, %sum, %accumulated) {iters = [par {T}, par 8], reads = [$0[d0], $1[d0], $2[d0, d1]], folds = [online_softmax_merge<lanes = [d1]> -> ([d0], [d0], [d0, d1])]} ({
   ^body(%partial_max: f32, %partial_sum: f32, %partial_accumulated: f32):
     tile.yield(%partial_max, %partial_sum, %partial_accumulated) : (f32, f32, f32) -> ()
   }) : (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>)
@@ -128,11 +128,11 @@ func.func @attention(%query: tensor<{T}x8xf32>, %key: tensor<{S}x8xf32>, %value:
 
 // The partition function of the logits: the state, merged with itself, and `m + log(l)`.
 // CHECK: func.func @logsumexp([[LOGITS:%[0-9]+]]: tensor<2x16xf32>) -> (tensor<2xf32>, tensor<2xf32>, tensor<2xf32>) {
-// CHECK-NEXT: [[MAX:%[0-9]+]], [[SUM:%[0-9]+]] = tile.block([[LOGITS]]) {iters = [par 2, red 16], reads = [$0[d0, d1]], folds = [logsumexp -> [d0], [d0]]} ({
+// CHECK-NEXT: [[MAX:%[0-9]+]], [[SUM:%[0-9]+]] = tile.block([[LOGITS]]) {iters = [par 2, red 16], reads = [$0[d0, d1]], folds = [logsumexp -> ([d0], [d0])]} ({
 // CHECK-NEXT: ^body([[LOGIT:%[0-9]+]]: f32):
 // CHECK-NEXT: tile.yield([[LOGIT]]) : (f32) -> ()
 // CHECK-NEXT: }) : (tensor<2x16xf32>) -> (tensor<2xf32>, tensor<2xf32>)
-// CHECK-NEXT: [[MERGED_MAX:%[0-9]+]], [[MERGED_SUM:%[0-9]+]] = tile.block([[MAX]], [[SUM]]) {iters = [par 2, red 2], reads = [$0[d0], $1[d0]], folds = [logsumexp_merge -> [d0], [d0]]} ({
+// CHECK-NEXT: [[MERGED_MAX:%[0-9]+]], [[MERGED_SUM:%[0-9]+]] = tile.block([[MAX]], [[SUM]]) {iters = [par 2, red 2], reads = [$0[d0], $1[d0]], folds = [logsumexp_merge -> ([d0], [d0])]} ({
 // CHECK-NEXT: ^body([[PARTIAL_MAX:%[0-9]+]]: f32, [[PARTIAL_SUM:%[0-9]+]]: f32):
 // CHECK-NEXT: tile.yield([[PARTIAL_MAX]], [[PARTIAL_SUM]]) : (f32, f32) -> ()
 // CHECK-NEXT: }) : (tensor<2xf32>, tensor<2xf32>) -> (tensor<2xf32>, tensor<2xf32>)
@@ -145,11 +145,11 @@ func.func @attention(%query: tensor<{T}x8xf32>, %key: tensor<{S}x8xf32>, %value:
 // CHECK-NEXT: func.return([[MAX]], [[SUM]], [[LOGSUMEXP]]) : (tensor<2xf32>, tensor<2xf32>, tensor<2xf32>) -> ()
 // CHECK-NEXT: }
 func.func @logsumexp(%logits: tensor<2x16xf32>) -> (tensor<2xf32>, tensor<2xf32>, tensor<2xf32>) {
-  %max, %sum = tile.block(%logits) {iters = [par 2, red 16], reads = [$0[d0, d1]], folds = [logsumexp -> [d0], [d0]]} ({
+  %max, %sum = tile.block(%logits) {iters = [par 2, red 16], reads = [$0[d0, d1]], folds = [logsumexp -> ([d0], [d0])]} ({
   ^body(%logit: f32):
     tile.yield(%logit) : (f32) -> ()
   }) : (tensor<2x16xf32>) -> (tensor<2xf32>, tensor<2xf32>)
-  %merged_max, %merged_sum = tile.block(%max, %sum) {iters = [par 2, red 2], reads = [$0[d0], $1[d0]], folds = [logsumexp_merge -> [d0], [d0]]} ({
+  %merged_max, %merged_sum = tile.block(%max, %sum) {iters = [par 2, red 2], reads = [$0[d0], $1[d0]], folds = [logsumexp_merge -> ([d0], [d0])]} ({
   ^body(%partial_max: f32, %partial_sum: f32):
     tile.yield(%partial_max, %partial_sum) : (f32, f32) -> ()
   }) : (tensor<2xf32>, tensor<2xf32>) -> (tensor<2xf32>, tensor<2xf32>)
@@ -220,7 +220,7 @@ func.func @experts(%input: tensor<{T}x8xf32>, %choices: tensor<{T}xsi32>, %first
 // -----
 
 // Blocks grouped over a grid, a sealed dispatch with symbol facts, and its call.
-// CHECK: tile.dispatch @rms([[INPUT:%[0-9]+]]: tensor<{T}x8xf32>) -> tensor<{T}xf32> {grid = [d0], facts = {T = [16, 4096] % 16}} {
+// CHECK: tile.dispatch @rms([[INPUT:%[0-9]+]]: tensor<{T}x8xf32>) -> tensor<{T}xf32> attributes {grid = [d0], facts = {T = [16, 4096] % 16}} {
 // CHECK-NEXT: [[SUM_OF_SQUARES:%[0-9]+]] = tile.block([[INPUT]]) {iters = [par {T}, red 8], reads = [$0[d0, d1]], folds = [sum -> [d0]]} ({
 // CHECK-NEXT: ^body([[ELEMENT:%[0-9]+]]: f32):
 // CHECK-NEXT: [[SQUARE:%[0-9]+]] = arith.mul([[ELEMENT]], [[ELEMENT]]) : (f32, f32) -> f32
@@ -240,7 +240,7 @@ func.func @experts(%input: tensor<{T}x8xf32>, %choices: tensor<{T}xsi32>, %first
 // CHECK-NEXT: }) : () -> tensor<{T}x8xf32>
 // CHECK-NEXT: func.return([[SUM_OF_SQUARES]], [[EXPONENTIALS]]) : (tensor<{T}xf32>, tensor<{T}x8xf32>) -> ()
 // CHECK-NEXT: }
-tile.dispatch @rms(%input: tensor<{T}x8xf32>) -> tensor<{T}xf32> {grid = [d0], facts = {T = [16, 4096] % 16}} {
+tile.dispatch @rms(%input: tensor<{T}x8xf32>) -> tensor<{T}xf32> attributes {grid = [d0], facts = {T = [16, 4096] % 16}} {
   %sum_of_squares = tile.block(%input) {iters = [par {T}, red 8], reads = [$0[d0, d1]], folds = [sum -> [d0]]} ({
   ^body(%element: f32):
     %square = arith.mul(%element, %element) : (f32, f32) -> f32

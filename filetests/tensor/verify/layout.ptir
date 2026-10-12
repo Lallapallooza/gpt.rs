@@ -1,184 +1,184 @@
 // RUN: verify
 
 // ERROR: tensor.transpose: perm [0, 0] is not a permutation of rank 2
-func.func @bad_perm(%0: tensor<2x3xf32>) -> tensor<2x2xf32> {
-  %1 = tensor.transpose(%0) {perm = [0, 0]} : (tensor<2x3xf32>) -> tensor<2x2xf32>
-  func.return(%1) : (tensor<2x2xf32>) -> ()
+func.func @bad_perm(%input: tensor<2x3xf32>) -> tensor<2x2xf32> {
+  %transposed = tensor.transpose(%input) {perm = [0, 0]} : (tensor<2x3xf32>) -> tensor<2x2xf32>
+  func.return(%transposed) : (tensor<2x2xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.reshape: shape [4, 2] has 8 elements, but tensor<2x3xf32> has 6
-func.func @reshape_count(%0: tensor<2x3xf32>) -> tensor<4x2xf32> {
-  %1 = tensor.reshape(%0) {shape = [4, 2]} : (tensor<2x3xf32>) -> tensor<4x2xf32>
-  func.return(%1) : (tensor<4x2xf32>) -> ()
+func.func @reshape_count(%input: tensor<2x3xf32>) -> tensor<4x2xf32> {
+  %reshaped = tensor.reshape(%input) {shape = [4, 2]} : (tensor<2x3xf32>) -> tensor<4x2xf32>
+  func.return(%reshaped) : (tensor<4x2xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.reshape: shape [{T}, 2] has 2*{T} elements, but tensor<{B}x2xf32> has 2*{B}
-func.func @reshape_dynamic_count(%0: tensor<{B}x2xf32>) -> tensor<{T}x2xf32> {
-  %1 = tensor.reshape(%0) {shape = [{T}, 2]} : (tensor<{B}x2xf32>) -> tensor<{T}x2xf32>
-  func.return(%1) : (tensor<{T}x2xf32>) -> ()
+func.func @reshape_dynamic_count(%input: tensor<{B}x2xf32>) -> tensor<{T}x2xf32> {
+  %reshaped = tensor.reshape(%input) {shape = [{T}, 2]} : (tensor<{B}x2xf32>) -> tensor<{T}x2xf32>
+  func.return(%reshaped) : (tensor<{T}x2xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.reshape: the element count of tensor<4294967296x4294967296xf32> overflows
-func.func @reshape_input_overflow(%0: tensor<4294967296x4294967296xf32>) -> tensor<1xf32> {
-  %1 = tensor.reshape(%0) {shape = [1]} : (tensor<4294967296x4294967296xf32>) -> tensor<1xf32>
-  func.return(%1) : (tensor<1xf32>) -> ()
+func.func @reshape_input_overflow(%input: tensor<4294967296x4294967296xf32>) -> tensor<1xf32> {
+  %reshaped = tensor.reshape(%input) {shape = [1]} : (tensor<4294967296x4294967296xf32>) -> tensor<1xf32>
+  func.return(%reshaped) : (tensor<1xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.reshape: the element count of shape [4294967296, 4294967296] overflows
-func.func @reshape_shape_overflow(%0: tensor<4xf32>) -> tensor<4xf32> {
-  %1 = tensor.reshape(%0) {shape = [4294967296, 4294967296]} : (tensor<4xf32>) -> tensor<4xf32>
-  func.return(%1) : (tensor<4xf32>) -> ()
+func.func @reshape_shape_overflow(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %reshaped = tensor.reshape(%input) {shape = [4294967296, 4294967296]} : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%reshaped) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.broadcast_to: shape [3] has a lower rank than tensor<2x3xf32>
-func.func @broadcast_rank(%0: tensor<2x3xf32>) -> tensor<3xf32> {
-  %1 = tensor.broadcast_to(%0) {shape = [3]} : (tensor<2x3xf32>) -> tensor<3xf32>
-  func.return(%1) : (tensor<3xf32>) -> ()
+func.func @broadcast_rank(%input: tensor<2x3xf32>) -> tensor<3xf32> {
+  %broadcast = tensor.broadcast_to(%input) {shape = [3]} : (tensor<2x3xf32>) -> tensor<3xf32>
+  func.return(%broadcast) : (tensor<3xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.broadcast_to: input axis 0 has extent 2, which does not broadcast to 4
-func.func @broadcast_extent(%0: tensor<2x3xf32>) -> tensor<4x3xf32> {
-  %1 = tensor.broadcast_to(%0) {shape = [4, 3]} : (tensor<2x3xf32>) -> tensor<4x3xf32>
-  func.return(%1) : (tensor<4x3xf32>) -> ()
+func.func @broadcast_extent(%input: tensor<2x3xf32>) -> tensor<4x3xf32> {
+  %broadcast = tensor.broadcast_to(%input) {shape = [4, 3]} : (tensor<2x3xf32>) -> tensor<4x3xf32>
+  func.return(%broadcast) : (tensor<4x3xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.broadcast_to: input axis 0 has extent {B}, which does not broadcast to {T}
-func.func @broadcast_dynamic(%0: tensor<{B}x3xf32>) -> tensor<{T}x3xf32> {
-  %1 = tensor.broadcast_to(%0) {shape = [{T}, 3]} : (tensor<{B}x3xf32>) -> tensor<{T}x3xf32>
-  func.return(%1) : (tensor<{T}x3xf32>) -> ()
+func.func @broadcast_dynamic(%input: tensor<{B}x3xf32>) -> tensor<{T}x3xf32> {
+  %broadcast = tensor.broadcast_to(%input) {shape = [{T}, 3]} : (tensor<{B}x3xf32>) -> tensor<{T}x3xf32>
+  func.return(%broadcast) : (tensor<{T}x3xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.slice: starts [0] and sizes [1] do not match rank 2
-func.func @slice_rank(%0: tensor<4x6xf32>) -> tensor<1xf32> {
-  %1 = tensor.slice(%0) {starts = [0], sizes = [1]} : (tensor<4x6xf32>) -> tensor<1xf32>
-  func.return(%1) : (tensor<1xf32>) -> ()
+func.func @slice_rank(%input: tensor<4x6xf32>) -> tensor<1xf32> {
+  %sliced = tensor.slice(%input) {starts = [0], sizes = [1]} : (tensor<4x6xf32>) -> tensor<1xf32>
+  func.return(%sliced) : (tensor<1xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.slice: start 3 + size 2 exceeds extent 4 on axis 0
-func.func @slice_bounds(%0: tensor<4x6xf32>) -> tensor<2x6xf32> {
-  %1 = tensor.slice(%0) {starts = [3, 0], sizes = [2, 6]} : (tensor<4x6xf32>) -> tensor<2x6xf32>
-  func.return(%1) : (tensor<2x6xf32>) -> ()
+func.func @slice_bounds(%input: tensor<4x6xf32>) -> tensor<2x6xf32> {
+  %sliced = tensor.slice(%input) {starts = [3, 0], sizes = [2, 6]} : (tensor<4x6xf32>) -> tensor<2x6xf32>
+  func.return(%sliced) : (tensor<2x6xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.concat: needs at least one input
 func.func @concat_empty() -> tensor<2xf32> {
-  %0 = tensor.concat() {axis = 0} : () -> tensor<2xf32>
-  func.return(%0) : (tensor<2xf32>) -> ()
+  %joined = tensor.concat() {axis = 0} : () -> tensor<2xf32>
+  func.return(%joined) : (tensor<2xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.concat: axis 2 is out of range for rank 2
-func.func @concat_axis(%0: tensor<2x3xf32>) -> tensor<2x3xf32> {
-  %1 = tensor.concat(%0, %0) {axis = 2} : (tensor<2x3xf32>, tensor<2x3xf32>) -> tensor<2x3xf32>
-  func.return(%1) : (tensor<2x3xf32>) -> ()
+func.func @concat_axis(%input: tensor<2x3xf32>) -> tensor<2x3xf32> {
+  %joined = tensor.concat(%input, %input) {axis = 2} : (tensor<2x3xf32>, tensor<2x3xf32>) -> tensor<2x3xf32>
+  func.return(%joined) : (tensor<2x3xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.concat: inputs must have equal dtypes, got tensor<2xf32> and tensor<2xsi32>
-func.func @concat_dtype(%0: tensor<2xf32>, %1: tensor<2xsi32>) -> tensor<4xf32> {
-  %2 = tensor.concat(%0, %1) {axis = 0} : (tensor<2xf32>, tensor<2xsi32>) -> tensor<4xf32>
-  func.return(%2) : (tensor<4xf32>) -> ()
+func.func @concat_dtype(%head: tensor<2xf32>, %tail: tensor<2xsi32>) -> tensor<4xf32> {
+  %joined = tensor.concat(%head, %tail) {axis = 0} : (tensor<2xf32>, tensor<2xsi32>) -> tensor<4xf32>
+  func.return(%joined) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.concat: inputs must have equal ranks, got tensor<2x3xf32> and tensor<6xf32>
-func.func @concat_ranks(%0: tensor<2x3xf32>, %1: tensor<6xf32>) -> tensor<4x3xf32> {
-  %2 = tensor.concat(%0, %1) {axis = 0} : (tensor<2x3xf32>, tensor<6xf32>) -> tensor<4x3xf32>
-  func.return(%2) : (tensor<4x3xf32>) -> ()
+func.func @concat_ranks(%head: tensor<2x3xf32>, %tail: tensor<6xf32>) -> tensor<4x3xf32> {
+  %joined = tensor.concat(%head, %tail) {axis = 0} : (tensor<2x3xf32>, tensor<6xf32>) -> tensor<4x3xf32>
+  func.return(%joined) : (tensor<4x3xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.concat: inputs must have equal extents off axis 0, got tensor<2x3xf32> and tensor<2x4xf32>
-func.func @concat_extents(%0: tensor<2x3xf32>, %1: tensor<2x4xf32>) -> tensor<4x3xf32> {
-  %2 = tensor.concat(%0, %1) {axis = 0} : (tensor<2x3xf32>, tensor<2x4xf32>) -> tensor<4x3xf32>
-  func.return(%2) : (tensor<4x3xf32>) -> ()
+func.func @concat_extents(%head: tensor<2x3xf32>, %tail: tensor<2x4xf32>) -> tensor<4x3xf32> {
+  %joined = tensor.concat(%head, %tail) {axis = 0} : (tensor<2x3xf32>, tensor<2x4xf32>) -> tensor<4x3xf32>
+  func.return(%joined) : (tensor<4x3xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.concat: axis 0 joins to {B} + 2, which is not one dimension
-func.func @concat_dynamic_join(%0: tensor<{B}x3xf32>, %1: tensor<2x3xf32>) -> tensor<{B}x3xf32> {
-  %2 = tensor.concat(%0, %1) {axis = 0} : (tensor<{B}x3xf32>, tensor<2x3xf32>) -> tensor<{B}x3xf32>
-  func.return(%2) : (tensor<{B}x3xf32>) -> ()
+func.func @concat_dynamic_join(%head: tensor<{B}x3xf32>, %tail: tensor<2x3xf32>) -> tensor<{B}x3xf32> {
+  %joined = tensor.concat(%head, %tail) {axis = 0} : (tensor<{B}x3xf32>, tensor<2x3xf32>) -> tensor<{B}x3xf32>
+  func.return(%joined) : (tensor<{B}x3xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.concat: the joined extent on axis 0 overflows
-func.func @concat_overflow(%0: tensor<9223372036854775808xf32>) -> tensor<1xf32> {
-  %1 = tensor.concat(%0, %0) {axis = 0} : (tensor<9223372036854775808xf32>, tensor<9223372036854775808xf32>) -> tensor<1xf32>
-  func.return(%1) : (tensor<1xf32>) -> ()
+func.func @concat_overflow(%input: tensor<9223372036854775808xf32>) -> tensor<1xf32> {
+  %joined = tensor.concat(%input, %input) {axis = 0} : (tensor<9223372036854775808xf32>, tensor<9223372036854775808xf32>) -> tensor<1xf32>
+  func.return(%joined) : (tensor<1xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.slice: strides [2] do not match rank 2
-func.func @strides_rank(%0: tensor<4x6xf32>) -> tensor<2x3xf32> {
-  %1 = tensor.slice(%0) {starts = [0, 0], sizes = [2, 3], strides = [2]} : (tensor<4x6xf32>) -> tensor<2x3xf32>
-  func.return(%1) : (tensor<2x3xf32>) -> ()
+func.func @strides_rank(%input: tensor<4x6xf32>) -> tensor<2x3xf32> {
+  %sliced = tensor.slice(%input) {starts = [0, 0], sizes = [2, 3], strides = [2]} : (tensor<4x6xf32>) -> tensor<2x3xf32>
+  func.return(%sliced) : (tensor<2x3xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.slice: strides [1, 0] must all be positive
-func.func @strides_zero(%0: tensor<4x6xf32>) -> tensor<2x3xf32> {
-  %1 = tensor.slice(%0) {starts = [0, 0], sizes = [2, 3], strides = [1, 0]} : (tensor<4x6xf32>) -> tensor<2x3xf32>
-  func.return(%1) : (tensor<2x3xf32>) -> ()
+func.func @strides_zero(%input: tensor<4x6xf32>) -> tensor<2x3xf32> {
+  %sliced = tensor.slice(%input) {starts = [0, 0], sizes = [2, 3], strides = [1, 0]} : (tensor<4x6xf32>) -> tensor<2x3xf32>
+  func.return(%sliced) : (tensor<2x3xf32>) -> ()
 }
 
 // -----
 
 // The last of 3 elements stepping by 3 from 1 is element 7, past the 6 of axis 1.
 // ERROR: tensor.slice: start 1 + size 7 exceeds extent 6 on axis 1
-func.func @strides_window(%0: tensor<4x6xf32>) -> tensor<2x3xf32> {
-  %1 = tensor.slice(%0) {starts = [0, 1], sizes = [2, 3], strides = [1, 3]} : (tensor<4x6xf32>) -> tensor<2x3xf32>
-  func.return(%1) : (tensor<2x3xf32>) -> ()
+func.func @strides_window(%input: tensor<4x6xf32>) -> tensor<2x3xf32> {
+  %sliced = tensor.slice(%input) {starts = [0, 1], sizes = [2, 3], strides = [1, 3]} : (tensor<4x6xf32>) -> tensor<2x3xf32>
+  func.return(%sliced) : (tensor<2x3xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.bitcast: i1 elements have no bits to reinterpret
-func.func @bitcast_i1(%0: tensor<8xi1>) -> tensor<1xui8> {
-  %1 = tensor.bitcast(%0) {to = ui8} : (tensor<8xi1>) -> tensor<1xui8>
-  func.return(%1) : (tensor<1xui8>) -> ()
+func.func @bitcast_i1(%flags: tensor<8xi1>) -> tensor<1xui8> {
+  %bytes = tensor.bitcast(%flags) {to = ui8} : (tensor<8xi1>) -> tensor<1xui8>
+  func.return(%bytes) : (tensor<1xui8>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.bitcast: the 16 bits of each row of tensor<4x2xui8> are no whole number of f6e2m3 elements
-func.func @bitcast_bits(%0: tensor<4x2xui8>) -> tensor<4x2xf6e2m3> {
-  %1 = tensor.bitcast(%0) {to = f6e2m3} : (tensor<4x2xui8>) -> tensor<4x2xf6e2m3>
-  func.return(%1) : (tensor<4x2xf6e2m3>) -> ()
+func.func @bitcast_bits(%bytes: tensor<4x2xui8>) -> tensor<4x2xf6e2m3> {
+  %values = tensor.bitcast(%bytes) {to = f6e2m3} : (tensor<4x2xui8>) -> tensor<4x2xf6e2m3>
+  func.return(%values) : (tensor<4x2xf6e2m3>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.bitcast: reinterpreting tensor<{B}xsi32> as ui4 needs a static last axis
-func.func @bitcast_dynamic(%0: tensor<{B}xsi32>) -> tensor<{B}xui4> {
-  %1 = tensor.bitcast(%0) {to = ui4} : (tensor<{B}xsi32>) -> tensor<{B}xui4>
-  func.return(%1) : (tensor<{B}xui4>) -> ()
+func.func @bitcast_dynamic(%words: tensor<{B}xsi32>) -> tensor<{B}xui4> {
+  %nibbles = tensor.bitcast(%words) {to = ui4} : (tensor<{B}xsi32>) -> tensor<{B}xui4>
+  func.return(%nibbles) : (tensor<{B}xui4>) -> ()
 }

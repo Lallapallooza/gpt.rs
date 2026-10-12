@@ -2,23 +2,23 @@
 
 // A negative axis counts back from the rank: it is written as the axis it names. Reduced axes are
 // also sorted.
-// CHECK: func.func @axes
-// CHECK-NEXT: tensor.reduce_max(%0) {axes = [0, 1]} :
-// CHECK-NEXT: tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} :
-// CHECK-NEXT: tensor.argmax(%0) {axis = 1, out = si32} :
-// CHECK-NEXT: tensor.top_k(%0) {k = 2, axis = 1, indices = si32} :
-// CHECK-NEXT: tensor.concat(%0, %0) {axis = 1} :
+// CHECK: func.func @axes([[INPUT:%[0-9]+]]: tensor<2x3xf32>, [[RHS:%[0-9]+]]: tensor<3x4xf32>, [[INDICES:%[0-9]+]]: tensor<2x3xsi32>) -> (tensor<f32>, tensor<2x4xf32>, tensor<2xsi32>, tensor<2x2xf32>, tensor<2x2xsi32>, tensor<2x6xf32>, tensor<2x3xsi32>, tensor<2x3xf32>, tensor<2x3xf32>) {
+// CHECK-NEXT: tensor.reduce_max([[INPUT]]) {axes = [0, 1]} :
+// CHECK-NEXT: tensor.dot_general([[INPUT]], [[RHS]]) {contract_lhs = [1], contract_rhs = [0]} :
+// CHECK-NEXT: tensor.argmax([[INPUT]]) {axis = 1, out = si32} :
+// CHECK-NEXT: tensor.top_k([[INPUT]]) {k = 2, axis = 1, indices = si32} :
+// CHECK-NEXT: tensor.concat([[INPUT]], [[INPUT]]) {axis = 1} :
 // CHECK-NEXT: tensor.iota() {shape = [2, 3], dtype = si32, axis = 1} :
-// CHECK-NEXT: tensor.gather(%0, %2) {axis = 1} :
-// CHECK-NEXT: tensor.scatter_add(%0, %2, %0) {axis = 1} :
-func.func @axes(%0: tensor<2x3xf32>, %1: tensor<3x4xf32>, %2: tensor<2x3xsi32>) -> (tensor<f32>, tensor<2x4xf32>, tensor<2xsi32>, tensor<2x2xf32>, tensor<2x2xsi32>, tensor<2x6xf32>, tensor<2x3xsi32>, tensor<2x3xf32>, tensor<2x3xf32>) {
-  %3 = tensor.reduce_max(%0) {axes = [-1, 0]} : (tensor<2x3xf32>) -> tensor<f32>
-  %4 = tensor.dot_general(%0, %1) {contract_lhs = [-1], contract_rhs = [-2]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
-  %5 = tensor.argmax(%0) {axis = -1, out = si32} : (tensor<2x3xf32>) -> tensor<2xsi32>
-  %6, %7 = tensor.top_k(%0) {k = 2, axis = -1, indices = si32} : (tensor<2x3xf32>) -> (tensor<2x2xf32>, tensor<2x2xsi32>)
-  %8 = tensor.concat(%0, %0) {axis = -1} : (tensor<2x3xf32>, tensor<2x3xf32>) -> tensor<2x6xf32>
-  %9 = tensor.iota() {shape = [2, 3], dtype = si32, axis = -1} : () -> tensor<2x3xsi32>
-  %10 = tensor.gather(%0, %2) {axis = -1} : (tensor<2x3xf32>, tensor<2x3xsi32>) -> tensor<2x3xf32>
-  %11 = tensor.scatter_add(%0, %2, %0) {axis = -1} : (tensor<2x3xf32>, tensor<2x3xsi32>, tensor<2x3xf32>) -> tensor<2x3xf32>
-  func.return(%3, %4, %5, %6, %7, %8, %9, %10, %11) : (tensor<f32>, tensor<2x4xf32>, tensor<2xsi32>, tensor<2x2xf32>, tensor<2x2xsi32>, tensor<2x6xf32>, tensor<2x3xsi32>, tensor<2x3xf32>, tensor<2x3xf32>) -> ()
+// CHECK-NEXT: tensor.gather([[INPUT]], [[INDICES]]) {axis = 1} :
+// CHECK-NEXT: tensor.scatter_add([[INPUT]], [[INDICES]], [[INPUT]]) {axis = 1} :
+func.func @axes(%input: tensor<2x3xf32>, %rhs: tensor<3x4xf32>, %indices: tensor<2x3xsi32>) -> (tensor<f32>, tensor<2x4xf32>, tensor<2xsi32>, tensor<2x2xf32>, tensor<2x2xsi32>, tensor<2x6xf32>, tensor<2x3xsi32>, tensor<2x3xf32>, tensor<2x3xf32>) {
+  %max = tensor.reduce_max(%input) {axes = [-1, 0]} : (tensor<2x3xf32>) -> tensor<f32>
+  %product = tensor.dot_general(%input, %rhs) {contract_lhs = [-1], contract_rhs = [-2]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
+  %argmax = tensor.argmax(%input) {axis = -1, out = si32} : (tensor<2x3xf32>) -> tensor<2xsi32>
+  %top_values, %top_indices = tensor.top_k(%input) {k = 2, axis = -1, indices = si32} : (tensor<2x3xf32>) -> (tensor<2x2xf32>, tensor<2x2xsi32>)
+  %joined = tensor.concat(%input, %input) {axis = -1} : (tensor<2x3xf32>, tensor<2x3xf32>) -> tensor<2x6xf32>
+  %positions = tensor.iota() {shape = [2, 3], dtype = si32, axis = -1} : () -> tensor<2x3xsi32>
+  %gathered = tensor.gather(%input, %indices) {axis = -1} : (tensor<2x3xf32>, tensor<2x3xsi32>) -> tensor<2x3xf32>
+  %scattered = tensor.scatter_add(%input, %indices, %input) {axis = -1} : (tensor<2x3xf32>, tensor<2x3xsi32>, tensor<2x3xf32>) -> tensor<2x3xf32>
+  func.return(%max, %product, %argmax, %top_values, %top_indices, %joined, %positions, %gathered, %scattered) : (tensor<f32>, tensor<2x4xf32>, tensor<2xsi32>, tensor<2x2xf32>, tensor<2x2xsi32>, tensor<2x6xf32>, tensor<2x3xsi32>, tensor<2x3xf32>, tensor<2x3xf32>) -> ()
 }

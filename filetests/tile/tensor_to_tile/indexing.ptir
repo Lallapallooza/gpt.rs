@@ -5,20 +5,21 @@
 // CHECK: tile.block() {iters = [par {T}], reads = [], folds = [none -> [d0]]}
 // CHECK-NEXT: tile.index() {expr = d0, dtype = f32}
 // CHECK-NOT: tensor.iota
-func.func @iota(%0: tensor<{T}xf32>) -> (tensor<2x3xsi32>, tensor<{T}xf32>) {
-  %1 = tensor.iota() {shape = [2, 3], dtype = si32, axis = 1} : () -> tensor<2x3xsi32>
-  %2 = tensor.iota() {shape = [{T}], dtype = f32, axis = 0} : () -> tensor<{T}xf32>
-  func.return(%1, %2) : (tensor<2x3xsi32>, tensor<{T}xf32>) -> ()
+func.func @iota(%input: tensor<{T}xf32>) -> (tensor<2x3xsi32>, tensor<{T}xf32>) {
+  %columns = tensor.iota() {shape = [2, 3], dtype = si32, axis = 1} : () -> tensor<2x3xsi32>
+  %positions = tensor.iota() {shape = [{T}], dtype = f32, axis = 0} : () -> tensor<{T}xf32>
+  func.return(%columns, %positions) : (tensor<2x3xsi32>, tensor<{T}xf32>) -> ()
 }
 
 // -----
-// CHECK: tile.block(%0, %1) {iters = [par 2, par 3, par 8], reads = [$0[$1[d0, d1], d2]], folds = [none -> [d0, d1, d2]]}
-// CHECK: tile.block(%2, %3) {iters = [par {B}, par 8], reads = [$0[$1[d0], d1]], folds = [none -> [d0, d1]]}
+// CHECK: func.func @take([[EMBEDDING:%[0-9]+]]: tensor<50x8xf32> {param = 3}, [[TOKENS:%[0-9]+]]: tensor<2x3xsi32>, [[BF16_EMBEDDING:%[0-9]+]]: tensor<50x8xbf16>, [[BATCH_TOKENS:%[0-9]+]]: tensor<{B}xsi32>) -> (tensor<2x3x8xf32>, tensor<{B}x8xbf16>) {
+// CHECK: tile.block([[EMBEDDING]], [[TOKENS]]) {iters = [par 2, par 3, par 8], reads = [$0[$1[d0, d1], d2]], folds = [none -> [d0, d1, d2]]}
+// CHECK: tile.block([[BF16_EMBEDDING]], [[BATCH_TOKENS]]) {iters = [par {B}, par 8], reads = [$0[$1[d0], d1]], folds = [none -> [d0, d1]]}
 // CHECK-NOT: tensor.
-func.func @take(%0: tensor<50x8xf32> {param = 3}, %1: tensor<2x3xsi32>, %2: tensor<50x8xbf16>, %3: tensor<{B}xsi32>) -> (tensor<2x3x8xf32>, tensor<{B}x8xbf16>) {
-  %4 = tensor.take(%0, %1) : (tensor<50x8xf32>, tensor<2x3xsi32>) -> tensor<2x3x8xf32>
-  %5 = tensor.take(%2, %3) : (tensor<50x8xbf16>, tensor<{B}xsi32>) -> tensor<{B}x8xbf16>
-  func.return(%4, %5) : (tensor<2x3x8xf32>, tensor<{B}x8xbf16>) -> ()
+func.func @take(%embedding: tensor<50x8xf32> {param = 3}, %tokens: tensor<2x3xsi32>, %bf16_embedding: tensor<50x8xbf16>, %batch_tokens: tensor<{B}xsi32>) -> (tensor<2x3x8xf32>, tensor<{B}x8xbf16>) {
+  %embedded = tensor.take(%embedding, %tokens) : (tensor<50x8xf32>, tensor<2x3xsi32>) -> tensor<2x3x8xf32>
+  %batch_embedded = tensor.take(%bf16_embedding, %batch_tokens) : (tensor<50x8xbf16>, tensor<{B}xsi32>) -> tensor<{B}x8xbf16>
+  func.return(%embedded, %batch_embedded) : (tensor<2x3x8xf32>, tensor<{B}x8xbf16>) -> ()
 }
 
 // -----
@@ -26,30 +27,31 @@ func.func @take(%0: tensor<50x8xf32> {param = 3}, %1: tensor<2x3xsi32>, %2: tens
 // CHECK: reads = [$0[min(max($1[0], 0), 3) + d0, min(max($1[1], 0), 0) + d1]]
 // CHECK: reads = [$0[min(max($1[0], 0), {S} - 2) + d0, min(max($1[1], 0), 0) + d1]]
 // CHECK-NOT: tensor.
-func.func @dynamic_slice(%0: tensor<4x8xf32>, %1: tensor<{S}x8xsi32>, %2: tensor<2xsi32>) -> (tensor<1x8xf32>, tensor<2x8xsi32>) {
-  %3 = tensor.dynamic_slice(%0, %2) {sizes = [1, 8]} : (tensor<4x8xf32>, tensor<2xsi32>) -> tensor<1x8xf32>
-  %4 = tensor.dynamic_slice(%1, %2) {sizes = [2, 8]} : (tensor<{S}x8xsi32>, tensor<2xsi32>) -> tensor<2x8xsi32>
-  func.return(%3, %4) : (tensor<1x8xf32>, tensor<2x8xsi32>) -> ()
+func.func @dynamic_slice(%input: tensor<4x8xf32>, %dynamic_input: tensor<{S}x8xsi32>, %starts: tensor<2xsi32>) -> (tensor<1x8xf32>, tensor<2x8xsi32>) {
+  %row = tensor.dynamic_slice(%input, %starts) {sizes = [1, 8]} : (tensor<4x8xf32>, tensor<2xsi32>) -> tensor<1x8xf32>
+  %rows = tensor.dynamic_slice(%dynamic_input, %starts) {sizes = [2, 8]} : (tensor<{S}x8xsi32>, tensor<2xsi32>) -> tensor<2x8xsi32>
+  func.return(%row, %rows) : (tensor<1x8xf32>, tensor<2x8xsi32>) -> ()
 }
 
 // -----
-// CHECK: tile.block(%0, %1, %2) {iters = [par 2, par 1, par 4], reads = [$1[d0, d1, d2]], folds = [none -> $0[min(max($2[0], 0), 0) + d0, min(max($2[1], 0), 15) + d1, min(max($2[2], 0), 0) + d2]]}
+// CHECK: func.func @dynamic_update_slice([[CACHE:%[0-9]+]]: tensor<2x16x4xf32>, [[UPDATE:%[0-9]+]]: tensor<2x1x4xf32>, [[STARTS:%[0-9]+]]: tensor<3xsi32>, [[DYNAMIC_CACHE:%[0-9]+]]: tensor<2x{S}x4xf32>) -> (tensor<2x16x4xf32>, tensor<2x{S}x4xf32>) {
+// CHECK: tile.block([[CACHE]], [[UPDATE]], [[STARTS]]) {iters = [par 2, par 1, par 4], reads = [$1[d0, d1, d2]], folds = [none -> $0[min(max($2[0], 0), 0) + d0, min(max($2[1], 0), 15) + d1, min(max($2[2], 0), 0) + d2]]}
 // CHECK: folds = [none -> $0[min(max($2[0], 0), 0) + d0, min(max($2[1], 0), {S} - 1) + d1, min(max($2[2], 0), 0) + d2]]
 // CHECK-NOT: tensor.
-func.func @dynamic_update_slice(%0: tensor<2x16x4xf32>, %1: tensor<2x1x4xf32>, %2: tensor<3xsi32>, %3: tensor<2x{S}x4xf32>) -> (tensor<2x16x4xf32>, tensor<2x{S}x4xf32>) {
-  %4 = tensor.dynamic_update_slice(%0, %1, %2) : (tensor<2x16x4xf32>, tensor<2x1x4xf32>, tensor<3xsi32>) -> tensor<2x16x4xf32>
-  %5 = tensor.dynamic_update_slice(%3, %1, %2) : (tensor<2x{S}x4xf32>, tensor<2x1x4xf32>, tensor<3xsi32>) -> tensor<2x{S}x4xf32>
-  func.return(%4, %5) : (tensor<2x16x4xf32>, tensor<2x{S}x4xf32>) -> ()
+func.func @dynamic_update_slice(%cache: tensor<2x16x4xf32>, %update: tensor<2x1x4xf32>, %starts: tensor<3xsi32>, %dynamic_cache: tensor<2x{S}x4xf32>) -> (tensor<2x16x4xf32>, tensor<2x{S}x4xf32>) {
+  %updated = tensor.dynamic_update_slice(%cache, %update, %starts) : (tensor<2x16x4xf32>, tensor<2x1x4xf32>, tensor<3xsi32>) -> tensor<2x16x4xf32>
+  %dynamic_updated = tensor.dynamic_update_slice(%dynamic_cache, %update, %starts) : (tensor<2x{S}x4xf32>, tensor<2x1x4xf32>, tensor<3xsi32>) -> tensor<2x{S}x4xf32>
+  func.return(%updated, %dynamic_updated) : (tensor<2x16x4xf32>, tensor<2x{S}x4xf32>) -> ()
 }
 
 // -----
 // CHECK: reads = [$0[d0, $1[d0, d1]]], folds = [none -> [d0, d1]]
 // CHECK: reads = [$0[$1[d0, d1], d1]], folds = [none -> [d0, d1]]
 // CHECK-NOT: tensor.
-func.func @gather(%0: tensor<3x4xf32>, %1: tensor<3x2xsi32>, %2: tensor<5x4xsi32>) -> (tensor<3x2xf32>, tensor<5x4xf32>) {
-  %3 = tensor.gather(%0, %1) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>) -> tensor<3x2xf32>
-  %4 = tensor.gather(%0, %2) {axis = 0} : (tensor<3x4xf32>, tensor<5x4xsi32>) -> tensor<5x4xf32>
-  func.return(%3, %4) : (tensor<3x2xf32>, tensor<5x4xf32>) -> ()
+func.func @gather(%input: tensor<3x4xf32>, %column_indices: tensor<3x2xsi32>, %row_indices: tensor<5x4xsi32>) -> (tensor<3x2xf32>, tensor<5x4xf32>) {
+  %gathered_columns = tensor.gather(%input, %column_indices) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>) -> tensor<3x2xf32>
+  %gathered_rows = tensor.gather(%input, %row_indices) {axis = 0} : (tensor<3x4xf32>, tensor<5x4xsi32>) -> tensor<5x4xf32>
+  func.return(%gathered_columns, %gathered_rows) : (tensor<3x2xf32>, tensor<5x4xf32>) -> ()
 }
 
 // -----
@@ -59,20 +61,20 @@ func.func @gather(%0: tensor<3x4xf32>, %1: tensor<3x2xsi32>, %2: tensor<5x4xsi32
 // `replace` lets the last update win: no combine.
 // CHECK: reads = [$2[d0, d1]], folds = [none -> $0[d0, $1[d0, d1]]]} ({
 // CHECK-NOT: tensor.
-func.func @scatter(%0: tensor<3x4xf32>, %1: tensor<3x2xsi32>, %2: tensor<3x2xf32>) -> (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) {
-  %3 = tensor.scatter_add(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
-  %4 = tensor.scatter_max(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
-  %5 = tensor.scatter_min(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
-  %6 = tensor.scatter_replace(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
-  func.return(%3, %4, %5, %6) : (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) -> ()
+func.func @scatter(%input: tensor<3x4xf32>, %indices: tensor<3x2xsi32>, %updates: tensor<3x2xf32>) -> (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) {
+  %sums = tensor.scatter_add(%input, %indices, %updates) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  %maxima = tensor.scatter_max(%input, %indices, %updates) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  %minima = tensor.scatter_min(%input, %indices, %updates) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  %replaced = tensor.scatter_replace(%input, %indices, %updates) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  func.return(%sums, %maxima, %minima, %replaced) : (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) -> ()
 }
 
 // -----
 // CHECK: reads = [$0[$1[d0], d1]]
 // CHECK: reads = [$0[min(max($1[0], 0), 49) + d0, min(max($1[1], 0), 0) + d1]]
 // CHECK-NOT: tensor.
-func.func @si64_indices(%0: tensor<50x8xf32>, %1: tensor<3xsi64>, %2: tensor<2xsi64>) -> (tensor<3x8xf32>, tensor<1x8xf32>) {
-  %3 = tensor.take(%0, %1) : (tensor<50x8xf32>, tensor<3xsi64>) -> tensor<3x8xf32>
-  %4 = tensor.dynamic_slice(%0, %2) {sizes = [1, 8]} : (tensor<50x8xf32>, tensor<2xsi64>) -> tensor<1x8xf32>
-  func.return(%3, %4) : (tensor<3x8xf32>, tensor<1x8xf32>) -> ()
+func.func @si64_indices(%table: tensor<50x8xf32>, %indices: tensor<3xsi64>, %starts: tensor<2xsi64>) -> (tensor<3x8xf32>, tensor<1x8xf32>) {
+  %taken = tensor.take(%table, %indices) : (tensor<50x8xf32>, tensor<3xsi64>) -> tensor<3x8xf32>
+  %row = tensor.dynamic_slice(%table, %starts) {sizes = [1, 8]} : (tensor<50x8xf32>, tensor<2xsi64>) -> tensor<1x8xf32>
+  func.return(%taken, %row) : (tensor<3x8xf32>, tensor<1x8xf32>) -> ()
 }

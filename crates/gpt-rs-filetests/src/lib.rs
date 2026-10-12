@@ -10,9 +10,10 @@
 //! A file starts with `// RUN: <mode>` and holds cases separated by `// -----`. A case starts at
 //! its first non-blank line, and the line numbers of parse errors count from there. Modes:
 //!
-//! - `roundtrip`: the case is canonical text. It must parse, verify, and print back unchanged,
-//!   with the locations of its ops. A case that starts with the spec version prints with it, as a
-//!   stored program does.
+//! - `roundtrip`: the case must parse and verify. Its printed text, which holds the locations of
+//!   its ops, must parse, print back unchanged and satisfy the case's CHECK lines. The case needs at
+//!   least one CHECK line. A case that starts with the spec version prints with it, as a stored
+//!   program does.
 //! - `parse`: the case fails to parse with exactly the message of its `// ERROR: <message>` line.
 //! - `verify`: the case parses and fails verification with exactly the message of its
 //!   `// ERROR: <message>` line.
@@ -40,6 +41,11 @@
 //! line, `CHECK-NOT:` nowhere between the previous match and the next one. Any other comment line
 //! that names CHECK is an error. In a pattern, `[[NAME:regex]]` captures, `[[NAME]]` reuses a
 //! capture and `{{regex}}` matches a regex. Everything else is literal.
+//!
+//! Values have no names in the IR: the parser reads any name, and the printer numbers the values.
+//! A case names each value for what it holds (`%weight`, `%scores`). Its CHECK lines capture a
+//! printed value under such a name and reuse it. They never match a printed number:
+//! `[[SUM:%[0-9]+]] = tensor.add([[LHS]], [[RHS]])`.
 
 #[cfg(feature = "backend")]
 pub mod backend;
@@ -204,17 +210,24 @@ fn run_case(mode: &str, case: &Case, default: DefaultPipeline<'_>) -> Result<(),
     match mode {
         "roundtrip" => {
             verify(&module).map_err(|err| format!("verify error: {err}"))?;
-            let expected = code_lines(&case.text);
-            let printed = module.print(TextOptions {
-                versioned: expected.starts_with("spec_version"),
+            let checks = check::check_lines(&case.text)?;
+            if checks.is_empty() {
+                return Err("a roundtrip case needs a CHECK line".into());
+            }
+            let options = TextOptions {
+                versioned: code_lines(&case.text).starts_with("spec_version"),
                 locations: true,
-            });
-            if printed != expected {
+            };
+            let printed = module.print(options);
+            let reprinted = Module::from_text(&printed).map(|module| module.print(options));
+            if reprinted.as_ref().ok() != Some(&printed) {
                 return Err(format!(
-                    "printed text differs\n--- expected\n{expected}--- printed\n{printed}"
+                    "the printed text does not print back unchanged: {reprinted:?}\n--- printed\n\
+                     {printed}"
                 ));
             }
-            Ok(())
+            check::file_check(&checks, &printed)
+                .map_err(|err| format!("{err}\n--- printed\n{printed}"))
         }
         "verify" => expect_error(&case.text, verify(&module)),
         "pass" => pass_case(module, args, case, default),

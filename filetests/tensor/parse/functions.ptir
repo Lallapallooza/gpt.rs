@@ -1,6 +1,6 @@
 // RUN: parse
 
-// ERROR: 2:106: a load-time function binds every result to a parameter
-func.func @load_time_unbound(%0: tensor<4xf32> {param = 1}) -> (tensor<4xf32> {param = 7}, tensor<4xf32>) {
-  func.return(%0, %0) : (tensor<4xf32>, tensor<4xf32>) -> ()
+// ERROR: 2:111: a load-time function binds every result to a parameter
+func.func @load_time_unbound(%weight: tensor<4xf32> {param = 1}) -> (tensor<4xf32> {param = 7}, tensor<4xf32>) {
+  func.return(%weight, %weight) : (tensor<4xf32>, tensor<4xf32>) -> ()
 }

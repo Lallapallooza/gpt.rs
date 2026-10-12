@@ -1,196 +1,196 @@
 // RUN: verify
 
 // ERROR: tensor.extract_patches: tensor<{N}x4x4x3xf32> has a dynamic dimension
-func.func @patches_dynamic(%0: tensor<{N}x4x4x3xf32>) -> tensor<{N}x2x2x27xf32> {
-  %1 = tensor.extract_patches(%0) {window = [3, 3], strides = [1, 1], dilation = [1, 1], padding = [(0, 0), (0, 0)], pad_value = 0.0} : (tensor<{N}x4x4x3xf32>) -> tensor<{N}x2x2x27xf32>
-  func.return(%1) : (tensor<{N}x2x2x27xf32>) -> ()
+func.func @patches_dynamic(%input: tensor<{N}x4x4x3xf32>) -> tensor<{N}x2x2x27xf32> {
+  %patches = tensor.extract_patches(%input) {window = [3, 3], strides = [1, 1], dilation = [1, 1], padding = [(0, 0), (0, 0)], pad_value = 0.0} : (tensor<{N}x4x4x3xf32>) -> tensor<{N}x2x2x27xf32>
+  func.return(%patches) : (tensor<{N}x2x2x27xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.extract_patches: input must be [N, spatial..., C], got tensor<4x4xf32>
-func.func @patches_rank(%0: tensor<4x4xf32>) -> tensor<4x2x2xf32> {
-  %1 = tensor.extract_patches(%0) {window = [3], strides = [1], dilation = [1], padding = [(0, 0)], pad_value = 0.0} : (tensor<4x4xf32>) -> tensor<4x2x2xf32>
-  func.return(%1) : (tensor<4x2x2xf32>) -> ()
+func.func @patches_rank(%input: tensor<4x4xf32>) -> tensor<4x2x2xf32> {
+  %patches = tensor.extract_patches(%input) {window = [3], strides = [1], dilation = [1], padding = [(0, 0)], pad_value = 0.0} : (tensor<4x4xf32>) -> tensor<4x2x2xf32>
+  func.return(%patches) : (tensor<4x2x2xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.extract_patches: window [3] has rank 1, but the input has 2 spatial axes
-func.func @patches_window_rank(%0: tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32> {
-  %1 = tensor.extract_patches(%0) {window = [3], strides = [1, 1], dilation = [1, 1], padding = [(0, 0), (0, 0)], pad_value = 0.0} : (tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32>
-  func.return(%1) : (tensor<1x2x2x27xf32>) -> ()
+func.func @patches_window_rank(%input: tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32> {
+  %patches = tensor.extract_patches(%input) {window = [3], strides = [1, 1], dilation = [1, 1], padding = [(0, 0), (0, 0)], pad_value = 0.0} : (tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32>
+  func.return(%patches) : (tensor<1x2x2x27xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.extract_patches: strides [1, 1, 1] has rank 3, but the input has 2 spatial axes
-func.func @patches_strides_rank(%0: tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32> {
-  %1 = tensor.extract_patches(%0) {window = [3, 3], strides = [1, 1, 1], dilation = [1, 1], padding = [(0, 0), (0, 0)], pad_value = 0.0} : (tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32>
-  func.return(%1) : (tensor<1x2x2x27xf32>) -> ()
+func.func @patches_strides_rank(%input: tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32> {
+  %patches = tensor.extract_patches(%input) {window = [3, 3], strides = [1, 1, 1], dilation = [1, 1], padding = [(0, 0), (0, 0)], pad_value = 0.0} : (tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32>
+  func.return(%patches) : (tensor<1x2x2x27xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.extract_patches: dilation [1] has rank 1, but the input has 2 spatial axes
-func.func @patches_dilation_rank(%0: tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32> {
-  %1 = tensor.extract_patches(%0) {window = [3, 3], strides = [1, 1], dilation = [1], padding = [(0, 0), (0, 0)], pad_value = 0.0} : (tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32>
-  func.return(%1) : (tensor<1x2x2x27xf32>) -> ()
+func.func @patches_dilation_rank(%input: tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32> {
+  %patches = tensor.extract_patches(%input) {window = [3, 3], strides = [1, 1], dilation = [1], padding = [(0, 0), (0, 0)], pad_value = 0.0} : (tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32>
+  func.return(%patches) : (tensor<1x2x2x27xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.extract_patches: padding [(0, 0)] has rank 1, but the input has 2 spatial axes
-func.func @patches_padding_rank(%0: tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32> {
-  %1 = tensor.extract_patches(%0) {window = [3, 3], strides = [1, 1], dilation = [1, 1], padding = [(0, 0)], pad_value = 0.0} : (tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32>
-  func.return(%1) : (tensor<1x2x2x27xf32>) -> ()
+func.func @patches_padding_rank(%input: tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32> {
+  %patches = tensor.extract_patches(%input) {window = [3, 3], strides = [1, 1], dilation = [1, 1], padding = [(0, 0)], pad_value = 0.0} : (tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32>
+  func.return(%patches) : (tensor<1x2x2x27xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.extract_patches: input tensor<1x4x4x0xf32> has an empty spatial or channel axis
-func.func @patches_no_channels(%0: tensor<1x4x4x0xf32>) -> tensor<1x2x2x0xf32> {
-  %1 = tensor.extract_patches(%0) {window = [3, 3], strides = [1, 1], dilation = [1, 1], padding = [(0, 0), (0, 0)], pad_value = 0.0} : (tensor<1x4x4x0xf32>) -> tensor<1x2x2x0xf32>
-  func.return(%1) : (tensor<1x2x2x0xf32>) -> ()
+func.func @patches_no_channels(%input: tensor<1x4x4x0xf32>) -> tensor<1x2x2x0xf32> {
+  %patches = tensor.extract_patches(%input) {window = [3, 3], strides = [1, 1], dilation = [1, 1], padding = [(0, 0), (0, 0)], pad_value = 0.0} : (tensor<1x4x4x0xf32>) -> tensor<1x2x2x0xf32>
+  func.return(%patches) : (tensor<1x2x2x0xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.extract_patches: window [0, 3] must all be positive
-func.func @patches_zero_window(%0: tensor<1x4x4x3xf32>) -> tensor<1x2x2x0xf32> {
-  %1 = tensor.extract_patches(%0) {window = [0, 3], strides = [1, 1], dilation = [1, 1], padding = [(0, 0), (0, 0)], pad_value = 0.0} : (tensor<1x4x4x3xf32>) -> tensor<1x2x2x0xf32>
-  func.return(%1) : (tensor<1x2x2x0xf32>) -> ()
+func.func @patches_zero_window(%input: tensor<1x4x4x3xf32>) -> tensor<1x2x2x0xf32> {
+  %patches = tensor.extract_patches(%input) {window = [0, 3], strides = [1, 1], dilation = [1, 1], padding = [(0, 0), (0, 0)], pad_value = 0.0} : (tensor<1x4x4x3xf32>) -> tensor<1x2x2x0xf32>
+  func.return(%patches) : (tensor<1x2x2x0xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.extract_patches: strides [1, 0] must all be positive
-func.func @patches_zero_stride(%0: tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32> {
-  %1 = tensor.extract_patches(%0) {window = [3, 3], strides = [1, 0], dilation = [1, 1], padding = [(0, 0), (0, 0)], pad_value = 0.0} : (tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32>
-  func.return(%1) : (tensor<1x2x2x27xf32>) -> ()
+func.func @patches_zero_stride(%input: tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32> {
+  %patches = tensor.extract_patches(%input) {window = [3, 3], strides = [1, 0], dilation = [1, 1], padding = [(0, 0), (0, 0)], pad_value = 0.0} : (tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32>
+  func.return(%patches) : (tensor<1x2x2x27xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.extract_patches: dilation [0, 1] must all be positive
-func.func @patches_zero_dilation(%0: tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32> {
-  %1 = tensor.extract_patches(%0) {window = [3, 3], strides = [1, 1], dilation = [0, 1], padding = [(0, 0), (0, 0)], pad_value = 0.0} : (tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32>
-  func.return(%1) : (tensor<1x2x2x27xf32>) -> ()
+func.func @patches_zero_dilation(%input: tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32> {
+  %patches = tensor.extract_patches(%input) {window = [3, 3], strides = [1, 1], dilation = [0, 1], padding = [(0, 0), (0, 0)], pad_value = 0.0} : (tensor<1x4x4x3xf32>) -> tensor<1x2x2x27xf32>
+  func.return(%patches) : (tensor<1x2x2x27xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.extract_patches: patch size overflows
-func.func @patches_size_overflow(%0: tensor<1x1x1x1xf32>) -> tensor<1x2x2x1xf32> {
-  %1 = tensor.extract_patches(%0) {window = [4294967296, 4294967296], strides = [1, 1], dilation = [1, 1], padding = [(4294967296, 0), (4294967296, 0)], pad_value = 0.0} : (tensor<1x1x1x1xf32>) -> tensor<1x2x2x1xf32>
-  func.return(%1) : (tensor<1x2x2x1xf32>) -> ()
+func.func @patches_size_overflow(%input: tensor<1x1x1x1xf32>) -> tensor<1x2x2x1xf32> {
+  %patches = tensor.extract_patches(%input) {window = [4294967296, 4294967296], strides = [1, 1], dilation = [1, 1], padding = [(4294967296, 0), (4294967296, 0)], pad_value = 0.0} : (tensor<1x1x1x1xf32>) -> tensor<1x2x2x1xf32>
+  func.return(%patches) : (tensor<1x2x2x1xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.extract_patches: pad_value 0.5 is not representable in si32
-func.func @patches_fractional_pad(%0: tensor<1x4x4x1xsi32>) -> tensor<1x4x4x9xsi32> {
-  %1 = tensor.extract_patches(%0) {window = [3, 3], strides = [1, 1], dilation = [1, 1], padding = [(1, 1), (1, 1)], pad_value = 0.5} : (tensor<1x4x4x1xsi32>) -> tensor<1x4x4x9xsi32>
-  func.return(%1) : (tensor<1x4x4x9xsi32>) -> ()
+func.func @patches_fractional_pad(%input: tensor<1x4x4x1xsi32>) -> tensor<1x4x4x9xsi32> {
+  %patches = tensor.extract_patches(%input) {window = [3, 3], strides = [1, 1], dilation = [1, 1], padding = [(1, 1), (1, 1)], pad_value = 0.5} : (tensor<1x4x4x1xsi32>) -> tensor<1x4x4x9xsi32>
+  func.return(%patches) : (tensor<1x4x4x9xsi32>) -> ()
 }
 
 // -----
 // ERROR: tensor.reduce_window_max: tensor<{N}x4xf32> has a dynamic dimension
-func.func @window_dynamic(%0: tensor<{N}x4xf32>) -> tensor<{N}x2xf32> {
-  %1 = tensor.reduce_window_max(%0) {window_dims = [1, 3], strides = [1, 1], padding = [(0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [1, 1]} : (tensor<{N}x4xf32>) -> tensor<{N}x2xf32>
-  func.return(%1) : (tensor<{N}x2xf32>) -> ()
+func.func @window_dynamic(%input: tensor<{N}x4xf32>) -> tensor<{N}x2xf32> {
+  %max = tensor.reduce_window_max(%input) {window_dims = [1, 3], strides = [1, 1], padding = [(0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [1, 1]} : (tensor<{N}x4xf32>) -> tensor<{N}x2xf32>
+  func.return(%max) : (tensor<{N}x2xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.reduce_window_max: window_dims [2] has rank 1, but the input has rank 2
-func.func @window_dims_rank(%0: tensor<4x4xf32>) -> tensor<3x4xf32> {
-  %1 = tensor.reduce_window_max(%0) {window_dims = [2], strides = [1, 1], padding = [(0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [1, 1]} : (tensor<4x4xf32>) -> tensor<3x4xf32>
-  func.return(%1) : (tensor<3x4xf32>) -> ()
+func.func @window_dims_rank(%input: tensor<4x4xf32>) -> tensor<3x4xf32> {
+  %max = tensor.reduce_window_max(%input) {window_dims = [2], strides = [1, 1], padding = [(0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [1, 1]} : (tensor<4x4xf32>) -> tensor<3x4xf32>
+  func.return(%max) : (tensor<3x4xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.reduce_window_max: strides [1] has rank 1, but the input has rank 2
-func.func @window_strides_rank(%0: tensor<4x4xf32>) -> tensor<3x4xf32> {
-  %1 = tensor.reduce_window_max(%0) {window_dims = [2, 1], strides = [1], padding = [(0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [1, 1]} : (tensor<4x4xf32>) -> tensor<3x4xf32>
-  func.return(%1) : (tensor<3x4xf32>) -> ()
+func.func @window_strides_rank(%input: tensor<4x4xf32>) -> tensor<3x4xf32> {
+  %max = tensor.reduce_window_max(%input) {window_dims = [2, 1], strides = [1], padding = [(0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [1, 1]} : (tensor<4x4xf32>) -> tensor<3x4xf32>
+  func.return(%max) : (tensor<3x4xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.reduce_window_max: padding [(0, 0), (0, 0), (0, 0)] has rank 3, but the input has rank 2
-func.func @window_padding_rank(%0: tensor<4x4xf32>) -> tensor<3x4xf32> {
-  %1 = tensor.reduce_window_max(%0) {window_dims = [2, 1], strides = [1, 1], padding = [(0, 0), (0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [1, 1]} : (tensor<4x4xf32>) -> tensor<3x4xf32>
-  func.return(%1) : (tensor<3x4xf32>) -> ()
+func.func @window_padding_rank(%input: tensor<4x4xf32>) -> tensor<3x4xf32> {
+  %max = tensor.reduce_window_max(%input) {window_dims = [2, 1], strides = [1, 1], padding = [(0, 0), (0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [1, 1]} : (tensor<4x4xf32>) -> tensor<3x4xf32>
+  func.return(%max) : (tensor<3x4xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.reduce_window_max: base_dilation [] has rank 0, but the input has rank 2
-func.func @window_base_dilation_rank(%0: tensor<4x4xf32>) -> tensor<3x4xf32> {
-  %1 = tensor.reduce_window_max(%0) {window_dims = [2, 1], strides = [1, 1], padding = [(0, 0), (0, 0)], base_dilation = [], window_dilation = [1, 1]} : (tensor<4x4xf32>) -> tensor<3x4xf32>
-  func.return(%1) : (tensor<3x4xf32>) -> ()
+func.func @window_base_dilation_rank(%input: tensor<4x4xf32>) -> tensor<3x4xf32> {
+  %max = tensor.reduce_window_max(%input) {window_dims = [2, 1], strides = [1, 1], padding = [(0, 0), (0, 0)], base_dilation = [], window_dilation = [1, 1]} : (tensor<4x4xf32>) -> tensor<3x4xf32>
+  func.return(%max) : (tensor<3x4xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.reduce_window_max: window_dilation [1] has rank 1, but the input has rank 2
-func.func @window_dilation_rank(%0: tensor<4x4xf32>) -> tensor<3x4xf32> {
-  %1 = tensor.reduce_window_max(%0) {window_dims = [2, 1], strides = [1, 1], padding = [(0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [1]} : (tensor<4x4xf32>) -> tensor<3x4xf32>
-  func.return(%1) : (tensor<3x4xf32>) -> ()
+func.func @window_dilation_rank(%input: tensor<4x4xf32>) -> tensor<3x4xf32> {
+  %max = tensor.reduce_window_max(%input) {window_dims = [2, 1], strides = [1, 1], padding = [(0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [1]} : (tensor<4x4xf32>) -> tensor<3x4xf32>
+  func.return(%max) : (tensor<3x4xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.reduce_window_sum: window_dims [2, 0] must all be positive
-func.func @window_zero_window(%0: tensor<4x4xf32>) -> tensor<3x4xf32> {
-  %1 = tensor.reduce_window_sum(%0) {window_dims = [2, 0], strides = [1, 1], padding = [(0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [1, 1]} : (tensor<4x4xf32>) -> tensor<3x4xf32>
-  func.return(%1) : (tensor<3x4xf32>) -> ()
+func.func @window_zero_window(%input: tensor<4x4xf32>) -> tensor<3x4xf32> {
+  %sum = tensor.reduce_window_sum(%input) {window_dims = [2, 0], strides = [1, 1], padding = [(0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [1, 1]} : (tensor<4x4xf32>) -> tensor<3x4xf32>
+  func.return(%sum) : (tensor<3x4xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.reduce_window_sum: strides [0, 1] must all be positive
-func.func @window_zero_stride(%0: tensor<4x4xf32>) -> tensor<3x4xf32> {
-  %1 = tensor.reduce_window_sum(%0) {window_dims = [2, 1], strides = [0, 1], padding = [(0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [1, 1]} : (tensor<4x4xf32>) -> tensor<3x4xf32>
-  func.return(%1) : (tensor<3x4xf32>) -> ()
+func.func @window_zero_stride(%input: tensor<4x4xf32>) -> tensor<3x4xf32> {
+  %sum = tensor.reduce_window_sum(%input) {window_dims = [2, 1], strides = [0, 1], padding = [(0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [1, 1]} : (tensor<4x4xf32>) -> tensor<3x4xf32>
+  func.return(%sum) : (tensor<3x4xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.reduce_window_sum: base_dilation [1, 0] must all be positive
-func.func @window_zero_base_dilation(%0: tensor<4x4xf32>) -> tensor<3x4xf32> {
-  %1 = tensor.reduce_window_sum(%0) {window_dims = [2, 1], strides = [1, 1], padding = [(0, 0), (0, 0)], base_dilation = [1, 0], window_dilation = [1, 1]} : (tensor<4x4xf32>) -> tensor<3x4xf32>
-  func.return(%1) : (tensor<3x4xf32>) -> ()
+func.func @window_zero_base_dilation(%input: tensor<4x4xf32>) -> tensor<3x4xf32> {
+  %sum = tensor.reduce_window_sum(%input) {window_dims = [2, 1], strides = [1, 1], padding = [(0, 0), (0, 0)], base_dilation = [1, 0], window_dilation = [1, 1]} : (tensor<4x4xf32>) -> tensor<3x4xf32>
+  func.return(%sum) : (tensor<3x4xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.reduce_window_sum: window_dilation [0, 1] must all be positive
-func.func @window_zero_window_dilation(%0: tensor<4x4xf32>) -> tensor<3x4xf32> {
-  %1 = tensor.reduce_window_sum(%0) {window_dims = [2, 1], strides = [1, 1], padding = [(0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [0, 1]} : (tensor<4x4xf32>) -> tensor<3x4xf32>
-  func.return(%1) : (tensor<3x4xf32>) -> ()
+func.func @window_zero_window_dilation(%input: tensor<4x4xf32>) -> tensor<3x4xf32> {
+  %sum = tensor.reduce_window_sum(%input) {window_dims = [2, 1], strides = [1, 1], padding = [(0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [0, 1]} : (tensor<4x4xf32>) -> tensor<3x4xf32>
+  func.return(%sum) : (tensor<3x4xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.reduce_window_sum: accum must be a float dtype, got i1
-func.func @window_i1_accum(%0: tensor<4xf32>) -> tensor<3xf32> {
-  %1 = tensor.reduce_window_sum(%0) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1], accum = i1} : (tensor<4xf32>) -> tensor<3xf32>
-  func.return(%1) : (tensor<3xf32>) -> ()
+func.func @window_i1_accum(%input: tensor<4xf32>) -> tensor<3xf32> {
+  %sum = tensor.reduce_window_sum(%input) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1], accum = i1} : (tensor<4xf32>) -> tensor<3xf32>
+  func.return(%sum) : (tensor<3xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.reduce_window_max: the input must be an integer or float tensor, got tensor<4xi1>
-func.func @window_i1_input(%0: tensor<4xi1>) -> tensor<3xi1> {
-  %1 = tensor.reduce_window_max(%0) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1]} : (tensor<4xi1>) -> tensor<3xi1>
-  func.return(%1) : (tensor<3xi1>) -> ()
+func.func @window_i1_input(%input: tensor<4xi1>) -> tensor<3xi1> {
+  %max = tensor.reduce_window_max(%input) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1]} : (tensor<4xi1>) -> tensor<3xi1>
+  func.return(%max) : (tensor<3xi1>) -> ()
 }
 
 // -----
 // ERROR: tensor.reduce_window_min: the dilated input overflows on axis 0
-func.func @window_base_dilation_overflow(%0: tensor<4xf32>) -> tensor<4xf32> {
-  %1 = tensor.reduce_window_min(%0) {window_dims = [1], strides = [1], padding = [(0, 0)], base_dilation = [9223372036854775807], window_dilation = [1]} : (tensor<4xf32>) -> tensor<4xf32>
-  func.return(%1) : (tensor<4xf32>) -> ()
+func.func @window_base_dilation_overflow(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %min = tensor.reduce_window_min(%input) {window_dims = [1], strides = [1], padding = [(0, 0)], base_dilation = [9223372036854775807], window_dilation = [1]} : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%min) : (tensor<4xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.reduce_window_min: the padded input overflows on axis 0
-func.func @window_padding_overflow(%0: tensor<4xf32>) -> tensor<4xf32> {
-  %1 = tensor.reduce_window_min(%0) {window_dims = [1], strides = [1], padding = [(18446744073709551615, 0)], base_dilation = [1], window_dilation = [1]} : (tensor<4xf32>) -> tensor<4xf32>
-  func.return(%1) : (tensor<4xf32>) -> ()
+func.func @window_padding_overflow(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %min = tensor.reduce_window_min(%input) {window_dims = [1], strides = [1], padding = [(18446744073709551615, 0)], base_dilation = [1], window_dilation = [1]} : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%min) : (tensor<4xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.reduce_window_min: the dilated window overflows on axis 0
-func.func @window_dilation_overflow(%0: tensor<4xf32>) -> tensor<1xf32> {
-  %1 = tensor.reduce_window_min(%0) {window_dims = [4], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [9223372036854775807]} : (tensor<4xf32>) -> tensor<1xf32>
-  func.return(%1) : (tensor<1xf32>) -> ()
+func.func @window_dilation_overflow(%input: tensor<4xf32>) -> tensor<1xf32> {
+  %min = tensor.reduce_window_min(%input) {window_dims = [4], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [9223372036854775807]} : (tensor<4xf32>) -> tensor<1xf32>
+  func.return(%min) : (tensor<1xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.reduce_window_min: window extent 3 exceeds padded input extent 2 on axis 0
-func.func @window_too_large(%0: tensor<2x4xf32>) -> tensor<1x4xf32> {
-  %1 = tensor.reduce_window_min(%0) {window_dims = [3, 1], strides = [1, 1], padding = [(0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [1, 1]} : (tensor<2x4xf32>) -> tensor<1x4xf32>
-  func.return(%1) : (tensor<1x4xf32>) -> ()
+func.func @window_too_large(%input: tensor<2x4xf32>) -> tensor<1x4xf32> {
+  %min = tensor.reduce_window_min(%input) {window_dims = [3, 1], strides = [1, 1], padding = [(0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [1, 1]} : (tensor<2x4xf32>) -> tensor<1x4xf32>
+  func.return(%min) : (tensor<1x4xf32>) -> ()
 }

@@ -1,58 +1,92 @@
 // RUN: roundtrip
 
-func.func @conv_patches(%0: tensor<1x5x5x3xf32>) -> tensor<1x3x3x27xf32> {
-  %1 = tensor.extract_patches(%0) {window = [3, 3], strides = [2, 2], dilation = [1, 1], padding = [(1, 1), (1, 1)], pad_value = 0.0} : (tensor<1x5x5x3xf32>) -> tensor<1x3x3x27xf32>
-  func.return(%1) : (tensor<1x3x3x27xf32>) -> ()
+// CHECK: func.func @conv_patches([[IMAGE:%[0-9]+]]: tensor<1x5x5x3xf32>) -> tensor<1x3x3x27xf32> {
+// CHECK-NEXT: [[PATCHES:%[0-9]+]] = tensor.extract_patches([[IMAGE]]) {window = [3, 3], strides = [2, 2], dilation = [1, 1], padding = [(1, 1), (1, 1)], pad_value = 0.0} : (tensor<1x5x5x3xf32>) -> tensor<1x3x3x27xf32>
+// CHECK-NEXT: func.return([[PATCHES]]) : (tensor<1x3x3x27xf32>) -> ()
+// CHECK-NEXT: }
+func.func @conv_patches(%image: tensor<1x5x5x3xf32>) -> tensor<1x3x3x27xf32> {
+  %patches = tensor.extract_patches(%image) {window = [3, 3], strides = [2, 2], dilation = [1, 1], padding = [(1, 1), (1, 1)], pad_value = 0.0} : (tensor<1x5x5x3xf32>) -> tensor<1x3x3x27xf32>
+  func.return(%patches) : (tensor<1x3x3x27xf32>) -> ()
 }
 
 // -----
 
-func.func @dilated_patches(%0: tensor<2x7x4xf32>) -> tensor<2x5x12xf32> {
-  %1 = tensor.extract_patches(%0) {window = [3], strides = [1], dilation = [2], padding = [(0, 2)], pad_value = -1.5} : (tensor<2x7x4xf32>) -> tensor<2x5x12xf32>
-  func.return(%1) : (tensor<2x5x12xf32>) -> ()
+// CHECK: func.func @dilated_patches([[SEQUENCE:%[0-9]+]]: tensor<2x7x4xf32>) -> tensor<2x5x12xf32> {
+// CHECK-NEXT: [[PATCHES:%[0-9]+]] = tensor.extract_patches([[SEQUENCE]]) {window = [3], strides = [1], dilation = [2], padding = [(0, 2)], pad_value = -1.5} : (tensor<2x7x4xf32>) -> tensor<2x5x12xf32>
+// CHECK-NEXT: func.return([[PATCHES]]) : (tensor<2x5x12xf32>) -> ()
+// CHECK-NEXT: }
+func.func @dilated_patches(%sequence: tensor<2x7x4xf32>) -> tensor<2x5x12xf32> {
+  %patches = tensor.extract_patches(%sequence) {window = [3], strides = [1], dilation = [2], padding = [(0, 2)], pad_value = -1.5} : (tensor<2x7x4xf32>) -> tensor<2x5x12xf32>
+  func.return(%patches) : (tensor<2x5x12xf32>) -> ()
 }
 
 // -----
 
-func.func @integer_patches(%0: tensor<1x2x3x2xsi32>) -> tensor<1x1x3x8xsi32> {
-  %1 = tensor.extract_patches(%0) {window = [2, 2], strides = [1, 1], dilation = [1, 1], padding = [(0, 0), (0, 1)], pad_value = 7.0} : (tensor<1x2x3x2xsi32>) -> tensor<1x1x3x8xsi32>
-  func.return(%1) : (tensor<1x1x3x8xsi32>) -> ()
+// CHECK: func.func @integer_patches([[IMAGE:%[0-9]+]]: tensor<1x2x3x2xsi32>) -> tensor<1x1x3x8xsi32> {
+// CHECK-NEXT: [[PATCHES:%[0-9]+]] = tensor.extract_patches([[IMAGE]]) {window = [2, 2], strides = [1, 1], dilation = [1, 1], padding = [(0, 0), (0, 1)], pad_value = 7.0} : (tensor<1x2x3x2xsi32>) -> tensor<1x1x3x8xsi32>
+// CHECK-NEXT: func.return([[PATCHES]]) : (tensor<1x1x3x8xsi32>) -> ()
+// CHECK-NEXT: }
+func.func @integer_patches(%image: tensor<1x2x3x2xsi32>) -> tensor<1x1x3x8xsi32> {
+  %patches = tensor.extract_patches(%image) {window = [2, 2], strides = [1, 1], dilation = [1, 1], padding = [(0, 0), (0, 1)], pad_value = 7.0} : (tensor<1x2x3x2xsi32>) -> tensor<1x1x3x8xsi32>
+  func.return(%patches) : (tensor<1x1x3x8xsi32>) -> ()
 }
 
 // -----
 
-func.func @padded_max_patches(%0: tensor<1x4x4x2xf32>) -> tensor<1x2x2x18xf32> {
-  %1 = tensor.extract_patches(%0) {window = [3, 3], strides = [2, 2], dilation = [1, 1], padding = [(1, 1), (1, 1)], pad_value = -inf} : (tensor<1x4x4x2xf32>) -> tensor<1x2x2x18xf32>
-  func.return(%1) : (tensor<1x2x2x18xf32>) -> ()
+// CHECK: func.func @padded_max_patches([[IMAGE:%[0-9]+]]: tensor<1x4x4x2xf32>) -> tensor<1x2x2x18xf32> {
+// CHECK-NEXT: [[PATCHES:%[0-9]+]] = tensor.extract_patches([[IMAGE]]) {window = [3, 3], strides = [2, 2], dilation = [1, 1], padding = [(1, 1), (1, 1)], pad_value = -inf} : (tensor<1x4x4x2xf32>) -> tensor<1x2x2x18xf32>
+// CHECK-NEXT: func.return([[PATCHES]]) : (tensor<1x2x2x18xf32>) -> ()
+// CHECK-NEXT: }
+func.func @padded_max_patches(%image: tensor<1x4x4x2xf32>) -> tensor<1x2x2x18xf32> {
+  %patches = tensor.extract_patches(%image) {window = [3, 3], strides = [2, 2], dilation = [1, 1], padding = [(1, 1), (1, 1)], pad_value = -inf} : (tensor<1x4x4x2xf32>) -> tensor<1x2x2x18xf32>
+  func.return(%patches) : (tensor<1x2x2x18xf32>) -> ()
 }
 
 // -----
 
-func.func @max_pool(%0: tensor<1x4x4x2xf32>) -> tensor<1x2x2x2xf32> {
-  %1 = tensor.reduce_window_max(%0) {window_dims = [1, 3, 3, 1], strides = [1, 2, 2, 1], padding = [(0, 0), (1, 1), (1, 1), (0, 0)], base_dilation = [1, 1, 1, 1], window_dilation = [1, 1, 1, 1]} : (tensor<1x4x4x2xf32>) -> tensor<1x2x2x2xf32>
-  func.return(%1) : (tensor<1x2x2x2xf32>) -> ()
+// CHECK: func.func @max_pool([[IMAGE:%[0-9]+]]: tensor<1x4x4x2xf32>) -> tensor<1x2x2x2xf32> {
+// CHECK-NEXT: [[POOLED:%[0-9]+]] = tensor.reduce_window_max([[IMAGE]]) {window_dims = [1, 3, 3, 1], strides = [1, 2, 2, 1], padding = [(0, 0), (1, 1), (1, 1), (0, 0)], base_dilation = [1, 1, 1, 1], window_dilation = [1, 1, 1, 1]} : (tensor<1x4x4x2xf32>) -> tensor<1x2x2x2xf32>
+// CHECK-NEXT: func.return([[POOLED]]) : (tensor<1x2x2x2xf32>) -> ()
+// CHECK-NEXT: }
+func.func @max_pool(%image: tensor<1x4x4x2xf32>) -> tensor<1x2x2x2xf32> {
+  %pooled = tensor.reduce_window_max(%image) {window_dims = [1, 3, 3, 1], strides = [1, 2, 2, 1], padding = [(0, 0), (1, 1), (1, 1), (0, 0)], base_dilation = [1, 1, 1, 1], window_dilation = [1, 1, 1, 1]} : (tensor<1x4x4x2xf32>) -> tensor<1x2x2x2xf32>
+  func.return(%pooled) : (tensor<1x2x2x2xf32>) -> ()
 }
 
 // -----
 
-func.func @dilated_sum(%0: tensor<5x3xf32>) -> tensor<9x1xf32> {
-  %1 = tensor.reduce_window_sum(%0) {window_dims = [2, 2], strides = [1, 2], padding = [(1, 0), (0, 1)], base_dilation = [2, 1], window_dilation = [1, 2], accum = f32} : (tensor<5x3xf32>) -> tensor<9x1xf32>
-  func.return(%1) : (tensor<9x1xf32>) -> ()
+// CHECK: func.func @dilated_sum([[INPUT:%[0-9]+]]: tensor<5x3xf32>) -> tensor<9x1xf32> {
+// CHECK-NEXT: [[WINDOW_SUMS:%[0-9]+]] = tensor.reduce_window_sum([[INPUT]]) {window_dims = [2, 2], strides = [1, 2], padding = [(1, 0), (0, 1)], base_dilation = [2, 1], window_dilation = [1, 2], accum = f32} : (tensor<5x3xf32>) -> tensor<9x1xf32>
+// CHECK-NEXT: func.return([[WINDOW_SUMS]]) : (tensor<9x1xf32>) -> ()
+// CHECK-NEXT: }
+func.func @dilated_sum(%input: tensor<5x3xf32>) -> tensor<9x1xf32> {
+  %window_sums = tensor.reduce_window_sum(%input) {window_dims = [2, 2], strides = [1, 2], padding = [(1, 0), (0, 1)], base_dilation = [2, 1], window_dilation = [1, 2], accum = f32} : (tensor<5x3xf32>) -> tensor<9x1xf32>
+  func.return(%window_sums) : (tensor<9x1xf32>) -> ()
 }
 
 // -----
 
-func.func @bf16_min(%0: tensor<6xbf16>) -> tensor<2xbf16> {
-  %1 = tensor.reduce_window_min(%0) {window_dims = [3], strides = [3], padding = [(0, 0)], base_dilation = [1], window_dilation = [1], accum = f32} : (tensor<6xbf16>) -> tensor<2xbf16>
-  func.return(%1) : (tensor<2xbf16>) -> ()
+// CHECK: func.func @bf16_min([[INPUT:%[0-9]+]]: tensor<6xbf16>) -> tensor<2xbf16> {
+// CHECK-NEXT: [[WINDOW_MINIMA:%[0-9]+]] = tensor.reduce_window_min([[INPUT]]) {window_dims = [3], strides = [3], padding = [(0, 0)], base_dilation = [1], window_dilation = [1], accum = f32} : (tensor<6xbf16>) -> tensor<2xbf16>
+// CHECK-NEXT: func.return([[WINDOW_MINIMA]]) : (tensor<2xbf16>) -> ()
+// CHECK-NEXT: }
+func.func @bf16_min(%input: tensor<6xbf16>) -> tensor<2xbf16> {
+  %window_minima = tensor.reduce_window_min(%input) {window_dims = [3], strides = [3], padding = [(0, 0)], base_dilation = [1], window_dilation = [1], accum = f32} : (tensor<6xbf16>) -> tensor<2xbf16>
+  func.return(%window_minima) : (tensor<2xbf16>) -> ()
 }
 
 // -----
 
 // `and` and `or` windows, and a window sum of bf16 returned as f32.
-func.func @window_kinds(%0: tensor<6xi1>, %1: tensor<6xbf16>) -> (tensor<5xi1>, tensor<5xi1>, tensor<5xf32>) {
-  %2 = tensor.reduce_window_and(%0) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1]} : (tensor<6xi1>) -> tensor<5xi1>
-  %3 = tensor.reduce_window_or(%0) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1]} : (tensor<6xi1>) -> tensor<5xi1>
-  %4 = tensor.reduce_window_sum(%1) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1], out = f32} : (tensor<6xbf16>) -> tensor<5xf32>
-  func.return(%2, %3, %4) : (tensor<5xi1>, tensor<5xi1>, tensor<5xf32>) -> ()
+// CHECK: func.func @window_kinds([[MASK:%[0-9]+]]: tensor<6xi1>, [[VALUES:%[0-9]+]]: tensor<6xbf16>) -> (tensor<5xi1>, tensor<5xi1>, tensor<5xf32>) {
+// CHECK-NEXT: [[ALL_SET:%[0-9]+]] = tensor.reduce_window_and([[MASK]]) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1]} : (tensor<6xi1>) -> tensor<5xi1>
+// CHECK-NEXT: [[ANY_SET:%[0-9]+]] = tensor.reduce_window_or([[MASK]]) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1]} : (tensor<6xi1>) -> tensor<5xi1>
+// CHECK-NEXT: [[WINDOW_SUMS:%[0-9]+]] = tensor.reduce_window_sum([[VALUES]]) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1], out = f32} : (tensor<6xbf16>) -> tensor<5xf32>
+// CHECK-NEXT: func.return([[ALL_SET]], [[ANY_SET]], [[WINDOW_SUMS]]) : (tensor<5xi1>, tensor<5xi1>, tensor<5xf32>) -> ()
+// CHECK-NEXT: }
+func.func @window_kinds(%mask: tensor<6xi1>, %values: tensor<6xbf16>) -> (tensor<5xi1>, tensor<5xi1>, tensor<5xf32>) {
+  %all_set = tensor.reduce_window_and(%mask) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1]} : (tensor<6xi1>) -> tensor<5xi1>
+  %any_set = tensor.reduce_window_or(%mask) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1]} : (tensor<6xi1>) -> tensor<5xi1>
+  %window_sums = tensor.reduce_window_sum(%values) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1], out = f32} : (tensor<6xbf16>) -> tensor<5xf32>
+  func.return(%all_set, %any_set, %window_sums) : (tensor<5xi1>, tensor<5xi1>, tensor<5xf32>) -> ()
 }

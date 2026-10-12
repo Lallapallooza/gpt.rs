@@ -1,13 +1,13 @@
 // RUN: pass canonicalize,cse
 
 // Constants move to the right of commutative ops, so `c + x` and `x + c` merge.
-// CHECK: func.func @sum
-// CHECK: [[S:%[0-9]+]] = tensor.add(%0, {{%[0-9]+}})
+// CHECK: func.func @sum([[INPUT:%[0-9]+]]: tensor<4xf32>)
+// CHECK: [[SUM:%[0-9]+]] = tensor.add([[INPUT]], {{%[0-9]+}})
 // CHECK-NOT: tensor.add
-// CHECK: func.return([[S]], [[S]])
-func.func @sum(%0: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
-  %1 = tensor.constant() {value = dense<[4] x f32: 2.0>} : () -> tensor<4xf32>
-  %2 = tensor.add(%1, %0) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %3 = tensor.add(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%2, %3) : (tensor<4xf32>, tensor<4xf32>) -> ()
+// CHECK: func.return([[SUM]], [[SUM]])
+func.func @sum(%input: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
+  %two = tensor.constant() {value = dense<[4] x f32: 2.0>} : () -> tensor<4xf32>
+  %two_plus_input = tensor.add(%two, %input) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %input_plus_two = tensor.add(%input, %two) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%two_plus_input, %input_plus_two) : (tensor<4xf32>, tensor<4xf32>) -> ()
 }

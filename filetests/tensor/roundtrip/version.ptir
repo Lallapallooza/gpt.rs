@@ -1,7 +1,11 @@
 // RUN: roundtrip
 
 // A stored program starts with the version of the spec it follows.
+// CHECK: spec_version = "ptir.v0.5"
+// CHECK-NEXT: func.func @f([[INPUT:%[0-9]+]]: tensor<4xf32>) -> tensor<4xf32> {
+// CHECK-NEXT: func.return([[INPUT]]) : (tensor<4xf32>) -> ()
+// CHECK-NEXT: }
 spec_version = "ptir.v0.5"
-func.func @f(%0: tensor<4xf32>) -> tensor<4xf32> {
-  func.return(%0) : (tensor<4xf32>) -> ()
+func.func @f(%input: tensor<4xf32>) -> tensor<4xf32> {
+  func.return(%input) : (tensor<4xf32>) -> ()
 }

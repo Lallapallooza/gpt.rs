@@ -2,121 +2,121 @@
 
 // A weight [K, N] that is a parameter gets the GEMM's panel layout [N / 64, K, 64]. The dot reads
 // the panels and gives [M, N / 64, 64], which holds [M, N].
-// CHECK: func.func @in_out
-// CHECK-NEXT: %[[S:[0-9]+]] = tensor.reshape(%1) {shape = [4, 2, 64]} : (tensor<4x128xf32>) -> tensor<4x2x64xf32>
-// CHECK-NEXT: %[[P:[0-9]+]] = tensor.transpose(%[[S]]) {perm = [1, 0, 2]} : (tensor<4x2x64xf32>) -> tensor<2x4x64xf32>
-// CHECK-NEXT: %[[D:[0-9]+]] = tensor.dot_general(%0, %[[P]]) {contract_lhs = [1], contract_rhs = [1]} : (tensor<2x4xf32>, tensor<2x4x64xf32>) -> tensor<2x2x64xf32>
-// CHECK-NEXT: %[[Y:[0-9]+]] = tensor.reshape(%[[D]]) {shape = [2, 128]} : (tensor<2x2x64xf32>) -> tensor<2x128xf32>
-// CHECK-NEXT: func.return(%[[Y]])
-func.func @in_out(%0: tensor<2x4xf32>, %1: tensor<4x128xf32> {param = 1}) -> tensor<2x128xf32> {
-  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x4xf32>, tensor<4x128xf32>) -> tensor<2x128xf32>
-  func.return(%2) : (tensor<2x128xf32>) -> ()
+// CHECK: func.func @in_out([[INPUT:%[0-9]+]]: tensor<2x4xf32>, [[WEIGHT:%[0-9]+]]: tensor<4x128xf32> {param = 1})
+// CHECK-NEXT: [[SPLIT:%[0-9]+]] = tensor.reshape([[WEIGHT]]) {shape = [4, 2, 64]} : (tensor<4x128xf32>) -> tensor<4x2x64xf32>
+// CHECK-NEXT: [[PANELS:%[0-9]+]] = tensor.transpose([[SPLIT]]) {perm = [1, 0, 2]} : (tensor<4x2x64xf32>) -> tensor<2x4x64xf32>
+// CHECK-NEXT: [[PANEL_PRODUCT:%[0-9]+]] = tensor.dot_general([[INPUT]], [[PANELS]]) {contract_lhs = [1], contract_rhs = [1]} : (tensor<2x4xf32>, tensor<2x4x64xf32>) -> tensor<2x2x64xf32>
+// CHECK-NEXT: [[PRODUCT:%[0-9]+]] = tensor.reshape([[PANEL_PRODUCT]]) {shape = [2, 128]} : (tensor<2x2x64xf32>) -> tensor<2x128xf32>
+// CHECK-NEXT: func.return([[PRODUCT]])
+func.func @in_out(%input: tensor<2x4xf32>, %weight: tensor<4x128xf32> {param = 1}) -> tensor<2x128xf32> {
+  %product = tensor.dot_general(%input, %weight) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x4xf32>, tensor<4x128xf32>) -> tensor<2x128xf32>
+  func.return(%product) : (tensor<2x128xf32>) -> ()
 }
 
 // -----
 // A weight [N, K] goes to the GEMM at LINEAR_PACK_MIN_ROWS rows of x or more.
-// CHECK: func.func @out_in
-// CHECK-NEXT: %[[S:[0-9]+]] = tensor.reshape(%1) {shape = [2, 64, 4]} : (tensor<128x4xf32>) -> tensor<2x64x4xf32>
-// CHECK-NEXT: %[[P:[0-9]+]] = tensor.transpose(%[[S]]) {perm = [0, 2, 1]} : (tensor<2x64x4xf32>) -> tensor<2x4x64xf32>
-// CHECK-NEXT: %[[D:[0-9]+]] = tensor.dot_general(%0, %[[P]]) {contract_lhs = [1], contract_rhs = [1]}
-// CHECK-NEXT: tensor.reshape(%[[D]]) {shape = [64, 128]}
-func.func @out_in(%0: tensor<64x4xf32>, %1: tensor<128x4xf32> {param = 1}) -> tensor<64x128xf32> {
-  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [1]} : (tensor<64x4xf32>, tensor<128x4xf32>) -> tensor<64x128xf32>
-  func.return(%2) : (tensor<64x128xf32>) -> ()
+// CHECK: func.func @out_in([[INPUT:%[0-9]+]]: tensor<64x4xf32>, [[WEIGHT:%[0-9]+]]: tensor<128x4xf32> {param = 1})
+// CHECK-NEXT: [[SPLIT:%[0-9]+]] = tensor.reshape([[WEIGHT]]) {shape = [2, 64, 4]} : (tensor<128x4xf32>) -> tensor<2x64x4xf32>
+// CHECK-NEXT: [[PANELS:%[0-9]+]] = tensor.transpose([[SPLIT]]) {perm = [0, 2, 1]} : (tensor<2x64x4xf32>) -> tensor<2x4x64xf32>
+// CHECK-NEXT: [[PANEL_PRODUCT:%[0-9]+]] = tensor.dot_general([[INPUT]], [[PANELS]]) {contract_lhs = [1], contract_rhs = [1]}
+// CHECK-NEXT: tensor.reshape([[PANEL_PRODUCT]]) {shape = [64, 128]}
+func.func @out_in(%input: tensor<64x4xf32>, %weight: tensor<128x4xf32> {param = 1}) -> tensor<64x128xf32> {
+  %product = tensor.dot_general(%input, %weight) {contract_lhs = [1], contract_rhs = [1]} : (tensor<64x4xf32>, tensor<128x4xf32>) -> tensor<64x128xf32>
+  func.return(%product) : (tensor<64x128xf32>) -> ()
 }
 
 // -----
 // Fewer rows of x go to the dot-product kernels, which read the weight [N, K] as stored.
-// CHECK: func.func @out_in_few_rows
-// CHECK-NEXT: tensor.dot_general(%0, %1)
-func.func @out_in_few_rows(%0: tensor<63x4xf32>, %1: tensor<128x4xf32> {param = 1}) -> tensor<63x128xf32> {
-  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [1]} : (tensor<63x4xf32>, tensor<128x4xf32>) -> tensor<63x128xf32>
-  func.return(%2) : (tensor<63x128xf32>) -> ()
+// CHECK: func.func @out_in_few_rows([[INPUT:%[0-9]+]]: tensor<63x4xf32>, [[WEIGHT:%[0-9]+]]: tensor<128x4xf32> {param = 1})
+// CHECK-NEXT: tensor.dot_general([[INPUT]], [[WEIGHT]])
+func.func @out_in_few_rows(%input: tensor<63x4xf32>, %weight: tensor<128x4xf32> {param = 1}) -> tensor<63x128xf32> {
+  %product = tensor.dot_general(%input, %weight) {contract_lhs = [1], contract_rhs = [1]} : (tensor<63x4xf32>, tensor<128x4xf32>) -> tensor<63x128xf32>
+  func.return(%product) : (tensor<63x128xf32>) -> ()
 }
 
 // -----
 // The GEMM multiplies a single row of x with the weight in place.
-// CHECK: func.func @one_row
-// CHECK-NEXT: tensor.dot_general(%0, %1)
-func.func @one_row(%0: tensor<1x4xf32>, %1: tensor<4x128xf32> {param = 1}) -> tensor<1x128xf32> {
-  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} : (tensor<1x4xf32>, tensor<4x128xf32>) -> tensor<1x128xf32>
-  func.return(%2) : (tensor<1x128xf32>) -> ()
+// CHECK: func.func @one_row([[INPUT:%[0-9]+]]: tensor<1x4xf32>, [[WEIGHT:%[0-9]+]]: tensor<4x128xf32> {param = 1})
+// CHECK-NEXT: tensor.dot_general([[INPUT]], [[WEIGHT]])
+func.func @one_row(%input: tensor<1x4xf32>, %weight: tensor<4x128xf32> {param = 1}) -> tensor<1x128xf32> {
+  %product = tensor.dot_general(%input, %weight) {contract_lhs = [1], contract_rhs = [0]} : (tensor<1x4xf32>, tensor<4x128xf32>) -> tensor<1x128xf32>
+  func.return(%product) : (tensor<1x128xf32>) -> ()
 }
 
 // -----
 // The GEMM packs an operand that is not a parameter on each call.
-// CHECK: func.func @activation
-// CHECK-NEXT: tensor.dot_general(%0, %1)
-func.func @activation(%0: tensor<2x4xf32>, %1: tensor<4x128xf32>) -> tensor<2x128xf32> {
-  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x4xf32>, tensor<4x128xf32>) -> tensor<2x128xf32>
-  func.return(%2) : (tensor<2x128xf32>) -> ()
+// CHECK: func.func @activation([[LHS:%[0-9]+]]: tensor<2x4xf32>, [[RHS:%[0-9]+]]: tensor<4x128xf32>)
+// CHECK-NEXT: tensor.dot_general([[LHS]], [[RHS]])
+func.func @activation(%lhs: tensor<2x4xf32>, %rhs: tensor<4x128xf32>) -> tensor<2x128xf32> {
+  %product = tensor.dot_general(%lhs, %rhs) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x4xf32>, tensor<4x128xf32>) -> tensor<2x128xf32>
+  func.return(%product) : (tensor<2x128xf32>) -> ()
 }
 
 // -----
 // A dot of two parameters moves to load time whole, so it stays a dot.
-// CHECK: func.func @static_dot
-// CHECK-NEXT: tensor.dot_general(%0, %1)
-func.func @static_dot(%0: tensor<2x4xf32> {param = 1}, %1: tensor<4x128xf32> {param = 2}) -> tensor<2x128xf32> {
-  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x4xf32>, tensor<4x128xf32>) -> tensor<2x128xf32>
-  func.return(%2) : (tensor<2x128xf32>) -> ()
+// CHECK: func.func @static_dot([[LHS:%[0-9]+]]: tensor<2x4xf32> {param = 1}, [[RHS:%[0-9]+]]: tensor<4x128xf32> {param = 2})
+// CHECK-NEXT: tensor.dot_general([[LHS]], [[RHS]])
+func.func @static_dot(%lhs: tensor<2x4xf32> {param = 1}, %rhs: tensor<4x128xf32> {param = 2}) -> tensor<2x128xf32> {
+  %product = tensor.dot_general(%lhs, %rhs) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x4xf32>, tensor<4x128xf32>) -> tensor<2x128xf32>
+  func.return(%product) : (tensor<2x128xf32>) -> ()
 }
 
 // -----
 // Panels would pad N = 96 with zeros to 128 columns, which takes more bytes than the parameter.
-// CHECK: func.func @padded
-// CHECK-NEXT: tensor.dot_general(%0, %1)
-func.func @padded(%0: tensor<2x4xf32>, %1: tensor<4x96xf32> {param = 1}) -> tensor<2x96xf32> {
-  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x4xf32>, tensor<4x96xf32>) -> tensor<2x96xf32>
-  func.return(%2) : (tensor<2x96xf32>) -> ()
+// CHECK: func.func @padded([[INPUT:%[0-9]+]]: tensor<2x4xf32>, [[WEIGHT:%[0-9]+]]: tensor<4x96xf32> {param = 1})
+// CHECK-NEXT: tensor.dot_general([[INPUT]], [[WEIGHT]])
+func.func @padded(%input: tensor<2x4xf32>, %weight: tensor<4x96xf32> {param = 1}) -> tensor<2x96xf32> {
+  %product = tensor.dot_general(%input, %weight) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x4xf32>, tensor<4x96xf32>) -> tensor<2x96xf32>
+  func.return(%product) : (tensor<2x96xf32>) -> ()
 }
 
 // -----
 // A bf16 parameter widened to f32 takes twice its bytes.
-// CHECK: func.func @widened
-// CHECK-NEXT: %[[W:[0-9]+]] = tensor.cast(%1) {to = f32}
-// CHECK-NEXT: tensor.dot_general(%0, %[[W]])
-func.func @widened(%0: tensor<2x4xf32>, %1: tensor<4x128xbf16> {param = 1}) -> tensor<2x128xf32> {
-  %2 = tensor.cast(%1) {to = f32} : (tensor<4x128xbf16>) -> tensor<4x128xf32>
-  %3 = tensor.dot_general(%0, %2) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x4xf32>, tensor<4x128xf32>) -> tensor<2x128xf32>
-  func.return(%3) : (tensor<2x128xf32>) -> ()
+// CHECK: func.func @widened([[INPUT:%[0-9]+]]: tensor<2x4xf32>, [[WEIGHT:%[0-9]+]]: tensor<4x128xbf16> {param = 1})
+// CHECK-NEXT: [[WIDE_WEIGHT:%[0-9]+]] = tensor.cast([[WEIGHT]]) {to = f32}
+// CHECK-NEXT: tensor.dot_general([[INPUT]], [[WIDE_WEIGHT]])
+func.func @widened(%input: tensor<2x4xf32>, %weight: tensor<4x128xbf16> {param = 1}) -> tensor<2x128xf32> {
+  %wide_weight = tensor.cast(%weight) {to = f32} : (tensor<4x128xbf16>) -> tensor<4x128xf32>
+  %product = tensor.dot_general(%input, %wide_weight) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x4xf32>, tensor<4x128xf32>) -> tensor<2x128xf32>
+  func.return(%product) : (tensor<2x128xf32>) -> ()
 }
 
 // -----
 // A weight computed from several parameters fits their bytes together, as a convolution weight
 // with a folded BatchNorm scale does.
-// CHECK: func.func @scaled
-// CHECK: %[[W:[0-9]+]] = tensor.mul(%1, %{{[0-9]+}})
-// CHECK-NEXT: %[[S:[0-9]+]] = tensor.reshape(%[[W]]) {shape = [4, 1, 64]}
-// CHECK-NEXT: %[[P:[0-9]+]] = tensor.transpose(%[[S]]) {perm = [1, 0, 2]}
-// CHECK-NEXT: tensor.dot_general(%0, %[[P]]) {contract_lhs = [1], contract_rhs = [1]}
-func.func @scaled(%0: tensor<2x4xf32>, %1: tensor<4x64xf32> {param = 1}, %2: tensor<64xf32> {param = 2}) -> tensor<2x64xf32> {
-  %3 = tensor.broadcast_to(%2) {shape = [4, 64]} : (tensor<64xf32>) -> tensor<4x64xf32>
-  %4 = tensor.mul(%1, %3) : (tensor<4x64xf32>, tensor<4x64xf32>) -> tensor<4x64xf32>
-  %5 = tensor.dot_general(%0, %4) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x4xf32>, tensor<4x64xf32>) -> tensor<2x64xf32>
-  func.return(%5) : (tensor<2x64xf32>) -> ()
+// CHECK: func.func @scaled([[INPUT:%[0-9]+]]: tensor<2x4xf32>, [[WEIGHT:%[0-9]+]]: tensor<4x64xf32> {param = 1}, [[SCALE:%[0-9]+]]: tensor<64xf32> {param = 2})
+// CHECK: [[SCALED_WEIGHT:%[0-9]+]] = tensor.mul([[WEIGHT]], {{%[0-9]+}})
+// CHECK-NEXT: [[SPLIT:%[0-9]+]] = tensor.reshape([[SCALED_WEIGHT]]) {shape = [4, 1, 64]}
+// CHECK-NEXT: [[PANELS:%[0-9]+]] = tensor.transpose([[SPLIT]]) {perm = [1, 0, 2]}
+// CHECK-NEXT: tensor.dot_general([[INPUT]], [[PANELS]]) {contract_lhs = [1], contract_rhs = [1]}
+func.func @scaled(%input: tensor<2x4xf32>, %weight: tensor<4x64xf32> {param = 1}, %scale: tensor<64xf32> {param = 2}) -> tensor<2x64xf32> {
+  %scale_rows = tensor.broadcast_to(%scale) {shape = [4, 64]} : (tensor<64xf32>) -> tensor<4x64xf32>
+  %scaled_weight = tensor.mul(%weight, %scale_rows) : (tensor<4x64xf32>, tensor<4x64xf32>) -> tensor<4x64xf32>
+  %product = tensor.dot_general(%input, %scaled_weight) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x4xf32>, tensor<4x64xf32>) -> tensor<2x64xf32>
+  func.return(%product) : (tensor<2x64xf32>) -> ()
 }
 
 // -----
 // A grouped convolution, 2 groups of 2 input and 3 output channels: the weight
 // [G, C_out / G, C_in / G, KH, KW] becomes [KH, KW, C_in / G, G, C_out / G], the layout of the
 // grouped kernel, and the dot contracts the weight in that layout. The result keeps its axes.
-// CHECK: func.func @grouped
-// CHECK: %[[R:[0-9]+]] = tensor.reshape(%{{[0-9]+}}) {shape = [1, 5, 5, 3, 3, 2, 2]}
-// CHECK-NEXT: %[[T:[0-9]+]] = tensor.transpose(%1) {perm = [3, 4, 2, 0, 1]} : (tensor<2x3x2x3x3xf32>) -> tensor<3x3x2x2x3xf32>
-// CHECK-NEXT: %[[D:[0-9]+]] = tensor.dot_general(%[[R]], %[[T]]) {batch_lhs = [5], batch_rhs = [3], contract_lhs = [3, 4, 6], contract_rhs = [0, 1, 2]} : (tensor<1x5x5x3x3x2x2xf32>, tensor<3x3x2x2x3xf32>) -> tensor<2x1x5x5x3xf32>
-// CHECK-NEXT: func.return(%[[D]])
-func.func @grouped(%0: tensor<1x5x5x4xf32>, %1: tensor<2x3x2x3x3xf32> {param = 1}) -> tensor<2x1x5x5x3xf32> {
-  %2 = tensor.extract_patches(%0) {window = [3, 3], strides = [1, 1], dilation = [1, 1], padding = [(1, 1), (1, 1)], pad_value = 0.0} : (tensor<1x5x5x4xf32>) -> tensor<1x5x5x36xf32>
-  %3 = tensor.reshape(%2) {shape = [1, 5, 5, 3, 3, 2, 2]} : (tensor<1x5x5x36xf32>) -> tensor<1x5x5x3x3x2x2xf32>
-  %4 = tensor.dot_general(%3, %1) {batch_lhs = [5], batch_rhs = [0], contract_lhs = [3, 4, 6], contract_rhs = [3, 4, 2]} : (tensor<1x5x5x3x3x2x2xf32>, tensor<2x3x2x3x3xf32>) -> tensor<2x1x5x5x3xf32>
-  func.return(%4) : (tensor<2x1x5x5x3xf32>) -> ()
+// CHECK: func.func @grouped([[INPUT:%[0-9]+]]: tensor<1x5x5x4xf32>, [[WEIGHT:%[0-9]+]]: tensor<2x3x2x3x3xf32> {param = 1})
+// CHECK: [[WINDOWS:%[0-9]+]] = tensor.reshape({{%[0-9]+}}) {shape = [1, 5, 5, 3, 3, 2, 2]}
+// CHECK-NEXT: [[KERNEL_WEIGHT:%[0-9]+]] = tensor.transpose([[WEIGHT]]) {perm = [3, 4, 2, 0, 1]} : (tensor<2x3x2x3x3xf32>) -> tensor<3x3x2x2x3xf32>
+// CHECK-NEXT: [[OUTPUT:%[0-9]+]] = tensor.dot_general([[WINDOWS]], [[KERNEL_WEIGHT]]) {batch_lhs = [5], batch_rhs = [3], contract_lhs = [3, 4, 6], contract_rhs = [0, 1, 2]} : (tensor<1x5x5x3x3x2x2xf32>, tensor<3x3x2x2x3xf32>) -> tensor<2x1x5x5x3xf32>
+// CHECK-NEXT: func.return([[OUTPUT]])
+func.func @grouped(%input: tensor<1x5x5x4xf32>, %weight: tensor<2x3x2x3x3xf32> {param = 1}) -> tensor<2x1x5x5x3xf32> {
+  %patches = tensor.extract_patches(%input) {window = [3, 3], strides = [1, 1], dilation = [1, 1], padding = [(1, 1), (1, 1)], pad_value = 0.0} : (tensor<1x5x5x4xf32>) -> tensor<1x5x5x36xf32>
+  %windows = tensor.reshape(%patches) {shape = [1, 5, 5, 3, 3, 2, 2]} : (tensor<1x5x5x36xf32>) -> tensor<1x5x5x3x3x2x2xf32>
+  %output = tensor.dot_general(%windows, %weight) {batch_lhs = [5], batch_rhs = [0], contract_lhs = [3, 4, 6], contract_rhs = [3, 4, 2]} : (tensor<1x5x5x3x3x2x2xf32>, tensor<2x3x2x3x3xf32>) -> tensor<2x1x5x5x3xf32>
+  func.return(%output) : (tensor<2x1x5x5x3xf32>) -> ()
 }
 
 // -----
 // A dot with the same axes whose lhs is not patches is no convolution, and keeps its weight.
-// CHECK: func.func @not_patches
-// CHECK-NEXT: tensor.dot_general(%0, %1)
-func.func @not_patches(%0: tensor<1x5x5x3x3x2x2xf32>, %1: tensor<2x3x2x3x3xf32> {param = 1}) -> tensor<2x1x5x5x3xf32> {
-  %2 = tensor.dot_general(%0, %1) {batch_lhs = [5], batch_rhs = [0], contract_lhs = [3, 4, 6], contract_rhs = [3, 4, 2]} : (tensor<1x5x5x3x3x2x2xf32>, tensor<2x3x2x3x3xf32>) -> tensor<2x1x5x5x3xf32>
-  func.return(%2) : (tensor<2x1x5x5x3xf32>) -> ()
+// CHECK: func.func @not_patches([[INPUT:%[0-9]+]]: tensor<1x5x5x3x3x2x2xf32>, [[WEIGHT:%[0-9]+]]: tensor<2x3x2x3x3xf32> {param = 1})
+// CHECK-NEXT: tensor.dot_general([[INPUT]], [[WEIGHT]])
+func.func @not_patches(%input: tensor<1x5x5x3x3x2x2xf32>, %weight: tensor<2x3x2x3x3xf32> {param = 1}) -> tensor<2x1x5x5x3xf32> {
+  %output = tensor.dot_general(%input, %weight) {batch_lhs = [5], batch_rhs = [0], contract_lhs = [3, 4, 6], contract_rhs = [3, 4, 2]} : (tensor<1x5x5x3x3x2x2xf32>, tensor<2x3x2x3x3xf32>) -> tensor<2x1x5x5x3xf32>
+  func.return(%output) : (tensor<2x1x5x5x3xf32>) -> ()
 }

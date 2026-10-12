@@ -1,8 +1,14 @@
 // RUN: roundtrip
 
-func.func @rng(%0: tensor<2xui64>) -> (tensor<2x3xf32>, tensor<4xbf16>, tensor<2xui64>, tensor<4xui32>) {
-  %1, %2 = tensor.rng_uniform(%0) {shape = [2, 3], dtype = f32} : (tensor<2xui64>) -> (tensor<2xui64>, tensor<2x3xf32>)
-  %3, %4 = tensor.rng_normal(%1) {shape = [4], dtype = bf16} : (tensor<2xui64>) -> (tensor<2xui64>, tensor<4xbf16>)
-  %5, %6 = tensor.rng_uniform(%3) {shape = [4], dtype = ui32} : (tensor<2xui64>) -> (tensor<2xui64>, tensor<4xui32>)
-  func.return(%2, %4, %5, %6) : (tensor<2x3xf32>, tensor<4xbf16>, tensor<2xui64>, tensor<4xui32>) -> ()
+// CHECK: func.func @rng([[STATE:%[0-9]+]]: tensor<2xui64>) -> (tensor<2x3xf32>, tensor<4xbf16>, tensor<2xui64>, tensor<4xui32>) {
+// CHECK-NEXT: [[UNIFORM_STATE:%[0-9]+]], [[UNIFORM:%[0-9]+]] = tensor.rng_uniform([[STATE]]) {shape = [2, 3], dtype = f32} : (tensor<2xui64>) -> (tensor<2xui64>, tensor<2x3xf32>)
+// CHECK-NEXT: [[NORMAL_STATE:%[0-9]+]], [[NORMAL:%[0-9]+]] = tensor.rng_normal([[UNIFORM_STATE]]) {shape = [4], dtype = bf16} : (tensor<2xui64>) -> (tensor<2xui64>, tensor<4xbf16>)
+// CHECK-NEXT: [[FINAL_STATE:%[0-9]+]], [[DRAWS:%[0-9]+]] = tensor.rng_uniform([[NORMAL_STATE]]) {shape = [4], dtype = ui32} : (tensor<2xui64>) -> (tensor<2xui64>, tensor<4xui32>)
+// CHECK-NEXT: func.return([[UNIFORM]], [[NORMAL]], [[FINAL_STATE]], [[DRAWS]]) : (tensor<2x3xf32>, tensor<4xbf16>, tensor<2xui64>, tensor<4xui32>) -> ()
+// CHECK-NEXT: }
+func.func @rng(%state: tensor<2xui64>) -> (tensor<2x3xf32>, tensor<4xbf16>, tensor<2xui64>, tensor<4xui32>) {
+  %uniform_state, %uniform = tensor.rng_uniform(%state) {shape = [2, 3], dtype = f32} : (tensor<2xui64>) -> (tensor<2xui64>, tensor<2x3xf32>)
+  %normal_state, %normal = tensor.rng_normal(%uniform_state) {shape = [4], dtype = bf16} : (tensor<2xui64>) -> (tensor<2xui64>, tensor<4xbf16>)
+  %final_state, %draws = tensor.rng_uniform(%normal_state) {shape = [4], dtype = ui32} : (tensor<2xui64>) -> (tensor<2xui64>, tensor<4xui32>)
+  func.return(%uniform, %normal, %final_state, %draws) : (tensor<2x3xf32>, tensor<4xbf16>, tensor<2xui64>, tensor<4xui32>) -> ()
 }

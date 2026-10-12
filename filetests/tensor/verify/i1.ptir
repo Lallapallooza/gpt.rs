@@ -1,21 +1,21 @@
 // RUN: verify
 
 // ERROR: tensor.neg: the input must be an integer or float tensor, got tensor<4xi1>
-func.func @neg_i1(%0: tensor<4xi1>) -> tensor<4xi1> {
-  %1 = tensor.neg(%0) : (tensor<4xi1>) -> tensor<4xi1>
-  func.return(%1) : (tensor<4xi1>) -> ()
+func.func @neg_i1(%input: tensor<4xi1>) -> tensor<4xi1> {
+  %negated = tensor.neg(%input) : (tensor<4xi1>) -> tensor<4xi1>
+  func.return(%negated) : (tensor<4xi1>) -> ()
 }
 
 // -----
 // ERROR: tensor.dot_general: out must be a float or narrow float dtype, got i1
-func.func @dot_i1_out(%0: tensor<2x3xf32>, %1: tensor<3x2xf32>) -> tensor<2x2xi1> {
-  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0], out = i1} : (tensor<2x3xf32>, tensor<3x2xf32>) -> tensor<2x2xi1>
-  func.return(%2) : (tensor<2x2xi1>) -> ()
+func.func @dot_i1_out(%lhs: tensor<2x3xf32>, %rhs: tensor<3x2xf32>) -> tensor<2x2xi1> {
+  %product = tensor.dot_general(%lhs, %rhs) {contract_lhs = [1], contract_rhs = [0], out = i1} : (tensor<2x3xf32>, tensor<3x2xf32>) -> tensor<2x2xi1>
+  func.return(%product) : (tensor<2x2xi1>) -> ()
 }
 
 // -----
 // ERROR: tensor.reduce_sum: out must be a float dtype, got i1
-func.func @reduce_i1_out(%0: tensor<4xf32>) -> tensor<1xi1> {
-  %1 = tensor.reduce_sum(%0) {axes = [0], keepdims = true, out = i1} : (tensor<4xf32>) -> tensor<1xi1>
-  func.return(%1) : (tensor<1xi1>) -> ()
+func.func @reduce_i1_out(%input: tensor<4xf32>) -> tensor<1xi1> {
+  %sum = tensor.reduce_sum(%input) {axes = [0], keepdims = true, out = i1} : (tensor<4xf32>) -> tensor<1xi1>
+  func.return(%sum) : (tensor<1xi1>) -> ()
 }

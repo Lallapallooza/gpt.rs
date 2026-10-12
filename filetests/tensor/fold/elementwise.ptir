@@ -1,58 +1,58 @@
 // RUN: pass fold,dce
 
 // Identities that hold bit for bit fold to the left operand.
-// CHECK: func.func @identities
+// CHECK: func.func @identities([[INPUT:%[0-9]+]]: tensor<4xf32>)
 // CHECK-NOT: tensor.mul
 // CHECK-NOT: tensor.add
 // CHECK-NOT: tensor.sub
 // CHECK-NOT: tensor.div
-// CHECK: func.return(%0, %0, %0, %0)
-func.func @identities(%0: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) {
-  %1 = tensor.constant() {value = dense<[4] x f32: 1.0>} : () -> tensor<4xf32>
-  %2 = tensor.constant() {value = dense<[4] x f32: -0.0>} : () -> tensor<4xf32>
-  %3 = tensor.constant() {value = dense<[4] x f32: 0.0>} : () -> tensor<4xf32>
-  %4 = tensor.mul(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %5 = tensor.add(%0, %2) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %6 = tensor.sub(%0, %3) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %7 = tensor.div(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%4, %5, %6, %7) : (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) -> ()
+// CHECK: func.return([[INPUT]], [[INPUT]], [[INPUT]], [[INPUT]])
+func.func @identities(%input: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) {
+  %one = tensor.constant() {value = dense<[4] x f32: 1.0>} : () -> tensor<4xf32>
+  %neg_zero = tensor.constant() {value = dense<[4] x f32: -0.0>} : () -> tensor<4xf32>
+  %zero = tensor.constant() {value = dense<[4] x f32: 0.0>} : () -> tensor<4xf32>
+  %times_one = tensor.mul(%input, %one) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %plus_neg_zero = tensor.add(%input, %neg_zero) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %minus_zero = tensor.sub(%input, %zero) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %over_one = tensor.div(%input, %one) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%times_one, %plus_neg_zero, %minus_zero, %over_one) : (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) -> ()
 }
 
 // -----
 
 // `x + 0.0` is not `x`: for `x = -0.0` it is `0.0`. The interpreter check feeds -0.0, so a fold
 // here fails.
-// CHECK: func.func @plus_zero
-// CHECK: tensor.add(%0, {{%[0-9]+}})
-func.func @plus_zero(%0: tensor<4xf32>) -> tensor<4xf32> {
-  %1 = tensor.constant() {value = dense<[4] x f32: 0.0>} : () -> tensor<4xf32>
-  %2 = tensor.add(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%2) : (tensor<4xf32>) -> ()
+// CHECK: func.func @plus_zero([[INPUT:%[0-9]+]]: tensor<4xf32>)
+// CHECK: tensor.add([[INPUT]], {{%[0-9]+}})
+func.func @plus_zero(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %zero = tensor.constant() {value = dense<[4] x f32: 0.0>} : () -> tensor<4xf32>
+  %sum = tensor.add(%input, %zero) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%sum) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // A constant on the left of a commutative op moves to the right, where the folder sees it.
-// CHECK: func.func @commuted
+// CHECK: func.func @commuted([[INPUT:%[0-9]+]]: tensor<4xf32>)
 // CHECK-NOT: tensor.mul
-// CHECK: func.return(%0)
-func.func @commuted(%0: tensor<4xf32>) -> tensor<4xf32> {
-  %1 = tensor.constant() {value = dense<[4] x f32: 1.0>} : () -> tensor<4xf32>
-  %2 = tensor.mul(%1, %0) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%2) : (tensor<4xf32>) -> ()
+// CHECK: func.return([[INPUT]])
+func.func @commuted(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %one = tensor.constant() {value = dense<[4] x f32: 1.0>} : () -> tensor<4xf32>
+  %product = tensor.mul(%one, %input) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%product) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // Integer identities, and `maximum(x, x)`, which is `x`.
-// CHECK: func.func @integers
+// CHECK: func.func @integers([[INPUT:%[0-9]+]]: tensor<4xsi32>)
 // CHECK-NOT: tensor.
-// CHECK: func.return(%0, %0)
-func.func @integers(%0: tensor<4xsi32>) -> (tensor<4xsi32>, tensor<4xsi32>) {
-  %1 = tensor.constant() {value = dense<[4] x si32: 0>} : () -> tensor<4xsi32>
-  %2 = tensor.add(%0, %1) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
-  %3 = tensor.maximum(%2, %2) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
-  func.return(%2, %3) : (tensor<4xsi32>, tensor<4xsi32>) -> ()
+// CHECK: func.return([[INPUT]], [[INPUT]])
+func.func @integers(%input: tensor<4xsi32>) -> (tensor<4xsi32>, tensor<4xsi32>) {
+  %zero = tensor.constant() {value = dense<[4] x si32: 0>} : () -> tensor<4xsi32>
+  %sum = tensor.add(%input, %zero) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  %maximum = tensor.maximum(%sum, %sum) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  func.return(%sum, %maximum) : (tensor<4xsi32>, tensor<4xsi32>) -> ()
 }
 
 // -----
@@ -61,67 +61,67 @@ func.func @integers(%0: tensor<4xsi32>) -> (tensor<4xsi32>, tensor<4xsi32>) {
 // CHECK: func.func @constants
 // CHECK: tensor.add
 func.func @constants() -> tensor<2xf32> {
-  %0 = tensor.constant() {value = dense<[2] x f32: [1.0, -2.0]>} : () -> tensor<2xf32>
-  %1 = tensor.constant() {value = dense<[2] x f32: [2.0, 1.0]>} : () -> tensor<2xf32>
-  %2 = tensor.add(%0, %1) : (tensor<2xf32>, tensor<2xf32>) -> tensor<2xf32>
-  func.return(%2) : (tensor<2xf32>) -> ()
+  %lhs = tensor.constant() {value = dense<[2] x f32: [1.0, -2.0]>} : () -> tensor<2xf32>
+  %rhs = tensor.constant() {value = dense<[2] x f32: [2.0, 1.0]>} : () -> tensor<2xf32>
+  %sum = tensor.add(%lhs, %rhs) : (tensor<2xf32>, tensor<2xf32>) -> tensor<2xf32>
+  func.return(%sum) : (tensor<2xf32>) -> ()
 }
 
 // -----
 
 // neg is an involution and abs is idempotent.
-// CHECK: func.func @involution
-// CHECK-NEXT: [[A:%[0-9]+]] = tensor.abs(%0)
-// CHECK-NEXT: func.return(%0, [[A]])
-func.func @involution(%0: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
-  %1 = tensor.neg(%0) : (tensor<4xf32>) -> tensor<4xf32>
-  %2 = tensor.neg(%1) : (tensor<4xf32>) -> tensor<4xf32>
-  %3 = tensor.abs(%0) : (tensor<4xf32>) -> tensor<4xf32>
-  %4 = tensor.abs(%3) : (tensor<4xf32>) -> tensor<4xf32>
-  func.return(%2, %4) : (tensor<4xf32>, tensor<4xf32>) -> ()
+// CHECK: func.func @involution([[INPUT:%[0-9]+]]: tensor<4xf32>)
+// CHECK-NEXT: [[ABS:%[0-9]+]] = tensor.abs([[INPUT]])
+// CHECK-NEXT: func.return([[INPUT]], [[ABS]])
+func.func @involution(%input: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
+  %negated = tensor.neg(%input) : (tensor<4xf32>) -> tensor<4xf32>
+  %negated_twice = tensor.neg(%negated) : (tensor<4xf32>) -> tensor<4xf32>
+  %abs = tensor.abs(%input) : (tensor<4xf32>) -> tensor<4xf32>
+  %abs_twice = tensor.abs(%abs) : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%negated_twice, %abs_twice) : (tensor<4xf32>, tensor<4xf32>) -> ()
 }
 
 // -----
 
 // select with a splat predicate, or with equal branches, is one of its branches.
-// CHECK: func.func @select
+// CHECK: func.func @select([[ON_TRUE:%[0-9]+]]: tensor<4xf32>, [[ON_FALSE:%[0-9]+]]: tensor<4xf32>, [[PREDICATE:%[0-9]+]]: tensor<4xi1>)
 // CHECK-NOT: tensor.select
-// CHECK: func.return(%0, %1, %0)
-func.func @select(%0: tensor<4xf32>, %1: tensor<4xf32>, %2: tensor<4xi1>) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) {
-  %3 = tensor.constant() {value = dense<[4] x i1: true>} : () -> tensor<4xi1>
-  %4 = tensor.constant() {value = dense<[4] x i1: false>} : () -> tensor<4xi1>
-  %5 = tensor.select(%3, %0, %1) : (tensor<4xi1>, tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %6 = tensor.select(%4, %0, %1) : (tensor<4xi1>, tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %7 = tensor.select(%2, %0, %0) : (tensor<4xi1>, tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%5, %6, %7) : (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) -> ()
+// CHECK: func.return([[ON_TRUE]], [[ON_FALSE]], [[ON_TRUE]])
+func.func @select(%on_true: tensor<4xf32>, %on_false: tensor<4xf32>, %predicate: tensor<4xi1>) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) {
+  %all_true = tensor.constant() {value = dense<[4] x i1: true>} : () -> tensor<4xi1>
+  %all_false = tensor.constant() {value = dense<[4] x i1: false>} : () -> tensor<4xi1>
+  %picked_on_true = tensor.select(%all_true, %on_true, %on_false) : (tensor<4xi1>, tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %picked_on_false = tensor.select(%all_false, %on_true, %on_false) : (tensor<4xi1>, tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %same_branches = tensor.select(%predicate, %on_true, %on_true) : (tensor<4xi1>, tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%picked_on_true, %picked_on_false, %same_branches) : (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) -> ()
 }
 
 // -----
 
 // A cast to the input's own dtype is the input.
-// CHECK: func.func @cast
+// CHECK: func.func @cast([[INPUT:%[0-9]+]]: tensor<4xf32>)
 // CHECK-NOT: tensor.cast
-// CHECK: func.return(%0)
-func.func @cast(%0: tensor<4xf32>) -> tensor<4xf32> {
-  %1 = tensor.cast(%0) {to = f32} : (tensor<4xf32>) -> tensor<4xf32>
-  func.return(%1) : (tensor<4xf32>) -> ()
+// CHECK: func.return([[INPUT]])
+func.func @cast(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %same_dtype = tensor.cast(%input) {to = f32} : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%same_dtype) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // An absorbing integer constant is the result. Float `x * 0.0` stays: `inf * 0.0` is NaN.
-// CHECK: func.func @absorbing
-// CHECK-NEXT: [[Z:%[0-9]+]] = tensor.constant() {value = dense<[4] x si32: 0>}
-// CHECK-NEXT: [[M:%[0-9]+]] = tensor.constant() {value = dense<[4] x si32: 2147483647>}
-// CHECK-NEXT: [[F:%[0-9]+]] = tensor.constant() {value = dense<[4] x f32: 0.0>}
-// CHECK-NEXT: [[P:%[0-9]+]] = tensor.mul(%1, [[F]])
-// CHECK-NEXT: func.return([[Z]], [[M]], [[P]])
-func.func @absorbing(%0: tensor<4xsi32>, %1: tensor<4xf32>) -> (tensor<4xsi32>, tensor<4xsi32>, tensor<4xf32>) {
-  %2 = tensor.constant() {value = dense<[4] x si32: 0>} : () -> tensor<4xsi32>
-  %3 = tensor.constant() {value = dense<[4] x si32: 2147483647>} : () -> tensor<4xsi32>
-  %4 = tensor.constant() {value = dense<[4] x f32: 0.0>} : () -> tensor<4xf32>
-  %5 = tensor.mul(%0, %2) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
-  %6 = tensor.maximum(%3, %0) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
-  %7 = tensor.mul(%1, %4) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%5, %6, %7) : (tensor<4xsi32>, tensor<4xsi32>, tensor<4xf32>) -> ()
+// CHECK: func.func @absorbing([[INTEGERS:%[0-9]+]]: tensor<4xsi32>, [[FLOATS:%[0-9]+]]: tensor<4xf32>)
+// CHECK-NEXT: [[ZERO:%[0-9]+]] = tensor.constant() {value = dense<[4] x si32: 0>}
+// CHECK-NEXT: [[LARGEST:%[0-9]+]] = tensor.constant() {value = dense<[4] x si32: 2147483647>}
+// CHECK-NEXT: [[FLOAT_ZERO:%[0-9]+]] = tensor.constant() {value = dense<[4] x f32: 0.0>}
+// CHECK-NEXT: [[FLOATS_TIMES_ZERO:%[0-9]+]] = tensor.mul([[FLOATS]], [[FLOAT_ZERO]])
+// CHECK-NEXT: func.return([[ZERO]], [[LARGEST]], [[FLOATS_TIMES_ZERO]])
+func.func @absorbing(%integers: tensor<4xsi32>, %floats: tensor<4xf32>) -> (tensor<4xsi32>, tensor<4xsi32>, tensor<4xf32>) {
+  %zero = tensor.constant() {value = dense<[4] x si32: 0>} : () -> tensor<4xsi32>
+  %largest = tensor.constant() {value = dense<[4] x si32: 2147483647>} : () -> tensor<4xsi32>
+  %float_zero = tensor.constant() {value = dense<[4] x f32: 0.0>} : () -> tensor<4xf32>
+  %times_zero = tensor.mul(%integers, %zero) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  %at_least_largest = tensor.maximum(%largest, %integers) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  %floats_times_zero = tensor.mul(%floats, %float_zero) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%times_zero, %at_least_largest, %floats_times_zero) : (tensor<4xsi32>, tensor<4xsi32>, tensor<4xf32>) -> ()
 }

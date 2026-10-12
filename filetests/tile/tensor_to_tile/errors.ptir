@@ -2,9 +2,9 @@
 
 // A custom call has no tile form.
 // ERROR: tensor-to-tile: tensor.custom_call: failed to legalize: a custom call has no tile form; record core ops instead
-func.func @custom_call(%0: tensor<4xf32>) -> tensor<4xf32> {
-  %1 = tensor.custom_call(%0) {target = "k", results = [tensor<4xf32>]} : (tensor<4xf32>) -> tensor<4xf32>
-  func.return(%1) : (tensor<4xf32>) -> ()
+func.func @custom_call(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %result = tensor.custom_call(%input) {target = "k", results = [tensor<4xf32>]} : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%result) : (tensor<4xf32>) -> ()
 }
 
 // -----
@@ -12,7 +12,7 @@ func.func @custom_call(%0: tensor<4xf32>) -> tensor<4xf32> {
 // Between widths, the bits of an element travel in an integer of its width, and no integer has
 // six bits.
 // ERROR: tensor-to-tile: tensor.bitcast: failed to legalize: BitcastToTile: no integer has the width of f6e2m3 to carry its bits
-func.func @f6_bits(%0: tensor<4x3xui8>) -> tensor<4x4xf6e2m3> {
-  %1 = tensor.bitcast(%0) {to = f6e2m3} : (tensor<4x3xui8>) -> tensor<4x4xf6e2m3>
-  func.return(%1) : (tensor<4x4xf6e2m3>) -> ()
+func.func @f6_bits(%bytes: tensor<4x3xui8>) -> tensor<4x4xf6e2m3> {
+  %codes = tensor.bitcast(%bytes) {to = f6e2m3} : (tensor<4x3xui8>) -> tensor<4x4xf6e2m3>
+  func.return(%codes) : (tensor<4x4xf6e2m3>) -> ()
 }

@@ -1,10 +1,11 @@
 // RUN: pass tensor-to-tile
 
-// CHECK: tile.block(%0) {iters = [par 4, par 2, par 3], reads = [$0[d1, d2, d0]], folds = [none -> [d0, d1, d2]]}
+// CHECK: func.func @transpose([[INPUT:%[0-9]+]]: tensor<2x3x4xf32>) -> tensor<4x2x3xf32> {
+// CHECK: tile.block([[INPUT]]) {iters = [par 4, par 2, par 3], reads = [$0[d1, d2, d0]], folds = [none -> [d0, d1, d2]]}
 // CHECK-NOT: tensor.
-func.func @transpose(%0: tensor<2x3x4xf32>) -> tensor<4x2x3xf32> {
-  %1 = tensor.transpose(%0) {perm = [2, 0, 1]} : (tensor<2x3x4xf32>) -> tensor<4x2x3xf32>
-  func.return(%1) : (tensor<4x2x3xf32>) -> ()
+func.func @transpose(%input: tensor<2x3x4xf32>) -> tensor<4x2x3xf32> {
+  %transposed = tensor.transpose(%input) {perm = [2, 0, 1]} : (tensor<2x3x4xf32>) -> tensor<4x2x3xf32>
+  func.return(%transposed) : (tensor<4x2x3xf32>) -> ()
 }
 
 // -----
@@ -12,37 +13,38 @@ func.func @transpose(%0: tensor<2x3x4xf32>) -> tensor<4x2x3xf32> {
 // CHECK: iters = [par 6, par 4], reads = [$0[(d0 * 4 + d1) floordiv 12, (d0 * 4 + d1) floordiv 4 mod 3, (d0 * 4 + d1) mod 4]]
 // CHECK: iters = [par 24], reads = [$0[d0 floordiv 12, d0 floordiv 4 mod 3, d0 mod 4]]
 // CHECK-NOT: tensor.
-func.func @reshape(%0: tensor<2x3x4xf32>) -> (tensor<6x4xf32>, tensor<2x12xf32>, tensor<24xf32>) {
-  %1 = tensor.reshape(%0) {shape = [6, 4]} : (tensor<2x3x4xf32>) -> tensor<6x4xf32>
-  %2 = tensor.reshape(%0) {shape = [2, 12]} : (tensor<2x3x4xf32>) -> tensor<2x12xf32>
-  %3 = tensor.reshape(%0) {shape = [24]} : (tensor<2x3x4xf32>) -> tensor<24xf32>
-  func.return(%1, %2, %3) : (tensor<6x4xf32>, tensor<2x12xf32>, tensor<24xf32>) -> ()
+func.func @reshape(%input: tensor<2x3x4xf32>) -> (tensor<6x4xf32>, tensor<2x12xf32>, tensor<24xf32>) {
+  %rows = tensor.reshape(%input) {shape = [6, 4]} : (tensor<2x3x4xf32>) -> tensor<6x4xf32>
+  %matrices = tensor.reshape(%input) {shape = [2, 12]} : (tensor<2x3x4xf32>) -> tensor<2x12xf32>
+  %flat = tensor.reshape(%input) {shape = [24]} : (tensor<2x3x4xf32>) -> tensor<24xf32>
+  func.return(%rows, %matrices, %flat) : (tensor<6x4xf32>, tensor<2x12xf32>, tensor<24xf32>) -> ()
 }
 
 // -----
-// CHECK: tile.block(%0) {iters = [], reads = [$0[0, 0]], folds = [none -> []]}
+// CHECK: func.func @reshape_scalar([[INPUT:%[0-9]+]]: tensor<1x1xsi32>) -> tensor<si32> {
+// CHECK: tile.block([[INPUT]]) {iters = [], reads = [$0[0, 0]], folds = [none -> []]}
 // CHECK-NOT: tensor.
-func.func @reshape_scalar(%0: tensor<1x1xsi32>) -> tensor<si32> {
-  %1 = tensor.reshape(%0) {shape = []} : (tensor<1x1xsi32>) -> tensor<si32>
-  func.return(%1) : (tensor<si32>) -> ()
+func.func @reshape_scalar(%input: tensor<1x1xsi32>) -> tensor<si32> {
+  %scalar = tensor.reshape(%input) {shape = []} : (tensor<1x1xsi32>) -> tensor<si32>
+  func.return(%scalar) : (tensor<si32>) -> ()
 }
 
 // -----
 // CHECK: iters = [par {B}, par 12], reads = [$0[(d0 * 12 + d1) floordiv 12, (d0 * 12 + d1) floordiv 4 mod 3, (d0 * 12 + d1) mod 4]]
 // CHECK-NOT: tensor.
-func.func @reshape_dynamic(%0: tensor<{B}x3x4xf32>) -> (tensor<{B}x12xf32>, tensor<{B}x2x6xf32>) {
-  %1 = tensor.reshape(%0) {shape = [{B}, 12]} : (tensor<{B}x3x4xf32>) -> tensor<{B}x12xf32>
-  %2 = tensor.reshape(%0) {shape = [{B}, 2, 6]} : (tensor<{B}x3x4xf32>) -> tensor<{B}x2x6xf32>
-  func.return(%1, %2) : (tensor<{B}x12xf32>, tensor<{B}x2x6xf32>) -> ()
+func.func @reshape_dynamic(%input: tensor<{B}x3x4xf32>) -> (tensor<{B}x12xf32>, tensor<{B}x2x6xf32>) {
+  %flat_rows = tensor.reshape(%input) {shape = [{B}, 12]} : (tensor<{B}x3x4xf32>) -> tensor<{B}x12xf32>
+  %split_rows = tensor.reshape(%input) {shape = [{B}, 2, 6]} : (tensor<{B}x3x4xf32>) -> tensor<{B}x2x6xf32>
+  func.return(%flat_rows, %split_rows) : (tensor<{B}x12xf32>, tensor<{B}x2x6xf32>) -> ()
 }
 
 // -----
 // An empty tensor has no elements, whatever its dynamic extents are.
 // CHECK: iters = [par 0], reads = [$0[d0 floordiv {B}, d0 mod {B}]]
 // CHECK-NOT: tensor.
-func.func @reshape_empty(%0: tensor<0x{B}xf32>) -> tensor<0xf32> {
-  %1 = tensor.reshape(%0) {shape = [0]} : (tensor<0x{B}xf32>) -> tensor<0xf32>
-  func.return(%1) : (tensor<0xf32>) -> ()
+func.func @reshape_empty(%input: tensor<0x{B}xf32>) -> tensor<0xf32> {
+  %flat = tensor.reshape(%input) {shape = [0]} : (tensor<0x{B}xf32>) -> tensor<0xf32>
+  func.return(%flat) : (tensor<0xf32>) -> ()
 }
 
 // -----
@@ -51,83 +53,88 @@ func.func @reshape_empty(%0: tensor<0x{B}xf32>) -> tensor<0xf32> {
 // CHECK: iters = [par 4, par 2, par 3], reads = [$0[0, d2]]
 // CHECK: iters = [par 2, par 2], reads = [$0[]]
 // CHECK-NOT: tensor.
-func.func @broadcast_to(%0: tensor<3xf32>, %1: tensor<1x3xsi32>, %2: tensor<i1>) -> (tensor<2x3xf32>, tensor<4x2x3xsi32>, tensor<2x2xi1>) {
-  %3 = tensor.broadcast_to(%0) {shape = [2, 3]} : (tensor<3xf32>) -> tensor<2x3xf32>
-  %4 = tensor.broadcast_to(%1) {shape = [4, 2, 3]} : (tensor<1x3xsi32>) -> tensor<4x2x3xsi32>
-  %5 = tensor.broadcast_to(%2) {shape = [2, 2]} : (tensor<i1>) -> tensor<2x2xi1>
-  func.return(%3, %4, %5) : (tensor<2x3xf32>, tensor<4x2x3xsi32>, tensor<2x2xi1>) -> ()
+func.func @broadcast_to(%row: tensor<3xf32>, %int_row: tensor<1x3xsi32>, %flag: tensor<i1>) -> (tensor<2x3xf32>, tensor<4x2x3xsi32>, tensor<2x2xi1>) {
+  %rows = tensor.broadcast_to(%row) {shape = [2, 3]} : (tensor<3xf32>) -> tensor<2x3xf32>
+  %int_rows = tensor.broadcast_to(%int_row) {shape = [4, 2, 3]} : (tensor<1x3xsi32>) -> tensor<4x2x3xsi32>
+  %flags = tensor.broadcast_to(%flag) {shape = [2, 2]} : (tensor<i1>) -> tensor<2x2xi1>
+  func.return(%rows, %int_rows, %flags) : (tensor<2x3xf32>, tensor<4x2x3xsi32>, tensor<2x2xi1>) -> ()
 }
 
 // -----
 // CHECK: iters = [par {B}, par 768], reads = [$0[0, d1]]
 // CHECK: iters = [par 2, par {B}, par 4], reads = [$0[d1, 0]]
 // CHECK-NOT: tensor.
-func.func @broadcast_to_dynamic(%0: tensor<1x768xf32>, %1: tensor<{B}x1xf32>) -> (tensor<{B}x768xf32>, tensor<2x{B}x4xf32>) {
-  %2 = tensor.broadcast_to(%0) {shape = [{B}, 768]} : (tensor<1x768xf32>) -> tensor<{B}x768xf32>
-  %3 = tensor.broadcast_to(%1) {shape = [2, {B}, 4]} : (tensor<{B}x1xf32>) -> tensor<2x{B}x4xf32>
-  func.return(%2, %3) : (tensor<{B}x768xf32>, tensor<2x{B}x4xf32>) -> ()
+func.func @broadcast_to_dynamic(%bias: tensor<1x768xf32>, %column: tensor<{B}x1xf32>) -> (tensor<{B}x768xf32>, tensor<2x{B}x4xf32>) {
+  %biases = tensor.broadcast_to(%bias) {shape = [{B}, 768]} : (tensor<1x768xf32>) -> tensor<{B}x768xf32>
+  %columns = tensor.broadcast_to(%column) {shape = [2, {B}, 4]} : (tensor<{B}x1xf32>) -> tensor<2x{B}x4xf32>
+  func.return(%biases, %columns) : (tensor<{B}x768xf32>, tensor<2x{B}x4xf32>) -> ()
 }
 
 // -----
 // CHECK: iters = [par 2, par 3], reads = [$0[1 + d0, 2 + d1]]
 // CHECK: iters = [par 1, par 4], reads = [$0[d0, 2 + d1]]
 // CHECK-NOT: tensor.
-func.func @slice(%0: tensor<4x6xf32>, %1: tensor<{B}x6xf32>) -> (tensor<2x3xf32>, tensor<1x4xf32>) {
-  %2 = tensor.slice(%0) {starts = [1, 2], sizes = [2, 3]} : (tensor<4x6xf32>) -> tensor<2x3xf32>
-  %3 = tensor.slice(%1) {starts = [0, 2], sizes = [1, 4]} : (tensor<{B}x6xf32>) -> tensor<1x4xf32>
-  func.return(%2, %3) : (tensor<2x3xf32>, tensor<1x4xf32>) -> ()
+func.func @slice(%input: tensor<4x6xf32>, %dynamic_input: tensor<{B}x6xf32>) -> (tensor<2x3xf32>, tensor<1x4xf32>) {
+  %window = tensor.slice(%input) {starts = [1, 2], sizes = [2, 3]} : (tensor<4x6xf32>) -> tensor<2x3xf32>
+  %row = tensor.slice(%dynamic_input) {starts = [0, 2], sizes = [1, 4]} : (tensor<{B}x6xf32>) -> tensor<1x4xf32>
+  func.return(%window, %row) : (tensor<2x3xf32>, tensor<1x4xf32>) -> ()
 }
 
 // -----
 // Each input is read shifted by its offset, padded outside it, and the block selects.
-// CHECK: tile.block(%0, %1) {iters = [par 6, par 3], reads = [$0[d0, d1] pad 0.0, $1[d0 - 2, d1] pad 0.0]
+// CHECK: func.func @concat([[HEAD:%[0-9]+]]: tensor<2x3xf32>, [[TAIL:%[0-9]+]]: tensor<4x3xf32>, [[COLUMN:%[0-9]+]]: tensor<2x1xf32>) -> (tensor<6x3xf32>, tensor<2x4xf32>, tensor<2x3xf32>) {
+// CHECK: tile.block([[HEAD]], [[TAIL]]) {iters = [par 6, par 3], reads = [$0[d0, d1] pad 0.0, $1[d0 - 2, d1] pad 0.0]
+// CHECK-NEXT: ^body([[HEAD_ELEMENT:%[0-9]+]]: f32, [[TAIL_ELEMENT:%[0-9]+]]: f32):
 // CHECK: [[AT:%[0-9]+]] = tile.index() {expr = d0, dtype = si64}
 // CHECK-NEXT: [[START:%[0-9]+]] = tile.index() {expr = 2, dtype = si64}
 // CHECK-NEXT: [[IN:%[0-9]+]] = arith.greater_equal([[AT]], [[START]])
-// CHECK-NEXT: arith.select([[IN]], %1, %0)
+// CHECK-NEXT: arith.select([[IN]], [[TAIL_ELEMENT]], [[HEAD_ELEMENT]])
 // CHECK: reads = [$0[d0, d1] pad 0.0, $1[d0, d1 - 3] pad 0.0]
 // CHECK-NOT: tensor.
-func.func @concat(%0: tensor<2x3xf32>, %1: tensor<4x3xf32>, %2: tensor<2x1xf32>) -> (tensor<6x3xf32>, tensor<2x4xf32>, tensor<2x3xf32>) {
-  %3 = tensor.concat(%0, %1) {axis = 0} : (tensor<2x3xf32>, tensor<4x3xf32>) -> tensor<6x3xf32>
-  %4 = tensor.concat(%0, %2) {axis = 1} : (tensor<2x3xf32>, tensor<2x1xf32>) -> tensor<2x4xf32>
-  %5 = tensor.concat(%0) {axis = 1} : (tensor<2x3xf32>) -> tensor<2x3xf32>
-  func.return(%3, %4, %5) : (tensor<6x3xf32>, tensor<2x4xf32>, tensor<2x3xf32>) -> ()
+func.func @concat(%head: tensor<2x3xf32>, %tail: tensor<4x3xf32>, %column: tensor<2x1xf32>) -> (tensor<6x3xf32>, tensor<2x4xf32>, tensor<2x3xf32>) {
+  %stacked = tensor.concat(%head, %tail) {axis = 0} : (tensor<2x3xf32>, tensor<4x3xf32>) -> tensor<6x3xf32>
+  %widened = tensor.concat(%head, %column) {axis = 1} : (tensor<2x3xf32>, tensor<2x1xf32>) -> tensor<2x4xf32>
+  %alone = tensor.concat(%head) {axis = 1} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+  func.return(%stacked, %widened, %alone) : (tensor<6x3xf32>, tensor<2x4xf32>, tensor<2x3xf32>) -> ()
 }
 
 // -----
 // CHECK: reads = [$0[d0, d1] pad 0.0, $1[d0, d1 - 3] pad 0.0]
 // CHECK-NOT: tensor.
-func.func @concat_dynamic(%0: tensor<{B}x3xf32>, %1: tensor<{B}x5xf32>, %2: tensor<{T}x2xf32>) -> (tensor<{B}x8xf32>, tensor<{T}x2xf32>) {
-  %3 = tensor.concat(%0, %1) {axis = 1} : (tensor<{B}x3xf32>, tensor<{B}x5xf32>) -> tensor<{B}x8xf32>
-  %4 = tensor.concat(%2) {axis = 0} : (tensor<{T}x2xf32>) -> tensor<{T}x2xf32>
-  func.return(%3, %4) : (tensor<{B}x8xf32>, tensor<{T}x2xf32>) -> ()
+func.func @concat_dynamic(%left: tensor<{B}x3xf32>, %right: tensor<{B}x5xf32>, %input: tensor<{T}x2xf32>) -> (tensor<{B}x8xf32>, tensor<{T}x2xf32>) {
+  %joined = tensor.concat(%left, %right) {axis = 1} : (tensor<{B}x3xf32>, tensor<{B}x5xf32>) -> tensor<{B}x8xf32>
+  %alone = tensor.concat(%input) {axis = 0} : (tensor<{T}x2xf32>) -> tensor<{T}x2xf32>
+  func.return(%joined, %alone) : (tensor<{B}x8xf32>, tensor<{T}x2xf32>) -> ()
 }
 
 // -----
 // CHECK: reads = [$0[1 + d0 * 2, d1 * 4]]
 // CHECK-NOT: tensor.
-func.func @strided_slice(%0: tensor<4x9xf32>) -> tensor<2x3xf32> {
-  %1 = tensor.slice(%0) {starts = [1, 0], sizes = [2, 3], strides = [2, 4]} : (tensor<4x9xf32>) -> tensor<2x3xf32>
-  func.return(%1) : (tensor<2x3xf32>) -> ()
+func.func @strided_slice(%input: tensor<4x9xf32>) -> tensor<2x3xf32> {
+  %strided = tensor.slice(%input) {starts = [1, 0], sizes = [2, 3], strides = [2, 4]} : (tensor<4x9xf32>) -> tensor<2x3xf32>
+  func.return(%strided) : (tensor<2x3xf32>) -> ()
 }
 
 // -----
 // The bits of the last axis read as another dtype: eight 4-bit codes per 32-bit word, and four
 // bytes per f32.
 // A narrower result takes its bits from the one input element that holds them.
-// CHECK: [[W:%[0-9]+]] = tile.block(%0) {iters = [par 4, par 16, red 1], reads = [$0[d0, 4 * d1 floordiv 32 + d2]], folds = [or -> [d0, d1]], constraints = [32 * (4 * d1 floordiv 32 + d2) - 4 * d1 < 4]}
-// CHECK: arith.bitcast(%0) {to = ui32}
-// CHECK: tile.block([[W]])
+// CHECK: func.func @bitcast([[WORDS:%[0-9]+]]: tensor<4x2xsi32>, [[BYTES:%[0-9]+]]: tensor<4x4xui8>, [[BF16_VALUES:%[0-9]+]]: tensor<4xbf16>) -> (tensor<4x16xui4>, tensor<4x1xf32>, tensor<4xsi16>) {
+// CHECK: [[CODE_BITS:%[0-9]+]] = tile.block([[WORDS]]) {iters = [par 4, par 16, red 1], reads = [$0[d0, 4 * d1 floordiv 32 + d2]], folds = [or -> [d0, d1]], constraints = [32 * (4 * d1 floordiv 32 + d2) - 4 * d1 < 4]}
+// CHECK-NEXT: ^body([[WORD:%[0-9]+]]: si32):
+// CHECK: arith.bitcast([[WORD]]) {to = ui32}
+// CHECK: tile.block([[CODE_BITS]])
 // CHECK: arith.cast({{%[0-9]+}}) {to = ui4}
 // A wider result ors the shifted bits of its four input elements.
 // CHECK: iters = [par 4, par 1, red 4], reads = [$0[d0, 32 * d1 floordiv 8 + d2]]
 // CHECK: arith.bitcast({{%[0-9]+}}) {to = f32}
 // Equal widths bitcast each element.
-// CHECK: arith.bitcast(%0) {to = si16} : (bf16) -> si16
+// CHECK: ^body([[BF16_VALUE:%[0-9]+]]: bf16):
+// CHECK: arith.bitcast([[BF16_VALUE]]) {to = si16} : (bf16) -> si16
 // CHECK-NOT: tensor.
-func.func @bitcast(%0: tensor<4x2xsi32>, %1: tensor<4x4xui8>, %2: tensor<4xbf16>) -> (tensor<4x16xui4>, tensor<4x1xf32>, tensor<4xsi16>) {
-  %3 = tensor.bitcast(%0) {to = ui4} : (tensor<4x2xsi32>) -> tensor<4x16xui4>
-  %4 = tensor.bitcast(%1) {to = f32} : (tensor<4x4xui8>) -> tensor<4x1xf32>
-  %5 = tensor.bitcast(%2) {to = si16} : (tensor<4xbf16>) -> tensor<4xsi16>
-  func.return(%3, %4, %5) : (tensor<4x16xui4>, tensor<4x1xf32>, tensor<4xsi16>) -> ()
+func.func @bitcast(%words: tensor<4x2xsi32>, %bytes: tensor<4x4xui8>, %bf16_values: tensor<4xbf16>) -> (tensor<4x16xui4>, tensor<4x1xf32>, tensor<4xsi16>) {
+  %codes = tensor.bitcast(%words) {to = ui4} : (tensor<4x2xsi32>) -> tensor<4x16xui4>
+  %floats = tensor.bitcast(%bytes) {to = f32} : (tensor<4x4xui8>) -> tensor<4x1xf32>
+  %bf16_bits = tensor.bitcast(%bf16_values) {to = si16} : (tensor<4xbf16>) -> tensor<4xsi16>
+  func.return(%codes, %floats, %bf16_bits) : (tensor<4x16xui4>, tensor<4x1xf32>, tensor<4xsi16>) -> ()
 }

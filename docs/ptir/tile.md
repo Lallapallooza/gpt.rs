@@ -192,13 +192,13 @@ Defined by `Block` in [crates/gpt-rs-ir/src/dialects/tile/ir.rs](../../crates/gp
 Example, from `filetests/tile/roundtrip/block.ptir`:
 
 ```text
-func.func @experts(%0: tensor<{T}x8xf32>, %1: tensor<{T}xsi32>, %2: tensor<4x8xf32>, %3: tensor<4x8xf32>, %4: tensor<4x8xf32>) -> tensor<{T}x4xf32> {
-  %5 = tile.block(%0, %1, %2, %3, %4) {iters = [par {T}, par 4, red 8], reads = [$0[d0, d2], $2..$4[$1[d0]][d1, d2]], folds = [sum -> [d0, d1]]} ({
-  ^body(%0: f32, %1: f32):
-    %2 = arith.mul(%0, %1) : (f32, f32) -> f32
-    tile.yield(%2) : (f32) -> ()
+func.func @experts(%input: tensor<{T}x8xf32>, %choices: tensor<{T}xsi32>, %first_expert: tensor<4x8xf32>, %second_expert: tensor<4x8xf32>, %third_expert: tensor<4x8xf32>) -> tensor<{T}x4xf32> {
+  %output = tile.block(%input, %choices, %first_expert, %second_expert, %third_expert) {iters = [par {T}, par 4, red 8], reads = [$0[d0, d2], $2..$4[$1[d0]][d1, d2]], folds = [sum -> [d0, d1]]} ({
+  ^body(%activation: f32, %expert_weight: f32):
+    %product = arith.mul(%activation, %expert_weight) : (f32, f32) -> f32
+    tile.yield(%product) : (f32) -> ()
   }) : (tensor<{T}x8xf32>, tensor<{T}xsi32>, tensor<4x8xf32>, tensor<4x8xf32>, tensor<4x8xf32>) -> tensor<{T}x4xf32>
-  func.return(%5) : (tensor<{T}x4xf32>) -> ()
+  func.return(%output) : (tensor<{T}x4xf32>) -> ()
 }
 ```
 
@@ -236,22 +236,22 @@ Defined by `Index` in [crates/gpt-rs-ir/src/dialects/tile/ir.rs](../../crates/gp
 Example, from `filetests/tile/roundtrip/block.ptir`:
 
 ```text
-func.func @folds(%0: tensor<2x5xf32>, %1: tensor<2x5xi1>) -> (tensor<2xf32>, tensor<2xsi32>, tensor<2xf32>, tensor<2xsi64>, tensor<2x3xf32>, tensor<2x3xsi32>, tensor<2xf32>, tensor<2xf32>, tensor<2xf32>, tensor<2xi1>, tensor<2xi1>) {
-  %2, %3, %4, %5, %6, %7 = tile.block(%0) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [argmax -> [d0], [d0], argmin -> [d0], [d0], top_k<k = 3> -> [d0], [d0]]} ({
-  ^body(%0: f32):
-    %1 = tile.index() {expr = d1, dtype = si32} : () -> si32
-    %2 = tile.index() {expr = d1, dtype = si64} : () -> si64
-    tile.yield(%0, %1, %0, %2, %0, %1) : (f32, si32, f32, si64, f32, si32) -> ()
+func.func @folds(%scores: tensor<2x5xf32>, %flags: tensor<2x5xi1>) -> (tensor<2xf32>, tensor<2xsi32>, tensor<2xf32>, tensor<2xsi64>, tensor<2x3xf32>, tensor<2x3xsi32>, tensor<2xf32>, tensor<2xf32>, tensor<2xf32>, tensor<2xi1>, tensor<2xi1>) {
+  %argmax_value, %argmax_index, %argmin_value, %argmin_index, %top_values, %top_indices = tile.block(%scores) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [argmax -> [d0], [d0], argmin -> [d0], [d0], top_k<k = 3> -> [d0], [d0]]} ({
+  ^body(%score: f32):
+    %index = tile.index() {expr = d1, dtype = si32} : () -> si32
+    %wide_index = tile.index() {expr = d1, dtype = si64} : () -> si64
+    tile.yield(%score, %index, %score, %wide_index, %score, %index) : (f32, si32, f32, si64, f32, si32) -> ()
   }) : (tensor<2x5xf32>) -> (tensor<2xf32>, tensor<2xsi32>, tensor<2xf32>, tensor<2xsi64>, tensor<2x3xf32>, tensor<2x3xsi32>)
-  %8, %9, %10 = tile.block(%0) {iters = [par 2, red ordered 5], reads = [$0[d0, d1]], folds = [sum -> [d0], max -> [d0], min -> [d0]]} ({
-  ^body(%0: f32):
-    tile.yield(%0, %0, %0) : (f32, f32, f32) -> ()
+  %sum, %max, %min = tile.block(%scores) {iters = [par 2, red ordered 5], reads = [$0[d0, d1]], folds = [sum -> [d0], max -> [d0], min -> [d0]]} ({
+  ^body(%score: f32):
+    tile.yield(%score, %score, %score) : (f32, f32, f32) -> ()
   }) : (tensor<2x5xf32>) -> (tensor<2xf32>, tensor<2xf32>, tensor<2xf32>)
-  %11, %12 = tile.block(%1) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [and -> [d0], or -> [d0]]} ({
-  ^body(%0: i1):
-    tile.yield(%0, %0) : (i1, i1) -> ()
+  %all, %any = tile.block(%flags) {iters = [par 2, red 5], reads = [$0[d0, d1]], folds = [and -> [d0], or -> [d0]]} ({
+  ^body(%flag: i1):
+    tile.yield(%flag, %flag) : (i1, i1) -> ()
   }) : (tensor<2x5xi1>) -> (tensor<2xi1>, tensor<2xi1>)
-  func.return(%2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12) : (tensor<2xf32>, tensor<2xsi32>, tensor<2xf32>, tensor<2xsi64>, tensor<2x3xf32>, tensor<2x3xsi32>, tensor<2xf32>, tensor<2xf32>, tensor<2xf32>, tensor<2xi1>, tensor<2xi1>) -> ()
+  func.return(%argmax_value, %argmax_index, %argmin_value, %argmin_index, %top_values, %top_indices, %sum, %max, %min, %all, %any) : (tensor<2xf32>, tensor<2xsi32>, tensor<2xf32>, tensor<2xsi64>, tensor<2x3xf32>, tensor<2x3xsi32>, tensor<2xf32>, tensor<2xf32>, tensor<2xf32>, tensor<2xi1>, tensor<2xi1>) -> ()
 }
 ```
 
@@ -272,13 +272,13 @@ Defined by `Yield` in [crates/gpt-rs-ir/src/dialects/tile/ir.rs](../../crates/gp
 Example, from `filetests/tile/roundtrip/block.ptir`:
 
 ```text
-func.func @experts(%0: tensor<{T}x8xf32>, %1: tensor<{T}xsi32>, %2: tensor<4x8xf32>, %3: tensor<4x8xf32>, %4: tensor<4x8xf32>) -> tensor<{T}x4xf32> {
-  %5 = tile.block(%0, %1, %2, %3, %4) {iters = [par {T}, par 4, red 8], reads = [$0[d0, d2], $2..$4[$1[d0]][d1, d2]], folds = [sum -> [d0, d1]]} ({
-  ^body(%0: f32, %1: f32):
-    %2 = arith.mul(%0, %1) : (f32, f32) -> f32
-    tile.yield(%2) : (f32) -> ()
+func.func @experts(%input: tensor<{T}x8xf32>, %choices: tensor<{T}xsi32>, %first_expert: tensor<4x8xf32>, %second_expert: tensor<4x8xf32>, %third_expert: tensor<4x8xf32>) -> tensor<{T}x4xf32> {
+  %output = tile.block(%input, %choices, %first_expert, %second_expert, %third_expert) {iters = [par {T}, par 4, red 8], reads = [$0[d0, d2], $2..$4[$1[d0]][d1, d2]], folds = [sum -> [d0, d1]]} ({
+  ^body(%activation: f32, %expert_weight: f32):
+    %product = arith.mul(%activation, %expert_weight) : (f32, f32) -> f32
+    tile.yield(%product) : (f32) -> ()
   }) : (tensor<{T}x8xf32>, tensor<{T}xsi32>, tensor<4x8xf32>, tensor<4x8xf32>, tensor<4x8xf32>) -> tensor<{T}x4xf32>
-  func.return(%5) : (tensor<{T}x4xf32>) -> ()
+  func.return(%output) : (tensor<{T}x4xf32>) -> ()
 }
 ```
 
@@ -305,25 +305,25 @@ Defined by `Group` in [crates/gpt-rs-ir/src/dialects/tile/ir.rs](../../crates/gp
 Example, from `filetests/tile/roundtrip/block.ptir`:
 
 ```text
-tile.dispatch @rms(%0: tensor<{T}x8xf32>) -> tensor<{T}xf32> {grid = [d0], facts = {T = [16, 4096] % 16}} {
-  %1 = tile.block(%0) {iters = [par {T}, red 8], reads = [$0[d0, d1]], folds = [sum -> [d0]]} ({
-  ^body(%0: f32):
-    %1 = arith.mul(%0, %0) : (f32, f32) -> f32
-    tile.yield(%1) : (f32) -> ()
+tile.dispatch @rms(%input: tensor<{T}x8xf32>) -> tensor<{T}xf32> {grid = [d0], facts = {T = [16, 4096] % 16}} {
+  %sum_of_squares = tile.block(%input) {iters = [par {T}, red 8], reads = [$0[d0, d1]], folds = [sum -> [d0]]} ({
+  ^body(%element: f32):
+    %square = arith.mul(%element, %element) : (f32, f32) -> f32
+    tile.yield(%square) : (f32) -> ()
   }) : (tensor<{T}x8xf32>) -> tensor<{T}xf32>
-  func.return(%1) : (tensor<{T}xf32>) -> ()
+  func.return(%sum_of_squares) : (tensor<{T}xf32>) -> ()
 }
-func.func @call(%0: tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}x8xf32>) {
-  %1 = host.dispatch(%0) {callee = @rms} : (tensor<{T}x8xf32>) -> tensor<{T}xf32>
-  %2 = tile.group() {grid = [d0]} ({
-    %3 = tile.block(%0) {iters = [par {T}, par 8], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
-    ^body(%0: f32):
-      %1 = arith.exp(%0) : (f32) -> f32
-      tile.yield(%1) : (f32) -> ()
+func.func @call(%input: tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}x8xf32>) {
+  %sum_of_squares = host.dispatch(%input) {callee = @rms} : (tensor<{T}x8xf32>) -> tensor<{T}xf32>
+  %exponentials = tile.group() {grid = [d0]} ({
+    %block_exponentials = tile.block(%input) {iters = [par {T}, par 8], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+    ^body(%element: f32):
+      %exponential = arith.exp(%element) : (f32) -> f32
+      tile.yield(%exponential) : (f32) -> ()
     }) : (tensor<{T}x8xf32>) -> tensor<{T}x8xf32>
-    tile.yield(%3) : (tensor<{T}x8xf32>) -> ()
+    tile.yield(%block_exponentials) : (tensor<{T}x8xf32>) -> ()
   }) : () -> tensor<{T}x8xf32>
-  func.return(%1, %2) : (tensor<{T}xf32>, tensor<{T}x8xf32>) -> ()
+  func.return(%sum_of_squares, %exponentials) : (tensor<{T}xf32>, tensor<{T}x8xf32>) -> ()
 }
 ```
 
@@ -350,25 +350,25 @@ Defined by `Dispatch` in [crates/gpt-rs-ir/src/dialects/tile/ir.rs](../../crates
 Example, from `filetests/tile/roundtrip/block.ptir`:
 
 ```text
-tile.dispatch @rms(%0: tensor<{T}x8xf32>) -> tensor<{T}xf32> {grid = [d0], facts = {T = [16, 4096] % 16}} {
-  %1 = tile.block(%0) {iters = [par {T}, red 8], reads = [$0[d0, d1]], folds = [sum -> [d0]]} ({
-  ^body(%0: f32):
-    %1 = arith.mul(%0, %0) : (f32, f32) -> f32
-    tile.yield(%1) : (f32) -> ()
+tile.dispatch @rms(%input: tensor<{T}x8xf32>) -> tensor<{T}xf32> {grid = [d0], facts = {T = [16, 4096] % 16}} {
+  %sum_of_squares = tile.block(%input) {iters = [par {T}, red 8], reads = [$0[d0, d1]], folds = [sum -> [d0]]} ({
+  ^body(%element: f32):
+    %square = arith.mul(%element, %element) : (f32, f32) -> f32
+    tile.yield(%square) : (f32) -> ()
   }) : (tensor<{T}x8xf32>) -> tensor<{T}xf32>
-  func.return(%1) : (tensor<{T}xf32>) -> ()
+  func.return(%sum_of_squares) : (tensor<{T}xf32>) -> ()
 }
-func.func @call(%0: tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}x8xf32>) {
-  %1 = host.dispatch(%0) {callee = @rms} : (tensor<{T}x8xf32>) -> tensor<{T}xf32>
-  %2 = tile.group() {grid = [d0]} ({
-    %3 = tile.block(%0) {iters = [par {T}, par 8], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
-    ^body(%0: f32):
-      %1 = arith.exp(%0) : (f32) -> f32
-      tile.yield(%1) : (f32) -> ()
+func.func @call(%input: tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}x8xf32>) {
+  %sum_of_squares = host.dispatch(%input) {callee = @rms} : (tensor<{T}x8xf32>) -> tensor<{T}xf32>
+  %exponentials = tile.group() {grid = [d0]} ({
+    %block_exponentials = tile.block(%input) {iters = [par {T}, par 8], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+    ^body(%element: f32):
+      %exponential = arith.exp(%element) : (f32) -> f32
+      tile.yield(%exponential) : (f32) -> ()
     }) : (tensor<{T}x8xf32>) -> tensor<{T}x8xf32>
-    tile.yield(%3) : (tensor<{T}x8xf32>) -> ()
+    tile.yield(%block_exponentials) : (tensor<{T}x8xf32>) -> ()
   }) : () -> tensor<{T}x8xf32>
-  func.return(%1, %2) : (tensor<{T}xf32>, tensor<{T}x8xf32>) -> ()
+  func.return(%sum_of_squares, %exponentials) : (tensor<{T}xf32>, tensor<{T}x8xf32>) -> ()
 }
 ```
 

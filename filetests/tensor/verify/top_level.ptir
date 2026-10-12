@@ -1,4 +1,4 @@
 // RUN: verify
 
 // ERROR: tensor.constant: only func.func and tile.dispatch may appear at the top level
-%0 = tensor.constant() {value = dense<[4] x f32: 3.0>} : () -> tensor<4xf32>
+%threes = tensor.constant() {value = dense<[4] x f32: 3.0>} : () -> tensor<4xf32>

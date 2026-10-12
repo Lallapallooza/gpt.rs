@@ -4,17 +4,17 @@
 // moves into the weight, the scaled weight becomes a load-time result, and the run computes one
 // dot and one add.
 // ROUNDING: the scale rounds into every weight before the sum, instead of into the sum once
-// CHECK: func.func @conv_bn(%0: tensor<2x3xf32>, %1: tensor<3x4xf32> {param = 1}, %2: tensor<4xf32> {param = 2}, %3: tensor<4xf32> {param = 3}, %4: tensor<3x4xf32> {param = [[W:[0-9]+]]}) -> tensor<2x4xf32>
-// CHECK-NEXT: [[D:%[0-9]+]] = tensor.dot_general(%0, %4)
-// CHECK-NEXT: [[B:%[0-9]+]] = tensor.broadcast_to(%3) {shape = [2, 4]}
-// CHECK-NEXT: [[S:%[0-9]+]] = tensor.add([[D]], [[B]])
-// CHECK-NEXT: func.return([[S]])
-// CHECK: func.func @static.{{[0-9a-f]+}}(%0: tensor<3x4xf32> {param = 1}, %1: tensor<4xf32> {param = 2}) -> (tensor<3x4xf32> {param = [[W]]})
-func.func @conv_bn(%0: tensor<2x3xf32>, %1: tensor<3x4xf32> {param = 1}, %2: tensor<4xf32> {param = 2}, %3: tensor<4xf32> {param = 3}) -> tensor<2x4xf32> {
-  %4 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
-  %5 = tensor.broadcast_to(%2) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
-  %6 = tensor.mul(%5, %4) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
-  %7 = tensor.broadcast_to(%3) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
-  %8 = tensor.add(%6, %7) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
-  func.return(%8) : (tensor<2x4xf32>) -> ()
+// CHECK: func.func @conv_bn([[INPUT:%[0-9]+]]: tensor<2x3xf32>, [[WEIGHT:%[0-9]+]]: tensor<3x4xf32> {param = 1}, [[SCALE:%[0-9]+]]: tensor<4xf32> {param = 2}, [[SHIFT:%[0-9]+]]: tensor<4xf32> {param = 3}, [[SCALED_WEIGHT:%[0-9]+]]: tensor<3x4xf32> {param = [[SCALED_WEIGHT_ID:[0-9]+]]}) -> tensor<2x4xf32>
+// CHECK-NEXT: [[PRODUCT:%[0-9]+]] = tensor.dot_general([[INPUT]], [[SCALED_WEIGHT]])
+// CHECK-NEXT: [[SHIFTS:%[0-9]+]] = tensor.broadcast_to([[SHIFT]]) {shape = [2, 4]}
+// CHECK-NEXT: [[NORMALIZED:%[0-9]+]] = tensor.add([[PRODUCT]], [[SHIFTS]])
+// CHECK-NEXT: func.return([[NORMALIZED]])
+// CHECK: func.func @static.{{[0-9a-f]+}}([[STATIC_WEIGHT:%[0-9]+]]: tensor<3x4xf32> {param = 1}, [[STATIC_SCALE:%[0-9]+]]: tensor<4xf32> {param = 2}) -> (tensor<3x4xf32> {param = [[SCALED_WEIGHT_ID]]})
+func.func @conv_bn(%input: tensor<2x3xf32>, %weight: tensor<3x4xf32> {param = 1}, %scale: tensor<4xf32> {param = 2}, %shift: tensor<4xf32> {param = 3}) -> tensor<2x4xf32> {
+  %product = tensor.dot_general(%input, %weight) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
+  %scales = tensor.broadcast_to(%scale) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
+  %scaled = tensor.mul(%scales, %product) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+  %shifts = tensor.broadcast_to(%shift) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
+  %normalized = tensor.add(%scaled, %shifts) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+  func.return(%normalized) : (tensor<2x4xf32>) -> ()
 }

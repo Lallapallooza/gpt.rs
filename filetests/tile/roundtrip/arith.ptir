@@ -1,79 +1,147 @@
 // RUN: roundtrip
 
 // Every arith op, in the body of a parallel block.
-func.func @scalar_ops(%0: tensor<4xf32>, %1: tensor<4xsi32>, %2: tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) {
-  %3, %4, %5, %6 = tile.block(%0, %1, %2) {iters = [par 4], reads = [$0[d0], $1[d0], $2[0], $2[1]], folds = [none -> [d0], none -> [d0], none -> [d0], none -> [d0]]} ({
-  ^body(%0: f32, %1: si32, %2: ui64, %3: ui64):
-    %4 = arith.neg(%0) : (f32) -> f32
-    %5 = arith.abs(%4) : (f32) -> f32
-    %6 = arith.exp(%5) : (f32) -> f32
-    %7 = arith.log(%6) : (f32) -> f32
-    %8 = arith.tanh(%7) : (f32) -> f32
-    %9 = arith.erf(%8) : (f32) -> f32
-    %10 = arith.rsqrt(%9) : (f32) -> f32
-    %11 = arith.reciprocal(%10) : (f32) -> f32
-    %12 = arith.sin(%11) : (f32) -> f32
-    %13 = arith.cos(%12) : (f32) -> f32
-    %14 = arith.constant() {value = 0.5 : f32} : () -> f32
-    %15 = arith.add(%13, %14) : (f32, f32) -> f32
-    %16 = arith.sub(%15, %14) : (f32, f32) -> f32
-    %17 = arith.mul(%16, %14) : (f32, f32) -> f32
-    %18 = arith.div(%17, %14) : (f32, f32) -> f32
-    %19 = arith.maximum(%18, %14) : (f32, f32) -> f32
-    %20 = arith.minimum(%19, %14) : (f32, f32) -> f32
-    %21 = arith.constant() {value = 3 : si32} : () -> si32
-    %22 = arith.and(%1, %21) : (si32, si32) -> si32
-    %23 = arith.or(%22, %21) : (si32, si32) -> si32
-    %24 = arith.xor(%23, %21) : (si32, si32) -> si32
-    %25 = arith.shift_left(%24, %21) : (si32, si32) -> si32
-    %26 = arith.shift_right_logical(%25, %21) : (si32, si32) -> si32
-    %27 = arith.shift_right_arithmetic(%26, %21) : (si32, si32) -> si32
-    %28 = arith.not(%27) : (si32) -> si32
-    %29 = arith.less(%20, %14) : (f32, f32) -> i1
-    %30 = arith.select(%29, %20, %14) : (i1, f32, f32) -> f32
-    %31 = arith.cast(%30) {to = bf16} : (f32) -> bf16
-    %32 = arith.bitcast(%30) {to = si32} : (f32) -> si32
-    %33 = arith.add(%28, %32) : (si32, si32) -> si32
-    %34 = tile.index() {expr = d0, dtype = ui64} : () -> ui64
-    %35 = arith.rng_uniform(%2, %3, %34) {dtype = f32} : (ui64, ui64, ui64) -> f32
-    %36 = arith.rng_normal(%2, %3, %34) {dtype = bf16} : (ui64, ui64, ui64) -> bf16
-    tile.yield(%35, %33, %29, %36) : (f32, si32, i1, bf16) -> ()
+// CHECK: func.func @scalar_ops([[INPUT:%[0-9]+]]: tensor<4xf32>, [[INTEGERS:%[0-9]+]]: tensor<4xsi32>, [[STATE:%[0-9]+]]: tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) {
+// CHECK-NEXT: [[UNIFORMS:%[0-9]+]], [[COMBINED_BITS:%[0-9]+]], [[LESS_FLAGS:%[0-9]+]], [[NORMALS:%[0-9]+]] = tile.block([[INPUT]], [[INTEGERS]], [[STATE]]) {iters = [par 4], reads = [$0[d0], $1[d0], $2[0], $2[1]], folds = [none -> [d0], none -> [d0], none -> [d0], none -> [d0]]} ({
+// CHECK-NEXT: ^body([[ELEMENT:%[0-9]+]]: f32, [[INTEGER:%[0-9]+]]: si32, [[KEY:%[0-9]+]]: ui64, [[COUNTER:%[0-9]+]]: ui64):
+// CHECK-NEXT: [[NEGATED:%[0-9]+]] = arith.neg([[ELEMENT]]) : (f32) -> f32
+// CHECK-NEXT: [[ABSOLUTE:%[0-9]+]] = arith.abs([[NEGATED]]) : (f32) -> f32
+// CHECK-NEXT: [[EXPONENTIAL:%[0-9]+]] = arith.exp([[ABSOLUTE]]) : (f32) -> f32
+// CHECK-NEXT: [[LOGARITHM:%[0-9]+]] = arith.log([[EXPONENTIAL]]) : (f32) -> f32
+// CHECK-NEXT: [[TANH:%[0-9]+]] = arith.tanh([[LOGARITHM]]) : (f32) -> f32
+// CHECK-NEXT: [[ERF:%[0-9]+]] = arith.erf([[TANH]]) : (f32) -> f32
+// CHECK-NEXT: [[RSQRT:%[0-9]+]] = arith.rsqrt([[ERF]]) : (f32) -> f32
+// CHECK-NEXT: [[RECIPROCAL:%[0-9]+]] = arith.reciprocal([[RSQRT]]) : (f32) -> f32
+// CHECK-NEXT: [[SINE:%[0-9]+]] = arith.sin([[RECIPROCAL]]) : (f32) -> f32
+// CHECK-NEXT: [[COSINE:%[0-9]+]] = arith.cos([[SINE]]) : (f32) -> f32
+// CHECK-NEXT: [[HALF:%[0-9]+]] = arith.constant() {value = 0.5 : f32} : () -> f32
+// CHECK-NEXT: [[SUM:%[0-9]+]] = arith.add([[COSINE]], [[HALF]]) : (f32, f32) -> f32
+// CHECK-NEXT: [[DIFFERENCE:%[0-9]+]] = arith.sub([[SUM]], [[HALF]]) : (f32, f32) -> f32
+// CHECK-NEXT: [[PRODUCT:%[0-9]+]] = arith.mul([[DIFFERENCE]], [[HALF]]) : (f32, f32) -> f32
+// CHECK-NEXT: [[QUOTIENT:%[0-9]+]] = arith.div([[PRODUCT]], [[HALF]]) : (f32, f32) -> f32
+// CHECK-NEXT: [[MAXIMUM:%[0-9]+]] = arith.maximum([[QUOTIENT]], [[HALF]]) : (f32, f32) -> f32
+// CHECK-NEXT: [[MINIMUM:%[0-9]+]] = arith.minimum([[MAXIMUM]], [[HALF]]) : (f32, f32) -> f32
+// CHECK-NEXT: [[THREE:%[0-9]+]] = arith.constant() {value = 3 : si32} : () -> si32
+// CHECK-NEXT: [[AND_BITS:%[0-9]+]] = arith.and([[INTEGER]], [[THREE]]) : (si32, si32) -> si32
+// CHECK-NEXT: [[OR_BITS:%[0-9]+]] = arith.or([[AND_BITS]], [[THREE]]) : (si32, si32) -> si32
+// CHECK-NEXT: [[XOR_BITS:%[0-9]+]] = arith.xor([[OR_BITS]], [[THREE]]) : (si32, si32) -> si32
+// CHECK-NEXT: [[LEFT_SHIFTED:%[0-9]+]] = arith.shift_left([[XOR_BITS]], [[THREE]]) : (si32, si32) -> si32
+// CHECK-NEXT: [[LOGICAL_SHIFTED:%[0-9]+]] = arith.shift_right_logical([[LEFT_SHIFTED]], [[THREE]]) : (si32, si32) -> si32
+// CHECK-NEXT: [[ARITHMETIC_SHIFTED:%[0-9]+]] = arith.shift_right_arithmetic([[LOGICAL_SHIFTED]], [[THREE]]) : (si32, si32) -> si32
+// CHECK-NEXT: [[INVERTED:%[0-9]+]] = arith.not([[ARITHMETIC_SHIFTED]]) : (si32) -> si32
+// CHECK-NEXT: [[IS_LESS:%[0-9]+]] = arith.less([[MINIMUM]], [[HALF]]) : (f32, f32) -> i1
+// CHECK-NEXT: [[SELECTED:%[0-9]+]] = arith.select([[IS_LESS]], [[MINIMUM]], [[HALF]]) : (i1, f32, f32) -> f32
+// CHECK-NEXT: [[NARROWED:%[0-9]+]] = arith.cast([[SELECTED]]) {to = bf16} : (f32) -> bf16
+// CHECK-NEXT: [[SELECTED_BITS:%[0-9]+]] = arith.bitcast([[SELECTED]]) {to = si32} : (f32) -> si32
+// CHECK-NEXT: [[COMBINED:%[0-9]+]] = arith.add([[INVERTED]], [[SELECTED_BITS]]) : (si32, si32) -> si32
+// CHECK-NEXT: [[INDEX:%[0-9]+]] = tile.index() {expr = d0, dtype = ui64} : () -> ui64
+// CHECK-NEXT: [[UNIFORM:%[0-9]+]] = arith.rng_uniform([[KEY]], [[COUNTER]], [[INDEX]]) {dtype = f32} : (ui64, ui64, ui64) -> f32
+// CHECK-NEXT: [[NORMAL:%[0-9]+]] = arith.rng_normal([[KEY]], [[COUNTER]], [[INDEX]]) {dtype = bf16} : (ui64, ui64, ui64) -> bf16
+// CHECK-NEXT: tile.yield([[UNIFORM]], [[COMBINED]], [[IS_LESS]], [[NORMAL]]) : (f32, si32, i1, bf16) -> ()
+// CHECK-NEXT: }) : (tensor<4xf32>, tensor<4xsi32>, tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>)
+// CHECK-NEXT: func.return([[UNIFORMS]], [[COMBINED_BITS]], [[LESS_FLAGS]], [[NORMALS]]) : (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) -> ()
+// CHECK-NEXT: }
+func.func @scalar_ops(%input: tensor<4xf32>, %integers: tensor<4xsi32>, %state: tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) {
+  %uniforms, %combined_bits, %less_flags, %normals = tile.block(%input, %integers, %state) {iters = [par 4], reads = [$0[d0], $1[d0], $2[0], $2[1]], folds = [none -> [d0], none -> [d0], none -> [d0], none -> [d0]]} ({
+  ^body(%element: f32, %integer: si32, %key: ui64, %counter: ui64):
+    %negated = arith.neg(%element) : (f32) -> f32
+    %absolute = arith.abs(%negated) : (f32) -> f32
+    %exponential = arith.exp(%absolute) : (f32) -> f32
+    %logarithm = arith.log(%exponential) : (f32) -> f32
+    %tanh = arith.tanh(%logarithm) : (f32) -> f32
+    %erf = arith.erf(%tanh) : (f32) -> f32
+    %rsqrt = arith.rsqrt(%erf) : (f32) -> f32
+    %reciprocal = arith.reciprocal(%rsqrt) : (f32) -> f32
+    %sine = arith.sin(%reciprocal) : (f32) -> f32
+    %cosine = arith.cos(%sine) : (f32) -> f32
+    %half = arith.constant() {value = 0.5 : f32} : () -> f32
+    %sum = arith.add(%cosine, %half) : (f32, f32) -> f32
+    %difference = arith.sub(%sum, %half) : (f32, f32) -> f32
+    %product = arith.mul(%difference, %half) : (f32, f32) -> f32
+    %quotient = arith.div(%product, %half) : (f32, f32) -> f32
+    %maximum = arith.maximum(%quotient, %half) : (f32, f32) -> f32
+    %minimum = arith.minimum(%maximum, %half) : (f32, f32) -> f32
+    %three = arith.constant() {value = 3 : si32} : () -> si32
+    %and_bits = arith.and(%integer, %three) : (si32, si32) -> si32
+    %or_bits = arith.or(%and_bits, %three) : (si32, si32) -> si32
+    %xor_bits = arith.xor(%or_bits, %three) : (si32, si32) -> si32
+    %left_shifted = arith.shift_left(%xor_bits, %three) : (si32, si32) -> si32
+    %logical_shifted = arith.shift_right_logical(%left_shifted, %three) : (si32, si32) -> si32
+    %arithmetic_shifted = arith.shift_right_arithmetic(%logical_shifted, %three) : (si32, si32) -> si32
+    %inverted = arith.not(%arithmetic_shifted) : (si32) -> si32
+    %is_less = arith.less(%minimum, %half) : (f32, f32) -> i1
+    %selected = arith.select(%is_less, %minimum, %half) : (i1, f32, f32) -> f32
+    %narrowed = arith.cast(%selected) {to = bf16} : (f32) -> bf16
+    %selected_bits = arith.bitcast(%selected) {to = si32} : (f32) -> si32
+    %combined = arith.add(%inverted, %selected_bits) : (si32, si32) -> si32
+    %index = tile.index() {expr = d0, dtype = ui64} : () -> ui64
+    %uniform = arith.rng_uniform(%key, %counter, %index) {dtype = f32} : (ui64, ui64, ui64) -> f32
+    %normal = arith.rng_normal(%key, %counter, %index) {dtype = bf16} : (ui64, ui64, ui64) -> bf16
+    tile.yield(%uniform, %combined, %is_less, %normal) : (f32, si32, i1, bf16) -> ()
   }) : (tensor<4xf32>, tensor<4xsi32>, tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>)
-  func.return(%3, %4, %5, %6) : (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) -> ()
+  func.return(%uniforms, %combined_bits, %less_flags, %normals) : (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) -> ()
 }
 
 // -----
 
 // Literals of every computation type: integers, i1, f32-computed floats and f64.
+// CHECK: func.func @literals() -> (tensor<si64>, tensor<i1>, tensor<bf16>, tensor<f64>) {
+// CHECK-NEXT: [[MIN:%[0-9]+]], [[TRUE:%[0-9]+]], [[NEG_INF:%[0-9]+]], [[TENTH:%[0-9]+]] = tile.block() {iters = [], reads = [], folds = [none -> [], none -> [], none -> [], none -> []]} ({
+// CHECK-NEXT: [[MIN_SCALAR:%[0-9]+]] = arith.constant() {value = -9223372036854775808 : si64} : () -> si64
+// CHECK-NEXT: [[TRUE_SCALAR:%[0-9]+]] = arith.constant() {value = 1 : i1} : () -> i1
+// CHECK-NEXT: [[NEG_INF_SCALAR:%[0-9]+]] = arith.constant() {value = -inf : bf16} : () -> bf16
+// CHECK-NEXT: [[TENTH_SCALAR:%[0-9]+]] = arith.constant() {value = 0.1 : f64} : () -> f64
+// CHECK-NEXT: tile.yield([[MIN_SCALAR]], [[TRUE_SCALAR]], [[NEG_INF_SCALAR]], [[TENTH_SCALAR]]) : (si64, i1, bf16, f64) -> ()
+// CHECK-NEXT: }) : () -> (tensor<si64>, tensor<i1>, tensor<bf16>, tensor<f64>)
+// CHECK-NEXT: func.return([[MIN]], [[TRUE]], [[NEG_INF]], [[TENTH]]) : (tensor<si64>, tensor<i1>, tensor<bf16>, tensor<f64>) -> ()
+// CHECK-NEXT: }
 func.func @literals() -> (tensor<si64>, tensor<i1>, tensor<bf16>, tensor<f64>) {
-  %0, %1, %2, %3 = tile.block() {iters = [], reads = [], folds = [none -> [], none -> [], none -> [], none -> []]} ({
-    %0 = arith.constant() {value = -9223372036854775808 : si64} : () -> si64
-    %1 = arith.constant() {value = 1 : i1} : () -> i1
-    %2 = arith.constant() {value = -inf : bf16} : () -> bf16
-    %3 = arith.constant() {value = 0.1 : f64} : () -> f64
-    tile.yield(%0, %1, %2, %3) : (si64, i1, bf16, f64) -> ()
+  %min, %true, %neg_inf, %tenth = tile.block() {iters = [], reads = [], folds = [none -> [], none -> [], none -> [], none -> []]} ({
+    %min_scalar = arith.constant() {value = -9223372036854775808 : si64} : () -> si64
+    %true_scalar = arith.constant() {value = 1 : i1} : () -> i1
+    %neg_inf_scalar = arith.constant() {value = -inf : bf16} : () -> bf16
+    %tenth_scalar = arith.constant() {value = 0.1 : f64} : () -> f64
+    tile.yield(%min_scalar, %true_scalar, %neg_inf_scalar, %tenth_scalar) : (si64, i1, bf16, f64) -> ()
   }) : () -> (tensor<si64>, tensor<i1>, tensor<bf16>, tensor<f64>)
-  func.return(%0, %1, %2, %3) : (tensor<si64>, tensor<i1>, tensor<bf16>, tensor<f64>) -> ()
+  func.return(%min, %true, %neg_inf, %tenth) : (tensor<si64>, tensor<i1>, tensor<bf16>, tensor<f64>) -> ()
 }
 
 // -----
 
 // Every arith comparison, joined into one flag.
-func.func @comparisons(%0: tensor<4xf32>, %1: tensor<4xf32>) -> tensor<4xi1> {
-  %2 = tile.block(%0, %1) {iters = [par 4], reads = [$0[d0], $1[d0]], folds = [none -> [d0]]} ({
-  ^body(%0: f32, %1: f32):
-    %2 = arith.less(%0, %1) : (f32, f32) -> i1
-    %3 = arith.less_equal(%0, %1) : (f32, f32) -> i1
-    %4 = arith.equal(%0, %1) : (f32, f32) -> i1
-    %5 = arith.greater_equal(%0, %1) : (f32, f32) -> i1
-    %6 = arith.greater(%0, %1) : (f32, f32) -> i1
-    %7 = arith.not_equal(%0, %1) : (f32, f32) -> i1
-    %8 = arith.and(%2, %3) : (i1, i1) -> i1
-    %9 = arith.or(%4, %5) : (i1, i1) -> i1
-    %10 = arith.xor(%6, %7) : (i1, i1) -> i1
-    %11 = arith.and(%8, %9) : (i1, i1) -> i1
-    %12 = arith.or(%11, %10) : (i1, i1) -> i1
-    tile.yield(%12) : (i1) -> ()
+// CHECK: func.func @comparisons([[LHS:%[0-9]+]]: tensor<4xf32>, [[RHS:%[0-9]+]]: tensor<4xf32>) -> tensor<4xi1> {
+// CHECK-NEXT: [[FLAGS:%[0-9]+]] = tile.block([[LHS]], [[RHS]]) {iters = [par 4], reads = [$0[d0], $1[d0]], folds = [none -> [d0]]} ({
+// CHECK-NEXT: ^body([[LEFT:%[0-9]+]]: f32, [[RIGHT:%[0-9]+]]: f32):
+// CHECK-NEXT: [[LESS:%[0-9]+]] = arith.less([[LEFT]], [[RIGHT]]) : (f32, f32) -> i1
+// CHECK-NEXT: [[LESS_EQUAL:%[0-9]+]] = arith.less_equal([[LEFT]], [[RIGHT]]) : (f32, f32) -> i1
+// CHECK-NEXT: [[EQUAL:%[0-9]+]] = arith.equal([[LEFT]], [[RIGHT]]) : (f32, f32) -> i1
+// CHECK-NEXT: [[GREATER_EQUAL:%[0-9]+]] = arith.greater_equal([[LEFT]], [[RIGHT]]) : (f32, f32) -> i1
+// CHECK-NEXT: [[GREATER:%[0-9]+]] = arith.greater([[LEFT]], [[RIGHT]]) : (f32, f32) -> i1
+// CHECK-NEXT: [[NOT_EQUAL:%[0-9]+]] = arith.not_equal([[LEFT]], [[RIGHT]]) : (f32, f32) -> i1
+// CHECK-NEXT: [[BOTH_LESS:%[0-9]+]] = arith.and([[LESS]], [[LESS_EQUAL]]) : (i1, i1) -> i1
+// CHECK-NEXT: [[EITHER_EQUAL:%[0-9]+]] = arith.or([[EQUAL]], [[GREATER_EQUAL]]) : (i1, i1) -> i1
+// CHECK-NEXT: [[GREATER_XOR_UNEQUAL:%[0-9]+]] = arith.xor([[GREATER]], [[NOT_EQUAL]]) : (i1, i1) -> i1
+// CHECK-NEXT: [[CONJUNCTION:%[0-9]+]] = arith.and([[BOTH_LESS]], [[EITHER_EQUAL]]) : (i1, i1) -> i1
+// CHECK-NEXT: [[JOINED:%[0-9]+]] = arith.or([[CONJUNCTION]], [[GREATER_XOR_UNEQUAL]]) : (i1, i1) -> i1
+// CHECK-NEXT: tile.yield([[JOINED]]) : (i1) -> ()
+// CHECK-NEXT: }) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+// CHECK-NEXT: func.return([[FLAGS]]) : (tensor<4xi1>) -> ()
+// CHECK-NEXT: }
+func.func @comparisons(%lhs: tensor<4xf32>, %rhs: tensor<4xf32>) -> tensor<4xi1> {
+  %flags = tile.block(%lhs, %rhs) {iters = [par 4], reads = [$0[d0], $1[d0]], folds = [none -> [d0]]} ({
+  ^body(%left: f32, %right: f32):
+    %less = arith.less(%left, %right) : (f32, f32) -> i1
+    %less_equal = arith.less_equal(%left, %right) : (f32, f32) -> i1
+    %equal = arith.equal(%left, %right) : (f32, f32) -> i1
+    %greater_equal = arith.greater_equal(%left, %right) : (f32, f32) -> i1
+    %greater = arith.greater(%left, %right) : (f32, f32) -> i1
+    %not_equal = arith.not_equal(%left, %right) : (f32, f32) -> i1
+    %both_less = arith.and(%less, %less_equal) : (i1, i1) -> i1
+    %either_equal = arith.or(%equal, %greater_equal) : (i1, i1) -> i1
+    %greater_xor_unequal = arith.xor(%greater, %not_equal) : (i1, i1) -> i1
+    %conjunction = arith.and(%both_less, %either_equal) : (i1, i1) -> i1
+    %joined = arith.or(%conjunction, %greater_xor_unequal) : (i1, i1) -> i1
+    tile.yield(%joined) : (i1) -> ()
   }) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
-  func.return(%2) : (tensor<4xi1>) -> ()
+  func.return(%flags) : (tensor<4xi1>) -> ()
 }

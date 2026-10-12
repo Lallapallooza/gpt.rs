@@ -1,92 +1,92 @@
 // RUN: pass canonicalize
 
 // Two transposes that compose to the identity disappear.
-// CHECK: func.func @inverse
+// CHECK: func.func @inverse([[INPUT:%[0-9]+]]: tensor<2x3xf32>) -> tensor<2x3xf32> {
 // CHECK-NOT: tensor.transpose
-// CHECK: func.return(%0)
-func.func @inverse(%0: tensor<2x3xf32>) -> tensor<2x3xf32> {
-  %1 = tensor.transpose(%0) {perm = [1, 0]} : (tensor<2x3xf32>) -> tensor<3x2xf32>
-  %2 = tensor.transpose(%1) {perm = [1, 0]} : (tensor<3x2xf32>) -> tensor<2x3xf32>
-  func.return(%2) : (tensor<2x3xf32>) -> ()
+// CHECK: func.return([[INPUT]])
+func.func @inverse(%input: tensor<2x3xf32>) -> tensor<2x3xf32> {
+  %transposed = tensor.transpose(%input) {perm = [1, 0]} : (tensor<2x3xf32>) -> tensor<3x2xf32>
+  %restored = tensor.transpose(%transposed) {perm = [1, 0]} : (tensor<3x2xf32>) -> tensor<2x3xf32>
+  func.return(%restored) : (tensor<2x3xf32>) -> ()
 }
 
 // -----
 
 // A chain becomes one transpose by the composed permutation q[i] = p1[p2[i]].
-// CHECK: func.func @chain
-// CHECK-NEXT: [[T:%[0-9]+]] = tensor.transpose(%0) {perm = [1, 2, 0]} : (tensor<2x3x4xf32>) -> tensor<3x4x2xf32>
-// CHECK-NEXT: func.return([[T]])
-func.func @chain(%0: tensor<2x3x4xf32>) -> tensor<3x4x2xf32> {
-  %1 = tensor.transpose(%0) {perm = [1, 0, 2]} : (tensor<2x3x4xf32>) -> tensor<3x2x4xf32>
-  %2 = tensor.transpose(%1) {perm = [0, 2, 1]} : (tensor<3x2x4xf32>) -> tensor<3x4x2xf32>
-  func.return(%2) : (tensor<3x4x2xf32>) -> ()
+// CHECK: func.func @chain([[INPUT:%[0-9]+]]: tensor<2x3x4xf32>) -> tensor<3x4x2xf32> {
+// CHECK-NEXT: [[ROTATED:%[0-9]+]] = tensor.transpose([[INPUT]]) {perm = [1, 2, 0]} : (tensor<2x3x4xf32>) -> tensor<3x4x2xf32>
+// CHECK-NEXT: func.return([[ROTATED]])
+func.func @chain(%input: tensor<2x3x4xf32>) -> tensor<3x4x2xf32> {
+  %swapped = tensor.transpose(%input) {perm = [1, 0, 2]} : (tensor<2x3x4xf32>) -> tensor<3x2x4xf32>
+  %rotated = tensor.transpose(%swapped) {perm = [0, 2, 1]} : (tensor<3x2x4xf32>) -> tensor<3x4x2xf32>
+  func.return(%rotated) : (tensor<3x4x2xf32>) -> ()
 }
 
 // -----
 
 // A chain collapses even when the inner transpose has another use, which keeps it.
-// CHECK: func.func @shared
-// CHECK: [[A:%[0-9]+]] = tensor.transpose(%0) {perm = [1, 0]}
-// CHECK: func.return(%0, [[A]])
-func.func @shared(%0: tensor<2x3xf32>) -> (tensor<2x3xf32>, tensor<3x2xf32>) {
-  %1 = tensor.transpose(%0) {perm = [1, 0]} : (tensor<2x3xf32>) -> tensor<3x2xf32>
-  %2 = tensor.transpose(%1) {perm = [1, 0]} : (tensor<3x2xf32>) -> tensor<2x3xf32>
-  func.return(%2, %1) : (tensor<2x3xf32>, tensor<3x2xf32>) -> ()
+// CHECK: func.func @shared([[INPUT:%[0-9]+]]: tensor<2x3xf32>) -> (tensor<2x3xf32>, tensor<3x2xf32>) {
+// CHECK: [[TRANSPOSED:%[0-9]+]] = tensor.transpose([[INPUT]]) {perm = [1, 0]}
+// CHECK: func.return([[INPUT]], [[TRANSPOSED]])
+func.func @shared(%input: tensor<2x3xf32>) -> (tensor<2x3xf32>, tensor<3x2xf32>) {
+  %transposed = tensor.transpose(%input) {perm = [1, 0]} : (tensor<2x3xf32>) -> tensor<3x2xf32>
+  %restored = tensor.transpose(%transposed) {perm = [1, 0]} : (tensor<3x2xf32>) -> tensor<2x3xf32>
+  func.return(%restored, %transposed) : (tensor<2x3xf32>, tensor<3x2xf32>) -> ()
 }
 
 // -----
 
 // On a cube both composition orders type-check, so only the values tell them apart.
-// CHECK: func.func @cube
-// CHECK-NEXT: tensor.transpose(%0)
+// CHECK: func.func @cube([[INPUT:%[0-9]+]]: tensor<3x3x3xf32>) -> tensor<3x3x3xf32> {
+// CHECK-NEXT: tensor.transpose([[INPUT]])
 // CHECK-NEXT: func.return
-func.func @cube(%0: tensor<3x3x3xf32>) -> tensor<3x3x3xf32> {
-  %1 = tensor.transpose(%0) {perm = [1, 0, 2]} : (tensor<3x3x3xf32>) -> tensor<3x3x3xf32>
-  %2 = tensor.transpose(%1) {perm = [0, 2, 1]} : (tensor<3x3x3xf32>) -> tensor<3x3x3xf32>
-  func.return(%2) : (tensor<3x3x3xf32>) -> ()
+func.func @cube(%input: tensor<3x3x3xf32>) -> tensor<3x3x3xf32> {
+  %swapped = tensor.transpose(%input) {perm = [1, 0, 2]} : (tensor<3x3x3xf32>) -> tensor<3x3x3xf32>
+  %rotated = tensor.transpose(%swapped) {perm = [0, 2, 1]} : (tensor<3x3x3xf32>) -> tensor<3x3x3xf32>
+  func.return(%rotated) : (tensor<3x3x3xf32>) -> ()
 }
 
 // -----
 
 // A transpose that moves only axes of extent 1 is a reshape.
-// CHECK: func.func @unit_axes
+// CHECK: func.func @unit_axes([[INPUT:%[0-9]+]]: tensor<1x16x128xf32>) -> tensor<16x1x128xf32> {
 // CHECK-NOT: tensor.transpose
-// CHECK: tensor.reshape(%0) {shape = [16, 1, 128]}
-func.func @unit_axes(%0: tensor<1x16x128xf32>) -> tensor<16x1x128xf32> {
-  %1 = tensor.transpose(%0) {perm = [1, 0, 2]} : (tensor<1x16x128xf32>) -> tensor<16x1x128xf32>
-  func.return(%1) : (tensor<16x1x128xf32>) -> ()
+// CHECK: tensor.reshape([[INPUT]]) {shape = [16, 1, 128]}
+func.func @unit_axes(%input: tensor<1x16x128xf32>) -> tensor<16x1x128xf32> {
+  %transposed = tensor.transpose(%input) {perm = [1, 0, 2]} : (tensor<1x16x128xf32>) -> tensor<16x1x128xf32>
+  func.return(%transposed) : (tensor<16x1x128xf32>) -> ()
 }
 
 // -----
 
 // A transpose that reorders axes of more than one element stays, unit axes or not.
-// CHECK: func.func @unit_axes_reordered
-// CHECK: tensor.transpose(%0) {perm = [2, 0, 1]}
-func.func @unit_axes_reordered(%0: tensor<1x3x4xf32>) -> tensor<4x1x3xf32> {
-  %1 = tensor.transpose(%0) {perm = [2, 0, 1]} : (tensor<1x3x4xf32>) -> tensor<4x1x3xf32>
-  func.return(%1) : (tensor<4x1x3xf32>) -> ()
+// CHECK: func.func @unit_axes_reordered([[INPUT:%[0-9]+]]: tensor<1x3x4xf32>) -> tensor<4x1x3xf32> {
+// CHECK: tensor.transpose([[INPUT]]) {perm = [2, 0, 1]}
+func.func @unit_axes_reordered(%input: tensor<1x3x4xf32>) -> tensor<4x1x3xf32> {
+  %transposed = tensor.transpose(%input) {perm = [2, 0, 1]} : (tensor<1x3x4xf32>) -> tensor<4x1x3xf32>
+  func.return(%transposed) : (tensor<4x1x3xf32>) -> ()
 }
 
 // -----
 
 // A transpose that keeps the order of the free axes folds into the dot, which reads its input.
-// CHECK: func.func @into_dot
+// CHECK: func.func @into_dot([[LHS:%[0-9]+]]: tensor<2x5x3xf32>, [[RHS:%[0-9]+]]: tensor<2x5x4xf32>) -> tensor<2x3x4xf32> {
 // CHECK-NOT: tensor.transpose
-// CHECK: tensor.dot_general(%0, %1) {batch_lhs = [0], batch_rhs = [0], contract_lhs = [1], contract_rhs = [1]}
-func.func @into_dot(%0: tensor<2x5x3xf32>, %1: tensor<2x5x4xf32>) -> tensor<2x3x4xf32> {
-  %2 = tensor.transpose(%0) {perm = [0, 2, 1]} : (tensor<2x5x3xf32>) -> tensor<2x3x5xf32>
-  %3 = tensor.dot_general(%2, %1) {batch_lhs = [0], batch_rhs = [0], contract_lhs = [2], contract_rhs = [1]} : (tensor<2x3x5xf32>, tensor<2x5x4xf32>) -> tensor<2x3x4xf32>
-  func.return(%3) : (tensor<2x3x4xf32>) -> ()
+// CHECK: tensor.dot_general([[LHS]], [[RHS]]) {batch_lhs = [0], batch_rhs = [0], contract_lhs = [1], contract_rhs = [1]}
+func.func @into_dot(%lhs: tensor<2x5x3xf32>, %rhs: tensor<2x5x4xf32>) -> tensor<2x3x4xf32> {
+  %lhs_transposed = tensor.transpose(%lhs) {perm = [0, 2, 1]} : (tensor<2x5x3xf32>) -> tensor<2x3x5xf32>
+  %product = tensor.dot_general(%lhs_transposed, %rhs) {batch_lhs = [0], batch_rhs = [0], contract_lhs = [2], contract_rhs = [1]} : (tensor<2x3x5xf32>, tensor<2x5x4xf32>) -> tensor<2x3x4xf32>
+  func.return(%product) : (tensor<2x3x4xf32>) -> ()
 }
 
 // -----
 
 // A transpose that reorders the free axes stays: the result's axes follow them.
-// CHECK: func.func @into_dot_reordered
-// CHECK: [[T:%[0-9]+]] = tensor.transpose(%0) {perm = [1, 0, 2]}
-// CHECK: tensor.dot_general([[T]], %1)
-func.func @into_dot_reordered(%0: tensor<3x4x5xf32>, %1: tensor<5x2xf32>) -> tensor<4x3x2xf32> {
-  %2 = tensor.transpose(%0) {perm = [1, 0, 2]} : (tensor<3x4x5xf32>) -> tensor<4x3x5xf32>
-  %3 = tensor.dot_general(%2, %1) {contract_lhs = [2], contract_rhs = [0]} : (tensor<4x3x5xf32>, tensor<5x2xf32>) -> tensor<4x3x2xf32>
-  func.return(%3) : (tensor<4x3x2xf32>) -> ()
+// CHECK: func.func @into_dot_reordered([[LHS:%[0-9]+]]: tensor<3x4x5xf32>, [[RHS:%[0-9]+]]: tensor<5x2xf32>) -> tensor<4x3x2xf32> {
+// CHECK: [[LHS_TRANSPOSED:%[0-9]+]] = tensor.transpose([[LHS]]) {perm = [1, 0, 2]}
+// CHECK: tensor.dot_general([[LHS_TRANSPOSED]], [[RHS]])
+func.func @into_dot_reordered(%lhs: tensor<3x4x5xf32>, %rhs: tensor<5x2xf32>) -> tensor<4x3x2xf32> {
+  %lhs_transposed = tensor.transpose(%lhs) {perm = [1, 0, 2]} : (tensor<3x4x5xf32>) -> tensor<4x3x5xf32>
+  %product = tensor.dot_general(%lhs_transposed, %rhs) {contract_lhs = [2], contract_rhs = [0]} : (tensor<4x3x5xf32>, tensor<5x2xf32>) -> tensor<4x3x2xf32>
+  func.return(%product) : (tensor<4x3x2xf32>) -> ()
 }

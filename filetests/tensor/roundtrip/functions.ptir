@@ -1,14 +1,21 @@
 // RUN: roundtrip
 
 // A load-time function binds its results to the parameters they compute.
-func.func @static(%0: tensor<4xf32> {param = 1}, %1: tensor<4xf32> {param = 2}) -> (tensor<4xf32> {param = 170141183460469231731687303715884105728}, tensor<4xf32> {param = 9}) {
-  %2 = tensor.add(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%2, %0) : (tensor<4xf32>, tensor<4xf32>) -> ()
+// CHECK: func.func @static([[WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1}, [[OFFSET:%[0-9]+]]: tensor<4xf32> {param = 2}) -> (tensor<4xf32> {param = 170141183460469231731687303715884105728}, tensor<4xf32> {param = 9}) {
+// CHECK-NEXT: [[SHIFTED:%[0-9]+]] = tensor.add([[WEIGHT]], [[OFFSET]]) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: func.return([[SHIFTED]], [[WEIGHT]]) : (tensor<4xf32>, tensor<4xf32>) -> ()
+// CHECK-NEXT: }
+func.func @static(%weight: tensor<4xf32> {param = 1}, %offset: tensor<4xf32> {param = 2}) -> (tensor<4xf32> {param = 170141183460469231731687303715884105728}, tensor<4xf32> {param = 9}) {
+  %shifted = tensor.add(%weight, %offset) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%shifted, %weight) : (tensor<4xf32>, tensor<4xf32>) -> ()
 }
 
 // -----
 
 // A function can return nothing and take index and scalar arguments.
-func.func @no_results(%0: tensor<4xf32>, %1: index, %2: f32) -> () {
+// CHECK: func.func @no_results([[INPUT:%[0-9]+]]: tensor<4xf32>, [[POSITION:%[0-9]+]]: index, [[SCALE:%[0-9]+]]: f32) -> () {
+// CHECK-NEXT: func.return() : () -> ()
+// CHECK-NEXT: }
+func.func @no_results(%input: tensor<4xf32>, %position: index, %scale: f32) -> () {
   func.return() : () -> ()
 }

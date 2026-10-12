@@ -1,8 +1,14 @@
 // RUN: roundtrip
 
-func.func @located(%0: tensor<4xf32>) -> tensor<4xf32> {
-  %1 = tensor.exp(%0) : (tensor<4xf32>) -> tensor<4xf32> loc("model.layers.3.mlp"("crates/gpt-rs/src/nn/layers/mlp.rs":42:9))
-  %2 = tensor.neg(%1) : (tensor<4xf32>) -> tensor<4xf32> loc("model.layers.3.mlp")
-  %3 = tensor.abs(%2) : (tensor<4xf32>) -> tensor<4xf32> loc("crates/gpt-rs/src/nn/layers/mlp.rs":43:9)
-  func.return(%3) : (tensor<4xf32>) -> ()
+// CHECK: func.func @located([[INPUT:%[0-9]+]]: tensor<4xf32>) -> tensor<4xf32> {
+// CHECK-NEXT: [[EXP:%[0-9]+]] = tensor.exp([[INPUT]]) : (tensor<4xf32>) -> tensor<4xf32> loc("model.layers.3.mlp"("crates/gpt-rs/src/nn/layers/mlp.rs":42:9))
+// CHECK-NEXT: [[NEGATED:%[0-9]+]] = tensor.neg([[EXP]]) : (tensor<4xf32>) -> tensor<4xf32> loc("model.layers.3.mlp")
+// CHECK-NEXT: [[MAGNITUDE:%[0-9]+]] = tensor.abs([[NEGATED]]) : (tensor<4xf32>) -> tensor<4xf32> loc("crates/gpt-rs/src/nn/layers/mlp.rs":43:9)
+// CHECK-NEXT: func.return([[MAGNITUDE]]) : (tensor<4xf32>) -> ()
+// CHECK-NEXT: }
+func.func @located(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %exp = tensor.exp(%input) : (tensor<4xf32>) -> tensor<4xf32> loc("model.layers.3.mlp"("crates/gpt-rs/src/nn/layers/mlp.rs":42:9))
+  %negated = tensor.neg(%exp) : (tensor<4xf32>) -> tensor<4xf32> loc("model.layers.3.mlp")
+  %magnitude = tensor.abs(%negated) : (tensor<4xf32>) -> tensor<4xf32> loc("crates/gpt-rs/src/nn/layers/mlp.rs":43:9)
+  func.return(%magnitude) : (tensor<4xf32>) -> ()
 }

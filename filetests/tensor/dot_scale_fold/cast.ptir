@@ -3,12 +3,14 @@
 // A weight cast from a narrower dtype stays unscaled when ops that only move elements come
 // between the cast and the dot: scaling it would store a widened copy.
 // CHECK: func.func @transposed_cast
-// CHECK: tensor.mul(%5, %6)
-func.func @transposed_cast(%0: tensor<2x3xf32>, %1: tensor<4x3xbf16> {param = 1}, %2: tensor<4xf32> {param = 2}) -> tensor<2x4xf32> {
-  %3 = tensor.cast(%1) {to = f32} : (tensor<4x3xbf16>) -> tensor<4x3xf32>
-  %4 = tensor.transpose(%3) {perm = [1, 0]} : (tensor<4x3xf32>) -> tensor<3x4xf32>
-  %5 = tensor.dot_general(%0, %4) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
-  %6 = tensor.broadcast_to(%2) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
-  %7 = tensor.mul(%5, %6) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
-  func.return(%7) : (tensor<2x4xf32>) -> ()
+// CHECK: [[PRODUCT:%[0-9]+]] = tensor.dot_general
+// CHECK: [[SCALES:%[0-9]+]] = tensor.broadcast_to
+// CHECK: tensor.mul([[PRODUCT]], [[SCALES]])
+func.func @transposed_cast(%input: tensor<2x3xf32>, %weight: tensor<4x3xbf16> {param = 1}, %scale: tensor<4xf32> {param = 2}) -> tensor<2x4xf32> {
+  %widened = tensor.cast(%weight) {to = f32} : (tensor<4x3xbf16>) -> tensor<4x3xf32>
+  %transposed = tensor.transpose(%widened) {perm = [1, 0]} : (tensor<4x3xf32>) -> tensor<3x4xf32>
+  %product = tensor.dot_general(%input, %transposed) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
+  %scales = tensor.broadcast_to(%scale) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
+  %scaled = tensor.mul(%product, %scales) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+  func.return(%scaled) : (tensor<2x4xf32>) -> ()
 }

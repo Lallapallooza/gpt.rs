@@ -1,17 +1,17 @@
 // RUN: pass fold,dce
 
 // Data movement that keeps the type is the input.
-// CHECK: func.func @same_type
+// CHECK: func.func @same_type([[INPUT:%[0-9]+]]: tensor<2x3xf32>)
 // CHECK-NOT: tensor.
-// CHECK: func.return(%0, %0, %0, %0, %0, %0)
-func.func @same_type(%0: tensor<2x3xf32>) -> (tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>) {
-  %1 = tensor.reshape(%0) {shape = [2, 3]} : (tensor<2x3xf32>) -> tensor<2x3xf32>
-  %2 = tensor.transpose(%0) {perm = [0, 1]} : (tensor<2x3xf32>) -> tensor<2x3xf32>
-  %3 = tensor.broadcast_to(%0) {shape = [2, 3]} : (tensor<2x3xf32>) -> tensor<2x3xf32>
-  %4 = tensor.slice(%0) {starts = [0, 0], sizes = [2, 3]} : (tensor<2x3xf32>) -> tensor<2x3xf32>
-  %5 = tensor.concat(%0) {axis = 0} : (tensor<2x3xf32>) -> tensor<2x3xf32>
-  %6 = tensor.bitcast(%0) {to = f32} : (tensor<2x3xf32>) -> tensor<2x3xf32>
-  func.return(%1, %2, %3, %4, %5, %6) : (tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>) -> ()
+// CHECK: func.return([[INPUT]], [[INPUT]], [[INPUT]], [[INPUT]], [[INPUT]], [[INPUT]])
+func.func @same_type(%input: tensor<2x3xf32>) -> (tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>) {
+  %reshaped = tensor.reshape(%input) {shape = [2, 3]} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+  %transposed = tensor.transpose(%input) {perm = [0, 1]} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+  %broadcast = tensor.broadcast_to(%input) {shape = [2, 3]} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+  %sliced = tensor.slice(%input) {starts = [0, 0], sizes = [2, 3]} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+  %concatenated = tensor.concat(%input) {axis = 0} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+  %bitcast = tensor.bitcast(%input) {to = f32} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+  func.return(%reshaped, %transposed, %broadcast, %sliced, %concatenated, %bitcast) : (tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>) -> ()
 }
 
 // -----
@@ -21,19 +21,19 @@ func.func @same_type(%0: tensor<2x3xf32>) -> (tensor<2x3xf32>, tensor<2x3xf32>, 
 // constants go first.
 // CHECK: func.func @constants
 // CHECK: tensor.constant() {value = dense<[3, 2] x f32: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]>}
-// CHECK: [[S:%[0-9]+]] = tensor.constant() {value = dense<[3] x f32: 0.5>}
+// CHECK: [[SPLAT:%[0-9]+]] = tensor.constant() {value = dense<[3] x f32: 0.5>}
 // CHECK: tensor.constant() {value = dense<[3, 4] x f32: 0.5>}
 // CHECK: tensor.constant() {value = dense<[2, 2] x f32: 0.5>}
-// CHECK: tensor.broadcast_to([[S]]) {shape = [4, 3]}
+// CHECK: tensor.broadcast_to([[SPLAT]]) {shape = [4, 3]}
 func.func @constants() -> (tensor<3x2xf32>, tensor<4x3xf32>, tensor<3x4xf32>, tensor<2x2xf32>) {
-  %0 = tensor.constant() {value = dense<[2, 3] x f32: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]>} : () -> tensor<2x3xf32>
-  %1 = tensor.reshape(%0) {shape = [3, 2]} : (tensor<2x3xf32>) -> tensor<3x2xf32>
-  %2 = tensor.constant() {value = dense<[3] x f32: 0.5>} : () -> tensor<3xf32>
-  %3 = tensor.broadcast_to(%2) {shape = [4, 3]} : (tensor<3xf32>) -> tensor<4x3xf32>
-  %4 = tensor.constant() {value = dense<[4, 3] x f32: 0.5>} : () -> tensor<4x3xf32>
-  %5 = tensor.transpose(%4) {perm = [1, 0]} : (tensor<4x3xf32>) -> tensor<3x4xf32>
-  %6 = tensor.slice(%4) {starts = [1, 0], sizes = [2, 2]} : (tensor<4x3xf32>) -> tensor<2x2xf32>
-  func.return(%1, %3, %5, %6) : (tensor<3x2xf32>, tensor<4x3xf32>, tensor<3x4xf32>, tensor<2x2xf32>) -> ()
+  %matrix = tensor.constant() {value = dense<[2, 3] x f32: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]>} : () -> tensor<2x3xf32>
+  %reshaped = tensor.reshape(%matrix) {shape = [3, 2]} : (tensor<2x3xf32>) -> tensor<3x2xf32>
+  %splat = tensor.constant() {value = dense<[3] x f32: 0.5>} : () -> tensor<3xf32>
+  %broadcast = tensor.broadcast_to(%splat) {shape = [4, 3]} : (tensor<3xf32>) -> tensor<4x3xf32>
+  %splat_matrix = tensor.constant() {value = dense<[4, 3] x f32: 0.5>} : () -> tensor<4x3xf32>
+  %transposed = tensor.transpose(%splat_matrix) {perm = [1, 0]} : (tensor<4x3xf32>) -> tensor<3x4xf32>
+  %sliced = tensor.slice(%splat_matrix) {starts = [1, 0], sizes = [2, 2]} : (tensor<4x3xf32>) -> tensor<2x2xf32>
+  func.return(%reshaped, %broadcast, %transposed, %sliced) : (tensor<3x2xf32>, tensor<4x3xf32>, tensor<3x4xf32>, tensor<2x2xf32>) -> ()
 }
 
 // -----
@@ -42,11 +42,11 @@ func.func @constants() -> (tensor<3x2xf32>, tensor<4x3xf32>, tensor<3x4xf32>, te
 // CHECK: func.func @moved_splats
 // CHECK: tensor.constant() {value = dense<[4, 3] x f32: 0.5>}
 // CHECK: tensor.constant() {value = dense<[1, 3] x f32: 0.5>}
-func.func @moved_splats(%0: tensor<2xsi32>) -> (tensor<4x3xf32>, tensor<1x3xf32>) {
-  %1 = tensor.constant() {value = dense<[2, 3] x f32: 0.5>} : () -> tensor<2x3xf32>
-  %2 = tensor.concat(%1, %1) {axis = 0} : (tensor<2x3xf32>, tensor<2x3xf32>) -> tensor<4x3xf32>
-  %3 = tensor.dynamic_slice(%1, %0) {sizes = [1, 3]} : (tensor<2x3xf32>, tensor<2xsi32>) -> tensor<1x3xf32>
-  func.return(%2, %3) : (tensor<4x3xf32>, tensor<1x3xf32>) -> ()
+func.func @moved_splats(%starts: tensor<2xsi32>) -> (tensor<4x3xf32>, tensor<1x3xf32>) {
+  %splat = tensor.constant() {value = dense<[2, 3] x f32: 0.5>} : () -> tensor<2x3xf32>
+  %concatenated = tensor.concat(%splat, %splat) {axis = 0} : (tensor<2x3xf32>, tensor<2x3xf32>) -> tensor<4x3xf32>
+  %sliced = tensor.dynamic_slice(%splat, %starts) {sizes = [1, 3]} : (tensor<2x3xf32>, tensor<2xsi32>) -> tensor<1x3xf32>
+  func.return(%concatenated, %sliced) : (tensor<4x3xf32>, tensor<1x3xf32>) -> ()
 }
 
 // -----
@@ -55,8 +55,8 @@ func.func @moved_splats(%0: tensor<2xsi32>) -> (tensor<4x3xf32>, tensor<1x3xf32>
 // CHECK: func.func @mixed_splats
 // CHECK: tensor.concat
 func.func @mixed_splats() -> tensor<4xf32> {
-  %0 = tensor.constant() {value = dense<[2] x f32: 0.5>} : () -> tensor<2xf32>
-  %1 = tensor.constant() {value = dense<[2] x f32: 1.5>} : () -> tensor<2xf32>
-  %2 = tensor.concat(%0, %1) {axis = 0} : (tensor<2xf32>, tensor<2xf32>) -> tensor<4xf32>
-  func.return(%2) : (tensor<4xf32>) -> ()
+  %halves = tensor.constant() {value = dense<[2] x f32: 0.5>} : () -> tensor<2xf32>
+  %three_halves = tensor.constant() {value = dense<[2] x f32: 1.5>} : () -> tensor<2xf32>
+  %concatenated = tensor.concat(%halves, %three_halves) {axis = 0} : (tensor<2xf32>, tensor<2xf32>) -> tensor<4xf32>
+  func.return(%concatenated) : (tensor<4xf32>) -> ()
 }

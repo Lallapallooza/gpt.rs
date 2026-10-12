@@ -1,57 +1,94 @@
 // RUN: roundtrip
 
+// CHECK: func.func @iota() -> (tensor<2x3xsi32>, tensor<{T}xf32>) {
+// CHECK-NEXT: [[COLUMN_IDS:%[0-9]+]] = tensor.iota() {shape = [2, 3], dtype = si32, axis = 1} : () -> tensor<2x3xsi32>
+// CHECK-NEXT: [[POSITIONS:%[0-9]+]] = tensor.iota() {shape = [{T}], dtype = f32, axis = 0} : () -> tensor<{T}xf32>
+// CHECK-NEXT: func.return([[COLUMN_IDS]], [[POSITIONS]]) : (tensor<2x3xsi32>, tensor<{T}xf32>) -> ()
+// CHECK-NEXT: }
 func.func @iota() -> (tensor<2x3xsi32>, tensor<{T}xf32>) {
-  %0 = tensor.iota() {shape = [2, 3], dtype = si32, axis = 1} : () -> tensor<2x3xsi32>
-  %1 = tensor.iota() {shape = [{T}], dtype = f32, axis = 0} : () -> tensor<{T}xf32>
-  func.return(%0, %1) : (tensor<2x3xsi32>, tensor<{T}xf32>) -> ()
+  %column_ids = tensor.iota() {shape = [2, 3], dtype = si32, axis = 1} : () -> tensor<2x3xsi32>
+  %positions = tensor.iota() {shape = [{T}], dtype = f32, axis = 0} : () -> tensor<{T}xf32>
+  func.return(%column_ids, %positions) : (tensor<2x3xsi32>, tensor<{T}xf32>) -> ()
 }
 
 // -----
 
-func.func @take(%0: tensor<50x8xf32> {param = 3}, %1: tensor<2x3xsi32>, %2: tensor<50x8xbf16>, %3: tensor<{B}xsi32>) -> (tensor<2x3x8xf32>, tensor<{B}x8xbf16>) {
-  %4 = tensor.take(%0, %1) : (tensor<50x8xf32>, tensor<2x3xsi32>) -> tensor<2x3x8xf32>
-  %5 = tensor.take(%2, %3) : (tensor<50x8xbf16>, tensor<{B}xsi32>) -> tensor<{B}x8xbf16>
-  func.return(%4, %5) : (tensor<2x3x8xf32>, tensor<{B}x8xbf16>) -> ()
+// CHECK: func.func @take([[EMBEDDING:%[0-9]+]]: tensor<50x8xf32> {param = 3}, [[TOKEN_IDS:%[0-9]+]]: tensor<2x3xsi32>, [[BF16_EMBEDDING:%[0-9]+]]: tensor<50x8xbf16>, [[BATCH_IDS:%[0-9]+]]: tensor<{B}xsi32>) -> (tensor<2x3x8xf32>, tensor<{B}x8xbf16>) {
+// CHECK-NEXT: [[TOKEN_ROWS:%[0-9]+]] = tensor.take([[EMBEDDING]], [[TOKEN_IDS]]) : (tensor<50x8xf32>, tensor<2x3xsi32>) -> tensor<2x3x8xf32>
+// CHECK-NEXT: [[BATCH_ROWS:%[0-9]+]] = tensor.take([[BF16_EMBEDDING]], [[BATCH_IDS]]) : (tensor<50x8xbf16>, tensor<{B}xsi32>) -> tensor<{B}x8xbf16>
+// CHECK-NEXT: func.return([[TOKEN_ROWS]], [[BATCH_ROWS]]) : (tensor<2x3x8xf32>, tensor<{B}x8xbf16>) -> ()
+// CHECK-NEXT: }
+func.func @take(%embedding: tensor<50x8xf32> {param = 3}, %token_ids: tensor<2x3xsi32>, %bf16_embedding: tensor<50x8xbf16>, %batch_ids: tensor<{B}xsi32>) -> (tensor<2x3x8xf32>, tensor<{B}x8xbf16>) {
+  %token_rows = tensor.take(%embedding, %token_ids) : (tensor<50x8xf32>, tensor<2x3xsi32>) -> tensor<2x3x8xf32>
+  %batch_rows = tensor.take(%bf16_embedding, %batch_ids) : (tensor<50x8xbf16>, tensor<{B}xsi32>) -> tensor<{B}x8xbf16>
+  func.return(%token_rows, %batch_rows) : (tensor<2x3x8xf32>, tensor<{B}x8xbf16>) -> ()
 }
 
 // -----
 
-func.func @dynamic_slice(%0: tensor<4x8xf32>, %1: tensor<{S}x8xsi32>, %2: tensor<2xsi32>) -> (tensor<1x8xf32>, tensor<2x8xsi32>) {
-  %3 = tensor.dynamic_slice(%0, %2) {sizes = [1, 8]} : (tensor<4x8xf32>, tensor<2xsi32>) -> tensor<1x8xf32>
-  %4 = tensor.dynamic_slice(%1, %2) {sizes = [2, 8]} : (tensor<{S}x8xsi32>, tensor<2xsi32>) -> tensor<2x8xsi32>
-  func.return(%3, %4) : (tensor<1x8xf32>, tensor<2x8xsi32>) -> ()
+// CHECK: func.func @dynamic_slice([[INPUT:%[0-9]+]]: tensor<4x8xf32>, [[DYNAMIC_INPUT:%[0-9]+]]: tensor<{S}x8xsi32>, [[STARTS:%[0-9]+]]: tensor<2xsi32>) -> (tensor<1x8xf32>, tensor<2x8xsi32>) {
+// CHECK-NEXT: [[ROW:%[0-9]+]] = tensor.dynamic_slice([[INPUT]], [[STARTS]]) {sizes = [1, 8]} : (tensor<4x8xf32>, tensor<2xsi32>) -> tensor<1x8xf32>
+// CHECK-NEXT: [[DYNAMIC_ROWS:%[0-9]+]] = tensor.dynamic_slice([[DYNAMIC_INPUT]], [[STARTS]]) {sizes = [2, 8]} : (tensor<{S}x8xsi32>, tensor<2xsi32>) -> tensor<2x8xsi32>
+// CHECK-NEXT: func.return([[ROW]], [[DYNAMIC_ROWS]]) : (tensor<1x8xf32>, tensor<2x8xsi32>) -> ()
+// CHECK-NEXT: }
+func.func @dynamic_slice(%input: tensor<4x8xf32>, %dynamic_input: tensor<{S}x8xsi32>, %starts: tensor<2xsi32>) -> (tensor<1x8xf32>, tensor<2x8xsi32>) {
+  %row = tensor.dynamic_slice(%input, %starts) {sizes = [1, 8]} : (tensor<4x8xf32>, tensor<2xsi32>) -> tensor<1x8xf32>
+  %dynamic_rows = tensor.dynamic_slice(%dynamic_input, %starts) {sizes = [2, 8]} : (tensor<{S}x8xsi32>, tensor<2xsi32>) -> tensor<2x8xsi32>
+  func.return(%row, %dynamic_rows) : (tensor<1x8xf32>, tensor<2x8xsi32>) -> ()
 }
 
 // -----
 
-func.func @dynamic_update_slice(%0: tensor<2x16x4xf32>, %1: tensor<2x1x4xf32>, %2: tensor<3xsi32>, %3: tensor<2x{S}x4xf32>) -> (tensor<2x16x4xf32>, tensor<2x{S}x4xf32>) {
-  %4 = tensor.dynamic_update_slice(%0, %1, %2) : (tensor<2x16x4xf32>, tensor<2x1x4xf32>, tensor<3xsi32>) -> tensor<2x16x4xf32>
-  %5 = tensor.dynamic_update_slice(%3, %1, %2) : (tensor<2x{S}x4xf32>, tensor<2x1x4xf32>, tensor<3xsi32>) -> tensor<2x{S}x4xf32>
-  func.return(%4, %5) : (tensor<2x16x4xf32>, tensor<2x{S}x4xf32>) -> ()
+// CHECK: func.func @dynamic_update_slice([[CACHE:%[0-9]+]]: tensor<2x16x4xf32>, [[UPDATE:%[0-9]+]]: tensor<2x1x4xf32>, [[STARTS:%[0-9]+]]: tensor<3xsi32>, [[DYNAMIC_CACHE:%[0-9]+]]: tensor<2x{S}x4xf32>) -> (tensor<2x16x4xf32>, tensor<2x{S}x4xf32>) {
+// CHECK-NEXT: [[UPDATED_CACHE:%[0-9]+]] = tensor.dynamic_update_slice([[CACHE]], [[UPDATE]], [[STARTS]]) : (tensor<2x16x4xf32>, tensor<2x1x4xf32>, tensor<3xsi32>) -> tensor<2x16x4xf32>
+// CHECK-NEXT: [[UPDATED_DYNAMIC_CACHE:%[0-9]+]] = tensor.dynamic_update_slice([[DYNAMIC_CACHE]], [[UPDATE]], [[STARTS]]) : (tensor<2x{S}x4xf32>, tensor<2x1x4xf32>, tensor<3xsi32>) -> tensor<2x{S}x4xf32>
+// CHECK-NEXT: func.return([[UPDATED_CACHE]], [[UPDATED_DYNAMIC_CACHE]]) : (tensor<2x16x4xf32>, tensor<2x{S}x4xf32>) -> ()
+// CHECK-NEXT: }
+func.func @dynamic_update_slice(%cache: tensor<2x16x4xf32>, %update: tensor<2x1x4xf32>, %starts: tensor<3xsi32>, %dynamic_cache: tensor<2x{S}x4xf32>) -> (tensor<2x16x4xf32>, tensor<2x{S}x4xf32>) {
+  %updated_cache = tensor.dynamic_update_slice(%cache, %update, %starts) : (tensor<2x16x4xf32>, tensor<2x1x4xf32>, tensor<3xsi32>) -> tensor<2x16x4xf32>
+  %updated_dynamic_cache = tensor.dynamic_update_slice(%dynamic_cache, %update, %starts) : (tensor<2x{S}x4xf32>, tensor<2x1x4xf32>, tensor<3xsi32>) -> tensor<2x{S}x4xf32>
+  func.return(%updated_cache, %updated_dynamic_cache) : (tensor<2x16x4xf32>, tensor<2x{S}x4xf32>) -> ()
 }
 
 // -----
 
-func.func @gather(%0: tensor<3x4xf32>, %1: tensor<3x2xsi32>, %2: tensor<5x4xsi32>) -> (tensor<3x2xf32>, tensor<5x4xf32>) {
-  %3 = tensor.gather(%0, %1) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>) -> tensor<3x2xf32>
-  %4 = tensor.gather(%0, %2) {axis = 0} : (tensor<3x4xf32>, tensor<5x4xsi32>) -> tensor<5x4xf32>
-  func.return(%3, %4) : (tensor<3x2xf32>, tensor<5x4xf32>) -> ()
+// CHECK: func.func @gather([[INPUT:%[0-9]+]]: tensor<3x4xf32>, [[COLUMN_INDICES:%[0-9]+]]: tensor<3x2xsi32>, [[ROW_INDICES:%[0-9]+]]: tensor<5x4xsi32>) -> (tensor<3x2xf32>, tensor<5x4xf32>) {
+// CHECK-NEXT: [[GATHERED_COLUMNS:%[0-9]+]] = tensor.gather([[INPUT]], [[COLUMN_INDICES]]) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>) -> tensor<3x2xf32>
+// CHECK-NEXT: [[GATHERED_ROWS:%[0-9]+]] = tensor.gather([[INPUT]], [[ROW_INDICES]]) {axis = 0} : (tensor<3x4xf32>, tensor<5x4xsi32>) -> tensor<5x4xf32>
+// CHECK-NEXT: func.return([[GATHERED_COLUMNS]], [[GATHERED_ROWS]]) : (tensor<3x2xf32>, tensor<5x4xf32>) -> ()
+// CHECK-NEXT: }
+func.func @gather(%input: tensor<3x4xf32>, %column_indices: tensor<3x2xsi32>, %row_indices: tensor<5x4xsi32>) -> (tensor<3x2xf32>, tensor<5x4xf32>) {
+  %gathered_columns = tensor.gather(%input, %column_indices) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>) -> tensor<3x2xf32>
+  %gathered_rows = tensor.gather(%input, %row_indices) {axis = 0} : (tensor<3x4xf32>, tensor<5x4xsi32>) -> tensor<5x4xf32>
+  func.return(%gathered_columns, %gathered_rows) : (tensor<3x2xf32>, tensor<5x4xf32>) -> ()
 }
 
 // -----
 
-func.func @scatter(%0: tensor<3x4xf32>, %1: tensor<3x2xsi32>, %2: tensor<3x2xf32>) -> (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) {
-  %3 = tensor.scatter_add(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
-  %4 = tensor.scatter_max(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
-  %5 = tensor.scatter_min(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
-  %6 = tensor.scatter_replace(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
-  func.return(%3, %4, %5, %6) : (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) -> ()
+// CHECK: func.func @scatter([[INPUT:%[0-9]+]]: tensor<3x4xf32>, [[INDICES:%[0-9]+]]: tensor<3x2xsi32>, [[UPDATES:%[0-9]+]]: tensor<3x2xf32>) -> (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) {
+// CHECK-NEXT: [[SUMMED:%[0-9]+]] = tensor.scatter_add([[INPUT]], [[INDICES]], [[UPDATES]]) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+// CHECK-NEXT: [[MAXIMA:%[0-9]+]] = tensor.scatter_max([[INPUT]], [[INDICES]], [[UPDATES]]) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+// CHECK-NEXT: [[MINIMA:%[0-9]+]] = tensor.scatter_min([[INPUT]], [[INDICES]], [[UPDATES]]) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+// CHECK-NEXT: [[REPLACED:%[0-9]+]] = tensor.scatter_replace([[INPUT]], [[INDICES]], [[UPDATES]]) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+// CHECK-NEXT: func.return([[SUMMED]], [[MAXIMA]], [[MINIMA]], [[REPLACED]]) : (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) -> ()
+// CHECK-NEXT: }
+func.func @scatter(%input: tensor<3x4xf32>, %indices: tensor<3x2xsi32>, %updates: tensor<3x2xf32>) -> (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) {
+  %summed = tensor.scatter_add(%input, %indices, %updates) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  %maxima = tensor.scatter_max(%input, %indices, %updates) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  %minima = tensor.scatter_min(%input, %indices, %updates) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  %replaced = tensor.scatter_replace(%input, %indices, %updates) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  func.return(%summed, %maxima, %minima, %replaced) : (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) -> ()
 }
 
 // -----
 
-func.func @si64_indices(%0: tensor<50x8xf32>, %1: tensor<3xsi64>, %2: tensor<2xsi64>) -> (tensor<3x8xf32>, tensor<1x8xf32>) {
-  %3 = tensor.take(%0, %1) : (tensor<50x8xf32>, tensor<3xsi64>) -> tensor<3x8xf32>
-  %4 = tensor.dynamic_slice(%0, %2) {sizes = [1, 8]} : (tensor<50x8xf32>, tensor<2xsi64>) -> tensor<1x8xf32>
-  func.return(%3, %4) : (tensor<3x8xf32>, tensor<1x8xf32>) -> ()
+// CHECK: func.func @si64_indices([[TABLE:%[0-9]+]]: tensor<50x8xf32>, [[IDS:%[0-9]+]]: tensor<3xsi64>, [[STARTS:%[0-9]+]]: tensor<2xsi64>) -> (tensor<3x8xf32>, tensor<1x8xf32>) {
+// CHECK-NEXT: [[ROWS:%[0-9]+]] = tensor.take([[TABLE]], [[IDS]]) : (tensor<50x8xf32>, tensor<3xsi64>) -> tensor<3x8xf32>
+// CHECK-NEXT: [[ROW:%[0-9]+]] = tensor.dynamic_slice([[TABLE]], [[STARTS]]) {sizes = [1, 8]} : (tensor<50x8xf32>, tensor<2xsi64>) -> tensor<1x8xf32>
+// CHECK-NEXT: func.return([[ROWS]], [[ROW]]) : (tensor<3x8xf32>, tensor<1x8xf32>) -> ()
+// CHECK-NEXT: }
+func.func @si64_indices(%table: tensor<50x8xf32>, %ids: tensor<3xsi64>, %starts: tensor<2xsi64>) -> (tensor<3x8xf32>, tensor<1x8xf32>) {
+  %rows = tensor.take(%table, %ids) : (tensor<50x8xf32>, tensor<3xsi64>) -> tensor<3x8xf32>
+  %row = tensor.dynamic_slice(%table, %starts) {sizes = [1, 8]} : (tensor<50x8xf32>, tensor<2xsi64>) -> tensor<1x8xf32>
+  func.return(%rows, %row) : (tensor<3x8xf32>, tensor<1x8xf32>) -> ()
 }

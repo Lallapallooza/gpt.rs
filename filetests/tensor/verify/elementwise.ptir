@@ -1,91 +1,91 @@
 // RUN: verify
 
 // ERROR: tensor.add: operands must have equal types, got tensor<4xf32> and tensor<3xf32>
-func.func @mismatch(%0: tensor<4xf32>, %1: tensor<3xf32>) -> tensor<4xf32> {
-  %2 = tensor.add(%0, %1) : (tensor<4xf32>, tensor<3xf32>) -> tensor<4xf32>
-  func.return(%2) : (tensor<4xf32>) -> ()
+func.func @mismatch(%lhs: tensor<4xf32>, %rhs: tensor<3xf32>) -> tensor<4xf32> {
+  %sum = tensor.add(%lhs, %rhs) : (tensor<4xf32>, tensor<3xf32>) -> tensor<4xf32>
+  func.return(%sum) : (tensor<4xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.less: operands must have equal types, got tensor<4xf32> and tensor<4xsi32>
-func.func @compare_mismatch(%0: tensor<4xf32>, %1: tensor<4xsi32>) -> tensor<4xi1> {
-  %2 = tensor.less(%0, %1) : (tensor<4xf32>, tensor<4xsi32>) -> tensor<4xi1>
-  func.return(%2) : (tensor<4xi1>) -> ()
+func.func @compare_mismatch(%lhs: tensor<4xf32>, %rhs: tensor<4xsi32>) -> tensor<4xi1> {
+  %is_less = tensor.less(%lhs, %rhs) : (tensor<4xf32>, tensor<4xsi32>) -> tensor<4xi1>
+  func.return(%is_less) : (tensor<4xi1>) -> ()
 }
 
 // -----
 // ERROR: tensor.select: pred must be an i1 tensor, got tensor<4xf32>
-func.func @select_float_pred(%0: tensor<4xf32>, %1: tensor<4xf32>) -> tensor<4xf32> {
-  %2 = tensor.select(%0, %1, %1) : (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%2) : (tensor<4xf32>) -> ()
+func.func @select_float_pred(%pred: tensor<4xf32>, %value: tensor<4xf32>) -> tensor<4xf32> {
+  %selected = tensor.select(%pred, %value, %value) : (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%selected) : (tensor<4xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.select: on_true and on_false must have equal types, got tensor<4xf32> and tensor<4xbf16>
-func.func @select_branch_mismatch(%0: tensor<4xi1>, %1: tensor<4xf32>, %2: tensor<4xbf16>) -> tensor<4xf32> {
-  %3 = tensor.select(%0, %1, %2) : (tensor<4xi1>, tensor<4xf32>, tensor<4xbf16>) -> tensor<4xf32>
-  func.return(%3) : (tensor<4xf32>) -> ()
+func.func @select_branch_mismatch(%pred: tensor<4xi1>, %on_true: tensor<4xf32>, %on_false: tensor<4xbf16>) -> tensor<4xf32> {
+  %selected = tensor.select(%pred, %on_true, %on_false) : (tensor<4xi1>, tensor<4xf32>, tensor<4xbf16>) -> tensor<4xf32>
+  func.return(%selected) : (tensor<4xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.select: pred and the branches must have equal shapes, got tensor<1x4xi1> and tensor<4xf32>
-func.func @select_pred_shape(%0: tensor<1x4xi1>, %1: tensor<4xf32>) -> tensor<4xf32> {
-  %2 = tensor.select(%0, %1, %1) : (tensor<1x4xi1>, tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%2) : (tensor<4xf32>) -> ()
+func.func @select_pred_shape(%pred: tensor<1x4xi1>, %value: tensor<4xf32>) -> tensor<4xf32> {
+  %selected = tensor.select(%pred, %value, %value) : (tensor<1x4xi1>, tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%selected) : (tensor<4xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.exp: the input must be a float tensor, got tensor<4xsi32>
-func.func @exp_integer(%0: tensor<4xsi32>) -> tensor<4xsi32> {
-  %1 = tensor.exp(%0) : (tensor<4xsi32>) -> tensor<4xsi32>
-  func.return(%1) : (tensor<4xsi32>) -> ()
+func.func @exp_integer(%input: tensor<4xsi32>) -> tensor<4xsi32> {
+  %exp = tensor.exp(%input) : (tensor<4xsi32>) -> tensor<4xsi32>
+  func.return(%exp) : (tensor<4xsi32>) -> ()
 }
 
 // -----
 // ERROR: tensor.add: each operand must be an integer or float tensor, got tensor<4xi1>
-func.func @add_i1(%0: tensor<4xi1>) -> tensor<4xi1> {
-  %1 = tensor.add(%0, %0) : (tensor<4xi1>, tensor<4xi1>) -> tensor<4xi1>
-  func.return(%1) : (tensor<4xi1>) -> ()
+func.func @add_i1(%input: tensor<4xi1>) -> tensor<4xi1> {
+  %sum = tensor.add(%input, %input) : (tensor<4xi1>, tensor<4xi1>) -> tensor<4xi1>
+  func.return(%sum) : (tensor<4xi1>) -> ()
 }
 
 // -----
 // ERROR: tensor.shift_left: each operand must be an integer tensor, got tensor<4xf32>
-func.func @shift_float(%0: tensor<4xf32>) -> tensor<4xf32> {
-  %1 = tensor.shift_left(%0, %0) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%1) : (tensor<4xf32>) -> ()
+func.func @shift_float(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %shifted = tensor.shift_left(%input, %input) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%shifted) : (tensor<4xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.and: each operand must be an i1 or integer tensor, got tensor<4xbf16>
-func.func @and_float(%0: tensor<4xbf16>) -> tensor<4xbf16> {
-  %1 = tensor.and(%0, %0) : (tensor<4xbf16>, tensor<4xbf16>) -> tensor<4xbf16>
-  func.return(%1) : (tensor<4xbf16>) -> ()
+func.func @and_float(%input: tensor<4xbf16>) -> tensor<4xbf16> {
+  %both = tensor.and(%input, %input) : (tensor<4xbf16>, tensor<4xbf16>) -> tensor<4xbf16>
+  func.return(%both) : (tensor<4xbf16>) -> ()
 }
 
 // -----
 // ERROR: tensor.not: the input must be an i1 or integer tensor, got tensor<4xf32>
-func.func @not_float(%0: tensor<4xf32>) -> tensor<4xf32> {
-  %1 = tensor.not(%0) : (tensor<4xf32>) -> tensor<4xf32>
-  func.return(%1) : (tensor<4xf32>) -> ()
+func.func @not_float(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %inverted = tensor.not(%input) : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%inverted) : (tensor<4xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.add: each operand must be an integer or float tensor, got tensor<4xf8e4m3>
-func.func @add_narrow(%0: tensor<4xf8e4m3>) -> tensor<4xf8e4m3> {
-  %1 = tensor.add(%0, %0) : (tensor<4xf8e4m3>, tensor<4xf8e4m3>) -> tensor<4xf8e4m3>
-  func.return(%1) : (tensor<4xf8e4m3>) -> ()
+func.func @add_narrow(%input: tensor<4xf8e4m3>) -> tensor<4xf8e4m3> {
+  %sum = tensor.add(%input, %input) : (tensor<4xf8e4m3>, tensor<4xf8e4m3>) -> tensor<4xf8e4m3>
+  func.return(%sum) : (tensor<4xf8e4m3>) -> ()
 }
 
 // -----
 // ERROR: tensor.less: each operand must be an i1, integer or float tensor, got tensor<4xe8m0>
-func.func @compare_scales(%0: tensor<4xe8m0>) -> tensor<4xi1> {
-  %1 = tensor.less(%0, %0) : (tensor<4xe8m0>, tensor<4xe8m0>) -> tensor<4xi1>
-  func.return(%1) : (tensor<4xi1>) -> ()
+func.func @compare_scales(%scales: tensor<4xe8m0>) -> tensor<4xi1> {
+  %is_less = tensor.less(%scales, %scales) : (tensor<4xe8m0>, tensor<4xe8m0>) -> tensor<4xi1>
+  func.return(%is_less) : (tensor<4xi1>) -> ()
 }
 
 // -----
 // ERROR: tensor.cast: to must be an i1, integer, float or narrow float dtype, got e8m0
-func.func @cast_to_e8m0(%0: tensor<4xf32>) -> tensor<4xe8m0> {
-  %1 = tensor.cast(%0) {to = e8m0} : (tensor<4xf32>) -> tensor<4xe8m0>
-  func.return(%1) : (tensor<4xe8m0>) -> ()
+func.func @cast_to_e8m0(%input: tensor<4xf32>) -> tensor<4xe8m0> {
+  %scales = tensor.cast(%input) {to = e8m0} : (tensor<4xf32>) -> tensor<4xe8m0>
+  func.return(%scales) : (tensor<4xe8m0>) -> ()
 }

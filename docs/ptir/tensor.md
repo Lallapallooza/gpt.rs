@@ -340,16 +340,16 @@ Example, from `filetests/tensor/roundtrip/elementwise.ptir`:
 
 ```text
 func.func @constants() -> (tensor<2x2xf32>, tensor<3xsi32>, tensor<f32>, tensor<2xbf16>, tensor<2xf32>, tensor<1xf32>, tensor<2xi1>, tensor<2xf8e4m3>, tensor<0xf32>) {
-  %0 = tensor.constant() {value = dense<[2, 2] x f32: [1.0, -0.5, 1e-7, inf]>} : () -> tensor<2x2xf32>
-  %1 = tensor.constant() {value = dense<[3] x si32: 0>} : () -> tensor<3xsi32>
-  %2 = tensor.constant() {value = dense<[] x f32: 0.5>} : () -> tensor<f32>
-  %3 = tensor.constant() {value = dense<[2] x bf16: [1.0, 3.140625]>} : () -> tensor<2xbf16>
-  %4 = tensor.constant() {value = dense<[2] x f32: [-0.0, -inf]>} : () -> tensor<2xf32>
-  %5 = tensor.constant() {value = dense<[1] x f32: 0x0000c07f>} : () -> tensor<1xf32>
-  %6 = tensor.constant() {value = dense<[2] x i1: [true, false]>} : () -> tensor<2xi1>
-  %7 = tensor.constant() {value = dense<[2] x f8e4m3: 0x3840>} : () -> tensor<2xf8e4m3>
-  %8 = tensor.constant() {value = dense<[0] x f32: []>} : () -> tensor<0xf32>
-  func.return(%0, %1, %2, %3, %4, %5, %6, %7, %8) : (tensor<2x2xf32>, tensor<3xsi32>, tensor<f32>, tensor<2xbf16>, tensor<2xf32>, tensor<1xf32>, tensor<2xi1>, tensor<2xf8e4m3>, tensor<0xf32>) -> ()
+  %matrix = tensor.constant() {value = dense<[2, 2] x f32: [1.0, -0.5, 1e-7, inf]>} : () -> tensor<2x2xf32>
+  %zeros = tensor.constant() {value = dense<[3] x si32: 0>} : () -> tensor<3xsi32>
+  %half = tensor.constant() {value = dense<[] x f32: 0.5>} : () -> tensor<f32>
+  %one_and_pi = tensor.constant() {value = dense<[2] x bf16: [1.0, 3.140625]>} : () -> tensor<2xbf16>
+  %neg_zero_and_neg_inf = tensor.constant() {value = dense<[2] x f32: [-0.0, -inf]>} : () -> tensor<2xf32>
+  %nan = tensor.constant() {value = dense<[1] x f32: 0x0000c07f>} : () -> tensor<1xf32>
+  %flags = tensor.constant() {value = dense<[2] x i1: [true, false]>} : () -> tensor<2xi1>
+  %fp8_values = tensor.constant() {value = dense<[2] x f8e4m3: 0x3840>} : () -> tensor<2xf8e4m3>
+  %empty = tensor.constant() {value = dense<[0] x f32: []>} : () -> tensor<0xf32>
+  func.return(%matrix, %zeros, %half, %one_and_pi, %neg_zero_and_neg_inf, %nan, %flags, %fp8_values, %empty) : (tensor<2x2xf32>, tensor<3xsi32>, tensor<f32>, tensor<2xbf16>, tensor<2xf32>, tensor<1xf32>, tensor<2xi1>, tensor<2xf8e4m3>, tensor<0xf32>) -> ()
 }
 ```
 
@@ -390,22 +390,22 @@ Defined by `Unary` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/
 Example, from `filetests/tensor/roundtrip/elementwise.ptir`:
 
 ```text
-func.func @kinds(%0: tensor<4xf32>, %1: tensor<4xf32>) -> tensor<4xf32> {
-  %2 = tensor.add(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %3 = tensor.sub(%2, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %4 = tensor.mul(%3, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %5 = tensor.div(%4, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %6 = tensor.maximum(%5, %0) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %7 = tensor.minimum(%6, %0) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %8 = tensor.neg(%7) : (tensor<4xf32>) -> tensor<4xf32>
-  %9 = tensor.abs(%8) : (tensor<4xf32>) -> tensor<4xf32>
-  %10 = tensor.exp(%9) : (tensor<4xf32>) -> tensor<4xf32>
-  %11 = tensor.log(%10) : (tensor<4xf32>) -> tensor<4xf32>
-  %12 = tensor.tanh(%11) : (tensor<4xf32>) -> tensor<4xf32>
-  %13 = tensor.erf(%12) : (tensor<4xf32>) -> tensor<4xf32>
-  %14 = tensor.rsqrt(%13) : (tensor<4xf32>) -> tensor<4xf32>
-  %15 = tensor.reciprocal(%14) : (tensor<4xf32>) -> tensor<4xf32>
-  func.return(%15) : (tensor<4xf32>) -> ()
+func.func @kinds(%lhs: tensor<4xf32>, %rhs: tensor<4xf32>) -> tensor<4xf32> {
+  %sum = tensor.add(%lhs, %rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %difference = tensor.sub(%sum, %rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %product = tensor.mul(%difference, %rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %quotient = tensor.div(%product, %rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %maximum = tensor.maximum(%quotient, %lhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %minimum = tensor.minimum(%maximum, %lhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %negated = tensor.neg(%minimum) : (tensor<4xf32>) -> tensor<4xf32>
+  %absolute = tensor.abs(%negated) : (tensor<4xf32>) -> tensor<4xf32>
+  %exponential = tensor.exp(%absolute) : (tensor<4xf32>) -> tensor<4xf32>
+  %logarithm = tensor.log(%exponential) : (tensor<4xf32>) -> tensor<4xf32>
+  %tanh = tensor.tanh(%logarithm) : (tensor<4xf32>) -> tensor<4xf32>
+  %erf = tensor.erf(%tanh) : (tensor<4xf32>) -> tensor<4xf32>
+  %rsqrt = tensor.rsqrt(%erf) : (tensor<4xf32>) -> tensor<4xf32>
+  %reciprocal = tensor.reciprocal(%rsqrt) : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%reciprocal) : (tensor<4xf32>) -> ()
 }
 ```
 
@@ -455,18 +455,18 @@ Defined by `Binary` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates
 Example, from `filetests/tensor/roundtrip/elementwise.ptir`:
 
 ```text
-func.func @bits(%0: tensor<4xui8>, %1: tensor<4xi1>, %2: tensor<4xf64>) -> (tensor<4xui8>, tensor<4xi1>, tensor<4xf64>) {
-  %3 = tensor.and(%0, %0) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
-  %4 = tensor.or(%3, %0) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
-  %5 = tensor.xor(%4, %0) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
-  %6 = tensor.shift_left(%5, %0) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
-  %7 = tensor.shift_right_logical(%6, %0) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
-  %8 = tensor.shift_right_arithmetic(%7, %0) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
-  %9 = tensor.not(%8) : (tensor<4xui8>) -> tensor<4xui8>
-  %10 = tensor.not(%1) : (tensor<4xi1>) -> tensor<4xi1>
-  %11 = tensor.sin(%2) : (tensor<4xf64>) -> tensor<4xf64>
-  %12 = tensor.cos(%11) : (tensor<4xf64>) -> tensor<4xf64>
-  func.return(%9, %10, %12) : (tensor<4xui8>, tensor<4xi1>, tensor<4xf64>) -> ()
+func.func @bits(%bytes: tensor<4xui8>, %flags: tensor<4xi1>, %angles: tensor<4xf64>) -> (tensor<4xui8>, tensor<4xi1>, tensor<4xf64>) {
+  %and = tensor.and(%bytes, %bytes) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+  %or = tensor.or(%and, %bytes) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+  %xor = tensor.xor(%or, %bytes) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+  %shifted_left = tensor.shift_left(%xor, %bytes) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+  %shifted_right_logical = tensor.shift_right_logical(%shifted_left, %bytes) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+  %shifted_right_arithmetic = tensor.shift_right_arithmetic(%shifted_right_logical, %bytes) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+  %inverted_bytes = tensor.not(%shifted_right_arithmetic) : (tensor<4xui8>) -> tensor<4xui8>
+  %inverted_flags = tensor.not(%flags) : (tensor<4xi1>) -> tensor<4xi1>
+  %sine = tensor.sin(%angles) : (tensor<4xf64>) -> tensor<4xf64>
+  %cosine = tensor.cos(%sine) : (tensor<4xf64>) -> tensor<4xf64>
+  func.return(%inverted_bytes, %inverted_flags, %cosine) : (tensor<4xui8>, tensor<4xi1>, tensor<4xf64>) -> ()
 }
 ```
 
@@ -513,14 +513,14 @@ Defined by `Compare` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crate
 Example, from `filetests/tensor/roundtrip/elementwise.ptir`:
 
 ```text
-func.func @compare(%0: tensor<4xf32>, %1: tensor<4xf32>) -> (tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>) {
-  %2 = tensor.less(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
-  %3 = tensor.less_equal(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
-  %4 = tensor.equal(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
-  %5 = tensor.greater_equal(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
-  %6 = tensor.greater(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
-  %7 = tensor.not_equal(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
-  func.return(%2, %3, %4, %5, %6, %7) : (tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>) -> ()
+func.func @compare(%lhs: tensor<4xf32>, %rhs: tensor<4xf32>) -> (tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>) {
+  %less = tensor.less(%lhs, %rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  %less_equal = tensor.less_equal(%lhs, %rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  %equal = tensor.equal(%lhs, %rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  %greater_equal = tensor.greater_equal(%lhs, %rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  %greater = tensor.greater(%lhs, %rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  %not_equal = tensor.not_equal(%lhs, %rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  func.return(%less, %less_equal, %equal, %greater_equal, %greater, %not_equal) : (tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>) -> ()
 }
 ```
 
@@ -551,9 +551,9 @@ Defined by `Select` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates
 Example, from `filetests/tensor/roundtrip/elementwise.ptir`:
 
 ```text
-func.func @select(%0: tensor<2x{T}xi1>, %1: tensor<2x{T}xf32>, %2: tensor<2x{T}xf32>) -> tensor<2x{T}xf32> {
-  %3 = tensor.select(%0, %1, %2) : (tensor<2x{T}xi1>, tensor<2x{T}xf32>, tensor<2x{T}xf32>) -> tensor<2x{T}xf32>
-  func.return(%3) : (tensor<2x{T}xf32>) -> ()
+func.func @select(%condition: tensor<2x{T}xi1>, %on_true: tensor<2x{T}xf32>, %on_false: tensor<2x{T}xf32>) -> tensor<2x{T}xf32> {
+  %selected = tensor.select(%condition, %on_true, %on_false) : (tensor<2x{T}xi1>, tensor<2x{T}xf32>, tensor<2x{T}xf32>) -> tensor<2x{T}xf32>
+  func.return(%selected) : (tensor<2x{T}xf32>) -> ()
 }
 ```
 
@@ -586,11 +586,11 @@ Defined by `Cast` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/g
 Example, from `filetests/tensor/roundtrip/elementwise.ptir`:
 
 ```text
-func.func @cast(%0: tensor<2x3xbf16>, %1: tensor<4xsi32>) -> (tensor<2x3xf32>, tensor<4xi1>, tensor<4xsi32>) {
-  %2 = tensor.cast(%0) {to = f32} : (tensor<2x3xbf16>) -> tensor<2x3xf32>
-  %3 = tensor.cast(%1) {to = i1} : (tensor<4xsi32>) -> tensor<4xi1>
-  %4 = tensor.cast(%1) {to = si32} : (tensor<4xsi32>) -> tensor<4xsi32>
-  func.return(%2, %3, %4) : (tensor<2x3xf32>, tensor<4xi1>, tensor<4xsi32>) -> ()
+func.func @cast(%bf16_input: tensor<2x3xbf16>, %si32_input: tensor<4xsi32>) -> (tensor<2x3xf32>, tensor<4xi1>, tensor<4xsi32>) {
+  %as_f32 = tensor.cast(%bf16_input) {to = f32} : (tensor<2x3xbf16>) -> tensor<2x3xf32>
+  %as_i1 = tensor.cast(%si32_input) {to = i1} : (tensor<4xsi32>) -> tensor<4xi1>
+  %as_si32 = tensor.cast(%si32_input) {to = si32} : (tensor<4xsi32>) -> tensor<4xsi32>
+  func.return(%as_f32, %as_i1, %as_si32) : (tensor<2x3xf32>, tensor<4xi1>, tensor<4xsi32>) -> ()
 }
 ```
 
@@ -629,9 +629,9 @@ Defined by `DotGeneral` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../cr
 Example, from `filetests/tensor/roundtrip/contraction.ptir`:
 
 ```text
-func.func @matmul(%0: tensor<4x8xf32>, %1: tensor<16x8xf32>) -> tensor<4x16xf32> {
-  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [1]} : (tensor<4x8xf32>, tensor<16x8xf32>) -> tensor<4x16xf32>
-  func.return(%2) : (tensor<4x16xf32>) -> ()
+func.func @matmul(%input: tensor<4x8xf32>, %weight: tensor<16x8xf32>) -> tensor<4x16xf32> {
+  %product = tensor.dot_general(%input, %weight) {contract_lhs = [1], contract_rhs = [1]} : (tensor<4x8xf32>, tensor<16x8xf32>) -> tensor<4x16xf32>
+  func.return(%product) : (tensor<4x16xf32>) -> ()
 }
 ```
 
@@ -686,12 +686,12 @@ Defined by `Reduce` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates
 Example, from `filetests/tensor/roundtrip/contraction.ptir`:
 
 ```text
-func.func @reduce(%0: tensor<2x{T}x8xf32>) -> (tensor<2x{T}x1xf32>, tensor<{T}xf32>, tensor<2x1x1xf32>, tensor<2x{T}x8xf32>) {
-  %1 = tensor.reduce_sum(%0) {axes = [2], keepdims = true} : (tensor<2x{T}x8xf32>) -> tensor<2x{T}x1xf32>
-  %2 = tensor.reduce_max(%0) {axes = [0, 2]} : (tensor<2x{T}x8xf32>) -> tensor<{T}xf32>
-  %3 = tensor.reduce_min(%0) {axes = [1, 2], keepdims = true, accum = f32, out = f32} : (tensor<2x{T}x8xf32>) -> tensor<2x1x1xf32>
-  %4 = tensor.reduce_sum(%0) {axes = []} : (tensor<2x{T}x8xf32>) -> tensor<2x{T}x8xf32>
-  func.return(%1, %2, %3, %4) : (tensor<2x{T}x1xf32>, tensor<{T}xf32>, tensor<2x1x1xf32>, tensor<2x{T}x8xf32>) -> ()
+func.func @reduce(%input: tensor<2x{T}x8xf32>) -> (tensor<2x{T}x1xf32>, tensor<{T}xf32>, tensor<2x1x1xf32>, tensor<2x{T}x8xf32>) {
+  %sum = tensor.reduce_sum(%input) {axes = [2], keepdims = true} : (tensor<2x{T}x8xf32>) -> tensor<2x{T}x1xf32>
+  %max = tensor.reduce_max(%input) {axes = [0, 2]} : (tensor<2x{T}x8xf32>) -> tensor<{T}xf32>
+  %min = tensor.reduce_min(%input) {axes = [1, 2], keepdims = true, accum = f32, out = f32} : (tensor<2x{T}x8xf32>) -> tensor<2x1x1xf32>
+  %sum_no_axes = tensor.reduce_sum(%input) {axes = []} : (tensor<2x{T}x8xf32>) -> tensor<2x{T}x8xf32>
+  func.return(%sum, %max, %min, %sum_no_axes) : (tensor<2x{T}x1xf32>, tensor<{T}xf32>, tensor<2x1x1xf32>, tensor<2x{T}x8xf32>) -> ()
 }
 ```
 
@@ -727,9 +727,9 @@ Defined by `Reshape` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crate
 Example, from `filetests/tensor/roundtrip/layout.ptir`:
 
 ```text
-func.func @reshape_scalar(%0: tensor<1x1xsi32>) -> tensor<si32> {
-  %1 = tensor.reshape(%0) {shape = []} : (tensor<1x1xsi32>) -> tensor<si32>
-  func.return(%1) : (tensor<si32>) -> ()
+func.func @reshape_scalar(%input: tensor<1x1xsi32>) -> tensor<si32> {
+  %scalar = tensor.reshape(%input) {shape = []} : (tensor<1x1xsi32>) -> tensor<si32>
+  func.return(%scalar) : (tensor<si32>) -> ()
 }
 ```
 
@@ -761,9 +761,9 @@ Defined by `Transpose` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../cra
 Example, from `filetests/tensor/roundtrip/layout.ptir`:
 
 ```text
-func.func @transpose(%0: tensor<2x3x4xf32>) -> tensor<4x2x3xf32> {
-  %1 = tensor.transpose(%0) {perm = [2, 0, 1]} : (tensor<2x3x4xf32>) -> tensor<4x2x3xf32>
-  func.return(%1) : (tensor<4x2x3xf32>) -> ()
+func.func @transpose(%input: tensor<2x3x4xf32>) -> tensor<4x2x3xf32> {
+  %transposed = tensor.transpose(%input) {perm = [2, 0, 1]} : (tensor<2x3x4xf32>) -> tensor<4x2x3xf32>
+  func.return(%transposed) : (tensor<4x2x3xf32>) -> ()
 }
 ```
 
@@ -797,10 +797,10 @@ Defined by `BroadcastTo` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../c
 Example, from `filetests/tensor/roundtrip/layout.ptir`:
 
 ```text
-func.func @broadcast_to_dynamic(%0: tensor<1x768xf32>, %1: tensor<{B}x1xf32>) -> (tensor<{B}x768xf32>, tensor<2x{B}x4xf32>) {
-  %2 = tensor.broadcast_to(%0) {shape = [{B}, 768]} : (tensor<1x768xf32>) -> tensor<{B}x768xf32>
-  %3 = tensor.broadcast_to(%1) {shape = [2, {B}, 4]} : (tensor<{B}x1xf32>) -> tensor<2x{B}x4xf32>
-  func.return(%2, %3) : (tensor<{B}x768xf32>, tensor<2x{B}x4xf32>) -> ()
+func.func @broadcast_to_dynamic(%bias: tensor<1x768xf32>, %column: tensor<{B}x1xf32>) -> (tensor<{B}x768xf32>, tensor<2x{B}x4xf32>) {
+  %batch_bias = tensor.broadcast_to(%bias) {shape = [{B}, 768]} : (tensor<1x768xf32>) -> tensor<{B}x768xf32>
+  %wide_columns = tensor.broadcast_to(%column) {shape = [2, {B}, 4]} : (tensor<{B}x1xf32>) -> tensor<2x{B}x4xf32>
+  func.return(%batch_bias, %wide_columns) : (tensor<{B}x768xf32>, tensor<2x{B}x4xf32>) -> ()
 }
 ```
 
@@ -838,10 +838,10 @@ Defined by `Slice` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/
 Example, from `filetests/tensor/roundtrip/layout.ptir`:
 
 ```text
-func.func @slice(%0: tensor<4x6xf32>, %1: tensor<{B}x6xf32>) -> (tensor<2x3xf32>, tensor<1x4xf32>) {
-  %2 = tensor.slice(%0) {starts = [1, 2], sizes = [2, 3]} : (tensor<4x6xf32>) -> tensor<2x3xf32>
-  %3 = tensor.slice(%1) {starts = [0, 2], sizes = [1, 4]} : (tensor<{B}x6xf32>) -> tensor<1x4xf32>
-  func.return(%2, %3) : (tensor<2x3xf32>, tensor<1x4xf32>) -> ()
+func.func @slice(%input: tensor<4x6xf32>, %dynamic_input: tensor<{B}x6xf32>) -> (tensor<2x3xf32>, tensor<1x4xf32>) {
+  %block = tensor.slice(%input) {starts = [1, 2], sizes = [2, 3]} : (tensor<4x6xf32>) -> tensor<2x3xf32>
+  %dynamic_block = tensor.slice(%dynamic_input) {starts = [0, 2], sizes = [1, 4]} : (tensor<{B}x6xf32>) -> tensor<1x4xf32>
+  func.return(%block, %dynamic_block) : (tensor<2x3xf32>, tensor<1x4xf32>) -> ()
 }
 ```
 
@@ -879,11 +879,11 @@ Defined by `Bitcast` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crate
 Example, from `filetests/tensor/roundtrip/layout.ptir`:
 
 ```text
-func.func @bitcast(%0: tensor<4x2xsi32>, %1: tensor<4x3xui8>, %2: tensor<4xbf16>) -> (tensor<4x16xui4>, tensor<4x4xf6e2m3>, tensor<4xsi16>) {
-  %3 = tensor.bitcast(%0) {to = ui4} : (tensor<4x2xsi32>) -> tensor<4x16xui4>
-  %4 = tensor.bitcast(%1) {to = f6e2m3} : (tensor<4x3xui8>) -> tensor<4x4xf6e2m3>
-  %5 = tensor.bitcast(%2) {to = si16} : (tensor<4xbf16>) -> tensor<4xsi16>
-  func.return(%3, %4, %5) : (tensor<4x16xui4>, tensor<4x4xf6e2m3>, tensor<4xsi16>) -> ()
+func.func @bitcast(%words: tensor<4x2xsi32>, %bytes: tensor<4x3xui8>, %halves: tensor<4xbf16>) -> (tensor<4x16xui4>, tensor<4x4xf6e2m3>, tensor<4xsi16>) {
+  %nibbles = tensor.bitcast(%words) {to = ui4} : (tensor<4x2xsi32>) -> tensor<4x16xui4>
+  %six_bit_codes = tensor.bitcast(%bytes) {to = f6e2m3} : (tensor<4x3xui8>) -> tensor<4x4xf6e2m3>
+  %half_bits = tensor.bitcast(%halves) {to = si16} : (tensor<4xbf16>) -> tensor<4xsi16>
+  func.return(%nibbles, %six_bit_codes, %half_bits) : (tensor<4x16xui4>, tensor<4x4xf6e2m3>, tensor<4xsi16>) -> ()
 }
 ```
 
@@ -916,10 +916,10 @@ Defined by `Concat` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates
 Example, from `filetests/tensor/roundtrip/layout.ptir`:
 
 ```text
-func.func @concat_dynamic(%0: tensor<{B}x3xf32>, %1: tensor<{B}x5xf32>, %2: tensor<{T}x2xf32>) -> (tensor<{B}x8xf32>, tensor<{T}x2xf32>) {
-  %3 = tensor.concat(%0, %1) {axis = 1} : (tensor<{B}x3xf32>, tensor<{B}x5xf32>) -> tensor<{B}x8xf32>
-  %4 = tensor.concat(%2) {axis = 0} : (tensor<{T}x2xf32>) -> tensor<{T}x2xf32>
-  func.return(%3, %4) : (tensor<{B}x8xf32>, tensor<{T}x2xf32>) -> ()
+func.func @concat_dynamic(%left: tensor<{B}x3xf32>, %right: tensor<{B}x5xf32>, %rows: tensor<{T}x2xf32>) -> (tensor<{B}x8xf32>, tensor<{T}x2xf32>) {
+  %joined = tensor.concat(%left, %right) {axis = 1} : (tensor<{B}x3xf32>, tensor<{B}x5xf32>) -> tensor<{B}x8xf32>
+  %single = tensor.concat(%rows) {axis = 0} : (tensor<{T}x2xf32>) -> tensor<{T}x2xf32>
+  func.return(%joined, %single) : (tensor<{B}x8xf32>, tensor<{T}x2xf32>) -> ()
 }
 ```
 
@@ -956,9 +956,9 @@ Example, from `filetests/tensor/roundtrip/indexing.ptir`:
 
 ```text
 func.func @iota() -> (tensor<2x3xsi32>, tensor<{T}xf32>) {
-  %0 = tensor.iota() {shape = [2, 3], dtype = si32, axis = 1} : () -> tensor<2x3xsi32>
-  %1 = tensor.iota() {shape = [{T}], dtype = f32, axis = 0} : () -> tensor<{T}xf32>
-  func.return(%0, %1) : (tensor<2x3xsi32>, tensor<{T}xf32>) -> ()
+  %column_ids = tensor.iota() {shape = [2, 3], dtype = si32, axis = 1} : () -> tensor<2x3xsi32>
+  %positions = tensor.iota() {shape = [{T}], dtype = f32, axis = 0} : () -> tensor<{T}xf32>
+  func.return(%column_ids, %positions) : (tensor<2x3xsi32>, tensor<{T}xf32>) -> ()
 }
 ```
 
@@ -989,10 +989,10 @@ Defined by `Take` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/g
 Example, from `filetests/tensor/roundtrip/indexing.ptir`:
 
 ```text
-func.func @take(%0: tensor<50x8xf32> {param = 3}, %1: tensor<2x3xsi32>, %2: tensor<50x8xbf16>, %3: tensor<{B}xsi32>) -> (tensor<2x3x8xf32>, tensor<{B}x8xbf16>) {
-  %4 = tensor.take(%0, %1) : (tensor<50x8xf32>, tensor<2x3xsi32>) -> tensor<2x3x8xf32>
-  %5 = tensor.take(%2, %3) : (tensor<50x8xbf16>, tensor<{B}xsi32>) -> tensor<{B}x8xbf16>
-  func.return(%4, %5) : (tensor<2x3x8xf32>, tensor<{B}x8xbf16>) -> ()
+func.func @take(%embedding: tensor<50x8xf32> {param = 3}, %token_ids: tensor<2x3xsi32>, %bf16_embedding: tensor<50x8xbf16>, %batch_ids: tensor<{B}xsi32>) -> (tensor<2x3x8xf32>, tensor<{B}x8xbf16>) {
+  %token_rows = tensor.take(%embedding, %token_ids) : (tensor<50x8xf32>, tensor<2x3xsi32>) -> tensor<2x3x8xf32>
+  %batch_rows = tensor.take(%bf16_embedding, %batch_ids) : (tensor<50x8xbf16>, tensor<{B}xsi32>) -> tensor<{B}x8xbf16>
+  func.return(%token_rows, %batch_rows) : (tensor<2x3x8xf32>, tensor<{B}x8xbf16>) -> ()
 }
 ```
 
@@ -1028,10 +1028,10 @@ Defined by `DynamicSlice` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../
 Example, from `filetests/tensor/roundtrip/indexing.ptir`:
 
 ```text
-func.func @dynamic_slice(%0: tensor<4x8xf32>, %1: tensor<{S}x8xsi32>, %2: tensor<2xsi32>) -> (tensor<1x8xf32>, tensor<2x8xsi32>) {
-  %3 = tensor.dynamic_slice(%0, %2) {sizes = [1, 8]} : (tensor<4x8xf32>, tensor<2xsi32>) -> tensor<1x8xf32>
-  %4 = tensor.dynamic_slice(%1, %2) {sizes = [2, 8]} : (tensor<{S}x8xsi32>, tensor<2xsi32>) -> tensor<2x8xsi32>
-  func.return(%3, %4) : (tensor<1x8xf32>, tensor<2x8xsi32>) -> ()
+func.func @dynamic_slice(%input: tensor<4x8xf32>, %dynamic_input: tensor<{S}x8xsi32>, %starts: tensor<2xsi32>) -> (tensor<1x8xf32>, tensor<2x8xsi32>) {
+  %row = tensor.dynamic_slice(%input, %starts) {sizes = [1, 8]} : (tensor<4x8xf32>, tensor<2xsi32>) -> tensor<1x8xf32>
+  %dynamic_rows = tensor.dynamic_slice(%dynamic_input, %starts) {sizes = [2, 8]} : (tensor<{S}x8xsi32>, tensor<2xsi32>) -> tensor<2x8xsi32>
+  func.return(%row, %dynamic_rows) : (tensor<1x8xf32>, tensor<2x8xsi32>) -> ()
 }
 ```
 
@@ -1066,10 +1066,10 @@ Defined by `DynamicUpdateSlice` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](
 Example, from `filetests/tensor/roundtrip/indexing.ptir`:
 
 ```text
-func.func @dynamic_update_slice(%0: tensor<2x16x4xf32>, %1: tensor<2x1x4xf32>, %2: tensor<3xsi32>, %3: tensor<2x{S}x4xf32>) -> (tensor<2x16x4xf32>, tensor<2x{S}x4xf32>) {
-  %4 = tensor.dynamic_update_slice(%0, %1, %2) : (tensor<2x16x4xf32>, tensor<2x1x4xf32>, tensor<3xsi32>) -> tensor<2x16x4xf32>
-  %5 = tensor.dynamic_update_slice(%3, %1, %2) : (tensor<2x{S}x4xf32>, tensor<2x1x4xf32>, tensor<3xsi32>) -> tensor<2x{S}x4xf32>
-  func.return(%4, %5) : (tensor<2x16x4xf32>, tensor<2x{S}x4xf32>) -> ()
+func.func @dynamic_update_slice(%cache: tensor<2x16x4xf32>, %update: tensor<2x1x4xf32>, %starts: tensor<3xsi32>, %dynamic_cache: tensor<2x{S}x4xf32>) -> (tensor<2x16x4xf32>, tensor<2x{S}x4xf32>) {
+  %updated_cache = tensor.dynamic_update_slice(%cache, %update, %starts) : (tensor<2x16x4xf32>, tensor<2x1x4xf32>, tensor<3xsi32>) -> tensor<2x16x4xf32>
+  %updated_dynamic_cache = tensor.dynamic_update_slice(%dynamic_cache, %update, %starts) : (tensor<2x{S}x4xf32>, tensor<2x1x4xf32>, tensor<3xsi32>) -> tensor<2x{S}x4xf32>
+  func.return(%updated_cache, %updated_dynamic_cache) : (tensor<2x16x4xf32>, tensor<2x{S}x4xf32>) -> ()
 }
 ```
 
@@ -1107,9 +1107,9 @@ Defined by `ExtractPatches` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../.
 Example, from `filetests/tensor/roundtrip/window.ptir`:
 
 ```text
-func.func @conv_patches(%0: tensor<1x5x5x3xf32>) -> tensor<1x3x3x27xf32> {
-  %1 = tensor.extract_patches(%0) {window = [3, 3], strides = [2, 2], dilation = [1, 1], padding = [(1, 1), (1, 1)], pad_value = 0.0} : (tensor<1x5x5x3xf32>) -> tensor<1x3x3x27xf32>
-  func.return(%1) : (tensor<1x3x3x27xf32>) -> ()
+func.func @conv_patches(%image: tensor<1x5x5x3xf32>) -> tensor<1x3x3x27xf32> {
+  %patches = tensor.extract_patches(%image) {window = [3, 3], strides = [2, 2], dilation = [1, 1], padding = [(1, 1), (1, 1)], pad_value = 0.0} : (tensor<1x5x5x3xf32>) -> tensor<1x3x3x27xf32>
+  func.return(%patches) : (tensor<1x3x3x27xf32>) -> ()
 }
 ```
 
@@ -1166,11 +1166,11 @@ Defined by `ReduceWindow` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../
 Example, from `filetests/tensor/roundtrip/window.ptir`:
 
 ```text
-func.func @window_kinds(%0: tensor<6xi1>, %1: tensor<6xbf16>) -> (tensor<5xi1>, tensor<5xi1>, tensor<5xf32>) {
-  %2 = tensor.reduce_window_and(%0) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1]} : (tensor<6xi1>) -> tensor<5xi1>
-  %3 = tensor.reduce_window_or(%0) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1]} : (tensor<6xi1>) -> tensor<5xi1>
-  %4 = tensor.reduce_window_sum(%1) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1], out = f32} : (tensor<6xbf16>) -> tensor<5xf32>
-  func.return(%2, %3, %4) : (tensor<5xi1>, tensor<5xi1>, tensor<5xf32>) -> ()
+func.func @window_kinds(%mask: tensor<6xi1>, %values: tensor<6xbf16>) -> (tensor<5xi1>, tensor<5xi1>, tensor<5xf32>) {
+  %all_set = tensor.reduce_window_and(%mask) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1]} : (tensor<6xi1>) -> tensor<5xi1>
+  %any_set = tensor.reduce_window_or(%mask) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1]} : (tensor<6xi1>) -> tensor<5xi1>
+  %window_sums = tensor.reduce_window_sum(%values) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1], out = f32} : (tensor<6xbf16>) -> tensor<5xf32>
+  func.return(%all_set, %any_set, %window_sums) : (tensor<5xi1>, tensor<5xi1>, tensor<5xf32>) -> ()
 }
 ```
 
@@ -1224,9 +1224,9 @@ Defined by `CustomCall` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../cr
 Example, from `filetests/tensor/roundtrip/custom_call.ptir`:
 
 ```text
-func.func @call(%0: tensor<8x16xf32>, %1: tensor<16xf32>) -> tensor<8x16xf32> {
-  %2 = tensor.custom_call(%0, %1) {target = "gpt_rs.c.conv2d.nhwc.f32.v1", attrs = {alpha = 1.5, "conv.stride" = array<i64: 1, 1>, fused = true, name = "conv"}, results = [tensor<8x16xf32>]} : (tensor<8x16xf32>, tensor<16xf32>) -> tensor<8x16xf32>
-  func.return(%2) : (tensor<8x16xf32>) -> ()
+func.func @call(%input: tensor<8x16xf32>, %bias: tensor<16xf32>) -> tensor<8x16xf32> {
+  %output = tensor.custom_call(%input, %bias) {target = "gpt_rs.c.conv2d.nhwc.f32.v1", attrs = {alpha = 1.5, "conv.stride" = array<i64: 1, 1>, fused = true, name = "conv"}, results = [tensor<8x16xf32>]} : (tensor<8x16xf32>, tensor<16xf32>) -> tensor<8x16xf32>
+  func.return(%output) : (tensor<8x16xf32>) -> ()
 }
 ```
 
@@ -1256,9 +1256,9 @@ Defined by `StopGradient` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../
 Example, from `filetests/tensor/roundtrip/elementwise.ptir`:
 
 ```text
-func.func @stop_gradient(%0: tensor<2x{T}xf32>) -> tensor<2x{T}xf32> {
-  %1 = tensor.stop_gradient(%0) : (tensor<2x{T}xf32>) -> tensor<2x{T}xf32>
-  func.return(%1) : (tensor<2x{T}xf32>) -> ()
+func.func @stop_gradient(%input: tensor<2x{T}xf32>) -> tensor<2x{T}xf32> {
+  %detached = tensor.stop_gradient(%input) : (tensor<2x{T}xf32>) -> tensor<2x{T}xf32>
+  func.return(%detached) : (tensor<2x{T}xf32>) -> ()
 }
 ```
 
@@ -1285,10 +1285,10 @@ Defined by `ArgMax` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates
 Example, from `filetests/tensor/roundtrip/contraction.ptir`:
 
 ```text
-func.func @argmax(%0: tensor<2x5xf32>, %1: tensor<4x{T}xsi32>) -> (tensor<2xsi32>, tensor<4x1xsi64>) {
-  %2 = tensor.argmax(%0) {axis = 1, out = si32} : (tensor<2x5xf32>) -> tensor<2xsi32>
-  %3 = tensor.argmax(%1) {axis = 1, keepdims = true, out = si64} : (tensor<4x{T}xsi32>) -> tensor<4x1xsi64>
-  func.return(%2, %3) : (tensor<2xsi32>, tensor<4x1xsi64>) -> ()
+func.func @argmax(%logits: tensor<2x5xf32>, %counts: tensor<4x{T}xsi32>) -> (tensor<2xsi32>, tensor<4x1xsi64>) {
+  %best_logit = tensor.argmax(%logits) {axis = 1, out = si32} : (tensor<2x5xf32>) -> tensor<2xsi32>
+  %best_count = tensor.argmax(%counts) {axis = 1, keepdims = true, out = si64} : (tensor<4x{T}xsi32>) -> tensor<4x1xsi64>
+  func.return(%best_logit, %best_count) : (tensor<2xsi32>, tensor<4x1xsi64>) -> ()
 }
 ```
 
@@ -1334,11 +1334,11 @@ Defined by `Segment` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crate
 Example, from `filetests/tensor/roundtrip/contraction.ptir`:
 
 ```text
-func.func @segment(%0: tensor<6x4xf32>, %1: tensor<6xsi32>) -> (tensor<3x4xf32>, tensor<3x4xf32>, tensor<8x4xf32>) {
-  %2 = tensor.segment_sum(%0, %1) {num_segments = 3} : (tensor<6x4xf32>, tensor<6xsi32>) -> tensor<3x4xf32>
-  %3 = tensor.segment_max(%0, %1) {num_segments = 3, indices_are_sorted = true} : (tensor<6x4xf32>, tensor<6xsi32>) -> tensor<3x4xf32>
-  %4 = tensor.segment_min(%0, %1) {num_segments = 8, indices_are_sorted = true, unique = true} : (tensor<6x4xf32>, tensor<6xsi32>) -> tensor<8x4xf32>
-  func.return(%2, %3, %4) : (tensor<3x4xf32>, tensor<3x4xf32>, tensor<8x4xf32>) -> ()
+func.func @segment(%input: tensor<6x4xf32>, %segment_ids: tensor<6xsi32>) -> (tensor<3x4xf32>, tensor<3x4xf32>, tensor<8x4xf32>) {
+  %sum = tensor.segment_sum(%input, %segment_ids) {num_segments = 3} : (tensor<6x4xf32>, tensor<6xsi32>) -> tensor<3x4xf32>
+  %max = tensor.segment_max(%input, %segment_ids) {num_segments = 3, indices_are_sorted = true} : (tensor<6x4xf32>, tensor<6xsi32>) -> tensor<3x4xf32>
+  %min = tensor.segment_min(%input, %segment_ids) {num_segments = 8, indices_are_sorted = true, unique = true} : (tensor<6x4xf32>, tensor<6xsi32>) -> tensor<8x4xf32>
+  func.return(%sum, %max, %min) : (tensor<3x4xf32>, tensor<3x4xf32>, tensor<8x4xf32>) -> ()
 }
 ```
 
@@ -1376,10 +1376,10 @@ Defined by `SelectK` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crate
 Example, from `filetests/tensor/roundtrip/contraction.ptir`:
 
 ```text
-func.func @top_k(%0: tensor<2x5xf32>) -> (tensor<2x3xf32>, tensor<2x3xsi32>, tensor<1x5xf32>, tensor<1x5xsi64>) {
-  %1, %2 = tensor.top_k(%0) {k = 3, axis = 1, indices = si32} : (tensor<2x5xf32>) -> (tensor<2x3xf32>, tensor<2x3xsi32>)
-  %3, %4 = tensor.bottom_k(%0) {k = 1, axis = 0, indices = si64} : (tensor<2x5xf32>) -> (tensor<1x5xf32>, tensor<1x5xsi64>)
-  func.return(%1, %2, %3, %4) : (tensor<2x3xf32>, tensor<2x3xsi32>, tensor<1x5xf32>, tensor<1x5xsi64>) -> ()
+func.func @top_k(%input: tensor<2x5xf32>) -> (tensor<2x3xf32>, tensor<2x3xsi32>, tensor<1x5xf32>, tensor<1x5xsi64>) {
+  %top_values, %top_indices = tensor.top_k(%input) {k = 3, axis = 1, indices = si32} : (tensor<2x5xf32>) -> (tensor<2x3xf32>, tensor<2x3xsi32>)
+  %bottom_values, %bottom_indices = tensor.bottom_k(%input) {k = 1, axis = 0, indices = si64} : (tensor<2x5xf32>) -> (tensor<1x5xf32>, tensor<1x5xsi64>)
+  func.return(%top_values, %top_indices, %bottom_values, %bottom_indices) : (tensor<2x3xf32>, tensor<2x3xsi32>, tensor<1x5xf32>, tensor<1x5xsi64>) -> ()
 }
 ```
 
@@ -1411,10 +1411,10 @@ Defined by `Gather` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates
 Example, from `filetests/tensor/roundtrip/indexing.ptir`:
 
 ```text
-func.func @gather(%0: tensor<3x4xf32>, %1: tensor<3x2xsi32>, %2: tensor<5x4xsi32>) -> (tensor<3x2xf32>, tensor<5x4xf32>) {
-  %3 = tensor.gather(%0, %1) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>) -> tensor<3x2xf32>
-  %4 = tensor.gather(%0, %2) {axis = 0} : (tensor<3x4xf32>, tensor<5x4xsi32>) -> tensor<5x4xf32>
-  func.return(%3, %4) : (tensor<3x2xf32>, tensor<5x4xf32>) -> ()
+func.func @gather(%input: tensor<3x4xf32>, %column_indices: tensor<3x2xsi32>, %row_indices: tensor<5x4xsi32>) -> (tensor<3x2xf32>, tensor<5x4xf32>) {
+  %gathered_columns = tensor.gather(%input, %column_indices) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>) -> tensor<3x2xf32>
+  %gathered_rows = tensor.gather(%input, %row_indices) {axis = 0} : (tensor<3x4xf32>, tensor<5x4xsi32>) -> tensor<5x4xf32>
+  func.return(%gathered_columns, %gathered_rows) : (tensor<3x2xf32>, tensor<5x4xf32>) -> ()
 }
 ```
 
@@ -1457,12 +1457,12 @@ Defined by `Scatter` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crate
 Example, from `filetests/tensor/roundtrip/indexing.ptir`:
 
 ```text
-func.func @scatter(%0: tensor<3x4xf32>, %1: tensor<3x2xsi32>, %2: tensor<3x2xf32>) -> (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) {
-  %3 = tensor.scatter_add(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
-  %4 = tensor.scatter_max(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
-  %5 = tensor.scatter_min(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
-  %6 = tensor.scatter_replace(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
-  func.return(%3, %4, %5, %6) : (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) -> ()
+func.func @scatter(%input: tensor<3x4xf32>, %indices: tensor<3x2xsi32>, %updates: tensor<3x2xf32>) -> (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) {
+  %summed = tensor.scatter_add(%input, %indices, %updates) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  %maxima = tensor.scatter_max(%input, %indices, %updates) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  %minima = tensor.scatter_min(%input, %indices, %updates) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  %replaced = tensor.scatter_replace(%input, %indices, %updates) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  func.return(%summed, %maxima, %minima, %replaced) : (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) -> ()
 }
 ```
 
@@ -1491,12 +1491,12 @@ Defined by `ScatterReplace` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../.
 Example, from `filetests/tensor/roundtrip/indexing.ptir`:
 
 ```text
-func.func @scatter(%0: tensor<3x4xf32>, %1: tensor<3x2xsi32>, %2: tensor<3x2xf32>) -> (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) {
-  %3 = tensor.scatter_add(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
-  %4 = tensor.scatter_max(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
-  %5 = tensor.scatter_min(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
-  %6 = tensor.scatter_replace(%0, %1, %2) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
-  func.return(%3, %4, %5, %6) : (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) -> ()
+func.func @scatter(%input: tensor<3x4xf32>, %indices: tensor<3x2xsi32>, %updates: tensor<3x2xf32>) -> (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) {
+  %summed = tensor.scatter_add(%input, %indices, %updates) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  %maxima = tensor.scatter_max(%input, %indices, %updates) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  %minima = tensor.scatter_min(%input, %indices, %updates) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  %replaced = tensor.scatter_replace(%input, %indices, %updates) {axis = 1} : (tensor<3x4xf32>, tensor<3x2xsi32>, tensor<3x2xf32>) -> tensor<3x4xf32>
+  func.return(%summed, %maxima, %minima, %replaced) : (tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>, tensor<3x4xf32>) -> ()
 }
 ```
 
@@ -1539,11 +1539,11 @@ Defined by `Rng` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/gp
 Example, from `filetests/tensor/roundtrip/random.ptir`:
 
 ```text
-func.func @rng(%0: tensor<2xui64>) -> (tensor<2x3xf32>, tensor<4xbf16>, tensor<2xui64>, tensor<4xui32>) {
-  %1, %2 = tensor.rng_uniform(%0) {shape = [2, 3], dtype = f32} : (tensor<2xui64>) -> (tensor<2xui64>, tensor<2x3xf32>)
-  %3, %4 = tensor.rng_normal(%1) {shape = [4], dtype = bf16} : (tensor<2xui64>) -> (tensor<2xui64>, tensor<4xbf16>)
-  %5, %6 = tensor.rng_uniform(%3) {shape = [4], dtype = ui32} : (tensor<2xui64>) -> (tensor<2xui64>, tensor<4xui32>)
-  func.return(%2, %4, %5, %6) : (tensor<2x3xf32>, tensor<4xbf16>, tensor<2xui64>, tensor<4xui32>) -> ()
+func.func @rng(%state: tensor<2xui64>) -> (tensor<2x3xf32>, tensor<4xbf16>, tensor<2xui64>, tensor<4xui32>) {
+  %uniform_state, %uniform = tensor.rng_uniform(%state) {shape = [2, 3], dtype = f32} : (tensor<2xui64>) -> (tensor<2xui64>, tensor<2x3xf32>)
+  %normal_state, %normal = tensor.rng_normal(%uniform_state) {shape = [4], dtype = bf16} : (tensor<2xui64>) -> (tensor<2xui64>, tensor<4xbf16>)
+  %final_state, %draws = tensor.rng_uniform(%normal_state) {shape = [4], dtype = ui32} : (tensor<2xui64>) -> (tensor<2xui64>, tensor<4xui32>)
+  func.return(%uniform, %normal, %final_state, %draws) : (tensor<2x3xf32>, tensor<4xbf16>, tensor<2xui64>, tensor<4xui32>) -> ()
 }
 ```
 
@@ -1572,13 +1572,13 @@ Defined by `Yield` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/
 Example, from `filetests/tensor/roundtrip/control.ptir`:
 
 ```text
-func.func @scan(%0: tensor<4xf32>, %1: tensor<6x4xf32>) -> (tensor<4xf32>, tensor<6x4xf32>) {
-  %2, %3 = tensor.scan(%0, %1) {carry_count = 1, outputs = [tensor<4xf32>]} ({
-  ^body(%4: tensor<4xf32>, %5: tensor<4xf32>):
-    %6 = tensor.add(%4, %5) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-    tensor.yield(%6, %6) : (tensor<4xf32>, tensor<4xf32>) -> ()
+func.func @scan(%init: tensor<4xf32>, %rows: tensor<6x4xf32>) -> (tensor<4xf32>, tensor<6x4xf32>) {
+  %total, %running_sums = tensor.scan(%init, %rows) {carry_count = 1, outputs = [tensor<4xf32>]} ({
+  ^body(%carry: tensor<4xf32>, %row: tensor<4xf32>):
+    %sum = tensor.add(%carry, %row) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+    tensor.yield(%sum, %sum) : (tensor<4xf32>, tensor<4xf32>) -> ()
   }) : (tensor<4xf32>, tensor<6x4xf32>) -> (tensor<4xf32>, tensor<6x4xf32>)
-  func.return(%2, %3) : (tensor<4xf32>, tensor<6x4xf32>) -> ()
+  func.return(%total, %running_sums) : (tensor<4xf32>, tensor<6x4xf32>) -> ()
 }
 ```
 
@@ -1603,16 +1603,16 @@ Defined by `Cond` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/g
 Example, from `filetests/tensor/roundtrip/control.ptir`:
 
 ```text
-func.func @cond(%0: tensor<i1>, %1: tensor<4xf32>) -> tensor<4xf32> {
-  %2 = tensor.cond(%0, %1) {results = [tensor<4xf32>]} ({
-  ^then_branch(%3: tensor<4xf32>):
-    %4 = tensor.neg(%3) : (tensor<4xf32>) -> tensor<4xf32>
-    tensor.yield(%4) : (tensor<4xf32>) -> ()
+func.func @cond(%pred: tensor<i1>, %input: tensor<4xf32>) -> tensor<4xf32> {
+  %result = tensor.cond(%pred, %input) {results = [tensor<4xf32>]} ({
+  ^then_branch(%then_input: tensor<4xf32>):
+    %negated = tensor.neg(%then_input) : (tensor<4xf32>) -> tensor<4xf32>
+    tensor.yield(%negated) : (tensor<4xf32>) -> ()
   }, {
-  ^else_branch(%5: tensor<4xf32>):
-    tensor.yield(%5) : (tensor<4xf32>) -> ()
+  ^else_branch(%else_input: tensor<4xf32>):
+    tensor.yield(%else_input) : (tensor<4xf32>) -> ()
   }) : (tensor<i1>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%2) : (tensor<4xf32>) -> ()
+  func.return(%result) : (tensor<4xf32>) -> ()
 }
 ```
 
@@ -1643,20 +1643,20 @@ Defined by `While` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/
 Example, from `filetests/tensor/roundtrip/control.ptir`:
 
 ```text
-func.func @while(%0: tensor<si32>, %1: tensor<4xf32>) -> (tensor<si32>, tensor<4xf32>) {
-  %2, %3 = tensor.while(%0, %1) ({
-  ^cond(%4: tensor<si32>, %5: tensor<4xf32>):
-    %6 = tensor.constant() {value = dense<[] x si32: 10>} : () -> tensor<si32>
-    %7 = tensor.less(%4, %6) : (tensor<si32>, tensor<si32>) -> tensor<i1>
-    tensor.yield(%7, %4, %5) : (tensor<i1>, tensor<si32>, tensor<4xf32>) -> ()
+func.func @while(%counter: tensor<si32>, %state: tensor<4xf32>) -> (tensor<si32>, tensor<4xf32>) {
+  %final_counter, %final_state = tensor.while(%counter, %state) ({
+  ^cond(%cond_counter: tensor<si32>, %cond_state: tensor<4xf32>):
+    %limit = tensor.constant() {value = dense<[] x si32: 10>} : () -> tensor<si32>
+    %keep_going = tensor.less(%cond_counter, %limit) : (tensor<si32>, tensor<si32>) -> tensor<i1>
+    tensor.yield(%keep_going, %cond_counter, %cond_state) : (tensor<i1>, tensor<si32>, tensor<4xf32>) -> ()
   }, {
-  ^body(%8: tensor<si32>, %9: tensor<4xf32>):
-    %10 = tensor.constant() {value = dense<[] x si32: 1>} : () -> tensor<si32>
-    %11 = tensor.add(%8, %10) : (tensor<si32>, tensor<si32>) -> tensor<si32>
-    %12 = tensor.add(%9, %9) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-    tensor.yield(%11, %12) : (tensor<si32>, tensor<4xf32>) -> ()
+  ^body(%body_counter: tensor<si32>, %body_state: tensor<4xf32>):
+    %one = tensor.constant() {value = dense<[] x si32: 1>} : () -> tensor<si32>
+    %next_counter = tensor.add(%body_counter, %one) : (tensor<si32>, tensor<si32>) -> tensor<si32>
+    %doubled = tensor.add(%body_state, %body_state) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+    tensor.yield(%next_counter, %doubled) : (tensor<si32>, tensor<4xf32>) -> ()
   }) : (tensor<si32>, tensor<4xf32>) -> (tensor<si32>, tensor<4xf32>)
-  func.return(%2, %3) : (tensor<si32>, tensor<4xf32>) -> ()
+  func.return(%final_counter, %final_state) : (tensor<si32>, tensor<4xf32>) -> ()
 }
 ```
 
@@ -1688,13 +1688,13 @@ Defined by `Scan` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/g
 Example, from `filetests/tensor/roundtrip/control.ptir`:
 
 ```text
-func.func @scan(%0: tensor<4xf32>, %1: tensor<6x4xf32>) -> (tensor<4xf32>, tensor<6x4xf32>) {
-  %2, %3 = tensor.scan(%0, %1) {carry_count = 1, outputs = [tensor<4xf32>]} ({
-  ^body(%4: tensor<4xf32>, %5: tensor<4xf32>):
-    %6 = tensor.add(%4, %5) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-    tensor.yield(%6, %6) : (tensor<4xf32>, tensor<4xf32>) -> ()
+func.func @scan(%init: tensor<4xf32>, %rows: tensor<6x4xf32>) -> (tensor<4xf32>, tensor<6x4xf32>) {
+  %total, %running_sums = tensor.scan(%init, %rows) {carry_count = 1, outputs = [tensor<4xf32>]} ({
+  ^body(%carry: tensor<4xf32>, %row: tensor<4xf32>):
+    %sum = tensor.add(%carry, %row) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+    tensor.yield(%sum, %sum) : (tensor<4xf32>, tensor<4xf32>) -> ()
   }) : (tensor<4xf32>, tensor<6x4xf32>) -> (tensor<4xf32>, tensor<6x4xf32>)
-  func.return(%2, %3) : (tensor<4xf32>, tensor<6x4xf32>) -> ()
+  func.return(%total, %running_sums) : (tensor<4xf32>, tensor<6x4xf32>) -> ()
 }
 ```
 
@@ -1734,9 +1734,9 @@ Defined by `Dequantize` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../cr
 Example, from `filetests/tensor/roundtrip/quant.ptir`:
 
 ```text
-func.func @mxfp4(%0: tensor<4x64xf4e2m1>, %1: tensor<4x2xe8m0>) -> tensor<4x64xbf16> {
-  %2 = tensor.dequantize(%0, %1) {block = [1, 32], to = bf16} : (tensor<4x64xf4e2m1>, tensor<4x2xe8m0>) -> tensor<4x64xbf16>
-  func.return(%2) : (tensor<4x64xbf16>) -> ()
+func.func @mxfp4(%quantized: tensor<4x64xf4e2m1>, %scales: tensor<4x2xe8m0>) -> tensor<4x64xbf16> {
+  %dequantized = tensor.dequantize(%quantized, %scales) {block = [1, 32], to = bf16} : (tensor<4x64xf4e2m1>, tensor<4x2xe8m0>) -> tensor<4x64xbf16>
+  func.return(%dequantized) : (tensor<4x64xbf16>) -> ()
 }
 ```
 
@@ -1777,11 +1777,11 @@ Defined by `Quantize` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crat
 Example, from `filetests/tensor/roundtrip/quant.ptir`:
 
 ```text
-func.func @quantize_options(%0: tensor<8x16xf32>, %1: tensor<8x1xf32>, %2: tensor<8x16xui32>, %3: tensor<16xf32>) -> (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) {
-  %4 = tensor.quantize_stochastic(%0, %1, %2) {block = [1, 16], to = f8e4m3} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x16xui32>) -> tensor<8x16xf8e4m3>
-  %5 = tensor.quantize(%0, %1, %1) {block = [1, 16], to = ui8} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x1xf32>) -> tensor<8x16xui8>
-  %6 = tensor.quantize_table(%0, %1, %3) {block = [1, 16], to = ui4} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<16xf32>) -> tensor<8x16xui4>
-  func.return(%4, %5, %6) : (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) -> ()
+func.func @quantize_options(%input: tensor<8x16xf32>, %scales: tensor<8x1xf32>, %draws: tensor<8x16xui32>, %table: tensor<16xf32>) -> (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) {
+  %stochastic_codes = tensor.quantize_stochastic(%input, %scales, %draws) {block = [1, 16], to = f8e4m3} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x16xui32>) -> tensor<8x16xf8e4m3>
+  %offset_codes = tensor.quantize(%input, %scales, %scales) {block = [1, 16], to = ui8} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x1xf32>) -> tensor<8x16xui8>
+  %table_codes = tensor.quantize_table(%input, %scales, %table) {block = [1, 16], to = ui4} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<16xf32>) -> tensor<8x16xui4>
+  func.return(%stochastic_codes, %offset_codes, %table_codes) : (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) -> ()
 }
 ```
 
@@ -1817,11 +1817,11 @@ Defined by `QuantizeStochastic` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](
 Example, from `filetests/tensor/roundtrip/quant.ptir`:
 
 ```text
-func.func @quantize_options(%0: tensor<8x16xf32>, %1: tensor<8x1xf32>, %2: tensor<8x16xui32>, %3: tensor<16xf32>) -> (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) {
-  %4 = tensor.quantize_stochastic(%0, %1, %2) {block = [1, 16], to = f8e4m3} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x16xui32>) -> tensor<8x16xf8e4m3>
-  %5 = tensor.quantize(%0, %1, %1) {block = [1, 16], to = ui8} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x1xf32>) -> tensor<8x16xui8>
-  %6 = tensor.quantize_table(%0, %1, %3) {block = [1, 16], to = ui4} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<16xf32>) -> tensor<8x16xui4>
-  func.return(%4, %5, %6) : (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) -> ()
+func.func @quantize_options(%input: tensor<8x16xf32>, %scales: tensor<8x1xf32>, %draws: tensor<8x16xui32>, %table: tensor<16xf32>) -> (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) {
+  %stochastic_codes = tensor.quantize_stochastic(%input, %scales, %draws) {block = [1, 16], to = f8e4m3} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x16xui32>) -> tensor<8x16xf8e4m3>
+  %offset_codes = tensor.quantize(%input, %scales, %scales) {block = [1, 16], to = ui8} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x1xf32>) -> tensor<8x16xui8>
+  %table_codes = tensor.quantize_table(%input, %scales, %table) {block = [1, 16], to = ui4} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<16xf32>) -> tensor<8x16xui4>
+  func.return(%stochastic_codes, %offset_codes, %table_codes) : (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) -> ()
 }
 ```
 
@@ -1853,11 +1853,11 @@ Defined by `QuantizeTable` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../..
 Example, from `filetests/tensor/roundtrip/quant.ptir`:
 
 ```text
-func.func @quantize_options(%0: tensor<8x16xf32>, %1: tensor<8x1xf32>, %2: tensor<8x16xui32>, %3: tensor<16xf32>) -> (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) {
-  %4 = tensor.quantize_stochastic(%0, %1, %2) {block = [1, 16], to = f8e4m3} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x16xui32>) -> tensor<8x16xf8e4m3>
-  %5 = tensor.quantize(%0, %1, %1) {block = [1, 16], to = ui8} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x1xf32>) -> tensor<8x16xui8>
-  %6 = tensor.quantize_table(%0, %1, %3) {block = [1, 16], to = ui4} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<16xf32>) -> tensor<8x16xui4>
-  func.return(%4, %5, %6) : (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) -> ()
+func.func @quantize_options(%input: tensor<8x16xf32>, %scales: tensor<8x1xf32>, %draws: tensor<8x16xui32>, %table: tensor<16xf32>) -> (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) {
+  %stochastic_codes = tensor.quantize_stochastic(%input, %scales, %draws) {block = [1, 16], to = f8e4m3} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x16xui32>) -> tensor<8x16xf8e4m3>
+  %offset_codes = tensor.quantize(%input, %scales, %scales) {block = [1, 16], to = ui8} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x1xf32>) -> tensor<8x16xui8>
+  %table_codes = tensor.quantize_table(%input, %scales, %table) {block = [1, 16], to = ui4} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<16xf32>) -> tensor<8x16xui4>
+  func.return(%stochastic_codes, %offset_codes, %table_codes) : (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) -> ()
 }
 ```
 
@@ -1897,12 +1897,12 @@ Defined by `BlockScale` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../cr
 Example, from `filetests/tensor/roundtrip/quant.ptir`:
 
 ```text
-func.func @dynamic(%0: tensor<{T}x64xf32>) -> (tensor<{T}x64xf4e2m1>, tensor<{T}x4xf8e4m3>, tensor<{T}x64xf6e3m2>, tensor<{T}x2xe8m0>) {
-  %1 = tensor.block_scale_amax(%0) {block = [1, 16], to = f4e2m1, scale_dtype = f8e4m3} : (tensor<{T}x64xf32>) -> tensor<{T}x4xf8e4m3>
-  %2 = tensor.quantize(%0, %1) {block = [1, 16], to = f4e2m1} : (tensor<{T}x64xf32>, tensor<{T}x4xf8e4m3>) -> tensor<{T}x64xf4e2m1>
-  %3 = tensor.block_scale_pow2_floor(%0) {block = [1, 32], to = f6e3m2, scale_dtype = e8m0} : (tensor<{T}x64xf32>) -> tensor<{T}x2xe8m0>
-  %4 = tensor.quantize(%0, %3) {block = [1, 32], to = f6e3m2} : (tensor<{T}x64xf32>, tensor<{T}x2xe8m0>) -> tensor<{T}x64xf6e3m2>
-  func.return(%2, %1, %4, %3) : (tensor<{T}x64xf4e2m1>, tensor<{T}x4xf8e4m3>, tensor<{T}x64xf6e3m2>, tensor<{T}x2xe8m0>) -> ()
+func.func @dynamic(%input: tensor<{T}x64xf32>) -> (tensor<{T}x64xf4e2m1>, tensor<{T}x4xf8e4m3>, tensor<{T}x64xf6e3m2>, tensor<{T}x2xe8m0>) {
+  %amax_scales = tensor.block_scale_amax(%input) {block = [1, 16], to = f4e2m1, scale_dtype = f8e4m3} : (tensor<{T}x64xf32>) -> tensor<{T}x4xf8e4m3>
+  %amax_codes = tensor.quantize(%input, %amax_scales) {block = [1, 16], to = f4e2m1} : (tensor<{T}x64xf32>, tensor<{T}x4xf8e4m3>) -> tensor<{T}x64xf4e2m1>
+  %floor_scales = tensor.block_scale_pow2_floor(%input) {block = [1, 32], to = f6e3m2, scale_dtype = e8m0} : (tensor<{T}x64xf32>) -> tensor<{T}x2xe8m0>
+  %floor_codes = tensor.quantize(%input, %floor_scales) {block = [1, 32], to = f6e3m2} : (tensor<{T}x64xf32>, tensor<{T}x2xe8m0>) -> tensor<{T}x64xf6e3m2>
+  func.return(%amax_codes, %amax_scales, %floor_codes, %floor_scales) : (tensor<{T}x64xf4e2m1>, tensor<{T}x4xf8e4m3>, tensor<{T}x64xf6e3m2>, tensor<{T}x2xe8m0>) -> ()
 }
 ```
 
@@ -1939,12 +1939,12 @@ Defined by `BlockScaleRange` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../
 Example, from `filetests/tensor/roundtrip/quant.ptir`:
 
 ```text
-func.func @dynamic_options(%0: tensor<4x64xf32>, %1: tensor<4x64xui32>) -> (tensor<4x64xui8>, tensor<4x2xf32>, tensor<4x2xf32>, tensor<4x64xf8e4m3>, tensor<4x2xe8m0>) {
-  %2, %3 = tensor.block_scale_range(%0) {block = [1, 32], to = ui8, scale_dtype = f32} : (tensor<4x64xf32>) -> (tensor<4x2xf32>, tensor<4x2xf32>)
-  %4 = tensor.quantize(%0, %2, %3) {block = [1, 32], to = ui8} : (tensor<4x64xf32>, tensor<4x2xf32>, tensor<4x2xf32>) -> tensor<4x64xui8>
-  %5 = tensor.block_scale_pow2_ceil(%0) {block = [1, 32], to = f8e4m3, scale_dtype = e8m0} : (tensor<4x64xf32>) -> tensor<4x2xe8m0>
-  %6 = tensor.quantize_stochastic(%0, %5, %1) {block = [1, 32], to = f8e4m3} : (tensor<4x64xf32>, tensor<4x2xe8m0>, tensor<4x64xui32>) -> tensor<4x64xf8e4m3>
-  func.return(%4, %2, %3, %6, %5) : (tensor<4x64xui8>, tensor<4x2xf32>, tensor<4x2xf32>, tensor<4x64xf8e4m3>, tensor<4x2xe8m0>) -> ()
+func.func @dynamic_options(%input: tensor<4x64xf32>, %draws: tensor<4x64xui32>) -> (tensor<4x64xui8>, tensor<4x2xf32>, tensor<4x2xf32>, tensor<4x64xf8e4m3>, tensor<4x2xe8m0>) {
+  %range_scales, %range_offsets = tensor.block_scale_range(%input) {block = [1, 32], to = ui8, scale_dtype = f32} : (tensor<4x64xf32>) -> (tensor<4x2xf32>, tensor<4x2xf32>)
+  %range_codes = tensor.quantize(%input, %range_scales, %range_offsets) {block = [1, 32], to = ui8} : (tensor<4x64xf32>, tensor<4x2xf32>, tensor<4x2xf32>) -> tensor<4x64xui8>
+  %ceil_scales = tensor.block_scale_pow2_ceil(%input) {block = [1, 32], to = f8e4m3, scale_dtype = e8m0} : (tensor<4x64xf32>) -> tensor<4x2xe8m0>
+  %stochastic_codes = tensor.quantize_stochastic(%input, %ceil_scales, %draws) {block = [1, 32], to = f8e4m3} : (tensor<4x64xf32>, tensor<4x2xe8m0>, tensor<4x64xui32>) -> tensor<4x64xf8e4m3>
+  func.return(%range_codes, %range_scales, %range_offsets, %stochastic_codes, %ceil_scales) : (tensor<4x64xui8>, tensor<4x2xf32>, tensor<4x2xf32>, tensor<4x64xf8e4m3>, tensor<4x2xe8m0>) -> ()
 }
 ```
 

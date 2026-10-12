@@ -1,47 +1,47 @@
 // RUN: pass canonicalize
 
 // An elementwise op on broadcasts of one shape runs on that shape, and its result broadcasts.
-// CHECK: func.func @hoist
-// CHECK-NEXT: [[S:%[0-9]+]] = tensor.add(%0, %1) : (tensor<3xf32>, tensor<3xf32>) -> tensor<3xf32>
-// CHECK-NEXT: [[E:%[0-9]+]] = tensor.exp([[S]]) : (tensor<3xf32>) -> tensor<3xf32>
-// CHECK-NEXT: [[B:%[0-9]+]] = tensor.broadcast_to([[E]]) {shape = [4, 3]}
-// CHECK-NEXT: func.return([[B]])
-func.func @hoist(%0: tensor<3xf32>, %1: tensor<3xf32>) -> tensor<4x3xf32> {
-  %2 = tensor.broadcast_to(%0) {shape = [4, 3]} : (tensor<3xf32>) -> tensor<4x3xf32>
-  %3 = tensor.broadcast_to(%1) {shape = [4, 3]} : (tensor<3xf32>) -> tensor<4x3xf32>
-  %4 = tensor.add(%2, %3) : (tensor<4x3xf32>, tensor<4x3xf32>) -> tensor<4x3xf32>
-  %5 = tensor.exp(%4) : (tensor<4x3xf32>) -> tensor<4x3xf32>
-  func.return(%5) : (tensor<4x3xf32>) -> ()
+// CHECK: func.func @hoist([[LHS:%[0-9]+]]: tensor<3xf32>, [[RHS:%[0-9]+]]: tensor<3xf32>) -> tensor<4x3xf32> {
+// CHECK-NEXT: [[SUM:%[0-9]+]] = tensor.add([[LHS]], [[RHS]]) : (tensor<3xf32>, tensor<3xf32>) -> tensor<3xf32>
+// CHECK-NEXT: [[EXP:%[0-9]+]] = tensor.exp([[SUM]]) : (tensor<3xf32>) -> tensor<3xf32>
+// CHECK-NEXT: [[WIDE_EXP:%[0-9]+]] = tensor.broadcast_to([[EXP]]) {shape = [4, 3]}
+// CHECK-NEXT: func.return([[WIDE_EXP]])
+func.func @hoist(%lhs: tensor<3xf32>, %rhs: tensor<3xf32>) -> tensor<4x3xf32> {
+  %wide_lhs = tensor.broadcast_to(%lhs) {shape = [4, 3]} : (tensor<3xf32>) -> tensor<4x3xf32>
+  %wide_rhs = tensor.broadcast_to(%rhs) {shape = [4, 3]} : (tensor<3xf32>) -> tensor<4x3xf32>
+  %sum = tensor.add(%wide_lhs, %wide_rhs) : (tensor<4x3xf32>, tensor<4x3xf32>) -> tensor<4x3xf32>
+  %exp = tensor.exp(%sum) : (tensor<4x3xf32>) -> tensor<4x3xf32>
+  func.return(%exp) : (tensor<4x3xf32>) -> ()
 }
 
 // -----
 
 // A splat constant operand is splatted to the smaller shape, and a compare broadcasts its i1
 // result.
-// CHECK: func.func @splat_operand
-// CHECK: [[C:%[0-9]+]] = tensor.constant() {value = dense<[] x f32: 2.0>}
-// CHECK-NEXT: [[S:%[0-9]+]] = tensor.broadcast_to([[C]]) {shape = [3]}
-// CHECK-NEXT: [[P:%[0-9]+]] = tensor.less(%0, [[S]]) : (tensor<3xf32>, tensor<3xf32>) -> tensor<3xi1>
-// CHECK-NEXT: tensor.broadcast_to([[P]]) {shape = [4, 3]} : (tensor<3xi1>) -> tensor<4x3xi1>
-func.func @splat_operand(%0: tensor<3xf32>) -> tensor<4x3xi1> {
-  %1 = tensor.broadcast_to(%0) {shape = [4, 3]} : (tensor<3xf32>) -> tensor<4x3xf32>
-  %2 = tensor.constant() {value = dense<[4, 3] x f32: 2.0>} : () -> tensor<4x3xf32>
-  %3 = tensor.less(%1, %2) : (tensor<4x3xf32>, tensor<4x3xf32>) -> tensor<4x3xi1>
-  func.return(%3) : (tensor<4x3xi1>) -> ()
+// CHECK: func.func @splat_operand([[INPUT:%[0-9]+]]: tensor<3xf32>) -> tensor<4x3xi1> {
+// CHECK: [[TWO:%[0-9]+]] = tensor.constant() {value = dense<[] x f32: 2.0>}
+// CHECK-NEXT: [[TWOS:%[0-9]+]] = tensor.broadcast_to([[TWO]]) {shape = [3]}
+// CHECK-NEXT: [[BELOW_TWO:%[0-9]+]] = tensor.less([[INPUT]], [[TWOS]]) : (tensor<3xf32>, tensor<3xf32>) -> tensor<3xi1>
+// CHECK-NEXT: tensor.broadcast_to([[BELOW_TWO]]) {shape = [4, 3]} : (tensor<3xi1>) -> tensor<4x3xi1>
+func.func @splat_operand(%input: tensor<3xf32>) -> tensor<4x3xi1> {
+  %wide_input = tensor.broadcast_to(%input) {shape = [4, 3]} : (tensor<3xf32>) -> tensor<4x3xf32>
+  %twos = tensor.constant() {value = dense<[4, 3] x f32: 2.0>} : () -> tensor<4x3xf32>
+  %below_two = tensor.less(%wide_input, %twos) : (tensor<4x3xf32>, tensor<4x3xf32>) -> tensor<4x3xi1>
+  func.return(%below_two) : (tensor<4x3xi1>) -> ()
 }
 
 // -----
 
 // Broadcasts from different shapes, or a non-splat operand, keep the op at the wide shape.
-// CHECK: func.func @stays
+// CHECK: func.func @stays([[ROW:%[0-9]+]]: tensor<3xf32>, [[COLUMN:%[0-9]+]]: tensor<4x1xf32>, [[MATRIX:%[0-9]+]]: tensor<4x3xf32>) -> (tensor<4x3xf32>, tensor<4x3xf32>) {
 // CHECK: tensor.add({{%[0-9]+}}, {{%[0-9]+}}) : (tensor<4x3xf32>, tensor<4x3xf32>)
-// CHECK: tensor.mul({{%[0-9]+}}, %2) : (tensor<4x3xf32>, tensor<4x3xf32>)
-func.func @stays(%0: tensor<3xf32>, %1: tensor<4x1xf32>, %2: tensor<4x3xf32>) -> (tensor<4x3xf32>, tensor<4x3xf32>) {
-  %3 = tensor.broadcast_to(%0) {shape = [4, 3]} : (tensor<3xf32>) -> tensor<4x3xf32>
-  %4 = tensor.broadcast_to(%1) {shape = [4, 3]} : (tensor<4x1xf32>) -> tensor<4x3xf32>
-  %5 = tensor.add(%3, %4) : (tensor<4x3xf32>, tensor<4x3xf32>) -> tensor<4x3xf32>
-  %6 = tensor.mul(%3, %2) : (tensor<4x3xf32>, tensor<4x3xf32>) -> tensor<4x3xf32>
-  func.return(%5, %6) : (tensor<4x3xf32>, tensor<4x3xf32>) -> ()
+// CHECK: tensor.mul({{%[0-9]+}}, [[MATRIX]]) : (tensor<4x3xf32>, tensor<4x3xf32>)
+func.func @stays(%row: tensor<3xf32>, %column: tensor<4x1xf32>, %matrix: tensor<4x3xf32>) -> (tensor<4x3xf32>, tensor<4x3xf32>) {
+  %wide_row = tensor.broadcast_to(%row) {shape = [4, 3]} : (tensor<3xf32>) -> tensor<4x3xf32>
+  %wide_column = tensor.broadcast_to(%column) {shape = [4, 3]} : (tensor<4x1xf32>) -> tensor<4x3xf32>
+  %sum = tensor.add(%wide_row, %wide_column) : (tensor<4x3xf32>, tensor<4x3xf32>) -> tensor<4x3xf32>
+  %product = tensor.mul(%wide_row, %matrix) : (tensor<4x3xf32>, tensor<4x3xf32>) -> tensor<4x3xf32>
+  func.return(%sum, %product) : (tensor<4x3xf32>, tensor<4x3xf32>) -> ()
 }
 
 // -----
@@ -49,21 +49,21 @@ func.func @stays(%0: tensor<3xf32>, %1: tensor<4x1xf32>, %2: tensor<4x3xf32>) ->
 // A non-splat constant operand keeps the op at the wide shape.
 // CHECK: func.func @non_splat
 // CHECK: tensor.mul({{%[0-9]+}}, {{%[0-9]+}}) : (tensor<2x2xf32>, tensor<2x2xf32>)
-func.func @non_splat(%0: tensor<2xf32>) -> tensor<2x2xf32> {
-  %1 = tensor.broadcast_to(%0) {shape = [2, 2]} : (tensor<2xf32>) -> tensor<2x2xf32>
-  %2 = tensor.constant() {value = dense<[2, 2] x f32: [1.0, 2.0, 3.0, 4.0]>} : () -> tensor<2x2xf32>
-  %3 = tensor.mul(%1, %2) : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
-  func.return(%3) : (tensor<2x2xf32>) -> ()
+func.func @non_splat(%input: tensor<2xf32>) -> tensor<2x2xf32> {
+  %wide_input = tensor.broadcast_to(%input) {shape = [2, 2]} : (tensor<2xf32>) -> tensor<2x2xf32>
+  %coefficients = tensor.constant() {value = dense<[2, 2] x f32: [1.0, 2.0, 3.0, 4.0]>} : () -> tensor<2x2xf32>
+  %product = tensor.mul(%wide_input, %coefficients) : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+  func.return(%product) : (tensor<2x2xf32>) -> ()
 }
 
 // -----
 
 // A reshape that only adds leading axes of extent 1 adds nothing to a broadcast.
-// CHECK: func.func @leading_unit_axes
-// CHECK-NEXT: [[B:%[0-9]+]] = tensor.broadcast_to(%0) {shape = [5, 16]}
-// CHECK-NEXT: func.return([[B]])
-func.func @leading_unit_axes(%0: tensor<16xf32>) -> tensor<5x16xf32> {
-  %1 = tensor.reshape(%0) {shape = [1, 16]} : (tensor<16xf32>) -> tensor<1x16xf32>
-  %2 = tensor.broadcast_to(%1) {shape = [5, 16]} : (tensor<1x16xf32>) -> tensor<5x16xf32>
-  func.return(%2) : (tensor<5x16xf32>) -> ()
+// CHECK: func.func @leading_unit_axes([[INPUT:%[0-9]+]]: tensor<16xf32>) -> tensor<5x16xf32> {
+// CHECK-NEXT: [[ROWS:%[0-9]+]] = tensor.broadcast_to([[INPUT]]) {shape = [5, 16]}
+// CHECK-NEXT: func.return([[ROWS]])
+func.func @leading_unit_axes(%input: tensor<16xf32>) -> tensor<5x16xf32> {
+  %row = tensor.reshape(%input) {shape = [1, 16]} : (tensor<16xf32>) -> tensor<1x16xf32>
+  %rows = tensor.broadcast_to(%row) {shape = [5, 16]} : (tensor<1x16xf32>) -> tensor<5x16xf32>
+  func.return(%rows) : (tensor<5x16xf32>) -> ()
 }

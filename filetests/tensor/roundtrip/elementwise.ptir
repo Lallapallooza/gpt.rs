@@ -1,96 +1,171 @@
 // RUN: roundtrip
 
 // Arithmetic and transcendental kinds of the unary and binary families.
-func.func @kinds(%0: tensor<4xf32>, %1: tensor<4xf32>) -> tensor<4xf32> {
-  %2 = tensor.add(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %3 = tensor.sub(%2, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %4 = tensor.mul(%3, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %5 = tensor.div(%4, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %6 = tensor.maximum(%5, %0) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %7 = tensor.minimum(%6, %0) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %8 = tensor.neg(%7) : (tensor<4xf32>) -> tensor<4xf32>
-  %9 = tensor.abs(%8) : (tensor<4xf32>) -> tensor<4xf32>
-  %10 = tensor.exp(%9) : (tensor<4xf32>) -> tensor<4xf32>
-  %11 = tensor.log(%10) : (tensor<4xf32>) -> tensor<4xf32>
-  %12 = tensor.tanh(%11) : (tensor<4xf32>) -> tensor<4xf32>
-  %13 = tensor.erf(%12) : (tensor<4xf32>) -> tensor<4xf32>
-  %14 = tensor.rsqrt(%13) : (tensor<4xf32>) -> tensor<4xf32>
-  %15 = tensor.reciprocal(%14) : (tensor<4xf32>) -> tensor<4xf32>
-  func.return(%15) : (tensor<4xf32>) -> ()
+// CHECK: func.func @kinds([[LHS:%[0-9]+]]: tensor<4xf32>, [[RHS:%[0-9]+]]: tensor<4xf32>) -> tensor<4xf32> {
+// CHECK-NEXT: [[SUM:%[0-9]+]] = tensor.add([[LHS]], [[RHS]]) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: [[DIFFERENCE:%[0-9]+]] = tensor.sub([[SUM]], [[RHS]]) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: [[PRODUCT:%[0-9]+]] = tensor.mul([[DIFFERENCE]], [[RHS]]) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: [[QUOTIENT:%[0-9]+]] = tensor.div([[PRODUCT]], [[RHS]]) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: [[MAXIMUM:%[0-9]+]] = tensor.maximum([[QUOTIENT]], [[LHS]]) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: [[MINIMUM:%[0-9]+]] = tensor.minimum([[MAXIMUM]], [[LHS]]) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: [[NEGATED:%[0-9]+]] = tensor.neg([[MINIMUM]]) : (tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: [[ABSOLUTE:%[0-9]+]] = tensor.abs([[NEGATED]]) : (tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: [[EXPONENTIAL:%[0-9]+]] = tensor.exp([[ABSOLUTE]]) : (tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: [[LOGARITHM:%[0-9]+]] = tensor.log([[EXPONENTIAL]]) : (tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: [[TANH:%[0-9]+]] = tensor.tanh([[LOGARITHM]]) : (tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: [[ERF:%[0-9]+]] = tensor.erf([[TANH]]) : (tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: [[RSQRT:%[0-9]+]] = tensor.rsqrt([[ERF]]) : (tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: [[RECIPROCAL:%[0-9]+]] = tensor.reciprocal([[RSQRT]]) : (tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: func.return([[RECIPROCAL]]) : (tensor<4xf32>) -> ()
+// CHECK-NEXT: }
+func.func @kinds(%lhs: tensor<4xf32>, %rhs: tensor<4xf32>) -> tensor<4xf32> {
+  %sum = tensor.add(%lhs, %rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %difference = tensor.sub(%sum, %rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %product = tensor.mul(%difference, %rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %quotient = tensor.div(%product, %rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %maximum = tensor.maximum(%quotient, %lhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %minimum = tensor.minimum(%maximum, %lhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %negated = tensor.neg(%minimum) : (tensor<4xf32>) -> tensor<4xf32>
+  %absolute = tensor.abs(%negated) : (tensor<4xf32>) -> tensor<4xf32>
+  %exponential = tensor.exp(%absolute) : (tensor<4xf32>) -> tensor<4xf32>
+  %logarithm = tensor.log(%exponential) : (tensor<4xf32>) -> tensor<4xf32>
+  %tanh = tensor.tanh(%logarithm) : (tensor<4xf32>) -> tensor<4xf32>
+  %erf = tensor.erf(%tanh) : (tensor<4xf32>) -> tensor<4xf32>
+  %rsqrt = tensor.rsqrt(%erf) : (tensor<4xf32>) -> tensor<4xf32>
+  %reciprocal = tensor.reciprocal(%rsqrt) : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%reciprocal) : (tensor<4xf32>) -> ()
 }
 
 // -----
+// CHECK: func.func @constants() -> (tensor<2x2xf32>, tensor<3xsi32>, tensor<f32>, tensor<2xbf16>, tensor<2xf32>, tensor<1xf32>, tensor<2xi1>, tensor<2xf8e4m3>, tensor<0xf32>) {
+// CHECK-NEXT: [[MATRIX:%[0-9]+]] = tensor.constant() {value = dense<[2, 2] x f32: [1.0, -0.5, 1e-7, inf]>} : () -> tensor<2x2xf32>
+// CHECK-NEXT: [[ZEROS:%[0-9]+]] = tensor.constant() {value = dense<[3] x si32: 0>} : () -> tensor<3xsi32>
+// CHECK-NEXT: [[HALF:%[0-9]+]] = tensor.constant() {value = dense<[] x f32: 0.5>} : () -> tensor<f32>
+// CHECK-NEXT: [[ONE_AND_PI:%[0-9]+]] = tensor.constant() {value = dense<[2] x bf16: [1.0, 3.140625]>} : () -> tensor<2xbf16>
+// CHECK-NEXT: [[NEG_ZERO_AND_NEG_INF:%[0-9]+]] = tensor.constant() {value = dense<[2] x f32: [-0.0, -inf]>} : () -> tensor<2xf32>
+// CHECK-NEXT: [[NAN:%[0-9]+]] = tensor.constant() {value = dense<[1] x f32: 0x0000c07f>} : () -> tensor<1xf32>
+// CHECK-NEXT: [[FLAGS:%[0-9]+]] = tensor.constant() {value = dense<[2] x i1: [true, false]>} : () -> tensor<2xi1>
+// CHECK-NEXT: [[FP8_VALUES:%[0-9]+]] = tensor.constant() {value = dense<[2] x f8e4m3: 0x3840>} : () -> tensor<2xf8e4m3>
+// CHECK-NEXT: [[EMPTY:%[0-9]+]] = tensor.constant() {value = dense<[0] x f32: []>} : () -> tensor<0xf32>
+// CHECK-NEXT: func.return([[MATRIX]], [[ZEROS]], [[HALF]], [[ONE_AND_PI]], [[NEG_ZERO_AND_NEG_INF]], [[NAN]], [[FLAGS]], [[FP8_VALUES]], [[EMPTY]]) : (tensor<2x2xf32>, tensor<3xsi32>, tensor<f32>, tensor<2xbf16>, tensor<2xf32>, tensor<1xf32>, tensor<2xi1>, tensor<2xf8e4m3>, tensor<0xf32>) -> ()
+// CHECK-NEXT: }
 func.func @constants() -> (tensor<2x2xf32>, tensor<3xsi32>, tensor<f32>, tensor<2xbf16>, tensor<2xf32>, tensor<1xf32>, tensor<2xi1>, tensor<2xf8e4m3>, tensor<0xf32>) {
-  %0 = tensor.constant() {value = dense<[2, 2] x f32: [1.0, -0.5, 1e-7, inf]>} : () -> tensor<2x2xf32>
-  %1 = tensor.constant() {value = dense<[3] x si32: 0>} : () -> tensor<3xsi32>
-  %2 = tensor.constant() {value = dense<[] x f32: 0.5>} : () -> tensor<f32>
-  %3 = tensor.constant() {value = dense<[2] x bf16: [1.0, 3.140625]>} : () -> tensor<2xbf16>
-  %4 = tensor.constant() {value = dense<[2] x f32: [-0.0, -inf]>} : () -> tensor<2xf32>
-  %5 = tensor.constant() {value = dense<[1] x f32: 0x0000c07f>} : () -> tensor<1xf32>
-  %6 = tensor.constant() {value = dense<[2] x i1: [true, false]>} : () -> tensor<2xi1>
-  %7 = tensor.constant() {value = dense<[2] x f8e4m3: 0x3840>} : () -> tensor<2xf8e4m3>
-  %8 = tensor.constant() {value = dense<[0] x f32: []>} : () -> tensor<0xf32>
-  func.return(%0, %1, %2, %3, %4, %5, %6, %7, %8) : (tensor<2x2xf32>, tensor<3xsi32>, tensor<f32>, tensor<2xbf16>, tensor<2xf32>, tensor<1xf32>, tensor<2xi1>, tensor<2xf8e4m3>, tensor<0xf32>) -> ()
+  %matrix = tensor.constant() {value = dense<[2, 2] x f32: [1.0, -0.5, 1e-7, inf]>} : () -> tensor<2x2xf32>
+  %zeros = tensor.constant() {value = dense<[3] x si32: 0>} : () -> tensor<3xsi32>
+  %half = tensor.constant() {value = dense<[] x f32: 0.5>} : () -> tensor<f32>
+  %one_and_pi = tensor.constant() {value = dense<[2] x bf16: [1.0, 3.140625]>} : () -> tensor<2xbf16>
+  %neg_zero_and_neg_inf = tensor.constant() {value = dense<[2] x f32: [-0.0, -inf]>} : () -> tensor<2xf32>
+  %nan = tensor.constant() {value = dense<[1] x f32: 0x0000c07f>} : () -> tensor<1xf32>
+  %flags = tensor.constant() {value = dense<[2] x i1: [true, false]>} : () -> tensor<2xi1>
+  %fp8_values = tensor.constant() {value = dense<[2] x f8e4m3: 0x3840>} : () -> tensor<2xf8e4m3>
+  %empty = tensor.constant() {value = dense<[0] x f32: []>} : () -> tensor<0xf32>
+  func.return(%matrix, %zeros, %half, %one_and_pi, %neg_zero_and_neg_inf, %nan, %flags, %fp8_values, %empty) : (tensor<2x2xf32>, tensor<3xsi32>, tensor<f32>, tensor<2xbf16>, tensor<2xf32>, tensor<1xf32>, tensor<2xi1>, tensor<2xf8e4m3>, tensor<0xf32>) -> ()
 }
 
 // -----
-func.func @compare(%0: tensor<4xf32>, %1: tensor<4xf32>) -> (tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>) {
-  %2 = tensor.less(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
-  %3 = tensor.less_equal(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
-  %4 = tensor.equal(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
-  %5 = tensor.greater_equal(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
-  %6 = tensor.greater(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
-  %7 = tensor.not_equal(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
-  func.return(%2, %3, %4, %5, %6, %7) : (tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>) -> ()
+// CHECK: func.func @compare([[LHS:%[0-9]+]]: tensor<4xf32>, [[RHS:%[0-9]+]]: tensor<4xf32>) -> (tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>) {
+// CHECK-NEXT: [[LESS:%[0-9]+]] = tensor.less([[LHS]], [[RHS]]) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+// CHECK-NEXT: [[LESS_EQUAL:%[0-9]+]] = tensor.less_equal([[LHS]], [[RHS]]) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+// CHECK-NEXT: [[EQUAL:%[0-9]+]] = tensor.equal([[LHS]], [[RHS]]) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+// CHECK-NEXT: [[GREATER_EQUAL:%[0-9]+]] = tensor.greater_equal([[LHS]], [[RHS]]) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+// CHECK-NEXT: [[GREATER:%[0-9]+]] = tensor.greater([[LHS]], [[RHS]]) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+// CHECK-NEXT: [[NOT_EQUAL:%[0-9]+]] = tensor.not_equal([[LHS]], [[RHS]]) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+// CHECK-NEXT: func.return([[LESS]], [[LESS_EQUAL]], [[EQUAL]], [[GREATER_EQUAL]], [[GREATER]], [[NOT_EQUAL]]) : (tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>) -> ()
+// CHECK-NEXT: }
+func.func @compare(%lhs: tensor<4xf32>, %rhs: tensor<4xf32>) -> (tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>) {
+  %less = tensor.less(%lhs, %rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  %less_equal = tensor.less_equal(%lhs, %rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  %equal = tensor.equal(%lhs, %rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  %greater_equal = tensor.greater_equal(%lhs, %rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  %greater = tensor.greater(%lhs, %rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  %not_equal = tensor.not_equal(%lhs, %rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+  func.return(%less, %less_equal, %equal, %greater_equal, %greater, %not_equal) : (tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>) -> ()
 }
 
 // -----
-func.func @compare_si32(%0: tensor<2x{T}xsi32>, %1: tensor<2x{T}xsi32>) -> tensor<2x{T}xi1> {
-  %2 = tensor.greater_equal(%0, %1) : (tensor<2x{T}xsi32>, tensor<2x{T}xsi32>) -> tensor<2x{T}xi1>
-  func.return(%2) : (tensor<2x{T}xi1>) -> ()
+// CHECK: func.func @compare_si32([[LHS:%[0-9]+]]: tensor<2x{T}xsi32>, [[RHS:%[0-9]+]]: tensor<2x{T}xsi32>) -> tensor<2x{T}xi1> {
+// CHECK-NEXT: [[GREATER_EQUAL:%[0-9]+]] = tensor.greater_equal([[LHS]], [[RHS]]) : (tensor<2x{T}xsi32>, tensor<2x{T}xsi32>) -> tensor<2x{T}xi1>
+// CHECK-NEXT: func.return([[GREATER_EQUAL]]) : (tensor<2x{T}xi1>) -> ()
+// CHECK-NEXT: }
+func.func @compare_si32(%lhs: tensor<2x{T}xsi32>, %rhs: tensor<2x{T}xsi32>) -> tensor<2x{T}xi1> {
+  %greater_equal = tensor.greater_equal(%lhs, %rhs) : (tensor<2x{T}xsi32>, tensor<2x{T}xsi32>) -> tensor<2x{T}xi1>
+  func.return(%greater_equal) : (tensor<2x{T}xi1>) -> ()
 }
 
 // -----
-func.func @select(%0: tensor<2x{T}xi1>, %1: tensor<2x{T}xf32>, %2: tensor<2x{T}xf32>) -> tensor<2x{T}xf32> {
-  %3 = tensor.select(%0, %1, %2) : (tensor<2x{T}xi1>, tensor<2x{T}xf32>, tensor<2x{T}xf32>) -> tensor<2x{T}xf32>
-  func.return(%3) : (tensor<2x{T}xf32>) -> ()
+// CHECK: func.func @select([[CONDITION:%[0-9]+]]: tensor<2x{T}xi1>, [[ON_TRUE:%[0-9]+]]: tensor<2x{T}xf32>, [[ON_FALSE:%[0-9]+]]: tensor<2x{T}xf32>) -> tensor<2x{T}xf32> {
+// CHECK-NEXT: [[SELECTED:%[0-9]+]] = tensor.select([[CONDITION]], [[ON_TRUE]], [[ON_FALSE]]) : (tensor<2x{T}xi1>, tensor<2x{T}xf32>, tensor<2x{T}xf32>) -> tensor<2x{T}xf32>
+// CHECK-NEXT: func.return([[SELECTED]]) : (tensor<2x{T}xf32>) -> ()
+// CHECK-NEXT: }
+func.func @select(%condition: tensor<2x{T}xi1>, %on_true: tensor<2x{T}xf32>, %on_false: tensor<2x{T}xf32>) -> tensor<2x{T}xf32> {
+  %selected = tensor.select(%condition, %on_true, %on_false) : (tensor<2x{T}xi1>, tensor<2x{T}xf32>, tensor<2x{T}xf32>) -> tensor<2x{T}xf32>
+  func.return(%selected) : (tensor<2x{T}xf32>) -> ()
 }
 
 // -----
-func.func @cast(%0: tensor<2x3xbf16>, %1: tensor<4xsi32>) -> (tensor<2x3xf32>, tensor<4xi1>, tensor<4xsi32>) {
-  %2 = tensor.cast(%0) {to = f32} : (tensor<2x3xbf16>) -> tensor<2x3xf32>
-  %3 = tensor.cast(%1) {to = i1} : (tensor<4xsi32>) -> tensor<4xi1>
-  %4 = tensor.cast(%1) {to = si32} : (tensor<4xsi32>) -> tensor<4xsi32>
-  func.return(%2, %3, %4) : (tensor<2x3xf32>, tensor<4xi1>, tensor<4xsi32>) -> ()
+// CHECK: func.func @cast([[BF16_INPUT:%[0-9]+]]: tensor<2x3xbf16>, [[SI32_INPUT:%[0-9]+]]: tensor<4xsi32>) -> (tensor<2x3xf32>, tensor<4xi1>, tensor<4xsi32>) {
+// CHECK-NEXT: [[AS_F32:%[0-9]+]] = tensor.cast([[BF16_INPUT]]) {to = f32} : (tensor<2x3xbf16>) -> tensor<2x3xf32>
+// CHECK-NEXT: [[AS_I1:%[0-9]+]] = tensor.cast([[SI32_INPUT]]) {to = i1} : (tensor<4xsi32>) -> tensor<4xi1>
+// CHECK-NEXT: [[AS_SI32:%[0-9]+]] = tensor.cast([[SI32_INPUT]]) {to = si32} : (tensor<4xsi32>) -> tensor<4xsi32>
+// CHECK-NEXT: func.return([[AS_F32]], [[AS_I1]], [[AS_SI32]]) : (tensor<2x3xf32>, tensor<4xi1>, tensor<4xsi32>) -> ()
+// CHECK-NEXT: }
+func.func @cast(%bf16_input: tensor<2x3xbf16>, %si32_input: tensor<4xsi32>) -> (tensor<2x3xf32>, tensor<4xi1>, tensor<4xsi32>) {
+  %as_f32 = tensor.cast(%bf16_input) {to = f32} : (tensor<2x3xbf16>) -> tensor<2x3xf32>
+  %as_i1 = tensor.cast(%si32_input) {to = i1} : (tensor<4xsi32>) -> tensor<4xi1>
+  %as_si32 = tensor.cast(%si32_input) {to = si32} : (tensor<4xsi32>) -> tensor<4xsi32>
+  func.return(%as_f32, %as_i1, %as_si32) : (tensor<2x3xf32>, tensor<4xi1>, tensor<4xsi32>) -> ()
 }
 
 // -----
-func.func @stop_gradient(%0: tensor<2x{T}xf32>) -> tensor<2x{T}xf32> {
-  %1 = tensor.stop_gradient(%0) : (tensor<2x{T}xf32>) -> tensor<2x{T}xf32>
-  func.return(%1) : (tensor<2x{T}xf32>) -> ()
+// CHECK: func.func @stop_gradient([[INPUT:%[0-9]+]]: tensor<2x{T}xf32>) -> tensor<2x{T}xf32> {
+// CHECK-NEXT: [[DETACHED:%[0-9]+]] = tensor.stop_gradient([[INPUT]]) : (tensor<2x{T}xf32>) -> tensor<2x{T}xf32>
+// CHECK-NEXT: func.return([[DETACHED]]) : (tensor<2x{T}xf32>) -> ()
+// CHECK-NEXT: }
+func.func @stop_gradient(%input: tensor<2x{T}xf32>) -> tensor<2x{T}xf32> {
+  %detached = tensor.stop_gradient(%input) : (tensor<2x{T}xf32>) -> tensor<2x{T}xf32>
+  func.return(%detached) : (tensor<2x{T}xf32>) -> ()
 }
 
 // -----
 // The kinds that compute on bits, and sin and cos.
-func.func @bits(%0: tensor<4xui8>, %1: tensor<4xi1>, %2: tensor<4xf64>) -> (tensor<4xui8>, tensor<4xi1>, tensor<4xf64>) {
-  %3 = tensor.and(%0, %0) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
-  %4 = tensor.or(%3, %0) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
-  %5 = tensor.xor(%4, %0) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
-  %6 = tensor.shift_left(%5, %0) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
-  %7 = tensor.shift_right_logical(%6, %0) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
-  %8 = tensor.shift_right_arithmetic(%7, %0) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
-  %9 = tensor.not(%8) : (tensor<4xui8>) -> tensor<4xui8>
-  %10 = tensor.not(%1) : (tensor<4xi1>) -> tensor<4xi1>
-  %11 = tensor.sin(%2) : (tensor<4xf64>) -> tensor<4xf64>
-  %12 = tensor.cos(%11) : (tensor<4xf64>) -> tensor<4xf64>
-  func.return(%9, %10, %12) : (tensor<4xui8>, tensor<4xi1>, tensor<4xf64>) -> ()
+// CHECK: func.func @bits([[BYTES:%[0-9]+]]: tensor<4xui8>, [[FLAGS:%[0-9]+]]: tensor<4xi1>, [[ANGLES:%[0-9]+]]: tensor<4xf64>) -> (tensor<4xui8>, tensor<4xi1>, tensor<4xf64>) {
+// CHECK-NEXT: [[AND:%[0-9]+]] = tensor.and([[BYTES]], [[BYTES]]) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+// CHECK-NEXT: [[OR:%[0-9]+]] = tensor.or([[AND]], [[BYTES]]) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+// CHECK-NEXT: [[XOR:%[0-9]+]] = tensor.xor([[OR]], [[BYTES]]) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+// CHECK-NEXT: [[SHIFTED_LEFT:%[0-9]+]] = tensor.shift_left([[XOR]], [[BYTES]]) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+// CHECK-NEXT: [[SHIFTED_RIGHT_LOGICAL:%[0-9]+]] = tensor.shift_right_logical([[SHIFTED_LEFT]], [[BYTES]]) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+// CHECK-NEXT: [[SHIFTED_RIGHT_ARITHMETIC:%[0-9]+]] = tensor.shift_right_arithmetic([[SHIFTED_RIGHT_LOGICAL]], [[BYTES]]) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+// CHECK-NEXT: [[INVERTED_BYTES:%[0-9]+]] = tensor.not([[SHIFTED_RIGHT_ARITHMETIC]]) : (tensor<4xui8>) -> tensor<4xui8>
+// CHECK-NEXT: [[INVERTED_FLAGS:%[0-9]+]] = tensor.not([[FLAGS]]) : (tensor<4xi1>) -> tensor<4xi1>
+// CHECK-NEXT: [[SINE:%[0-9]+]] = tensor.sin([[ANGLES]]) : (tensor<4xf64>) -> tensor<4xf64>
+// CHECK-NEXT: [[COSINE:%[0-9]+]] = tensor.cos([[SINE]]) : (tensor<4xf64>) -> tensor<4xf64>
+// CHECK-NEXT: func.return([[INVERTED_BYTES]], [[INVERTED_FLAGS]], [[COSINE]]) : (tensor<4xui8>, tensor<4xi1>, tensor<4xf64>) -> ()
+// CHECK-NEXT: }
+func.func @bits(%bytes: tensor<4xui8>, %flags: tensor<4xi1>, %angles: tensor<4xf64>) -> (tensor<4xui8>, tensor<4xi1>, tensor<4xf64>) {
+  %and = tensor.and(%bytes, %bytes) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+  %or = tensor.or(%and, %bytes) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+  %xor = tensor.xor(%or, %bytes) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+  %shifted_left = tensor.shift_left(%xor, %bytes) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+  %shifted_right_logical = tensor.shift_right_logical(%shifted_left, %bytes) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+  %shifted_right_arithmetic = tensor.shift_right_arithmetic(%shifted_right_logical, %bytes) : (tensor<4xui8>, tensor<4xui8>) -> tensor<4xui8>
+  %inverted_bytes = tensor.not(%shifted_right_arithmetic) : (tensor<4xui8>) -> tensor<4xui8>
+  %inverted_flags = tensor.not(%flags) : (tensor<4xi1>) -> tensor<4xi1>
+  %sine = tensor.sin(%angles) : (tensor<4xf64>) -> tensor<4xf64>
+  %cosine = tensor.cos(%sine) : (tensor<4xf64>) -> tensor<4xf64>
+  func.return(%inverted_bytes, %inverted_flags, %cosine) : (tensor<4xui8>, tensor<4xi1>, tensor<4xf64>) -> ()
 }
 
 // -----
 // Casts between the integer widths, and to the fnuz floats.
-func.func @casts(%0: tensor<4xsi16>, %1: tensor<4xf32>) -> (tensor<4xui64>, tensor<4xf8e4m3fnuz>, tensor<4xf8e5m2fnuz>) {
-  %2 = tensor.cast(%0) {to = ui64} : (tensor<4xsi16>) -> tensor<4xui64>
-  %3 = tensor.cast(%1) {to = f8e4m3fnuz} : (tensor<4xf32>) -> tensor<4xf8e4m3fnuz>
-  %4 = tensor.cast(%1) {to = f8e5m2fnuz} : (tensor<4xf32>) -> tensor<4xf8e5m2fnuz>
-  func.return(%2, %3, %4) : (tensor<4xui64>, tensor<4xf8e4m3fnuz>, tensor<4xf8e5m2fnuz>) -> ()
+// CHECK: func.func @casts([[SI16_INPUT:%[0-9]+]]: tensor<4xsi16>, [[F32_INPUT:%[0-9]+]]: tensor<4xf32>) -> (tensor<4xui64>, tensor<4xf8e4m3fnuz>, tensor<4xf8e5m2fnuz>) {
+// CHECK-NEXT: [[AS_UI64:%[0-9]+]] = tensor.cast([[SI16_INPUT]]) {to = ui64} : (tensor<4xsi16>) -> tensor<4xui64>
+// CHECK-NEXT: [[AS_F8E4M3FNUZ:%[0-9]+]] = tensor.cast([[F32_INPUT]]) {to = f8e4m3fnuz} : (tensor<4xf32>) -> tensor<4xf8e4m3fnuz>
+// CHECK-NEXT: [[AS_F8E5M2FNUZ:%[0-9]+]] = tensor.cast([[F32_INPUT]]) {to = f8e5m2fnuz} : (tensor<4xf32>) -> tensor<4xf8e5m2fnuz>
+// CHECK-NEXT: func.return([[AS_UI64]], [[AS_F8E4M3FNUZ]], [[AS_F8E5M2FNUZ]]) : (tensor<4xui64>, tensor<4xf8e4m3fnuz>, tensor<4xf8e5m2fnuz>) -> ()
+// CHECK-NEXT: }
+func.func @casts(%si16_input: tensor<4xsi16>, %f32_input: tensor<4xf32>) -> (tensor<4xui64>, tensor<4xf8e4m3fnuz>, tensor<4xf8e5m2fnuz>) {
+  %as_ui64 = tensor.cast(%si16_input) {to = ui64} : (tensor<4xsi16>) -> tensor<4xui64>
+  %as_f8e4m3fnuz = tensor.cast(%f32_input) {to = f8e4m3fnuz} : (tensor<4xf32>) -> tensor<4xf8e4m3fnuz>
+  %as_f8e5m2fnuz = tensor.cast(%f32_input) {to = f8e5m2fnuz} : (tensor<4xf32>) -> tensor<4xf8e5m2fnuz>
+  func.return(%as_ui64, %as_f8e4m3fnuz, %as_f8e5m2fnuz) : (tensor<4xui64>, tensor<4xf8e4m3fnuz>, tensor<4xf8e5m2fnuz>) -> ()
 }

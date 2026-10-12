@@ -36,25 +36,25 @@ Defined by `Dispatch` in [crates/gpt-rs-ir/src/dialects/host/ir.rs](../../crates
 Example, from `filetests/tile/roundtrip/block.ptir`:
 
 ```text
-tile.dispatch @rms(%0: tensor<{T}x8xf32>) -> tensor<{T}xf32> {grid = [d0], facts = {T = [16, 4096] % 16}} {
-  %1 = tile.block(%0) {iters = [par {T}, red 8], reads = [$0[d0, d1]], folds = [sum -> [d0]]} ({
-  ^body(%0: f32):
-    %1 = arith.mul(%0, %0) : (f32, f32) -> f32
-    tile.yield(%1) : (f32) -> ()
+tile.dispatch @rms(%input: tensor<{T}x8xf32>) -> tensor<{T}xf32> {grid = [d0], facts = {T = [16, 4096] % 16}} {
+  %sum_of_squares = tile.block(%input) {iters = [par {T}, red 8], reads = [$0[d0, d1]], folds = [sum -> [d0]]} ({
+  ^body(%element: f32):
+    %square = arith.mul(%element, %element) : (f32, f32) -> f32
+    tile.yield(%square) : (f32) -> ()
   }) : (tensor<{T}x8xf32>) -> tensor<{T}xf32>
-  func.return(%1) : (tensor<{T}xf32>) -> ()
+  func.return(%sum_of_squares) : (tensor<{T}xf32>) -> ()
 }
-func.func @call(%0: tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}x8xf32>) {
-  %1 = host.dispatch(%0) {callee = @rms} : (tensor<{T}x8xf32>) -> tensor<{T}xf32>
-  %2 = tile.group() {grid = [d0]} ({
-    %3 = tile.block(%0) {iters = [par {T}, par 8], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
-    ^body(%0: f32):
-      %1 = arith.exp(%0) : (f32) -> f32
-      tile.yield(%1) : (f32) -> ()
+func.func @call(%input: tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}x8xf32>) {
+  %sum_of_squares = host.dispatch(%input) {callee = @rms} : (tensor<{T}x8xf32>) -> tensor<{T}xf32>
+  %exponentials = tile.group() {grid = [d0]} ({
+    %block_exponentials = tile.block(%input) {iters = [par {T}, par 8], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+    ^body(%element: f32):
+      %exponential = arith.exp(%element) : (f32) -> f32
+      tile.yield(%exponential) : (f32) -> ()
     }) : (tensor<{T}x8xf32>) -> tensor<{T}x8xf32>
-    tile.yield(%3) : (tensor<{T}x8xf32>) -> ()
+    tile.yield(%block_exponentials) : (tensor<{T}x8xf32>) -> ()
   }) : () -> tensor<{T}x8xf32>
-  func.return(%1, %2) : (tensor<{T}xf32>, tensor<{T}x8xf32>) -> ()
+  func.return(%sum_of_squares, %exponentials) : (tensor<{T}xf32>, tensor<{T}x8xf32>) -> ()
 }
 ```
 

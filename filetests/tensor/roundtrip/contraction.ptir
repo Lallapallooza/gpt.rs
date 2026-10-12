@@ -1,100 +1,162 @@
 // RUN: roundtrip
 
-func.func @matmul(%0: tensor<4x8xf32>, %1: tensor<16x8xf32>) -> tensor<4x16xf32> {
-  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [1]} : (tensor<4x8xf32>, tensor<16x8xf32>) -> tensor<4x16xf32>
-  func.return(%2) : (tensor<4x16xf32>) -> ()
+// CHECK: func.func @matmul([[INPUT:%[0-9]+]]: tensor<4x8xf32>, [[WEIGHT:%[0-9]+]]: tensor<16x8xf32>) -> tensor<4x16xf32> {
+// CHECK-NEXT: [[PRODUCT:%[0-9]+]] = tensor.dot_general([[INPUT]], [[WEIGHT]]) {contract_lhs = [1], contract_rhs = [1]} : (tensor<4x8xf32>, tensor<16x8xf32>) -> tensor<4x16xf32>
+// CHECK-NEXT: func.return([[PRODUCT]]) : (tensor<4x16xf32>) -> ()
+// CHECK-NEXT: }
+func.func @matmul(%input: tensor<4x8xf32>, %weight: tensor<16x8xf32>) -> tensor<4x16xf32> {
+  %product = tensor.dot_general(%input, %weight) {contract_lhs = [1], contract_rhs = [1]} : (tensor<4x8xf32>, tensor<16x8xf32>) -> tensor<4x16xf32>
+  func.return(%product) : (tensor<4x16xf32>) -> ()
 }
 
 // -----
 
-func.func @batched(%0: tensor<{B}x4x8xbf16>, %1: tensor<{B}x8x16xbf16>) -> tensor<{B}x4x16xf32> {
-  %2 = tensor.dot_general(%0, %1) {batch_lhs = [0], batch_rhs = [0], contract_lhs = [2], contract_rhs = [1], accum = f32, out = f32} : (tensor<{B}x4x8xbf16>, tensor<{B}x8x16xbf16>) -> tensor<{B}x4x16xf32>
-  func.return(%2) : (tensor<{B}x4x16xf32>) -> ()
+// CHECK: func.func @batched([[LHS:%[0-9]+]]: tensor<{B}x4x8xbf16>, [[RHS:%[0-9]+]]: tensor<{B}x8x16xbf16>) -> tensor<{B}x4x16xf32> {
+// CHECK-NEXT: [[PRODUCT:%[0-9]+]] = tensor.dot_general([[LHS]], [[RHS]]) {batch_lhs = [0], batch_rhs = [0], contract_lhs = [2], contract_rhs = [1], accum = f32, out = f32} : (tensor<{B}x4x8xbf16>, tensor<{B}x8x16xbf16>) -> tensor<{B}x4x16xf32>
+// CHECK-NEXT: func.return([[PRODUCT]]) : (tensor<{B}x4x16xf32>) -> ()
+// CHECK-NEXT: }
+func.func @batched(%lhs: tensor<{B}x4x8xbf16>, %rhs: tensor<{B}x8x16xbf16>) -> tensor<{B}x4x16xf32> {
+  %product = tensor.dot_general(%lhs, %rhs) {batch_lhs = [0], batch_rhs = [0], contract_lhs = [2], contract_rhs = [1], accum = f32, out = f32} : (tensor<{B}x4x8xbf16>, tensor<{B}x8x16xbf16>) -> tensor<{B}x4x16xf32>
+  func.return(%product) : (tensor<{B}x4x16xf32>) -> ()
 }
 
 // -----
 
-func.func @dtypes(%0: tensor<4x8xbf16>, %1: tensor<8x2xbf16>) -> (tensor<4x2xbf16>, tensor<4x2xf32>) {
-  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0], accum = f32} : (tensor<4x8xbf16>, tensor<8x2xbf16>) -> tensor<4x2xbf16>
-  %3 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0], out = f32} : (tensor<4x8xbf16>, tensor<8x2xbf16>) -> tensor<4x2xf32>
-  func.return(%2, %3) : (tensor<4x2xbf16>, tensor<4x2xf32>) -> ()
+// CHECK: func.func @dtypes([[LHS:%[0-9]+]]: tensor<4x8xbf16>, [[RHS:%[0-9]+]]: tensor<8x2xbf16>) -> (tensor<4x2xbf16>, tensor<4x2xf32>) {
+// CHECK-NEXT: [[PRODUCT_BF16:%[0-9]+]] = tensor.dot_general([[LHS]], [[RHS]]) {contract_lhs = [1], contract_rhs = [0], accum = f32} : (tensor<4x8xbf16>, tensor<8x2xbf16>) -> tensor<4x2xbf16>
+// CHECK-NEXT: [[PRODUCT_F32:%[0-9]+]] = tensor.dot_general([[LHS]], [[RHS]]) {contract_lhs = [1], contract_rhs = [0], out = f32} : (tensor<4x8xbf16>, tensor<8x2xbf16>) -> tensor<4x2xf32>
+// CHECK-NEXT: func.return([[PRODUCT_BF16]], [[PRODUCT_F32]]) : (tensor<4x2xbf16>, tensor<4x2xf32>) -> ()
+// CHECK-NEXT: }
+func.func @dtypes(%lhs: tensor<4x8xbf16>, %rhs: tensor<8x2xbf16>) -> (tensor<4x2xbf16>, tensor<4x2xf32>) {
+  %product_bf16 = tensor.dot_general(%lhs, %rhs) {contract_lhs = [1], contract_rhs = [0], accum = f32} : (tensor<4x8xbf16>, tensor<8x2xbf16>) -> tensor<4x2xbf16>
+  %product_f32 = tensor.dot_general(%lhs, %rhs) {contract_lhs = [1], contract_rhs = [0], out = f32} : (tensor<4x8xbf16>, tensor<8x2xbf16>) -> tensor<4x2xf32>
+  func.return(%product_bf16, %product_f32) : (tensor<4x2xbf16>, tensor<4x2xf32>) -> ()
 }
 
 // -----
 
-func.func @grouped_conv(%0: tensor<1x2x2x3x3x2x4xf32>, %1: tensor<2x5x4x3x3xf32>) -> tensor<2x1x2x2x5xf32> {
-  %2 = tensor.dot_general(%0, %1) {batch_lhs = [5], batch_rhs = [0], contract_lhs = [3, 4, 6], contract_rhs = [3, 4, 2]} : (tensor<1x2x2x3x3x2x4xf32>, tensor<2x5x4x3x3xf32>) -> tensor<2x1x2x2x5xf32>
-  func.return(%2) : (tensor<2x1x2x2x5xf32>) -> ()
+// CHECK: func.func @grouped_conv([[PATCHES:%[0-9]+]]: tensor<1x2x2x3x3x2x4xf32>, [[WEIGHT:%[0-9]+]]: tensor<2x5x4x3x3xf32>) -> tensor<2x1x2x2x5xf32> {
+// CHECK-NEXT: [[CONV:%[0-9]+]] = tensor.dot_general([[PATCHES]], [[WEIGHT]]) {batch_lhs = [5], batch_rhs = [0], contract_lhs = [3, 4, 6], contract_rhs = [3, 4, 2]} : (tensor<1x2x2x3x3x2x4xf32>, tensor<2x5x4x3x3xf32>) -> tensor<2x1x2x2x5xf32>
+// CHECK-NEXT: func.return([[CONV]]) : (tensor<2x1x2x2x5xf32>) -> ()
+// CHECK-NEXT: }
+func.func @grouped_conv(%patches: tensor<1x2x2x3x3x2x4xf32>, %weight: tensor<2x5x4x3x3xf32>) -> tensor<2x1x2x2x5xf32> {
+  %conv = tensor.dot_general(%patches, %weight) {batch_lhs = [5], batch_rhs = [0], contract_lhs = [3, 4, 6], contract_rhs = [3, 4, 2]} : (tensor<1x2x2x3x3x2x4xf32>, tensor<2x5x4x3x3xf32>) -> tensor<2x1x2x2x5xf32>
+  func.return(%conv) : (tensor<2x1x2x2x5xf32>) -> ()
 }
 
 // -----
 
-func.func @reduce(%0: tensor<2x{T}x8xf32>) -> (tensor<2x{T}x1xf32>, tensor<{T}xf32>, tensor<2x1x1xf32>, tensor<2x{T}x8xf32>) {
-  %1 = tensor.reduce_sum(%0) {axes = [2], keepdims = true} : (tensor<2x{T}x8xf32>) -> tensor<2x{T}x1xf32>
-  %2 = tensor.reduce_max(%0) {axes = [0, 2]} : (tensor<2x{T}x8xf32>) -> tensor<{T}xf32>
-  %3 = tensor.reduce_min(%0) {axes = [1, 2], keepdims = true, accum = f32, out = f32} : (tensor<2x{T}x8xf32>) -> tensor<2x1x1xf32>
-  %4 = tensor.reduce_sum(%0) {axes = []} : (tensor<2x{T}x8xf32>) -> tensor<2x{T}x8xf32>
-  func.return(%1, %2, %3, %4) : (tensor<2x{T}x1xf32>, tensor<{T}xf32>, tensor<2x1x1xf32>, tensor<2x{T}x8xf32>) -> ()
+// CHECK: func.func @reduce([[INPUT:%[0-9]+]]: tensor<2x{T}x8xf32>) -> (tensor<2x{T}x1xf32>, tensor<{T}xf32>, tensor<2x1x1xf32>, tensor<2x{T}x8xf32>) {
+// CHECK-NEXT: [[SUM:%[0-9]+]] = tensor.reduce_sum([[INPUT]]) {axes = [2], keepdims = true} : (tensor<2x{T}x8xf32>) -> tensor<2x{T}x1xf32>
+// CHECK-NEXT: [[MAX:%[0-9]+]] = tensor.reduce_max([[INPUT]]) {axes = [0, 2]} : (tensor<2x{T}x8xf32>) -> tensor<{T}xf32>
+// CHECK-NEXT: [[MIN:%[0-9]+]] = tensor.reduce_min([[INPUT]]) {axes = [1, 2], keepdims = true, accum = f32, out = f32} : (tensor<2x{T}x8xf32>) -> tensor<2x1x1xf32>
+// CHECK-NEXT: [[SUM_NO_AXES:%[0-9]+]] = tensor.reduce_sum([[INPUT]]) {axes = []} : (tensor<2x{T}x8xf32>) -> tensor<2x{T}x8xf32>
+// CHECK-NEXT: func.return([[SUM]], [[MAX]], [[MIN]], [[SUM_NO_AXES]]) : (tensor<2x{T}x1xf32>, tensor<{T}xf32>, tensor<2x1x1xf32>, tensor<2x{T}x8xf32>) -> ()
+// CHECK-NEXT: }
+func.func @reduce(%input: tensor<2x{T}x8xf32>) -> (tensor<2x{T}x1xf32>, tensor<{T}xf32>, tensor<2x1x1xf32>, tensor<2x{T}x8xf32>) {
+  %sum = tensor.reduce_sum(%input) {axes = [2], keepdims = true} : (tensor<2x{T}x8xf32>) -> tensor<2x{T}x1xf32>
+  %max = tensor.reduce_max(%input) {axes = [0, 2]} : (tensor<2x{T}x8xf32>) -> tensor<{T}xf32>
+  %min = tensor.reduce_min(%input) {axes = [1, 2], keepdims = true, accum = f32, out = f32} : (tensor<2x{T}x8xf32>) -> tensor<2x1x1xf32>
+  %sum_no_axes = tensor.reduce_sum(%input) {axes = []} : (tensor<2x{T}x8xf32>) -> tensor<2x{T}x8xf32>
+  func.return(%sum, %max, %min, %sum_no_axes) : (tensor<2x{T}x1xf32>, tensor<{T}xf32>, tensor<2x1x1xf32>, tensor<2x{T}x8xf32>) -> ()
 }
 
 // -----
 
-func.func @reduce_dtypes(%0: tensor<4x8xbf16>) -> (tensor<4xbf16>, tensor<4x1xf32>) {
-  %1 = tensor.reduce_sum(%0) {axes = [1], accum = f32} : (tensor<4x8xbf16>) -> tensor<4xbf16>
-  %2 = tensor.reduce_sum(%0) {axes = [1], keepdims = true, out = f32} : (tensor<4x8xbf16>) -> tensor<4x1xf32>
-  func.return(%1, %2) : (tensor<4xbf16>, tensor<4x1xf32>) -> ()
+// CHECK: func.func @reduce_dtypes([[INPUT:%[0-9]+]]: tensor<4x8xbf16>) -> (tensor<4xbf16>, tensor<4x1xf32>) {
+// CHECK-NEXT: [[SUM_BF16:%[0-9]+]] = tensor.reduce_sum([[INPUT]]) {axes = [1], accum = f32} : (tensor<4x8xbf16>) -> tensor<4xbf16>
+// CHECK-NEXT: [[SUM_F32:%[0-9]+]] = tensor.reduce_sum([[INPUT]]) {axes = [1], keepdims = true, out = f32} : (tensor<4x8xbf16>) -> tensor<4x1xf32>
+// CHECK-NEXT: func.return([[SUM_BF16]], [[SUM_F32]]) : (tensor<4xbf16>, tensor<4x1xf32>) -> ()
+// CHECK-NEXT: }
+func.func @reduce_dtypes(%input: tensor<4x8xbf16>) -> (tensor<4xbf16>, tensor<4x1xf32>) {
+  %sum_bf16 = tensor.reduce_sum(%input) {axes = [1], accum = f32} : (tensor<4x8xbf16>) -> tensor<4xbf16>
+  %sum_f32 = tensor.reduce_sum(%input) {axes = [1], keepdims = true, out = f32} : (tensor<4x8xbf16>) -> tensor<4x1xf32>
+  func.return(%sum_bf16, %sum_f32) : (tensor<4xbf16>, tensor<4x1xf32>) -> ()
 }
 
 // -----
 
-func.func @argmax(%0: tensor<2x5xf32>, %1: tensor<4x{T}xsi32>) -> (tensor<2xsi32>, tensor<4x1xsi64>) {
-  %2 = tensor.argmax(%0) {axis = 1, out = si32} : (tensor<2x5xf32>) -> tensor<2xsi32>
-  %3 = tensor.argmax(%1) {axis = 1, keepdims = true, out = si64} : (tensor<4x{T}xsi32>) -> tensor<4x1xsi64>
-  func.return(%2, %3) : (tensor<2xsi32>, tensor<4x1xsi64>) -> ()
+// CHECK: func.func @argmax([[LOGITS:%[0-9]+]]: tensor<2x5xf32>, [[COUNTS:%[0-9]+]]: tensor<4x{T}xsi32>) -> (tensor<2xsi32>, tensor<4x1xsi64>) {
+// CHECK-NEXT: [[BEST_LOGIT:%[0-9]+]] = tensor.argmax([[LOGITS]]) {axis = 1, out = si32} : (tensor<2x5xf32>) -> tensor<2xsi32>
+// CHECK-NEXT: [[BEST_COUNT:%[0-9]+]] = tensor.argmax([[COUNTS]]) {axis = 1, keepdims = true, out = si64} : (tensor<4x{T}xsi32>) -> tensor<4x1xsi64>
+// CHECK-NEXT: func.return([[BEST_LOGIT]], [[BEST_COUNT]]) : (tensor<2xsi32>, tensor<4x1xsi64>) -> ()
+// CHECK-NEXT: }
+func.func @argmax(%logits: tensor<2x5xf32>, %counts: tensor<4x{T}xsi32>) -> (tensor<2xsi32>, tensor<4x1xsi64>) {
+  %best_logit = tensor.argmax(%logits) {axis = 1, out = si32} : (tensor<2x5xf32>) -> tensor<2xsi32>
+  %best_count = tensor.argmax(%counts) {axis = 1, keepdims = true, out = si64} : (tensor<4x{T}xsi32>) -> tensor<4x1xsi64>
+  func.return(%best_logit, %best_count) : (tensor<2xsi32>, tensor<4x1xsi64>) -> ()
 }
 
 // -----
 
-func.func @segment(%0: tensor<6x4xf32>, %1: tensor<6xsi32>) -> (tensor<3x4xf32>, tensor<3x4xf32>, tensor<8x4xf32>) {
-  %2 = tensor.segment_sum(%0, %1) {num_segments = 3} : (tensor<6x4xf32>, tensor<6xsi32>) -> tensor<3x4xf32>
-  %3 = tensor.segment_max(%0, %1) {num_segments = 3, indices_are_sorted = true} : (tensor<6x4xf32>, tensor<6xsi32>) -> tensor<3x4xf32>
-  %4 = tensor.segment_min(%0, %1) {num_segments = 8, indices_are_sorted = true, unique = true} : (tensor<6x4xf32>, tensor<6xsi32>) -> tensor<8x4xf32>
-  func.return(%2, %3, %4) : (tensor<3x4xf32>, tensor<3x4xf32>, tensor<8x4xf32>) -> ()
+// CHECK: func.func @segment([[INPUT:%[0-9]+]]: tensor<6x4xf32>, [[SEGMENT_IDS:%[0-9]+]]: tensor<6xsi32>) -> (tensor<3x4xf32>, tensor<3x4xf32>, tensor<8x4xf32>) {
+// CHECK-NEXT: [[SUM:%[0-9]+]] = tensor.segment_sum([[INPUT]], [[SEGMENT_IDS]]) {num_segments = 3} : (tensor<6x4xf32>, tensor<6xsi32>) -> tensor<3x4xf32>
+// CHECK-NEXT: [[MAX:%[0-9]+]] = tensor.segment_max([[INPUT]], [[SEGMENT_IDS]]) {num_segments = 3, indices_are_sorted = true} : (tensor<6x4xf32>, tensor<6xsi32>) -> tensor<3x4xf32>
+// CHECK-NEXT: [[MIN:%[0-9]+]] = tensor.segment_min([[INPUT]], [[SEGMENT_IDS]]) {num_segments = 8, indices_are_sorted = true, unique = true} : (tensor<6x4xf32>, tensor<6xsi32>) -> tensor<8x4xf32>
+// CHECK-NEXT: func.return([[SUM]], [[MAX]], [[MIN]]) : (tensor<3x4xf32>, tensor<3x4xf32>, tensor<8x4xf32>) -> ()
+// CHECK-NEXT: }
+func.func @segment(%input: tensor<6x4xf32>, %segment_ids: tensor<6xsi32>) -> (tensor<3x4xf32>, tensor<3x4xf32>, tensor<8x4xf32>) {
+  %sum = tensor.segment_sum(%input, %segment_ids) {num_segments = 3} : (tensor<6x4xf32>, tensor<6xsi32>) -> tensor<3x4xf32>
+  %max = tensor.segment_max(%input, %segment_ids) {num_segments = 3, indices_are_sorted = true} : (tensor<6x4xf32>, tensor<6xsi32>) -> tensor<3x4xf32>
+  %min = tensor.segment_min(%input, %segment_ids) {num_segments = 8, indices_are_sorted = true, unique = true} : (tensor<6x4xf32>, tensor<6xsi32>) -> tensor<8x4xf32>
+  func.return(%sum, %max, %min) : (tensor<3x4xf32>, tensor<3x4xf32>, tensor<8x4xf32>) -> ()
 }
 
 // -----
 
-func.func @top_k(%0: tensor<2x5xf32>) -> (tensor<2x3xf32>, tensor<2x3xsi32>, tensor<1x5xf32>, tensor<1x5xsi64>) {
-  %1, %2 = tensor.top_k(%0) {k = 3, axis = 1, indices = si32} : (tensor<2x5xf32>) -> (tensor<2x3xf32>, tensor<2x3xsi32>)
-  %3, %4 = tensor.bottom_k(%0) {k = 1, axis = 0, indices = si64} : (tensor<2x5xf32>) -> (tensor<1x5xf32>, tensor<1x5xsi64>)
-  func.return(%1, %2, %3, %4) : (tensor<2x3xf32>, tensor<2x3xsi32>, tensor<1x5xf32>, tensor<1x5xsi64>) -> ()
+// CHECK: func.func @top_k([[INPUT:%[0-9]+]]: tensor<2x5xf32>) -> (tensor<2x3xf32>, tensor<2x3xsi32>, tensor<1x5xf32>, tensor<1x5xsi64>) {
+// CHECK-NEXT: [[TOP_VALUES:%[0-9]+]], [[TOP_INDICES:%[0-9]+]] = tensor.top_k([[INPUT]]) {k = 3, axis = 1, indices = si32} : (tensor<2x5xf32>) -> (tensor<2x3xf32>, tensor<2x3xsi32>)
+// CHECK-NEXT: [[BOTTOM_VALUES:%[0-9]+]], [[BOTTOM_INDICES:%[0-9]+]] = tensor.bottom_k([[INPUT]]) {k = 1, axis = 0, indices = si64} : (tensor<2x5xf32>) -> (tensor<1x5xf32>, tensor<1x5xsi64>)
+// CHECK-NEXT: func.return([[TOP_VALUES]], [[TOP_INDICES]], [[BOTTOM_VALUES]], [[BOTTOM_INDICES]]) : (tensor<2x3xf32>, tensor<2x3xsi32>, tensor<1x5xf32>, tensor<1x5xsi64>) -> ()
+// CHECK-NEXT: }
+func.func @top_k(%input: tensor<2x5xf32>) -> (tensor<2x3xf32>, tensor<2x3xsi32>, tensor<1x5xf32>, tensor<1x5xsi64>) {
+  %top_values, %top_indices = tensor.top_k(%input) {k = 3, axis = 1, indices = si32} : (tensor<2x5xf32>) -> (tensor<2x3xf32>, tensor<2x3xsi32>)
+  %bottom_values, %bottom_indices = tensor.bottom_k(%input) {k = 1, axis = 0, indices = si64} : (tensor<2x5xf32>) -> (tensor<1x5xf32>, tensor<1x5xsi64>)
+  func.return(%top_values, %top_indices, %bottom_values, %bottom_indices) : (tensor<2x3xf32>, tensor<2x3xsi32>, tensor<1x5xf32>, tensor<1x5xsi64>) -> ()
 }
 
 // -----
 
 // Negative axes count from the end, and print as written.
-func.func @negative_axes(%0: tensor<2x3xf32>, %1: tensor<3x4xf32>) -> (tensor<2xf32>, tensor<2x4xf32>) {
-  %2 = tensor.reduce_sum(%0) {axes = [-1]} : (tensor<2x3xf32>) -> tensor<2xf32>
-  %3 = tensor.dot_general(%0, %1) {contract_lhs = [-1], contract_rhs = [-2]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
-  func.return(%2, %3) : (tensor<2xf32>, tensor<2x4xf32>) -> ()
+// CHECK: func.func @negative_axes([[LHS:%[0-9]+]]: tensor<2x3xf32>, [[RHS:%[0-9]+]]: tensor<3x4xf32>) -> (tensor<2xf32>, tensor<2x4xf32>) {
+// CHECK-NEXT: [[SUM:%[0-9]+]] = tensor.reduce_sum([[LHS]]) {axes = [-1]} : (tensor<2x3xf32>) -> tensor<2xf32>
+// CHECK-NEXT: [[PRODUCT:%[0-9]+]] = tensor.dot_general([[LHS]], [[RHS]]) {contract_lhs = [-1], contract_rhs = [-2]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
+// CHECK-NEXT: func.return([[SUM]], [[PRODUCT]]) : (tensor<2xf32>, tensor<2x4xf32>) -> ()
+// CHECK-NEXT: }
+func.func @negative_axes(%lhs: tensor<2x3xf32>, %rhs: tensor<3x4xf32>) -> (tensor<2xf32>, tensor<2x4xf32>) {
+  %sum = tensor.reduce_sum(%lhs) {axes = [-1]} : (tensor<2x3xf32>) -> tensor<2xf32>
+  %product = tensor.dot_general(%lhs, %rhs) {contract_lhs = [-1], contract_rhs = [-2]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
+  func.return(%sum, %product) : (tensor<2xf32>, tensor<2x4xf32>) -> ()
 }
 
 // -----
 
 // `and` and `or` reductions: bitwise on integers, and all and any on i1.
-func.func @logic_reductions(%0: tensor<2x3xi1>, %1: tensor<6xsi32>, %2: tensor<6xsi32>) -> (tensor<2xi1>, tensor<3xi1>, tensor<2xsi32>, tensor<2xsi32>) {
-  %3 = tensor.reduce_and(%0) {axes = [1]} : (tensor<2x3xi1>) -> tensor<2xi1>
-  %4 = tensor.reduce_or(%0) {axes = [0]} : (tensor<2x3xi1>) -> tensor<3xi1>
-  %5 = tensor.segment_and(%1, %2) {num_segments = 2} : (tensor<6xsi32>, tensor<6xsi32>) -> tensor<2xsi32>
-  %6 = tensor.segment_or(%1, %2) {num_segments = 2} : (tensor<6xsi32>, tensor<6xsi32>) -> tensor<2xsi32>
-  func.return(%3, %4, %5, %6) : (tensor<2xi1>, tensor<3xi1>, tensor<2xsi32>, tensor<2xsi32>) -> ()
+// CHECK: func.func @logic_reductions([[FLAGS:%[0-9]+]]: tensor<2x3xi1>, [[BITS:%[0-9]+]]: tensor<6xsi32>, [[SEGMENT_IDS:%[0-9]+]]: tensor<6xsi32>) -> (tensor<2xi1>, tensor<3xi1>, tensor<2xsi32>, tensor<2xsi32>) {
+// CHECK-NEXT: [[ALL:%[0-9]+]] = tensor.reduce_and([[FLAGS]]) {axes = [1]} : (tensor<2x3xi1>) -> tensor<2xi1>
+// CHECK-NEXT: [[ANY:%[0-9]+]] = tensor.reduce_or([[FLAGS]]) {axes = [0]} : (tensor<2x3xi1>) -> tensor<3xi1>
+// CHECK-NEXT: [[SEGMENT_AND:%[0-9]+]] = tensor.segment_and([[BITS]], [[SEGMENT_IDS]]) {num_segments = 2} : (tensor<6xsi32>, tensor<6xsi32>) -> tensor<2xsi32>
+// CHECK-NEXT: [[SEGMENT_OR:%[0-9]+]] = tensor.segment_or([[BITS]], [[SEGMENT_IDS]]) {num_segments = 2} : (tensor<6xsi32>, tensor<6xsi32>) -> tensor<2xsi32>
+// CHECK-NEXT: func.return([[ALL]], [[ANY]], [[SEGMENT_AND]], [[SEGMENT_OR]]) : (tensor<2xi1>, tensor<3xi1>, tensor<2xsi32>, tensor<2xsi32>) -> ()
+// CHECK-NEXT: }
+func.func @logic_reductions(%flags: tensor<2x3xi1>, %bits: tensor<6xsi32>, %segment_ids: tensor<6xsi32>) -> (tensor<2xi1>, tensor<3xi1>, tensor<2xsi32>, tensor<2xsi32>) {
+  %all = tensor.reduce_and(%flags) {axes = [1]} : (tensor<2x3xi1>) -> tensor<2xi1>
+  %any = tensor.reduce_or(%flags) {axes = [0]} : (tensor<2x3xi1>) -> tensor<3xi1>
+  %segment_and = tensor.segment_and(%bits, %segment_ids) {num_segments = 2} : (tensor<6xsi32>, tensor<6xsi32>) -> tensor<2xsi32>
+  %segment_or = tensor.segment_or(%bits, %segment_ids) {num_segments = 2} : (tensor<6xsi32>, tensor<6xsi32>) -> tensor<2xsi32>
+  func.return(%all, %any, %segment_and, %segment_or) : (tensor<2xi1>, tensor<3xi1>, tensor<2xsi32>, tensor<2xsi32>) -> ()
 }
 
 // -----
 
 // Operands of different dtypes name the accumulator and the result.
-func.func @mixed(%0: tensor<2x3xf8e4m3>, %1: tensor<3x2xf8e5m2>, %2: tensor<2x3xsi8>, %3: tensor<3x2xsi4>) -> (tensor<2x2xbf16>, tensor<2x2xsi32>) {
-  %4 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0], accum = f32, out = bf16} : (tensor<2x3xf8e4m3>, tensor<3x2xf8e5m2>) -> tensor<2x2xbf16>
-  %5 = tensor.dot_general(%2, %3) {contract_lhs = [1], contract_rhs = [0], accum = si32, out = si32} : (tensor<2x3xsi8>, tensor<3x2xsi4>) -> tensor<2x2xsi32>
-  func.return(%4, %5) : (tensor<2x2xbf16>, tensor<2x2xsi32>) -> ()
+// CHECK: func.func @mixed([[FLOAT_LHS:%[0-9]+]]: tensor<2x3xf8e4m3>, [[FLOAT_RHS:%[0-9]+]]: tensor<3x2xf8e5m2>, [[INT_LHS:%[0-9]+]]: tensor<2x3xsi8>, [[INT_RHS:%[0-9]+]]: tensor<3x2xsi4>) -> (tensor<2x2xbf16>, tensor<2x2xsi32>) {
+// CHECK-NEXT: [[FLOAT_PRODUCT:%[0-9]+]] = tensor.dot_general([[FLOAT_LHS]], [[FLOAT_RHS]]) {contract_lhs = [1], contract_rhs = [0], accum = f32, out = bf16} : (tensor<2x3xf8e4m3>, tensor<3x2xf8e5m2>) -> tensor<2x2xbf16>
+// CHECK-NEXT: [[INT_PRODUCT:%[0-9]+]] = tensor.dot_general([[INT_LHS]], [[INT_RHS]]) {contract_lhs = [1], contract_rhs = [0], accum = si32, out = si32} : (tensor<2x3xsi8>, tensor<3x2xsi4>) -> tensor<2x2xsi32>
+// CHECK-NEXT: func.return([[FLOAT_PRODUCT]], [[INT_PRODUCT]]) : (tensor<2x2xbf16>, tensor<2x2xsi32>) -> ()
+// CHECK-NEXT: }
+func.func @mixed(%float_lhs: tensor<2x3xf8e4m3>, %float_rhs: tensor<3x2xf8e5m2>, %int_lhs: tensor<2x3xsi8>, %int_rhs: tensor<3x2xsi4>) -> (tensor<2x2xbf16>, tensor<2x2xsi32>) {
+  %float_product = tensor.dot_general(%float_lhs, %float_rhs) {contract_lhs = [1], contract_rhs = [0], accum = f32, out = bf16} : (tensor<2x3xf8e4m3>, tensor<3x2xf8e5m2>) -> tensor<2x2xbf16>
+  %int_product = tensor.dot_general(%int_lhs, %int_rhs) {contract_lhs = [1], contract_rhs = [0], accum = si32, out = si32} : (tensor<2x3xsi8>, tensor<3x2xsi4>) -> tensor<2x2xsi32>
+  func.return(%float_product, %int_product) : (tensor<2x2xbf16>, tensor<2x2xsi32>) -> ()
 }

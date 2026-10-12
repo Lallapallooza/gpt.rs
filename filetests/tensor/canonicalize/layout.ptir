@@ -1,69 +1,69 @@
 // RUN: pass canonicalize
 
 // Chains of reshapes, of broadcasts and of slices collapse into one op.
-// CHECK: func.func @chains
-// CHECK-NEXT: [[R:%[0-9]+]] = tensor.reshape(%0) {shape = [6]}
-// CHECK-NEXT: [[B:%[0-9]+]] = tensor.broadcast_to(%1) {shape = [2, 4, 3]}
-// CHECK-NEXT: [[S:%[0-9]+]] = tensor.slice(%2) {starts = [3, 1], sizes = [2, 2]}
-// CHECK-NEXT: func.return([[R]], [[B]], [[S]])
-func.func @chains(%0: tensor<2x3xf32>, %1: tensor<3xf32>, %2: tensor<8x4xf32>) -> (tensor<6xf32>, tensor<2x4x3xf32>, tensor<2x2xf32>) {
-  %3 = tensor.reshape(%0) {shape = [3, 2]} : (tensor<2x3xf32>) -> tensor<3x2xf32>
-  %4 = tensor.reshape(%3) {shape = [6]} : (tensor<3x2xf32>) -> tensor<6xf32>
-  %5 = tensor.broadcast_to(%1) {shape = [4, 3]} : (tensor<3xf32>) -> tensor<4x3xf32>
-  %6 = tensor.broadcast_to(%5) {shape = [2, 4, 3]} : (tensor<4x3xf32>) -> tensor<2x4x3xf32>
-  %7 = tensor.slice(%2) {starts = [2, 0], sizes = [4, 4]} : (tensor<8x4xf32>) -> tensor<4x4xf32>
-  %8 = tensor.slice(%7) {starts = [1, 1], sizes = [2, 2]} : (tensor<4x4xf32>) -> tensor<2x2xf32>
-  func.return(%4, %6, %8) : (tensor<6xf32>, tensor<2x4x3xf32>, tensor<2x2xf32>) -> ()
+// CHECK: func.func @chains([[RESHAPE_INPUT:%[0-9]+]]: tensor<2x3xf32>, [[BROADCAST_INPUT:%[0-9]+]]: tensor<3xf32>, [[SLICE_INPUT:%[0-9]+]]: tensor<8x4xf32>) -> (tensor<6xf32>, tensor<2x4x3xf32>, tensor<2x2xf32>) {
+// CHECK-NEXT: [[FLAT:%[0-9]+]] = tensor.reshape([[RESHAPE_INPUT]]) {shape = [6]}
+// CHECK-NEXT: [[BATCHES:%[0-9]+]] = tensor.broadcast_to([[BROADCAST_INPUT]]) {shape = [2, 4, 3]}
+// CHECK-NEXT: [[CORNER:%[0-9]+]] = tensor.slice([[SLICE_INPUT]]) {starts = [3, 1], sizes = [2, 2]}
+// CHECK-NEXT: func.return([[FLAT]], [[BATCHES]], [[CORNER]])
+func.func @chains(%reshape_input: tensor<2x3xf32>, %broadcast_input: tensor<3xf32>, %slice_input: tensor<8x4xf32>) -> (tensor<6xf32>, tensor<2x4x3xf32>, tensor<2x2xf32>) {
+  %reshaped = tensor.reshape(%reshape_input) {shape = [3, 2]} : (tensor<2x3xf32>) -> tensor<3x2xf32>
+  %flat = tensor.reshape(%reshaped) {shape = [6]} : (tensor<3x2xf32>) -> tensor<6xf32>
+  %rows = tensor.broadcast_to(%broadcast_input) {shape = [4, 3]} : (tensor<3xf32>) -> tensor<4x3xf32>
+  %batches = tensor.broadcast_to(%rows) {shape = [2, 4, 3]} : (tensor<4x3xf32>) -> tensor<2x4x3xf32>
+  %window = tensor.slice(%slice_input) {starts = [2, 0], sizes = [4, 4]} : (tensor<8x4xf32>) -> tensor<4x4xf32>
+  %corner = tensor.slice(%window) {starts = [1, 1], sizes = [2, 2]} : (tensor<4x4xf32>) -> tensor<2x2xf32>
+  func.return(%flat, %batches, %corner) : (tensor<6xf32>, tensor<2x4x3xf32>, tensor<2x2xf32>) -> ()
 }
 
 // -----
 
 // Steps of 1 are written as no strides.
-// CHECK: func.func @unit_strides
-// CHECK-NEXT: tensor.slice(%0) {starts = [1, 0], sizes = [2, 3]} :
-func.func @unit_strides(%0: tensor<4x6xf32>) -> tensor<2x3xf32> {
-  %1 = tensor.slice(%0) {starts = [1, 0], sizes = [2, 3], strides = [1, 1]} : (tensor<4x6xf32>) -> tensor<2x3xf32>
-  func.return(%1) : (tensor<2x3xf32>) -> ()
+// CHECK: func.func @unit_strides([[INPUT:%[0-9]+]]: tensor<4x6xf32>) -> tensor<2x3xf32> {
+// CHECK-NEXT: tensor.slice([[INPUT]]) {starts = [1, 0], sizes = [2, 3]} :
+func.func @unit_strides(%input: tensor<4x6xf32>) -> tensor<2x3xf32> {
+  %window = tensor.slice(%input) {starts = [1, 0], sizes = [2, 3], strides = [1, 1]} : (tensor<4x6xf32>) -> tensor<2x3xf32>
+  func.return(%window) : (tensor<2x3xf32>) -> ()
 }
 
 // -----
 
 // A slice of a strided slice steps by the product of the strides, from the second slice's start
 // counted in steps of the first. Element k of the result is element 1 + (1 + 2k) * 2 = 3 + 4k.
-// CHECK: func.func @strided_chain
-// CHECK-NEXT: tensor.slice(%0) {starts = [3], sizes = [3], strides = [4]} :
+// CHECK: func.func @strided_chain([[INPUT:%[0-9]+]]: tensor<16xf32>) -> tensor<3xf32> {
+// CHECK-NEXT: tensor.slice([[INPUT]]) {starts = [3], sizes = [3], strides = [4]} :
 // CHECK-NEXT: func.return
-func.func @strided_chain(%0: tensor<16xf32>) -> tensor<3xf32> {
-  %1 = tensor.slice(%0) {starts = [1], sizes = [7], strides = [2]} : (tensor<16xf32>) -> tensor<7xf32>
-  %2 = tensor.slice(%1) {starts = [1], sizes = [3], strides = [2]} : (tensor<7xf32>) -> tensor<3xf32>
-  func.return(%2) : (tensor<3xf32>) -> ()
+func.func @strided_chain(%input: tensor<16xf32>) -> tensor<3xf32> {
+  %odd_elements = tensor.slice(%input) {starts = [1], sizes = [7], strides = [2]} : (tensor<16xf32>) -> tensor<7xf32>
+  %every_fourth = tensor.slice(%odd_elements) {starts = [1], sizes = [3], strides = [2]} : (tensor<7xf32>) -> tensor<3xf32>
+  func.return(%every_fourth) : (tensor<3xf32>) -> ()
 }
 
 // -----
 
 // A slice of a concat that reads one input reads that input: a part of it, or all of it. A slice
 // that spans both inputs stays, so the concat does.
-// CHECK: func.func @slice_of_concat
-// CHECK: [[BOTH:%[0-9]+]] = tensor.concat(%0, %1) {axis = 0}
-// CHECK: [[HEAD:%[0-9]+]] = tensor.slice(%0) {starts = [0, 0], sizes = [1, 6]}
-// CHECK: [[NEXT:%[0-9]+]] = tensor.slice([[BOTH]]) {starts = [1, 0], sizes = [3, 6]}
-// CHECK: func.return([[HEAD]], %1, [[NEXT]])
-func.func @slice_of_concat(%0: tensor<3x6xf32>, %1: tensor<1x6xf32>) -> (tensor<1x6xf32>, tensor<1x6xf32>, tensor<3x6xf32>) {
-  %2 = tensor.concat(%0, %1) {axis = 0} : (tensor<3x6xf32>, tensor<1x6xf32>) -> tensor<4x6xf32>
-  %3 = tensor.slice(%2) {starts = [0, 0], sizes = [1, 6]} : (tensor<4x6xf32>) -> tensor<1x6xf32>
-  %4 = tensor.slice(%2) {starts = [3, 0], sizes = [1, 6]} : (tensor<4x6xf32>) -> tensor<1x6xf32>
-  %5 = tensor.slice(%2) {starts = [1, 0], sizes = [3, 6]} : (tensor<4x6xf32>) -> tensor<3x6xf32>
-  func.return(%3, %4, %5) : (tensor<1x6xf32>, tensor<1x6xf32>, tensor<3x6xf32>) -> ()
+// CHECK: func.func @slice_of_concat([[TOP:%[0-9]+]]: tensor<3x6xf32>, [[BOTTOM:%[0-9]+]]: tensor<1x6xf32>) -> (tensor<1x6xf32>, tensor<1x6xf32>, tensor<3x6xf32>) {
+// CHECK: [[BOTH:%[0-9]+]] = tensor.concat([[TOP]], [[BOTTOM]]) {axis = 0}
+// CHECK: [[HEAD:%[0-9]+]] = tensor.slice([[TOP]]) {starts = [0, 0], sizes = [1, 6]}
+// CHECK: [[REST:%[0-9]+]] = tensor.slice([[BOTH]]) {starts = [1, 0], sizes = [3, 6]}
+// CHECK: func.return([[HEAD]], [[BOTTOM]], [[REST]])
+func.func @slice_of_concat(%top: tensor<3x6xf32>, %bottom: tensor<1x6xf32>) -> (tensor<1x6xf32>, tensor<1x6xf32>, tensor<3x6xf32>) {
+  %both = tensor.concat(%top, %bottom) {axis = 0} : (tensor<3x6xf32>, tensor<1x6xf32>) -> tensor<4x6xf32>
+  %head = tensor.slice(%both) {starts = [0, 0], sizes = [1, 6]} : (tensor<4x6xf32>) -> tensor<1x6xf32>
+  %tail = tensor.slice(%both) {starts = [3, 0], sizes = [1, 6]} : (tensor<4x6xf32>) -> tensor<1x6xf32>
+  %rest = tensor.slice(%both) {starts = [1, 0], sizes = [3, 6]} : (tensor<4x6xf32>) -> tensor<3x6xf32>
+  func.return(%head, %tail, %rest) : (tensor<1x6xf32>, tensor<1x6xf32>, tensor<3x6xf32>) -> ()
 }
 
 // -----
 
 // A concat of a concat on the same axis is one concat.
-// CHECK: func.func @concat_of_concat
-// CHECK-NEXT: [[C:%[0-9]+]] = tensor.concat(%0, %1, %2) {axis = 1}
-// CHECK-NEXT: func.return([[C]])
-func.func @concat_of_concat(%0: tensor<2x3xf32>, %1: tensor<2x1xf32>, %2: tensor<2x4xf32>) -> tensor<2x8xf32> {
-  %3 = tensor.concat(%0, %1) {axis = 1} : (tensor<2x3xf32>, tensor<2x1xf32>) -> tensor<2x4xf32>
-  %4 = tensor.concat(%3, %2) {axis = -1} : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x8xf32>
-  func.return(%4) : (tensor<2x8xf32>) -> ()
+// CHECK: func.func @concat_of_concat([[LEFT:%[0-9]+]]: tensor<2x3xf32>, [[MIDDLE:%[0-9]+]]: tensor<2x1xf32>, [[RIGHT:%[0-9]+]]: tensor<2x4xf32>) -> tensor<2x8xf32> {
+// CHECK-NEXT: [[JOINED:%[0-9]+]] = tensor.concat([[LEFT]], [[MIDDLE]], [[RIGHT]]) {axis = 1}
+// CHECK-NEXT: func.return([[JOINED]])
+func.func @concat_of_concat(%left: tensor<2x3xf32>, %middle: tensor<2x1xf32>, %right: tensor<2x4xf32>) -> tensor<2x8xf32> {
+  %left_part = tensor.concat(%left, %middle) {axis = 1} : (tensor<2x3xf32>, tensor<2x1xf32>) -> tensor<2x4xf32>
+  %joined = tensor.concat(%left_part, %right) {axis = -1} : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x8xf32>
+  func.return(%joined) : (tensor<2x8xf32>) -> ()
 }

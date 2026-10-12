@@ -1,64 +1,64 @@
 // RUN: verify
 
 // ERROR: tensor.cond: the predicate must be an i1 scalar, got tensor<2xi1>
-func.func @cond_predicate(%0: tensor<2xi1>, %1: tensor<4xf32>) -> tensor<4xf32> {
-  %2 = tensor.cond(%0, %1) {results = [tensor<4xf32>]} ({
-  ^then_branch(%3: tensor<4xf32>):
-    tensor.yield(%3) : (tensor<4xf32>) -> ()
+func.func @cond_predicate(%pred: tensor<2xi1>, %input: tensor<4xf32>) -> tensor<4xf32> {
+  %chosen = tensor.cond(%pred, %input) {results = [tensor<4xf32>]} ({
+  ^then_branch(%then_input: tensor<4xf32>):
+    tensor.yield(%then_input) : (tensor<4xf32>) -> ()
   }, {
-  ^else_branch(%4: tensor<4xf32>):
-    tensor.yield(%4) : (tensor<4xf32>) -> ()
+  ^else_branch(%else_input: tensor<4xf32>):
+    tensor.yield(%else_input) : (tensor<4xf32>) -> ()
   }) : (tensor<2xi1>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%2) : (tensor<4xf32>) -> ()
+  func.return(%chosen) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.cond: region 1 yields (tensor<2x2xf32>), expected (tensor<4xf32>)
-func.func @cond_yield(%0: tensor<i1>, %1: tensor<4xf32>) -> tensor<4xf32> {
-  %2 = tensor.cond(%0, %1) {results = [tensor<4xf32>]} ({
-  ^then_branch(%3: tensor<4xf32>):
-    tensor.yield(%3) : (tensor<4xf32>) -> ()
+func.func @cond_yield(%pred: tensor<i1>, %input: tensor<4xf32>) -> tensor<4xf32> {
+  %chosen = tensor.cond(%pred, %input) {results = [tensor<4xf32>]} ({
+  ^then_branch(%then_input: tensor<4xf32>):
+    tensor.yield(%then_input) : (tensor<4xf32>) -> ()
   }, {
-  ^else_branch(%4: tensor<4xf32>):
-    %5 = tensor.reshape(%4) {shape = [2, 2]} : (tensor<4xf32>) -> tensor<2x2xf32>
-    tensor.yield(%5) : (tensor<2x2xf32>) -> ()
+  ^else_branch(%else_input: tensor<4xf32>):
+    %square = tensor.reshape(%else_input) {shape = [2, 2]} : (tensor<4xf32>) -> tensor<2x2xf32>
+    tensor.yield(%square) : (tensor<2x2xf32>) -> ()
   }) : (tensor<i1>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%2) : (tensor<4xf32>) -> ()
+  func.return(%chosen) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.while: region 0 yields (tensor<4xf32>), expected (tensor<i1>, tensor<4xf32>)
-func.func @while_predicate(%0: tensor<4xf32>) -> tensor<4xf32> {
-  %1 = tensor.while(%0) ({
-  ^cond(%2: tensor<4xf32>):
-    tensor.yield(%2) : (tensor<4xf32>) -> ()
+func.func @while_predicate(%init: tensor<4xf32>) -> tensor<4xf32> {
+  %final = tensor.while(%init) ({
+  ^cond(%cond_state: tensor<4xf32>):
+    tensor.yield(%cond_state) : (tensor<4xf32>) -> ()
   }, {
-  ^body(%3: tensor<4xf32>):
-    tensor.yield(%3) : (tensor<4xf32>) -> ()
+  ^body(%body_state: tensor<4xf32>):
+    tensor.yield(%body_state) : (tensor<4xf32>) -> ()
   }) : (tensor<4xf32>) -> tensor<4xf32>
-  func.return(%1) : (tensor<4xf32>) -> ()
+  func.return(%final) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.scan: the scanned inputs must share their leading extent, got tensor<5x4xf32>
-func.func @scan_steps(%0: tensor<6x4xf32>, %1: tensor<5x4xf32>) -> tensor<6x4xf32> {
-  %2 = tensor.scan(%0, %1) {carry_count = 0, outputs = [tensor<4xf32>]} ({
-  ^body(%3: tensor<4xf32>, %4: tensor<4xf32>):
-    tensor.yield(%3) : (tensor<4xf32>) -> ()
+func.func @scan_steps(%rows: tensor<6x4xf32>, %short_rows: tensor<5x4xf32>) -> tensor<6x4xf32> {
+  %outputs = tensor.scan(%rows, %short_rows) {carry_count = 0, outputs = [tensor<4xf32>]} ({
+  ^body(%row: tensor<4xf32>, %short_row: tensor<4xf32>):
+    tensor.yield(%row) : (tensor<4xf32>) -> ()
   }) : (tensor<6x4xf32>, tensor<5x4xf32>) -> tensor<6x4xf32>
-  func.return(%2) : (tensor<6x4xf32>) -> ()
+  func.return(%outputs) : (tensor<6x4xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tensor.scan: carry_count 2 exceeds the 1 operands
-func.func @scan_carries(%0: tensor<4xf32>) -> tensor<4xf32> {
-  %1 = tensor.scan(%0) {carry_count = 2, outputs = []} ({
-  ^body(%2: tensor<4xf32>):
-    tensor.yield(%2) : (tensor<4xf32>) -> ()
+func.func @scan_carries(%init: tensor<4xf32>) -> tensor<4xf32> {
+  %final = tensor.scan(%init) {carry_count = 2, outputs = []} ({
+  ^body(%carry: tensor<4xf32>):
+    tensor.yield(%carry) : (tensor<4xf32>) -> ()
   }) : (tensor<4xf32>) -> tensor<4xf32>
-  func.return(%1) : (tensor<4xf32>) -> ()
+  func.return(%final) : (tensor<4xf32>) -> ()
 }

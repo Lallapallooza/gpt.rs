@@ -2,15 +2,15 @@
 
 // With fuel for one step, the first fold runs, `neg(neg(x))` to `x`, and nothing else: the dead
 // `neg` and `abs(abs(x))` stay.
-// CHECK: func.func @fuel
-// CHECK-NEXT: {{%[0-9]+}} = tensor.neg(%0)
-// CHECK-NEXT: [[A:%[0-9]+]] = tensor.abs(%0)
-// CHECK-NEXT: [[B:%[0-9]+]] = tensor.abs([[A]])
-// CHECK-NEXT: func.return(%0, [[B]])
-func.func @fuel(%0: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
-  %1 = tensor.neg(%0) : (tensor<4xf32>) -> tensor<4xf32>
-  %2 = tensor.neg(%1) : (tensor<4xf32>) -> tensor<4xf32>
-  %3 = tensor.abs(%0) : (tensor<4xf32>) -> tensor<4xf32>
-  %4 = tensor.abs(%3) : (tensor<4xf32>) -> tensor<4xf32>
-  func.return(%2, %4) : (tensor<4xf32>, tensor<4xf32>) -> ()
+// CHECK: func.func @fuel([[INPUT:%[0-9]+]]: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
+// CHECK-NEXT: {{%[0-9]+}} = tensor.neg([[INPUT]])
+// CHECK-NEXT: [[MAGNITUDE:%[0-9]+]] = tensor.abs([[INPUT]])
+// CHECK-NEXT: [[DOUBLE_MAGNITUDE:%[0-9]+]] = tensor.abs([[MAGNITUDE]])
+// CHECK-NEXT: func.return([[INPUT]], [[DOUBLE_MAGNITUDE]])
+func.func @fuel(%input: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
+  %negated = tensor.neg(%input) : (tensor<4xf32>) -> tensor<4xf32>
+  %double_negated = tensor.neg(%negated) : (tensor<4xf32>) -> tensor<4xf32>
+  %magnitude = tensor.abs(%input) : (tensor<4xf32>) -> tensor<4xf32>
+  %double_magnitude = tensor.abs(%magnitude) : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%double_negated, %double_magnitude) : (tensor<4xf32>, tensor<4xf32>) -> ()
 }

@@ -1,11 +1,11 @@
 // RUN: pass outline-static,dce,outline-static
 
 // A second run leaves the load-time functions as they are.
-// CHECK: func.func @static.{{[0-9a-f]+}}(%0: tensor<4xf32> {param = 1}) -> (tensor<4xf32> {param = {{[0-9]+}}})
-// CHECK-NEXT: tensor.exp(%0)
+// CHECK: func.func @static.{{[0-9a-f]+}}([[WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1}) -> (tensor<4xf32> {param = {{[0-9]+}}})
+// CHECK-NEXT: tensor.exp([[WEIGHT]])
 // CHECK-NEXT: func.return
-func.func @f(%0: tensor<4xf32>, %1: tensor<4xf32> {param = 1}) -> tensor<4xf32> {
-  %2 = tensor.exp(%1) : (tensor<4xf32>) -> tensor<4xf32>
-  %3 = tensor.add(%0, %2) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%3) : (tensor<4xf32>) -> ()
+func.func @f(%input: tensor<4xf32>, %weight: tensor<4xf32> {param = 1}) -> tensor<4xf32> {
+  %exp = tensor.exp(%weight) : (tensor<4xf32>) -> tensor<4xf32>
+  %sum = tensor.add(%input, %exp) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%sum) : (tensor<4xf32>) -> ()
 }

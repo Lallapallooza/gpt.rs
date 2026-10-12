@@ -1,42 +1,76 @@
 // RUN: roundtrip
 
-func.func @cond(%0: tensor<i1>, %1: tensor<4xf32>) -> tensor<4xf32> {
-  %2 = tensor.cond(%0, %1) {results = [tensor<4xf32>]} ({
-  ^then_branch(%3: tensor<4xf32>):
-    %4 = tensor.neg(%3) : (tensor<4xf32>) -> tensor<4xf32>
-    tensor.yield(%4) : (tensor<4xf32>) -> ()
+// CHECK: func.func @cond([[PRED:%[0-9]+]]: tensor<i1>, [[INPUT:%[0-9]+]]: tensor<4xf32>) -> tensor<4xf32> {
+// CHECK-NEXT: [[RESULT:%[0-9]+]] = tensor.cond([[PRED]], [[INPUT]]) {results = [tensor<4xf32>]} ({
+// CHECK-NEXT: ^then_branch([[THEN_INPUT:%[0-9]+]]: tensor<4xf32>):
+// CHECK-NEXT: [[NEGATED:%[0-9]+]] = tensor.neg([[THEN_INPUT]]) : (tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: tensor.yield([[NEGATED]]) : (tensor<4xf32>) -> ()
+// CHECK-NEXT: }, {
+// CHECK-NEXT: ^else_branch([[ELSE_INPUT:%[0-9]+]]: tensor<4xf32>):
+// CHECK-NEXT: tensor.yield([[ELSE_INPUT]]) : (tensor<4xf32>) -> ()
+// CHECK-NEXT: }) : (tensor<i1>, tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: func.return([[RESULT]]) : (tensor<4xf32>) -> ()
+// CHECK-NEXT: }
+func.func @cond(%pred: tensor<i1>, %input: tensor<4xf32>) -> tensor<4xf32> {
+  %result = tensor.cond(%pred, %input) {results = [tensor<4xf32>]} ({
+  ^then_branch(%then_input: tensor<4xf32>):
+    %negated = tensor.neg(%then_input) : (tensor<4xf32>) -> tensor<4xf32>
+    tensor.yield(%negated) : (tensor<4xf32>) -> ()
   }, {
-  ^else_branch(%5: tensor<4xf32>):
-    tensor.yield(%5) : (tensor<4xf32>) -> ()
+  ^else_branch(%else_input: tensor<4xf32>):
+    tensor.yield(%else_input) : (tensor<4xf32>) -> ()
   }) : (tensor<i1>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%2) : (tensor<4xf32>) -> ()
+  func.return(%result) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
-func.func @while(%0: tensor<si32>, %1: tensor<4xf32>) -> (tensor<si32>, tensor<4xf32>) {
-  %2, %3 = tensor.while(%0, %1) ({
-  ^cond(%4: tensor<si32>, %5: tensor<4xf32>):
-    %6 = tensor.constant() {value = dense<[] x si32: 10>} : () -> tensor<si32>
-    %7 = tensor.less(%4, %6) : (tensor<si32>, tensor<si32>) -> tensor<i1>
-    tensor.yield(%7, %4, %5) : (tensor<i1>, tensor<si32>, tensor<4xf32>) -> ()
+// CHECK: func.func @while([[COUNTER:%[0-9]+]]: tensor<si32>, [[STATE:%[0-9]+]]: tensor<4xf32>) -> (tensor<si32>, tensor<4xf32>) {
+// CHECK-NEXT: [[FINAL_COUNTER:%[0-9]+]], [[FINAL_STATE:%[0-9]+]] = tensor.while([[COUNTER]], [[STATE]]) ({
+// CHECK-NEXT: ^cond([[COND_COUNTER:%[0-9]+]]: tensor<si32>, [[COND_STATE:%[0-9]+]]: tensor<4xf32>):
+// CHECK-NEXT: [[LIMIT:%[0-9]+]] = tensor.constant() {value = dense<[] x si32: 10>} : () -> tensor<si32>
+// CHECK-NEXT: [[KEEP_GOING:%[0-9]+]] = tensor.less([[COND_COUNTER]], [[LIMIT]]) : (tensor<si32>, tensor<si32>) -> tensor<i1>
+// CHECK-NEXT: tensor.yield([[KEEP_GOING]], [[COND_COUNTER]], [[COND_STATE]]) : (tensor<i1>, tensor<si32>, tensor<4xf32>) -> ()
+// CHECK-NEXT: }, {
+// CHECK-NEXT: ^body([[BODY_COUNTER:%[0-9]+]]: tensor<si32>, [[BODY_STATE:%[0-9]+]]: tensor<4xf32>):
+// CHECK-NEXT: [[ONE:%[0-9]+]] = tensor.constant() {value = dense<[] x si32: 1>} : () -> tensor<si32>
+// CHECK-NEXT: [[NEXT_COUNTER:%[0-9]+]] = tensor.add([[BODY_COUNTER]], [[ONE]]) : (tensor<si32>, tensor<si32>) -> tensor<si32>
+// CHECK-NEXT: [[DOUBLED:%[0-9]+]] = tensor.add([[BODY_STATE]], [[BODY_STATE]]) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: tensor.yield([[NEXT_COUNTER]], [[DOUBLED]]) : (tensor<si32>, tensor<4xf32>) -> ()
+// CHECK-NEXT: }) : (tensor<si32>, tensor<4xf32>) -> (tensor<si32>, tensor<4xf32>)
+// CHECK-NEXT: func.return([[FINAL_COUNTER]], [[FINAL_STATE]]) : (tensor<si32>, tensor<4xf32>) -> ()
+// CHECK-NEXT: }
+func.func @while(%counter: tensor<si32>, %state: tensor<4xf32>) -> (tensor<si32>, tensor<4xf32>) {
+  %final_counter, %final_state = tensor.while(%counter, %state) ({
+  ^cond(%cond_counter: tensor<si32>, %cond_state: tensor<4xf32>):
+    %limit = tensor.constant() {value = dense<[] x si32: 10>} : () -> tensor<si32>
+    %keep_going = tensor.less(%cond_counter, %limit) : (tensor<si32>, tensor<si32>) -> tensor<i1>
+    tensor.yield(%keep_going, %cond_counter, %cond_state) : (tensor<i1>, tensor<si32>, tensor<4xf32>) -> ()
   }, {
-  ^body(%8: tensor<si32>, %9: tensor<4xf32>):
-    %10 = tensor.constant() {value = dense<[] x si32: 1>} : () -> tensor<si32>
-    %11 = tensor.add(%8, %10) : (tensor<si32>, tensor<si32>) -> tensor<si32>
-    %12 = tensor.add(%9, %9) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-    tensor.yield(%11, %12) : (tensor<si32>, tensor<4xf32>) -> ()
+  ^body(%body_counter: tensor<si32>, %body_state: tensor<4xf32>):
+    %one = tensor.constant() {value = dense<[] x si32: 1>} : () -> tensor<si32>
+    %next_counter = tensor.add(%body_counter, %one) : (tensor<si32>, tensor<si32>) -> tensor<si32>
+    %doubled = tensor.add(%body_state, %body_state) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+    tensor.yield(%next_counter, %doubled) : (tensor<si32>, tensor<4xf32>) -> ()
   }) : (tensor<si32>, tensor<4xf32>) -> (tensor<si32>, tensor<4xf32>)
-  func.return(%2, %3) : (tensor<si32>, tensor<4xf32>) -> ()
+  func.return(%final_counter, %final_state) : (tensor<si32>, tensor<4xf32>) -> ()
 }
 
 // -----
 
-func.func @scan(%0: tensor<4xf32>, %1: tensor<6x4xf32>) -> (tensor<4xf32>, tensor<6x4xf32>) {
-  %2, %3 = tensor.scan(%0, %1) {carry_count = 1, outputs = [tensor<4xf32>]} ({
-  ^body(%4: tensor<4xf32>, %5: tensor<4xf32>):
-    %6 = tensor.add(%4, %5) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-    tensor.yield(%6, %6) : (tensor<4xf32>, tensor<4xf32>) -> ()
+// CHECK: func.func @scan([[INIT:%[0-9]+]]: tensor<4xf32>, [[ROWS:%[0-9]+]]: tensor<6x4xf32>) -> (tensor<4xf32>, tensor<6x4xf32>) {
+// CHECK-NEXT: [[TOTAL:%[0-9]+]], [[RUNNING_SUMS:%[0-9]+]] = tensor.scan([[INIT]], [[ROWS]]) {carry_count = 1, outputs = [tensor<4xf32>]} ({
+// CHECK-NEXT: ^body([[CARRY:%[0-9]+]]: tensor<4xf32>, [[ROW:%[0-9]+]]: tensor<4xf32>):
+// CHECK-NEXT: [[SUM:%[0-9]+]] = tensor.add([[CARRY]], [[ROW]]) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: tensor.yield([[SUM]], [[SUM]]) : (tensor<4xf32>, tensor<4xf32>) -> ()
+// CHECK-NEXT: }) : (tensor<4xf32>, tensor<6x4xf32>) -> (tensor<4xf32>, tensor<6x4xf32>)
+// CHECK-NEXT: func.return([[TOTAL]], [[RUNNING_SUMS]]) : (tensor<4xf32>, tensor<6x4xf32>) -> ()
+// CHECK-NEXT: }
+func.func @scan(%init: tensor<4xf32>, %rows: tensor<6x4xf32>) -> (tensor<4xf32>, tensor<6x4xf32>) {
+  %total, %running_sums = tensor.scan(%init, %rows) {carry_count = 1, outputs = [tensor<4xf32>]} ({
+  ^body(%carry: tensor<4xf32>, %row: tensor<4xf32>):
+    %sum = tensor.add(%carry, %row) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+    tensor.yield(%sum, %sum) : (tensor<4xf32>, tensor<4xf32>) -> ()
   }) : (tensor<4xf32>, tensor<6x4xf32>) -> (tensor<4xf32>, tensor<6x4xf32>)
-  func.return(%2, %3) : (tensor<4xf32>, tensor<6x4xf32>) -> ()
+  func.return(%total, %running_sums) : (tensor<4xf32>, tensor<6x4xf32>) -> ()
 }

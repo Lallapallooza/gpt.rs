@@ -1,24 +1,24 @@
 // RUN: pass canonicalize
 
 // A constant moves to the right of a parameter too, so the identity on the left folds away.
-// CHECK: func.func @identity_left_of_param
-// CHECK-NEXT: func.return(%0)
-func.func @identity_left_of_param(%0: tensor<4xf32> {param = 1}) -> tensor<4xf32> {
-  %1 = tensor.constant() {value = dense<[4] x f32: 1.0>} : () -> tensor<4xf32>
-  %2 = tensor.mul(%1, %0) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%2) : (tensor<4xf32>) -> ()
+// CHECK: func.func @identity_left_of_param([[WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1}) -> tensor<4xf32> {
+// CHECK-NEXT: func.return([[WEIGHT]])
+func.func @identity_left_of_param(%weight: tensor<4xf32> {param = 1}) -> tensor<4xf32> {
+  %one = tensor.constant() {value = dense<[4] x f32: 1.0>} : () -> tensor<4xf32>
+  %product = tensor.mul(%one, %weight) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%product) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // A constant on the left of a parameter moves to the right. A run-time value moves to the left of
 // a parameter.
-// CHECK: func.func @order
-// CHECK: tensor.mul(%1, {{%[0-9]+}})
-// CHECK: tensor.add(%0, %1)
-func.func @order(%0: tensor<4xf32>, %1: tensor<4xf32> {param = 1}) -> (tensor<4xf32>, tensor<4xf32>) {
-  %2 = tensor.constant() {value = dense<[4] x f32: 3.0>} : () -> tensor<4xf32>
-  %3 = tensor.mul(%2, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %4 = tensor.add(%1, %0) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%3, %4) : (tensor<4xf32>, tensor<4xf32>) -> ()
+// CHECK: func.func @order([[INPUT:%[0-9]+]]: tensor<4xf32>, [[WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1}) -> (tensor<4xf32>, tensor<4xf32>) {
+// CHECK: tensor.mul([[WEIGHT]], {{%[0-9]+}})
+// CHECK: tensor.add([[INPUT]], [[WEIGHT]])
+func.func @order(%input: tensor<4xf32>, %weight: tensor<4xf32> {param = 1}) -> (tensor<4xf32>, tensor<4xf32>) {
+  %three = tensor.constant() {value = dense<[4] x f32: 3.0>} : () -> tensor<4xf32>
+  %scaled = tensor.mul(%three, %weight) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %sum = tensor.add(%weight, %input) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%scaled, %sum) : (tensor<4xf32>, tensor<4xf32>) -> ()
 }

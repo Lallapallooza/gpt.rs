@@ -2,31 +2,31 @@
 
 // Two values computed from one weight take twice its bytes, so only the first moves. The second
 // stays at run time and reads the first from its load-time parameter.
-// CHECK: func.func @shared_weight(%0: tensor<4xf32>, %1: tensor<4xf32> {param = 1}, %2: tensor<4xf32> {param = {{[0-9]+}}}) -> tensor<4xf32>
-// CHECK-NEXT: [[N:%[0-9]+]] = tensor.neg(%2)
-// CHECK-NEXT: [[A:%[0-9]+]] = tensor.add(%0, %2)
-// CHECK-NEXT: tensor.mul([[A]], [[N]])
-// CHECK: func.func @static.
-// CHECK-NEXT: tensor.exp(%0)
+// CHECK: func.func @shared_weight([[INPUT:%[0-9]+]]: tensor<4xf32>, [[WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1}, [[EXP:%[0-9]+]]: tensor<4xf32> {param = {{[0-9]+}}}) -> tensor<4xf32>
+// CHECK-NEXT: [[NEGATED:%[0-9]+]] = tensor.neg([[EXP]])
+// CHECK-NEXT: [[SUM:%[0-9]+]] = tensor.add([[INPUT]], [[EXP]])
+// CHECK-NEXT: tensor.mul([[SUM]], [[NEGATED]])
+// CHECK: func.func @static.{{[0-9a-f]+}}([[STATIC_WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1})
+// CHECK-NEXT: tensor.exp([[STATIC_WEIGHT]])
 // CHECK-NEXT: func.return
 // CHECK-NOT: func.func @static.
-func.func @shared_weight(%0: tensor<4xf32>, %1: tensor<4xf32> {param = 1}) -> tensor<4xf32> {
-  %2 = tensor.exp(%1) : (tensor<4xf32>) -> tensor<4xf32>
-  %3 = tensor.neg(%2) : (tensor<4xf32>) -> tensor<4xf32>
-  %4 = tensor.add(%0, %2) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %5 = tensor.mul(%4, %3) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%5) : (tensor<4xf32>) -> ()
+func.func @shared_weight(%input: tensor<4xf32>, %weight: tensor<4xf32> {param = 1}) -> tensor<4xf32> {
+  %exp = tensor.exp(%weight) : (tensor<4xf32>) -> tensor<4xf32>
+  %negated = tensor.neg(%exp) : (tensor<4xf32>) -> tensor<4xf32>
+  %sum = tensor.add(%input, %exp) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %product = tensor.mul(%sum, %negated) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%product) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // A weight of unknown size never fits, so its cast to a wider dtype stays at run time.
-// CHECK: func.func @dynamic_weight(%0: tensor<2x8xf32>, %1: tensor<{N}x8xbf16> {param = 1}) -> tensor<2x{N}xf32>
-// CHECK-NEXT: [[W:%[0-9]+]] = tensor.cast(%1)
-// CHECK-NEXT: tensor.dot_general(%0, [[W]])
+// CHECK: func.func @dynamic_weight([[INPUT:%[0-9]+]]: tensor<2x8xf32>, [[WEIGHT:%[0-9]+]]: tensor<{N}x8xbf16> {param = 1}) -> tensor<2x{N}xf32>
+// CHECK-NEXT: [[WIDENED:%[0-9]+]] = tensor.cast([[WEIGHT]])
+// CHECK-NEXT: tensor.dot_general([[INPUT]], [[WIDENED]])
 // CHECK-NOT: func.func @static.
-func.func @dynamic_weight(%0: tensor<2x8xf32>, %1: tensor<{N}x8xbf16> {param = 1}) -> tensor<2x{N}xf32> {
-  %2 = tensor.cast(%1) {to = f32} : (tensor<{N}x8xbf16>) -> tensor<{N}x8xf32>
-  %3 = tensor.dot_general(%0, %2) {contract_lhs = [1], contract_rhs = [1]} : (tensor<2x8xf32>, tensor<{N}x8xf32>) -> tensor<2x{N}xf32>
-  func.return(%3) : (tensor<2x{N}xf32>) -> ()
+func.func @dynamic_weight(%input: tensor<2x8xf32>, %weight: tensor<{N}x8xbf16> {param = 1}) -> tensor<2x{N}xf32> {
+  %widened = tensor.cast(%weight) {to = f32} : (tensor<{N}x8xbf16>) -> tensor<{N}x8xf32>
+  %product = tensor.dot_general(%input, %widened) {contract_lhs = [1], contract_rhs = [1]} : (tensor<2x8xf32>, tensor<{N}x8xf32>) -> tensor<2x{N}xf32>
+  func.return(%product) : (tensor<2x{N}xf32>) -> ()
 }

@@ -3,60 +3,61 @@
 // Column `k * C + c` reads channel `c` of window element `k`, padded with the pad value.
 // CHECK: reads = [$0[d0, d1 * 2 + d3 floordiv 3 floordiv 3 - 1, d2 * 2 + d3 floordiv 3 mod 3 - 1, d3 mod 3] pad 0.0]
 // CHECK-NOT: tensor.
-func.func @conv_patches(%0: tensor<1x5x5x3xf32>) -> tensor<1x3x3x27xf32> {
-  %1 = tensor.extract_patches(%0) {window = [3, 3], strides = [2, 2], dilation = [1, 1], padding = [(1, 1), (1, 1)], pad_value = 0.0} : (tensor<1x5x5x3xf32>) -> tensor<1x3x3x27xf32>
-  func.return(%1) : (tensor<1x3x3x27xf32>) -> ()
+func.func @conv_patches(%image: tensor<1x5x5x3xf32>) -> tensor<1x3x3x27xf32> {
+  %patches = tensor.extract_patches(%image) {window = [3, 3], strides = [2, 2], dilation = [1, 1], padding = [(1, 1), (1, 1)], pad_value = 0.0} : (tensor<1x5x5x3xf32>) -> tensor<1x3x3x27xf32>
+  func.return(%patches) : (tensor<1x3x3x27xf32>) -> ()
 }
 
 // -----
 // CHECK: reads = [$0[d0, d1 + d2 floordiv 4 * 2, d2 mod 4] pad -1.5]
 // CHECK-NOT: tensor.
-func.func @dilated_patches(%0: tensor<2x7x4xf32>) -> tensor<2x5x12xf32> {
-  %1 = tensor.extract_patches(%0) {window = [3], strides = [1], dilation = [2], padding = [(0, 2)], pad_value = -1.5} : (tensor<2x7x4xf32>) -> tensor<2x5x12xf32>
-  func.return(%1) : (tensor<2x5x12xf32>) -> ()
+func.func @dilated_patches(%sequence: tensor<2x7x4xf32>) -> tensor<2x5x12xf32> {
+  %patches = tensor.extract_patches(%sequence) {window = [3], strides = [1], dilation = [2], padding = [(0, 2)], pad_value = -1.5} : (tensor<2x7x4xf32>) -> tensor<2x5x12xf32>
+  func.return(%patches) : (tensor<2x5x12xf32>) -> ()
 }
 
 // -----
 // CHECK: pad 7.0]
 // CHECK-NOT: tensor.
-func.func @integer_patches(%0: tensor<1x2x3x2xsi32>) -> tensor<1x1x3x8xsi32> {
-  %1 = tensor.extract_patches(%0) {window = [2, 2], strides = [1, 1], dilation = [1, 1], padding = [(0, 0), (0, 1)], pad_value = 7.0} : (tensor<1x2x3x2xsi32>) -> tensor<1x1x3x8xsi32>
-  func.return(%1) : (tensor<1x1x3x8xsi32>) -> ()
+func.func @integer_patches(%image: tensor<1x2x3x2xsi32>) -> tensor<1x1x3x8xsi32> {
+  %patches = tensor.extract_patches(%image) {window = [2, 2], strides = [1, 1], dilation = [1, 1], padding = [(0, 0), (0, 1)], pad_value = 7.0} : (tensor<1x2x3x2xsi32>) -> tensor<1x1x3x8xsi32>
+  func.return(%patches) : (tensor<1x1x3x8xsi32>) -> ()
 }
 
 // -----
 // CHECK: pad -inf]
 // CHECK-NOT: tensor.
-func.func @padded_max_patches(%0: tensor<1x4x4x2xf32>) -> tensor<1x2x2x18xf32> {
-  %1 = tensor.extract_patches(%0) {window = [3, 3], strides = [2, 2], dilation = [1, 1], padding = [(1, 1), (1, 1)], pad_value = -inf} : (tensor<1x4x4x2xf32>) -> tensor<1x2x2x18xf32>
-  func.return(%1) : (tensor<1x2x2x18xf32>) -> ()
+func.func @padded_max_patches(%image: tensor<1x4x4x2xf32>) -> tensor<1x2x2x18xf32> {
+  %patches = tensor.extract_patches(%image) {window = [3, 3], strides = [2, 2], dilation = [1, 1], padding = [(1, 1), (1, 1)], pad_value = -inf} : (tensor<1x4x4x2xf32>) -> tensor<1x2x2x18xf32>
+  func.return(%patches) : (tensor<1x2x2x18xf32>) -> ()
 }
 
 // -----
 // Window offsets fold after the positions, and the padding fails a constraint.
 // CHECK: iters = [par 1, par 2, par 2, par 2, red 1, red 3, red 3, red 1]{{.*}}folds = [max -> {{.*}}], constraints = [0 <= d1 * 2 + d5 - 1, d1 * 2 + d5 - 1 <= 3, 0 <= d2 * 2 + d6 - 1, d2 * 2 + d6 - 1 <= 3]
 // CHECK-NOT: tensor.
-func.func @max_pool(%0: tensor<1x4x4x2xf32>) -> tensor<1x2x2x2xf32> {
-  %1 = tensor.reduce_window_max(%0) {window_dims = [1, 3, 3, 1], strides = [1, 2, 2, 1], padding = [(0, 0), (1, 1), (1, 1), (0, 0)], base_dilation = [1, 1, 1, 1], window_dilation = [1, 1, 1, 1]} : (tensor<1x4x4x2xf32>) -> tensor<1x2x2x2xf32>
-  func.return(%1) : (tensor<1x2x2x2xf32>) -> ()
+func.func @max_pool(%image: tensor<1x4x4x2xf32>) -> tensor<1x2x2x2xf32> {
+  %pooled = tensor.reduce_window_max(%image) {window_dims = [1, 3, 3, 1], strides = [1, 2, 2, 1], padding = [(0, 0), (1, 1), (1, 1), (0, 0)], base_dilation = [1, 1, 1, 1], window_dilation = [1, 1, 1, 1]} : (tensor<1x4x4x2xf32>) -> tensor<1x2x2x2xf32>
+  func.return(%pooled) : (tensor<1x2x2x2xf32>) -> ()
 }
 
 // -----
 // Holes between dilated input elements fail the `mod` constraint.
 // CHECK: constraints = [0 <= d0 + d2 - 1, (d0 + d2 - 1) mod 2 == 0, d1 * 2 + d3 * 2 <= 2]
 // CHECK-NOT: tensor.
-func.func @dilated_sum(%0: tensor<5x3xf32>) -> tensor<9x1xf32> {
-  %1 = tensor.reduce_window_sum(%0) {window_dims = [2, 2], strides = [1, 2], padding = [(1, 0), (0, 1)], base_dilation = [2, 1], window_dilation = [1, 2], accum = f32} : (tensor<5x3xf32>) -> tensor<9x1xf32>
-  func.return(%1) : (tensor<9x1xf32>) -> ()
+func.func @dilated_sum(%input: tensor<5x3xf32>) -> tensor<9x1xf32> {
+  %sums = tensor.reduce_window_sum(%input) {window_dims = [2, 2], strides = [1, 2], padding = [(1, 0), (0, 1)], base_dilation = [2, 1], window_dilation = [1, 2], accum = f32} : (tensor<5x3xf32>) -> tensor<9x1xf32>
+  func.return(%sums) : (tensor<9x1xf32>) -> ()
 }
 
 // -----
 // CHECK: iters = [par 2, red 3], reads = [$0[d0 * 3 + d1]], folds = [min -> [d0]]
-// CHECK: arith.cast(%0) {to = bf16}
+// CHECK: ^body([[MINIMUM:%[0-9]+]]: f32):
+// CHECK: arith.cast([[MINIMUM]]) {to = bf16}
 // CHECK-NOT: tensor.
-func.func @bf16_min(%0: tensor<6xbf16>) -> tensor<2xbf16> {
-  %1 = tensor.reduce_window_min(%0) {window_dims = [3], strides = [3], padding = [(0, 0)], base_dilation = [1], window_dilation = [1], accum = f32} : (tensor<6xbf16>) -> tensor<2xbf16>
-  func.return(%1) : (tensor<2xbf16>) -> ()
+func.func @bf16_min(%input: tensor<6xbf16>) -> tensor<2xbf16> {
+  %minima = tensor.reduce_window_min(%input) {window_dims = [3], strides = [3], padding = [(0, 0)], base_dilation = [1], window_dilation = [1], accum = f32} : (tensor<6xbf16>) -> tensor<2xbf16>
+  func.return(%minima) : (tensor<2xbf16>) -> ()
 }
 
 // -----
@@ -64,9 +65,9 @@ func.func @bf16_min(%0: tensor<6xbf16>) -> tensor<2xbf16> {
 // CHECK: folds = [and ->
 // CHECK: folds = [or ->
 // CHECK-NOT: tensor.
-func.func @window_kinds(%0: tensor<6xi1>, %1: tensor<6xbf16>) -> (tensor<5xi1>, tensor<5xi1>, tensor<5xf32>) {
-  %2 = tensor.reduce_window_and(%0) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1]} : (tensor<6xi1>) -> tensor<5xi1>
-  %3 = tensor.reduce_window_or(%0) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1]} : (tensor<6xi1>) -> tensor<5xi1>
-  %4 = tensor.reduce_window_sum(%1) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1], out = f32} : (tensor<6xbf16>) -> tensor<5xf32>
-  func.return(%2, %3, %4) : (tensor<5xi1>, tensor<5xi1>, tensor<5xf32>) -> ()
+func.func @window_kinds(%flags: tensor<6xi1>, %values: tensor<6xbf16>) -> (tensor<5xi1>, tensor<5xi1>, tensor<5xf32>) {
+  %all_in_window = tensor.reduce_window_and(%flags) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1]} : (tensor<6xi1>) -> tensor<5xi1>
+  %any_in_window = tensor.reduce_window_or(%flags) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1]} : (tensor<6xi1>) -> tensor<5xi1>
+  %sums = tensor.reduce_window_sum(%values) {window_dims = [2], strides = [1], padding = [(0, 0)], base_dilation = [1], window_dilation = [1], out = f32} : (tensor<6xbf16>) -> tensor<5xf32>
+  func.return(%all_in_window, %any_in_window, %sums) : (tensor<5xi1>, tensor<5xi1>, tensor<5xf32>) -> ()
 }

@@ -2,94 +2,104 @@
 
 // A static scale of a dot's result moves into the weight, laid out along the weight's free axis.
 // ROUNDING: the scale rounds into every weight before the sum, instead of into the sum once
-// CHECK: func.func @scale
-// CHECK-NEXT: [[R:%[0-9]+]] = tensor.reshape(%2) {shape = [1, 4]}
-// CHECK-NEXT: [[B:%[0-9]+]] = tensor.broadcast_to([[R]]) {shape = [3, 4]}
-// CHECK-NEXT: [[W:%[0-9]+]] = tensor.mul(%1, [[B]])
-// CHECK-NEXT: [[D:%[0-9]+]] = tensor.dot_general(%0, [[W]]) {contract_lhs = [1], contract_rhs = [0]}
-// CHECK-NEXT: func.return([[D]])
-func.func @scale(%0: tensor<2x3xf32>, %1: tensor<3x4xf32> {param = 1}, %2: tensor<4xf32> {param = 2}) -> tensor<2x4xf32> {
-  %3 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
-  %4 = tensor.broadcast_to(%2) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
-  %5 = tensor.mul(%3, %4) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
-  func.return(%5) : (tensor<2x4xf32>) -> ()
+// CHECK: func.func @scale([[INPUT:%[0-9]+]]: tensor<2x3xf32>, [[WEIGHT:%[0-9]+]]: tensor<3x4xf32> {param = 1}, [[SCALE:%[0-9]+]]: tensor<4xf32> {param = 2})
+// CHECK-NEXT: [[RESHAPED_SCALE:%[0-9]+]] = tensor.reshape([[SCALE]]) {shape = [1, 4]}
+// CHECK-NEXT: [[SCALES:%[0-9]+]] = tensor.broadcast_to([[RESHAPED_SCALE]]) {shape = [3, 4]}
+// CHECK-NEXT: [[SCALED_WEIGHT:%[0-9]+]] = tensor.mul([[WEIGHT]], [[SCALES]])
+// CHECK-NEXT: [[SCALED:%[0-9]+]] = tensor.dot_general([[INPUT]], [[SCALED_WEIGHT]]) {contract_lhs = [1], contract_rhs = [0]}
+// CHECK-NEXT: func.return([[SCALED]])
+func.func @scale(%input: tensor<2x3xf32>, %weight: tensor<3x4xf32> {param = 1}, %scale: tensor<4xf32> {param = 2}) -> tensor<2x4xf32> {
+  %product = tensor.dot_general(%input, %weight) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
+  %scales = tensor.broadcast_to(%scale) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
+  %scaled = tensor.mul(%product, %scales) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+  func.return(%scaled) : (tensor<2x4xf32>) -> ()
 }
 
 // -----
 
 // With batch axes, the free axes of the weight still end the result.
 // ROUNDING: the scale rounds into every weight before the sum, instead of into the sum once
-// CHECK: func.func @batched
-// CHECK-NEXT: [[R:%[0-9]+]] = tensor.reshape(%2) {shape = [1, 1, 4]}
-// CHECK-NEXT: [[B:%[0-9]+]] = tensor.broadcast_to([[R]]) {shape = [2, 5, 4]}
-// CHECK-NEXT: [[W:%[0-9]+]] = tensor.mul(%1, [[B]])
-// CHECK-NEXT: tensor.dot_general(%0, [[W]]) {batch_lhs = [0], batch_rhs = [0], contract_lhs = [2], contract_rhs = [1]}
-func.func @batched(%0: tensor<2x3x5xf32>, %1: tensor<2x5x4xf32> {param = 1}, %2: tensor<4xf32> {param = 2}) -> tensor<2x3x4xf32> {
-  %3 = tensor.dot_general(%0, %1) {batch_lhs = [0], batch_rhs = [0], contract_lhs = [2], contract_rhs = [1]} : (tensor<2x3x5xf32>, tensor<2x5x4xf32>) -> tensor<2x3x4xf32>
-  %4 = tensor.broadcast_to(%2) {shape = [2, 3, 4]} : (tensor<4xf32>) -> tensor<2x3x4xf32>
-  %5 = tensor.mul(%3, %4) : (tensor<2x3x4xf32>, tensor<2x3x4xf32>) -> tensor<2x3x4xf32>
-  func.return(%5) : (tensor<2x3x4xf32>) -> ()
+// CHECK: func.func @batched([[INPUT:%[0-9]+]]: tensor<2x3x5xf32>, [[WEIGHT:%[0-9]+]]: tensor<2x5x4xf32> {param = 1}, [[SCALE:%[0-9]+]]: tensor<4xf32> {param = 2})
+// CHECK-NEXT: [[RESHAPED_SCALE:%[0-9]+]] = tensor.reshape([[SCALE]]) {shape = [1, 1, 4]}
+// CHECK-NEXT: [[SCALES:%[0-9]+]] = tensor.broadcast_to([[RESHAPED_SCALE]]) {shape = [2, 5, 4]}
+// CHECK-NEXT: [[SCALED_WEIGHT:%[0-9]+]] = tensor.mul([[WEIGHT]], [[SCALES]])
+// CHECK-NEXT: tensor.dot_general([[INPUT]], [[SCALED_WEIGHT]]) {batch_lhs = [0], batch_rhs = [0], contract_lhs = [2], contract_rhs = [1]}
+func.func @batched(%input: tensor<2x3x5xf32>, %weight: tensor<2x5x4xf32> {param = 1}, %scale: tensor<4xf32> {param = 2}) -> tensor<2x3x4xf32> {
+  %product = tensor.dot_general(%input, %weight) {batch_lhs = [0], batch_rhs = [0], contract_lhs = [2], contract_rhs = [1]} : (tensor<2x3x5xf32>, tensor<2x5x4xf32>) -> tensor<2x3x4xf32>
+  %scales = tensor.broadcast_to(%scale) {shape = [2, 3, 4]} : (tensor<4xf32>) -> tensor<2x3x4xf32>
+  %scaled = tensor.mul(%product, %scales) : (tensor<2x3x4xf32>, tensor<2x3x4xf32>) -> tensor<2x3x4xf32>
+  func.return(%scaled) : (tensor<2x3x4xf32>) -> ()
 }
 
 // -----
 
 // The scale stays outside the dot when it varies along an axis of `x`.
 // CHECK: func.func @along_x
-// CHECK: tensor.mul(%3, %4)
-func.func @along_x(%0: tensor<2x3xf32>, %1: tensor<3x4xf32> {param = 1}, %2: tensor<2x1xf32> {param = 2}) -> tensor<2x4xf32> {
-  %3 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
-  %4 = tensor.broadcast_to(%2) {shape = [2, 4]} : (tensor<2x1xf32>) -> tensor<2x4xf32>
-  %5 = tensor.mul(%3, %4) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
-  func.return(%5) : (tensor<2x4xf32>) -> ()
+// CHECK: [[PRODUCT:%[0-9]+]] = tensor.dot_general
+// CHECK: [[SCALES:%[0-9]+]] = tensor.broadcast_to
+// CHECK: tensor.mul([[PRODUCT]], [[SCALES]])
+func.func @along_x(%input: tensor<2x3xf32>, %weight: tensor<3x4xf32> {param = 1}, %scale: tensor<2x1xf32> {param = 2}) -> tensor<2x4xf32> {
+  %product = tensor.dot_general(%input, %weight) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
+  %scales = tensor.broadcast_to(%scale) {shape = [2, 4]} : (tensor<2x1xf32>) -> tensor<2x4xf32>
+  %scaled = tensor.mul(%product, %scales) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+  func.return(%scaled) : (tensor<2x4xf32>) -> ()
 }
 
 // -----
 
 // A run-time weight would be scaled on every run.
 // CHECK: func.func @run_time_weight
-// CHECK: tensor.mul(%3, %4)
-func.func @run_time_weight(%0: tensor<2x3xf32>, %1: tensor<3x4xf32>, %2: tensor<4xf32> {param = 2}) -> tensor<2x4xf32> {
-  %3 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
-  %4 = tensor.broadcast_to(%2) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
-  %5 = tensor.mul(%3, %4) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
-  func.return(%5) : (tensor<2x4xf32>) -> ()
+// CHECK: [[PRODUCT:%[0-9]+]] = tensor.dot_general
+// CHECK: [[SCALES:%[0-9]+]] = tensor.broadcast_to
+// CHECK: tensor.mul([[PRODUCT]], [[SCALES]])
+func.func @run_time_weight(%input: tensor<2x3xf32>, %weight: tensor<3x4xf32>, %scale: tensor<4xf32> {param = 2}) -> tensor<2x4xf32> {
+  %product = tensor.dot_general(%input, %weight) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
+  %scales = tensor.broadcast_to(%scale) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
+  %scaled = tensor.mul(%product, %scales) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+  func.return(%scaled) : (tensor<2x4xf32>) -> ()
 }
 
 // -----
 
 // Scaling a weight cast from a narrower dtype would store a widened copy of it.
 // CHECK: func.func @cast_weight
-// CHECK: tensor.mul(%4, %5)
-func.func @cast_weight(%0: tensor<2x3xf32>, %1: tensor<3x4xbf16> {param = 1}, %2: tensor<4xf32> {param = 2}) -> tensor<2x4xf32> {
-  %3 = tensor.cast(%1) {to = f32} : (tensor<3x4xbf16>) -> tensor<3x4xf32>
-  %4 = tensor.dot_general(%0, %3) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
-  %5 = tensor.broadcast_to(%2) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
-  %6 = tensor.mul(%4, %5) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
-  func.return(%6) : (tensor<2x4xf32>) -> ()
+// CHECK: [[PRODUCT:%[0-9]+]] = tensor.dot_general
+// CHECK: [[SCALES:%[0-9]+]] = tensor.broadcast_to
+// CHECK: tensor.mul([[PRODUCT]], [[SCALES]])
+func.func @cast_weight(%input: tensor<2x3xf32>, %weight: tensor<3x4xbf16> {param = 1}, %scale: tensor<4xf32> {param = 2}) -> tensor<2x4xf32> {
+  %widened = tensor.cast(%weight) {to = f32} : (tensor<3x4xbf16>) -> tensor<3x4xf32>
+  %product = tensor.dot_general(%input, %widened) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
+  %scales = tensor.broadcast_to(%scale) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
+  %scaled = tensor.mul(%product, %scales) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+  func.return(%scaled) : (tensor<2x4xf32>) -> ()
 }
 
 // -----
 
 // Another use of the unscaled product needs it as it is.
 // CHECK: func.func @shared_product
-// CHECK: tensor.mul(%3, %4)
-func.func @shared_product(%0: tensor<2x3xf32>, %1: tensor<3x4xf32> {param = 1}, %2: tensor<4xf32> {param = 2}) -> (tensor<2x4xf32>, tensor<2x4xf32>) {
-  %3 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
-  %4 = tensor.broadcast_to(%2) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
-  %5 = tensor.mul(%3, %4) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
-  func.return(%5, %3) : (tensor<2x4xf32>, tensor<2x4xf32>) -> ()
+// CHECK: [[PRODUCT:%[0-9]+]] = tensor.dot_general
+// CHECK: [[SCALES:%[0-9]+]] = tensor.broadcast_to
+// CHECK: tensor.mul([[PRODUCT]], [[SCALES]])
+func.func @shared_product(%input: tensor<2x3xf32>, %weight: tensor<3x4xf32> {param = 1}, %scale: tensor<4xf32> {param = 2}) -> (tensor<2x4xf32>, tensor<2x4xf32>) {
+  %product = tensor.dot_general(%input, %weight) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
+  %scales = tensor.broadcast_to(%scale) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
+  %scaled = tensor.mul(%product, %scales) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+  func.return(%scaled, %product) : (tensor<2x4xf32>, tensor<2x4xf32>) -> ()
 }
 
 // -----
 
 // A scale computed at run time would scale the weight on every run.
 // CHECK: func.func @run_time_scale
-// CHECK: tensor.mul(%3, %4)
-func.func @run_time_scale(%0: tensor<2x3xf32>, %1: tensor<3x4xf32> {param = 1}, %2: tensor<4xf32>) -> tensor<2x4xf32> {
-  %3 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
-  %4 = tensor.broadcast_to(%2) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
-  %5 = tensor.mul(%3, %4) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
-  func.return(%5) : (tensor<2x4xf32>) -> ()
+// CHECK: [[PRODUCT:%[0-9]+]] = tensor.dot_general
+// CHECK: [[SCALES:%[0-9]+]] = tensor.broadcast_to
+// CHECK: tensor.mul([[PRODUCT]], [[SCALES]])
+func.func @run_time_scale(%input: tensor<2x3xf32>, %weight: tensor<3x4xf32> {param = 1}, %scale: tensor<4xf32>) -> tensor<2x4xf32> {
+  %product = tensor.dot_general(%input, %weight) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
+  %scales = tensor.broadcast_to(%scale) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
+  %scaled = tensor.mul(%product, %scales) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+  func.return(%scaled) : (tensor<2x4xf32>) -> ()
 }
 
 // -----
@@ -97,13 +107,15 @@ func.func @run_time_scale(%0: tensor<2x3xf32>, %1: tensor<3x4xf32> {param = 1}, 
 // A constant weight keeps the multiply: its scaled copy would add a stored parameter as large as
 // the weight, instead of replacing one.
 // CHECK: func.func @constant_weight
-// CHECK: tensor.mul(%3, %4)
-func.func @constant_weight(%0: tensor<2x3xf32>, %1: tensor<4xf32> {param = 1}) -> tensor<2x4xf32> {
-  %2 = tensor.constant() {value = dense<[3, 4] x f32: 0.5>} : () -> tensor<3x4xf32>
-  %3 = tensor.dot_general(%0, %2) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
-  %4 = tensor.broadcast_to(%1) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
-  %5 = tensor.mul(%3, %4) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
-  func.return(%5) : (tensor<2x4xf32>) -> ()
+// CHECK: [[PRODUCT:%[0-9]+]] = tensor.dot_general
+// CHECK: [[SCALES:%[0-9]+]] = tensor.broadcast_to
+// CHECK: tensor.mul([[PRODUCT]], [[SCALES]])
+func.func @constant_weight(%input: tensor<2x3xf32>, %scale: tensor<4xf32> {param = 1}) -> tensor<2x4xf32> {
+  %weight = tensor.constant() {value = dense<[3, 4] x f32: 0.5>} : () -> tensor<3x4xf32>
+  %product = tensor.dot_general(%input, %weight) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
+  %scales = tensor.broadcast_to(%scale) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
+  %scaled = tensor.mul(%product, %scales) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+  func.return(%scaled) : (tensor<2x4xf32>) -> ()
 }
 
 // -----
@@ -111,23 +123,25 @@ func.func @constant_weight(%0: tensor<2x3xf32>, %1: tensor<4xf32> {param = 1}) -
 // A bf16 weight of a dot with an f32 result keeps the f32 multiply: scaling the weight would round
 // in bf16.
 // CHECK: func.func @widening_dot
-// CHECK: tensor.mul(%3, %4)
-func.func @widening_dot(%0: tensor<2x3xbf16>, %1: tensor<3x4xbf16> {param = 1}, %2: tensor<4xf32> {param = 2}) -> tensor<2x4xf32> {
-  %3 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0], out = f32} : (tensor<2x3xbf16>, tensor<3x4xbf16>) -> tensor<2x4xf32>
-  %4 = tensor.broadcast_to(%2) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
-  %5 = tensor.mul(%3, %4) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
-  func.return(%5) : (tensor<2x4xf32>) -> ()
+// CHECK: [[PRODUCT:%[0-9]+]] = tensor.dot_general
+// CHECK: [[SCALES:%[0-9]+]] = tensor.broadcast_to
+// CHECK: tensor.mul([[PRODUCT]], [[SCALES]])
+func.func @widening_dot(%input: tensor<2x3xbf16>, %weight: tensor<3x4xbf16> {param = 1}, %scale: tensor<4xf32> {param = 2}) -> tensor<2x4xf32> {
+  %product = tensor.dot_general(%input, %weight) {contract_lhs = [1], contract_rhs = [0], out = f32} : (tensor<2x3xbf16>, tensor<3x4xbf16>) -> tensor<2x4xf32>
+  %scales = tensor.broadcast_to(%scale) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>
+  %scaled = tensor.mul(%product, %scales) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+  func.return(%scaled) : (tensor<2x4xf32>) -> ()
 }
 
 // -----
 
 // A scale along the last of two free axes of the weight.
 // ROUNDING: the scale rounds into every weight before the sum, instead of into the sum once
-// CHECK: func.func @two_free
-// CHECK-NEXT: tensor.reshape(%2) {shape = [1, 1, 5]}
-func.func @two_free(%0: tensor<2x3xf32>, %1: tensor<3x4x5xf32> {param = 1}, %2: tensor<5xf32> {param = 2}) -> tensor<2x4x5xf32> {
-  %3 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4x5xf32>) -> tensor<2x4x5xf32>
-  %4 = tensor.broadcast_to(%2) {shape = [2, 4, 5]} : (tensor<5xf32>) -> tensor<2x4x5xf32>
-  %5 = tensor.mul(%3, %4) : (tensor<2x4x5xf32>, tensor<2x4x5xf32>) -> tensor<2x4x5xf32>
-  func.return(%5) : (tensor<2x4x5xf32>) -> ()
+// CHECK: func.func @two_free([[INPUT:%[0-9]+]]: tensor<2x3xf32>, [[WEIGHT:%[0-9]+]]: tensor<3x4x5xf32> {param = 1}, [[SCALE:%[0-9]+]]: tensor<5xf32> {param = 2})
+// CHECK-NEXT: tensor.reshape([[SCALE]]) {shape = [1, 1, 5]}
+func.func @two_free(%input: tensor<2x3xf32>, %weight: tensor<3x4x5xf32> {param = 1}, %scale: tensor<5xf32> {param = 2}) -> tensor<2x4x5xf32> {
+  %product = tensor.dot_general(%input, %weight) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4x5xf32>) -> tensor<2x4x5xf32>
+  %scales = tensor.broadcast_to(%scale) {shape = [2, 4, 5]} : (tensor<5xf32>) -> tensor<2x4x5xf32>
+  %scaled = tensor.mul(%product, %scales) : (tensor<2x4x5xf32>, tensor<2x4x5xf32>) -> tensor<2x4x5xf32>
+  func.return(%scaled) : (tensor<2x4x5xf32>) -> ()
 }

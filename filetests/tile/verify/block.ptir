@@ -1,204 +1,204 @@
 // RUN: verify
 
 // ERROR: tile.block: a block with a prefix iterator has no reduction iterators
-func.func @prefix_and_red(%0: tensor<4x4xf32>) -> tensor<4xf32> {
-  %1 = tile.block(%0) {iters = [prefix 4, red 4], reads = [$0[d0, d1]], folds = [sum -> [d0]]} ({
-  ^body(%0: f32):
-    tile.yield(%0) : (f32) -> ()
+func.func @prefix_and_red(%input: tensor<4x4xf32>) -> tensor<4xf32> {
+  %sums = tile.block(%input) {iters = [prefix 4, red 4], reads = [$0[d0, d1]], folds = [sum -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
   }) : (tensor<4x4xf32>) -> tensor<4xf32>
-  func.return(%1) : (tensor<4xf32>) -> ()
+  func.return(%sums) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tile.block: read 0 gives 1 coordinates for tensor<4x4xf32>
-func.func @read_coordinates(%0: tensor<4x4xf32>) -> tensor<4xf32> {
-  %1 = tile.block(%0) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0]]} ({
-  ^body(%0: f32):
-    tile.yield(%0) : (f32) -> ()
+func.func @read_coordinates(%input: tensor<4x4xf32>) -> tensor<4xf32> {
+  %output = tile.block(%input) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
   }) : (tensor<4x4xf32>) -> tensor<4xf32>
-  func.return(%1) : (tensor<4xf32>) -> ()
+  func.return(%output) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tile.block: read 0 uses d1, which is not an iterator of the block
-func.func @unknown_iterator(%0: tensor<4xf32>) -> tensor<4xf32> {
-  %1 = tile.block(%0) {iters = [par 4], reads = [$0[d1]], folds = [none -> [d0]]} ({
-  ^body(%0: f32):
-    tile.yield(%0) : (f32) -> ()
+func.func @unknown_iterator(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %output = tile.block(%input) {iters = [par 4], reads = [$0[d1]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
   }) : (tensor<4xf32>) -> tensor<4xf32>
-  func.return(%1) : (tensor<4xf32>) -> ()
+  func.return(%output) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tile.block: read 0 multiplies or divides by an expression of iterators: d0 * d0
-func.func @not_affine(%0: tensor<16xf32>) -> tensor<4xf32> {
-  %1 = tile.block(%0) {iters = [par 4], reads = [$0[d0 * d0]], folds = [none -> [d0]]} ({
-  ^body(%0: f32):
-    tile.yield(%0) : (f32) -> ()
+func.func @not_affine(%input: tensor<16xf32>) -> tensor<4xf32> {
+  %output = tile.block(%input) {iters = [par 4], reads = [$0[d0 * d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
   }) : (tensor<16xf32>) -> tensor<4xf32>
-  func.return(%1) : (tensor<4xf32>) -> ()
+  func.return(%output) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tile.block: read 0 reads $1 as an index, but it is tensor<4xf32>
-func.func @float_index(%0: tensor<4xf32>, %1: tensor<4xf32>) -> tensor<4xf32> {
-  %2 = tile.block(%0, %1) {iters = [par 4], reads = [$0[$1[d0]]], folds = [none -> [d0]]} ({
-  ^body(%0: f32):
-    tile.yield(%0) : (f32) -> ()
+func.func @float_index(%input: tensor<4xf32>, %indices: tensor<4xf32>) -> tensor<4xf32> {
+  %gathered = tile.block(%input, %indices) {iters = [par 4], reads = [$0[$1[d0]]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
   }) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%2) : (tensor<4xf32>) -> ()
+  func.return(%gathered) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tile.block: read 0 pads with 0.5, which is not a si32 value
-func.func @pad_value(%0: tensor<4xsi32>) -> tensor<4xsi32> {
-  %1 = tile.block(%0) {iters = [par 4], reads = [$0[d0 - 1] pad 0.5], folds = [none -> [d0]]} ({
-  ^body(%0: si32):
-    tile.yield(%0) : (si32) -> ()
+func.func @pad_value(%input: tensor<4xsi32>) -> tensor<4xsi32> {
+  %shifted = tile.block(%input) {iters = [par 4], reads = [$0[d0 - 1] pad 0.5], folds = [none -> [d0]]} ({
+  ^body(%element: si32):
+    tile.yield(%element) : (si32) -> ()
   }) : (tensor<4xsi32>) -> tensor<4xsi32>
-  func.return(%1) : (tensor<4xsi32>) -> ()
+  func.return(%shifted) : (tensor<4xsi32>) -> ()
 }
 
 // -----
 
 // ERROR: tile.block: the folds take 2 yielded values, but the body yields 1
-func.func @combine_yields(%0: tensor<4x4xf32>) -> tensor<4xf32> {
-  %1 = tile.block(%0) {iters = [par 4, red 4], reads = [$0[d0, d1]], folds = [argmax -> [d0]]} ({
-  ^body(%0: f32):
-    tile.yield(%0) : (f32) -> ()
+func.func @combine_yields(%input: tensor<4x4xf32>) -> tensor<4xf32> {
+  %argmax = tile.block(%input) {iters = [par 4, red 4], reads = [$0[d0, d1]], folds = [argmax -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
   }) : (tensor<4x4xf32>) -> tensor<4xf32>
-  func.return(%1) : (tensor<4xf32>) -> ()
+  func.return(%argmax) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tile.block: a block with reduction or prefix iterators needs a fold other than none
-func.func @fold_needs_combine(%0: tensor<4x4xf32>) -> tensor<4xf32> {
-  %1 = tile.block(%0) {iters = [par 4, red 4], reads = [$0[d0, d1]], folds = [none -> [d0]]} ({
-  ^body(%0: f32):
-    tile.yield(%0) : (f32) -> ()
+func.func @fold_needs_combine(%input: tensor<4x4xf32>) -> tensor<4xf32> {
+  %output = tile.block(%input) {iters = [par 4, red 4], reads = [$0[d0, d1]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
   }) : (tensor<4x4xf32>) -> tensor<4xf32>
-  func.return(%1) : (tensor<4xf32>) -> ()
+  func.return(%output) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tile.block: write 0 must name each of the iterators [d0, d1] once, got [d0]
-func.func @write_names_every_iterator(%0: tensor<4x4xf32>) -> tensor<4xf32> {
-  %1 = tile.block(%0) {iters = [par 4, par 4], reads = [$0[d0, d1]], folds = [none -> [d0]]} ({
-  ^body(%0: f32):
-    tile.yield(%0) : (f32) -> ()
+func.func @write_names_every_iterator(%input: tensor<4x4xf32>) -> tensor<4xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 4], reads = [$0[d0, d1]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
   }) : (tensor<4x4xf32>) -> tensor<4xf32>
-  func.return(%1) : (tensor<4xf32>) -> ()
+  func.return(%output) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tile.block: write 0 writes a new tensor at d0 + 1; its coordinates are iterators or 0
-func.func @write_expression(%0: tensor<4xf32>) -> tensor<5xf32> {
-  %1 = tile.block(%0) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0 + 1]]} ({
-  ^body(%0: f32):
-    tile.yield(%0) : (f32) -> ()
+func.func @write_expression(%input: tensor<4xf32>) -> tensor<5xf32> {
+  %output = tile.block(%input) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0 + 1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
   }) : (tensor<4xf32>) -> tensor<5xf32>
-  func.return(%1) : (tensor<5xf32>) -> ()
+  func.return(%output) : (tensor<5xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tile.block: write 0 folds into an operand with argmax, but only none, sum, max, min, and and or fold into one
-func.func @into_kind(%0: tensor<4xf32>, %1: tensor<4xsi32>) -> tensor<4xf32> {
-  %2, %3 = tile.block(%0, %1) {iters = [par 4], reads = [$0[d0]], folds = [argmax -> $0[d0], $0[d0]]} ({
-  ^body(%0: f32):
-    %1 = tile.index() {expr = d0, dtype = si32} : () -> si32
-    tile.yield(%0, %1) : (f32, si32) -> ()
+func.func @into_kind(%input: tensor<4xf32>, %indices: tensor<4xsi32>) -> tensor<4xf32> {
+  %max_value, %max_index = tile.block(%input, %indices) {iters = [par 4], reads = [$0[d0]], folds = [argmax -> $0[d0], $0[d0]]} ({
+  ^body(%element: f32):
+    %index = tile.index() {expr = d0, dtype = si32} : () -> si32
+    tile.yield(%element, %index) : (f32, si32) -> ()
   }) : (tensor<4xf32>, tensor<4xsi32>) -> (tensor<4xf32>, tensor<4xf32>)
-  func.return(%2) : (tensor<4xf32>) -> ()
+  func.return(%max_value) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tile.block: result 0 is a plain new tensor, which a block with constraints cannot write
-func.func @constrained_plain_result(%0: tensor<4xf32>) -> tensor<4xf32> {
-  %1 = tile.block(%0) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0]], constraints = [d0 < 2]} ({
-  ^body(%0: f32):
-    tile.yield(%0) : (f32) -> ()
+func.func @constrained_plain_result(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %output = tile.block(%input) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0]], constraints = [d0 < 2]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
   }) : (tensor<4xf32>) -> tensor<4xf32>
-  func.return(%1) : (tensor<4xf32>) -> ()
+  func.return(%output) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tile.block: lane d1 is not a parallel iterator of the block
-func.func @lane_not_parallel(%0: tensor<4x8xf32>) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) {
-  %1, %2, %3 = tile.block(%0) {iters = [par 4, red 8], reads = [$0[d0, d1]], folds = [online_softmax<lanes = [d1]> -> [d0], [d0], [d0]]} ({
-  ^body(%0: f32):
-    tile.yield(%0, %0) : (f32, f32) -> ()
+func.func @lane_not_parallel(%scores: tensor<4x8xf32>) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) {
+  %max, %sum, %accumulated = tile.block(%scores) {iters = [par 4, red 8], reads = [$0[d0, d1]], folds = [online_softmax<lanes = [d1]> -> [d0], [d0], [d0]]} ({
+  ^body(%score: f32):
+    tile.yield(%score, %score) : (f32, f32) -> ()
   }) : (tensor<4x8xf32>) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>)
-  func.return(%1, %2, %3) : (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) -> ()
+  func.return(%max, %sum, %accumulated) : (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) -> ()
 }
 
 // -----
 
 // ERROR: tile.dispatch: a block uses {T}, which no argument binds
 tile.dispatch @fill() -> tensor<{T}xf32> {
-  %0 = tile.block() {iters = [par {T}], reads = [], folds = [none -> [d0]]} ({
-    %0 = arith.constant() {value = 0.0 : f32} : () -> f32
-    tile.yield(%0) : (f32) -> ()
+  %zeros = tile.block() {iters = [par {T}], reads = [], folds = [none -> [d0]]} ({
+    %zero = arith.constant() {value = 0.0 : f32} : () -> f32
+    tile.yield(%zero) : (f32) -> ()
   }) : () -> tensor<{T}xf32>
-  func.return(%0) : (tensor<{T}xf32>) -> ()
+  func.return(%zeros) : (tensor<{T}xf32>) -> ()
 }
 
 // -----
 
 // ERROR: host.dispatch: no symbol @missing
-func.func @call_unknown(%0: tensor<4xf32>) -> tensor<4xf32> {
-  %1 = host.dispatch(%0) {callee = @missing} : (tensor<4xf32>) -> tensor<4xf32>
-  func.return(%1) : (tensor<4xf32>) -> ()
+func.func @call_unknown(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %output = host.dispatch(%input) {callee = @missing} : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%output) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // ERROR: host.dispatch: argument 0: tensor<4xsi32> does not match tensor<{T}xf32>
-tile.dispatch @neg(%0: tensor<{T}xf32>) -> tensor<{T}xf32> {
-  %1 = tile.block(%0) {iters = [par {T}], reads = [$0[d0]], folds = [none -> [d0]]} ({
-  ^body(%0: f32):
-    %1 = arith.neg(%0) : (f32) -> f32
-    tile.yield(%1) : (f32) -> ()
+tile.dispatch @neg(%input: tensor<{T}xf32>) -> tensor<{T}xf32> {
+  %negated = tile.block(%input) {iters = [par {T}], reads = [$0[d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    %negated_element = arith.neg(%element) : (f32) -> f32
+    tile.yield(%negated_element) : (f32) -> ()
   }) : (tensor<{T}xf32>) -> tensor<{T}xf32>
-  func.return(%1) : (tensor<{T}xf32>) -> ()
+  func.return(%negated) : (tensor<{T}xf32>) -> ()
 }
 
-func.func @call_arguments(%0: tensor<4xsi32>) -> tensor<4xsi32> {
-  %1 = host.dispatch(%0) {callee = @neg} : (tensor<4xsi32>) -> tensor<4xsi32>
-  func.return(%1) : (tensor<4xsi32>) -> ()
+func.func @call_arguments(%input: tensor<4xsi32>) -> tensor<4xsi32> {
+  %output = host.dispatch(%input) {callee = @neg} : (tensor<4xsi32>) -> tensor<4xsi32>
+  func.return(%output) : (tensor<4xsi32>) -> ()
 }
 
 // -----
 
 // ERROR: arith.add: operands must have equal types, got f32 and bf16
-func.func @arith_dtypes(%0: tensor<4xf32>, %1: tensor<4xbf16>) -> tensor<4xf32> {
-  %2 = tile.block(%0, %1) {iters = [par 4], reads = [$0[d0], $1[d0]], folds = [none -> [d0]]} ({
-  ^body(%0: f32, %1: bf16):
-    %2 = arith.add(%0, %1) : (f32, bf16) -> f32
-    tile.yield(%2) : (f32) -> ()
+func.func @arith_dtypes(%lhs: tensor<4xf32>, %rhs: tensor<4xbf16>) -> tensor<4xf32> {
+  %sums = tile.block(%lhs, %rhs) {iters = [par 4], reads = [$0[d0], $1[d0]], folds = [none -> [d0]]} ({
+  ^body(%left: f32, %right: bf16):
+    %sum = arith.add(%left, %right) : (f32, bf16) -> f32
+    tile.yield(%sum) : (f32) -> ()
   }) : (tensor<4xf32>, tensor<4xbf16>) -> tensor<4xf32>
-  func.return(%2) : (tensor<4xf32>) -> ()
+  func.return(%sums) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // ERROR: arith.rng_normal: dtype must be a float dtype, got si32
-func.func @arith_rng_dtype(%0: tensor<2xui64>) -> tensor<4xsi32> {
-  %1 = tile.block(%0) {iters = [par 4], reads = [$0[0], $0[1]], folds = [none -> [d0]]} ({
-  ^body(%0: ui64, %1: ui64):
-    %2 = tile.index() {expr = d0, dtype = ui64} : () -> ui64
-    %3 = arith.rng_normal(%0, %1, %2) {dtype = si32} : (ui64, ui64, ui64) -> si32
-    tile.yield(%3) : (si32) -> ()
+func.func @arith_rng_dtype(%state: tensor<2xui64>) -> tensor<4xsi32> {
+  %normals = tile.block(%state) {iters = [par 4], reads = [$0[0], $0[1]], folds = [none -> [d0]]} ({
+  ^body(%key: ui64, %counter: ui64):
+    %index = tile.index() {expr = d0, dtype = ui64} : () -> ui64
+    %normal = arith.rng_normal(%key, %counter, %index) {dtype = si32} : (ui64, ui64, ui64) -> si32
+    tile.yield(%normal) : (si32) -> ()
   }) : (tensor<2xui64>) -> tensor<4xsi32>
-  func.return(%1) : (tensor<4xsi32>) -> ()
+  func.return(%normals) : (tensor<4xsi32>) -> ()
 }

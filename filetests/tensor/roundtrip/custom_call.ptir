@@ -1,20 +1,32 @@
 // RUN: roundtrip
 
-func.func @call(%0: tensor<8x16xf32>, %1: tensor<16xf32>) -> tensor<8x16xf32> {
-  %2 = tensor.custom_call(%0, %1) {target = "gpt_rs.c.conv2d.nhwc.f32.v1", attrs = {alpha = 1.5, "conv.stride" = array<i64: 1, 1>, fused = true, name = "conv"}, results = [tensor<8x16xf32>]} : (tensor<8x16xf32>, tensor<16xf32>) -> tensor<8x16xf32>
-  func.return(%2) : (tensor<8x16xf32>) -> ()
+// CHECK: func.func @call([[INPUT:%[0-9]+]]: tensor<8x16xf32>, [[BIAS:%[0-9]+]]: tensor<16xf32>) -> tensor<8x16xf32> {
+// CHECK-NEXT: [[OUTPUT:%[0-9]+]] = tensor.custom_call([[INPUT]], [[BIAS]]) {target = "gpt_rs.c.conv2d.nhwc.f32.v1", attrs = {alpha = 1.5, "conv.stride" = array<i64: 1, 1>, fused = true, name = "conv"}, results = [tensor<8x16xf32>]} : (tensor<8x16xf32>, tensor<16xf32>) -> tensor<8x16xf32>
+// CHECK-NEXT: func.return([[OUTPUT]]) : (tensor<8x16xf32>) -> ()
+// CHECK-NEXT: }
+func.func @call(%input: tensor<8x16xf32>, %bias: tensor<16xf32>) -> tensor<8x16xf32> {
+  %output = tensor.custom_call(%input, %bias) {target = "gpt_rs.c.conv2d.nhwc.f32.v1", attrs = {alpha = 1.5, "conv.stride" = array<i64: 1, 1>, fused = true, name = "conv"}, results = [tensor<8x16xf32>]} : (tensor<8x16xf32>, tensor<16xf32>) -> tensor<8x16xf32>
+  func.return(%output) : (tensor<8x16xf32>) -> ()
 }
 
 // -----
 
-func.func @attrs(%0: tensor<4xf32>) -> (tensor<4xf32>, tensor<2xsi32>) {
-  %1, %2 = tensor.custom_call(%0) {target = "k", attrs = {count = 3, empty = array<i64:>, flags = array<bool: true, false>, names = array<str: "a\"b\\c">, scales = array<f64: 0.5, 0.001>}, results = [tensor<4xf32>, tensor<2xsi32>]} : (tensor<4xf32>) -> (tensor<4xf32>, tensor<2xsi32>)
-  func.return(%1, %2) : (tensor<4xf32>, tensor<2xsi32>) -> ()
+// CHECK: func.func @attrs([[INPUT:%[0-9]+]]: tensor<4xf32>) -> (tensor<4xf32>, tensor<2xsi32>) {
+// CHECK-NEXT: [[VALUES:%[0-9]+]], [[INDICES:%[0-9]+]] = tensor.custom_call([[INPUT]]) {target = "k", attrs = {count = 3, empty = array<i64:>, flags = array<bool: true, false>, names = array<str: "a\"b\\c">, scales = array<f64: 0.5, 0.001>}, results = [tensor<4xf32>, tensor<2xsi32>]} : (tensor<4xf32>) -> (tensor<4xf32>, tensor<2xsi32>)
+// CHECK-NEXT: func.return([[VALUES]], [[INDICES]]) : (tensor<4xf32>, tensor<2xsi32>) -> ()
+// CHECK-NEXT: }
+func.func @attrs(%input: tensor<4xf32>) -> (tensor<4xf32>, tensor<2xsi32>) {
+  %values, %indices = tensor.custom_call(%input) {target = "k", attrs = {count = 3, empty = array<i64:>, flags = array<bool: true, false>, names = array<str: "a\"b\\c">, scales = array<f64: 0.5, 0.001>}, results = [tensor<4xf32>, tensor<2xsi32>]} : (tensor<4xf32>) -> (tensor<4xf32>, tensor<2xsi32>)
+  func.return(%values, %indices) : (tensor<4xf32>, tensor<2xsi32>) -> ()
 }
 
 // -----
 
+// CHECK: func.func @no_inputs() -> tensor<4xf32> {
+// CHECK-NEXT: [[OUTPUT:%[0-9]+]] = tensor.custom_call() {target = "k", results = [tensor<4xf32>]} : () -> tensor<4xf32>
+// CHECK-NEXT: func.return([[OUTPUT]]) : (tensor<4xf32>) -> ()
+// CHECK-NEXT: }
 func.func @no_inputs() -> tensor<4xf32> {
-  %0 = tensor.custom_call() {target = "k", results = [tensor<4xf32>]} : () -> tensor<4xf32>
-  func.return(%0) : (tensor<4xf32>) -> ()
+  %output = tensor.custom_call() {target = "k", results = [tensor<4xf32>]} : () -> tensor<4xf32>
+  func.return(%output) : (tensor<4xf32>) -> ()
 }

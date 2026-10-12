@@ -2,76 +2,76 @@
 
 // Static operands of an associative op gather into one static value, which the backend computes
 // at load time.
-// CHECK: func.func @gather
-// CHECK-NEXT: [[W:%[0-9]+]] = tensor.maximum(%1, %2)
-// CHECK-NEXT: [[M:%[0-9]+]] = tensor.maximum(%0, [[W]])
-// CHECK-NEXT: func.return([[M]])
-func.func @gather(%0: tensor<4xf32>, %1: tensor<4xf32> {param = 1}, %2: tensor<4xf32> {param = 2}) -> tensor<4xf32> {
-  %3 = tensor.maximum(%1, %0) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %4 = tensor.maximum(%3, %2) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%4) : (tensor<4xf32>) -> ()
+// CHECK: func.func @gather([[INPUT:%[0-9]+]]: tensor<4xf32>, [[FIRST_WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1}, [[SECOND_WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 2}) -> tensor<4xf32> {
+// CHECK-NEXT: [[WEIGHT_MAX:%[0-9]+]] = tensor.maximum([[FIRST_WEIGHT]], [[SECOND_WEIGHT]])
+// CHECK-NEXT: [[MAX:%[0-9]+]] = tensor.maximum([[INPUT]], [[WEIGHT_MAX]])
+// CHECK-NEXT: func.return([[MAX]])
+func.func @gather(%input: tensor<4xf32>, %first_weight: tensor<4xf32> {param = 1}, %second_weight: tensor<4xf32> {param = 2}) -> tensor<4xf32> {
+  %partial_max = tensor.maximum(%first_weight, %input) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %max = tensor.maximum(%partial_max, %second_weight) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%max) : (tensor<4xf32>) -> ()
 }
 
 // -----
 
 // Static operands do not gather when the inner op has another use.
-// CHECK: func.func @gather_shared
-// CHECK-NEXT: [[I:%[0-9]+]] = tensor.maximum(%0, %1)
-// CHECK-NEXT: tensor.maximum([[I]], %2)
-func.func @gather_shared(%0: tensor<4xf32>, %1: tensor<4xf32> {param = 1}, %2: tensor<4xf32> {param = 2}) -> (tensor<4xf32>, tensor<4xf32>) {
-  %3 = tensor.maximum(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %4 = tensor.maximum(%3, %2) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%4, %3) : (tensor<4xf32>, tensor<4xf32>) -> ()
+// CHECK: func.func @gather_shared([[INPUT:%[0-9]+]]: tensor<4xf32>, [[FIRST_WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1}, [[SECOND_WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 2}) -> (tensor<4xf32>, tensor<4xf32>) {
+// CHECK-NEXT: [[PARTIAL_MAX:%[0-9]+]] = tensor.maximum([[INPUT]], [[FIRST_WEIGHT]])
+// CHECK-NEXT: tensor.maximum([[PARTIAL_MAX]], [[SECOND_WEIGHT]])
+func.func @gather_shared(%input: tensor<4xf32>, %first_weight: tensor<4xf32> {param = 1}, %second_weight: tensor<4xf32> {param = 2}) -> (tensor<4xf32>, tensor<4xf32>) {
+  %partial_max = tensor.maximum(%input, %first_weight) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %max = tensor.maximum(%partial_max, %second_weight) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%max, %partial_max) : (tensor<4xf32>, tensor<4xf32>) -> ()
 }
 
 // -----
 
 // Integer addition regroups. Float addition does not: regrouped, it rounds differently.
-// CHECK: func.func @regroup
-// CHECK: [[C:%[0-9]+]] = tensor.add({{%[0-9]+}}, {{%[0-9]+}}) : (tensor<4xsi32>
-// CHECK-NEXT: tensor.add(%0, [[C]])
-// CHECK: [[F:%[0-9]+]] = tensor.add(%1, {{%[0-9]+}})
-// CHECK-NEXT: tensor.add([[F]], {{%[0-9]+}})
-func.func @regroup(%0: tensor<4xsi32>, %1: tensor<4xf32>, %2: tensor<4xsi32> {param = 1}, %3: tensor<4xf32> {param = 2}) -> (tensor<4xsi32>, tensor<4xf32>) {
-  %4 = tensor.constant() {value = dense<[4] x si32: 5>} : () -> tensor<4xsi32>
-  %5 = tensor.add(%0, %2) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
-  %6 = tensor.add(%5, %4) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
-  %7 = tensor.constant() {value = dense<[4] x f32: 5.0>} : () -> tensor<4xf32>
-  %8 = tensor.add(%1, %3) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %9 = tensor.add(%8, %7) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%6, %9) : (tensor<4xsi32>, tensor<4xf32>) -> ()
+// CHECK: func.func @regroup([[INT_INPUT:%[0-9]+]]: tensor<4xsi32>, [[FLOAT_INPUT:%[0-9]+]]: tensor<4xf32>, [[INT_WEIGHT:%[0-9]+]]: tensor<4xsi32> {param = 1}, [[FLOAT_WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 2}) -> (tensor<4xsi32>, tensor<4xf32>) {
+// CHECK: [[INT_STATIC:%[0-9]+]] = tensor.add({{%[0-9]+}}, {{%[0-9]+}}) : (tensor<4xsi32>
+// CHECK-NEXT: tensor.add([[INT_INPUT]], [[INT_STATIC]])
+// CHECK: [[FLOAT_PARTIAL:%[0-9]+]] = tensor.add([[FLOAT_INPUT]], {{%[0-9]+}})
+// CHECK-NEXT: tensor.add([[FLOAT_PARTIAL]], {{%[0-9]+}})
+func.func @regroup(%int_input: tensor<4xsi32>, %float_input: tensor<4xf32>, %int_weight: tensor<4xsi32> {param = 1}, %float_weight: tensor<4xf32> {param = 2}) -> (tensor<4xsi32>, tensor<4xf32>) {
+  %int_five = tensor.constant() {value = dense<[4] x si32: 5>} : () -> tensor<4xsi32>
+  %int_partial = tensor.add(%int_input, %int_weight) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  %int_sum = tensor.add(%int_partial, %int_five) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  %float_five = tensor.constant() {value = dense<[4] x f32: 5.0>} : () -> tensor<4xf32>
+  %float_partial = tensor.add(%float_input, %float_weight) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %float_sum = tensor.add(%float_partial, %float_five) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%int_sum, %float_sum) : (tensor<4xsi32>, tensor<4xf32>) -> ()
 }
 
 // -----
 
 // Integer multiplication distributes over addition, so a shared factor comes out, on either side
 // of the commutative multiplication.
-// CHECK: func.func @factor
-// CHECK-NEXT: [[S:%[0-9]+]] = tensor.add(%1, %2)
-// CHECK-NEXT: [[P:%[0-9]+]] = tensor.mul(%0, [[S]])
-// CHECK-NEXT: func.return([[P]])
-func.func @factor(%0: tensor<4xsi32>, %1: tensor<4xsi32>, %2: tensor<4xsi32>) -> tensor<4xsi32> {
-  %3 = tensor.mul(%0, %1) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
-  %4 = tensor.mul(%2, %0) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
-  %5 = tensor.add(%3, %4) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
-  func.return(%5) : (tensor<4xsi32>) -> ()
+// CHECK: func.func @factor([[FACTOR:%[0-9]+]]: tensor<4xsi32>, [[LHS:%[0-9]+]]: tensor<4xsi32>, [[RHS:%[0-9]+]]: tensor<4xsi32>) -> tensor<4xsi32> {
+// CHECK-NEXT: [[TERMS:%[0-9]+]] = tensor.add([[LHS]], [[RHS]])
+// CHECK-NEXT: [[SUM:%[0-9]+]] = tensor.mul([[FACTOR]], [[TERMS]])
+// CHECK-NEXT: func.return([[SUM]])
+func.func @factor(%factor: tensor<4xsi32>, %lhs: tensor<4xsi32>, %rhs: tensor<4xsi32>) -> tensor<4xsi32> {
+  %lhs_product = tensor.mul(%factor, %lhs) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  %rhs_product = tensor.mul(%rhs, %factor) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  %sum = tensor.add(%lhs_product, %rhs_product) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  func.return(%sum) : (tensor<4xsi32>) -> ()
 }
 
 // -----
 
 // Float multiplication does not distribute exactly, and a product with another use stays.
-// CHECK: func.func @no_factor
-// CHECK: tensor.mul(%0, %1)
-// CHECK: tensor.mul(%0, %2)
+// CHECK: func.func @no_factor([[FLOAT_FACTOR:%[0-9]+]]: tensor<4xf32>, [[FLOAT_LHS:%[0-9]+]]: tensor<4xf32>, [[FLOAT_RHS:%[0-9]+]]: tensor<4xf32>, [[INT_FACTOR:%[0-9]+]]: tensor<4xsi32>, [[INT_LHS:%[0-9]+]]: tensor<4xsi32>, [[INT_RHS:%[0-9]+]]: tensor<4xsi32>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xsi32>) {
+// CHECK: tensor.mul([[FLOAT_FACTOR]], [[FLOAT_LHS]])
+// CHECK: tensor.mul([[FLOAT_FACTOR]], [[FLOAT_RHS]])
 // CHECK: tensor.add
-// CHECK: tensor.mul(%3, %4)
-// CHECK: tensor.mul(%3, %5)
-func.func @no_factor(%0: tensor<4xf32>, %1: tensor<4xf32>, %2: tensor<4xf32>, %3: tensor<4xsi32>, %4: tensor<4xsi32>, %5: tensor<4xsi32>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xsi32>) {
-  %6 = tensor.mul(%0, %1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %7 = tensor.mul(%0, %2) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %8 = tensor.add(%6, %7) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %9 = tensor.mul(%3, %4) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
-  %10 = tensor.mul(%3, %5) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
-  %11 = tensor.add(%9, %10) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
-  func.return(%8, %11, %9) : (tensor<4xf32>, tensor<4xsi32>, tensor<4xsi32>) -> ()
+// CHECK: tensor.mul([[INT_FACTOR]], [[INT_LHS]])
+// CHECK: tensor.mul([[INT_FACTOR]], [[INT_RHS]])
+func.func @no_factor(%float_factor: tensor<4xf32>, %float_lhs: tensor<4xf32>, %float_rhs: tensor<4xf32>, %int_factor: tensor<4xsi32>, %int_lhs: tensor<4xsi32>, %int_rhs: tensor<4xsi32>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xsi32>) {
+  %float_lhs_product = tensor.mul(%float_factor, %float_lhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %float_rhs_product = tensor.mul(%float_factor, %float_rhs) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %float_sum = tensor.add(%float_lhs_product, %float_rhs_product) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %int_lhs_product = tensor.mul(%int_factor, %int_lhs) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  %int_rhs_product = tensor.mul(%int_factor, %int_rhs) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  %int_sum = tensor.add(%int_lhs_product, %int_rhs_product) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  func.return(%float_sum, %int_sum, %int_lhs_product) : (tensor<4xf32>, tensor<4xsi32>, tensor<4xsi32>) -> ()
 }

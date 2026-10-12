@@ -3,19 +3,19 @@
 // The constants of a function go to its start, and equal ones become the first of them, so ops
 // on them see one value: a comparison of two equal constants is a comparison of a value with
 // itself.
-// CHECK: func.func @equal_constants
-// CHECK: [[C:%[0-9]+]] = tensor.constant() {value = dense<[4] x si32: 3>}
+// CHECK: func.func @equal_constants([[INPUT:%[0-9]+]]: tensor<4xsi32>) -> (tensor<4xsi32>, tensor<4xsi32>, tensor<4xi1>) {
+// CHECK: [[THREE:%[0-9]+]] = tensor.constant() {value = dense<[4] x si32: 3>}
 // CHECK-NOT: tensor.constant() {value = dense<[4] x si32: 3>}
-// CHECK: tensor.add(%0, [[C]])
-// CHECK: tensor.mul(%0, [[C]])
+// CHECK: tensor.add([[INPUT]], [[THREE]])
+// CHECK: tensor.mul([[INPUT]], [[THREE]])
 // CHECK-NOT: tensor.equal
-func.func @equal_constants(%0: tensor<4xsi32>) -> (tensor<4xsi32>, tensor<4xsi32>, tensor<4xi1>) {
-  %1 = tensor.constant() {value = dense<[4] x si32: 3>} : () -> tensor<4xsi32>
-  %2 = tensor.add(%0, %1) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
-  %3 = tensor.constant() {value = dense<[4] x si32: 3>} : () -> tensor<4xsi32>
-  %4 = tensor.mul(%0, %3) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
-  %5 = tensor.equal(%1, %3) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xi1>
-  func.return(%2, %4, %5) : (tensor<4xsi32>, tensor<4xsi32>, tensor<4xi1>) -> ()
+func.func @equal_constants(%input: tensor<4xsi32>) -> (tensor<4xsi32>, tensor<4xsi32>, tensor<4xi1>) {
+  %three = tensor.constant() {value = dense<[4] x si32: 3>} : () -> tensor<4xsi32>
+  %sum = tensor.add(%input, %three) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  %other_three = tensor.constant() {value = dense<[4] x si32: 3>} : () -> tensor<4xsi32>
+  %product = tensor.mul(%input, %other_three) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  %same = tensor.equal(%three, %other_three) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xi1>
+  func.return(%sum, %product, %same) : (tensor<4xsi32>, tensor<4xsi32>, tensor<4xi1>) -> ()
 }
 
 // -----
@@ -25,14 +25,14 @@ func.func @equal_constants(%0: tensor<4xsi32>) -> (tensor<4xsi32>, tensor<4xsi32
 // CHECK: tensor.constant() {value = dense<[4] x si32: 3>}
 // CHECK: tensor.constant() {value = dense<[4] x si32: 4>}
 // CHECK: tensor.constant() {value = dense<[4] x f32: 3.0>}
-func.func @different_constants(%0: tensor<4xsi32>, %1: tensor<4xf32>) -> (tensor<4xsi32>, tensor<4xsi32>, tensor<4xf32>) {
-  %2 = tensor.constant() {value = dense<[4] x si32: 3>} : () -> tensor<4xsi32>
-  %3 = tensor.add(%0, %2) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
-  %4 = tensor.constant() {value = dense<[4] x si32: 4>} : () -> tensor<4xsi32>
-  %5 = tensor.add(%0, %4) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
-  %6 = tensor.constant() {value = dense<[4] x f32: 3.0>} : () -> tensor<4xf32>
-  %7 = tensor.add(%1, %6) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  func.return(%3, %5, %7) : (tensor<4xsi32>, tensor<4xsi32>, tensor<4xf32>) -> ()
+func.func @different_constants(%int_input: tensor<4xsi32>, %float_input: tensor<4xf32>) -> (tensor<4xsi32>, tensor<4xsi32>, tensor<4xf32>) {
+  %int_three = tensor.constant() {value = dense<[4] x si32: 3>} : () -> tensor<4xsi32>
+  %plus_three = tensor.add(%int_input, %int_three) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  %int_four = tensor.constant() {value = dense<[4] x si32: 4>} : () -> tensor<4xsi32>
+  %plus_four = tensor.add(%int_input, %int_four) : (tensor<4xsi32>, tensor<4xsi32>) -> tensor<4xsi32>
+  %float_three = tensor.constant() {value = dense<[4] x f32: 3.0>} : () -> tensor<4xf32>
+  %float_plus_three = tensor.add(%float_input, %float_three) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%plus_three, %plus_four, %float_plus_three) : (tensor<4xsi32>, tensor<4xsi32>, tensor<4xf32>) -> ()
 }
 
 // -----
@@ -40,24 +40,24 @@ func.func @different_constants(%0: tensor<4xsi32>, %1: tensor<4xf32>) -> (tensor
 // A constant in a region of an op that is not isolated from above goes to the start of its
 // function too, and becomes the equal constant there.
 // CHECK: func.func @nested
-// CHECK-NEXT: [[C:%[0-9]+]] = tensor.constant() {value = dense<[] x si32: 2>}
+// CHECK-NEXT: [[TWO:%[0-9]+]] = tensor.constant() {value = dense<[] x si32: 2>}
 // CHECK-NEXT: tensor.constant() {value = dense<[] x si32: 3>}
 // CHECK-NOT: tensor.constant
 // CHECK: tensor.cond
-// CHECK: tensor.add({{%[0-9]+}}, [[C]])
-func.func @nested(%0: tensor<i1>, %1: tensor<si32>) -> (tensor<si32>, tensor<si32>) {
-  %2 = tensor.constant() {value = dense<[] x si32: 2>} : () -> tensor<si32>
-  %3 = tensor.mul(%1, %2) : (tensor<si32>, tensor<si32>) -> tensor<si32>
-  %4 = tensor.cond(%0, %3) {results = [tensor<si32>]} ({
-  ^then_branch(%5: tensor<si32>):
-    %6 = tensor.constant() {value = dense<[] x si32: 2>} : () -> tensor<si32>
-    %7 = tensor.add(%5, %6) : (tensor<si32>, tensor<si32>) -> tensor<si32>
-    tensor.yield(%7) : (tensor<si32>) -> ()
+// CHECK: tensor.add({{%[0-9]+}}, [[TWO]])
+func.func @nested(%condition: tensor<i1>, %input: tensor<si32>) -> (tensor<si32>, tensor<si32>) {
+  %two = tensor.constant() {value = dense<[] x si32: 2>} : () -> tensor<si32>
+  %doubled = tensor.mul(%input, %two) : (tensor<si32>, tensor<si32>) -> tensor<si32>
+  %chosen = tensor.cond(%condition, %doubled) {results = [tensor<si32>]} ({
+  ^then_branch(%then_input: tensor<si32>):
+    %then_two = tensor.constant() {value = dense<[] x si32: 2>} : () -> tensor<si32>
+    %plus_two = tensor.add(%then_input, %then_two) : (tensor<si32>, tensor<si32>) -> tensor<si32>
+    tensor.yield(%plus_two) : (tensor<si32>) -> ()
   }, {
-  ^else_branch(%8: tensor<si32>):
-    %9 = tensor.constant() {value = dense<[] x si32: 3>} : () -> tensor<si32>
-    %10 = tensor.sub(%8, %9) : (tensor<si32>, tensor<si32>) -> tensor<si32>
-    tensor.yield(%10) : (tensor<si32>) -> ()
+  ^else_branch(%else_input: tensor<si32>):
+    %three = tensor.constant() {value = dense<[] x si32: 3>} : () -> tensor<si32>
+    %minus_three = tensor.sub(%else_input, %three) : (tensor<si32>, tensor<si32>) -> tensor<si32>
+    tensor.yield(%minus_three) : (tensor<si32>) -> ()
   }) : (tensor<i1>, tensor<si32>) -> tensor<si32>
-  func.return(%3, %4) : (tensor<si32>, tensor<si32>) -> ()
+  func.return(%doubled, %chosen) : (tensor<si32>, tensor<si32>) -> ()
 }

@@ -2,31 +2,31 @@
 
 // An `out` equal to the operands' dtype and an `accum` equal to their default accumulator are left
 // out.
-// CHECK: func.func @dot
-// CHECK: tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0]} :
-func.func @dot(%0: tensor<2x3xf32>, %1: tensor<3x4xf32>) -> tensor<2x4xf32> {
-  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0], accum = f32, out = f32} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
-  func.return(%2) : (tensor<2x4xf32>) -> ()
+// CHECK: func.func @dot([[LHS:%[0-9]+]]: tensor<2x3xf32>, [[RHS:%[0-9]+]]: tensor<3x4xf32>) -> tensor<2x4xf32> {
+// CHECK: tensor.dot_general([[LHS]], [[RHS]]) {contract_lhs = [1], contract_rhs = [0]} :
+func.func @dot(%lhs: tensor<2x3xf32>, %rhs: tensor<3x4xf32>) -> tensor<2x4xf32> {
+  %product = tensor.dot_general(%lhs, %rhs) {contract_lhs = [1], contract_rhs = [0], accum = f32, out = f32} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
+  func.return(%product) : (tensor<2x4xf32>) -> ()
 }
 
 // -----
 
 // Reductions and reduce windows leave out the same default dtypes.
-// CHECK: func.func @reduce
-// CHECK: tensor.reduce_sum(%0) {axes = [1]} :
-// CHECK: tensor.reduce_window_max(%0) {window_dims = [1, 2], strides = [1, 1], padding = [(0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [1, 1]} :
-func.func @reduce(%0: tensor<2x3xf32>) -> (tensor<2xf32>, tensor<2x2xf32>) {
-  %1 = tensor.reduce_sum(%0) {axes = [1], accum = f32, out = f32} : (tensor<2x3xf32>) -> tensor<2xf32>
-  %2 = tensor.reduce_window_max(%0) {window_dims = [1, 2], strides = [1, 1], padding = [(0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [1, 1], accum = f32} : (tensor<2x3xf32>) -> tensor<2x2xf32>
-  func.return(%1, %2) : (tensor<2xf32>, tensor<2x2xf32>) -> ()
+// CHECK: func.func @reduce([[INPUT:%[0-9]+]]: tensor<2x3xf32>) -> (tensor<2xf32>, tensor<2x2xf32>) {
+// CHECK: tensor.reduce_sum([[INPUT]]) {axes = [1]} :
+// CHECK: tensor.reduce_window_max([[INPUT]]) {window_dims = [1, 2], strides = [1, 1], padding = [(0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [1, 1]} :
+func.func @reduce(%input: tensor<2x3xf32>) -> (tensor<2xf32>, tensor<2x2xf32>) {
+  %row_sums = tensor.reduce_sum(%input) {axes = [1], accum = f32, out = f32} : (tensor<2x3xf32>) -> tensor<2xf32>
+  %pooled = tensor.reduce_window_max(%input) {window_dims = [1, 2], strides = [1, 1], padding = [(0, 0), (0, 0)], base_dilation = [1, 1], window_dilation = [1, 1], accum = f32} : (tensor<2x3xf32>) -> tensor<2x2xf32>
+  func.return(%row_sums, %pooled) : (tensor<2xf32>, tensor<2x2xf32>) -> ()
 }
 
 // -----
 
 // An `out` that differs from the operands' dtype stays, and the default f32 `accum` of bf16 goes.
-// CHECK: func.func @accum_is_result
-// CHECK: tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0], out = f32} :
-func.func @accum_is_result(%0: tensor<2x3xbf16>, %1: tensor<3x4xbf16>) -> tensor<2x4xf32> {
-  %2 = tensor.dot_general(%0, %1) {contract_lhs = [1], contract_rhs = [0], accum = f32, out = f32} : (tensor<2x3xbf16>, tensor<3x4xbf16>) -> tensor<2x4xf32>
-  func.return(%2) : (tensor<2x4xf32>) -> ()
+// CHECK: func.func @accum_is_result([[LHS:%[0-9]+]]: tensor<2x3xbf16>, [[RHS:%[0-9]+]]: tensor<3x4xbf16>) -> tensor<2x4xf32> {
+// CHECK: tensor.dot_general([[LHS]], [[RHS]]) {contract_lhs = [1], contract_rhs = [0], out = f32} :
+func.func @accum_is_result(%lhs: tensor<2x3xbf16>, %rhs: tensor<3x4xbf16>) -> tensor<2x4xf32> {
+  %product = tensor.dot_general(%lhs, %rhs) {contract_lhs = [1], contract_rhs = [0], accum = f32, out = f32} : (tensor<2x3xbf16>, tensor<3x4xbf16>) -> tensor<2x4xf32>
+  func.return(%product) : (tensor<2x4xf32>) -> ()
 }

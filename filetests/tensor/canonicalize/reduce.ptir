@@ -3,106 +3,106 @@
 // Nested reductions of one kind merge into one over the axes of both, reshaped to the result. The
 // inner reduction's axes are axes of the input. The outer reduction's axes are axes of the inner
 // result, so axis 1 of the inner result below is axis 2 of the input.
-// CHECK: func.func @merge
-// CHECK-NEXT: [[R:%[0-9]+]] = tensor.reduce_max(%0) {axes = [0, 2]} : (tensor<2x3x3xf32>) -> tensor<3xf32>
-// CHECK-NEXT: [[K:%[0-9]+]] = tensor.reduce_min(%0) {axes = [1, 2]} : (tensor<2x3x3xf32>) -> tensor<2xf32>
-// CHECK-NEXT: [[S:%[0-9]+]] = tensor.reshape([[K]]) {shape = [2, 1]}
-// CHECK-NEXT: func.return([[R]], [[S]])
-func.func @merge(%0: tensor<2x3x3xf32>) -> (tensor<3xf32>, tensor<2x1xf32>) {
-  %1 = tensor.reduce_max(%0) {axes = [0]} : (tensor<2x3x3xf32>) -> tensor<3x3xf32>
-  %2 = tensor.reduce_max(%1) {axes = [1]} : (tensor<3x3xf32>) -> tensor<3xf32>
-  %3 = tensor.reduce_min(%0) {axes = [1], keepdims = true} : (tensor<2x3x3xf32>) -> tensor<2x1x3xf32>
-  %4 = tensor.reduce_min(%3) {axes = [2]} : (tensor<2x1x3xf32>) -> tensor<2x1xf32>
-  func.return(%2, %4) : (tensor<3xf32>, tensor<2x1xf32>) -> ()
+// CHECK: func.func @merge([[INPUT:%[0-9]+]]: tensor<2x3x3xf32>) -> (tensor<3xf32>, tensor<2x1xf32>) {
+// CHECK-NEXT: [[MAX:%[0-9]+]] = tensor.reduce_max([[INPUT]]) {axes = [0, 2]} : (tensor<2x3x3xf32>) -> tensor<3xf32>
+// CHECK-NEXT: [[MERGED_MIN:%[0-9]+]] = tensor.reduce_min([[INPUT]]) {axes = [1, 2]} : (tensor<2x3x3xf32>) -> tensor<2xf32>
+// CHECK-NEXT: [[MIN:%[0-9]+]] = tensor.reshape([[MERGED_MIN]]) {shape = [2, 1]}
+// CHECK-NEXT: func.return([[MAX]], [[MIN]])
+func.func @merge(%input: tensor<2x3x3xf32>) -> (tensor<3xf32>, tensor<2x1xf32>) {
+  %inner_max = tensor.reduce_max(%input) {axes = [0]} : (tensor<2x3x3xf32>) -> tensor<3x3xf32>
+  %max = tensor.reduce_max(%inner_max) {axes = [1]} : (tensor<3x3xf32>) -> tensor<3xf32>
+  %inner_min = tensor.reduce_min(%input) {axes = [1], keepdims = true} : (tensor<2x3x3xf32>) -> tensor<2x1x3xf32>
+  %min = tensor.reduce_min(%inner_min) {axes = [2]} : (tensor<2x1x3xf32>) -> tensor<2x1xf32>
+  func.return(%max, %min) : (tensor<3xf32>, tensor<2x1xf32>) -> ()
 }
 
 // -----
 
 // Float sums do not merge: they would add in another order.
-// CHECK: func.func @sum_stays
-// CHECK: tensor.reduce_sum(%0) {axes = [1], keepdims = true}
+// CHECK: func.func @sum_stays([[INPUT:%[0-9]+]]: tensor<2x3xf32>) -> tensor<1xf32> {
+// CHECK: tensor.reduce_sum([[INPUT]]) {axes = [1], keepdims = true}
 // CHECK-NEXT: tensor.reduce_sum
-func.func @sum_stays(%0: tensor<2x3xf32>) -> tensor<1xf32> {
-  %1 = tensor.reduce_sum(%0) {axes = [1], keepdims = true} : (tensor<2x3xf32>) -> tensor<2x1xf32>
-  %2 = tensor.reduce_sum(%1) {axes = [0]} : (tensor<2x1xf32>) -> tensor<1xf32>
-  func.return(%2) : (tensor<1xf32>) -> ()
+func.func @sum_stays(%input: tensor<2x3xf32>) -> tensor<1xf32> {
+  %row_sums = tensor.reduce_sum(%input) {axes = [1], keepdims = true} : (tensor<2x3xf32>) -> tensor<2x1xf32>
+  %total = tensor.reduce_sum(%row_sums) {axes = [0]} : (tensor<2x1xf32>) -> tensor<1xf32>
+  func.return(%total) : (tensor<1xf32>) -> ()
 }
 
 // -----
 
 // A max over the axes a broadcast repeats along is the broadcast's input: copies of one element
 // combine to it.
-// CHECK: func.func @of_broadcast
-// CHECK-NEXT: [[S:%[0-9]+]] = tensor.reshape(%0) {shape = [3, 1]}
-// CHECK-NEXT: func.return(%0, [[S]])
-func.func @of_broadcast(%0: tensor<3xf32>) -> (tensor<3xf32>, tensor<3x1xf32>) {
-  %1 = tensor.broadcast_to(%0) {shape = [2, 3]} : (tensor<3xf32>) -> tensor<2x3xf32>
-  %2 = tensor.reduce_max(%1) {axes = [0]} : (tensor<2x3xf32>) -> tensor<3xf32>
-  %3 = tensor.reshape(%0) {shape = [1, 3, 1]} : (tensor<3xf32>) -> tensor<1x3x1xf32>
-  %4 = tensor.broadcast_to(%3) {shape = [5, 3, 4]} : (tensor<1x3x1xf32>) -> tensor<5x3x4xf32>
-  %5 = tensor.reduce_max(%4) {axes = [0, 2], keepdims = true} : (tensor<5x3x4xf32>) -> tensor<1x3x1xf32>
-  %6 = tensor.reshape(%5) {shape = [3, 1]} : (tensor<1x3x1xf32>) -> tensor<3x1xf32>
-  func.return(%2, %6) : (tensor<3xf32>, tensor<3x1xf32>) -> ()
+// CHECK: func.func @of_broadcast([[INPUT:%[0-9]+]]: tensor<3xf32>) -> (tensor<3xf32>, tensor<3x1xf32>) {
+// CHECK-NEXT: [[COLUMN_MAX:%[0-9]+]] = tensor.reshape([[INPUT]]) {shape = [3, 1]}
+// CHECK-NEXT: func.return([[INPUT]], [[COLUMN_MAX]])
+func.func @of_broadcast(%input: tensor<3xf32>) -> (tensor<3xf32>, tensor<3x1xf32>) {
+  %rows = tensor.broadcast_to(%input) {shape = [2, 3]} : (tensor<3xf32>) -> tensor<2x3xf32>
+  %row_max = tensor.reduce_max(%rows) {axes = [0]} : (tensor<2x3xf32>) -> tensor<3xf32>
+  %column = tensor.reshape(%input) {shape = [1, 3, 1]} : (tensor<3xf32>) -> tensor<1x3x1xf32>
+  %repeated = tensor.broadcast_to(%column) {shape = [5, 3, 4]} : (tensor<1x3x1xf32>) -> tensor<5x3x4xf32>
+  %repeated_max = tensor.reduce_max(%repeated) {axes = [0, 2], keepdims = true} : (tensor<5x3x4xf32>) -> tensor<1x3x1xf32>
+  %column_max = tensor.reshape(%repeated_max) {shape = [3, 1]} : (tensor<1x3x1xf32>) -> tensor<3x1xf32>
+  func.return(%row_max, %column_max) : (tensor<3xf32>, tensor<3x1xf32>) -> ()
 }
 
 // -----
 
 // The reduction stays when it does not cover every repeated axis, when it covers a dynamic axis
-// that may have no elements, or when it is a sum. `%1` binds `N` for the run.
+// that may have no elements, or when it is a sum. `%sequence` binds `N` for the run.
 // CHECK: func.func @broadcast_stays
 // CHECK: tensor.reduce_max({{%[0-9]+}}) {axes = [0]} : (tensor<2x4x3xf32>)
 // CHECK: tensor.reduce_max({{%[0-9]+}}) {axes = [0]} : (tensor<{N}x3xf32>)
 // CHECK: tensor.reduce_sum
-func.func @broadcast_stays(%0: tensor<1x3xf32>, %1: tensor<{N}xf32>) -> (tensor<4x3xf32>, tensor<3xf32>, tensor<3xf32>) {
-  %2 = tensor.broadcast_to(%0) {shape = [2, 4, 3]} : (tensor<1x3xf32>) -> tensor<2x4x3xf32>
-  %3 = tensor.reduce_max(%2) {axes = [0]} : (tensor<2x4x3xf32>) -> tensor<4x3xf32>
-  %4 = tensor.broadcast_to(%0) {shape = [{N}, 3]} : (tensor<1x3xf32>) -> tensor<{N}x3xf32>
-  %5 = tensor.reduce_max(%4) {axes = [0]} : (tensor<{N}x3xf32>) -> tensor<3xf32>
-  %6 = tensor.broadcast_to(%0) {shape = [2, 3]} : (tensor<1x3xf32>) -> tensor<2x3xf32>
-  %7 = tensor.reduce_sum(%6) {axes = [0]} : (tensor<2x3xf32>) -> tensor<3xf32>
-  func.return(%3, %5, %7) : (tensor<4x3xf32>, tensor<3xf32>, tensor<3xf32>) -> ()
+func.func @broadcast_stays(%row: tensor<1x3xf32>, %sequence: tensor<{N}xf32>) -> (tensor<4x3xf32>, tensor<3xf32>, tensor<3xf32>) {
+  %stacked = tensor.broadcast_to(%row) {shape = [2, 4, 3]} : (tensor<1x3xf32>) -> tensor<2x4x3xf32>
+  %stacked_max = tensor.reduce_max(%stacked) {axes = [0]} : (tensor<2x4x3xf32>) -> tensor<4x3xf32>
+  %dynamic = tensor.broadcast_to(%row) {shape = [{N}, 3]} : (tensor<1x3xf32>) -> tensor<{N}x3xf32>
+  %dynamic_max = tensor.reduce_max(%dynamic) {axes = [0]} : (tensor<{N}x3xf32>) -> tensor<3xf32>
+  %pair = tensor.broadcast_to(%row) {shape = [2, 3]} : (tensor<1x3xf32>) -> tensor<2x3xf32>
+  %pair_sum = tensor.reduce_sum(%pair) {axes = [0]} : (tensor<2x3xf32>) -> tensor<3xf32>
+  func.return(%stacked_max, %dynamic_max, %pair_sum) : (tensor<4x3xf32>, tensor<3xf32>, tensor<3xf32>) -> ()
 }
 
 // -----
 
 // A max over the concatenated axis is the maximum of the parts' maxima.
-// CHECK: func.func @of_concat
-// CHECK-NEXT: [[A:%[0-9]+]] = tensor.reduce_max(%0) {axes = [1]} : (tensor<2x3xf32>) -> tensor<2xf32>
-// CHECK-NEXT: [[B:%[0-9]+]] = tensor.reduce_max(%1) {axes = [1]} : (tensor<2x5xf32>) -> tensor<2xf32>
-// CHECK-NEXT: [[M:%[0-9]+]] = tensor.maximum([[A]], [[B]])
-// CHECK-NEXT: func.return([[M]])
-func.func @of_concat(%0: tensor<2x3xf32>, %1: tensor<2x5xf32>) -> tensor<2xf32> {
-  %2 = tensor.concat(%0, %1) {axis = 1} : (tensor<2x3xf32>, tensor<2x5xf32>) -> tensor<2x8xf32>
-  %3 = tensor.reduce_max(%2) {axes = [1]} : (tensor<2x8xf32>) -> tensor<2xf32>
-  func.return(%3) : (tensor<2xf32>) -> ()
+// CHECK: func.func @of_concat([[LEFT:%[0-9]+]]: tensor<2x3xf32>, [[RIGHT:%[0-9]+]]: tensor<2x5xf32>) -> tensor<2xf32> {
+// CHECK-NEXT: [[LEFT_MAX:%[0-9]+]] = tensor.reduce_max([[LEFT]]) {axes = [1]} : (tensor<2x3xf32>) -> tensor<2xf32>
+// CHECK-NEXT: [[RIGHT_MAX:%[0-9]+]] = tensor.reduce_max([[RIGHT]]) {axes = [1]} : (tensor<2x5xf32>) -> tensor<2xf32>
+// CHECK-NEXT: [[MAX:%[0-9]+]] = tensor.maximum([[LEFT_MAX]], [[RIGHT_MAX]])
+// CHECK-NEXT: func.return([[MAX]])
+func.func @of_concat(%left: tensor<2x3xf32>, %right: tensor<2x5xf32>) -> tensor<2xf32> {
+  %joined = tensor.concat(%left, %right) {axis = 1} : (tensor<2x3xf32>, tensor<2x5xf32>) -> tensor<2x8xf32>
+  %max = tensor.reduce_max(%joined) {axes = [1]} : (tensor<2x8xf32>) -> tensor<2xf32>
+  func.return(%max) : (tensor<2xf32>) -> ()
 }
 
 // -----
 
 // Nested reductions stay apart when they differ in kind, or when the inner one has another use.
-// CHECK: func.func @merge_stays
-// CHECK-NEXT: [[A:%[0-9]+]] = tensor.reduce_max(%0) {axes = [0]}
-// CHECK-NEXT: tensor.reduce_min([[A]]) {axes = [0], keepdims = true}
-// CHECK-NEXT: [[B:%[0-9]+]] = tensor.reduce_max(%0) {axes = [1]}
-// CHECK-NEXT: tensor.reduce_max([[B]]) {axes = [0], keepdims = true}
-func.func @merge_stays(%0: tensor<2x3xf32>) -> (tensor<1xf32>, tensor<1xf32>, tensor<2xf32>) {
-  %1 = tensor.reduce_max(%0) {axes = [0]} : (tensor<2x3xf32>) -> tensor<3xf32>
-  %2 = tensor.reduce_min(%1) {axes = [0], keepdims = true} : (tensor<3xf32>) -> tensor<1xf32>
-  %3 = tensor.reduce_max(%0) {axes = [1]} : (tensor<2x3xf32>) -> tensor<2xf32>
-  %4 = tensor.reduce_max(%3) {axes = [0], keepdims = true} : (tensor<2xf32>) -> tensor<1xf32>
-  func.return(%2, %4, %3) : (tensor<1xf32>, tensor<1xf32>, tensor<2xf32>) -> ()
+// CHECK: func.func @merge_stays([[INPUT:%[0-9]+]]: tensor<2x3xf32>) -> (tensor<1xf32>, tensor<1xf32>, tensor<2xf32>) {
+// CHECK-NEXT: [[COLUMN_MAX:%[0-9]+]] = tensor.reduce_max([[INPUT]]) {axes = [0]}
+// CHECK-NEXT: tensor.reduce_min([[COLUMN_MAX]]) {axes = [0], keepdims = true}
+// CHECK-NEXT: [[ROW_MAX:%[0-9]+]] = tensor.reduce_max([[INPUT]]) {axes = [1]}
+// CHECK-NEXT: tensor.reduce_max([[ROW_MAX]]) {axes = [0], keepdims = true}
+func.func @merge_stays(%input: tensor<2x3xf32>) -> (tensor<1xf32>, tensor<1xf32>, tensor<2xf32>) {
+  %column_max = tensor.reduce_max(%input) {axes = [0]} : (tensor<2x3xf32>) -> tensor<3xf32>
+  %min_of_column_max = tensor.reduce_min(%column_max) {axes = [0], keepdims = true} : (tensor<3xf32>) -> tensor<1xf32>
+  %row_max = tensor.reduce_max(%input) {axes = [1]} : (tensor<2x3xf32>) -> tensor<2xf32>
+  %max_of_row_max = tensor.reduce_max(%row_max) {axes = [0], keepdims = true} : (tensor<2xf32>) -> tensor<1xf32>
+  func.return(%min_of_column_max, %max_of_row_max, %row_max) : (tensor<1xf32>, tensor<1xf32>, tensor<2xf32>) -> ()
 }
 
 // -----
 
 // A reduction with its own result dtype keeps its input.
-// CHECK: func.func @merge_out
-// CHECK-NEXT: [[A:%[0-9]+]] = tensor.reduce_max(%0) {axes = [0], out = f32}
-// CHECK-NEXT: tensor.reduce_max([[A]])
-func.func @merge_out(%0: tensor<2x3xbf16>) -> tensor<1xf32> {
-  %1 = tensor.reduce_max(%0) {axes = [0], out = f32} : (tensor<2x3xbf16>) -> tensor<3xf32>
-  %2 = tensor.reduce_max(%1) {axes = [0], keepdims = true} : (tensor<3xf32>) -> tensor<1xf32>
-  func.return(%2) : (tensor<1xf32>) -> ()
+// CHECK: func.func @merge_out([[INPUT:%[0-9]+]]: tensor<2x3xbf16>) -> tensor<1xf32> {
+// CHECK-NEXT: [[COLUMN_MAX:%[0-9]+]] = tensor.reduce_max([[INPUT]]) {axes = [0], out = f32}
+// CHECK-NEXT: tensor.reduce_max([[COLUMN_MAX]])
+func.func @merge_out(%input: tensor<2x3xbf16>) -> tensor<1xf32> {
+  %column_max = tensor.reduce_max(%input) {axes = [0], out = f32} : (tensor<2x3xbf16>) -> tensor<3xf32>
+  %max = tensor.reduce_max(%column_max) {axes = [0], keepdims = true} : (tensor<3xf32>) -> tensor<1xf32>
+  func.return(%max) : (tensor<1xf32>) -> ()
 }
 
 // -----
@@ -112,10 +112,10 @@ func.func @merge_out(%0: tensor<2x3xbf16>) -> tensor<1xf32> {
 // CHECK: func.func @partial_stays
 // CHECK: tensor.reduce_max({{%[0-9]+}}) {axes = [0, 1], keepdims = true} : (tensor<2x3xf32>)
 // CHECK: tensor.reduce_max({{%[0-9]+}}) {axes = [0]} : (tensor<2x6xf32>)
-func.func @partial_stays(%0: tensor<1x3xf32>, %1: tensor<2x3xf32>) -> (tensor<1x1xf32>, tensor<6xf32>) {
-  %2 = tensor.broadcast_to(%0) {shape = [2, 3]} : (tensor<1x3xf32>) -> tensor<2x3xf32>
-  %3 = tensor.reduce_max(%2) {axes = [0, 1], keepdims = true} : (tensor<2x3xf32>) -> tensor<1x1xf32>
-  %4 = tensor.concat(%1, %1) {axis = 1} : (tensor<2x3xf32>, tensor<2x3xf32>) -> tensor<2x6xf32>
-  %5 = tensor.reduce_max(%4) {axes = [0]} : (tensor<2x6xf32>) -> tensor<6xf32>
-  func.return(%3, %5) : (tensor<1x1xf32>, tensor<6xf32>) -> ()
+func.func @partial_stays(%row: tensor<1x3xf32>, %matrix: tensor<2x3xf32>) -> (tensor<1x1xf32>, tensor<6xf32>) {
+  %rows = tensor.broadcast_to(%row) {shape = [2, 3]} : (tensor<1x3xf32>) -> tensor<2x3xf32>
+  %rows_max = tensor.reduce_max(%rows) {axes = [0, 1], keepdims = true} : (tensor<2x3xf32>) -> tensor<1x1xf32>
+  %joined = tensor.concat(%matrix, %matrix) {axis = 1} : (tensor<2x3xf32>, tensor<2x3xf32>) -> tensor<2x6xf32>
+  %column_max = tensor.reduce_max(%joined) {axes = [0]} : (tensor<2x6xf32>) -> tensor<6xf32>
+  func.return(%rows_max, %column_max) : (tensor<1x1xf32>, tensor<6xf32>) -> ()
 }

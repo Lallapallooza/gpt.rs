@@ -47,14 +47,14 @@ Example, from `filetests/tile/roundtrip/arith.ptir`:
 
 ```text
 func.func @literals() -> (tensor<si64>, tensor<i1>, tensor<bf16>, tensor<f64>) {
-  %0, %1, %2, %3 = tile.block() {iters = [], reads = [], folds = [none -> [], none -> [], none -> [], none -> []]} ({
-    %0 = arith.constant() {value = -9223372036854775808 : si64} : () -> si64
-    %1 = arith.constant() {value = 1 : i1} : () -> i1
-    %2 = arith.constant() {value = -inf : bf16} : () -> bf16
-    %3 = arith.constant() {value = 0.1 : f64} : () -> f64
-    tile.yield(%0, %1, %2, %3) : (si64, i1, bf16, f64) -> ()
+  %min, %true, %neg_inf, %tenth = tile.block() {iters = [], reads = [], folds = [none -> [], none -> [], none -> [], none -> []]} ({
+    %min_scalar = arith.constant() {value = -9223372036854775808 : si64} : () -> si64
+    %true_scalar = arith.constant() {value = 1 : i1} : () -> i1
+    %neg_inf_scalar = arith.constant() {value = -inf : bf16} : () -> bf16
+    %tenth_scalar = arith.constant() {value = 0.1 : f64} : () -> f64
+    tile.yield(%min_scalar, %true_scalar, %neg_inf_scalar, %tenth_scalar) : (si64, i1, bf16, f64) -> ()
   }) : () -> (tensor<si64>, tensor<i1>, tensor<bf16>, tensor<f64>)
-  func.return(%0, %1, %2, %3) : (tensor<si64>, tensor<i1>, tensor<bf16>, tensor<f64>) -> ()
+  func.return(%min, %true, %neg_inf, %tenth) : (tensor<si64>, tensor<i1>, tensor<bf16>, tensor<f64>) -> ()
 }
 ```
 
@@ -89,22 +89,22 @@ Defined by `Unary` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates/g
 Example, from `filetests/tile/roundtrip/block.ptir`:
 
 ```text
-func.func @logsumexp(%0: tensor<2x16xf32>) -> (tensor<2xf32>, tensor<2xf32>, tensor<2xf32>) {
-  %1, %2 = tile.block(%0) {iters = [par 2, red 16], reads = [$0[d0, d1]], folds = [logsumexp -> [d0], [d0]]} ({
-  ^body(%0: f32):
-    tile.yield(%0) : (f32) -> ()
+func.func @logsumexp(%logits: tensor<2x16xf32>) -> (tensor<2xf32>, tensor<2xf32>, tensor<2xf32>) {
+  %max, %sum = tile.block(%logits) {iters = [par 2, red 16], reads = [$0[d0, d1]], folds = [logsumexp -> [d0], [d0]]} ({
+  ^body(%logit: f32):
+    tile.yield(%logit) : (f32) -> ()
   }) : (tensor<2x16xf32>) -> (tensor<2xf32>, tensor<2xf32>)
-  %3, %4 = tile.block(%1, %2) {iters = [par 2, red 2], reads = [$0[d0], $1[d0]], folds = [logsumexp_merge -> [d0], [d0]]} ({
-  ^body(%0: f32, %1: f32):
-    tile.yield(%0, %1) : (f32, f32) -> ()
+  %merged_max, %merged_sum = tile.block(%max, %sum) {iters = [par 2, red 2], reads = [$0[d0], $1[d0]], folds = [logsumexp_merge -> [d0], [d0]]} ({
+  ^body(%partial_max: f32, %partial_sum: f32):
+    tile.yield(%partial_max, %partial_sum) : (f32, f32) -> ()
   }) : (tensor<2xf32>, tensor<2xf32>) -> (tensor<2xf32>, tensor<2xf32>)
-  %5 = tile.block(%3, %4) {iters = [par 2], reads = [$0[d0], $1[d0]], folds = [none -> [d0]]} ({
-  ^body(%0: f32, %1: f32):
-    %2 = arith.log(%1) : (f32) -> f32
-    %3 = arith.add(%0, %2) : (f32, f32) -> f32
-    tile.yield(%3) : (f32) -> ()
+  %logsumexp = tile.block(%merged_max, %merged_sum) {iters = [par 2], reads = [$0[d0], $1[d0]], folds = [none -> [d0]]} ({
+  ^body(%row_max: f32, %row_sum: f32):
+    %log_sum = arith.log(%row_sum) : (f32) -> f32
+    %log_total = arith.add(%row_max, %log_sum) : (f32, f32) -> f32
+    tile.yield(%log_total) : (f32) -> ()
   }) : (tensor<2xf32>, tensor<2xf32>) -> tensor<2xf32>
-  func.return(%1, %2, %5) : (tensor<2xf32>, tensor<2xf32>, tensor<2xf32>) -> ()
+  func.return(%max, %sum, %logsumexp) : (tensor<2xf32>, tensor<2xf32>, tensor<2xf32>) -> ()
 }
 ```
 
@@ -140,45 +140,45 @@ Defined by `Binary` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates/
 Example, from `filetests/tile/roundtrip/arith.ptir`:
 
 ```text
-func.func @scalar_ops(%0: tensor<4xf32>, %1: tensor<4xsi32>, %2: tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) {
-  %3, %4, %5, %6 = tile.block(%0, %1, %2) {iters = [par 4], reads = [$0[d0], $1[d0], $2[0], $2[1]], folds = [none -> [d0], none -> [d0], none -> [d0], none -> [d0]]} ({
-  ^body(%0: f32, %1: si32, %2: ui64, %3: ui64):
-    %4 = arith.neg(%0) : (f32) -> f32
-    %5 = arith.abs(%4) : (f32) -> f32
-    %6 = arith.exp(%5) : (f32) -> f32
-    %7 = arith.log(%6) : (f32) -> f32
-    %8 = arith.tanh(%7) : (f32) -> f32
-    %9 = arith.erf(%8) : (f32) -> f32
-    %10 = arith.rsqrt(%9) : (f32) -> f32
-    %11 = arith.reciprocal(%10) : (f32) -> f32
-    %12 = arith.sin(%11) : (f32) -> f32
-    %13 = arith.cos(%12) : (f32) -> f32
-    %14 = arith.constant() {value = 0.5 : f32} : () -> f32
-    %15 = arith.add(%13, %14) : (f32, f32) -> f32
-    %16 = arith.sub(%15, %14) : (f32, f32) -> f32
-    %17 = arith.mul(%16, %14) : (f32, f32) -> f32
-    %18 = arith.div(%17, %14) : (f32, f32) -> f32
-    %19 = arith.maximum(%18, %14) : (f32, f32) -> f32
-    %20 = arith.minimum(%19, %14) : (f32, f32) -> f32
-    %21 = arith.constant() {value = 3 : si32} : () -> si32
-    %22 = arith.and(%1, %21) : (si32, si32) -> si32
-    %23 = arith.or(%22, %21) : (si32, si32) -> si32
-    %24 = arith.xor(%23, %21) : (si32, si32) -> si32
-    %25 = arith.shift_left(%24, %21) : (si32, si32) -> si32
-    %26 = arith.shift_right_logical(%25, %21) : (si32, si32) -> si32
-    %27 = arith.shift_right_arithmetic(%26, %21) : (si32, si32) -> si32
-    %28 = arith.not(%27) : (si32) -> si32
-    %29 = arith.less(%20, %14) : (f32, f32) -> i1
-    %30 = arith.select(%29, %20, %14) : (i1, f32, f32) -> f32
-    %31 = arith.cast(%30) {to = bf16} : (f32) -> bf16
-    %32 = arith.bitcast(%30) {to = si32} : (f32) -> si32
-    %33 = arith.add(%28, %32) : (si32, si32) -> si32
-    %34 = tile.index() {expr = d0, dtype = ui64} : () -> ui64
-    %35 = arith.rng_uniform(%2, %3, %34) {dtype = f32} : (ui64, ui64, ui64) -> f32
-    %36 = arith.rng_normal(%2, %3, %34) {dtype = bf16} : (ui64, ui64, ui64) -> bf16
-    tile.yield(%35, %33, %29, %36) : (f32, si32, i1, bf16) -> ()
+func.func @scalar_ops(%input: tensor<4xf32>, %integers: tensor<4xsi32>, %state: tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) {
+  %uniforms, %combined_bits, %less_flags, %normals = tile.block(%input, %integers, %state) {iters = [par 4], reads = [$0[d0], $1[d0], $2[0], $2[1]], folds = [none -> [d0], none -> [d0], none -> [d0], none -> [d0]]} ({
+  ^body(%element: f32, %integer: si32, %key: ui64, %counter: ui64):
+    %negated = arith.neg(%element) : (f32) -> f32
+    %absolute = arith.abs(%negated) : (f32) -> f32
+    %exponential = arith.exp(%absolute) : (f32) -> f32
+    %logarithm = arith.log(%exponential) : (f32) -> f32
+    %tanh = arith.tanh(%logarithm) : (f32) -> f32
+    %erf = arith.erf(%tanh) : (f32) -> f32
+    %rsqrt = arith.rsqrt(%erf) : (f32) -> f32
+    %reciprocal = arith.reciprocal(%rsqrt) : (f32) -> f32
+    %sine = arith.sin(%reciprocal) : (f32) -> f32
+    %cosine = arith.cos(%sine) : (f32) -> f32
+    %half = arith.constant() {value = 0.5 : f32} : () -> f32
+    %sum = arith.add(%cosine, %half) : (f32, f32) -> f32
+    %difference = arith.sub(%sum, %half) : (f32, f32) -> f32
+    %product = arith.mul(%difference, %half) : (f32, f32) -> f32
+    %quotient = arith.div(%product, %half) : (f32, f32) -> f32
+    %maximum = arith.maximum(%quotient, %half) : (f32, f32) -> f32
+    %minimum = arith.minimum(%maximum, %half) : (f32, f32) -> f32
+    %three = arith.constant() {value = 3 : si32} : () -> si32
+    %and_bits = arith.and(%integer, %three) : (si32, si32) -> si32
+    %or_bits = arith.or(%and_bits, %three) : (si32, si32) -> si32
+    %xor_bits = arith.xor(%or_bits, %three) : (si32, si32) -> si32
+    %left_shifted = arith.shift_left(%xor_bits, %three) : (si32, si32) -> si32
+    %logical_shifted = arith.shift_right_logical(%left_shifted, %three) : (si32, si32) -> si32
+    %arithmetic_shifted = arith.shift_right_arithmetic(%logical_shifted, %three) : (si32, si32) -> si32
+    %inverted = arith.not(%arithmetic_shifted) : (si32) -> si32
+    %is_less = arith.less(%minimum, %half) : (f32, f32) -> i1
+    %selected = arith.select(%is_less, %minimum, %half) : (i1, f32, f32) -> f32
+    %narrowed = arith.cast(%selected) {to = bf16} : (f32) -> bf16
+    %selected_bits = arith.bitcast(%selected) {to = si32} : (f32) -> si32
+    %combined = arith.add(%inverted, %selected_bits) : (si32, si32) -> si32
+    %index = tile.index() {expr = d0, dtype = ui64} : () -> ui64
+    %uniform = arith.rng_uniform(%key, %counter, %index) {dtype = f32} : (ui64, ui64, ui64) -> f32
+    %normal = arith.rng_normal(%key, %counter, %index) {dtype = bf16} : (ui64, ui64, ui64) -> bf16
+    tile.yield(%uniform, %combined, %is_less, %normal) : (f32, si32, i1, bf16) -> ()
   }) : (tensor<4xf32>, tensor<4xsi32>, tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>)
-  func.return(%3, %4, %5, %6) : (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) -> ()
+  func.return(%uniforms, %combined_bits, %less_flags, %normals) : (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) -> ()
 }
 ```
 
@@ -213,23 +213,23 @@ Defined by `Compare` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates
 Example, from `filetests/tile/roundtrip/arith.ptir`:
 
 ```text
-func.func @comparisons(%0: tensor<4xf32>, %1: tensor<4xf32>) -> tensor<4xi1> {
-  %2 = tile.block(%0, %1) {iters = [par 4], reads = [$0[d0], $1[d0]], folds = [none -> [d0]]} ({
-  ^body(%0: f32, %1: f32):
-    %2 = arith.less(%0, %1) : (f32, f32) -> i1
-    %3 = arith.less_equal(%0, %1) : (f32, f32) -> i1
-    %4 = arith.equal(%0, %1) : (f32, f32) -> i1
-    %5 = arith.greater_equal(%0, %1) : (f32, f32) -> i1
-    %6 = arith.greater(%0, %1) : (f32, f32) -> i1
-    %7 = arith.not_equal(%0, %1) : (f32, f32) -> i1
-    %8 = arith.and(%2, %3) : (i1, i1) -> i1
-    %9 = arith.or(%4, %5) : (i1, i1) -> i1
-    %10 = arith.xor(%6, %7) : (i1, i1) -> i1
-    %11 = arith.and(%8, %9) : (i1, i1) -> i1
-    %12 = arith.or(%11, %10) : (i1, i1) -> i1
-    tile.yield(%12) : (i1) -> ()
+func.func @comparisons(%lhs: tensor<4xf32>, %rhs: tensor<4xf32>) -> tensor<4xi1> {
+  %flags = tile.block(%lhs, %rhs) {iters = [par 4], reads = [$0[d0], $1[d0]], folds = [none -> [d0]]} ({
+  ^body(%left: f32, %right: f32):
+    %less = arith.less(%left, %right) : (f32, f32) -> i1
+    %less_equal = arith.less_equal(%left, %right) : (f32, f32) -> i1
+    %equal = arith.equal(%left, %right) : (f32, f32) -> i1
+    %greater_equal = arith.greater_equal(%left, %right) : (f32, f32) -> i1
+    %greater = arith.greater(%left, %right) : (f32, f32) -> i1
+    %not_equal = arith.not_equal(%left, %right) : (f32, f32) -> i1
+    %both_less = arith.and(%less, %less_equal) : (i1, i1) -> i1
+    %either_equal = arith.or(%equal, %greater_equal) : (i1, i1) -> i1
+    %greater_xor_unequal = arith.xor(%greater, %not_equal) : (i1, i1) -> i1
+    %conjunction = arith.and(%both_less, %either_equal) : (i1, i1) -> i1
+    %joined = arith.or(%conjunction, %greater_xor_unequal) : (i1, i1) -> i1
+    tile.yield(%joined) : (i1) -> ()
   }) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
-  func.return(%2) : (tensor<4xi1>) -> ()
+  func.return(%flags) : (tensor<4xi1>) -> ()
 }
 ```
 
@@ -250,45 +250,45 @@ Defined by `Select` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates/
 Example, from `filetests/tile/roundtrip/arith.ptir`:
 
 ```text
-func.func @scalar_ops(%0: tensor<4xf32>, %1: tensor<4xsi32>, %2: tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) {
-  %3, %4, %5, %6 = tile.block(%0, %1, %2) {iters = [par 4], reads = [$0[d0], $1[d0], $2[0], $2[1]], folds = [none -> [d0], none -> [d0], none -> [d0], none -> [d0]]} ({
-  ^body(%0: f32, %1: si32, %2: ui64, %3: ui64):
-    %4 = arith.neg(%0) : (f32) -> f32
-    %5 = arith.abs(%4) : (f32) -> f32
-    %6 = arith.exp(%5) : (f32) -> f32
-    %7 = arith.log(%6) : (f32) -> f32
-    %8 = arith.tanh(%7) : (f32) -> f32
-    %9 = arith.erf(%8) : (f32) -> f32
-    %10 = arith.rsqrt(%9) : (f32) -> f32
-    %11 = arith.reciprocal(%10) : (f32) -> f32
-    %12 = arith.sin(%11) : (f32) -> f32
-    %13 = arith.cos(%12) : (f32) -> f32
-    %14 = arith.constant() {value = 0.5 : f32} : () -> f32
-    %15 = arith.add(%13, %14) : (f32, f32) -> f32
-    %16 = arith.sub(%15, %14) : (f32, f32) -> f32
-    %17 = arith.mul(%16, %14) : (f32, f32) -> f32
-    %18 = arith.div(%17, %14) : (f32, f32) -> f32
-    %19 = arith.maximum(%18, %14) : (f32, f32) -> f32
-    %20 = arith.minimum(%19, %14) : (f32, f32) -> f32
-    %21 = arith.constant() {value = 3 : si32} : () -> si32
-    %22 = arith.and(%1, %21) : (si32, si32) -> si32
-    %23 = arith.or(%22, %21) : (si32, si32) -> si32
-    %24 = arith.xor(%23, %21) : (si32, si32) -> si32
-    %25 = arith.shift_left(%24, %21) : (si32, si32) -> si32
-    %26 = arith.shift_right_logical(%25, %21) : (si32, si32) -> si32
-    %27 = arith.shift_right_arithmetic(%26, %21) : (si32, si32) -> si32
-    %28 = arith.not(%27) : (si32) -> si32
-    %29 = arith.less(%20, %14) : (f32, f32) -> i1
-    %30 = arith.select(%29, %20, %14) : (i1, f32, f32) -> f32
-    %31 = arith.cast(%30) {to = bf16} : (f32) -> bf16
-    %32 = arith.bitcast(%30) {to = si32} : (f32) -> si32
-    %33 = arith.add(%28, %32) : (si32, si32) -> si32
-    %34 = tile.index() {expr = d0, dtype = ui64} : () -> ui64
-    %35 = arith.rng_uniform(%2, %3, %34) {dtype = f32} : (ui64, ui64, ui64) -> f32
-    %36 = arith.rng_normal(%2, %3, %34) {dtype = bf16} : (ui64, ui64, ui64) -> bf16
-    tile.yield(%35, %33, %29, %36) : (f32, si32, i1, bf16) -> ()
+func.func @scalar_ops(%input: tensor<4xf32>, %integers: tensor<4xsi32>, %state: tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) {
+  %uniforms, %combined_bits, %less_flags, %normals = tile.block(%input, %integers, %state) {iters = [par 4], reads = [$0[d0], $1[d0], $2[0], $2[1]], folds = [none -> [d0], none -> [d0], none -> [d0], none -> [d0]]} ({
+  ^body(%element: f32, %integer: si32, %key: ui64, %counter: ui64):
+    %negated = arith.neg(%element) : (f32) -> f32
+    %absolute = arith.abs(%negated) : (f32) -> f32
+    %exponential = arith.exp(%absolute) : (f32) -> f32
+    %logarithm = arith.log(%exponential) : (f32) -> f32
+    %tanh = arith.tanh(%logarithm) : (f32) -> f32
+    %erf = arith.erf(%tanh) : (f32) -> f32
+    %rsqrt = arith.rsqrt(%erf) : (f32) -> f32
+    %reciprocal = arith.reciprocal(%rsqrt) : (f32) -> f32
+    %sine = arith.sin(%reciprocal) : (f32) -> f32
+    %cosine = arith.cos(%sine) : (f32) -> f32
+    %half = arith.constant() {value = 0.5 : f32} : () -> f32
+    %sum = arith.add(%cosine, %half) : (f32, f32) -> f32
+    %difference = arith.sub(%sum, %half) : (f32, f32) -> f32
+    %product = arith.mul(%difference, %half) : (f32, f32) -> f32
+    %quotient = arith.div(%product, %half) : (f32, f32) -> f32
+    %maximum = arith.maximum(%quotient, %half) : (f32, f32) -> f32
+    %minimum = arith.minimum(%maximum, %half) : (f32, f32) -> f32
+    %three = arith.constant() {value = 3 : si32} : () -> si32
+    %and_bits = arith.and(%integer, %three) : (si32, si32) -> si32
+    %or_bits = arith.or(%and_bits, %three) : (si32, si32) -> si32
+    %xor_bits = arith.xor(%or_bits, %three) : (si32, si32) -> si32
+    %left_shifted = arith.shift_left(%xor_bits, %three) : (si32, si32) -> si32
+    %logical_shifted = arith.shift_right_logical(%left_shifted, %three) : (si32, si32) -> si32
+    %arithmetic_shifted = arith.shift_right_arithmetic(%logical_shifted, %three) : (si32, si32) -> si32
+    %inverted = arith.not(%arithmetic_shifted) : (si32) -> si32
+    %is_less = arith.less(%minimum, %half) : (f32, f32) -> i1
+    %selected = arith.select(%is_less, %minimum, %half) : (i1, f32, f32) -> f32
+    %narrowed = arith.cast(%selected) {to = bf16} : (f32) -> bf16
+    %selected_bits = arith.bitcast(%selected) {to = si32} : (f32) -> si32
+    %combined = arith.add(%inverted, %selected_bits) : (si32, si32) -> si32
+    %index = tile.index() {expr = d0, dtype = ui64} : () -> ui64
+    %uniform = arith.rng_uniform(%key, %counter, %index) {dtype = f32} : (ui64, ui64, ui64) -> f32
+    %normal = arith.rng_normal(%key, %counter, %index) {dtype = bf16} : (ui64, ui64, ui64) -> bf16
+    tile.yield(%uniform, %combined, %is_less, %normal) : (f32, si32, i1, bf16) -> ()
   }) : (tensor<4xf32>, tensor<4xsi32>, tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>)
-  func.return(%3, %4, %5, %6) : (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) -> ()
+  func.return(%uniforms, %combined_bits, %less_flags, %normals) : (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) -> ()
 }
 ```
 
@@ -310,27 +310,27 @@ Defined by `Cast` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates/gp
 Example, from `filetests/tile/roundtrip/block.ptir`:
 
 ```text
-func.func @linear_bias_gelu(%0: tensor<{M}x8xf32>, %1: tensor<6x8xbf16>, %2: tensor<6xf32>) -> tensor<{M}x6xf32> {
-  %3 = tile.block(%0, %1) {iters = [par {M}, par 6, red 8], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
-  ^body(%0: f32, %1: bf16):
-    %2 = arith.cast(%1) {to = f32} : (bf16) -> f32
-    %3 = arith.mul(%0, %2) : (f32, f32) -> f32
-    tile.yield(%3) : (f32) -> ()
+func.func @linear_bias_gelu(%input: tensor<{M}x8xf32>, %weight: tensor<6x8xbf16>, %bias: tensor<6xf32>) -> tensor<{M}x6xf32> {
+  %projection = tile.block(%input, %weight) {iters = [par {M}, par 6, red 8], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
+  ^body(%activation: f32, %weight_element: bf16):
+    %widened_weight = arith.cast(%weight_element) {to = f32} : (bf16) -> f32
+    %product = arith.mul(%activation, %widened_weight) : (f32, f32) -> f32
+    tile.yield(%product) : (f32) -> ()
   }) : (tensor<{M}x8xf32>, tensor<6x8xbf16>) -> tensor<{M}x6xf32>
-  %4 = tile.block(%3, %2) {iters = [par {M}, par 6], reads = [$0[d0, d1], $1[d1]], folds = [none -> [d0, d1]]} ({
-  ^body(%0: f32, %1: f32):
-    %2 = arith.add(%0, %1) : (f32, f32) -> f32
-    %3 = arith.constant() {value = 0.70710677 : f32} : () -> f32
-    %4 = arith.mul(%2, %3) : (f32, f32) -> f32
-    %5 = arith.erf(%4) : (f32) -> f32
-    %6 = arith.constant() {value = 1.0 : f32} : () -> f32
-    %7 = arith.add(%5, %6) : (f32, f32) -> f32
-    %8 = arith.constant() {value = 0.5 : f32} : () -> f32
-    %9 = arith.mul(%2, %8) : (f32, f32) -> f32
-    %10 = arith.mul(%9, %7) : (f32, f32) -> f32
-    tile.yield(%10) : (f32) -> ()
+  %activated = tile.block(%projection, %bias) {iters = [par {M}, par 6], reads = [$0[d0, d1], $1[d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%dot: f32, %bias_element: f32):
+    %biased = arith.add(%dot, %bias_element) : (f32, f32) -> f32
+    %inv_sqrt_two = arith.constant() {value = 0.70710677 : f32} : () -> f32
+    %scaled = arith.mul(%biased, %inv_sqrt_two) : (f32, f32) -> f32
+    %erf = arith.erf(%scaled) : (f32) -> f32
+    %one = arith.constant() {value = 1.0 : f32} : () -> f32
+    %erf_plus_one = arith.add(%erf, %one) : (f32, f32) -> f32
+    %half = arith.constant() {value = 0.5 : f32} : () -> f32
+    %half_biased = arith.mul(%biased, %half) : (f32, f32) -> f32
+    %gelu = arith.mul(%half_biased, %erf_plus_one) : (f32, f32) -> f32
+    tile.yield(%gelu) : (f32) -> ()
   }) : (tensor<{M}x6xf32>, tensor<6xf32>) -> tensor<{M}x6xf32>
-  func.return(%4) : (tensor<{M}x6xf32>) -> ()
+  func.return(%activated) : (tensor<{M}x6xf32>) -> ()
 }
 ```
 
@@ -353,45 +353,45 @@ Defined by `Bitcast` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates
 Example, from `filetests/tile/roundtrip/arith.ptir`:
 
 ```text
-func.func @scalar_ops(%0: tensor<4xf32>, %1: tensor<4xsi32>, %2: tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) {
-  %3, %4, %5, %6 = tile.block(%0, %1, %2) {iters = [par 4], reads = [$0[d0], $1[d0], $2[0], $2[1]], folds = [none -> [d0], none -> [d0], none -> [d0], none -> [d0]]} ({
-  ^body(%0: f32, %1: si32, %2: ui64, %3: ui64):
-    %4 = arith.neg(%0) : (f32) -> f32
-    %5 = arith.abs(%4) : (f32) -> f32
-    %6 = arith.exp(%5) : (f32) -> f32
-    %7 = arith.log(%6) : (f32) -> f32
-    %8 = arith.tanh(%7) : (f32) -> f32
-    %9 = arith.erf(%8) : (f32) -> f32
-    %10 = arith.rsqrt(%9) : (f32) -> f32
-    %11 = arith.reciprocal(%10) : (f32) -> f32
-    %12 = arith.sin(%11) : (f32) -> f32
-    %13 = arith.cos(%12) : (f32) -> f32
-    %14 = arith.constant() {value = 0.5 : f32} : () -> f32
-    %15 = arith.add(%13, %14) : (f32, f32) -> f32
-    %16 = arith.sub(%15, %14) : (f32, f32) -> f32
-    %17 = arith.mul(%16, %14) : (f32, f32) -> f32
-    %18 = arith.div(%17, %14) : (f32, f32) -> f32
-    %19 = arith.maximum(%18, %14) : (f32, f32) -> f32
-    %20 = arith.minimum(%19, %14) : (f32, f32) -> f32
-    %21 = arith.constant() {value = 3 : si32} : () -> si32
-    %22 = arith.and(%1, %21) : (si32, si32) -> si32
-    %23 = arith.or(%22, %21) : (si32, si32) -> si32
-    %24 = arith.xor(%23, %21) : (si32, si32) -> si32
-    %25 = arith.shift_left(%24, %21) : (si32, si32) -> si32
-    %26 = arith.shift_right_logical(%25, %21) : (si32, si32) -> si32
-    %27 = arith.shift_right_arithmetic(%26, %21) : (si32, si32) -> si32
-    %28 = arith.not(%27) : (si32) -> si32
-    %29 = arith.less(%20, %14) : (f32, f32) -> i1
-    %30 = arith.select(%29, %20, %14) : (i1, f32, f32) -> f32
-    %31 = arith.cast(%30) {to = bf16} : (f32) -> bf16
-    %32 = arith.bitcast(%30) {to = si32} : (f32) -> si32
-    %33 = arith.add(%28, %32) : (si32, si32) -> si32
-    %34 = tile.index() {expr = d0, dtype = ui64} : () -> ui64
-    %35 = arith.rng_uniform(%2, %3, %34) {dtype = f32} : (ui64, ui64, ui64) -> f32
-    %36 = arith.rng_normal(%2, %3, %34) {dtype = bf16} : (ui64, ui64, ui64) -> bf16
-    tile.yield(%35, %33, %29, %36) : (f32, si32, i1, bf16) -> ()
+func.func @scalar_ops(%input: tensor<4xf32>, %integers: tensor<4xsi32>, %state: tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) {
+  %uniforms, %combined_bits, %less_flags, %normals = tile.block(%input, %integers, %state) {iters = [par 4], reads = [$0[d0], $1[d0], $2[0], $2[1]], folds = [none -> [d0], none -> [d0], none -> [d0], none -> [d0]]} ({
+  ^body(%element: f32, %integer: si32, %key: ui64, %counter: ui64):
+    %negated = arith.neg(%element) : (f32) -> f32
+    %absolute = arith.abs(%negated) : (f32) -> f32
+    %exponential = arith.exp(%absolute) : (f32) -> f32
+    %logarithm = arith.log(%exponential) : (f32) -> f32
+    %tanh = arith.tanh(%logarithm) : (f32) -> f32
+    %erf = arith.erf(%tanh) : (f32) -> f32
+    %rsqrt = arith.rsqrt(%erf) : (f32) -> f32
+    %reciprocal = arith.reciprocal(%rsqrt) : (f32) -> f32
+    %sine = arith.sin(%reciprocal) : (f32) -> f32
+    %cosine = arith.cos(%sine) : (f32) -> f32
+    %half = arith.constant() {value = 0.5 : f32} : () -> f32
+    %sum = arith.add(%cosine, %half) : (f32, f32) -> f32
+    %difference = arith.sub(%sum, %half) : (f32, f32) -> f32
+    %product = arith.mul(%difference, %half) : (f32, f32) -> f32
+    %quotient = arith.div(%product, %half) : (f32, f32) -> f32
+    %maximum = arith.maximum(%quotient, %half) : (f32, f32) -> f32
+    %minimum = arith.minimum(%maximum, %half) : (f32, f32) -> f32
+    %three = arith.constant() {value = 3 : si32} : () -> si32
+    %and_bits = arith.and(%integer, %three) : (si32, si32) -> si32
+    %or_bits = arith.or(%and_bits, %three) : (si32, si32) -> si32
+    %xor_bits = arith.xor(%or_bits, %three) : (si32, si32) -> si32
+    %left_shifted = arith.shift_left(%xor_bits, %three) : (si32, si32) -> si32
+    %logical_shifted = arith.shift_right_logical(%left_shifted, %three) : (si32, si32) -> si32
+    %arithmetic_shifted = arith.shift_right_arithmetic(%logical_shifted, %three) : (si32, si32) -> si32
+    %inverted = arith.not(%arithmetic_shifted) : (si32) -> si32
+    %is_less = arith.less(%minimum, %half) : (f32, f32) -> i1
+    %selected = arith.select(%is_less, %minimum, %half) : (i1, f32, f32) -> f32
+    %narrowed = arith.cast(%selected) {to = bf16} : (f32) -> bf16
+    %selected_bits = arith.bitcast(%selected) {to = si32} : (f32) -> si32
+    %combined = arith.add(%inverted, %selected_bits) : (si32, si32) -> si32
+    %index = tile.index() {expr = d0, dtype = ui64} : () -> ui64
+    %uniform = arith.rng_uniform(%key, %counter, %index) {dtype = f32} : (ui64, ui64, ui64) -> f32
+    %normal = arith.rng_normal(%key, %counter, %index) {dtype = bf16} : (ui64, ui64, ui64) -> bf16
+    tile.yield(%uniform, %combined, %is_less, %normal) : (f32, si32, i1, bf16) -> ()
   }) : (tensor<4xf32>, tensor<4xsi32>, tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>)
-  func.return(%3, %4, %5, %6) : (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) -> ()
+  func.return(%uniforms, %combined_bits, %less_flags, %normals) : (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) -> ()
 }
 ```
 
@@ -419,45 +419,45 @@ Defined by `Rng` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates/gpt
 Example, from `filetests/tile/roundtrip/arith.ptir`:
 
 ```text
-func.func @scalar_ops(%0: tensor<4xf32>, %1: tensor<4xsi32>, %2: tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) {
-  %3, %4, %5, %6 = tile.block(%0, %1, %2) {iters = [par 4], reads = [$0[d0], $1[d0], $2[0], $2[1]], folds = [none -> [d0], none -> [d0], none -> [d0], none -> [d0]]} ({
-  ^body(%0: f32, %1: si32, %2: ui64, %3: ui64):
-    %4 = arith.neg(%0) : (f32) -> f32
-    %5 = arith.abs(%4) : (f32) -> f32
-    %6 = arith.exp(%5) : (f32) -> f32
-    %7 = arith.log(%6) : (f32) -> f32
-    %8 = arith.tanh(%7) : (f32) -> f32
-    %9 = arith.erf(%8) : (f32) -> f32
-    %10 = arith.rsqrt(%9) : (f32) -> f32
-    %11 = arith.reciprocal(%10) : (f32) -> f32
-    %12 = arith.sin(%11) : (f32) -> f32
-    %13 = arith.cos(%12) : (f32) -> f32
-    %14 = arith.constant() {value = 0.5 : f32} : () -> f32
-    %15 = arith.add(%13, %14) : (f32, f32) -> f32
-    %16 = arith.sub(%15, %14) : (f32, f32) -> f32
-    %17 = arith.mul(%16, %14) : (f32, f32) -> f32
-    %18 = arith.div(%17, %14) : (f32, f32) -> f32
-    %19 = arith.maximum(%18, %14) : (f32, f32) -> f32
-    %20 = arith.minimum(%19, %14) : (f32, f32) -> f32
-    %21 = arith.constant() {value = 3 : si32} : () -> si32
-    %22 = arith.and(%1, %21) : (si32, si32) -> si32
-    %23 = arith.or(%22, %21) : (si32, si32) -> si32
-    %24 = arith.xor(%23, %21) : (si32, si32) -> si32
-    %25 = arith.shift_left(%24, %21) : (si32, si32) -> si32
-    %26 = arith.shift_right_logical(%25, %21) : (si32, si32) -> si32
-    %27 = arith.shift_right_arithmetic(%26, %21) : (si32, si32) -> si32
-    %28 = arith.not(%27) : (si32) -> si32
-    %29 = arith.less(%20, %14) : (f32, f32) -> i1
-    %30 = arith.select(%29, %20, %14) : (i1, f32, f32) -> f32
-    %31 = arith.cast(%30) {to = bf16} : (f32) -> bf16
-    %32 = arith.bitcast(%30) {to = si32} : (f32) -> si32
-    %33 = arith.add(%28, %32) : (si32, si32) -> si32
-    %34 = tile.index() {expr = d0, dtype = ui64} : () -> ui64
-    %35 = arith.rng_uniform(%2, %3, %34) {dtype = f32} : (ui64, ui64, ui64) -> f32
-    %36 = arith.rng_normal(%2, %3, %34) {dtype = bf16} : (ui64, ui64, ui64) -> bf16
-    tile.yield(%35, %33, %29, %36) : (f32, si32, i1, bf16) -> ()
+func.func @scalar_ops(%input: tensor<4xf32>, %integers: tensor<4xsi32>, %state: tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) {
+  %uniforms, %combined_bits, %less_flags, %normals = tile.block(%input, %integers, %state) {iters = [par 4], reads = [$0[d0], $1[d0], $2[0], $2[1]], folds = [none -> [d0], none -> [d0], none -> [d0], none -> [d0]]} ({
+  ^body(%element: f32, %integer: si32, %key: ui64, %counter: ui64):
+    %negated = arith.neg(%element) : (f32) -> f32
+    %absolute = arith.abs(%negated) : (f32) -> f32
+    %exponential = arith.exp(%absolute) : (f32) -> f32
+    %logarithm = arith.log(%exponential) : (f32) -> f32
+    %tanh = arith.tanh(%logarithm) : (f32) -> f32
+    %erf = arith.erf(%tanh) : (f32) -> f32
+    %rsqrt = arith.rsqrt(%erf) : (f32) -> f32
+    %reciprocal = arith.reciprocal(%rsqrt) : (f32) -> f32
+    %sine = arith.sin(%reciprocal) : (f32) -> f32
+    %cosine = arith.cos(%sine) : (f32) -> f32
+    %half = arith.constant() {value = 0.5 : f32} : () -> f32
+    %sum = arith.add(%cosine, %half) : (f32, f32) -> f32
+    %difference = arith.sub(%sum, %half) : (f32, f32) -> f32
+    %product = arith.mul(%difference, %half) : (f32, f32) -> f32
+    %quotient = arith.div(%product, %half) : (f32, f32) -> f32
+    %maximum = arith.maximum(%quotient, %half) : (f32, f32) -> f32
+    %minimum = arith.minimum(%maximum, %half) : (f32, f32) -> f32
+    %three = arith.constant() {value = 3 : si32} : () -> si32
+    %and_bits = arith.and(%integer, %three) : (si32, si32) -> si32
+    %or_bits = arith.or(%and_bits, %three) : (si32, si32) -> si32
+    %xor_bits = arith.xor(%or_bits, %three) : (si32, si32) -> si32
+    %left_shifted = arith.shift_left(%xor_bits, %three) : (si32, si32) -> si32
+    %logical_shifted = arith.shift_right_logical(%left_shifted, %three) : (si32, si32) -> si32
+    %arithmetic_shifted = arith.shift_right_arithmetic(%logical_shifted, %three) : (si32, si32) -> si32
+    %inverted = arith.not(%arithmetic_shifted) : (si32) -> si32
+    %is_less = arith.less(%minimum, %half) : (f32, f32) -> i1
+    %selected = arith.select(%is_less, %minimum, %half) : (i1, f32, f32) -> f32
+    %narrowed = arith.cast(%selected) {to = bf16} : (f32) -> bf16
+    %selected_bits = arith.bitcast(%selected) {to = si32} : (f32) -> si32
+    %combined = arith.add(%inverted, %selected_bits) : (si32, si32) -> si32
+    %index = tile.index() {expr = d0, dtype = ui64} : () -> ui64
+    %uniform = arith.rng_uniform(%key, %counter, %index) {dtype = f32} : (ui64, ui64, ui64) -> f32
+    %normal = arith.rng_normal(%key, %counter, %index) {dtype = bf16} : (ui64, ui64, ui64) -> bf16
+    tile.yield(%uniform, %combined, %is_less, %normal) : (f32, si32, i1, bf16) -> ()
   }) : (tensor<4xf32>, tensor<4xsi32>, tensor<2xui64>) -> (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>)
-  func.return(%3, %4, %5, %6) : (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) -> ()
+  func.return(%uniforms, %combined_bits, %less_flags, %normals) : (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) -> ()
 }
 ```
 

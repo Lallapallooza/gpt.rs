@@ -1,98 +1,158 @@
 // RUN: roundtrip
 
-func.func @transpose(%0: tensor<2x3x4xf32>) -> tensor<4x2x3xf32> {
-  %1 = tensor.transpose(%0) {perm = [2, 0, 1]} : (tensor<2x3x4xf32>) -> tensor<4x2x3xf32>
-  func.return(%1) : (tensor<4x2x3xf32>) -> ()
+// CHECK: func.func @transpose([[INPUT:%[0-9]+]]: tensor<2x3x4xf32>) -> tensor<4x2x3xf32> {
+// CHECK-NEXT: [[TRANSPOSED:%[0-9]+]] = tensor.transpose([[INPUT]]) {perm = [2, 0, 1]} : (tensor<2x3x4xf32>) -> tensor<4x2x3xf32>
+// CHECK-NEXT: func.return([[TRANSPOSED]]) : (tensor<4x2x3xf32>) -> ()
+// CHECK-NEXT: }
+func.func @transpose(%input: tensor<2x3x4xf32>) -> tensor<4x2x3xf32> {
+  %transposed = tensor.transpose(%input) {perm = [2, 0, 1]} : (tensor<2x3x4xf32>) -> tensor<4x2x3xf32>
+  func.return(%transposed) : (tensor<4x2x3xf32>) -> ()
 }
 
 // -----
 
-func.func @reshape(%0: tensor<2x3x4xf32>) -> (tensor<6x4xf32>, tensor<2x12xf32>, tensor<24xf32>) {
-  %1 = tensor.reshape(%0) {shape = [6, 4]} : (tensor<2x3x4xf32>) -> tensor<6x4xf32>
-  %2 = tensor.reshape(%0) {shape = [2, 12]} : (tensor<2x3x4xf32>) -> tensor<2x12xf32>
-  %3 = tensor.reshape(%0) {shape = [24]} : (tensor<2x3x4xf32>) -> tensor<24xf32>
-  func.return(%1, %2, %3) : (tensor<6x4xf32>, tensor<2x12xf32>, tensor<24xf32>) -> ()
+// CHECK: func.func @reshape([[INPUT:%[0-9]+]]: tensor<2x3x4xf32>) -> (tensor<6x4xf32>, tensor<2x12xf32>, tensor<24xf32>) {
+// CHECK-NEXT: [[MERGED_LEADING:%[0-9]+]] = tensor.reshape([[INPUT]]) {shape = [6, 4]} : (tensor<2x3x4xf32>) -> tensor<6x4xf32>
+// CHECK-NEXT: [[MERGED_TRAILING:%[0-9]+]] = tensor.reshape([[INPUT]]) {shape = [2, 12]} : (tensor<2x3x4xf32>) -> tensor<2x12xf32>
+// CHECK-NEXT: [[FLAT:%[0-9]+]] = tensor.reshape([[INPUT]]) {shape = [24]} : (tensor<2x3x4xf32>) -> tensor<24xf32>
+// CHECK-NEXT: func.return([[MERGED_LEADING]], [[MERGED_TRAILING]], [[FLAT]]) : (tensor<6x4xf32>, tensor<2x12xf32>, tensor<24xf32>) -> ()
+// CHECK-NEXT: }
+func.func @reshape(%input: tensor<2x3x4xf32>) -> (tensor<6x4xf32>, tensor<2x12xf32>, tensor<24xf32>) {
+  %merged_leading = tensor.reshape(%input) {shape = [6, 4]} : (tensor<2x3x4xf32>) -> tensor<6x4xf32>
+  %merged_trailing = tensor.reshape(%input) {shape = [2, 12]} : (tensor<2x3x4xf32>) -> tensor<2x12xf32>
+  %flat = tensor.reshape(%input) {shape = [24]} : (tensor<2x3x4xf32>) -> tensor<24xf32>
+  func.return(%merged_leading, %merged_trailing, %flat) : (tensor<6x4xf32>, tensor<2x12xf32>, tensor<24xf32>) -> ()
 }
 
 // -----
 
-func.func @reshape_scalar(%0: tensor<1x1xsi32>) -> tensor<si32> {
-  %1 = tensor.reshape(%0) {shape = []} : (tensor<1x1xsi32>) -> tensor<si32>
-  func.return(%1) : (tensor<si32>) -> ()
+// CHECK: func.func @reshape_scalar([[INPUT:%[0-9]+]]: tensor<1x1xsi32>) -> tensor<si32> {
+// CHECK-NEXT: [[SCALAR:%[0-9]+]] = tensor.reshape([[INPUT]]) {shape = []} : (tensor<1x1xsi32>) -> tensor<si32>
+// CHECK-NEXT: func.return([[SCALAR]]) : (tensor<si32>) -> ()
+// CHECK-NEXT: }
+func.func @reshape_scalar(%input: tensor<1x1xsi32>) -> tensor<si32> {
+  %scalar = tensor.reshape(%input) {shape = []} : (tensor<1x1xsi32>) -> tensor<si32>
+  func.return(%scalar) : (tensor<si32>) -> ()
 }
 
 // -----
 
-func.func @reshape_dynamic(%0: tensor<{B}x3x4xf32>) -> (tensor<{B}x12xf32>, tensor<{B}x2x6xf32>) {
-  %1 = tensor.reshape(%0) {shape = [{B}, 12]} : (tensor<{B}x3x4xf32>) -> tensor<{B}x12xf32>
-  %2 = tensor.reshape(%0) {shape = [{B}, 2, 6]} : (tensor<{B}x3x4xf32>) -> tensor<{B}x2x6xf32>
-  func.return(%1, %2) : (tensor<{B}x12xf32>, tensor<{B}x2x6xf32>) -> ()
+// CHECK: func.func @reshape_dynamic([[INPUT:%[0-9]+]]: tensor<{B}x3x4xf32>) -> (tensor<{B}x12xf32>, tensor<{B}x2x6xf32>) {
+// CHECK-NEXT: [[MERGED_TRAILING:%[0-9]+]] = tensor.reshape([[INPUT]]) {shape = [{B}, 12]} : (tensor<{B}x3x4xf32>) -> tensor<{B}x12xf32>
+// CHECK-NEXT: [[REGROUPED_TRAILING:%[0-9]+]] = tensor.reshape([[INPUT]]) {shape = [{B}, 2, 6]} : (tensor<{B}x3x4xf32>) -> tensor<{B}x2x6xf32>
+// CHECK-NEXT: func.return([[MERGED_TRAILING]], [[REGROUPED_TRAILING]]) : (tensor<{B}x12xf32>, tensor<{B}x2x6xf32>) -> ()
+// CHECK-NEXT: }
+func.func @reshape_dynamic(%input: tensor<{B}x3x4xf32>) -> (tensor<{B}x12xf32>, tensor<{B}x2x6xf32>) {
+  %merged_trailing = tensor.reshape(%input) {shape = [{B}, 12]} : (tensor<{B}x3x4xf32>) -> tensor<{B}x12xf32>
+  %regrouped_trailing = tensor.reshape(%input) {shape = [{B}, 2, 6]} : (tensor<{B}x3x4xf32>) -> tensor<{B}x2x6xf32>
+  func.return(%merged_trailing, %regrouped_trailing) : (tensor<{B}x12xf32>, tensor<{B}x2x6xf32>) -> ()
 }
 
 // -----
 
 // An empty tensor has no elements, whatever its dynamic extents are.
-func.func @reshape_empty(%0: tensor<0x{B}xf32>) -> tensor<0xf32> {
-  %1 = tensor.reshape(%0) {shape = [0]} : (tensor<0x{B}xf32>) -> tensor<0xf32>
-  func.return(%1) : (tensor<0xf32>) -> ()
+// CHECK: func.func @reshape_empty([[INPUT:%[0-9]+]]: tensor<0x{B}xf32>) -> tensor<0xf32> {
+// CHECK-NEXT: [[FLAT:%[0-9]+]] = tensor.reshape([[INPUT]]) {shape = [0]} : (tensor<0x{B}xf32>) -> tensor<0xf32>
+// CHECK-NEXT: func.return([[FLAT]]) : (tensor<0xf32>) -> ()
+// CHECK-NEXT: }
+func.func @reshape_empty(%input: tensor<0x{B}xf32>) -> tensor<0xf32> {
+  %flat = tensor.reshape(%input) {shape = [0]} : (tensor<0x{B}xf32>) -> tensor<0xf32>
+  func.return(%flat) : (tensor<0xf32>) -> ()
 }
 
 // -----
 
-func.func @broadcast_to(%0: tensor<3xf32>, %1: tensor<1x3xsi32>, %2: tensor<i1>) -> (tensor<2x3xf32>, tensor<4x2x3xsi32>, tensor<2x2xi1>) {
-  %3 = tensor.broadcast_to(%0) {shape = [2, 3]} : (tensor<3xf32>) -> tensor<2x3xf32>
-  %4 = tensor.broadcast_to(%1) {shape = [4, 2, 3]} : (tensor<1x3xsi32>) -> tensor<4x2x3xsi32>
-  %5 = tensor.broadcast_to(%2) {shape = [2, 2]} : (tensor<i1>) -> tensor<2x2xi1>
-  func.return(%3, %4, %5) : (tensor<2x3xf32>, tensor<4x2x3xsi32>, tensor<2x2xi1>) -> ()
+// CHECK: func.func @broadcast_to([[VECTOR:%[0-9]+]]: tensor<3xf32>, [[ROW:%[0-9]+]]: tensor<1x3xsi32>, [[FLAG:%[0-9]+]]: tensor<i1>) -> (tensor<2x3xf32>, tensor<4x2x3xsi32>, tensor<2x2xi1>) {
+// CHECK-NEXT: [[MATRIX:%[0-9]+]] = tensor.broadcast_to([[VECTOR]]) {shape = [2, 3]} : (tensor<3xf32>) -> tensor<2x3xf32>
+// CHECK-NEXT: [[STACKED_ROWS:%[0-9]+]] = tensor.broadcast_to([[ROW]]) {shape = [4, 2, 3]} : (tensor<1x3xsi32>) -> tensor<4x2x3xsi32>
+// CHECK-NEXT: [[FLAGS:%[0-9]+]] = tensor.broadcast_to([[FLAG]]) {shape = [2, 2]} : (tensor<i1>) -> tensor<2x2xi1>
+// CHECK-NEXT: func.return([[MATRIX]], [[STACKED_ROWS]], [[FLAGS]]) : (tensor<2x3xf32>, tensor<4x2x3xsi32>, tensor<2x2xi1>) -> ()
+// CHECK-NEXT: }
+func.func @broadcast_to(%vector: tensor<3xf32>, %row: tensor<1x3xsi32>, %flag: tensor<i1>) -> (tensor<2x3xf32>, tensor<4x2x3xsi32>, tensor<2x2xi1>) {
+  %matrix = tensor.broadcast_to(%vector) {shape = [2, 3]} : (tensor<3xf32>) -> tensor<2x3xf32>
+  %stacked_rows = tensor.broadcast_to(%row) {shape = [4, 2, 3]} : (tensor<1x3xsi32>) -> tensor<4x2x3xsi32>
+  %flags = tensor.broadcast_to(%flag) {shape = [2, 2]} : (tensor<i1>) -> tensor<2x2xi1>
+  func.return(%matrix, %stacked_rows, %flags) : (tensor<2x3xf32>, tensor<4x2x3xsi32>, tensor<2x2xi1>) -> ()
 }
 
 // -----
 
-func.func @broadcast_to_dynamic(%0: tensor<1x768xf32>, %1: tensor<{B}x1xf32>) -> (tensor<{B}x768xf32>, tensor<2x{B}x4xf32>) {
-  %2 = tensor.broadcast_to(%0) {shape = [{B}, 768]} : (tensor<1x768xf32>) -> tensor<{B}x768xf32>
-  %3 = tensor.broadcast_to(%1) {shape = [2, {B}, 4]} : (tensor<{B}x1xf32>) -> tensor<2x{B}x4xf32>
-  func.return(%2, %3) : (tensor<{B}x768xf32>, tensor<2x{B}x4xf32>) -> ()
+// CHECK: func.func @broadcast_to_dynamic([[BIAS:%[0-9]+]]: tensor<1x768xf32>, [[COLUMN:%[0-9]+]]: tensor<{B}x1xf32>) -> (tensor<{B}x768xf32>, tensor<2x{B}x4xf32>) {
+// CHECK-NEXT: [[BATCH_BIAS:%[0-9]+]] = tensor.broadcast_to([[BIAS]]) {shape = [{B}, 768]} : (tensor<1x768xf32>) -> tensor<{B}x768xf32>
+// CHECK-NEXT: [[WIDE_COLUMNS:%[0-9]+]] = tensor.broadcast_to([[COLUMN]]) {shape = [2, {B}, 4]} : (tensor<{B}x1xf32>) -> tensor<2x{B}x4xf32>
+// CHECK-NEXT: func.return([[BATCH_BIAS]], [[WIDE_COLUMNS]]) : (tensor<{B}x768xf32>, tensor<2x{B}x4xf32>) -> ()
+// CHECK-NEXT: }
+func.func @broadcast_to_dynamic(%bias: tensor<1x768xf32>, %column: tensor<{B}x1xf32>) -> (tensor<{B}x768xf32>, tensor<2x{B}x4xf32>) {
+  %batch_bias = tensor.broadcast_to(%bias) {shape = [{B}, 768]} : (tensor<1x768xf32>) -> tensor<{B}x768xf32>
+  %wide_columns = tensor.broadcast_to(%column) {shape = [2, {B}, 4]} : (tensor<{B}x1xf32>) -> tensor<2x{B}x4xf32>
+  func.return(%batch_bias, %wide_columns) : (tensor<{B}x768xf32>, tensor<2x{B}x4xf32>) -> ()
 }
 
 // -----
 
-func.func @slice(%0: tensor<4x6xf32>, %1: tensor<{B}x6xf32>) -> (tensor<2x3xf32>, tensor<1x4xf32>) {
-  %2 = tensor.slice(%0) {starts = [1, 2], sizes = [2, 3]} : (tensor<4x6xf32>) -> tensor<2x3xf32>
-  %3 = tensor.slice(%1) {starts = [0, 2], sizes = [1, 4]} : (tensor<{B}x6xf32>) -> tensor<1x4xf32>
-  func.return(%2, %3) : (tensor<2x3xf32>, tensor<1x4xf32>) -> ()
+// CHECK: func.func @slice([[INPUT:%[0-9]+]]: tensor<4x6xf32>, [[DYNAMIC_INPUT:%[0-9]+]]: tensor<{B}x6xf32>) -> (tensor<2x3xf32>, tensor<1x4xf32>) {
+// CHECK-NEXT: [[BLOCK:%[0-9]+]] = tensor.slice([[INPUT]]) {starts = [1, 2], sizes = [2, 3]} : (tensor<4x6xf32>) -> tensor<2x3xf32>
+// CHECK-NEXT: [[DYNAMIC_BLOCK:%[0-9]+]] = tensor.slice([[DYNAMIC_INPUT]]) {starts = [0, 2], sizes = [1, 4]} : (tensor<{B}x6xf32>) -> tensor<1x4xf32>
+// CHECK-NEXT: func.return([[BLOCK]], [[DYNAMIC_BLOCK]]) : (tensor<2x3xf32>, tensor<1x4xf32>) -> ()
+// CHECK-NEXT: }
+func.func @slice(%input: tensor<4x6xf32>, %dynamic_input: tensor<{B}x6xf32>) -> (tensor<2x3xf32>, tensor<1x4xf32>) {
+  %block = tensor.slice(%input) {starts = [1, 2], sizes = [2, 3]} : (tensor<4x6xf32>) -> tensor<2x3xf32>
+  %dynamic_block = tensor.slice(%dynamic_input) {starts = [0, 2], sizes = [1, 4]} : (tensor<{B}x6xf32>) -> tensor<1x4xf32>
+  func.return(%block, %dynamic_block) : (tensor<2x3xf32>, tensor<1x4xf32>) -> ()
 }
 
 // -----
 
-func.func @concat(%0: tensor<2x3xf32>, %1: tensor<4x3xf32>, %2: tensor<2x1xf32>) -> (tensor<6x3xf32>, tensor<2x4xf32>, tensor<2x3xf32>) {
-  %3 = tensor.concat(%0, %1) {axis = 0} : (tensor<2x3xf32>, tensor<4x3xf32>) -> tensor<6x3xf32>
-  %4 = tensor.concat(%0, %2) {axis = 1} : (tensor<2x3xf32>, tensor<2x1xf32>) -> tensor<2x4xf32>
-  %5 = tensor.concat(%0) {axis = 1} : (tensor<2x3xf32>) -> tensor<2x3xf32>
-  func.return(%3, %4, %5) : (tensor<6x3xf32>, tensor<2x4xf32>, tensor<2x3xf32>) -> ()
+// CHECK: func.func @concat([[TOP:%[0-9]+]]: tensor<2x3xf32>, [[BOTTOM:%[0-9]+]]: tensor<4x3xf32>, [[SIDE:%[0-9]+]]: tensor<2x1xf32>) -> (tensor<6x3xf32>, tensor<2x4xf32>, tensor<2x3xf32>) {
+// CHECK-NEXT: [[STACKED:%[0-9]+]] = tensor.concat([[TOP]], [[BOTTOM]]) {axis = 0} : (tensor<2x3xf32>, tensor<4x3xf32>) -> tensor<6x3xf32>
+// CHECK-NEXT: [[WIDENED:%[0-9]+]] = tensor.concat([[TOP]], [[SIDE]]) {axis = 1} : (tensor<2x3xf32>, tensor<2x1xf32>) -> tensor<2x4xf32>
+// CHECK-NEXT: [[SINGLE:%[0-9]+]] = tensor.concat([[TOP]]) {axis = 1} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+// CHECK-NEXT: func.return([[STACKED]], [[WIDENED]], [[SINGLE]]) : (tensor<6x3xf32>, tensor<2x4xf32>, tensor<2x3xf32>) -> ()
+// CHECK-NEXT: }
+func.func @concat(%top: tensor<2x3xf32>, %bottom: tensor<4x3xf32>, %side: tensor<2x1xf32>) -> (tensor<6x3xf32>, tensor<2x4xf32>, tensor<2x3xf32>) {
+  %stacked = tensor.concat(%top, %bottom) {axis = 0} : (tensor<2x3xf32>, tensor<4x3xf32>) -> tensor<6x3xf32>
+  %widened = tensor.concat(%top, %side) {axis = 1} : (tensor<2x3xf32>, tensor<2x1xf32>) -> tensor<2x4xf32>
+  %single = tensor.concat(%top) {axis = 1} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+  func.return(%stacked, %widened, %single) : (tensor<6x3xf32>, tensor<2x4xf32>, tensor<2x3xf32>) -> ()
 }
 
 // -----
 
-func.func @concat_dynamic(%0: tensor<{B}x3xf32>, %1: tensor<{B}x5xf32>, %2: tensor<{T}x2xf32>) -> (tensor<{B}x8xf32>, tensor<{T}x2xf32>) {
-  %3 = tensor.concat(%0, %1) {axis = 1} : (tensor<{B}x3xf32>, tensor<{B}x5xf32>) -> tensor<{B}x8xf32>
-  %4 = tensor.concat(%2) {axis = 0} : (tensor<{T}x2xf32>) -> tensor<{T}x2xf32>
-  func.return(%3, %4) : (tensor<{B}x8xf32>, tensor<{T}x2xf32>) -> ()
+// CHECK: func.func @concat_dynamic([[LEFT:%[0-9]+]]: tensor<{B}x3xf32>, [[RIGHT:%[0-9]+]]: tensor<{B}x5xf32>, [[ROWS:%[0-9]+]]: tensor<{T}x2xf32>) -> (tensor<{B}x8xf32>, tensor<{T}x2xf32>) {
+// CHECK-NEXT: [[JOINED:%[0-9]+]] = tensor.concat([[LEFT]], [[RIGHT]]) {axis = 1} : (tensor<{B}x3xf32>, tensor<{B}x5xf32>) -> tensor<{B}x8xf32>
+// CHECK-NEXT: [[SINGLE:%[0-9]+]] = tensor.concat([[ROWS]]) {axis = 0} : (tensor<{T}x2xf32>) -> tensor<{T}x2xf32>
+// CHECK-NEXT: func.return([[JOINED]], [[SINGLE]]) : (tensor<{B}x8xf32>, tensor<{T}x2xf32>) -> ()
+// CHECK-NEXT: }
+func.func @concat_dynamic(%left: tensor<{B}x3xf32>, %right: tensor<{B}x5xf32>, %rows: tensor<{T}x2xf32>) -> (tensor<{B}x8xf32>, tensor<{T}x2xf32>) {
+  %joined = tensor.concat(%left, %right) {axis = 1} : (tensor<{B}x3xf32>, tensor<{B}x5xf32>) -> tensor<{B}x8xf32>
+  %single = tensor.concat(%rows) {axis = 0} : (tensor<{T}x2xf32>) -> tensor<{T}x2xf32>
+  func.return(%joined, %single) : (tensor<{B}x8xf32>, tensor<{T}x2xf32>) -> ()
 }
 
 // -----
 
-func.func @strided_slice(%0: tensor<4x9xf32>) -> tensor<2x3xf32> {
-  %1 = tensor.slice(%0) {starts = [1, 0], sizes = [2, 3], strides = [2, 4]} : (tensor<4x9xf32>) -> tensor<2x3xf32>
-  func.return(%1) : (tensor<2x3xf32>) -> ()
+// CHECK: func.func @strided_slice([[INPUT:%[0-9]+]]: tensor<4x9xf32>) -> tensor<2x3xf32> {
+// CHECK-NEXT: [[STRIDED:%[0-9]+]] = tensor.slice([[INPUT]]) {starts = [1, 0], sizes = [2, 3], strides = [2, 4]} : (tensor<4x9xf32>) -> tensor<2x3xf32>
+// CHECK-NEXT: func.return([[STRIDED]]) : (tensor<2x3xf32>) -> ()
+// CHECK-NEXT: }
+func.func @strided_slice(%input: tensor<4x9xf32>) -> tensor<2x3xf32> {
+  %strided = tensor.slice(%input) {starts = [1, 0], sizes = [2, 3], strides = [2, 4]} : (tensor<4x9xf32>) -> tensor<2x3xf32>
+  func.return(%strided) : (tensor<2x3xf32>) -> ()
 }
 
 // -----
 
 // The bits of the last axis read as another dtype: eight 4-bit codes per 32-bit word, and three
 // bytes per four 6-bit codes.
-func.func @bitcast(%0: tensor<4x2xsi32>, %1: tensor<4x3xui8>, %2: tensor<4xbf16>) -> (tensor<4x16xui4>, tensor<4x4xf6e2m3>, tensor<4xsi16>) {
-  %3 = tensor.bitcast(%0) {to = ui4} : (tensor<4x2xsi32>) -> tensor<4x16xui4>
-  %4 = tensor.bitcast(%1) {to = f6e2m3} : (tensor<4x3xui8>) -> tensor<4x4xf6e2m3>
-  %5 = tensor.bitcast(%2) {to = si16} : (tensor<4xbf16>) -> tensor<4xsi16>
-  func.return(%3, %4, %5) : (tensor<4x16xui4>, tensor<4x4xf6e2m3>, tensor<4xsi16>) -> ()
+// CHECK: func.func @bitcast([[WORDS:%[0-9]+]]: tensor<4x2xsi32>, [[BYTES:%[0-9]+]]: tensor<4x3xui8>, [[HALVES:%[0-9]+]]: tensor<4xbf16>) -> (tensor<4x16xui4>, tensor<4x4xf6e2m3>, tensor<4xsi16>) {
+// CHECK-NEXT: [[NIBBLES:%[0-9]+]] = tensor.bitcast([[WORDS]]) {to = ui4} : (tensor<4x2xsi32>) -> tensor<4x16xui4>
+// CHECK-NEXT: [[SIX_BIT_CODES:%[0-9]+]] = tensor.bitcast([[BYTES]]) {to = f6e2m3} : (tensor<4x3xui8>) -> tensor<4x4xf6e2m3>
+// CHECK-NEXT: [[HALF_BITS:%[0-9]+]] = tensor.bitcast([[HALVES]]) {to = si16} : (tensor<4xbf16>) -> tensor<4xsi16>
+// CHECK-NEXT: func.return([[NIBBLES]], [[SIX_BIT_CODES]], [[HALF_BITS]]) : (tensor<4x16xui4>, tensor<4x4xf6e2m3>, tensor<4xsi16>) -> ()
+// CHECK-NEXT: }
+func.func @bitcast(%words: tensor<4x2xsi32>, %bytes: tensor<4x3xui8>, %halves: tensor<4xbf16>) -> (tensor<4x16xui4>, tensor<4x4xf6e2m3>, tensor<4xsi16>) {
+  %nibbles = tensor.bitcast(%words) {to = ui4} : (tensor<4x2xsi32>) -> tensor<4x16xui4>
+  %six_bit_codes = tensor.bitcast(%bytes) {to = f6e2m3} : (tensor<4x3xui8>) -> tensor<4x4xf6e2m3>
+  %half_bits = tensor.bitcast(%halves) {to = si16} : (tensor<4xbf16>) -> tensor<4xsi16>
+  func.return(%nibbles, %six_bit_codes, %half_bits) : (tensor<4x16xui4>, tensor<4x4xf6e2m3>, tensor<4xsi16>) -> ()
 }

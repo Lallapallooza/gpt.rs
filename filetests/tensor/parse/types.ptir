@@ -1,21 +1,21 @@
 // RUN: parse
 
-// ERROR: 2:38: bad dimension `{}` in tensor type
-func.func @braces(%0: tensor<{}x3xf32>) -> tensor<{}x3xf32> {
-  func.return(%0) : (tensor<{}x3xf32>) -> ()
+// ERROR: 2:42: bad dimension `{}` in tensor type
+func.func @braces(%input: tensor<{}x3xf32>) -> tensor<{}x3xf32> {
+  func.return(%input) : (tensor<{}x3xf32>) -> ()
 }
 
 // -----
 
-// ERROR: 2:34: bad dimension `+3` in tensor type
-func.func @plus(%0: tensor<+3xf32>) -> tensor<+3xf32> {
-  func.return(%0) : (tensor<+3xf32>) -> ()
+// ERROR: 2:38: bad dimension `+3` in tensor type
+func.func @plus(%input: tensor<+3xf32>) -> tensor<+3xf32> {
+  func.return(%input) : (tensor<+3xf32>) -> ()
 }
 
 // -----
 
-// ERROR: 2:49: tensor type: rank 9 is above the largest rank, 8
-func.func @rank(%0: tensor<1x1x1x1x1x1x1x1x1xf32>) -> tensor<f32> {
-  %1 = tensor.reshape(%0) {shape = []} : (tensor<1x1x1x1x1x1x1x1x1xf32>) -> tensor<f32>
-  func.return(%1) : (tensor<f32>) -> ()
+// ERROR: 2:53: tensor type: rank 9 is above the largest rank, 8
+func.func @rank(%input: tensor<1x1x1x1x1x1x1x1x1xf32>) -> tensor<f32> {
+  %scalar = tensor.reshape(%input) {shape = []} : (tensor<1x1x1x1x1x1x1x1x1xf32>) -> tensor<f32>
+  func.return(%scalar) : (tensor<f32>) -> ()
 }

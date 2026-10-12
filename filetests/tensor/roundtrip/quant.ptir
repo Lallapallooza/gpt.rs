@@ -1,55 +1,91 @@
 // RUN: roundtrip
 
-func.func @mxfp4(%0: tensor<4x64xf4e2m1>, %1: tensor<4x2xe8m0>) -> tensor<4x64xbf16> {
-  %2 = tensor.dequantize(%0, %1) {block = [1, 32], to = bf16} : (tensor<4x64xf4e2m1>, tensor<4x2xe8m0>) -> tensor<4x64xbf16>
-  func.return(%2) : (tensor<4x64xbf16>) -> ()
+// CHECK: func.func @mxfp4([[QUANTIZED:%[0-9]+]]: tensor<4x64xf4e2m1>, [[SCALES:%[0-9]+]]: tensor<4x2xe8m0>) -> tensor<4x64xbf16> {
+// CHECK-NEXT: [[DEQUANTIZED:%[0-9]+]] = tensor.dequantize([[QUANTIZED]], [[SCALES]]) {block = [1, 32], to = bf16} : (tensor<4x64xf4e2m1>, tensor<4x2xe8m0>) -> tensor<4x64xbf16>
+// CHECK-NEXT: func.return([[DEQUANTIZED]]) : (tensor<4x64xbf16>) -> ()
+// CHECK-NEXT: }
+func.func @mxfp4(%quantized: tensor<4x64xf4e2m1>, %scales: tensor<4x2xe8m0>) -> tensor<4x64xbf16> {
+  %dequantized = tensor.dequantize(%quantized, %scales) {block = [1, 32], to = bf16} : (tensor<4x64xf4e2m1>, tensor<4x2xe8m0>) -> tensor<4x64xbf16>
+  func.return(%dequantized) : (tensor<4x64xbf16>) -> ()
 }
 
 // -----
 
-func.func @per_tensor(%0: tensor<8x16xf32>, %1: tensor<1x1xf32>) -> (tensor<8x16xf8e4m3>, tensor<8x16xsi8>) {
-  %2 = tensor.quantize(%0, %1) {block = [8, 16], to = f8e4m3} : (tensor<8x16xf32>, tensor<1x1xf32>) -> tensor<8x16xf8e4m3>
-  %3 = tensor.quantize(%0, %1) {block = [8, 16], to = si8} : (tensor<8x16xf32>, tensor<1x1xf32>) -> tensor<8x16xsi8>
-  func.return(%2, %3) : (tensor<8x16xf8e4m3>, tensor<8x16xsi8>) -> ()
+// CHECK: func.func @per_tensor([[INPUT:%[0-9]+]]: tensor<8x16xf32>, [[SCALE:%[0-9]+]]: tensor<1x1xf32>) -> (tensor<8x16xf8e4m3>, tensor<8x16xsi8>) {
+// CHECK-NEXT: [[FLOAT_CODES:%[0-9]+]] = tensor.quantize([[INPUT]], [[SCALE]]) {block = [8, 16], to = f8e4m3} : (tensor<8x16xf32>, tensor<1x1xf32>) -> tensor<8x16xf8e4m3>
+// CHECK-NEXT: [[INT_CODES:%[0-9]+]] = tensor.quantize([[INPUT]], [[SCALE]]) {block = [8, 16], to = si8} : (tensor<8x16xf32>, tensor<1x1xf32>) -> tensor<8x16xsi8>
+// CHECK-NEXT: func.return([[FLOAT_CODES]], [[INT_CODES]]) : (tensor<8x16xf8e4m3>, tensor<8x16xsi8>) -> ()
+// CHECK-NEXT: }
+func.func @per_tensor(%input: tensor<8x16xf32>, %scale: tensor<1x1xf32>) -> (tensor<8x16xf8e4m3>, tensor<8x16xsi8>) {
+  %float_codes = tensor.quantize(%input, %scale) {block = [8, 16], to = f8e4m3} : (tensor<8x16xf32>, tensor<1x1xf32>) -> tensor<8x16xf8e4m3>
+  %int_codes = tensor.quantize(%input, %scale) {block = [8, 16], to = si8} : (tensor<8x16xf32>, tensor<1x1xf32>) -> tensor<8x16xsi8>
+  func.return(%float_codes, %int_codes) : (tensor<8x16xf8e4m3>, tensor<8x16xsi8>) -> ()
 }
 
 // -----
 
 // A code table dequantizes as `take` at the codes, then `dequantize` of the values.
-func.func @offset_and_table(%0: tensor<4x64xui4>, %1: tensor<4x2xf16>, %2: tensor<4x2xf16>, %3: tensor<16xf32>) -> (tensor<4x64xbf16>, tensor<4x64xbf16>) {
-  %4 = tensor.dequantize(%0, %1, %2) {block = [1, 32], to = bf16} : (tensor<4x64xui4>, tensor<4x2xf16>, tensor<4x2xf16>) -> tensor<4x64xbf16>
-  %5 = tensor.cast(%0) {to = si32} : (tensor<4x64xui4>) -> tensor<4x64xsi32>
-  %6 = tensor.take(%3, %5) : (tensor<16xf32>, tensor<4x64xsi32>) -> tensor<4x64xf32>
-  %7 = tensor.dequantize(%6, %1) {block = [1, 32], to = bf16} : (tensor<4x64xf32>, tensor<4x2xf16>) -> tensor<4x64xbf16>
-  func.return(%4, %7) : (tensor<4x64xbf16>, tensor<4x64xbf16>) -> ()
+// CHECK: func.func @offset_and_table([[CODES:%[0-9]+]]: tensor<4x64xui4>, [[SCALES:%[0-9]+]]: tensor<4x2xf16>, [[OFFSETS:%[0-9]+]]: tensor<4x2xf16>, [[TABLE:%[0-9]+]]: tensor<16xf32>) -> (tensor<4x64xbf16>, tensor<4x64xbf16>) {
+// CHECK-NEXT: [[OFFSET_DEQUANTIZED:%[0-9]+]] = tensor.dequantize([[CODES]], [[SCALES]], [[OFFSETS]]) {block = [1, 32], to = bf16} : (tensor<4x64xui4>, tensor<4x2xf16>, tensor<4x2xf16>) -> tensor<4x64xbf16>
+// CHECK-NEXT: [[CODE_INDICES:%[0-9]+]] = tensor.cast([[CODES]]) {to = si32} : (tensor<4x64xui4>) -> tensor<4x64xsi32>
+// CHECK-NEXT: [[TABLE_VALUES:%[0-9]+]] = tensor.take([[TABLE]], [[CODE_INDICES]]) : (tensor<16xf32>, tensor<4x64xsi32>) -> tensor<4x64xf32>
+// CHECK-NEXT: [[TABLE_DEQUANTIZED:%[0-9]+]] = tensor.dequantize([[TABLE_VALUES]], [[SCALES]]) {block = [1, 32], to = bf16} : (tensor<4x64xf32>, tensor<4x2xf16>) -> tensor<4x64xbf16>
+// CHECK-NEXT: func.return([[OFFSET_DEQUANTIZED]], [[TABLE_DEQUANTIZED]]) : (tensor<4x64xbf16>, tensor<4x64xbf16>) -> ()
+// CHECK-NEXT: }
+func.func @offset_and_table(%codes: tensor<4x64xui4>, %scales: tensor<4x2xf16>, %offsets: tensor<4x2xf16>, %table: tensor<16xf32>) -> (tensor<4x64xbf16>, tensor<4x64xbf16>) {
+  %offset_dequantized = tensor.dequantize(%codes, %scales, %offsets) {block = [1, 32], to = bf16} : (tensor<4x64xui4>, tensor<4x2xf16>, tensor<4x2xf16>) -> tensor<4x64xbf16>
+  %code_indices = tensor.cast(%codes) {to = si32} : (tensor<4x64xui4>) -> tensor<4x64xsi32>
+  %table_values = tensor.take(%table, %code_indices) : (tensor<16xf32>, tensor<4x64xsi32>) -> tensor<4x64xf32>
+  %table_dequantized = tensor.dequantize(%table_values, %scales) {block = [1, 32], to = bf16} : (tensor<4x64xf32>, tensor<4x2xf16>) -> tensor<4x64xbf16>
+  func.return(%offset_dequantized, %table_dequantized) : (tensor<4x64xbf16>, tensor<4x64xbf16>) -> ()
 }
 
 // -----
 
-func.func @quantize_options(%0: tensor<8x16xf32>, %1: tensor<8x1xf32>, %2: tensor<8x16xui32>, %3: tensor<16xf32>) -> (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) {
-  %4 = tensor.quantize_stochastic(%0, %1, %2) {block = [1, 16], to = f8e4m3} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x16xui32>) -> tensor<8x16xf8e4m3>
-  %5 = tensor.quantize(%0, %1, %1) {block = [1, 16], to = ui8} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x1xf32>) -> tensor<8x16xui8>
-  %6 = tensor.quantize_table(%0, %1, %3) {block = [1, 16], to = ui4} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<16xf32>) -> tensor<8x16xui4>
-  func.return(%4, %5, %6) : (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) -> ()
+// CHECK: func.func @quantize_options([[INPUT:%[0-9]+]]: tensor<8x16xf32>, [[SCALES:%[0-9]+]]: tensor<8x1xf32>, [[DRAWS:%[0-9]+]]: tensor<8x16xui32>, [[TABLE:%[0-9]+]]: tensor<16xf32>) -> (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) {
+// CHECK-NEXT: [[STOCHASTIC_CODES:%[0-9]+]] = tensor.quantize_stochastic([[INPUT]], [[SCALES]], [[DRAWS]]) {block = [1, 16], to = f8e4m3} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x16xui32>) -> tensor<8x16xf8e4m3>
+// CHECK-NEXT: [[OFFSET_CODES:%[0-9]+]] = tensor.quantize([[INPUT]], [[SCALES]], [[SCALES]]) {block = [1, 16], to = ui8} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x1xf32>) -> tensor<8x16xui8>
+// CHECK-NEXT: [[TABLE_CODES:%[0-9]+]] = tensor.quantize_table([[INPUT]], [[SCALES]], [[TABLE]]) {block = [1, 16], to = ui4} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<16xf32>) -> tensor<8x16xui4>
+// CHECK-NEXT: func.return([[STOCHASTIC_CODES]], [[OFFSET_CODES]], [[TABLE_CODES]]) : (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) -> ()
+// CHECK-NEXT: }
+func.func @quantize_options(%input: tensor<8x16xf32>, %scales: tensor<8x1xf32>, %draws: tensor<8x16xui32>, %table: tensor<16xf32>) -> (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) {
+  %stochastic_codes = tensor.quantize_stochastic(%input, %scales, %draws) {block = [1, 16], to = f8e4m3} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x16xui32>) -> tensor<8x16xf8e4m3>
+  %offset_codes = tensor.quantize(%input, %scales, %scales) {block = [1, 16], to = ui8} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<8x1xf32>) -> tensor<8x16xui8>
+  %table_codes = tensor.quantize_table(%input, %scales, %table) {block = [1, 16], to = ui4} : (tensor<8x16xf32>, tensor<8x1xf32>, tensor<16xf32>) -> tensor<8x16xui4>
+  func.return(%stochastic_codes, %offset_codes, %table_codes) : (tensor<8x16xf8e4m3>, tensor<8x16xui8>, tensor<8x16xui4>) -> ()
 }
 
 // -----
 
 // Dynamic quantization: the scales of the blocks, then the quantization with them.
-func.func @dynamic(%0: tensor<{T}x64xf32>) -> (tensor<{T}x64xf4e2m1>, tensor<{T}x4xf8e4m3>, tensor<{T}x64xf6e3m2>, tensor<{T}x2xe8m0>) {
-  %1 = tensor.block_scale_amax(%0) {block = [1, 16], to = f4e2m1, scale_dtype = f8e4m3} : (tensor<{T}x64xf32>) -> tensor<{T}x4xf8e4m3>
-  %2 = tensor.quantize(%0, %1) {block = [1, 16], to = f4e2m1} : (tensor<{T}x64xf32>, tensor<{T}x4xf8e4m3>) -> tensor<{T}x64xf4e2m1>
-  %3 = tensor.block_scale_pow2_floor(%0) {block = [1, 32], to = f6e3m2, scale_dtype = e8m0} : (tensor<{T}x64xf32>) -> tensor<{T}x2xe8m0>
-  %4 = tensor.quantize(%0, %3) {block = [1, 32], to = f6e3m2} : (tensor<{T}x64xf32>, tensor<{T}x2xe8m0>) -> tensor<{T}x64xf6e3m2>
-  func.return(%2, %1, %4, %3) : (tensor<{T}x64xf4e2m1>, tensor<{T}x4xf8e4m3>, tensor<{T}x64xf6e3m2>, tensor<{T}x2xe8m0>) -> ()
+// CHECK: func.func @dynamic([[INPUT:%[0-9]+]]: tensor<{T}x64xf32>) -> (tensor<{T}x64xf4e2m1>, tensor<{T}x4xf8e4m3>, tensor<{T}x64xf6e3m2>, tensor<{T}x2xe8m0>) {
+// CHECK-NEXT: [[AMAX_SCALES:%[0-9]+]] = tensor.block_scale_amax([[INPUT]]) {block = [1, 16], to = f4e2m1, scale_dtype = f8e4m3} : (tensor<{T}x64xf32>) -> tensor<{T}x4xf8e4m3>
+// CHECK-NEXT: [[AMAX_CODES:%[0-9]+]] = tensor.quantize([[INPUT]], [[AMAX_SCALES]]) {block = [1, 16], to = f4e2m1} : (tensor<{T}x64xf32>, tensor<{T}x4xf8e4m3>) -> tensor<{T}x64xf4e2m1>
+// CHECK-NEXT: [[FLOOR_SCALES:%[0-9]+]] = tensor.block_scale_pow2_floor([[INPUT]]) {block = [1, 32], to = f6e3m2, scale_dtype = e8m0} : (tensor<{T}x64xf32>) -> tensor<{T}x2xe8m0>
+// CHECK-NEXT: [[FLOOR_CODES:%[0-9]+]] = tensor.quantize([[INPUT]], [[FLOOR_SCALES]]) {block = [1, 32], to = f6e3m2} : (tensor<{T}x64xf32>, tensor<{T}x2xe8m0>) -> tensor<{T}x64xf6e3m2>
+// CHECK-NEXT: func.return([[AMAX_CODES]], [[AMAX_SCALES]], [[FLOOR_CODES]], [[FLOOR_SCALES]]) : (tensor<{T}x64xf4e2m1>, tensor<{T}x4xf8e4m3>, tensor<{T}x64xf6e3m2>, tensor<{T}x2xe8m0>) -> ()
+// CHECK-NEXT: }
+func.func @dynamic(%input: tensor<{T}x64xf32>) -> (tensor<{T}x64xf4e2m1>, tensor<{T}x4xf8e4m3>, tensor<{T}x64xf6e3m2>, tensor<{T}x2xe8m0>) {
+  %amax_scales = tensor.block_scale_amax(%input) {block = [1, 16], to = f4e2m1, scale_dtype = f8e4m3} : (tensor<{T}x64xf32>) -> tensor<{T}x4xf8e4m3>
+  %amax_codes = tensor.quantize(%input, %amax_scales) {block = [1, 16], to = f4e2m1} : (tensor<{T}x64xf32>, tensor<{T}x4xf8e4m3>) -> tensor<{T}x64xf4e2m1>
+  %floor_scales = tensor.block_scale_pow2_floor(%input) {block = [1, 32], to = f6e3m2, scale_dtype = e8m0} : (tensor<{T}x64xf32>) -> tensor<{T}x2xe8m0>
+  %floor_codes = tensor.quantize(%input, %floor_scales) {block = [1, 32], to = f6e3m2} : (tensor<{T}x64xf32>, tensor<{T}x2xe8m0>) -> tensor<{T}x64xf6e3m2>
+  func.return(%amax_codes, %amax_scales, %floor_codes, %floor_scales) : (tensor<{T}x64xf4e2m1>, tensor<{T}x4xf8e4m3>, tensor<{T}x64xf6e3m2>, tensor<{T}x2xe8m0>) -> ()
 }
 
 // -----
 
-func.func @dynamic_options(%0: tensor<4x64xf32>, %1: tensor<4x64xui32>) -> (tensor<4x64xui8>, tensor<4x2xf32>, tensor<4x2xf32>, tensor<4x64xf8e4m3>, tensor<4x2xe8m0>) {
-  %2, %3 = tensor.block_scale_range(%0) {block = [1, 32], to = ui8, scale_dtype = f32} : (tensor<4x64xf32>) -> (tensor<4x2xf32>, tensor<4x2xf32>)
-  %4 = tensor.quantize(%0, %2, %3) {block = [1, 32], to = ui8} : (tensor<4x64xf32>, tensor<4x2xf32>, tensor<4x2xf32>) -> tensor<4x64xui8>
-  %5 = tensor.block_scale_pow2_ceil(%0) {block = [1, 32], to = f8e4m3, scale_dtype = e8m0} : (tensor<4x64xf32>) -> tensor<4x2xe8m0>
-  %6 = tensor.quantize_stochastic(%0, %5, %1) {block = [1, 32], to = f8e4m3} : (tensor<4x64xf32>, tensor<4x2xe8m0>, tensor<4x64xui32>) -> tensor<4x64xf8e4m3>
-  func.return(%4, %2, %3, %6, %5) : (tensor<4x64xui8>, tensor<4x2xf32>, tensor<4x2xf32>, tensor<4x64xf8e4m3>, tensor<4x2xe8m0>) -> ()
+// CHECK: func.func @dynamic_options([[INPUT:%[0-9]+]]: tensor<4x64xf32>, [[DRAWS:%[0-9]+]]: tensor<4x64xui32>) -> (tensor<4x64xui8>, tensor<4x2xf32>, tensor<4x2xf32>, tensor<4x64xf8e4m3>, tensor<4x2xe8m0>) {
+// CHECK-NEXT: [[RANGE_SCALES:%[0-9]+]], [[RANGE_OFFSETS:%[0-9]+]] = tensor.block_scale_range([[INPUT]]) {block = [1, 32], to = ui8, scale_dtype = f32} : (tensor<4x64xf32>) -> (tensor<4x2xf32>, tensor<4x2xf32>)
+// CHECK-NEXT: [[RANGE_CODES:%[0-9]+]] = tensor.quantize([[INPUT]], [[RANGE_SCALES]], [[RANGE_OFFSETS]]) {block = [1, 32], to = ui8} : (tensor<4x64xf32>, tensor<4x2xf32>, tensor<4x2xf32>) -> tensor<4x64xui8>
+// CHECK-NEXT: [[CEIL_SCALES:%[0-9]+]] = tensor.block_scale_pow2_ceil([[INPUT]]) {block = [1, 32], to = f8e4m3, scale_dtype = e8m0} : (tensor<4x64xf32>) -> tensor<4x2xe8m0>
+// CHECK-NEXT: [[STOCHASTIC_CODES:%[0-9]+]] = tensor.quantize_stochastic([[INPUT]], [[CEIL_SCALES]], [[DRAWS]]) {block = [1, 32], to = f8e4m3} : (tensor<4x64xf32>, tensor<4x2xe8m0>, tensor<4x64xui32>) -> tensor<4x64xf8e4m3>
+// CHECK-NEXT: func.return([[RANGE_CODES]], [[RANGE_SCALES]], [[RANGE_OFFSETS]], [[STOCHASTIC_CODES]], [[CEIL_SCALES]]) : (tensor<4x64xui8>, tensor<4x2xf32>, tensor<4x2xf32>, tensor<4x64xf8e4m3>, tensor<4x2xe8m0>) -> ()
+// CHECK-NEXT: }
+func.func @dynamic_options(%input: tensor<4x64xf32>, %draws: tensor<4x64xui32>) -> (tensor<4x64xui8>, tensor<4x2xf32>, tensor<4x2xf32>, tensor<4x64xf8e4m3>, tensor<4x2xe8m0>) {
+  %range_scales, %range_offsets = tensor.block_scale_range(%input) {block = [1, 32], to = ui8, scale_dtype = f32} : (tensor<4x64xf32>) -> (tensor<4x2xf32>, tensor<4x2xf32>)
+  %range_codes = tensor.quantize(%input, %range_scales, %range_offsets) {block = [1, 32], to = ui8} : (tensor<4x64xf32>, tensor<4x2xf32>, tensor<4x2xf32>) -> tensor<4x64xui8>
+  %ceil_scales = tensor.block_scale_pow2_ceil(%input) {block = [1, 32], to = f8e4m3, scale_dtype = e8m0} : (tensor<4x64xf32>) -> tensor<4x2xe8m0>
+  %stochastic_codes = tensor.quantize_stochastic(%input, %ceil_scales, %draws) {block = [1, 32], to = f8e4m3} : (tensor<4x64xf32>, tensor<4x2xe8m0>, tensor<4x64xui32>) -> tensor<4x64xf8e4m3>
+  func.return(%range_codes, %range_scales, %range_offsets, %stochastic_codes, %ceil_scales) : (tensor<4x64xui8>, tensor<4x2xf32>, tensor<4x2xf32>, tensor<4x64xf8e4m3>, tensor<4x2xe8m0>) -> ()
 }

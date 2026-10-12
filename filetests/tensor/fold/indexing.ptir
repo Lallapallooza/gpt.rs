@@ -2,13 +2,13 @@
 
 // A dynamic slice as large as its input is the input, and an update as large as its base
 // replaces it: the starts clamp to 0.
-// CHECK: func.func @whole
+// CHECK: func.func @whole([[BASE:%[0-9]+]]: tensor<2x3xf32>, [[UPDATE:%[0-9]+]]: tensor<2x3xf32>, [[STARTS:%[0-9]+]]: tensor<2xsi32>)
 // CHECK-NOT: tensor.dynamic
-// CHECK: func.return(%0, %1)
-func.func @whole(%0: tensor<2x3xf32>, %1: tensor<2x3xf32>, %2: tensor<2xsi32>) -> (tensor<2x3xf32>, tensor<2x3xf32>) {
-  %3 = tensor.dynamic_slice(%0, %2) {sizes = [2, 3]} : (tensor<2x3xf32>, tensor<2xsi32>) -> tensor<2x3xf32>
-  %4 = tensor.dynamic_update_slice(%0, %1, %2) : (tensor<2x3xf32>, tensor<2x3xf32>, tensor<2xsi32>) -> tensor<2x3xf32>
-  func.return(%3, %4) : (tensor<2x3xf32>, tensor<2x3xf32>) -> ()
+// CHECK: func.return([[BASE]], [[UPDATE]])
+func.func @whole(%base: tensor<2x3xf32>, %update: tensor<2x3xf32>, %starts: tensor<2xsi32>) -> (tensor<2x3xf32>, tensor<2x3xf32>) {
+  %sliced = tensor.dynamic_slice(%base, %starts) {sizes = [2, 3]} : (tensor<2x3xf32>, tensor<2xsi32>) -> tensor<2x3xf32>
+  %updated = tensor.dynamic_update_slice(%base, %update, %starts) : (tensor<2x3xf32>, tensor<2x3xf32>, tensor<2xsi32>) -> tensor<2x3xf32>
+  func.return(%sliced, %updated) : (tensor<2x3xf32>, tensor<2x3xf32>) -> ()
 }
 
 // -----
@@ -17,8 +17,8 @@ func.func @whole(%0: tensor<2x3xf32>, %1: tensor<2x3xf32>, %2: tensor<2xsi32>) -
 // CHECK: func.func @partial
 // CHECK: tensor.dynamic_slice
 // CHECK: tensor.dynamic_update_slice
-func.func @partial(%0: tensor<4x3xf32>, %1: tensor<2x3xf32>, %2: tensor<2xsi32>) -> (tensor<2x3xf32>, tensor<4x3xf32>) {
-  %3 = tensor.dynamic_slice(%0, %2) {sizes = [2, 3]} : (tensor<4x3xf32>, tensor<2xsi32>) -> tensor<2x3xf32>
-  %4 = tensor.dynamic_update_slice(%0, %1, %2) : (tensor<4x3xf32>, tensor<2x3xf32>, tensor<2xsi32>) -> tensor<4x3xf32>
-  func.return(%3, %4) : (tensor<2x3xf32>, tensor<4x3xf32>) -> ()
+func.func @partial(%base: tensor<4x3xf32>, %update: tensor<2x3xf32>, %starts: tensor<2xsi32>) -> (tensor<2x3xf32>, tensor<4x3xf32>) {
+  %sliced = tensor.dynamic_slice(%base, %starts) {sizes = [2, 3]} : (tensor<4x3xf32>, tensor<2xsi32>) -> tensor<2x3xf32>
+  %updated = tensor.dynamic_update_slice(%base, %update, %starts) : (tensor<4x3xf32>, tensor<2x3xf32>, tensor<2xsi32>) -> tensor<4x3xf32>
+  func.return(%sliced, %updated) : (tensor<2x3xf32>, tensor<4x3xf32>) -> ()
 }

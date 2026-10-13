@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, process};
 
 use gpt_rs::backend::PortableBackend;
-use gpt_rs::gpt_rs_ir::module::Module;
+use gpt_rs::gpt_rs_ir::ir::Module;
 use gpt_rs::ops::graph::context::with_default_arena;
 use gpt_rs::ops::graph::GraphArena;
 use gpt_rs::ops::trace::{self, ExecutionTraceSink, ProgramContext, ProgramStats, TraceGuard};

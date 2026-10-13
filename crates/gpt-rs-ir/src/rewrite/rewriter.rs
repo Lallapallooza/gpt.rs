@@ -1,7 +1,7 @@
 //! [`Rewriter`]: what a pattern changes, staged while the pattern reads the module.
 //!
-//! A pattern reads the module through shared references, [`Matched`](crate::op::Matched) and
-//! [`ValueRef`](crate::module::ValueRef), for as long as it runs, so the rewriter cannot change the
+//! A pattern reads the module through shared references, [`Matched`](crate::ir::Matched) and
+//! [`ValueRef`](crate::ir::ValueRef), for as long as it runs, so the rewriter cannot change the
 //! module while it does. It stages the changes instead: it builds new ops into a scratch module and
 //! records the edits of existing ops, in order. When the pattern succeeds the driver applies them,
 //! and when it fails the driver drops them, so a pattern that does not apply changes nothing.
@@ -11,12 +11,12 @@
 
 use std::collections::HashMap;
 
-use crate::location::Location;
-use crate::module::{Inst, Module, Region, Value};
-use crate::op::{Created, FoldIn, Groups, InOp, OpDyn, OpKind, Operands, Values};
+use crate::ir::{
+    Created, FoldIn, Groups, InOp, Inst, Location, Module, OpDyn, OpKind, Operands, Region,
+    TensorType, Type, Value, Values,
+};
 use crate::rewrite::build::materialize;
 use crate::rewrite::{AsInst, Build, Builder, IntoValues};
-use crate::types::{TensorType, Type};
 use crate::Op;
 
 /// What a pattern changes, staged until the driver applies it.

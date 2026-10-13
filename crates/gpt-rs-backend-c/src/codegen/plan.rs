@@ -6,8 +6,7 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use gpt_rs_ir::dialects::tensor::TensorOp;
-use gpt_rs_ir::module::Value;
-use gpt_rs_ir::types::DType;
+use gpt_rs_ir::ir::{DType, Value};
 
 use super::types::{Instruction, Kind};
 

@@ -3,7 +3,7 @@
 use anyhow::{ensure, Result};
 
 use crate::dialects::tensor::ir::*;
-use crate::op::{NoRegions, OpDef, OwnedTypes, TypeCx, Types};
+use crate::ir::{NoRegions, OpDef, OwnedTypes, TypeCx, Types};
 
 impl OpDef for CustomCall {
     fn result_types(

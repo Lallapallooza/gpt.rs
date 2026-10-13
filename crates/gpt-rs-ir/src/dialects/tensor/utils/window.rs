@@ -5,7 +5,7 @@ use std::fmt;
 use anyhow::{anyhow, ensure, Result};
 
 use crate::dialects::tensor::ir::*;
-use crate::types::TensorType;
+use crate::ir::TensorType;
 
 impl ExtractPatches {
     /// The spatial axes of an `input` of type `[N, spatial..., C]`, and the result extents

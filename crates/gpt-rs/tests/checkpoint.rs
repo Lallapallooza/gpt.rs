@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use gpt_rs::checkpoint;
-use gpt_rs::gpt_rs_ir::types::TensorType;
+use gpt_rs::gpt_rs_ir::ir::TensorType;
 use gpt_rs::io::safetensors;
 use gpt_rs::runtime::{load_model_with_options, LoadOptions};
 use gpt_rs::tensor::{DType, HostTensor};

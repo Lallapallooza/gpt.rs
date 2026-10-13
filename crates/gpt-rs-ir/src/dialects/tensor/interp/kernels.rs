@@ -18,10 +18,8 @@ use anyhow::{anyhow, bail, Result};
 use half::{bf16, f16};
 
 use super::elementwise::Arith;
-use crate::float8::F8E4M3;
 use crate::host::TensorData;
-use crate::minifloat::{e8m0_decode, Format, Overflow};
-use crate::types::DType;
+use crate::ir::{e8m0_decode, DType, Format, Overflow, F8E4M3};
 
 /// Row-major strides of `dims`.
 pub fn strides(dims: &[usize]) -> Vec<usize> {

@@ -12,17 +12,13 @@ use std::borrow::Cow;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::sync::Arc;
 
-use gpt_rs_ir::attr::F64;
-use gpt_rs_ir::dense::Dense;
 use gpt_rs_ir::dialects::tensor::{
     self, ArgMax, Binary, BroadcastTo, Cast, Concat, Constant, DotGeneral, DynamicSlice,
     DynamicUpdateSlice, ExtractPatches, Iota, Reduce, ReduceAttrs, ReduceWindow, ReduceWindowAttrs,
     Reshape, RngAttrs, RngUniform, Select, SelectKAttrs, Take, TopK, Transpose, Unary,
 };
 use gpt_rs_ir::host::HostTensor;
-use gpt_rs_ir::location::Location;
-use gpt_rs_ir::op::{InOp, OpDyn};
-use gpt_rs_ir::types::{ranked, DType, Dim, Ranked};
+use gpt_rs_ir::ir::{ranked, DType, Dense, Dim, InOp, Location, OpDyn, Ranked, F64};
 use half::{bf16, f16};
 use smallvec::SmallVec;
 

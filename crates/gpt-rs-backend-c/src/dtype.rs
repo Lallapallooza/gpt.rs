@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use gpt_rs_ir::types::DType;
+use gpt_rs_ir::ir::DType;
 
 /// The tag of `dtype` in a `PtirTensor`.
 pub(crate) fn dtype_tag(dtype: DType) -> Result<u32> {

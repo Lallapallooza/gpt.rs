@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
-use gpt_rs_ir::module::Module;
+use gpt_rs_ir::ir::Module;
 use gpt_rs_ir::text::TextOptions;
 use serde::Serialize;
 

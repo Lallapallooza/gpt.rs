@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Result};
 
 use super::ir::*;
-use crate::types::TensorType;
+use crate::ir::TensorType;
 
 impl Func {
     /// The tensor types of the arguments and of the results of a call with tensors: those of the

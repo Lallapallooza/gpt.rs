@@ -7,10 +7,11 @@ use anyhow::{anyhow, bail, ensure, Result};
 
 use crate::dialects::tensor::utils::class::{ensure_dtype_class, ARITHMETIC};
 use crate::dialects::tile::ir::*;
-use crate::index::{Expr, Iter, IterKind, OperandRef, ReadKind, Write};
-use crate::module::Region;
-use crate::op::{NoRegions, OpDef, OwnedTypes, RegionOpDef, RegionSig, TypeCx, Types};
-use crate::types::{ranked, DType, Dim, TensorType, Type};
+use crate::dialects::tile::{Iter, IterKind, Write};
+use crate::ir::{
+    ranked, DType, Dim, Expr, NoRegions, OpDef, OperandRef, OwnedTypes, ReadKind, Region,
+    RegionOpDef, RegionSig, TensorType, Type, TypeCx, Types,
+};
 
 impl RegionOpDef for Block {
     fn region_signatures(&self, ins: BlockOperands<Types<'_>>) -> Result<BlockRegions<RegionSig>> {

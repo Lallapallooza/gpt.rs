@@ -4,16 +4,19 @@
 //! A run binds each dynamic dimension (`{B}`) to the extent of the first value that has it. It
 //! checks every argument and every value an op computes against its type under those bindings.
 
+mod values;
+
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 
-use crate::host::{HostValue, Unit};
-use crate::module::{Inst, Module, Region, Value};
-use crate::op::{OpDyn, RegionRunner};
+pub use self::values::*;
+use crate::ir::{
+    BufferType, Dim, Inst, Module, OpDyn, Region, RegionRunner, Sym, SymBindings, TensorType, Type,
+    Value,
+};
 use crate::traits::Terminator;
-use crate::types::{BufferType, Dim, Sym, SymBindings, TensorType, Type};
 
 struct Interp<'m> {
     module: &'m Module,

@@ -1,6 +1,6 @@
 //! Parsing a dtype from its name.
 
-use gpt_rs_ir::types::DType;
+use gpt_rs_ir::ir::DType;
 
 #[test]
 fn a_dtype_parses_from_its_mnemonic_in_any_case() {

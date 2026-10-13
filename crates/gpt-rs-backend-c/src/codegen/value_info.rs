@@ -1,10 +1,8 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, ensure, Result};
-use gpt_rs_ir::dense::Dense;
 use gpt_rs_ir::dialects::tensor::TensorOp;
-use gpt_rs_ir::module::{Module, Value};
-use gpt_rs_ir::types::{DType, TensorType};
+use gpt_rs_ir::ir::{DType, Dense, Module, TensorType, Value};
 
 use super::plan::{plan, Planned};
 use super::types::{Instruction, Kind, ValueInfo, ValueStorage};

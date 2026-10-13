@@ -3,9 +3,8 @@
 use anyhow::{bail, Result};
 
 use crate::dialects::tile::ir::*;
-use crate::host::HostValue;
-use crate::module::Region;
-use crate::op::{Eval, EvalCx, Host, OwnedHost};
+use crate::interp::HostValue;
+use crate::ir::{Eval, EvalCx, Host, OwnedHost, Region};
 
 impl Eval for Group {
     fn eval(

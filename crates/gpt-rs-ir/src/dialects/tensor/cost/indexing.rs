@@ -1,8 +1,8 @@
 //! The costs of the indexing ops.
 
-use crate::cost::{cost, tensor_bytes, Cost, OpCost};
+use crate::analysis::{cost, tensor_bytes, Cost, OpCost};
 use crate::dialects::tensor::ir::*;
-use crate::op::Types;
+use crate::ir::Types;
 
 /// A gather reads the elements it gathers and its indices, not its whole input, such as the rows
 /// of an embedding table that a few tokens look up.

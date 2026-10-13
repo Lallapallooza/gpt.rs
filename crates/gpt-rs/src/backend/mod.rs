@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use gpt_rs_ir::host::HostTensor;
-use gpt_rs_ir::module::Module;
+use gpt_rs_ir::ir::Module;
 use gpt_rs_ir::passes::{self, Pipeline};
 
 /// A backend compiles functions of the IR and runs them on its own tensors.

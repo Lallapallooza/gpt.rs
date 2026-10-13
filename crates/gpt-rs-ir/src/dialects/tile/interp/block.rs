@@ -6,14 +6,16 @@ use std::collections::HashMap;
 use anyhow::{anyhow, bail, ensure, Context, Result};
 
 use super::combine::Acc;
+use crate::dialects::arith::math;
 use crate::dialects::tile::ir::*;
-use crate::host::{HostScalar, HostTensor, HostValue};
-use crate::index::{AccessExpr, IndexEnv, IterKind, OperandRef, Source, Write};
-use crate::module::{Module, Region, Value};
-use crate::op::{Eval, EvalCx, Host, NoRegions, OpDyn, OwnedHost, RegionRunner};
-use crate::scalar::{self, Decoded};
+use crate::dialects::tile::{IterKind, Source, Write};
+use crate::host::{self, Decoded, HostScalar, HostTensor};
+use crate::interp::HostValue;
+use crate::ir::{
+    AccessExpr, DType, Dim, Eval, EvalCx, Host, IndexEnv, Module, NoRegions, OpDyn, OperandRef,
+    OwnedHost, Region, RegionRunner, Sym, Type, Value,
+};
 use crate::traits::Terminator;
-use crate::types::{DType, Dim, Sym, Type};
 use crate::Op;
 
 /// One op of a compiled block body, on the values of its slots.
@@ -500,7 +502,7 @@ impl Eval for Block {
                         anyhow!("no point writes element {element} of result {result}")
                     })?);
                 }
-                HostTensor::new(out.dims, scalar::encode(out.dtype, &elements)?)
+                HostTensor::new(out.dims, host::encode(out.dtype, &elements)?)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(BlockResults { outs: tensors })
@@ -556,7 +558,7 @@ impl Eval for Index {
             .index_env()
             .ok_or_else(|| anyhow!("tile.index runs in the body of a tile.block, at its points"))?;
         Ok(IndexResults {
-            output: scalar::from_index(self.expr.eval(env)?, self.dtype)?,
+            output: math::from_index(self.expr.eval(env)?, self.dtype)?,
         })
     }
 }

@@ -5,8 +5,7 @@ use std::fmt;
 use half::{bf16, f16};
 
 use super::{FoldResult, Law, OpRef, OpTrait, Term};
-use crate::op::Folded;
-use crate::types::DType;
+use crate::ir::{DType, Folded};
 use crate::{Doc, Op};
 
 const A: Term = Term::Var(0);

@@ -4,16 +4,15 @@ use anyhow::Result;
 use smallvec::SmallVec;
 
 use crate::dialects::r#loop::{
-    Alloc, For, Forall, If, Index, Load, LoadOperands, Predicate, Store, StoreOperands, Yield,
+    Alloc, For, Forall, If, Index, Level, Load, LoadOperands, Predicate, Store, StoreOperands,
+    Yield,
 };
 use crate::dialects::tile::Body;
 use crate::host::HostScalar;
-use crate::index::{Constraint, Expr, IndexExpr, ReadKind, Relation};
-use crate::module::Value;
-use crate::op::Values;
+use crate::ir::{
+    Constraint, DType, Dim, Expr, IndexExpr, Ranked, ReadKind, Relation, Value, Values,
+};
 use crate::rewrite::Builder;
-use crate::schedule::Level;
-use crate::types::{DType, Dim, Ranked};
 
 /// The positions of the operands that `exprs` name, in increasing order.
 fn used_operands<'e, R: ReadKind + 'e>(exprs: impl IntoIterator<Item = &'e Expr<R>>) -> Vec<usize> {
@@ -162,7 +161,7 @@ pub(super) fn load(
     builder: &mut Builder<'_>,
     buffer: Value,
     indices: Vec<Value>,
-    pad: Option<crate::attr::F64>,
+    pad: Option<crate::ir::F64>,
 ) -> Value {
     builder.create(Load { pad }, LoadOperands::<Values> { buffer, indices })
 }

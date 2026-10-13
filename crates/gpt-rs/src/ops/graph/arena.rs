@@ -43,9 +43,8 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use gpt_rs_ir::dialects::func::{Func, ParamId};
-use gpt_rs_ir::module::{Module, Value};
+use gpt_rs_ir::ir::{Module, Type, Value};
 use gpt_rs_ir::passes::{self, Pass, Pipeline, PruneParams};
-use gpt_rs_ir::types::Type;
 
 use super::builder::GraphBuilder;
 use super::plan::{

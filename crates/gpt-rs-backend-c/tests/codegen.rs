@@ -13,9 +13,8 @@ use gpt_rs::tensor::{DType, DeviceTensor, HostTensor};
 use gpt_rs_backend_c::{generate_c_module, CBackend};
 use gpt_rs_backend_tests::recording_backend::RecordingBackend;
 use gpt_rs_backend_tests::{load_layer, tensor_as};
-use gpt_rs_ir::module::Module;
+use gpt_rs_ir::ir::{Module, TensorType};
 use gpt_rs_ir::passes::Pipeline;
-use gpt_rs_ir::types::TensorType;
 
 /// Records the programs the graph arena runs, which it compiles with the C backend's pipeline.
 #[derive(Default)]

@@ -6,7 +6,7 @@ use anyhow::{anyhow, Result};
 use gpt_rs::backend::{ParamStore, PortableBackend};
 use gpt_rs::gpt_rs_ir::dialects::func::Func;
 use gpt_rs::gpt_rs_ir::host::HostTensor;
-use gpt_rs::gpt_rs_ir::module::Module;
+use gpt_rs::gpt_rs_ir::ir::Module;
 
 #[derive(Default)]
 pub struct RecordingBackend {

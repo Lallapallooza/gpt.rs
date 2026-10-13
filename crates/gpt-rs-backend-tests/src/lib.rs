@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use gpt_rs::backend::PortableBackend;
-use gpt_rs::gpt_rs_ir::types::TensorType;
+use gpt_rs::gpt_rs_ir::ir::TensorType;
 use gpt_rs::nn::Params;
 use gpt_rs::params::{base_param_id, param_key};
 use gpt_rs::runtime::next_namespace;

@@ -3,13 +3,11 @@
 use anyhow::Result;
 
 use crate::dialects::tensor::{BroadcastTo, Cast, DotAxes, DotGeneral, Mul, Side};
-use crate::module::{Module, ValueRef};
-use crate::op::Matched;
-use crate::passes::{pass, run_patterns, Pass, Rewrites};
+use crate::ir::{Matched, Module, TensorType, ValueRef};
+use crate::passes::{pass, run_patterns, Pass};
 use crate::require;
-use crate::rewrite::{matched, pattern, Build, NoMatch, Pattern, PatternSet, Rewriter};
+use crate::rewrite::{matched, pattern, Build, NoMatch, Pattern, PatternSet, Rewriter, Rewrites};
 use crate::traits::Movement;
-use crate::types::TensorType;
 
 /// `dot_general(x, w) * broadcast_to(s)` becomes `dot_general(x, w * s')` when `w` and `s` are
 /// static and `s` varies only along result axes that come from `w`. `s'` is `s` laid out along

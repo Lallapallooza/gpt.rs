@@ -1,11 +1,8 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use crate::attr::print_tuple;
-use crate::module::{Inst, Module, Region, Value};
-use crate::op::{OpDyn, SymbolOp};
+use crate::ir::{print_tuple, type_list, Inst, Module, OpDyn, Region, SymbolOp, Value};
 use crate::traits::IsolatedFromAbove;
-use crate::types::type_list;
 
 struct Printer<'m> {
     module: &'m Module,

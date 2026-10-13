@@ -2,7 +2,7 @@
 //! the projections that [`linear`] records.
 
 use gpt_rs_ir::dialects::tensor::{BroadcastTo, Cast, DotGeneral, Mul};
-use gpt_rs_ir::module::{Inst, Module, Value, ValueRef};
+use gpt_rs_ir::ir::{Inst, Module, Value, ValueRef};
 
 use crate::tensor::DType;
 use crate::{ensure_dtype, ensure_rank, ensure_same_dtype, functional};

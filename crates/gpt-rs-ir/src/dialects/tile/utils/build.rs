@@ -4,13 +4,13 @@ use smallvec::SmallVec;
 
 use crate::dialects::arith::{self, Literal};
 use crate::dialects::tile::ir::{Block, Fold, Index, Yield};
+use crate::dialects::tile::{Iter, IterKind, Read};
 use crate::host::HostScalar;
-use crate::index::{AccessExpr, Constraint, IndexExpr, Iter, IterKind, Read, MAX_ITERS};
-use crate::minifloat::Format;
-use crate::module::Value;
-use crate::op::{Created, InOp, Operands, Values};
+use crate::ir::{
+    AccessExpr, Constraint, Created, DType, Dim, Format, InOp, IndexExpr, Operands, Value, Values,
+    MAX_ITERS,
+};
 use crate::rewrite::{Builder, Rewriter};
-use crate::types::{DType, Dim};
 
 impl Block {
     /// A block over `iters` with these reads and folds, and no constraints.

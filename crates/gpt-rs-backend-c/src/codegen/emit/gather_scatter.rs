@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use gpt_rs_ir::dialects::tensor::{DynamicSlice, TensorOp};
-use gpt_rs_ir::types::{DType, TensorType};
+use gpt_rs_ir::ir::{DType, TensorType};
 
 use super::super::profile::register_op_profile_generic;
 use super::super::types::{Instruction, Kind};

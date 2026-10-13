@@ -1,44 +1,7 @@
-//! Attribute values: the fields of an op struct, and their text forms.
-//!
-//! Every field type implements [`Attr`]: it prints its text form and reads it back with a
-//! [`Cursor`], one token at a time. The impls in this module are the leaves, each one token or a
-//! list of attributes: integers, floats, strings, names, `[a, b]`, `(a, b)`, `{key = value}` and
-//! `none`. Every other attribute declares its text form with `#[derive(Attr)]`, which generates
-//! the printer and the parser from one declaration:
-//!
-//! - A fieldless enum is written by the snake_case name of each variant: `red_ordered`.
-//! - A variant with named fields, or one that holds an [`AttrGroup`], is written by its name and
-//!   its fields as parameters, each left out at its default: `top_k<k = 3>`.
-//! - `#[attr(format = "...")]` on a struct or on a variant gives its text form as a sequence of
-//!   elements, MLIR's declarative format:
-//!   - `` `by` `` is a literal: one token, a keyword, a name with its sigil (`!loop.buf`,
-//!     `#sched`) or punctuation (`->`, `[`).
-//!   - `$extent` is the text form of the field `extent`, and `$0` that of the first field of a
-//!     tuple struct or variant.
-//!   - `` (`pad` $pad^)? `` is an optional group: it is printed when its anchor, the field marked `^`,
-//!     is not at its default (an `Option` field is `Some`), and read when the token its first
-//!     element starts with comes next. A field of a group that is not its anchor has a default.
-//!   - `shape($dims, $dtype)` is the extents and the dtype of a tensor: `4x{T}xf32`.
-//!   - `tuple($writes)` is a list written as op results are: one item alone, any other number in
-//!     parentheses.
-//!   - `struct($nest, ...)` is `key = value` for each field, in any order, a field at its default
-//!     left out. A closing `>`, `}`, `)` or `]` follows it.
-//!   - ``` `` ``` removes the space between the elements around it.
-//!
-//!   The printer puts one space between elements, except after `(`, `[`, `<` and `{`, and before
-//!   `)`, `]`, `>`, `}`, `,`, `(`, `[`, `<`, and on either side of `..`.
-//!
-//!   The next token decides each choice, and `#[derive(Attr)]` rejects a format where it cannot:
-//!   two variants that start with one literal, or an optional group that starts with the literal
-//!   that follows it. The parser tries the variants in order and reads the first whose first
-//!   token comes next, so a variant that starts with a field goes after every variant whose
-//!   first token the field could also start with.
-//! - `#[attr(via = Text)]` on a type whose text form is that of the type `Text`, a struct that
-//!   declares it: `From<&T> for Text` writes it, and `TryFrom<Text> for T` checks and builds the
-//!   value, failing at the start of its text.
-//!
-//! Fields take `#[attr(default)]`, the type's default, or `#[attr(default = expr)]`. A type with
-//! a format or a via also gets `Display`, its text form.
+//! Attribute values and their text forms, which [`Attr`] describes. An attribute value is a field
+//! of an op struct.
+
+mod dense;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -49,9 +12,49 @@ use anyhow::{bail, ensure, Result};
 use smallvec::{Array, SmallVec};
 use tinyvec::ArrayVec;
 
+pub use self::dense::Dense;
+use crate::ir::{ranked, DType, Dim, Ranked, Sym};
 use crate::text::{is_ident_start, is_name_char, Cursor, TokenKind};
-use crate::types::{ranked, DType, Dim, Ranked, Sym};
 
+/// Every field type implements [`Attr`]: it prints its text form and reads it back with a
+/// [`Cursor`], one token at a time. The impls in `ir/attr/mod.rs` are the leaves, each one token
+/// or a list of attributes: integers, floats, strings, names, `[a, b]`, `(a, b)`, `{key = value}`
+/// and `none`. Every other attribute declares its text form with `#[derive(Attr)]`, which generates
+/// the printer and the parser from one declaration:
+///
+/// - A fieldless enum is written by the snake_case name of each variant: `red_ordered`.
+/// - A variant with named fields, or one that holds an [`AttrGroup`], is written by its name and
+///   its fields as parameters, each left out at its default: `top_k<k = 3>`.
+/// - `#[attr(format = "...")]` on a struct or on a variant gives its text form as a sequence of
+///   elements, MLIR's declarative format:
+///   - `` `by` `` is a literal: one token, a keyword, a name with its sigil (`!loop.buf`,
+///     `#sched`) or punctuation (`->`, `[`).
+///   - `$extent` is the text form of the field `extent`, and `$0` that of the first field of a
+///     tuple struct or variant.
+///   - `` (`pad` $pad^)? `` is an optional group: it is printed when its anchor, the field marked `^`,
+///     is not at its default (an `Option` field is `Some`), and read when the token its first
+///     element starts with comes next. A field of a group that is not its anchor has a default.
+///   - `shape($dims, $dtype)` is the extents and the dtype of a tensor: `4x{T}xf32`.
+///   - `tuple($writes)` is a list written as op results are: one item alone, any other number in
+///     parentheses.
+///   - `struct($nest, ...)` is `key = value` for each field, in any order, a field at its default
+///     left out. A closing `>`, `}`, `)` or `]` follows it.
+///   - ``` `` ``` removes the space between the elements around it.
+///
+///   The printer puts one space between elements, except after `(`, `[`, `<` and `{`, and before
+///   `)`, `]`, `>`, `}`, `,`, `(`, `[`, `<`, and on either side of `..`.
+///
+///   The next token decides each choice, and `#[derive(Attr)]` rejects a format where it cannot:
+///   two variants that start with one literal, or an optional group that starts with the literal
+///   that follows it. The parser tries the variants in order and reads the first whose first
+///   token comes next, so a variant that starts with a field goes after every variant whose
+///   first token the field could also start with.
+/// - `#[attr(via = Text)]` on a type whose text form is that of the type `Text`, a struct that
+///   declares it: `From<&T> for Text` writes it, and `TryFrom<Text> for T` checks and builds the
+///   value, failing at the start of its text.
+///
+/// Fields take `#[attr(default)]`, the type's default, or `#[attr(default = expr)]`. A type with
+/// a format or a via also gets `Display`, its text form.
 pub trait Attr: Sized + Clone + PartialEq + Eq + Hash + fmt::Debug {
     /// The name of the type whose values the text writes: the type of the items of a list, a map
     /// or an option, else the type itself. The generated docs show the values or the format of
@@ -75,7 +78,7 @@ pub trait Attr: Sized + Clone + PartialEq + Eq + Hash + fmt::Debug {
 /// newtype over it. `#[derive(AttrGroup)]` implements it from the struct's fields, which are the
 /// ops' attributes, written as an op's own fields are.
 pub trait AttrGroup: Sized {
-    const INFOS: &'static [crate::op::AttrInfo];
+    const INFOS: &'static [crate::ir::AttrInfo];
     /// Pushes `(name, text)` for every attribute, except an `#[attr(default)]` attribute at its
     /// default.
     fn print_attrs(&self, out: &mut Vec<(&'static str, String)>);

@@ -6,14 +6,12 @@ use crate::dialects::tensor::{
     BlockScale, BlockScaleAmax, BlockScalePow2Ceil, BlockScalePow2Floor, BlockScaleRange,
     Dequantize, Quantize, QuantizeStochastic, QuantizeTable,
 };
-use crate::dialects::tile::{par_iters, push_iter, Block, Body, CombineKind, Fold, Inputs};
-use crate::index::{IndexExpr, IterKind, Read, Write};
-use crate::minifloat::floor_log2;
-use crate::module::{Value, ValueRef};
-use crate::op::Matched;
+use crate::dialects::tile::{
+    par_iters, push_iter, Block, Body, CombineKind, Fold, Inputs, IterKind, Read, Write,
+};
+use crate::ir::{floor_log2, DType, Dim, Elements, IndexExpr, Matched, Value, ValueRef};
 use crate::require;
 use crate::rewrite::{pattern, NoMatch, Pattern, Rewriter};
-use crate::types::{DType, Dim, Elements};
 
 /// `tensor.dequantize` is a parallel block that multiplies each value by its block's scale and
 /// adds the offset, in f32.
@@ -326,7 +324,7 @@ fn block_range(
         source.push((start + offset).simplify());
     }
     let read = Read {
-        pad: Some(crate::attr::F64(0.0)),
+        pad: Some(crate::ir::F64(0.0)),
         ..Read::new(0, source)
     };
     let folds = vec![

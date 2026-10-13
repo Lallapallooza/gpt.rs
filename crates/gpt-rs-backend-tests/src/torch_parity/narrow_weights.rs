@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use gpt_rs::backend::PortableBackend;
-use gpt_rs::gpt_rs_ir::types::TensorType;
+use gpt_rs::gpt_rs_ir::ir::TensorType;
 use gpt_rs::module::Layer;
 use gpt_rs::nn::layers::Linear;
 use gpt_rs::ops::functional::WeightLayout;

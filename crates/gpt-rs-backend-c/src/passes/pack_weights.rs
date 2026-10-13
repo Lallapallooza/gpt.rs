@@ -5,12 +5,12 @@ use std::collections::HashSet;
 
 use anyhow::Result;
 use gpt_rs_ir::dialects::tensor::{DotGeneral, ExtractPatches, Reshape, Transpose};
-use gpt_rs_ir::module::{Module, Value, ValueDef, ValueRef};
-use gpt_rs_ir::op::Matched;
-use gpt_rs_ir::passes::{pass, run_patterns, Pass, Rewrites};
+use gpt_rs_ir::ir::{DType, Matched, Module, Value, ValueDef, ValueRef};
+use gpt_rs_ir::passes::{pass, run_patterns, Pass};
 use gpt_rs_ir::require;
-use gpt_rs_ir::rewrite::{matched, pattern, Build, NoMatch, Pattern, PatternSet, Rewriter};
-use gpt_rs_ir::types::DType;
+use gpt_rs_ir::rewrite::{
+    matched, pattern, Build, NoMatch, Pattern, PatternSet, Rewriter, Rewrites,
+};
 
 use crate::kernels::{LINEAR_PACK_MIN_ROWS, PANEL_N};
 

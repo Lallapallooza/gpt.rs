@@ -2,9 +2,9 @@
 //! run: units of one `loop.forall` that race on an element, and reads of elements that no store
 //! wrote.
 
-use gpt_rs_ir::host::{HostTensor, HostValue};
-use gpt_rs_ir::interp::run;
-use gpt_rs_ir::module::Module;
+use gpt_rs_ir::host::HostTensor;
+use gpt_rs_ir::interp::{run, HostValue};
+use gpt_rs_ir::ir::Module;
 
 /// The error of running `@main` of `text` on a tensor of two f32 elements, or its results.
 fn launch(text: &str) -> Result<Vec<HostValue>, String> {

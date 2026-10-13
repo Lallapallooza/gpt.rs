@@ -4,12 +4,10 @@ use anyhow::Result;
 
 use crate::dialects::tensor::utils::shape::pick;
 use crate::dialects::tensor::{DotAxes, DotGeneral, Reshape, Side};
-use crate::module::Module;
-use crate::op::Matched;
-use crate::passes::{pass, run_patterns, Pass, Rewrites};
+use crate::ir::{Matched, Module, Ranked};
+use crate::passes::{pass, run_patterns, Pass};
 use crate::require;
-use crate::rewrite::{pattern, Build, NoMatch, Pattern, PatternSet, Rewriter};
-use crate::types::Ranked;
+use crate::rewrite::{pattern, Build, NoMatch, Pattern, PatternSet, Rewriter, Rewrites};
 
 /// `dot_general(reshape(x), w)` becomes `dot_general(x, w')` when the reshape only splits one
 /// axis `a` of `x` into the contracted axes of the lhs, which are adjacent and in order, and `w`

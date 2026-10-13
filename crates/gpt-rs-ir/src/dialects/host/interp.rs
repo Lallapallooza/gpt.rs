@@ -4,9 +4,8 @@ use anyhow::{anyhow, Result};
 
 use super::ir::*;
 use crate::dialects::r#loop::{self, Access};
-use crate::host::{HostBuffer, HostValue};
-use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
-use crate::types::{BufferType, Space, Type};
+use crate::interp::{HostBuffer, HostValue};
+use crate::ir::{BufferType, Eval, EvalCx, Host, NoRegions, OwnedHost, Space, Type};
 
 impl Eval for Dispatch {
     fn eval(

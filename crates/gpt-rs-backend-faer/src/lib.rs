@@ -10,10 +10,10 @@ use faer::mat::{MatMut, MatRef};
 use faer::{Accum, Par};
 use gpt_rs::backend::{ParamStore, PortableBackend};
 use gpt_rs_ir::dialects::tensor::{DotGeneral, ExtractPatches, ReduceWindowAttrs, TensorOp};
-use gpt_rs_ir::host::{Buffer, HostTensor, HostValue, TensorData};
-use gpt_rs_ir::module::{Inst, Module, Value};
+use gpt_rs_ir::host::{Buffer, HostTensor, TensorData};
+use gpt_rs_ir::interp::HostValue;
+use gpt_rs_ir::ir::{DType, Inst, Module, TensorType, Value};
 use gpt_rs_ir::traits::Terminator;
-use gpt_rs_ir::types::{DType, TensorType};
 use gpt_rs_ir::{interp, Op};
 
 mod layout;

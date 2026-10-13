@@ -11,10 +11,8 @@
 
 use anyhow::{anyhow, bail, ensure, Result};
 
-use crate::module::{Inst, Module, Region};
-use crate::op::{OpDyn, RegionSig};
+use crate::ir::{type_list, Inst, Module, OpDyn, Region, RegionSig, Type};
 use crate::traits::Terminator;
-use crate::types::{type_list, Type};
 use crate::{Dialect, Op};
 
 struct Verifier<'m> {

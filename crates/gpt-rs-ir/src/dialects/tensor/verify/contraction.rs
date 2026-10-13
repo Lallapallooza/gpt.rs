@@ -3,6 +3,7 @@
 use anyhow::{ensure, Result};
 
 use crate::dialects::arith;
+use crate::dialects::arith::math::Combiner;
 use crate::dialects::tensor::ir::*;
 use crate::dialects::tensor::utils::class::{
     ensure_class, ensure_dtype_class, ensure_index_dtype, Class, ARITHMETIC,
@@ -10,9 +11,7 @@ use crate::dialects::tensor::utils::class::{
 use crate::dialects::tensor::utils::contraction::Side;
 use crate::dialects::tensor::utils::shape::axis_index;
 use crate::dialects::tensor::Accumulates;
-use crate::op::{NoRegions, OpDef, OwnedTypes, TypeCx, Types};
-use crate::scalar::Combiner;
-use crate::types::{ranked, DType, Dim, TensorType};
+use crate::ir::{ranked, DType, Dim, NoRegions, OpDef, OwnedTypes, TensorType, TypeCx, Types};
 
 impl OpDef for DotGeneral {
     fn result_types(

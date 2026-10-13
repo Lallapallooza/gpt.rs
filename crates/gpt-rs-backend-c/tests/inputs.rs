@@ -6,8 +6,7 @@ use std::sync::Arc;
 use gpt_rs::backend::PortableBackend;
 use gpt_rs_backend_c::CBackend;
 use gpt_rs_ir::host::{ExternalBytes, HostTensor};
-use gpt_rs_ir::module::Module;
-use gpt_rs_ir::types::{DType, TensorType};
+use gpt_rs_ir::ir::{DType, Module, TensorType};
 
 /// f32 values that the test rewrites between runs, at the same address. A memory-mapped file
 /// changes the same way when another file is mapped where one was unmapped.

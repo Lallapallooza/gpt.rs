@@ -2,15 +2,15 @@ use std::marker::PhantomData;
 
 use super::utils::{along, cast_to, copy, fill};
 use crate::dialects::arith;
+use crate::dialects::arith::math;
+use crate::dialects::arith::math::Combiner;
 use crate::dialects::tensor::utils::shape::axis_index;
 use crate::dialects::tensor::{Accumulates, ArgMax, DotGeneral, Reduce, Segment, SelectK, Side};
-use crate::dialects::tile::{par_iters, push_iter, Block, CombineKind, Fold, KBest};
-use crate::index::{AccessExpr, IndexExpr, IterKind, Read, Write};
-use crate::op::Matched;
+use crate::dialects::tile::{
+    par_iters, push_iter, Block, CombineKind, Fold, IterKind, KBest, Read, Write,
+};
+use crate::ir::{AccessExpr, Dim, IndexExpr, Matched};
 use crate::rewrite::{pattern, NoMatch, Pattern, Rewriter};
-use crate::scalar;
-use crate::scalar::Combiner;
-use crate::types::Dim;
 
 /// `tensor.dot_general` is a block with one reduction iterator per contracted pair, in
 /// `contract_lhs` order, that sums the products in the accumulator dtype; a parallel block casts
@@ -192,7 +192,7 @@ impl<T: Segment> Pattern for SegmentToTile<T> {
         let accum = data.dtype.default_accumulator();
         let mut dims = data.dims.clone();
         dims[0] = Dim::Static(segment.num_segments);
-        let identity = scalar::fold_init::<T::Combiner>(accum).expect("a fold of the accumulator");
+        let identity = math::fold_init::<T::Combiner>(accum).expect("a fold of the accumulator");
         let filled = fill(rewriter, &dims, identity);
         let (iters, coords) = par_iters(&data.dims);
         let mut target = vec![AccessExpr::read(1, [coords[0].clone()])];

@@ -5,7 +5,10 @@
 
 mod build;
 mod builder;
+mod doc;
 mod editor;
+mod fold;
+mod greedy;
 mod rewriter;
 
 use std::borrow::Cow;
@@ -17,11 +20,12 @@ pub use gpt_rs_ir_macros::{matched, pattern};
 
 pub use self::build::{Build, Chain};
 pub use self::builder::Builder;
+pub use self::doc::*;
 pub(crate) use self::editor::Editor;
+pub use self::fold::*;
+pub use self::greedy::{Greedy, GreedyReport, Rewrites};
 pub use self::rewriter::{Rewriter, Staged};
-use crate::doc::{fired, short_name, Doc, Fired};
-use crate::module::{Inst, Module, Value, ValueRef};
-use crate::op::{InOp, Matched};
+use crate::ir::{InOp, Inst, Matched, Module, Value, ValueRef};
 use crate::traits::OpTrait;
 use crate::Op;
 
@@ -94,7 +98,7 @@ impl AsInst for Inst {
     }
 }
 
-impl<T: crate::op::OpKind, G: crate::op::Groups> AsInst for Matched<'_, T, G> {
+impl<T: crate::ir::OpKind, G: crate::ir::Groups> AsInst for Matched<'_, T, G> {
     fn inst(&self) -> Inst {
         Matched::inst(self)
     }

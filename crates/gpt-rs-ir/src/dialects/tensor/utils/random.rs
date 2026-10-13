@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Result};
 
-use crate::types::{DType, TensorType};
+use crate::ir::{DType, TensorType};
 
 /// The significant bits of a float dtype that has uniform floats.
 pub(crate) fn uniform_bits(dtype: DType) -> Result<u32> {

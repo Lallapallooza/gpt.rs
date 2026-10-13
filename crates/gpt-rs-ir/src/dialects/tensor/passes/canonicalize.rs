@@ -3,6 +3,7 @@
 
 use std::marker::PhantomData;
 
+use crate::dialects::arith::math::{Combiner, CompareMath};
 use crate::dialects::tensor::utils::shape::axis_index;
 use crate::dialects::tensor::{
     Accumulates, ArgMax, BottomK, BroadcastTo, Compare, Concat, DotAxes, DotGeneral, Equal, Gather,
@@ -12,13 +13,10 @@ use crate::dialects::tensor::{
     Side, Slice, TopK, Transpose,
 };
 use crate::host::HostScalar;
-use crate::module::{Value, ValueRef};
-use crate::op::{InOp, Matched, OpKind};
+use crate::ir::{DType, Dim, InOp, Matched, OpKind, Ranked, TensorType, Value, ValueRef};
 use crate::require;
 use crate::rewrite::{pattern, Build, Has, NoMatch, Pattern, Rewriter, WithTrait};
-use crate::scalar::{Combiner, CompareMath};
 use crate::traits::{Associative, Commutative, Elementwise, Idempotent, Traits};
-use crate::types::{DType, Dim, Ranked, TensorType};
 
 /// A movement op where two in a row make one op of the same kind.
 trait Compose: InOp {

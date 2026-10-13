@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use gpt_rs_ir::types::TensorType;
+use gpt_rs_ir::ir::TensorType;
 
 use super::handle::ModelHandle;
 use super::namespace::next_namespace;

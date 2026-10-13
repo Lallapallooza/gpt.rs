@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use anyhow::{ensure, Result};
-use gpt_rs_ir::module::Value;
+use gpt_rs_ir::ir::Value;
 
 use super::types::{Instruction, ValueInfo};
 use super::utils::push_block;

@@ -3,9 +3,10 @@
 use anyhow::{ensure, Result};
 
 use crate::dialects::tensor::ir::*;
-use crate::module::Region;
-use crate::op::{NoRegions, OpDef, OwnedTypes, RegionOpDef, RegionSig, TypeCx, Types};
-use crate::types::{ranked, DType, Dim, TensorType, Type};
+use crate::ir::{
+    ranked, DType, Dim, NoRegions, OpDef, OwnedTypes, Region, RegionOpDef, RegionSig, TensorType,
+    Type, TypeCx, Types,
+};
 
 impl OpDef for Yield {
     fn result_types(

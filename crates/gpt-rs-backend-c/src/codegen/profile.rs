@@ -1,6 +1,6 @@
 use anyhow::Result;
 use gpt_rs::profiling::WorkStats;
-use gpt_rs_ir::types::TensorType;
+use gpt_rs_ir::ir::TensorType;
 
 use super::utils::{escape_c_string, push_block, sizing};
 

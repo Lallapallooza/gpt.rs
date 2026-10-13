@@ -5,7 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use anyhow::Result;
-use gpt_rs_ir::types::TensorType;
+use gpt_rs_ir::ir::TensorType;
 
 use super::lazy_tensor::{InputRole, LazyHandle, Materialized};
 use super::shape::Shape;

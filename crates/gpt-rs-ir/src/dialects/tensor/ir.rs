@@ -3,15 +3,13 @@
 use std::collections::BTreeMap;
 use std::ops::Deref;
 
-use crate::attr::F64;
-use crate::dense::Dense;
 use crate::dialects::arith;
-use crate::scalar::Combiner;
+use crate::dialects::arith::math::Combiner;
+use crate::ir::{DType, Dense, Dim, Perm, Ranked, TensorType, F64};
 use crate::traits::{
     Absorbing, Associative, Commutative, DistributesOver, Elementwise, Idempotent, IntValue,
     Involution, Movement, RightIdentity, Terminator, NEG_ZERO,
 };
-use crate::types::{DType, Dim, Perm, Ranked, TensorType};
 
 // ------------------------------------------------------------------------------------------------
 // Constants.

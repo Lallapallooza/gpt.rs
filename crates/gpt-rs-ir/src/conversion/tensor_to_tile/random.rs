@@ -1,14 +1,12 @@
 use std::marker::PhantomData;
 
 use crate::dialects::arith;
+use crate::dialects::arith::math::Draw;
 use crate::dialects::tensor::Rng;
-use crate::dialects::tile::{par_iters, Block, Fold};
-use crate::index::{IndexExpr, Read, Write};
-use crate::op::Matched;
+use crate::dialects::tile::{par_iters, Block, Fold, Read, Write};
+use crate::ir::{DType, Dim, IndexExpr, Matched};
 use crate::require;
 use crate::rewrite::{pattern, NoMatch, Pattern, Rewriter};
-use crate::scalar::Draw;
-use crate::types::{DType, Dim};
 
 /// A `tensor.rng_*` op is a block that draws element `i` of the state's stream with the `arith`
 /// op of the same name, and a block that advances the state's counter by the blocks read.

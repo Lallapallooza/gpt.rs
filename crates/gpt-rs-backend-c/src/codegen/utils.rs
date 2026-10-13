@@ -1,5 +1,5 @@
 use anyhow::{anyhow, ensure, Result};
-use gpt_rs_ir::types::{DType, TensorType};
+use gpt_rs_ir::ir::{DType, TensorType};
 
 pub(super) fn escape_c_string(input: &str) -> String {
     input

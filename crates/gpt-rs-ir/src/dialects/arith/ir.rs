@@ -2,14 +2,13 @@
 
 use std::ops::Deref;
 
-use crate::dense::Dense;
+use crate::dialects::arith::math::{BinaryMath, CompareMath, Draw, UnaryMath};
 use crate::dialects::tensor::utils::class::{Class, ARITHMETIC, FLOATS, INTEGERS, LOGIC};
-use crate::scalar::{BinaryMath, CompareMath, Draw, UnaryMath};
+use crate::ir::{DType, Dense};
 use crate::traits::{
     Absorbing, Associative, Commutative, DistributesOver, Idempotent, IntValue, Involution,
     RightIdentity, NEG_ZERO,
 };
-use crate::types::DType;
 
 /// A scalar value of a dtype, written `0.5 : f32`, `-3 : si32` or `1 : i1`. It is held as a
 /// rank-0 dense constant, so constant queries and folds see it as they see `tensor.constant`.

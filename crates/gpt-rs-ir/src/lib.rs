@@ -1,35 +1,30 @@
 //! The gpt.rs IR: one container for a closed set of dialects, with a generated text form, a
 //! verifier, an interpreter and a rewrite driver.
 //!
-//! [`op`] says what an op is. A dialect is an enum of its ops with `#[derive(Dialect)]`, and
-//! [`Op`](enum@Op) is the union of the dialects.
+//! - [`ir`]: the core every dialect is made of: the module, what an op is, types, attributes, the
+//!   index language, locations and the verifier.
+//! - [`text`]: the text form.
+//! - [`host`]: data in host memory.
+//! - [`interp`]: the interpreter.
+//! - [`rewrite`]: building and rewriting IR.
+//! - [`passes`]: the passes over any dialect.
+//! - [`analysis`]: what ops cost.
+//! - [`traits`]: op traits.
+//! - [`dialects`]: the dialects, each with its own passes, and [`Op`](enum@Op), their union.
+//! - [`conversion`]: the conversions between dialects.
 
 extern crate self as gpt_rs_ir;
 
-pub mod attr;
+pub mod analysis;
 pub mod conversion;
-pub mod cost;
-pub mod dense;
 pub mod dialects;
-pub mod doc;
-pub mod float8;
-pub mod fold;
 pub mod host;
-pub mod index;
 pub mod interp;
-pub mod location;
-pub mod minifloat;
-pub mod module;
-pub mod op;
+pub mod ir;
 pub mod passes;
 pub mod rewrite;
-pub mod scalar;
-pub mod schedule;
-mod scope;
 pub mod text;
 pub mod traits;
-pub mod types;
-pub mod verify;
 
 #[doc(hidden)]
 pub use gpt_rs_ir_macros::family_op;

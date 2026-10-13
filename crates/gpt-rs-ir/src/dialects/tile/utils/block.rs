@@ -1,14 +1,14 @@
 //! Reading and rewriting the attributes of `tile.block`.
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, ensure, Result};
 use smallvec::SmallVec;
+use tinyvec::ArrayVec;
 
 use crate::dialects::tile::ir::*;
-use crate::index::{AccessExpr, OperandRef, Source, Write};
-use crate::module::{Module, Region, Value};
-use crate::types::{DType, Dim, Sym};
+use crate::ir::{AccessExpr, DType, Dim, IterRef, Module, OperandRef, Region, Sym, Value};
 
 impl Block {
     /// The writes of the results, in result order.
@@ -207,5 +207,187 @@ impl Fold {
     /// One yielded value, written at each point.
     pub fn plain(write: Write) -> Self {
         Self::new(CombineKind::None, vec![write])
+    }
+}
+
+impl Source {
+    /// The operands the read may take elements from.
+    pub fn operands(&self) -> Range<usize> {
+        match self {
+            Source::Operand(operand) => *operand..*operand + 1,
+            Source::List { first, count, .. } => *first..*first + *count,
+        }
+    }
+}
+
+/// The text form of a [`Source`]: one operand, `$2`, or a list of operands and the pick,
+/// `$2..$4[$1[d0]]`.
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
+#[attr(format = "$first (`..` $list^)?")]
+pub(in crate::dialects::tile) struct SourceText {
+    first: OperandRef,
+    list: Option<OperandList>,
+}
+
+/// The last operand of a list and the pick, after `..`.
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
+#[attr(format = "$last `[` $pick `]`")]
+struct OperandList {
+    last: OperandRef,
+    pick: AccessExpr,
+}
+
+impl From<&Source> for SourceText {
+    fn from(source: &Source) -> Self {
+        match source {
+            Source::Operand(operand) => SourceText {
+                first: OperandRef(*operand),
+                list: None,
+            },
+            Source::List { first, count, pick } => SourceText {
+                first: OperandRef(*first),
+                list: Some(OperandList {
+                    last: OperandRef(first + count - 1),
+                    pick: (**pick).clone(),
+                }),
+            },
+        }
+    }
+}
+
+impl TryFrom<SourceText> for Source {
+    type Error = anyhow::Error;
+
+    fn try_from(text: SourceText) -> Result<Self> {
+        let first = text.first.0;
+        let Some(list) = text.list else {
+            return Ok(Source::Operand(first));
+        };
+        let last = list.last.0;
+        ensure!(last >= first, "operand list ${first}..${last} is empty");
+        Ok(Source::List {
+            first,
+            count: last - first + 1,
+            pick: Box::new(list.pick),
+        })
+    }
+}
+
+/// The coordinates `coords`, in the form of an access.
+fn coords_of(coords: impl IntoIterator<Item = impl Into<AccessExpr>>) -> Coords {
+    coords.into_iter().map(Into::into).collect()
+}
+
+impl Read {
+    /// A read of operand `operand` at `coords`, without padding.
+    pub fn new(operand: usize, coords: impl IntoIterator<Item = impl Into<AccessExpr>>) -> Self {
+        Self {
+            source: Source::Operand(operand),
+            coords: coords_of(coords),
+            pad: None,
+        }
+    }
+
+    /// The read with every expression rewritten by `rewrite`.
+    pub fn map_exprs(&self, rewrite: &dyn Fn(&AccessExpr) -> AccessExpr) -> Read {
+        Read {
+            source: match &self.source {
+                Source::Operand(operand) => Source::Operand(*operand),
+                Source::List { first, count, pick } => Source::List {
+                    first: *first,
+                    count: *count,
+                    pick: Box::new(rewrite(pick)),
+                },
+            },
+            coords: self.coords.iter().map(rewrite).collect(),
+            pad: self.pad,
+        }
+    }
+
+    /// The read with operand `i` renamed to `rename(i)`, in its source and in its expressions.
+    pub fn rename_operands(&self, rename: &dyn Fn(usize) -> usize) -> Read {
+        let mut read = self.map_exprs(&|expr| expr.rename_operands(rename));
+        read.source = match read.source {
+            Source::Operand(operand) => Source::Operand(rename(operand)),
+            Source::List { first, count, pick } => Source::List {
+                first: rename(first),
+                count,
+                pick,
+            },
+        };
+        read
+    }
+
+    /// The expressions of the read: its coordinates and its pick.
+    pub fn exprs(&self) -> Vec<&AccessExpr> {
+        let mut out: Vec<&AccessExpr> = self.coords.iter().collect();
+        if let Source::List { pick, .. } = &self.source {
+            out.push(pick);
+        }
+        out
+    }
+}
+
+impl Write {
+    /// A write of a new result at `coords`.
+    pub fn new(coords: impl IntoIterator<Item = impl Into<AccessExpr>>) -> Self {
+        Self {
+            into: None,
+            coords: coords_of(coords),
+        }
+    }
+
+    /// A write of an updated copy of operand `operand`, at `coords`.
+    pub fn update(operand: usize, coords: impl IntoIterator<Item = impl Into<AccessExpr>>) -> Self {
+        Self {
+            into: Some(OperandRef(operand)),
+            coords: coords_of(coords),
+        }
+    }
+}
+
+impl IterList {
+    /// The iterators at `positions`.
+    #[track_caller]
+    pub fn new(positions: impl IntoIterator<Item = usize>) -> Self {
+        let mut list = ArrayVec::new();
+        for position in positions {
+            list.push(IterRef::new(position));
+        }
+        Self(list)
+    }
+
+    /// The positions, in order.
+    pub fn positions(&self) -> impl Iterator<Item = usize> + '_ {
+        self.0.iter().map(|iter| iter.position())
+    }
+
+    pub fn contains(&self, position: usize) -> bool {
+        self.positions().any(|listed| listed == position)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl IterKind {
+    /// Whether the combine folds the iterator.
+    pub fn is_reduced(self) -> bool {
+        matches!(self, IterKind::Red | IterKind::RedOrdered)
+    }
+}
+
+impl Iter {
+    pub fn new(kind: IterKind, extent: Dim) -> Self {
+        Self { kind, extent }
+    }
+
+    pub fn par(extent: Dim) -> Self {
+        Self::new(IterKind::Par, extent)
+    }
+
+    pub fn red(extent: Dim) -> Self {
+        Self::new(IterKind::Red, extent)
     }
 }

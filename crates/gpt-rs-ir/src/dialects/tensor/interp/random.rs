@@ -4,12 +4,11 @@ use anyhow::{bail, Result};
 
 use super::kernels::{from_f64, from_ints};
 use crate::dialects::arith;
+use crate::dialects::arith::math::{Draw, Drawn};
 use crate::dialects::tensor::ir::*;
 use crate::dialects::tensor::utils::random::uniform_bits;
 use crate::host::{HostTensor, TensorData};
-use crate::op::{EvalCx, Host, NoRegions, OwnedHost};
-use crate::scalar::{Draw, Drawn};
-use crate::types::{DType, IntFormat};
+use crate::ir::{DType, EvalCx, Host, IntFormat, NoRegions, OwnedHost};
 
 /// One block of Philox4x32-10: the four words of `counter` under `key`.
 fn philox(counter: [u32; 4], key: [u32; 2]) -> [u32; 4] {

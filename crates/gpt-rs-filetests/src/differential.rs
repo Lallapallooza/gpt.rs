@@ -4,11 +4,10 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 use gpt_rs_ir::dialects::func::{Func, ParamId};
-use gpt_rs_ir::host::{HostTensor, HostValue, TensorData};
+use gpt_rs_ir::host::{HostTensor, TensorData};
 use gpt_rs_ir::interp;
-use gpt_rs_ir::minifloat::{e8m0_decode, Format};
-use gpt_rs_ir::module::Module;
-use gpt_rs_ir::types::{DType, Dim, IntFormat, Type};
+use gpt_rs_ir::interp::HostValue;
+use gpt_rs_ir::ir::{e8m0_decode, DType, Dim, Format, IntFormat, Module, Type};
 use half::{bf16, f16};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};

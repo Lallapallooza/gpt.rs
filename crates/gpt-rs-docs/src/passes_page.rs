@@ -6,9 +6,9 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{bail, Result};
-use gpt_rs_ir::doc::Fired;
-use gpt_rs_ir::op::FOLDS;
-use gpt_rs_ir::passes::{self, PassEntry, Pipeline, Rewrites};
+use gpt_rs_ir::ir::FOLDS;
+use gpt_rs_ir::passes::{self, PassEntry, Pipeline};
+use gpt_rs_ir::rewrite::{Fired, Rewrites};
 
 use crate::filetests::{Case, Fires};
 use crate::{cell, defined_by, file_links, readme, Catalog, HEADER};

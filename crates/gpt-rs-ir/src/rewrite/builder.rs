@@ -6,14 +6,13 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use crate::dialects::func::{Func, ParamId, Return};
-use crate::fold::{fold_op, FoldResult};
-use crate::location::Location;
-use crate::module::{Inst, Module, NewInst, Region, Value};
-use crate::op::{Created, Folded, Groups, InOp, OpDyn, OpKind, Operands, Values};
+use crate::ir::{
+    Created, Folded, Groups, InOp, Inst, Location, Module, NewInst, OpDyn, OpKind, Operands,
+    Region, TensorType, Type, Value, Values,
+};
 use crate::rewrite::build::materialize;
-use crate::rewrite::Build;
+use crate::rewrite::{fold_op, Build, FoldResult};
 use crate::text::any_items;
-use crate::types::{TensorType, Type};
 use crate::Op;
 
 /// Where a builder places new instructions.

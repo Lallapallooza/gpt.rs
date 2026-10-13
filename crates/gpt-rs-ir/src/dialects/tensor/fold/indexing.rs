@@ -1,7 +1,7 @@
 //! The folders of the indexing ops.
 
 use crate::dialects::tensor::ir::*;
-use crate::op::{fold, Fold, FoldCx, FoldOut, Folded, Folding};
+use crate::ir::{fold, Fold, FoldCx, FoldOut, Folded, Folding};
 
 /// A slice as large as its input starts at 0 whatever `starts` holds, so it is the input.
 #[fold]

@@ -6,7 +6,7 @@ use gpt_rs_ir::dialects::tensor::{
     axis_index, BroadcastTo, Concat, DynamicSlice, Slice, Transpose,
 };
 use gpt_rs_ir::host::HostTensor;
-use gpt_rs_ir::types::TensorType;
+use gpt_rs_ir::ir::TensorType;
 
 /// Row-major strides of `dims`, in elements.
 fn strides(dims: &[usize]) -> Vec<usize> {

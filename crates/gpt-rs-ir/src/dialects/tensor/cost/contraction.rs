@@ -1,9 +1,9 @@
 //! The costs of the contraction ops.
 
-use crate::cost::{cost, tensor_bytes, tensor_elements, Cost, OpCost};
+use crate::analysis::{cost, tensor_bytes, tensor_elements, Cost, OpCost};
 use crate::dialects::tensor::ir::*;
 use crate::dialects::tensor::utils::contraction::Side;
-use crate::op::Types;
+use crate::ir::Types;
 
 /// Two operations, a multiply and an add, for each product the dot sums: each result element sums
 /// one product for each coordinate of the contracting axes. It reads both operands.

@@ -1,14 +1,12 @@
 use std::marker::PhantomData;
 
 use super::utils::{cast_to, copy};
+use crate::dialects::arith::math::Combiner;
 use crate::dialects::tensor::{Accumulates, ExtractPatches, ReduceWindow};
-use crate::dialects::tile::{par_iters, push_iter, Block, Fold};
-use crate::index::{Constraint, IndexExpr, IterKind, Read, Relation, Write};
-use crate::op::Matched;
+use crate::dialects::tile::{par_iters, push_iter, Block, Fold, IterKind, Read, Write};
+use crate::ir::{Constraint, Dim, IndexExpr, Matched, Relation};
 use crate::require;
 use crate::rewrite::{pattern, NoMatch, Pattern, Rewriter};
-use crate::scalar::Combiner;
-use crate::types::Dim;
 
 /// `tensor.extract_patches` is a copy block that reads channel `c` of window element `k` at
 /// position `o` into column `k * C + c`, padded outside the input.

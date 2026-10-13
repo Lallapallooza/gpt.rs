@@ -6,12 +6,9 @@ use std::collections::HashMap;
 
 use anyhow::{bail, Result};
 
-use crate::fold::FoldResult;
-use crate::module::{Inst, Module, Region, Value};
-use crate::op::Folded;
+use crate::ir::{Folded, Inst, Module, Region, Type, Value};
 use crate::rewrite::rewriter::{Edit, Staged, Staging};
-use crate::rewrite::Builder;
-use crate::types::Type;
+use crate::rewrite::{Builder, FoldResult};
 use crate::Op;
 
 pub(crate) struct Editor<'m> {

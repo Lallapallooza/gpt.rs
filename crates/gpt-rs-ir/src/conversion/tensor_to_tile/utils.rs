@@ -1,12 +1,10 @@
 //! Blocks the patterns of `tensor-to-tile` build: elementwise maps, casts, copies, fills, and the
 //! iterators of a reduction.
 
-use crate::dialects::tile::{par_iters, Block, Body, Fold, Inputs};
+use crate::dialects::tile::{par_iters, Block, Body, Fold, Inputs, Iter, IterKind, Read, Write};
 use crate::host::HostScalar;
-use crate::index::{AccessExpr, IndexExpr, Iter, IterKind, Read, Write};
-use crate::module::Value;
+use crate::ir::{AccessExpr, DType, Dim, IndexExpr, TensorType, Value};
 use crate::rewrite::Rewriter;
-use crate::types::{DType, Dim, TensorType};
 
 /// One parallel block over the extents of `output` that reads each of `inputs` at the same point
 /// and computes `compute` on the values.

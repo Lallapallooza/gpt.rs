@@ -8,7 +8,7 @@ pub mod shape;
 mod slicing;
 
 pub use gpt_rs_ir::host::HostTensor;
-pub use gpt_rs_ir::types::DType;
+pub use gpt_rs_ir::ir::DType;
 
 pub use self::device_tensor::DeviceTensor;
 pub use self::lazy_tensor::InputRole;

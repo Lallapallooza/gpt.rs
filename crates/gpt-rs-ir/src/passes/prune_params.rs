@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use super::{pass, Pass};
 use crate::dialects::func::Func;
-use crate::module::Module;
+use crate::ir::Module;
 
 /// Removes from every function the arguments bound to a parameter that nothing reads. A run-time
 /// argument stays even when nothing reads it, so the run-time arguments keep their positions.

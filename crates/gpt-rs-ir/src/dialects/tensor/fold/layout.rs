@@ -1,7 +1,7 @@
 //! The folders of the layout ops.
 
 use crate::dialects::tensor::ir::*;
-use crate::op::{fold, Fold, FoldCx, FoldOut, Folded, Folding};
+use crate::ir::{fold, Fold, FoldCx, FoldOut, Folded, Folding};
 
 /// A bitcast to the input's own type is the input.
 #[fold]

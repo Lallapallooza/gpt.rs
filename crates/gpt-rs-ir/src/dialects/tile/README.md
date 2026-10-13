@@ -148,4 +148,5 @@ top-level symbol that `host.dispatch` calls. A dispatch runs on its arguments al
 every dimension symbol its blocks use.
 
 A dispatch carries its schedule, `#sched<...>`: how it runs, which changes no value it computes.
-`gpt_rs_ir::schedule` defines its fields and the rules a schedule follows.
+`Schedule` in `ir.rs` declares its fields, and `verify/dispatch.rs` checks the rules a schedule
+follows.

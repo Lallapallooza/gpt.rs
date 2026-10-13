@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use gpt_rs_ir::host::ExternalBytes;
-use gpt_rs_ir::types::TensorType;
+use gpt_rs_ir::ir::TensorType;
 pub use safetensors::tensor::Dtype as StoredDtype;
 use safetensors::tensor::{Dtype, SafeTensors, View};
 

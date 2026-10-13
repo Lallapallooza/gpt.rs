@@ -5,8 +5,7 @@ use anyhow::{ensure, Result};
 use super::contraction::ensure_reduction;
 use crate::dialects::tensor::ir::*;
 use crate::dialects::tensor::Accumulates;
-use crate::op::{NoRegions, OpDef, OwnedTypes, TypeCx, Types};
-use crate::types::TensorType;
+use crate::ir::{NoRegions, OpDef, OwnedTypes, TensorType, TypeCx, Types};
 
 impl OpDef for ExtractPatches {
     fn result_types(

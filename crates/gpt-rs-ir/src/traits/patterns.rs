@@ -1,10 +1,9 @@
 //! Patterns rooted at a trait: rewrites that follow from the trait, for every op that has it.
 
 use super::{Associative, Commutative, DistributesOver};
-use crate::module::{Value, ValueRef};
+use crate::ir::{DType, Value, ValueRef};
 use crate::require;
 use crate::rewrite::{pattern, Has, NoMatch, Pattern, Rewriter, WithTrait};
-use crate::types::DType;
 
 /// `f(f(x, a), b)` is `f(x, f(a, b))` when `f` is associative, `a` and `b` are static, and one of
 /// them reads a parameter. The backend then computes `f(a, b)` once at load time, so a run

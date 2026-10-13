@@ -7,8 +7,7 @@ use crate::dialects::tensor::utils::class::{
     ensure_class, ensure_dtype_class, ensure_index_dtype, ARITHMETIC,
 };
 use crate::dialects::tensor::utils::shape::{axis_index, check_size};
-use crate::op::{NoRegions, OpDef, OwnedTypes, TypeCx, Types};
-use crate::types::{ranked, DType, Dim, TensorType};
+use crate::ir::{ranked, DType, Dim, NoRegions, OpDef, OwnedTypes, TensorType, TypeCx, Types};
 
 impl OpDef for Iota {
     fn result_types(

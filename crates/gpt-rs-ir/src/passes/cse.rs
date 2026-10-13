@@ -3,9 +3,8 @@
 use anyhow::Result;
 
 use super::{pass, Pass};
-use crate::module::{Inst, Module, OpKey, Region};
+use crate::ir::{Inst, Module, OpKey, Region, ScopedMap};
 use crate::rewrite::Editor;
-use crate::scope::ScopedMap;
 use crate::traits::IsolatedFromAbove;
 
 /// Replaces each op by an earlier op that computes the same values: the same op with the same

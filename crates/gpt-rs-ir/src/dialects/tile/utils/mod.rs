@@ -4,3 +4,7 @@
 mod block;
 pub(crate) mod build;
 mod combine;
+mod dispatch;
+
+pub(super) use self::block::SourceText;
+pub use self::dispatch::Step;

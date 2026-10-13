@@ -2,7 +2,7 @@
 
 use anyhow::{bail, ensure, Result};
 use gpt_rs_ir::dialects::tensor::TensorOp;
-use gpt_rs_ir::types::DType;
+use gpt_rs_ir::ir::DType;
 
 use super::super::profile::register_op_profile_generic;
 use super::super::types::{Instruction, Kind};

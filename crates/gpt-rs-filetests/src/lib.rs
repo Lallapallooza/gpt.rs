@@ -55,10 +55,9 @@ mod differential;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use gpt_rs_ir::module::Module;
+use gpt_rs_ir::ir::{verify, Module};
 use gpt_rs_ir::passes::{self, Pipeline};
 use gpt_rs_ir::text::TextOptions;
-use gpt_rs_ir::verify::verify;
 
 pub use self::differential::{bits_eq, random_value, rotation, run_dims, Specials, ROUNDS};
 

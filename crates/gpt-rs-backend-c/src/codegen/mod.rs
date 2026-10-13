@@ -10,9 +10,8 @@ mod value_info;
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Result};
-use gpt_rs_ir::module::Module;
+use gpt_rs_ir::ir::{Module, TensorType};
 use gpt_rs_ir::traits::Terminator;
-use gpt_rs_ir::types::TensorType;
 
 use self::emit::emit_instructions;
 use self::outline::Outliner;

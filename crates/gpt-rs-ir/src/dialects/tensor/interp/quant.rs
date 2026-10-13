@@ -4,12 +4,12 @@ use anyhow::{bail, Result};
 
 use super::kernels::{from_f32, from_ints, strides, unravel, values, Values};
 use crate::dialects::arith;
+use crate::dialects::arith::math::BinaryMath;
 use crate::dialects::tensor::ir::*;
 use crate::host::{HostTensor, TensorData};
-use crate::minifloat::{e8m0_encode, floor_log2, Overflow};
-use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
-use crate::scalar::BinaryMath;
-use crate::types::{DType, Elements};
+use crate::ir::{
+    e8m0_encode, floor_log2, DType, Elements, Eval, EvalCx, Host, NoRegions, Overflow, OwnedHost,
+};
 
 /// The value of every element of `data` as an f32.
 fn reals(data: &TensorData) -> Vec<f32> {

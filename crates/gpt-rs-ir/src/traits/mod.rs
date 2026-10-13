@@ -19,11 +19,8 @@ pub use self::algebra::{
     PerClass, RightIdentity, NEG_ZERO,
 };
 pub use self::structure::{Elementwise, IsolatedFromAbove, Movement, Terminator};
-use crate::dense::Dense;
-use crate::doc::Doc;
-use crate::fold::FoldResult;
-use crate::module::{Module, Value};
-use crate::types::{DType, Type};
+use crate::ir::{DType, Dense, Module, Type, Value};
+use crate::rewrite::{Doc, FoldResult};
 use crate::Op;
 
 /// A fact about an op. Every hook has a default that does nothing, so a trait implements only the

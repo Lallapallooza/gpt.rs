@@ -1,6 +1,5 @@
 use gpt_rs_ir::dialects::tensor::{ExtractPatches, TensorOp};
-use gpt_rs_ir::module::Value;
-use gpt_rs_ir::types::TensorType;
+use gpt_rs_ir::ir::{TensorType, Value};
 
 /// Where the generated function keeps a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

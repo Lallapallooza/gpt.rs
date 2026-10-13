@@ -4,12 +4,14 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 use smallvec::SmallVec;
+use tinyvec::ArrayVec;
 
 use crate::dialects::func::Return;
-use crate::index::{Constraint, IndexExpr, IterList, Iters, OperandRef, Read, SymFact, Write};
-use crate::schedule::Schedule;
+use crate::dialects::r#loop::Level;
+use crate::ir::{
+    AccessExpr, Constraint, DType, Dim, IndexExpr, IterRef, OperandRef, Type, F64, MAX_ITERS,
+};
 use crate::traits::{IsolatedFromAbove, Terminator};
-use crate::types::{DType, Dim, Type};
 use crate::Attr;
 
 // ------------------------------------------------------------------------------------------------
@@ -75,6 +77,76 @@ pub struct Index {
 /// the values the region gives.
 #[crate::op("tile.yield", operands(values(Variadic(Any))), traits(Terminator))]
 pub struct Yield;
+
+/// Which operand a read takes its elements from.
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
+#[attr(via = super::utils::SourceText)]
+pub enum Source {
+    /// Operand `i`.
+    Operand(usize),
+    /// One of the operands `first..first + count`, all of one type, picked at each point by the
+    /// value of `pick`: per-expert weights that stay separate tensors.
+    List {
+        first: usize,
+        count: usize,
+        pick: Box<AccessExpr>,
+    },
+}
+
+/// The coordinates of a read or a write, one per axis.
+pub type Coords = SmallVec<[AccessExpr; 4]>;
+
+/// A read of a `tile.block`: an operand element at index expressions, one per axis. With `pad`, a
+/// point whose coordinates fall outside the operand reads that value; without it, every point
+/// MUST be inside.
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
+#[attr(format = "$source `` $coords (`pad` $pad^)?")]
+pub struct Read {
+    pub source: Source,
+    pub coords: Coords,
+    pub pad: Option<F64>,
+}
+
+/// Where a `tile.block` writes one of its results: the coordinates of a new tensor, or of an
+/// operand that the result updates (`into`).
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
+#[attr(format = "($into^)? `` $coords")]
+pub struct Write {
+    /// The operand that the result is an updated copy of.
+    pub into: Option<OperandRef>,
+    pub coords: Coords,
+}
+
+/// Iterators by position, written by name: `[d0, d2]`.
+#[derive(crate::Attr, Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[attr(format = "$0")]
+pub struct IterList(pub(super) ArrayVec<[IterRef; MAX_ITERS]>);
+
+/// How a `tile.block` treats an iterator.
+#[derive(crate::Attr, Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum IterKind {
+    /// The results are indexed by it.
+    #[default]
+    Par,
+    /// The combine folds it.
+    Red,
+    /// The combine folds it in order: no schedule may split or reorder it.
+    RedOrdered,
+    /// The combine folds it, and every prefix of the fold is a result.
+    Prefix,
+}
+
+/// An iterator of a `tile.block`: a kind and an extent, `red 8`. Its position in the block's list
+/// names it: `d0` is the first.
+#[derive(crate::Attr, Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[attr(format = "$kind $extent")]
+pub struct Iter {
+    pub kind: IterKind,
+    pub extent: Dim,
+}
+
+/// The iterators of a `tile.block`, at most [`MAX_ITERS`].
+pub type Iters = ArrayVec<[Iter; MAX_ITERS]>;
 
 // ------------------------------------------------------------------------------------------------
 // Combine kinds: the closed set of folds over the reduction iterators of a `tile.block`.
@@ -205,6 +277,60 @@ pub struct Dispatch {
     pub facts: BTreeMap<String, SymFact>,
     #[attr(default)]
     pub schedule: Schedule,
+}
+
+/// What a dispatch knows of a dimension symbol: a range of extents, and a divisor of every one,
+/// `[1, 64] % 8`.
+#[derive(crate::Attr, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[attr(format = "`[` $min `,` $max `]` (`%` $divisor^)?")]
+pub struct SymFact {
+    pub min: u64,
+    pub max: u64,
+    #[attr(default = 1)]
+    pub divisor: u64,
+}
+
+/// The schedule record of a dispatch, `#sched<nest = [...]>`: how it runs. `tile-to-loop` realizes
+/// each field and makes no decision of its own, and a field left out is the reference: one
+/// sequential loop per iterator, in the order of the block. Fields name the iterators of the
+/// dispatch's block by position, as `d0`.
+#[derive(crate::Attr, Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[attr(format = "`#sched` `<` struct($nest) `>`")]
+pub struct Schedule {
+    /// Loops over tiles of the iterators, outermost first. Inside them, a loop walks the points of
+    /// each iterator's innermost tile: those of the parallel iterators first, then those of the
+    /// reduced ones, each in the order of the block.
+    #[attr(default)]
+    pub nest: Vec<Loop>,
+}
+
+/// One loop of a nest: over the tiles of `extent` points of iterator `iter`, within its tile of
+/// the loop around it, or within its whole extent. The last tile of a range may be smaller:
+/// `d1 by 64 : par<level = core>`.
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
+#[attr(format = "$iter `by` $extent `:` $parallelism")]
+pub struct Loop {
+    pub iter: IterRef,
+    pub extent: usize,
+    pub parallelism: Parallelism,
+}
+
+/// How a loop of a nest runs its tiles.
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Parallelism {
+    /// One after another, in increasing order.
+    Seq,
+    /// As units of work at an execution level, which may run at the same time.
+    Par(ParLoop),
+}
+
+/// Where a parallel loop runs its tiles: on units of `level`, `units` of them, each running a
+/// contiguous run of tiles, or one unit per tile.
+#[derive(crate::AttrGroup, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ParLoop {
+    pub level: Level,
+    #[attr(default)]
+    pub units: Option<usize>,
 }
 
 // ------------------------------------------------------------------------------------------------

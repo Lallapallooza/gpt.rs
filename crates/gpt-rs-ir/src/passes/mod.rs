@@ -4,7 +4,6 @@ mod canonicalize;
 mod cse;
 mod dce;
 mod fold;
-mod greedy;
 mod outline_static;
 mod prune_params;
 mod registry;
@@ -17,14 +16,21 @@ pub use self::canonicalize::Canonicalize;
 pub use self::cse::Cse;
 pub use self::dce::Dce;
 pub use self::fold::Fold;
-pub use self::greedy::{run_patterns, Greedy, GreedyReport, Rewrites};
 pub use self::outline_static::OutlineStatic;
 pub use self::prune_params::PruneParams;
 pub use self::registry::{parse, registered, OptionInfo, PassEntry, StatInfo, PASSES};
 pub use self::stats::{take_stats, Stat};
 use crate::dialects::tensor::{DotScaleFold, MergeContractedAxes};
-use crate::module::Module;
-use crate::verify::verify;
+use crate::ir::{verify, Module};
+use crate::rewrite::{Greedy, Rewrites};
+
+/// Runs `rewrites` to a fixpoint with the greedy driver, erasing dead ops, adds the rewrites to
+/// `stat`, and returns whether the module changed: the `run` of a pass that applies patterns.
+pub fn run_patterns(module: &mut Module, rewrites: Rewrites, stat: &Stat) -> Result<bool> {
+    let report = Greedy::new(rewrites).erase_dead().run(module)?;
+    stat.add(report.rewritten);
+    Ok(report.changed())
+}
 
 /// A transformation of a module. `#[pass]` on the struct implements `Registered`.
 pub trait Pass: Registered {

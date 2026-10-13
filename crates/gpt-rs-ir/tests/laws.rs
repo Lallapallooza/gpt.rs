@@ -12,16 +12,13 @@ use gpt_rs_filetests::{
     bits_eq, collect, filetests_root, random_value, rotation, run_dims, split_cases, Specials,
     ROUNDS,
 };
-use gpt_rs_ir::dense::Dense;
 use gpt_rs_ir::dialects::tensor::Constant;
 use gpt_rs_ir::dialects::tile::{Acc, CombineKind, KBest};
-use gpt_rs_ir::host::{HostScalar, HostValue};
-use gpt_rs_ir::module::{Module, Value};
-use gpt_rs_ir::op::OpDyn;
+use gpt_rs_ir::host::{self, Decoded, HostScalar};
+use gpt_rs_ir::interp::HostValue;
+use gpt_rs_ir::ir::{DType, Dense, Dim, Module, OpDyn, TensorType, Type, Value};
 use gpt_rs_ir::rewrite::Builder;
-use gpt_rs_ir::scalar::{self, Decoded};
 use gpt_rs_ir::traits::{Law, Term};
-use gpt_rs_ir::types::{DType, Dim, TensorType, Type};
 use gpt_rs_ir::{interp, Op};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -210,7 +207,7 @@ fn as_points(kind: &CombineKind, results: Vec<HostScalar>) -> Vec<Vec<HostScalar
 /// `scalars` as a tensor of `dtype`, which `bits_eq` compares.
 fn as_tensor(dtype: DType, scalars: &[HostScalar]) -> HostValue {
     HostValue::Tensor(
-        scalar::tensor(&TensorType::new(dtype, [scalars.len()]), scalars).expect("a tensor"),
+        host::tensor(&TensorType::new(dtype, [scalars.len()]), scalars).expect("a tensor"),
     )
 }
 

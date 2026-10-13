@@ -6,14 +6,14 @@ use std::collections::BTreeSet;
 use std::marker::PhantomData;
 
 use crate::dialects::arith::{self, Literal};
-use crate::dialects::tile::{Block, Index};
+use crate::dialects::tile::{Block, Index, IterKind, IterList, Source};
 use crate::host::HostScalar;
-use crate::index::{AccessExpr, BinaryOp, IndexExpr, IterKind, IterList, Source};
-use crate::module::{Inst, Module, RegionRef, Value, ValueRef};
-use crate::op::{InOp, Matched};
+use crate::ir::{
+    AccessExpr, BinaryOp, Dim, InOp, IndexExpr, Inst, IntFormat, Matched, Module, RegionRef, Value,
+    ValueRef,
+};
 use crate::require;
 use crate::rewrite::{pattern, NoMatch, Pattern, Rewriter};
-use crate::types::{Dim, IntFormat};
 
 /// Rewrites the expression of every `tile.index` in `body` with `rewrite_expr`, and returns
 /// whether any changed.

@@ -1,7 +1,7 @@
 //! Constructors of the layout ops.
 
 use crate::dialects::tensor::ir::*;
-use crate::types::{Dim, Ranked};
+use crate::ir::{Dim, Ranked};
 
 impl Reshape {
     /// A reshape to `shape`.

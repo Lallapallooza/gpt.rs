@@ -9,9 +9,8 @@ use gpt_rs::ops::functional::{linear_weight, WeightLayout};
 use gpt_rs_ir::dialects::tensor::{
     Add, BroadcastTo, Cast, DotGeneral, ExtractPatches, Reshape, Slice, TensorOp, Transpose,
 };
-use gpt_rs_ir::module::{Inst, Module, Value};
+use gpt_rs_ir::ir::{DType, Inst, Module, Value};
 use gpt_rs_ir::rewrite::matched;
-use gpt_rs_ir::types::DType;
 use gpt_rs_ir::Op;
 
 use super::types::{Elementwise, ElementwiseInput, Instruction, Kind, Node, NodeRef};

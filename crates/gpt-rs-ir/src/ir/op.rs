@@ -13,13 +13,14 @@ use std::marker::PhantomData;
 use anyhow::Result;
 use smallvec::SmallVec;
 
-use crate::dense::Dense;
-use crate::host::{HostBuffer, HostScalar, HostTensor, HostValue, Unit};
-use crate::index::IndexEnv;
-use crate::module::{Inst, Module, Region, RegionRef, Value, ValueRef};
+use crate::host::{HostScalar, HostTensor};
+use crate::interp::{HostBuffer, HostValue, Unit};
+use crate::ir::{
+    BufferType, DType, Dense, Element, IndexEnv, Inst, Module, Region, RegionRef, TensorType, Type,
+    Value, ValueRef,
+};
 use crate::text::Cursor;
 use crate::traits::Traits;
-use crate::types::{BufferType, DType, Element, TensorType, Type};
 use crate::Op;
 
 /// What one element of an operand or result group is, under some view.
@@ -451,9 +452,9 @@ pub struct OpInfo {
 #[derive(Clone, Copy)]
 pub struct AttrInfo {
     pub name: &'static str,
-    /// The type as the reference pages name it, [`Attr::type_name`](crate::attr::Attr::type_name).
+    /// The type as the reference pages name it, [`Attr::type_name`](crate::ir::Attr::type_name).
     pub type_name: fn() -> String,
-    /// The type whose values the text writes, [`Attr::ITEM`](crate::attr::Attr::ITEM).
+    /// The type whose values the text writes, [`Attr::ITEM`](crate::ir::Attr::ITEM).
     pub item: &'static str,
     /// Whether the text leaves it out at its default.
     pub default: bool,
@@ -506,7 +507,7 @@ pub trait RegionRunner {
     /// The module being run.
     fn module(&self) -> &Module;
     /// The extent this run bound to the dimension symbol `sym`.
-    fn sym(&self, sym: &crate::types::Sym) -> Option<usize>;
+    fn sym(&self, sym: &crate::ir::Sym) -> Option<usize>;
     /// Runs the top-level function-like op named `callee` on `args` and returns its results.
     fn call(&mut self, callee: &str, args: Vec<HostValue>) -> Result<Vec<HostValue>>;
     /// The point of the enclosing `tile.block` that a body op runs at, which `tile.index` reads.
@@ -545,7 +546,7 @@ impl<R> EvalCx<'_, R> {
     }
 
     /// The extent this run bound to the dimension symbol `sym`.
-    pub fn sym(&self, sym: &crate::types::Sym) -> Option<usize> {
+    pub fn sym(&self, sym: &crate::ir::Sym) -> Option<usize> {
         self.runner.sym(sym)
     }
 
@@ -762,7 +763,7 @@ pub fn fold_erased<T: Fold + 'static>(
     let op = op.downcast_ref::<T>()?;
     let typed = T::Groups::split_operands::<Folding<'_>>(ins.iter().cloned(), segments).ok()?;
     let out = op.fold(typed, &FoldCx { results })?;
-    crate::doc::fired(crate::doc::Fired::Fold(T::INFO.name));
+    crate::rewrite::fired(crate::rewrite::Fired::Fold(T::INFO.name));
     Some(T::Groups::flatten_results::<FoldOut>(out).0.into_vec())
 }
 

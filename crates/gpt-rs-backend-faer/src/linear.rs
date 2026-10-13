@@ -20,9 +20,8 @@ use faer::traits::pulp::{Arch, Simd, WithSimd};
 use faer::{Accum, Par};
 use gemm_common::cache::CACHE_INFO;
 use gpt_rs::ops::functional::WeightLayout;
-use gpt_rs_ir::float8::F8E4M3;
 use gpt_rs_ir::host::{Buffer, HostTensor, TensorData};
-use gpt_rs_ir::types::{DType, TensorType};
+use gpt_rs_ir::ir::{DType, TensorType, F8E4M3};
 use half::bf16;
 
 use crate::{dims_of, output_tensor};

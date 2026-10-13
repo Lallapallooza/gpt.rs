@@ -6,8 +6,7 @@ use crate::dialects::arith::ir::*;
 use crate::dialects::tensor::utils::class::{
     ensure_dtype_class, ensure_equal_types, ARITHMETIC, CASTABLE, INTEGERS, ORDERED,
 };
-use crate::op::{NoRegions, OpDef, OwnedTypes, TypeCx, Types};
-use crate::types::DType;
+use crate::ir::{DType, NoRegions, OpDef, OwnedTypes, TypeCx, Types};
 
 impl OpDef for Constant {
     fn result_types(

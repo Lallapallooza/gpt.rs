@@ -3,8 +3,7 @@
 use anyhow::{ensure, Result};
 
 use crate::dialects::func::ir::*;
-use crate::module::Region;
-use crate::op::{OpDef, OwnedTypes, RegionOpDef, RegionSig, TypeCx, Types};
+use crate::ir::{OpDef, OwnedTypes, Region, RegionOpDef, RegionSig, TypeCx, Types};
 
 impl RegionOpDef for Func {
     fn region_signatures(&self, _ins: FuncOperands<Types<'_>>) -> Result<FuncRegions<RegionSig>> {
@@ -44,7 +43,7 @@ impl OpDef for Return {
     fn result_types(
         &self,
         _ins: ReturnOperands<Types<'_>>,
-        _cx: &TypeCx<'_, crate::op::NoRegions>,
+        _cx: &TypeCx<'_, crate::ir::NoRegions>,
     ) -> Result<ReturnResults<OwnedTypes>> {
         Ok(ReturnResults::default())
     }

@@ -2,7 +2,7 @@
 //! elementwise ops.
 
 use gpt_rs_ir::dialects::tensor::TensorOp;
-use gpt_rs_ir::types::DType;
+use gpt_rs_ir::ir::DType;
 
 /// The C function that computes `x [.., M, K] . w [.., N, K]` with f32 sums, for an `x` of dtype
 /// `x` and weights stored in dtype `w`, dequantized by a scale of dtype `scale` when one is given.

@@ -4,9 +4,9 @@ use anyhow::{anyhow, bail, ensure, Result};
 
 use crate::dialects::host::ir::*;
 use crate::dialects::{r#loop, tile};
-use crate::module::Module;
-use crate::op::{NoRegions, OpDef, OwnedTypes, TypeCx, Types};
-use crate::types::{Dim, SymBindings, TensorType, Type};
+use crate::ir::{
+    Dim, Module, NoRegions, OpDef, OwnedTypes, SymBindings, TensorType, Type, TypeCx, Types,
+};
 
 /// The argument and result types of the dispatch named `name`: a `tile.dispatch`, or a
 /// `loop.func` as a call with tensors sees it.

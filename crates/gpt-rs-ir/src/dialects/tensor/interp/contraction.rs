@@ -14,14 +14,13 @@ use super::kernels::{
     accumulate, best_k, from_ints, gather_elements, offsets, strides, values, Accumulation, Values,
 };
 use crate::dialects::arith;
+use crate::dialects::arith::math::Combiner;
 use crate::dialects::tensor::ir::*;
 use crate::dialects::tensor::utils::contraction::Side;
 use crate::dialects::tensor::utils::shape::{axis_index, pick};
 use crate::dialects::tensor::Accumulates;
 use crate::host::{HostTensor, TensorData};
-use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
-use crate::scalar::Combiner;
-use crate::types::DType;
+use crate::ir::{DType, Eval, EvalCx, Host, NoRegions, OwnedHost};
 
 impl Eval for DotGeneral {
     fn eval(

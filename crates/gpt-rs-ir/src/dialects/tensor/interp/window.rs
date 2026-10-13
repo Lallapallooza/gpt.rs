@@ -4,11 +4,11 @@ use anyhow::Result;
 
 use super::contraction::fold_groups;
 use super::kernels::{cast, strides, unravel, Chunks};
+use crate::dialects::arith::math::Combiner;
 use crate::dialects::tensor::ir::*;
 use crate::dialects::tensor::Accumulates;
 use crate::host::{HostTensor, TensorData};
-use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
-use crate::scalar::Combiner;
+use crate::ir::{Eval, EvalCx, Host, NoRegions, OwnedHost};
 
 impl Eval for ExtractPatches {
     fn eval(

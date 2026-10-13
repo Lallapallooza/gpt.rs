@@ -7,9 +7,9 @@ use std::ops;
 use crate::dialects::constant_op;
 use crate::dialects::tensor::{Add, BroadcastTo, Cast, Constant, Mul, Reshape, Transpose};
 use crate::host::HostScalar;
-use crate::module::Value;
-use crate::op::{Created, Folded, Groups, InOp, Operands, Values};
-use crate::types::{DType, Dim, TensorType, Type};
+use crate::ir::{
+    Created, DType, Dim, Folded, Groups, InOp, Operands, TensorType, Type, Value, Values,
+};
 use crate::Op;
 
 /// What builds IR: a [`Builder`](super::Builder) outside patterns and a

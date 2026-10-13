@@ -315,7 +315,7 @@ loop.func @rows(%input: !loop.buf<4x2xf32, global>, %output: !loop.buf<4x2xf32, 
 
 ### `loop.index`
 
-The value of `expr`, an expression of the `tile` index language in which `di` is
+The value of `expr`, an expression of the index language in which `di` is
 operand `i` and `{T}` the extent the launch binds to the symbol `T`.
 
 Defined by `Index` in [crates/gpt-rs-ir/src/dialects/loop/ir.rs](../../crates/gpt-rs-ir/src/dialects/loop/ir.rs).

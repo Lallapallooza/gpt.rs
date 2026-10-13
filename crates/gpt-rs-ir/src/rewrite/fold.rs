@@ -1,10 +1,8 @@
 //! Folding without computing on elements: the op's own folder, then the folds its traits imply.
 
-use crate::doc::{fired, Fired};
-use crate::module::{Inst, Module, Value};
-use crate::op::{FoldIn, Folded, OpDyn};
+use crate::ir::{FoldIn, Folded, Inst, Module, OpDyn, Type, Value};
+use crate::rewrite::{fired, Fired};
 use crate::traits::OpRef;
-use crate::types::Type;
 use crate::Op;
 
 /// What an op folds to.

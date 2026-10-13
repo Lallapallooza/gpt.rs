@@ -3,8 +3,7 @@
 use anyhow::{bail, Result};
 
 use super::ir::*;
-use crate::module::Region;
-use crate::op::{Eval, EvalCx, Host, OwnedHost};
+use crate::ir::{Eval, EvalCx, Host, OwnedHost, Region};
 
 impl Eval for Func {
     fn eval(
@@ -20,7 +19,7 @@ impl Eval for Return {
     fn eval(
         &self,
         _ins: ReturnOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, crate::op::NoRegions>,
+        _cx: &mut EvalCx<'_, crate::ir::NoRegions>,
     ) -> Result<ReturnResults<OwnedHost>> {
         Ok(ReturnResults::default())
     }

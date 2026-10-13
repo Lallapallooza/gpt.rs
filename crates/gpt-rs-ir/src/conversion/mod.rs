@@ -15,8 +15,7 @@ use anyhow::{bail, Result};
 pub use self::tensor_to_tile::TensorToTile;
 pub use self::tile_to_loop::TileToLoop;
 use crate::dialects::Dialect;
-use crate::module::Module;
-use crate::op::InOp;
+use crate::ir::{InOp, Module};
 use crate::rewrite::{AnyPattern, Applied, PatternSet};
 use crate::Op;
 

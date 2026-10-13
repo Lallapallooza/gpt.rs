@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use gpt_rs_ir::dialects::tensor::{ReduceAttrs, ReduceWindowAttrs, TensorOp};
 use gpt_rs_ir::dialects::tile::CombineKind;
-use gpt_rs_ir::types::{DType, TensorType};
+use gpt_rs_ir::ir::{DType, TensorType};
 
 use super::super::profile::register_op_profile_unary;
 use super::super::types::{Instruction, Kind};

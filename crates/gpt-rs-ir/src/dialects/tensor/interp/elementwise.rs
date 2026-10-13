@@ -6,11 +6,10 @@ use std::cmp::Ordering;
 use anyhow::{anyhow, bail, Result};
 
 use super::kernels::{cast, from_f32, from_f64, from_ints, rounder, values, Chunks, Values};
+use crate::dialects::arith::math::{BinaryMath, Combiner, CompareMath, UnaryMath};
 use crate::dialects::tensor::ir::*;
 use crate::host::{Buffer, HostTensor, TensorData};
-use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
-use crate::scalar::{BinaryMath, Combiner, CompareMath, UnaryMath};
-use crate::types::{DType, IntFormat};
+use crate::ir::{DType, Eval, EvalCx, Host, IntFormat, NoRegions, OwnedHost};
 
 /// The arithmetic of the types the interpreter computes in: f32, f64, and i128 for the integer
 /// dtypes and `i1`, whose results the caller wraps to the dtype.

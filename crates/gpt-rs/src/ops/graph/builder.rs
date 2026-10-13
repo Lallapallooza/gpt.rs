@@ -4,12 +4,8 @@ use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, bail, Result};
-use gpt_rs_ir::dense::Dense;
 use gpt_rs_ir::dialects::tensor::{BroadcastTo, Constant};
-use gpt_rs_ir::location::Location;
-use gpt_rs_ir::module::Module;
-use gpt_rs_ir::op::{InOp, OpDyn};
-use gpt_rs_ir::types::{DType, Dim, Ranked, TensorType, Type};
+use gpt_rs_ir::ir::{DType, Dense, Dim, InOp, Location, Module, OpDyn, Ranked, TensorType, Type};
 use smallvec::SmallVec;
 
 use super::arena::GraphArena;

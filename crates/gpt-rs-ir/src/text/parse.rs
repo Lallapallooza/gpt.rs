@@ -1,13 +1,10 @@
 use anyhow::{bail, ensure, Result};
 
 use super::{Cursor, TokenKind};
-use crate::attr::{parse_tuple, Attr};
-use crate::location::Location;
-use crate::module::{Module, NewInst, Region, Value};
-use crate::op::NamedArg;
-use crate::scope::ScopedMap;
+use crate::ir::{
+    parse_tuple, Attr, Location, Module, NamedArg, NewInst, Region, ScopedMap, Type, Value,
+};
 use crate::traits::IsolatedFromAbove;
-use crate::types::Type;
 use crate::Op;
 
 struct Parser<'a> {
@@ -249,7 +246,7 @@ impl<'a> Parser<'a> {
 }
 
 impl Module {
-    /// Parses the text form. It does not verify the module: [`crate::verify::verify`] does.
+    /// Parses the text form. It does not verify the module: [`crate::ir::verify`] does.
     pub fn from_text(src: &str) -> Result<Module> {
         let mut parser = Parser {
             c: Cursor::new(src),

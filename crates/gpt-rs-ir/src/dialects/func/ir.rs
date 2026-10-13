@@ -1,7 +1,7 @@
 //! The `func` dialect's ops and their attributes.
 
+use crate::ir::Type;
 use crate::traits::{IsolatedFromAbove, Terminator};
-use crate::types::Type;
 
 /// Stable identity of a model parameter: derived from its checkpoint name, or from the text of the
 /// load-time function that computes it.

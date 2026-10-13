@@ -9,14 +9,11 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, ensure, Result};
 
-use crate::dense::Dense;
 use crate::dialects::func::Func;
 use crate::host::HostScalar;
-use crate::location::Location;
-use crate::op::{Flat, InOp, Matched, OpDyn};
+use crate::ir::{Dense, Flat, InOp, Location, Matched, OpDyn, TensorType, Type};
 use crate::text::any_items;
 use crate::traits::{IsolatedFromAbove, Terminator};
-use crate::types::{TensorType, Type};
 use crate::Op;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

@@ -1,8 +1,7 @@
 //! The value of `tensor.constant`.
 
-use crate::dense::Dense;
 use crate::dialects::tensor::ir::Constant;
-use crate::op::ConstantOp;
+use crate::ir::{ConstantOp, Dense};
 
 impl ConstantOp for Constant {
     fn value(&self) -> &Dense {

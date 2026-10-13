@@ -5,11 +5,12 @@ use std::collections::{BTreeSet, HashMap};
 use anyhow::{anyhow, bail, Result};
 
 use super::ir::*;
-use crate::host::{HostBuffer, HostScalar, HostValue};
-use crate::index::{Expr, IndexEnv, ReadKind};
-use crate::module::Region;
-use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
-use crate::types::{BufferType, Dim, Space, Sym};
+use crate::host::HostScalar;
+use crate::interp::{HostBuffer, HostValue};
+use crate::ir::{
+    BufferType, Dim, Eval, EvalCx, Expr, Host, IndexEnv, NoRegions, OwnedHost, ReadKind, Region,
+    Space, Sym,
+};
 
 impl Eval for Func {
     fn eval(
@@ -150,7 +151,7 @@ impl Eval for Predicate {
             holds &= constraint.holds(&operands)?;
         }
         Ok(PredicateResults {
-            output: HostScalar::int(crate::types::DType::I1, i128::from(holds))?,
+            output: HostScalar::int(crate::ir::DType::I1, i128::from(holds))?,
         })
     }
 }

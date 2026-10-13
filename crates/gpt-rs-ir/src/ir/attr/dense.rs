@@ -7,8 +7,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, ensure, Result};
 use half::{bf16, f16};
 
-use crate::attr::{print_float, print_shape, Number};
-use crate::types::{DType, Dim, Element, Ranked, TensorType};
+use crate::ir::{print_float, print_shape, DType, Dim, Element, Number, Ranked, TensorType};
 
 /// Little-endian elements of a static-shape tensor. `i1` stores one byte per element.
 #[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash)]

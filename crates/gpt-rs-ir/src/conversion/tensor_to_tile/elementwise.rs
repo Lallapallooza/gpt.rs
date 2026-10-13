@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use super::utils::elementwise;
 use crate::dialects::arith;
 use crate::dialects::tensor::{Binary, Cast, Compare, Select, StopGradient, Unary};
-use crate::op::Matched;
+use crate::ir::Matched;
 use crate::rewrite::{pattern, NoMatch, Pattern, Rewriter};
 
 /// `tensor.stop_gradient` is its input: a forward computation has no gradients.

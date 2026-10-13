@@ -1,7 +1,7 @@
-//! The costs that `gpt_rs_ir::cost` documents, on hand-computed cases.
+//! The costs that `gpt_rs_ir::analysis` documents, on hand-computed cases.
 
-use gpt_rs_ir::cost::Cost;
-use gpt_rs_ir::module::Module;
+use gpt_rs_ir::analysis::Cost;
+use gpt_rs_ir::ir::Module;
 
 /// The cost of each op of the one function of `text`, in order, the terminator left out.
 fn costs(text: &str) -> Vec<Option<Cost>> {

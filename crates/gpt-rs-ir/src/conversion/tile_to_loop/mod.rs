@@ -13,9 +13,9 @@ use self::dispatch::*;
 use super::{apply_conversion, ConversionTarget, ConvertOp, Mode, OpForm};
 use crate::dialects::tile::{self, TileOp};
 use crate::dialects::Dialect;
-use crate::module::Module;
-use crate::passes::{pass, Pass, Rewrites};
-use crate::rewrite::PatternSet;
+use crate::ir::Module;
+use crate::passes::{pass, Pass};
+use crate::rewrite::{PatternSet, Rewrites};
 
 /// Lowers each `tile.dispatch` to a `loop.func` of the same name that computes the same values, bit
 /// for bit, with the loops that its schedule record asks for. A dispatch whose schedule record has

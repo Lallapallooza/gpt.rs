@@ -3,7 +3,7 @@
 use anyhow::{bail, Result};
 
 use crate::dialects::tensor::ir::{CustomCall, CustomCallOperands, CustomCallResults};
-use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
+use crate::ir::{Eval, EvalCx, Host, NoRegions, OwnedHost};
 
 impl Eval for CustomCall {
     fn eval(

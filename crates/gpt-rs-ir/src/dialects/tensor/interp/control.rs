@@ -7,10 +7,9 @@ use crate::dialects::tensor::ir::{
     Cond, CondOperands, CondRegions, CondResults, Scan, ScanOperands, ScanRegions, ScanResults,
     While, WhileOperands, WhileRegions, WhileResults, Yield, YieldOperands, YieldResults,
 };
-use crate::host::{HostTensor, HostValue};
-use crate::module::Region;
-use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
-use crate::types::TensorType;
+use crate::host::HostTensor;
+use crate::interp::HostValue;
+use crate::ir::{Eval, EvalCx, Host, NoRegions, OwnedHost, Region, TensorType};
 
 impl Eval for Yield {
     fn eval(

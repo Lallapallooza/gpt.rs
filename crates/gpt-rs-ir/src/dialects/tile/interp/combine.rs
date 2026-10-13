@@ -3,12 +3,12 @@
 
 use anyhow::{anyhow, bail, Result};
 
+use crate::dialects::arith::math::{self, Combiner};
 use crate::dialects::tensor::interp::kernels::best_k;
 use crate::dialects::tile::CombineKind;
 use crate::dialects::{arith, tensor};
 use crate::host::{HostScalar, ScalarValue};
-use crate::scalar::{self, Combiner};
-use crate::types::DType;
+use crate::ir::DType;
 
 /// The fold of one combine kind for one result element.
 pub struct Acc(Box<dyn Accumulator>);
@@ -82,7 +82,7 @@ impl<C: Combiner> Monoid<C> {
     fn new(dtypes: &[DType], init: &[HostScalar]) -> Result<Self> {
         let value = match init {
             [value] => *value,
-            _ => scalar::fold_init::<C>(dtypes[0])?,
+            _ => math::fold_init::<C>(dtypes[0])?,
         };
         Ok(Monoid {
             value,
@@ -93,7 +93,7 @@ impl<C: Combiner> Monoid<C> {
 
 impl<C: Combiner> Accumulator for Monoid<C> {
     fn push(&mut self, values: &[HostScalar]) -> Result<()> {
-        self.value = scalar::binary::<C::Scalar>(self.value, values[0])?;
+        self.value = math::binary::<C::Scalar>(self.value, values[0])?;
         Ok(())
     }
 
@@ -141,12 +141,12 @@ impl Accumulator for Ranked {
         let mut by_index = self.items.clone();
         by_index.sort_by_key(|&(_, index)| index.as_int());
         let ranking = best_k(by_index.len(), self.k, self.largest, |first, second| {
-            scalar::order(by_index[first].0, by_index[second].0)
+            math::order(by_index[first].0, by_index[second].0)
         });
         let fill = if self.largest {
-            scalar::fold_init::<tensor::Maximum>(self.value_dtype)?
+            math::fold_init::<tensor::Maximum>(self.value_dtype)?
         } else {
-            scalar::fold_init::<tensor::Minimum>(self.value_dtype)?
+            math::fold_init::<tensor::Minimum>(self.value_dtype)?
         };
         let mut values = Vec::with_capacity(self.k);
         let mut indices = Vec::with_capacity(self.k);
@@ -186,26 +186,26 @@ fn rescale(from: f32, to: f32) -> Result<f32> {
     if from == f32::NEG_INFINITY {
         return Ok(0.0);
     }
-    let difference = scalar::binary::<arith::Sub>(f32_scalar(from), f32_scalar(to))?;
-    f32_of(scalar::unary::<arith::Exp>(difference)?)
+    let difference = math::binary::<arith::Sub>(f32_scalar(from), f32_scalar(to))?;
+    f32_of(math::unary::<arith::Exp>(difference)?)
 }
 
 fn add(lhs: f32, rhs: f32) -> Result<f32> {
-    f32_of(scalar::binary::<arith::Add>(
+    f32_of(math::binary::<arith::Add>(
         f32_scalar(lhs),
         f32_scalar(rhs),
     )?)
 }
 
 fn mul(lhs: f32, rhs: f32) -> Result<f32> {
-    f32_of(scalar::binary::<arith::Mul>(
+    f32_of(math::binary::<arith::Mul>(
         f32_scalar(lhs),
         f32_scalar(rhs),
     )?)
 }
 
 fn maximum(lhs: f32, rhs: f32) -> Result<f32> {
-    f32_of(scalar::binary::<arith::Maximum>(
+    f32_of(math::binary::<arith::Maximum>(
         f32_scalar(lhs),
         f32_scalar(rhs),
     )?)
@@ -277,8 +277,8 @@ impl<const WITH_VALUE: bool> Accumulator for TwoPass<WITH_VALUE> {
         let mut sum = mul(self.start.sum, factor)?;
         let mut weighted = mul(self.start.weighted, factor)?;
         for &(score, value) in &self.points {
-            let difference = scalar::binary::<arith::Sub>(f32_scalar(score), f32_scalar(max))?;
-            let weight = f32_of(scalar::unary::<arith::Exp>(difference)?)?;
+            let difference = math::binary::<arith::Sub>(f32_scalar(score), f32_scalar(max))?;
+            let weight = f32_of(math::unary::<arith::Exp>(difference)?)?;
             sum = add(sum, weight)?;
             if WITH_VALUE {
                 weighted = add(weighted, mul(weight, value)?)?;

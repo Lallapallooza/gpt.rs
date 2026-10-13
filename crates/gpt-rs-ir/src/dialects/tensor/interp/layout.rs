@@ -12,7 +12,7 @@ use crate::dialects::tensor::ir::{
 };
 use crate::dialects::tensor::utils::shape::{axis_index, check_window, pick};
 use crate::host::{HostTensor, TensorData};
-use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
+use crate::ir::{Eval, EvalCx, Host, NoRegions, OwnedHost};
 
 impl Eval for Reshape {
     fn eval(

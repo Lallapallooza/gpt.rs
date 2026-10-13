@@ -2,11 +2,8 @@
 
 use smallvec::SmallVec;
 
-use crate::attr::F64;
-use crate::index::{Constraint, IndexExpr};
-use crate::schedule::Level;
+use crate::ir::{Constraint, DType, IndexExpr, Ranked, Type, F64};
 use crate::traits::{IsolatedFromAbove, Terminator};
-use crate::types::{DType, Ranked, Type};
 
 // ------------------------------------------------------------------------------------------------
 // `loop.func` and `loop.return`.
@@ -77,10 +74,19 @@ pub struct If;
 #[crate::op("loop.yield", traits(Terminator))]
 pub struct Yield;
 
+/// An execution level of a CPU, from the outermost.
+#[derive(crate::Attr, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Level {
+    /// The cores that share one last-level cache.
+    L3,
+    /// One core.
+    Core,
+}
+
 // ------------------------------------------------------------------------------------------------
 // Index values: `loop.index` and `loop.predicate`.
 
-/// `loop.index`: the value of `expr`, an expression of the `tile` index language in which `di` is
+/// `loop.index`: the value of `expr`, an expression of the index language in which `di` is
 /// operand `i` and `{T}` the extent the launch binds to the symbol `T`.
 #[crate::op("loop.index", operands(ins(Variadic(Index))), results(output(Index)))]
 pub struct Index {

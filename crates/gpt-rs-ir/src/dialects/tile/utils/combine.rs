@@ -4,12 +4,12 @@ use std::marker::PhantomData;
 
 use anyhow::{ensure, Result};
 
+use crate::dialects::arith::math::Combiner;
 use crate::dialects::tensor::utils::class::{ensure_dtype_class, ensure_index_dtype, ARITHMETIC};
 use crate::dialects::tile::ir::*;
+use crate::dialects::tile::IterList;
 use crate::dialects::{arith, tensor};
-use crate::index::IterList;
-use crate::scalar::Combiner;
-use crate::types::{DType, Dim};
+use crate::ir::{DType, Dim};
 
 /// `none`: one value, written per point.
 struct NoFold;

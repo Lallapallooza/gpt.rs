@@ -2,10 +2,8 @@
 //! build such a constant: the parser checks the payload of the text form first. Building an op
 //! its type rule rejects is a bug in the code that builds it, so the builder panics.
 
-use gpt_rs_ir::dense::Dense;
 use gpt_rs_ir::dialects::tensor::Constant;
-use gpt_rs_ir::module::Module;
-use gpt_rs_ir::types::DType;
+use gpt_rs_ir::ir::{DType, Dense, Module};
 
 #[test]
 #[should_panic(expected = "building tensor.constant: 8 bytes do not hold 4 f32 elements")]

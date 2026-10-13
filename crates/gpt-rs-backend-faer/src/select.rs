@@ -7,9 +7,8 @@ use gpt_rs::ops::functional::{linear_weight, WeightLayout};
 use gpt_rs_ir::dialects::tensor::{
     Add, BroadcastTo, DotGeneral, ExtractPatches, Maximum, Minimum, Reshape, Transpose,
 };
-use gpt_rs_ir::module::{Inst, Module, Value, ValueRef};
+use gpt_rs_ir::ir::{DType, Inst, Module, Value, ValueRef};
 use gpt_rs_ir::rewrite::matched;
-use gpt_rs_ir::types::DType;
 
 pub(crate) struct Step {
     pub kind: StepKind,

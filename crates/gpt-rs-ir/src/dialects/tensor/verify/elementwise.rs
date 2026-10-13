@@ -7,8 +7,7 @@ use crate::dialects::tensor::ir::*;
 use crate::dialects::tensor::utils::class::{
     ensure_class, ensure_dtype_class, ensure_equal_types, CASTABLE, ORDERED,
 };
-use crate::op::{NoRegions, OpDef, OwnedTypes, TypeCx, Types};
-use crate::types::DType;
+use crate::ir::{DType, NoRegions, OpDef, OwnedTypes, TypeCx, Types};
 
 impl OpDef for Select {
     fn result_types(

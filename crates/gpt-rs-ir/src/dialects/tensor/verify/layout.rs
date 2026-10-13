@@ -4,11 +4,9 @@ use std::fmt;
 
 use anyhow::{anyhow, bail, ensure, Result};
 
-use crate::attr::Attr;
 use crate::dialects::tensor::ir::*;
 use crate::dialects::tensor::utils::shape::{axis_index, check_window};
-use crate::op::{NoRegions, OpDef, OwnedTypes, TypeCx, Types};
-use crate::types::{DType, Dim, Sym, TensorType};
+use crate::ir::{Attr, DType, Dim, NoRegions, OpDef, OwnedTypes, Sym, TensorType, TypeCx, Types};
 
 impl OpDef for Reshape {
     fn result_types(

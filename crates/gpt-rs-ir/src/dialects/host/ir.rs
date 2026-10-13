@@ -1,6 +1,6 @@
 //! `host.dispatch`.
 
-use crate::attr::SymbolRef;
+use crate::ir::SymbolRef;
 
 /// `host.dispatch`: calls the dispatch named `callee` on `args` and gives its results. The callee
 /// is a `tile.dispatch`, or the `loop.func` it lowers to.

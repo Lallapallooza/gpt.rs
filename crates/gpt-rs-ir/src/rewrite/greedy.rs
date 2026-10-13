@@ -4,10 +4,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{ensure, Result};
 
-use super::stats::Stat;
-use crate::fold::fold_inst;
-use crate::module::{Inst, Module, OpKey, Region};
-use crate::rewrite::{Applied, Editor, PatternSet};
+use crate::ir::{Inst, Module, OpKey, Region};
+use crate::rewrite::{fold_inst, Applied, Editor, PatternSet};
 use crate::traits::IsolatedFromAbove;
 
 /// The folds and patterns a greedy rewrite applies.
@@ -31,14 +29,6 @@ impl Rewrites {
             patterns,
         }
     }
-}
-
-/// Runs `rewrites` to a fixpoint with the greedy driver, erasing dead ops, adds the rewrites to
-/// `stat`, and returns whether the module changed: the `run` of a pass that applies patterns.
-pub fn run_patterns(module: &mut Module, rewrites: Rewrites, stat: &Stat) -> Result<bool> {
-    let report = Greedy::new(rewrites).erase_dead().run(module)?;
-    stat.add(report.rewritten);
-    Ok(report.changed())
 }
 
 /// The driver of the passes made of folds and patterns. It erases each op it visits that is dead,

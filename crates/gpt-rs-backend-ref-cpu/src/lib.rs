@@ -5,9 +5,10 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, ensure, Result};
 use gpt_rs::backend::{ParamStore, PortableBackend};
-use gpt_rs_ir::host::{HostTensor, HostValue};
+use gpt_rs_ir::host::HostTensor;
 use gpt_rs_ir::interp;
-use gpt_rs_ir::module::Module;
+use gpt_rs_ir::interp::HostValue;
+use gpt_rs_ir::ir::Module;
 
 #[derive(Default)]
 pub struct CpuPortableBackend {

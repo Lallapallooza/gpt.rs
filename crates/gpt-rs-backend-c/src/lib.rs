@@ -12,9 +12,8 @@ use gpt_rs::backend::hashing::FingerprintHasher;
 use gpt_rs::backend::{ParamStore, PortableBackend};
 use gpt_rs_ir::dialects::func::Func;
 use gpt_rs_ir::host::HostTensor;
-use gpt_rs_ir::module::Module;
+use gpt_rs_ir::ir::{Module, TensorType};
 use gpt_rs_ir::passes::Pipeline;
-use gpt_rs_ir::types::TensorType;
 use libloading::Library;
 
 use crate::codegen::ENTRY_SYMBOL;

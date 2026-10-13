@@ -1,9 +1,4 @@
-//! What an op costs to run: the arithmetic it does and the bytes it reads and writes, from its
-//! operand and result types. A cost is of the op as a backend runs it, not of a naive reading of
-//! its semantics: a `tensor.gather` reads the rows it gathers, not its whole table.
-//!
-//! Most ops cost what [`default_cost`] says. An op that costs something else implements
-//! [`OpCost`] with `#[cost]`, which registers it.
+//! What an op costs to run.
 
 use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
@@ -11,10 +6,10 @@ use std::ops::{Add, AddAssign};
 
 pub use gpt_rs_ir_macros::cost;
 
-use crate::module::{Inst, Module, Region};
-use crate::op::{Groups, OpDyn, OpKind, Operands, Results, Types};
+use crate::ir::{
+    Groups, Inst, Module, OpDyn, OpKind, Operands, Region, Results, TensorType, Type, Types,
+};
 use crate::traits::{Movement, Terminator};
-use crate::types::{TensorType, Type};
 use crate::Op;
 
 /// The arithmetic and the memory traffic of running an op.

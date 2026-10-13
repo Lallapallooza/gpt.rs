@@ -10,3 +10,4 @@ pub use self::interp::Acc;
 pub use self::ir::*;
 pub use self::passes::SealDispatches;
 pub use self::utils::build::{par_iters, push_iter, Body, Inputs};
+pub use self::utils::Step;

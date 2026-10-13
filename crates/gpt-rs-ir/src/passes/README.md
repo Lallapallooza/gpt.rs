@@ -23,11 +23,10 @@ pass of the crate.
 ```rust,no_run
 use anyhow::Result;
 use gpt_rs_ir::dialects::tensor::{Div, Mul, Reciprocal};
-use gpt_rs_ir::module::Module;
-use gpt_rs_ir::op::Matched;
-use gpt_rs_ir::passes::{pass, run_patterns, Pass, Rewrites};
+use gpt_rs_ir::ir::{Matched, Module};
+use gpt_rs_ir::passes::{pass, run_patterns, Pass};
 use gpt_rs_ir::require;
-use gpt_rs_ir::rewrite::{pattern, NoMatch, Pattern, PatternSet, Rewriter};
+use gpt_rs_ir::rewrite::{pattern, NoMatch, Pattern, PatternSet, Rewriter, Rewrites};
 
 /// `x / s` is `x * reciprocal(s)` for a static float `s`: the backend computes the reciprocal
 /// once at load time, and a run multiplies, which costs less than dividing.

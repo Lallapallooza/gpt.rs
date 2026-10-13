@@ -11,7 +11,7 @@
 //! `Module::from_text(&m.to_text())` rebuilds a module that prints the same text.
 //!
 //! The parser reads the text as the tokens of `gpt_rs_ir_lexer`. Each attribute reads its own
-//! text form ([`crate::attr`]), which `#[derive(Attr)]` declares.
+//! text form ([`Attr`](crate::ir::Attr)), which `#[derive(Attr)]` declares.
 //!
 //! An op may end with its location, which says where it comes from and never what it computes:
 //! `loc("model.layers.3.mlp"("crates/gpt-rs/src/nn/layers/mlp.rs":42:9))`, the module path alone
@@ -20,7 +20,7 @@
 //!
 //! A program stored for later, such as a dump, starts with the version of the spec it follows,
 //! `spec_version = "ptir.v0.6"`
-//! ([`Module::to_versioned_text`](crate::module::Module::to_versioned_text)). The parser reads a
+//! ([`Module::to_versioned_text`](crate::ir::Module::to_versioned_text)). The parser reads a
 //! module with that line or without it, and rejects any other version.
 
 mod cursor;

@@ -1,4 +1,4 @@
-use gpt_rs_ir::float8::F8E4M3;
+use gpt_rs_ir::ir::F8E4M3;
 
 /// Minimum work at which kernels and generated loops split across OpenMP threads. Work counts the
 /// multiply-accumulates of a matmul or the output elements of an elementwise loop. Smaller ops

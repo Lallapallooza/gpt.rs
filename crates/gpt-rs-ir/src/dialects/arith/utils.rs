@@ -4,11 +4,8 @@
 use anyhow::{anyhow, ensure, Result};
 
 use super::ir::*;
-use crate::attr::{print_float, Number};
-use crate::dense::Dense;
 use crate::host::{HostScalar, ScalarValue};
-use crate::op::ConstantOp;
-use crate::types::DType;
+use crate::ir::{print_float, ConstantOp, DType, Dense, Number};
 
 impl Literal {
     pub fn new(value: HostScalar) -> Result<Self> {

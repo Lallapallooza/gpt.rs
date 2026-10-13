@@ -101,7 +101,7 @@ If shapes are not broadcast-compatible, backends MUST reject the op as a spec vi
 
 ### DType set
 
-The dtype universe is defined by `gpt_rs_ir::types::DType` and includes:
+The dtype universe is defined by `gpt_rs_ir::ir::DType` and includes:
 
 - booleans: `i1`
 - integers: `si4/ui4/si8/ui8/si16/ui16/si32/ui32/si64/ui64`

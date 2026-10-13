@@ -2,12 +2,12 @@ use super::utils::{copy, elementwise};
 use crate::dialects::arith;
 use crate::dialects::tensor::utils::shape::axis_index;
 use crate::dialects::tensor::{Bitcast, BroadcastTo, Concat, Reshape, Slice, Transpose};
-use crate::dialects::tile::{par_iters, push_iter, Block, CombineKind, Fold};
-use crate::index::{Constraint, IndexExpr, IterKind, Read, Relation, Write};
-use crate::op::Matched;
+use crate::dialects::tile::{
+    par_iters, push_iter, Block, CombineKind, Fold, IterKind, Read, Write,
+};
+use crate::ir::{Constraint, DType, Dim, IndexExpr, Matched, Relation};
 use crate::require;
 use crate::rewrite::{pattern, NoMatch, Pattern, Rewriter};
-use crate::types::{DType, Dim};
 
 /// `tensor.reshape` is a copy block that reads the input at the row-major position of each
 /// result element.
@@ -147,7 +147,7 @@ impl Pattern for ConcatToTile {
                 1.0
             };
             reads.push(Read {
-                pad: Some(crate::attr::F64(pad)),
+                pad: Some(crate::ir::F64(pad)),
                 ..Read::new(operand, source)
             });
             starts.push(start.clone());

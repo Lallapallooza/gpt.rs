@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
 use gpt_rs_ir::dialects::tensor::{DotAxes, DotGeneral, TensorOp};
-use gpt_rs_ir::module::Value;
-use gpt_rs_ir::types::{DType, TensorType};
+use gpt_rs_ir::ir::{DType, TensorType, Value};
 
 use super::super::profile::{matmul_work_stats, register_op_profile_binary, signature_binary};
 use super::super::types::{Instruction, Kind};

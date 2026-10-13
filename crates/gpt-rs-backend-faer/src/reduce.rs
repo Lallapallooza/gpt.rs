@@ -4,7 +4,7 @@
 use anyhow::Result;
 use gpt_rs_ir::dialects::tensor::ReduceAttrs;
 use gpt_rs_ir::host::HostTensor;
-use gpt_rs_ir::types::{DType, TensorType};
+use gpt_rs_ir::ir::{DType, TensorType};
 
 /// The reduction of an f32 `input` with an f32 result that folds with `combine` from `init`,
 /// unless `op` takes or gives other dtypes.

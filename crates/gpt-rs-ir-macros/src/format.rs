@@ -1,6 +1,6 @@
 //! The format compiler of `#[derive(Attr)]`: it reads the format of a struct or a variant, checks
-//! it, and generates the code that prints, reads and peeks the fields it writes. The format
-//! language is documented on `gpt_rs_ir::attr`.
+//! it, and generates the code that prints, reads and peeks the fields it writes.
+//! `gpt_rs_ir::ir::Attr` documents the format language.
 
 use gpt_rs_ir_lexer::{token, TokenKind};
 use proc_macro2::{Span, TokenStream as TokenStream2};
@@ -86,7 +86,7 @@ pub(crate) fn read_entries(
                 if #slot.is_some() {
                     ::anyhow::bail!(c.error_at(at, format!(concat!("duplicate ", #kind, " `{}`"), key)));
                 }
-                #slot = ::std::option::Option::Some(<#ty as ::gpt_rs_ir::attr::Attr>::parse(c)?);
+                #slot = ::std::option::Option::Some(<#ty as ::gpt_rs_ir::ir::Attr>::parse(c)?);
             }
         }
     });
@@ -611,13 +611,13 @@ fn first(elements: &[Element], fields: &[FormatField]) -> (Vec<TokenStream2>, bo
                     (true, Some(inner)) => inner,
                     _ => &written.ty,
                 };
-                quote!(<#ty as ::gpt_rs_ir::attr::Attr>::peek(c))
+                quote!(<#ty as ::gpt_rs_ir::ir::Attr>::peek(c))
             }
             Element::Tuple { field, .. } => {
                 let ty = &fields[*field].ty;
-                quote!(::gpt_rs_ir::attr::peek_tuple::<#ty>(c))
+                quote!(::gpt_rs_ir::ir::peek_tuple::<#ty>(c))
             }
-            Element::Shape { .. } => quote!(::gpt_rs_ir::attr::peek_shape(c)),
+            Element::Shape { .. } => quote!(::gpt_rs_ir::ir::peek_shape(c)),
         };
         alternatives.push(test);
         return (alternatives, false);
@@ -686,10 +686,10 @@ fn print_element(element: &Element, fields: &[FormatField]) -> TokenStream2 {
             let print = match (anchor, written.option_inner()) {
                 (true, Some(inner)) => quote! {
                     if let ::std::option::Option::Some(value) = #binding {
-                        <#inner as ::gpt_rs_ir::attr::Attr>::print(value, out);
+                        <#inner as ::gpt_rs_ir::ir::Attr>::print(value, out);
                     }
                 },
-                _ => quote!(<#ty as ::gpt_rs_ir::attr::Attr>::print(#binding, out);),
+                _ => quote!(<#ty as ::gpt_rs_ir::ir::Attr>::print(#binding, out);),
             };
             quote! {
                 #space_before
@@ -701,7 +701,7 @@ fn print_element(element: &Element, fields: &[FormatField]) -> TokenStream2 {
             let binding = &fields[*field].binding;
             quote! {
                 #space_before
-                ::gpt_rs_ir::attr::print_tuple(::gpt_rs_ir::attr::AttrList::items(#binding), out);
+                ::gpt_rs_ir::ir::print_tuple(::gpt_rs_ir::ir::AttrList::items(#binding), out);
                 space = true;
             }
         }
@@ -709,7 +709,7 @@ fn print_element(element: &Element, fields: &[FormatField]) -> TokenStream2 {
             let (dims, dtype) = (&fields[*dims].binding, &fields[*dtype].binding);
             quote! {
                 #space_before
-                ::gpt_rs_ir::attr::print_shape(&#dims[..], #dtype, out);
+                ::gpt_rs_ir::ir::print_shape(&#dims[..], #dtype, out);
                 space = true;
             }
         }
@@ -731,7 +731,7 @@ fn print_element(element: &Element, fields: &[FormatField]) -> TokenStream2 {
                             out.push(' ');
                         }
                         out.push_str(concat!(#key, " = "));
-                        <#ty as ::gpt_rs_ir::attr::Attr>::print(#binding, out);
+                        <#ty as ::gpt_rs_ir::ir::Attr>::print(#binding, out);
                         first = false;
                     }
                 }
@@ -779,21 +779,21 @@ fn parse_element(
             let ty = &fields[*field].ty;
             let value = match (anchor, fields[*field].option_inner()) {
                 (true, Some(inner)) => quote! {
-                    ::std::option::Option::Some(<#inner as ::gpt_rs_ir::attr::Attr>::parse(c)?)
+                    ::std::option::Option::Some(<#inner as ::gpt_rs_ir::ir::Attr>::parse(c)?)
                 },
-                _ => quote!(<#ty as ::gpt_rs_ir::attr::Attr>::parse(c)?),
+                _ => quote!(<#ty as ::gpt_rs_ir::ir::Attr>::parse(c)?),
             };
             bind(*field, value)
         }
         Element::Tuple { field, .. } => {
             let ty = &fields[*field].ty;
-            bind(*field, quote!(::gpt_rs_ir::attr::parse_tuple::<#ty>(c)?))
+            bind(*field, quote!(::gpt_rs_ir::ir::parse_tuple::<#ty>(c)?))
         }
         Element::Shape { dims, dtype } => {
             let dims_value = bind(*dims, quote!(::std::convert::Into::into(shape.0)));
             let dtype_value = bind(*dtype, quote!(::std::convert::Into::into(shape.1)));
             quote! {
-                let shape = ::gpt_rs_ir::attr::parse_shape(c)?;
+                let shape = ::gpt_rs_ir::ir::parse_shape(c)?;
                 #dims_value
                 #dtype_value
             }
@@ -818,7 +818,7 @@ fn parse_element(
                 .map(|(&index, entry)| bind(index, entry_value(entry, &owner, "parameter")));
             quote! {
                 #slots
-                ::gpt_rs_ir::attr::parse_entries(c, #reader)?;
+                ::gpt_rs_ir::ir::parse_entries(c, #reader)?;
                 #(#values)*
             }
         }

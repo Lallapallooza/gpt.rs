@@ -9,15 +9,12 @@ use anyhow::{bail, Result};
 use super::utils::{
     cell, constant, for_range, get, if_then, index, less, lit, load, predicate, set, store,
 };
+use crate::dialects::arith::math::{self, Combiner};
 use crate::dialects::tile::{Body, CombineKind};
 use crate::dialects::{arith, tensor};
 use crate::host::HostScalar;
-use crate::index::IndexExpr;
-use crate::module::Value;
-use crate::op::InOp;
+use crate::ir::{DType, InOp, IndexExpr, Value};
 use crate::rewrite::Builder;
-use crate::scalar::{self, Combiner};
-use crate::types::DType;
 
 /// The state of a fold for one element: a buffer per state component, which holds the state of
 /// every element of a tile, and the element's position in them.
@@ -131,7 +128,7 @@ where
     ) -> Result<()> {
         let first = match init {
             [value] => *value,
-            _ => lit(builder, scalar::fold_init::<C>(dtypes[0])?),
+            _ => lit(builder, math::fold_init::<C>(dtypes[0])?),
         };
         state.set(builder, 0, first);
         Ok(())
@@ -210,9 +207,9 @@ impl<const LARGEST: bool> Best<LARGEST> {
     /// The value of an empty place: the identity of the order.
     fn fill(dtype: DType) -> Result<HostScalar> {
         if LARGEST {
-            scalar::fold_init::<tensor::Maximum>(dtype)
+            math::fold_init::<tensor::Maximum>(dtype)
         } else {
-            scalar::fold_init::<tensor::Minimum>(dtype)
+            math::fold_init::<tensor::Minimum>(dtype)
         }
     }
 

@@ -6,8 +6,7 @@ use crate::dialects::arith;
 use crate::dialects::tensor::ir::*;
 use crate::dialects::tensor::utils::class::ensure_dtype_class;
 use crate::dialects::tensor::utils::random::state_type;
-use crate::op::{NoRegions, OwnedTypes, TypeCx, Types};
-use crate::types::TensorType;
+use crate::ir::{NoRegions, OwnedTypes, TensorType, TypeCx, Types};
 
 /// The type rule of every [`Rng`] op.
 pub(crate) fn rng<T: Rng>(

@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use super::{pass, Greedy, Pass, Rewrites};
-use crate::module::Module;
+use crate::ir::Module;
 
 /// Erases the ops that have no effect and whose results nothing reads, until nothing changes.
 #[pass(name = "dce", stats(erased = "dead ops erased"))]

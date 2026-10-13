@@ -8,7 +8,7 @@ use gpt_rs::backend::PortableBackend;
 use gpt_rs::tensor::HostTensor;
 use gpt_rs_backend_c::CBackend;
 use gpt_rs_ir::host::TensorData;
-use gpt_rs_ir::module::Module;
+use gpt_rs_ir::ir::Module;
 
 #[test]
 fn rng_uniform_draws_the_philox_known_answer() -> Result<()> {

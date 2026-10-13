@@ -5,10 +5,9 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use gpt_rs_ir::doc::{record_fired, Fired};
-use gpt_rs_ir::module::Module;
-use gpt_rs_ir::op::OpDyn;
+use gpt_rs_ir::ir::{Module, OpDyn};
 use gpt_rs_ir::passes::{self, Pipeline};
+use gpt_rs_ir::rewrite::{record_fired, Fired};
 
 /// One filetest case: its file, relative to the repository, its mode, its text, and what the
 /// module it holds names, when it parses.

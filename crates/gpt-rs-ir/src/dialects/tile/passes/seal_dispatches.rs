@@ -4,16 +4,13 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use anyhow::{anyhow, Result};
 
-use crate::attr::SymbolRef;
 use crate::dialects::func::Return;
 use crate::dialects::host;
-use crate::dialects::tile::{Block, Dispatch, Group};
-use crate::index::IterList;
-use crate::module::{Inst, Module, Region, Value};
+use crate::dialects::tile::{Block, Dispatch, Group, IterList};
+use crate::ir::{Dim, Inst, Module, Region, Sym, SymbolRef, Type, Value};
 use crate::passes::{pass, Pass};
 use crate::rewrite::Builder;
 use crate::traits::IsolatedFromAbove;
-use crate::types::{Dim, Sym, Type};
 
 /// Outlines each group of blocks into a `tile.dispatch` that the function calls with
 /// `host.dispatch`.

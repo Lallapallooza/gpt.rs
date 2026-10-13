@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use super::{pass, Greedy, Pass, Rewrites};
-use crate::module::Module;
+use crate::ir::Module;
 use crate::rewrite::canonical_patterns;
 
 /// Simplifies the module without changing what it computes: folds ops, erases dead ones and

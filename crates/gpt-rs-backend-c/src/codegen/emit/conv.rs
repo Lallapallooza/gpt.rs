@@ -2,8 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use gpt_rs_ir::dialects::tensor::{ExtractPatches, TensorOp};
-use gpt_rs_ir::module::Value;
-use gpt_rs_ir::types::{DType, TensorType};
+use gpt_rs_ir::ir::{DType, TensorType, Value};
 
 use super::super::profile::register_op_profile_unary;
 use super::super::types::{Instruction, Kind, ValueInfo};

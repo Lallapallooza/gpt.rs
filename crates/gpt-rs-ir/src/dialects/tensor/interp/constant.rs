@@ -6,7 +6,7 @@ use anyhow::Result;
 
 use crate::dialects::tensor::ir::{Constant, ConstantOperands, ConstantResults};
 use crate::host::{HostTensor, TensorData};
-use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
+use crate::ir::{Eval, EvalCx, Host, NoRegions, OwnedHost};
 
 impl Eval for Constant {
     fn eval(

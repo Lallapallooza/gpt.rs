@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use super::{pass, Greedy, Pass, Rewrites};
-use crate::module::Module;
+use crate::ir::Module;
 
 /// Replaces each op that folds by an existing value or a constant, until nothing changes. The
 /// folds are those of `canonicalize`, without its patterns.

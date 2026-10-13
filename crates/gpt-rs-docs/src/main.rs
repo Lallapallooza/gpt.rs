@@ -27,9 +27,9 @@ use gpt_rs_ir::dialects::host::HostOp;
 use gpt_rs_ir::dialects::r#loop::LoopOp;
 use gpt_rs_ir::dialects::tensor::TensorOp;
 use gpt_rs_ir::dialects::tile::TileOp;
-use gpt_rs_ir::op::OpInfo;
-use gpt_rs_ir::passes::{self, PassEntry, Pipeline, Rewrites};
-use gpt_rs_ir::rewrite::RootInfo;
+use gpt_rs_ir::ir::OpInfo;
+use gpt_rs_ir::passes::{self, PassEntry, Pipeline};
+use gpt_rs_ir::rewrite::{Rewrites, RootInfo};
 use gpt_rs_ir::traits::OpTrait;
 
 const HEADER: &str = "<!-- Generated from the code by `cargo run -p gpt-rs-docs`. Do not edit: \

@@ -5,12 +5,11 @@ use std::ops::DerefMut;
 
 use anyhow::{anyhow, ensure, Result};
 
+use crate::dialects::arith::math::{Combiner, Float};
 use crate::dialects::tensor::ir::*;
 use crate::dialects::tensor::utils::shape::axis_index;
 use crate::dialects::tile::CombineKind;
-use crate::op::Matched;
-use crate::scalar::{Combiner, Float};
-use crate::types::{DType, IntFormat, Perm, Ranked, MAX_RANK};
+use crate::ir::{DType, IntFormat, Matched, Perm, Ranked, MAX_RANK};
 
 impl DotGeneral {
     /// The contraction of the `lhs` axes with the `rhs` axes, in pairs, without batch axes.

@@ -6,10 +6,8 @@ use anyhow::Result;
 
 use super::{pass, Pass};
 use crate::dialects::func::{Func, ParamId};
-use crate::location::Location;
-use crate::module::{Inst, Module, Region, Value, ValueDef};
+use crate::ir::{Inst, Location, Module, Region, Type, Value, ValueDef};
 use crate::traits::{Movement, Terminator};
-use crate::types::Type;
 use crate::Op;
 
 /// Moves each static value that a run-time op reads into a load-time function, which the runtime

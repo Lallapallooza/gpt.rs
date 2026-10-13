@@ -2,12 +2,13 @@
 //! implements: [`UnaryMath`], [`BinaryMath`] and [`CompareMath`]. The `tensor` ops apply the same
 //! functions to each element.
 
+pub mod math;
+
 use anyhow::Result;
 
+use self::math::{draw_one, BinaryMath, CompareMath, Float, IntBinary, UnaryMath};
 use super::ir::*;
-use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
-use crate::scalar::{self, draw_one, BinaryMath, CompareMath, Float, IntBinary, UnaryMath};
-use crate::types::IntFormat;
+use crate::ir::{Eval, EvalCx, Host, IntFormat, NoRegions, OwnedHost};
 
 impl UnaryMath for Neg {
     fn float<F: Float>() -> Option<fn(F) -> F> {
@@ -253,7 +254,7 @@ impl Eval for Select {
         _cx: &mut EvalCx<'_, NoRegions>,
     ) -> Result<SelectResults<OwnedHost>> {
         Ok(SelectResults {
-            output: scalar::select(ins.pred, ins.on_true, ins.on_false)?,
+            output: math::select(ins.pred, ins.on_true, ins.on_false)?,
         })
     }
 }
@@ -265,7 +266,7 @@ impl Eval for Cast {
         _cx: &mut EvalCx<'_, NoRegions>,
     ) -> Result<CastResults<OwnedHost>> {
         Ok(CastResults {
-            output: scalar::cast(ins.input, self.to)?,
+            output: math::cast(ins.input, self.to)?,
         })
     }
 }
@@ -277,7 +278,7 @@ impl Eval for FromIndex {
         _cx: &mut EvalCx<'_, NoRegions>,
     ) -> Result<FromIndexResults<OwnedHost>> {
         Ok(FromIndexResults {
-            output: scalar::from_index(ins.input, self.dtype)?,
+            output: math::from_index(ins.input, self.dtype)?,
         })
     }
 }
@@ -301,7 +302,7 @@ impl Eval for Bitcast {
         _cx: &mut EvalCx<'_, NoRegions>,
     ) -> Result<BitcastResults<OwnedHost>> {
         Ok(BitcastResults {
-            output: scalar::bitcast(ins.input, self.to)?,
+            output: math::bitcast(ins.input, self.to)?,
         })
     }
 }
@@ -313,7 +314,7 @@ pub(crate) fn unary<T: Unary>(
     _cx: &mut EvalCx<'_, NoRegions>,
 ) -> Result<UnaryResults<OwnedHost>> {
     Ok(UnaryResults {
-        output: scalar::unary::<T>(ins.input)?,
+        output: math::unary::<T>(ins.input)?,
     })
 }
 
@@ -324,7 +325,7 @@ pub(crate) fn binary<T: Binary>(
     _cx: &mut EvalCx<'_, NoRegions>,
 ) -> Result<BinaryResults<OwnedHost>> {
     Ok(BinaryResults {
-        output: scalar::binary::<T>(ins.lhs, ins.rhs)?,
+        output: math::binary::<T>(ins.lhs, ins.rhs)?,
     })
 }
 
@@ -346,6 +347,6 @@ pub(crate) fn compare<T: Compare>(
     _cx: &mut EvalCx<'_, NoRegions>,
 ) -> Result<CompareResults<OwnedHost>> {
     Ok(CompareResults {
-        output: scalar::compare::<T>(ins.lhs, ins.rhs)?,
+        output: math::compare::<T>(ins.lhs, ins.rhs)?,
     })
 }

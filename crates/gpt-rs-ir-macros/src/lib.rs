@@ -18,7 +18,7 @@
 //! - `#[derive(Attr)]` on an attribute type: its text form, which a fieldless enum writes by the
 //!   snake_case name of each variant, and a struct or a variant by its `#[attr(format = "...")]`
 //!   or `#[attr(via = Type)]`. `format.rs` compiles a format into the printer and the parser;
-//!   `gpt_rs_ir::attr` documents the format language.
+//!   `gpt_rs_ir::ir::Attr` documents the format language.
 //! - `#[pass(name = "...", stats(...))]` on a pass struct. It gives the pass its name and
 //!   statistics, makes its fields options, and registers it with its doc comment.
 //! - `#[pattern]` on a pattern struct records its name and doc comment. `#[pattern(canonical)]`
@@ -162,12 +162,12 @@ fn format_entry(name: &str, format: &LitStr, fields: &Fields) -> TokenStream2 {
     );
     let types = fields.iter().map(|field| {
         let ty = &field.ty;
-        quote!(<#ty as ::gpt_rs_ir::attr::Attr>::ITEM)
+        quote!(<#ty as ::gpt_rs_ir::ir::Attr>::ITEM)
     });
     quote! {
-        #[::gpt_rs_ir::linkme::distributed_slice(::gpt_rs_ir::attr::ATTR_FORMATS)]
+        #[::gpt_rs_ir::linkme::distributed_slice(::gpt_rs_ir::ir::ATTR_FORMATS)]
         #[linkme(crate = ::gpt_rs_ir::linkme)]
-        static #entry: ::gpt_rs_ir::attr::AttrFormat = ::gpt_rs_ir::attr::AttrFormat {
+        static #entry: ::gpt_rs_ir::ir::AttrFormat = ::gpt_rs_ir::ir::AttrFormat {
             name: #name,
             format: #format,
             fields: &[#(#types),*],
@@ -183,7 +183,7 @@ fn display_impl(input: &DeriveInput) -> TokenStream2 {
         impl #impl_generics ::std::fmt::Display for #name #ty_generics #where_clause {
             fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 let mut text = ::std::string::String::new();
-                ::gpt_rs_ir::attr::Attr::print(self, &mut text);
+                ::gpt_rs_ir::ir::Attr::print(self, &mut text);
                 f.write_str(&text)
             }
         }
@@ -201,7 +201,7 @@ fn attr_impl(
     let item = name.to_string();
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     quote! {
-        impl #impl_generics ::gpt_rs_ir::attr::Attr for #name #ty_generics #where_clause {
+        impl #impl_generics ::gpt_rs_ir::ir::Attr for #name #ty_generics #where_clause {
             const ITEM: &'static str = #item;
 
             #[allow(unused_assignments, unused_mut, unused_variables)]
@@ -276,27 +276,27 @@ fn expand_attr_via(input: &DeriveInput, via: &SynType) -> TokenStream2 {
         input,
         quote! {
             let text: #via = ::std::convert::From::from(self);
-            <#via as ::gpt_rs_ir::attr::Attr>::print(&text, out);
+            <#via as ::gpt_rs_ir::ir::Attr>::print(&text, out);
         },
         quote! {
             let start = c.position();
-            let text = <#via as ::gpt_rs_ir::attr::Attr>::parse(c)?;
+            let text = <#via as ::gpt_rs_ir::ir::Attr>::parse(c)?;
             <Self as ::std::convert::TryFrom<#via>>::try_from(text)
                 .map_err(|err| c.error_at(start, err))
         },
-        quote!(<#via as ::gpt_rs_ir::attr::Attr>::peek(c)),
+        quote!(<#via as ::gpt_rs_ir::ir::Attr>::peek(c)),
     );
     let display = display_impl(input);
     quote! {
         #attr
         #display
 
-        #[::gpt_rs_ir::linkme::distributed_slice(::gpt_rs_ir::attr::ATTR_FORMATS)]
+        #[::gpt_rs_ir::linkme::distributed_slice(::gpt_rs_ir::ir::ATTR_FORMATS)]
         #[linkme(crate = ::gpt_rs_ir::linkme)]
-        static #entry: ::gpt_rs_ir::attr::AttrFormat = ::gpt_rs_ir::attr::AttrFormat {
+        static #entry: ::gpt_rs_ir::ir::AttrFormat = ::gpt_rs_ir::ir::AttrFormat {
             name: #name,
             format: "",
-            fields: &[<#via as ::gpt_rs_ir::attr::Attr>::ITEM],
+            fields: &[<#via as ::gpt_rs_ir::ir::Attr>::ITEM],
         };
     }
 }
@@ -348,7 +348,7 @@ fn expand_attr_mnemonic(input: &DeriveInput, data: &syn::DataEnum) -> syn::Resul
     let what = words(&type_name);
     let entry = format_ident!("__GPT_RS_ATTR_ENUM_{}", type_name.to_uppercase());
     Ok(quote! {
-        impl ::gpt_rs_ir::attr::Mnemonic for #name {
+        impl ::gpt_rs_ir::ir::Mnemonic for #name {
             const ALL: &'static [Self] = &[#(Self::#variants),*];
             fn mnemonic(self) -> &'static str {
                 match self { #(Self::#variants => #names),* }
@@ -358,25 +358,25 @@ fn expand_attr_mnemonic(input: &DeriveInput, data: &syn::DataEnum) -> syn::Resul
             }
         }
 
-        impl ::gpt_rs_ir::attr::Attr for #name {
+        impl ::gpt_rs_ir::ir::Attr for #name {
             const ITEM: &'static str = #type_name;
 
             fn print(&self, out: &mut ::std::string::String) {
-                out.push_str(::gpt_rs_ir::attr::Mnemonic::mnemonic(*self));
+                out.push_str(::gpt_rs_ir::ir::Mnemonic::mnemonic(*self));
             }
             fn parse(c: &mut ::gpt_rs_ir::text::Cursor<'_>) -> ::anyhow::Result<Self> {
-                ::gpt_rs_ir::attr::parse_mnemonic(c, #what)
+                ::gpt_rs_ir::ir::parse_mnemonic(c, #what)
             }
             fn peek(c: &::gpt_rs_ir::text::Cursor<'_>) -> bool {
-                ::gpt_rs_ir::attr::peek_mnemonic::<Self>(c)
+                ::gpt_rs_ir::ir::peek_mnemonic::<Self>(c)
             }
         }
 
-        #[::gpt_rs_ir::linkme::distributed_slice(::gpt_rs_ir::attr::ATTR_ENUMS)]
+        #[::gpt_rs_ir::linkme::distributed_slice(::gpt_rs_ir::ir::ATTR_ENUMS)]
         #[linkme(crate = ::gpt_rs_ir::linkme)]
-        static #entry: ::gpt_rs_ir::attr::AttrEnum = ::gpt_rs_ir::attr::AttrEnum {
+        static #entry: ::gpt_rs_ir::ir::AttrEnum = ::gpt_rs_ir::ir::AttrEnum {
             name: #type_name,
-            values: ::gpt_rs_ir::attr::enum_values::<#name>,
+            values: ::gpt_rs_ir::ir::enum_values::<#name>,
         };
     })
 }
@@ -420,7 +420,7 @@ fn expand_attr_enum(input: &DeriveInput, data: &syn::DataEnum) -> syn::Result<To
                 Self::#ident(group) => {
                     out.push_str(#text);
                     let mut attrs = ::std::vec::Vec::new();
-                    ::gpt_rs_ir::attr::AttrGroup::print_attrs(group, &mut attrs);
+                    ::gpt_rs_ir::ir::AttrGroup::print_attrs(group, &mut attrs);
                     let params: ::std::vec::Vec<::std::string::String> = attrs
                         .into_iter()
                         .map(|(key, value)| format!("{} = {}", key, value))
@@ -438,7 +438,7 @@ fn expand_attr_enum(input: &DeriveInput, data: &syn::DataEnum) -> syn::Result<To
                 if #peek {
                     c.next_token();
                     return ::std::result::Result::Ok(Self::#ident(
-                        <#group as ::gpt_rs_ir::attr::AttrGroup>::parse_params(#text, c)?,
+                        <#group as ::gpt_rs_ir::ir::AttrGroup>::parse_params(#text, c)?,
                     ));
                 }
             });
@@ -904,22 +904,22 @@ pub fn op(args: TokenStream, input: TokenStream) -> TokenStream {
 
 fn kind_tokens(kind: KindSpec) -> TokenStream2 {
     match kind {
-        KindSpec::Any => quote!(::gpt_rs_ir::op::Kind::Any),
-        KindSpec::Tensor => quote!(::gpt_rs_ir::op::Kind::Tensor),
-        KindSpec::Buffer => quote!(::gpt_rs_ir::op::Kind::Buffer),
-        KindSpec::Index => quote!(::gpt_rs_ir::op::Kind::Index),
-        KindSpec::Scalar => quote!(::gpt_rs_ir::op::Kind::Scalar),
+        KindSpec::Any => quote!(::gpt_rs_ir::ir::Kind::Any),
+        KindSpec::Tensor => quote!(::gpt_rs_ir::ir::Kind::Tensor),
+        KindSpec::Buffer => quote!(::gpt_rs_ir::ir::Kind::Buffer),
+        KindSpec::Index => quote!(::gpt_rs_ir::ir::Kind::Index),
+        KindSpec::Scalar => quote!(::gpt_rs_ir::ir::Kind::Scalar),
     }
 }
 
 /// The element type of a group under view `V`.
 fn element_type(kind: KindSpec) -> TokenStream2 {
     match kind {
-        KindSpec::Any => quote!(<V as ::gpt_rs_ir::op::View>::Any),
-        KindSpec::Tensor => quote!(<V as ::gpt_rs_ir::op::View>::Tensor),
-        KindSpec::Buffer => quote!(<V as ::gpt_rs_ir::op::View>::Buffer),
-        KindSpec::Index => quote!(<V as ::gpt_rs_ir::op::View>::Index),
-        KindSpec::Scalar => quote!(<V as ::gpt_rs_ir::op::View>::Scalar),
+        KindSpec::Any => quote!(<V as ::gpt_rs_ir::ir::View>::Any),
+        KindSpec::Tensor => quote!(<V as ::gpt_rs_ir::ir::View>::Tensor),
+        KindSpec::Buffer => quote!(<V as ::gpt_rs_ir::ir::View>::Buffer),
+        KindSpec::Index => quote!(<V as ::gpt_rs_ir::ir::View>::Index),
+        KindSpec::Scalar => quote!(<V as ::gpt_rs_ir::ir::View>::Scalar),
     }
 }
 
@@ -927,10 +927,10 @@ fn element_type(kind: KindSpec) -> TokenStream2 {
 fn project(kind: KindSpec) -> TokenStream2 {
     match kind {
         KindSpec::Any => quote!(::std::option::Option::Some),
-        KindSpec::Tensor => quote!(<V as ::gpt_rs_ir::op::View>::tensor),
-        KindSpec::Buffer => quote!(<V as ::gpt_rs_ir::op::View>::buffer),
-        KindSpec::Index => quote!(<V as ::gpt_rs_ir::op::View>::index),
-        KindSpec::Scalar => quote!(<V as ::gpt_rs_ir::op::View>::scalar),
+        KindSpec::Tensor => quote!(<V as ::gpt_rs_ir::ir::View>::tensor),
+        KindSpec::Buffer => quote!(<V as ::gpt_rs_ir::ir::View>::buffer),
+        KindSpec::Index => quote!(<V as ::gpt_rs_ir::ir::View>::index),
+        KindSpec::Scalar => quote!(<V as ::gpt_rs_ir::ir::View>::scalar),
     }
 }
 
@@ -938,10 +938,10 @@ fn project(kind: KindSpec) -> TokenStream2 {
 fn embed(kind: KindSpec) -> TokenStream2 {
     match kind {
         KindSpec::Any => quote!((|x| x)),
-        KindSpec::Tensor => quote!(<V as ::gpt_rs_ir::op::Embed>::from_tensor),
-        KindSpec::Buffer => quote!(<V as ::gpt_rs_ir::op::Embed>::from_buffer),
-        KindSpec::Index => quote!(<V as ::gpt_rs_ir::op::Embed>::from_index),
-        KindSpec::Scalar => quote!(<V as ::gpt_rs_ir::op::Embed>::from_scalar),
+        KindSpec::Tensor => quote!(<V as ::gpt_rs_ir::ir::Embed>::from_tensor),
+        KindSpec::Buffer => quote!(<V as ::gpt_rs_ir::ir::Embed>::from_buffer),
+        KindSpec::Index => quote!(<V as ::gpt_rs_ir::ir::Embed>::from_index),
+        KindSpec::Scalar => quote!(<V as ::gpt_rs_ir::ir::Embed>::from_scalar),
     }
 }
 
@@ -977,7 +977,7 @@ fn group_code(
         quote!()
     };
     let struct_def = quote! {
-        #vis struct #struct_name<V: ::gpt_rs_ir::op::View> {
+        #vis struct #struct_name<V: ::gpt_rs_ir::ir::View> {
             #(#fields,)*
             #phantom
         }
@@ -987,22 +987,22 @@ fn group_code(
         let name = g.name.unraw().to_string();
         let kind = kind_tokens(g.kind);
         let arity = match g.arity {
-            AritySpec::One => quote!(::gpt_rs_ir::op::Arity::One),
-            AritySpec::Optional => quote!(::gpt_rs_ir::op::Arity::Optional),
-            AritySpec::Variadic => quote!(::gpt_rs_ir::op::Arity::Variadic),
+            AritySpec::One => quote!(::gpt_rs_ir::ir::Arity::One),
+            AritySpec::Optional => quote!(::gpt_rs_ir::ir::Arity::Optional),
+            AritySpec::Variadic => quote!(::gpt_rs_ir::ir::Arity::Variadic),
         };
-        quote!(::gpt_rs_ir::op::Group { name: #name, kind: #kind, arity: #arity })
+        quote!(::gpt_rs_ir::ir::Group { name: #name, kind: #kind, arity: #arity })
     });
     let consts =
-        quote!(const #consts_name: &'static [::gpt_rs_ir::op::Group] = &[#(#group_entries),*];);
+        quote!(const #consts_name: &'static [::gpt_rs_ir::ir::Group] = &[#(#group_entries),*];);
 
     let takes = groups.iter().enumerate().map(|(i, g)| {
         let name = &g.name;
         let proj = project(g.kind);
         match g.arity {
-            AritySpec::One => quote!(#name: ::gpt_rs_ir::op::take_one(&mut items, #proj, &Self::#consts_name[#i], #what)?),
-            AritySpec::Optional => quote!(#name: ::gpt_rs_ir::op::take_optional(&mut items, sizes[#i], #proj, &Self::#consts_name[#i], #what)?),
-            AritySpec::Variadic => quote!(#name: ::gpt_rs_ir::op::take_many(&mut items, sizes[#i], #proj, &Self::#consts_name[#i], #what)?),
+            AritySpec::One => quote!(#name: ::gpt_rs_ir::ir::take_one(&mut items, #proj, &Self::#consts_name[#i], #what)?),
+            AritySpec::Optional => quote!(#name: ::gpt_rs_ir::ir::take_optional(&mut items, sizes[#i], #proj, &Self::#consts_name[#i], #what)?),
+            AritySpec::Variadic => quote!(#name: ::gpt_rs_ir::ir::take_many(&mut items, sizes[#i], #proj, &Self::#consts_name[#i], #what)?),
         }
     });
     let phantom_init = if groups.is_empty() {
@@ -1017,7 +1017,7 @@ fn group_code(
         quote! {
             match segments {
                 ::std::option::Option::Some(_) => {
-                    ::gpt_rs_ir::op::group_sizes(Self::#consts_name, flat.len(), segments, #what)?;
+                    ::gpt_rs_ir::ir::group_sizes(Self::#consts_name, flat.len(), segments, #what)?;
                 }
                 ::std::option::Option::None => ::anyhow::ensure!(
                     flat.len() == #count,
@@ -1030,7 +1030,7 @@ fn group_code(
         }
     } else {
         quote! {
-            let sizes = ::gpt_rs_ir::op::group_sizes(Self::#consts_name, flat.len(), segments, #what)?;
+            let sizes = ::gpt_rs_ir::ir::group_sizes(Self::#consts_name, flat.len(), segments, #what)?;
         }
     };
     let split = quote! {
@@ -1058,16 +1058,16 @@ fn group_code(
         }
     });
     let flatten = quote! {
-        let mut flat = ::gpt_rs_ir::op::Flat::new();
-        let mut sizes: ::gpt_rs_ir::op::Flat<usize> = ::gpt_rs_ir::op::Flat::new();
+        let mut flat = ::gpt_rs_ir::ir::Flat::new();
+        let mut sizes: ::gpt_rs_ir::ir::Flat<usize> = ::gpt_rs_ir::ir::Flat::new();
         #(#pushes)*
-        (flat, ::gpt_rs_ir::op::segments_if_needed(Self::#consts_name, &sizes))
+        (flat, ::gpt_rs_ir::ir::segments_if_needed(Self::#consts_name, &sizes))
     };
 
     let struct_def = if groups.is_empty() {
         quote! {
             #struct_def
-            impl<V: ::gpt_rs_ir::op::View> ::std::default::Default for #struct_name<V> {
+            impl<V: ::gpt_rs_ir::ir::View> ::std::default::Default for #struct_name<V> {
                 fn default() -> Self { #struct_name { _view: ::std::marker::PhantomData } }
             }
         }
@@ -1086,8 +1086,8 @@ fn group_code(
 /// The conversions of operands into the `Values` view that `create` takes: a value, or a tuple of
 /// values for several groups, where a value is anything that converts into a `Value`.
 fn operands_from(struct_name: &Ident, groups: &[GroupSpec]) -> TokenStream2 {
-    let values = quote!(::gpt_rs_ir::op::Values);
-    let value = quote!(::gpt_rs_ir::module::Value);
+    let values = quote!(::gpt_rs_ir::ir::Values);
+    let value = quote!(::gpt_rs_ir::ir::Value);
     if groups.is_empty() {
         return quote! {
             impl ::std::convert::From<()> for #struct_name<#values> {
@@ -1102,8 +1102,8 @@ fn operands_from(struct_name: &Ident, groups: &[GroupSpec]) -> TokenStream2 {
                 impl ::std::convert::From<#value> for #struct_name<#values> {
                     fn from(value: #value) -> Self { #struct_name { #name: value } }
                 }
-                impl ::std::convert::From<::gpt_rs_ir::module::ValueRef<'_>> for #struct_name<#values> {
-                    fn from(value: ::gpt_rs_ir::module::ValueRef<'_>) -> Self {
+                impl ::std::convert::From<::gpt_rs_ir::ir::ValueRef<'_>> for #struct_name<#values> {
+                    fn from(value: ::gpt_rs_ir::ir::ValueRef<'_>) -> Self {
                         #struct_name { #name: value.into() }
                     }
                 }
@@ -1141,7 +1141,7 @@ fn operands_from(struct_name: &Ident, groups: &[GroupSpec]) -> TokenStream2 {
 
 /// What `create` gives for an op with these result groups, and how it is made from the groups.
 fn created(results_ident: &Ident, groups: &[GroupSpec]) -> (TokenStream2, TokenStream2) {
-    let value = quote!(::gpt_rs_ir::module::Value);
+    let value = quote!(::gpt_rs_ir::ir::Value);
     match groups {
         [] => (quote!(()), quote!(let _ = results;)),
         [group] if group.arity == AritySpec::One => {
@@ -1153,7 +1153,7 @@ fn created(results_ident: &Ident, groups: &[GroupSpec]) -> (TokenStream2, TokenS
             (quote!(::std::vec::Vec<#value>), quote!(results.#name))
         }
         _ => (
-            quote!(#results_ident<::gpt_rs_ir::op::Values>),
+            quote!(#results_ident<::gpt_rs_ir::ir::Values>),
             quote!(results),
         ),
     }
@@ -1166,7 +1166,7 @@ fn matched_accessors(
     results: &[GroupSpec],
     regions: &[RegionSpec],
 ) -> TokenStream2 {
-    let value_ref = quote!(::gpt_rs_ir::module::ValueRef<'m>);
+    let value_ref = quote!(::gpt_rs_ir::ir::ValueRef<'m>);
     let group = |field: TokenStream2, g: &GroupSpec| {
         let name = &g.name;
         match g.arity {
@@ -1186,11 +1186,11 @@ fn matched_accessors(
     let region_fns = regions.iter().map(|r| {
         let name = &r.name;
         quote! {
-            pub fn #name(&self) -> ::gpt_rs_ir::module::RegionRef<'m> { self.regions.#name }
+            pub fn #name(&self) -> ::gpt_rs_ir::ir::RegionRef<'m> { self.regions.#name }
         }
     });
     quote! {
-        impl<'m, T: ::gpt_rs_ir::op::OpKind> ::gpt_rs_ir::op::Matched<'m, T, #groups> {
+        impl<'m, T: ::gpt_rs_ir::ir::OpKind> ::gpt_rs_ir::ir::Matched<'m, T, #groups> {
             #(#operand_fns)*
             #(#result_fns)*
             #(#region_fns)*
@@ -1244,10 +1244,10 @@ fn groups_code(
     let (regions_def, regions_ty, split_regions, flatten_regions) = if regions.is_empty() {
         (
             quote!(),
-            quote!(::gpt_rs_ir::op::NoRegions),
+            quote!(::gpt_rs_ir::ir::NoRegions),
             quote! {
                 ::anyhow::ensure!(flat.is_empty(), "expected no regions, got {}", flat.len());
-                ::std::result::Result::Ok(::gpt_rs_ir::op::NoRegions)
+                ::std::result::Result::Ok(::gpt_rs_ir::ir::NoRegions)
             },
             quote! { ::std::vec::Vec::new() },
         )
@@ -1267,7 +1267,7 @@ fn groups_code(
     };
     let terminator_arms = regions.iter().enumerate().map(|(i, r)| {
         let term = &r.terminator;
-        quote!(#i => <#term as ::gpt_rs_ir::op::InOp>::cast(op).is_some(),)
+        quote!(#i => <#term as ::gpt_rs_ir::ir::InOp>::cast(op).is_some(),)
     });
     quote! {
         #operands_def
@@ -1276,9 +1276,9 @@ fn groups_code(
         #operands_from
         #accessors
 
-        impl ::gpt_rs_ir::op::Groups for #target {
-            type Operands<V: ::gpt_rs_ir::op::View> = #operands_ident<V>;
-            type Results<V: ::gpt_rs_ir::op::View> = #results_ident<V>;
+        impl ::gpt_rs_ir::ir::Groups for #target {
+            type Operands<V: ::gpt_rs_ir::ir::View> = #operands_ident<V>;
+            type Results<V: ::gpt_rs_ir::ir::View> = #results_ident<V>;
             type Regions<R> = #regions_ty;
             type Created = #created_ty;
 
@@ -1286,29 +1286,29 @@ fn groups_code(
             #results_const
             const REGIONS: &'static [&'static str] = &[#(#region_names),*];
 
-            fn split_operands<V: ::gpt_rs_ir::op::View>(
+            fn split_operands<V: ::gpt_rs_ir::ir::View>(
                 flat: impl ::std::iter::ExactSizeIterator<Item = V::Any>,
                 segments: ::std::option::Option<&[usize]>,
             ) -> ::anyhow::Result<Self::Operands<V>> {
                 #split_operands
             }
 
-            fn flatten_operands<V: ::gpt_rs_ir::op::Embed>(
+            fn flatten_operands<V: ::gpt_rs_ir::ir::Embed>(
                 groups: Self::Operands<V>,
-            ) -> (::gpt_rs_ir::op::Flat<V::Any>, ::std::option::Option<::std::vec::Vec<usize>>) {
+            ) -> (::gpt_rs_ir::ir::Flat<V::Any>, ::std::option::Option<::std::vec::Vec<usize>>) {
                 #flatten_operands
             }
 
-            fn split_results<V: ::gpt_rs_ir::op::View>(
+            fn split_results<V: ::gpt_rs_ir::ir::View>(
                 flat: impl ::std::iter::ExactSizeIterator<Item = V::Any>,
                 segments: ::std::option::Option<&[usize]>,
             ) -> ::anyhow::Result<Self::Results<V>> {
                 #split_results
             }
 
-            fn flatten_results<V: ::gpt_rs_ir::op::Embed>(
+            fn flatten_results<V: ::gpt_rs_ir::ir::Embed>(
                 groups: Self::Results<V>,
-            ) -> (::gpt_rs_ir::op::Flat<V::Any>, ::std::option::Option<::std::vec::Vec<usize>>) {
+            ) -> (::gpt_rs_ir::ir::Flat<V::Any>, ::std::option::Option<::std::vec::Vec<usize>>) {
                 #flatten_results
             }
 
@@ -1320,7 +1320,7 @@ fn groups_code(
                 #flatten_regions
             }
 
-            fn created(results: Self::Results<::gpt_rs_ir::op::Values>) -> Self::Created {
+            fn created(results: Self::Results<::gpt_rs_ir::ir::Values>) -> Self::Created {
                 #created_body
             }
 
@@ -1538,7 +1538,7 @@ fn attr_code(fields: &[FieldSpec], form: AttrForm) -> AttrCode {
         quote! {
             if !(#skip) {
                 let mut text = ::std::string::String::new();
-                ::gpt_rs_ir::attr::Attr::print(&self.#ident, &mut text);
+                ::gpt_rs_ir::ir::Attr::print(&self.#ident, &mut text);
                 out.push((#key, text));
             }
         }
@@ -1548,10 +1548,10 @@ fn attr_code(fields: &[FieldSpec], form: AttrForm) -> AttrCode {
         .map(|field| {
             let (key, ty, default) = (&field.key, &field.ty, field.default.is_some());
             quote! {
-                ::gpt_rs_ir::op::AttrInfo {
+                ::gpt_rs_ir::ir::AttrInfo {
                     name: #key,
-                    type_name: <#ty as ::gpt_rs_ir::attr::Attr>::type_name,
-                    item: <#ty as ::gpt_rs_ir::attr::Attr>::ITEM,
+                    type_name: <#ty as ::gpt_rs_ir::ir::Attr>::type_name,
+                    item: <#ty as ::gpt_rs_ir::ir::Attr>::ITEM,
                     default: #default,
                 }
             }
@@ -1566,10 +1566,10 @@ fn attr_code(fields: &[FieldSpec], form: AttrForm) -> AttrCode {
     };
     let (slots, reader) = format::read_entries(&entries, &owner, kind, unknown);
     let read = match form {
-        AttrForm::Dict => quote!(::gpt_rs_ir::attr::parse_dict(c, #reader)?;),
+        AttrForm::Dict => quote!(::gpt_rs_ir::ir::parse_dict(c, #reader)?;),
         AttrForm::Params => quote! {
             if c.eat("<") {
-                ::gpt_rs_ir::attr::parse_entries(c, #reader)?;
+                ::gpt_rs_ir::ir::parse_entries(c, #reader)?;
                 c.expect(">")?;
             }
         },
@@ -1628,7 +1628,7 @@ fn symbol_impl(ident: &Ident, op_name: &LitStr, fields: &[FieldSpec]) -> syn::Re
         ));
     }
     let has_results = has("results");
-    let attr_trait = quote!(::gpt_rs_ir::attr::Attr);
+    let attr_trait = quote!(::gpt_rs_ir::ir::Attr);
     // A per-item attribute: its field, its key, the type of one item's value, whether an item
     // may lack it, whether it is per argument or per result, and the local of the items read.
     struct ItemAttr<'a> {
@@ -1725,7 +1725,7 @@ fn symbol_impl(ident: &Ident, op_name: &LitStr, fields: &[FieldSpec]) -> syn::Re
         });
         quote! {
             #slots
-            ::gpt_rs_ir::attr::parse_dict(c, #reader)?;
+            ::gpt_rs_ir::ir::parse_dict(c, #reader)?;
             #(#pushes)*
         }
     };
@@ -1787,15 +1787,15 @@ fn symbol_impl(ident: &Ident, op_name: &LitStr, fields: &[FieldSpec]) -> syn::Re
         quote! {
             c.expect("->")?;
             results_at = c.position();
-            let results: ::std::vec::Vec<::gpt_rs_ir::types::Type> = if c.eat("(") {
+            let results: ::std::vec::Vec<::gpt_rs_ir::ir::Type> = if c.eat("(") {
                 c.list(")", |c| {
-                    let ty = <::gpt_rs_ir::types::Type as #attr_trait>::parse(c)?;
+                    let ty = <::gpt_rs_ir::ir::Type as #attr_trait>::parse(c)?;
                     #read_result_attrs
                     ::std::result::Result::Ok(ty)
                 })?
             } else {
                 #(#no_attrs)*
-                ::std::vec![<::gpt_rs_ir::types::Type as #attr_trait>::parse(c)?]
+                ::std::vec![<::gpt_rs_ir::ir::Type as #attr_trait>::parse(c)?]
             };
         }
     } else {
@@ -1834,7 +1834,7 @@ fn symbol_impl(ident: &Ident, op_name: &LitStr, fields: &[FieldSpec]) -> syn::Re
     let item_fields = item_attrs.iter().map(|attr| &attr.field.ident);
 
     Ok(quote! {
-        impl ::gpt_rs_ir::op::SymbolOp for #ident {
+        impl ::gpt_rs_ir::ir::SymbolOp for #ident {
             fn symbol(&self) -> &str {
                 &self.name
             }
@@ -1866,7 +1866,7 @@ fn symbol_impl(ident: &Ident, op_name: &LitStr, fields: &[FieldSpec]) -> syn::Re
             #[allow(unreachable_code)]
             fn parse_signature(
                 c: &mut ::gpt_rs_ir::text::Cursor<'_>,
-            ) -> ::anyhow::Result<::gpt_rs_ir::op::ParsedSymbol<Self>> {
+            ) -> ::anyhow::Result<::gpt_rs_ir::ir::ParsedSymbol<Self>> {
                 let name = c
                     .sigil_name(::gpt_rs_ir::text::TokenKind::Symbol, "a symbol")?
                     .to_string();
@@ -1880,15 +1880,15 @@ fn symbol_impl(ident: &Ident, op_name: &LitStr, fields: &[FieldSpec]) -> syn::Re
                         .sigil_name(::gpt_rs_ir::text::TokenKind::Value, "an argument")?
                         .to_string();
                     c.expect(":")?;
-                    let ty = <::gpt_rs_ir::types::Type as #attr_trait>::parse(c)?;
+                    let ty = <::gpt_rs_ir::ir::Type as #attr_trait>::parse(c)?;
                     #read_arg_attrs
-                    ::std::result::Result::Ok(::gpt_rs_ir::op::NamedArg { name: arg, at, ty })
+                    ::std::result::Result::Ok(::gpt_rs_ir::ir::NamedArg { name: arg, at, ty })
                 })?;
                 #read_results
                 #other_slots
                 if c.eat("attributes") {
                     c.expect("{")?;
-                    ::gpt_rs_ir::attr::parse_entries(c, #other_reader)?;
+                    ::gpt_rs_ir::ir::parse_entries(c, #other_reader)?;
                     c.expect("}")?;
                 }
                 #(#build_items)*
@@ -1999,15 +1999,15 @@ fn expand_op_in(
     let op_traits = trait_slice(&traits);
     // The folder that `#[fold]` registers for this op, found once.
     let fold_body = quote! {
-        static FOLDER: ::std::sync::OnceLock<::std::option::Option<::gpt_rs_ir::op::FoldFn>> =
+        static FOLDER: ::std::sync::OnceLock<::std::option::Option<::gpt_rs_ir::ir::FoldFn>> =
             ::std::sync::OnceLock::new();
         let fold = (*FOLDER.get_or_init(|| {
-            ::gpt_rs_ir::op::folder_of(::std::any::TypeId::of::<Self>())
+            ::gpt_rs_ir::ir::folder_of(::std::any::TypeId::of::<Self>())
         }))?;
         fold(self, ins, segments, results)
     };
     let declare_regions = if has_regions {
-        quote!(impl ::gpt_rs_ir::op::DeclaresRegions for #ident {})
+        quote!(impl ::gpt_rs_ir::ir::DeclaresRegions for #ident {})
     } else {
         quote!()
     };
@@ -2022,9 +2022,9 @@ fn expand_op_in(
             (print, parse, quote!(&[#(#infos),*]), quote!())
         }
         AttrSource::Group(group) => (
-            quote!(<#group as ::gpt_rs_ir::attr::AttrGroup>::print_attrs(&self.0, out)),
-            quote!(<#group as ::gpt_rs_ir::attr::AttrGroup>::parse_attrs(name, c, other_attr).map(Self)),
-            quote!(<#group as ::gpt_rs_ir::attr::AttrGroup>::INFOS),
+            quote!(<#group as ::gpt_rs_ir::ir::AttrGroup>::print_attrs(&self.0, out)),
+            quote!(<#group as ::gpt_rs_ir::ir::AttrGroup>::parse_attrs(name, c, other_attr).map(Self)),
+            quote!(<#group as ::gpt_rs_ir::ir::AttrGroup>::INFOS),
             quote! {
                 impl ::std::ops::Deref for #ident {
                     type Target = #group;
@@ -2052,7 +2052,7 @@ fn expand_op_in(
     let family_info = match &family {
         Some(f) => {
             let (name, doc) = (f.ident.to_string(), &f.doc);
-            quote!(::std::option::Option::Some(::gpt_rs_ir::op::FamilyInfo { name: #name, doc: #doc }))
+            quote!(::std::option::Option::Some(::gpt_rs_ir::ir::FamilyInfo { name: #name, doc: #doc }))
         }
         None => quote!(::std::option::Option::None),
     };
@@ -2067,22 +2067,22 @@ fn expand_op_in(
             quote! {
                 #trait_impl
 
-                impl ::gpt_rs_ir::op::OpDef for #ident {
+                impl ::gpt_rs_ir::ir::OpDef for #ident {
                     fn result_types(
                         &self,
-                        ins: ::gpt_rs_ir::op::Operands<Self, ::gpt_rs_ir::op::Types<'_>>,
-                        cx: &::gpt_rs_ir::op::TypeCx<'_, ::gpt_rs_ir::op::Regions<Self, ::gpt_rs_ir::module::Region>>,
-                    ) -> ::anyhow::Result<::gpt_rs_ir::op::Results<Self, ::gpt_rs_ir::op::OwnedTypes>> {
+                        ins: ::gpt_rs_ir::ir::Operands<Self, ::gpt_rs_ir::ir::Types<'_>>,
+                        cx: &::gpt_rs_ir::ir::TypeCx<'_, ::gpt_rs_ir::ir::Regions<Self, ::gpt_rs_ir::ir::Region>>,
+                    ) -> ::anyhow::Result<::gpt_rs_ir::ir::Results<Self, ::gpt_rs_ir::ir::OwnedTypes>> {
                         #rule(self, ins, cx)
                     }
                 }
 
-                impl ::gpt_rs_ir::op::Eval for #ident {
+                impl ::gpt_rs_ir::ir::Eval for #ident {
                     fn eval(
                         &self,
-                        ins: ::gpt_rs_ir::op::Operands<Self, ::gpt_rs_ir::op::Host<'_>>,
-                        cx: &mut ::gpt_rs_ir::op::EvalCx<'_, ::gpt_rs_ir::op::Regions<Self, ::gpt_rs_ir::module::Region>>,
-                    ) -> ::anyhow::Result<::gpt_rs_ir::op::Results<Self, ::gpt_rs_ir::op::OwnedHost>> {
+                        ins: ::gpt_rs_ir::ir::Operands<Self, ::gpt_rs_ir::ir::Host<'_>>,
+                        cx: &mut ::gpt_rs_ir::ir::EvalCx<'_, ::gpt_rs_ir::ir::Regions<Self, ::gpt_rs_ir::ir::Region>>,
+                    ) -> ::anyhow::Result<::gpt_rs_ir::ir::Results<Self, ::gpt_rs_ir::ir::OwnedHost>> {
                         #eval(self, ins, cx)
                     }
                 }
@@ -2093,8 +2093,8 @@ fn expand_op_in(
 
     let constant_hook = if constant {
         quote! {
-            fn dyn_constant(&self) -> ::std::option::Option<&::gpt_rs_ir::dense::Dense> {
-                ::std::option::Option::Some(<Self as ::gpt_rs_ir::op::ConstantOp>::value(self))
+            fn dyn_constant(&self) -> ::std::option::Option<&::gpt_rs_ir::ir::Dense> {
+                ::std::option::Option::Some(<Self as ::gpt_rs_ir::ir::ConstantOp>::value(self))
             }
         }
     } else {
@@ -2113,7 +2113,7 @@ fn expand_op_in(
     let (symbol_hook, parse_symbol) = if symbol {
         (
             quote! {
-                fn dyn_symbol(&self) -> ::std::option::Option<&dyn ::gpt_rs_ir::op::SymbolOp> {
+                fn dyn_symbol(&self) -> ::std::option::Option<&dyn ::gpt_rs_ir::ir::SymbolOp> {
                     ::std::option::Option::Some(self)
                 }
             },
@@ -2121,11 +2121,11 @@ fn expand_op_in(
                 fn parse_symbol(
                     name: &str,
                     c: &mut ::gpt_rs_ir::text::Cursor<'_>,
-                ) -> ::std::option::Option<::anyhow::Result<::gpt_rs_ir::op::ParsedSymbol<Self>>> {
+                ) -> ::std::option::Option<::anyhow::Result<::gpt_rs_ir::ir::ParsedSymbol<Self>>> {
                     if name != #op_name {
                         return ::std::option::Option::None;
                     }
-                    ::std::option::Option::Some(<Self as ::gpt_rs_ir::op::SymbolOp>::parse_signature(c))
+                    ::std::option::Option::Some(<Self as ::gpt_rs_ir::ir::SymbolOp>::parse_signature(c))
                 }
             },
         )
@@ -2135,9 +2135,9 @@ fn expand_op_in(
 
     let region_sigs = if has_regions {
         quote! {
-            let typed = <<Self as ::gpt_rs_ir::op::OpKind>::Groups as ::gpt_rs_ir::op::Groups>::split_operands::<::gpt_rs_ir::op::Types<'_>>(ins.iter().copied(), segments)?;
-            let sigs = <Self as ::gpt_rs_ir::op::RegionOpDef>::region_signatures(self, typed)?;
-            ::std::result::Result::Ok(<<Self as ::gpt_rs_ir::op::OpKind>::Groups as ::gpt_rs_ir::op::Groups>::flatten_regions(sigs))
+            let typed = <<Self as ::gpt_rs_ir::ir::OpKind>::Groups as ::gpt_rs_ir::ir::Groups>::split_operands::<::gpt_rs_ir::ir::Types<'_>>(ins.iter().copied(), segments)?;
+            let sigs = <Self as ::gpt_rs_ir::ir::RegionOpDef>::region_signatures(self, typed)?;
+            ::std::result::Result::Ok(<<Self as ::gpt_rs_ir::ir::OpKind>::Groups as ::gpt_rs_ir::ir::Groups>::flatten_regions(sigs))
         }
     } else {
         quote!(::std::result::Result::Ok(::std::vec::Vec::new()))
@@ -2150,20 +2150,20 @@ fn expand_op_in(
         #family_impls
         #symbol_impl
 
-        impl ::gpt_rs_ir::op::OpKind for #ident {
+        impl ::gpt_rs_ir::ir::OpKind for #ident {
             type Groups = #groups;
 
-            const INFO: ::gpt_rs_ir::op::OpInfo = ::gpt_rs_ir::op::OpInfo {
+            const INFO: ::gpt_rs_ir::ir::OpInfo = ::gpt_rs_ir::ir::OpInfo {
                 name: #op_name,
                 rust: ::std::stringify!(#ident),
                 file: ::std::file!(),
                 doc: #op_doc,
-                operands: <#groups as ::gpt_rs_ir::op::Groups>::OPERANDS,
-                results: <#groups as ::gpt_rs_ir::op::Groups>::RESULTS,
-                regions: <#groups as ::gpt_rs_ir::op::Groups>::REGIONS,
+                operands: <#groups as ::gpt_rs_ir::ir::Groups>::OPERANDS,
+                results: <#groups as ::gpt_rs_ir::ir::Groups>::RESULTS,
+                regions: <#groups as ::gpt_rs_ir::ir::Groups>::REGIONS,
                 attrs: #attr_infos,
                 traits: #op_traits,
-                effects: ::gpt_rs_ir::op::Effects {
+                effects: ::gpt_rs_ir::ir::Effects {
                     opaque: #opaque,
                     rng: #rng,
                     alloc: #alloc,
@@ -2177,8 +2177,8 @@ fn expand_op_in(
                 ::std::borrow::Cow::Borrowed(#op_name)
             }
 
-            fn effects(&self) -> ::gpt_rs_ir::op::Effects {
-                <Self as ::gpt_rs_ir::op::OpKind>::INFO.effects
+            fn effects(&self) -> ::gpt_rs_ir::ir::Effects {
+                <Self as ::gpt_rs_ir::ir::OpKind>::INFO.effects
             }
 
             fn traits(&self) -> ::gpt_rs_ir::traits::Traits {
@@ -2203,22 +2203,22 @@ fn expand_op_in(
             #parse_symbol
         }
 
-        impl ::gpt_rs_ir::op::OpDyn for #ident {
+        impl ::gpt_rs_ir::ir::OpDyn for #ident {
             fn dyn_result_types(
                 &self,
-                ins: &[&::gpt_rs_ir::types::Type],
+                ins: &[&::gpt_rs_ir::ir::Type],
                 segments: ::std::option::Option<&[usize]>,
-                regions: &[::gpt_rs_ir::module::Region],
-                module: &::gpt_rs_ir::module::Module,
-            ) -> ::anyhow::Result<(::gpt_rs_ir::op::Flat<::gpt_rs_ir::types::Type>, ::std::option::Option<::std::vec::Vec<usize>>)> {
-                let typed = <<Self as ::gpt_rs_ir::op::OpKind>::Groups as ::gpt_rs_ir::op::Groups>::split_operands::<::gpt_rs_ir::op::Types<'_>>(ins.iter().copied(), segments)?;
-                let regions = <<Self as ::gpt_rs_ir::op::OpKind>::Groups as ::gpt_rs_ir::op::Groups>::split_regions(regions.to_vec())?;
-                let out = <Self as ::gpt_rs_ir::op::OpDef>::result_types(
+                regions: &[::gpt_rs_ir::ir::Region],
+                module: &::gpt_rs_ir::ir::Module,
+            ) -> ::anyhow::Result<(::gpt_rs_ir::ir::Flat<::gpt_rs_ir::ir::Type>, ::std::option::Option<::std::vec::Vec<usize>>)> {
+                let typed = <<Self as ::gpt_rs_ir::ir::OpKind>::Groups as ::gpt_rs_ir::ir::Groups>::split_operands::<::gpt_rs_ir::ir::Types<'_>>(ins.iter().copied(), segments)?;
+                let regions = <<Self as ::gpt_rs_ir::ir::OpKind>::Groups as ::gpt_rs_ir::ir::Groups>::split_regions(regions.to_vec())?;
+                let out = <Self as ::gpt_rs_ir::ir::OpDef>::result_types(
                     self,
                     typed,
-                    &::gpt_rs_ir::op::TypeCx { module, regions },
+                    &::gpt_rs_ir::ir::TypeCx { module, regions },
                 )?;
-                ::std::result::Result::Ok(<<Self as ::gpt_rs_ir::op::OpKind>::Groups as ::gpt_rs_ir::op::Groups>::flatten_results::<::gpt_rs_ir::op::OwnedTypes>(out))
+                ::std::result::Result::Ok(<<Self as ::gpt_rs_ir::ir::OpKind>::Groups as ::gpt_rs_ir::ir::Groups>::flatten_results::<::gpt_rs_ir::ir::OwnedTypes>(out))
             }
 
             fn dyn_any(&self) -> &dyn ::std::any::Any {
@@ -2227,34 +2227,34 @@ fn expand_op_in(
 
             fn dyn_region_signatures(
                 &self,
-                ins: &[&::gpt_rs_ir::types::Type],
+                ins: &[&::gpt_rs_ir::ir::Type],
                 segments: ::std::option::Option<&[usize]>,
-            ) -> ::anyhow::Result<::std::vec::Vec<::gpt_rs_ir::op::RegionSig>> {
+            ) -> ::anyhow::Result<::std::vec::Vec<::gpt_rs_ir::ir::RegionSig>> {
                 #region_sigs
             }
 
             fn dyn_fold(
                 &self,
-                ins: &[::gpt_rs_ir::op::FoldIn<'_>],
+                ins: &[::gpt_rs_ir::ir::FoldIn<'_>],
                 segments: ::std::option::Option<&[usize]>,
-                results: &[::gpt_rs_ir::types::Type],
-            ) -> ::std::option::Option<::std::vec::Vec<::gpt_rs_ir::op::Folded>> {
+                results: &[::gpt_rs_ir::ir::Type],
+            ) -> ::std::option::Option<::std::vec::Vec<::gpt_rs_ir::ir::Folded>> {
                 #fold_body
             }
 
             fn dyn_eval(
                 &self,
-                ins: &[&::gpt_rs_ir::host::HostValue],
+                ins: &[&::gpt_rs_ir::interp::HostValue],
                 segments: ::std::option::Option<&[usize]>,
-                regions: &[::gpt_rs_ir::module::Region],
-                results: &[::gpt_rs_ir::types::Type],
-                runner: &mut dyn ::gpt_rs_ir::op::RegionRunner,
-            ) -> ::anyhow::Result<::std::vec::Vec<::gpt_rs_ir::host::HostValue>> {
-                let typed = <<Self as ::gpt_rs_ir::op::OpKind>::Groups as ::gpt_rs_ir::op::Groups>::split_operands::<::gpt_rs_ir::op::Host<'_>>(ins.iter().copied(), segments)?;
-                let regions = <<Self as ::gpt_rs_ir::op::OpKind>::Groups as ::gpt_rs_ir::op::Groups>::split_regions(regions.to_vec())?;
-                let mut cx = ::gpt_rs_ir::op::EvalCx { regions, results, runner };
-                let out = <Self as ::gpt_rs_ir::op::Eval>::eval(self, typed, &mut cx)?;
-                ::std::result::Result::Ok(<<Self as ::gpt_rs_ir::op::OpKind>::Groups as ::gpt_rs_ir::op::Groups>::flatten_results::<::gpt_rs_ir::op::OwnedHost>(out).0.into_vec())
+                regions: &[::gpt_rs_ir::ir::Region],
+                results: &[::gpt_rs_ir::ir::Type],
+                runner: &mut dyn ::gpt_rs_ir::ir::RegionRunner,
+            ) -> ::anyhow::Result<::std::vec::Vec<::gpt_rs_ir::interp::HostValue>> {
+                let typed = <<Self as ::gpt_rs_ir::ir::OpKind>::Groups as ::gpt_rs_ir::ir::Groups>::split_operands::<::gpt_rs_ir::ir::Host<'_>>(ins.iter().copied(), segments)?;
+                let regions = <<Self as ::gpt_rs_ir::ir::OpKind>::Groups as ::gpt_rs_ir::ir::Groups>::split_regions(regions.to_vec())?;
+                let mut cx = ::gpt_rs_ir::ir::EvalCx { regions, results, runner };
+                let out = <Self as ::gpt_rs_ir::ir::Eval>::eval(self, typed, &mut cx)?;
+                ::std::result::Result::Ok(<<Self as ::gpt_rs_ir::ir::OpKind>::Groups as ::gpt_rs_ir::ir::Groups>::flatten_results::<::gpt_rs_ir::ir::OwnedHost>(out).0.into_vec())
             }
 
             #constant_hook
@@ -2390,10 +2390,10 @@ fn expand_family(args: FamilyArgs, mut input: syn::ItemTrait) -> syn::Result<Tok
     // The ops of the family are ops of a dialect, with the family's groups.
     input
         .supertraits
-        .push(syn::parse_quote!(::gpt_rs_ir::op::InOp));
+        .push(syn::parse_quote!(::gpt_rs_ir::ir::InOp));
     input
         .supertraits
-        .push(syn::parse_quote!(::gpt_rs_ir::op::OpKind<Groups = #marker>));
+        .push(syn::parse_quote!(::gpt_rs_ir::ir::OpKind<Groups = #marker>));
     let doc = doc_text(&input.attrs);
     let marker_doc = format!("The groups of the ops of the family [`{ident}`].");
     let operands = args.operands.iter().map(group_tokens);
@@ -2570,8 +2570,8 @@ fn expand_attr_group(input: &DeriveInput) -> syn::Result<TokenStream2> {
     } = attr_code(&fields, AttrForm::Dict);
     let params = attr_code(&fields, AttrForm::Params).parse;
     Ok(quote! {
-        impl #impl_generics ::gpt_rs_ir::attr::AttrGroup for #ident #ty_generics #where_clause {
-            const INFOS: &'static [::gpt_rs_ir::op::AttrInfo] = &[#(#infos),*];
+        impl #impl_generics ::gpt_rs_ir::ir::AttrGroup for #ident #ty_generics #where_clause {
+            const INFOS: &'static [::gpt_rs_ir::ir::AttrInfo] = &[#(#infos),*];
 
             fn print_attrs(&self, out: &mut ::std::vec::Vec<(&'static str, ::std::string::String)>) {
                 #print
@@ -2700,15 +2700,15 @@ fn expand_dialect(input: &DeriveInput) -> syn::Result<TokenStream2> {
         }
     }
 
-    let op_kind = quote!(::gpt_rs_ir::op::OpKind);
-    let op_dyn = quote!(::gpt_rs_ir::op::OpDyn);
+    let op_kind = quote!(::gpt_rs_ir::ir::OpKind);
+    let op_dyn = quote!(::gpt_rs_ir::ir::OpDyn);
 
     Ok(quote! {
         impl #ident {
             pub const DIALECT: &'static str = #dialect_name;
 
             /// What the reference of the dialect shows about each of its ops, in order.
-            pub fn infos() -> ::std::vec::Vec<::gpt_rs_ir::op::OpInfo> {
+            pub fn infos() -> ::std::vec::Vec<::gpt_rs_ir::ir::OpInfo> {
                 ::std::vec![#(<#tys as #op_kind>::INFO),*]
             }
 
@@ -2716,7 +2716,7 @@ fn expand_dialect(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 match self { #(Self::#variants(op) => #op_kind::name(#access),)* }
             }
 
-            pub fn effects(&self) -> ::gpt_rs_ir::op::Effects {
+            pub fn effects(&self) -> ::gpt_rs_ir::ir::Effects {
                 match self { #(Self::#variants(op) => #op_kind::effects(#access),)* }
             }
 
@@ -2724,20 +2724,20 @@ fn expand_dialect(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 match self { #(Self::#variants(op) => #op_kind::traits(#access),)* }
             }
 
-            pub fn operand_groups(&self) -> &'static [::gpt_rs_ir::op::Group] {
-                match self { #(Self::#variants(_) => <<#tys as #op_kind>::Groups as ::gpt_rs_ir::op::Groups>::OPERANDS,)* }
+            pub fn operand_groups(&self) -> &'static [::gpt_rs_ir::ir::Group] {
+                match self { #(Self::#variants(_) => <<#tys as #op_kind>::Groups as ::gpt_rs_ir::ir::Groups>::OPERANDS,)* }
             }
 
-            pub fn result_groups(&self) -> &'static [::gpt_rs_ir::op::Group] {
-                match self { #(Self::#variants(_) => <<#tys as #op_kind>::Groups as ::gpt_rs_ir::op::Groups>::RESULTS,)* }
+            pub fn result_groups(&self) -> &'static [::gpt_rs_ir::ir::Group] {
+                match self { #(Self::#variants(_) => <<#tys as #op_kind>::Groups as ::gpt_rs_ir::ir::Groups>::RESULTS,)* }
             }
 
             pub fn region_names(&self) -> &'static [&'static str] {
-                match self { #(Self::#variants(_) => <<#tys as #op_kind>::Groups as ::gpt_rs_ir::op::Groups>::REGIONS,)* }
+                match self { #(Self::#variants(_) => <<#tys as #op_kind>::Groups as ::gpt_rs_ir::ir::Groups>::REGIONS,)* }
             }
 
             pub fn is_region_terminator(&self, index: usize, op: &::gpt_rs_ir::Op) -> bool {
-                match self { #(Self::#variants(_) => <<#tys as #op_kind>::Groups as ::gpt_rs_ir::op::Groups>::is_region_terminator(index, op),)* }
+                match self { #(Self::#variants(_) => <<#tys as #op_kind>::Groups as ::gpt_rs_ir::ir::Groups>::is_region_terminator(index, op),)* }
             }
 
             pub fn print_attrs(&self, out: &mut ::std::vec::Vec<(&'static str, ::std::string::String)>) {
@@ -2762,7 +2762,7 @@ fn expand_dialect(input: &DeriveInput) -> syn::Result<TokenStream2> {
             pub fn parse_symbol(
                 name: &str,
                 c: &mut ::gpt_rs_ir::text::Cursor<'_>,
-            ) -> ::std::option::Option<::anyhow::Result<::gpt_rs_ir::op::ParsedSymbol<Self>>> {
+            ) -> ::std::option::Option<::anyhow::Result<::gpt_rs_ir::ir::ParsedSymbol<Self>>> {
                 #(
                     if let ::std::option::Option::Some(result) = <#tys as #op_kind>::parse_symbol(name, c) {
                         return ::std::option::Option::Some(result.map(|(op, args)| (Self::#variants(#wrap), args)));
@@ -2793,11 +2793,11 @@ fn expand_dialect(input: &DeriveInput) -> syn::Result<TokenStream2> {
         impl #op_dyn for #ident {
             fn dyn_result_types(
                 &self,
-                ins: &[&::gpt_rs_ir::types::Type],
+                ins: &[&::gpt_rs_ir::ir::Type],
                 segments: ::std::option::Option<&[usize]>,
-                regions: &[::gpt_rs_ir::module::Region],
-                module: &::gpt_rs_ir::module::Module,
-            ) -> ::anyhow::Result<(::gpt_rs_ir::op::Flat<::gpt_rs_ir::types::Type>, ::std::option::Option<::std::vec::Vec<usize>>)> {
+                regions: &[::gpt_rs_ir::ir::Region],
+                module: &::gpt_rs_ir::ir::Module,
+            ) -> ::anyhow::Result<(::gpt_rs_ir::ir::Flat<::gpt_rs_ir::ir::Type>, ::std::option::Option<::std::vec::Vec<usize>>)> {
                 match self { #(Self::#variants(op) => #op_dyn::dyn_result_types(#access, ins, segments, regions, module),)* }
             }
 
@@ -2807,37 +2807,37 @@ fn expand_dialect(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
             fn dyn_region_signatures(
                 &self,
-                ins: &[&::gpt_rs_ir::types::Type],
+                ins: &[&::gpt_rs_ir::ir::Type],
                 segments: ::std::option::Option<&[usize]>,
-            ) -> ::anyhow::Result<::std::vec::Vec<::gpt_rs_ir::op::RegionSig>> {
+            ) -> ::anyhow::Result<::std::vec::Vec<::gpt_rs_ir::ir::RegionSig>> {
                 match self { #(Self::#variants(op) => #op_dyn::dyn_region_signatures(#access, ins, segments),)* }
             }
 
             fn dyn_fold(
                 &self,
-                ins: &[::gpt_rs_ir::op::FoldIn<'_>],
+                ins: &[::gpt_rs_ir::ir::FoldIn<'_>],
                 segments: ::std::option::Option<&[usize]>,
-                results: &[::gpt_rs_ir::types::Type],
-            ) -> ::std::option::Option<::std::vec::Vec<::gpt_rs_ir::op::Folded>> {
+                results: &[::gpt_rs_ir::ir::Type],
+            ) -> ::std::option::Option<::std::vec::Vec<::gpt_rs_ir::ir::Folded>> {
                 match self { #(Self::#variants(op) => #op_dyn::dyn_fold(#access, ins, segments, results),)* }
             }
 
             fn dyn_eval(
                 &self,
-                ins: &[&::gpt_rs_ir::host::HostValue],
+                ins: &[&::gpt_rs_ir::interp::HostValue],
                 segments: ::std::option::Option<&[usize]>,
-                regions: &[::gpt_rs_ir::module::Region],
-                results: &[::gpt_rs_ir::types::Type],
-                runner: &mut dyn ::gpt_rs_ir::op::RegionRunner,
-            ) -> ::anyhow::Result<::std::vec::Vec<::gpt_rs_ir::host::HostValue>> {
+                regions: &[::gpt_rs_ir::ir::Region],
+                results: &[::gpt_rs_ir::ir::Type],
+                runner: &mut dyn ::gpt_rs_ir::ir::RegionRunner,
+            ) -> ::anyhow::Result<::std::vec::Vec<::gpt_rs_ir::interp::HostValue>> {
                 match self { #(Self::#variants(op) => #op_dyn::dyn_eval(#access, ins, segments, regions, results, runner),)* }
             }
 
-            fn dyn_constant(&self) -> ::std::option::Option<&::gpt_rs_ir::dense::Dense> {
+            fn dyn_constant(&self) -> ::std::option::Option<&::gpt_rs_ir::ir::Dense> {
                 match self { #(Self::#variants(op) => #op_dyn::dyn_constant(#access),)* }
             }
 
-            fn dyn_symbol(&self) -> ::std::option::Option<&dyn ::gpt_rs_ir::op::SymbolOp> {
+            fn dyn_symbol(&self) -> ::std::option::Option<&dyn ::gpt_rs_ir::ir::SymbolOp> {
                 match self { #(Self::#variants(op) => #op_dyn::dyn_symbol(#access),)* }
             }
         }
@@ -2847,7 +2847,7 @@ fn expand_dialect(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 fn from(op: #tys) -> Self { ::gpt_rs_ir::Op::#op_variant(#ident::#variants(#wrap)) }
             }
 
-            impl ::gpt_rs_ir::op::InOp for #tys {
+            impl ::gpt_rs_ir::ir::InOp for #tys {
                 fn cast(op: &::gpt_rs_ir::Op) -> ::std::option::Option<&Self> {
                     match op {
                         ::gpt_rs_ir::Op::#op_variant(#ident::#variants(op)) => ::std::option::Option::Some(#access),
@@ -2910,7 +2910,7 @@ fn expand_dialect_set(input: &DeriveInput) -> syn::Result<TokenStream2> {
         variants.push(&variant.ident);
         tys.push(&fields.unnamed[0].ty);
     }
-    let op_dyn = quote!(::gpt_rs_ir::op::OpDyn);
+    let op_dyn = quote!(::gpt_rs_ir::ir::OpDyn);
     Ok(quote! {
         /// The dialect an op belongs to.
         #[derive(::std::fmt::Debug, ::std::clone::Clone, ::std::marker::Copy, ::std::cmp::PartialEq, ::std::cmp::Eq, ::std::hash::Hash)]
@@ -2928,7 +2928,7 @@ fn expand_dialect_set(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 match self { #(Self::#variants(op) => op.name(),)* }
             }
 
-            pub fn effects(&self) -> ::gpt_rs_ir::op::Effects {
+            pub fn effects(&self) -> ::gpt_rs_ir::ir::Effects {
                 match self { #(Self::#variants(op) => op.effects(),)* }
             }
 
@@ -2937,12 +2937,12 @@ fn expand_dialect_set(input: &DeriveInput) -> syn::Result<TokenStream2> {
             }
 
             /// The op's operand groups, in operand order.
-            pub fn operand_groups(&self) -> &'static [::gpt_rs_ir::op::Group] {
+            pub fn operand_groups(&self) -> &'static [::gpt_rs_ir::ir::Group] {
                 match self { #(Self::#variants(op) => op.operand_groups(),)* }
             }
 
             /// The op's result groups, in result order.
-            pub fn result_groups(&self) -> &'static [::gpt_rs_ir::op::Group] {
+            pub fn result_groups(&self) -> &'static [::gpt_rs_ir::ir::Group] {
                 match self { #(Self::#variants(op) => op.result_groups(),)* }
             }
 
@@ -2978,7 +2978,7 @@ fn expand_dialect_set(input: &DeriveInput) -> syn::Result<TokenStream2> {
             pub fn parse_symbol(
                 name: &str,
                 c: &mut ::gpt_rs_ir::text::Cursor<'_>,
-            ) -> ::std::option::Option<::anyhow::Result<::gpt_rs_ir::op::ParsedSymbol<Self>>> {
+            ) -> ::std::option::Option<::anyhow::Result<::gpt_rs_ir::ir::ParsedSymbol<Self>>> {
                 #(
                     if let ::std::option::Option::Some(result) = <#tys>::parse_symbol(name, c) {
                         return ::std::option::Option::Some(result.map(|(op, args)| (Self::#variants(op), args)));
@@ -2995,47 +2995,47 @@ fn expand_dialect_set(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
             fn dyn_result_types(
                 &self,
-                ins: &[&::gpt_rs_ir::types::Type],
+                ins: &[&::gpt_rs_ir::ir::Type],
                 segments: ::std::option::Option<&[usize]>,
-                regions: &[::gpt_rs_ir::module::Region],
-                module: &::gpt_rs_ir::module::Module,
-            ) -> ::anyhow::Result<(::gpt_rs_ir::op::Flat<::gpt_rs_ir::types::Type>, ::std::option::Option<::std::vec::Vec<usize>>)> {
+                regions: &[::gpt_rs_ir::ir::Region],
+                module: &::gpt_rs_ir::ir::Module,
+            ) -> ::anyhow::Result<(::gpt_rs_ir::ir::Flat<::gpt_rs_ir::ir::Type>, ::std::option::Option<::std::vec::Vec<usize>>)> {
                 match self { #(Self::#variants(op) => #op_dyn::dyn_result_types(op, ins, segments, regions, module),)* }
             }
 
             fn dyn_region_signatures(
                 &self,
-                ins: &[&::gpt_rs_ir::types::Type],
+                ins: &[&::gpt_rs_ir::ir::Type],
                 segments: ::std::option::Option<&[usize]>,
-            ) -> ::anyhow::Result<::std::vec::Vec<::gpt_rs_ir::op::RegionSig>> {
+            ) -> ::anyhow::Result<::std::vec::Vec<::gpt_rs_ir::ir::RegionSig>> {
                 match self { #(Self::#variants(op) => #op_dyn::dyn_region_signatures(op, ins, segments),)* }
             }
 
             fn dyn_fold(
                 &self,
-                ins: &[::gpt_rs_ir::op::FoldIn<'_>],
+                ins: &[::gpt_rs_ir::ir::FoldIn<'_>],
                 segments: ::std::option::Option<&[usize]>,
-                results: &[::gpt_rs_ir::types::Type],
-            ) -> ::std::option::Option<::std::vec::Vec<::gpt_rs_ir::op::Folded>> {
+                results: &[::gpt_rs_ir::ir::Type],
+            ) -> ::std::option::Option<::std::vec::Vec<::gpt_rs_ir::ir::Folded>> {
                 match self { #(Self::#variants(op) => #op_dyn::dyn_fold(op, ins, segments, results),)* }
             }
 
             fn dyn_eval(
                 &self,
-                ins: &[&::gpt_rs_ir::host::HostValue],
+                ins: &[&::gpt_rs_ir::interp::HostValue],
                 segments: ::std::option::Option<&[usize]>,
-                regions: &[::gpt_rs_ir::module::Region],
-                results: &[::gpt_rs_ir::types::Type],
-                runner: &mut dyn ::gpt_rs_ir::op::RegionRunner,
-            ) -> ::anyhow::Result<::std::vec::Vec<::gpt_rs_ir::host::HostValue>> {
+                regions: &[::gpt_rs_ir::ir::Region],
+                results: &[::gpt_rs_ir::ir::Type],
+                runner: &mut dyn ::gpt_rs_ir::ir::RegionRunner,
+            ) -> ::anyhow::Result<::std::vec::Vec<::gpt_rs_ir::interp::HostValue>> {
                 match self { #(Self::#variants(op) => #op_dyn::dyn_eval(op, ins, segments, regions, results, runner),)* }
             }
 
-            fn dyn_constant(&self) -> ::std::option::Option<&::gpt_rs_ir::dense::Dense> {
+            fn dyn_constant(&self) -> ::std::option::Option<&::gpt_rs_ir::ir::Dense> {
                 match self { #(Self::#variants(op) => #op_dyn::dyn_constant(op),)* }
             }
 
-            fn dyn_symbol(&self) -> ::std::option::Option<&dyn ::gpt_rs_ir::op::SymbolOp> {
+            fn dyn_symbol(&self) -> ::std::option::Option<&dyn ::gpt_rs_ir::ir::SymbolOp> {
                 match self { #(Self::#variants(op) => #op_dyn::dyn_symbol(op),)* }
             }
         }
@@ -3187,7 +3187,7 @@ fn expand_pass(args: PassArgs, input: DeriveInput) -> syn::Result<TokenStream2> 
         quote! {
             if self.#f != defaults.#f {
                 let mut text = ::std::string::String::from(concat!(#key, " = "));
-                <#ty as ::gpt_rs_ir::attr::Attr>::print(&self.#f, &mut text);
+                <#ty as ::gpt_rs_ir::ir::Attr>::print(&self.#f, &mut text);
                 changed.push(text);
             }
         }
@@ -3207,7 +3207,7 @@ fn expand_pass(args: PassArgs, input: DeriveInput) -> syn::Result<TokenStream2> 
             #[allow(non_snake_case)]
             fn #def() -> ::std::string::String {
                 let mut text = ::std::string::String::new();
-                <#ty as ::gpt_rs_ir::attr::Attr>::print(&#value.#f, &mut text);
+                <#ty as ::gpt_rs_ir::ir::Attr>::print(&#value.#f, &mut text);
                 text
             }
         }
@@ -3245,7 +3245,7 @@ fn expand_pass(args: PassArgs, input: DeriveInput) -> syn::Result<TokenStream2> 
             });
         quote! {
             #slots
-            ::gpt_rs_ir::attr::parse_dict(c, #reader)?;
+            ::gpt_rs_ir::ir::parse_dict(c, #reader)?;
             #(#sets)*
         }
     };
@@ -3335,7 +3335,7 @@ fn doc_impl(input: &DeriveInput, what: &str) -> syn::Result<TokenStream2> {
     let ident = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     Ok(quote! {
-        impl #impl_generics ::gpt_rs_ir::doc::Doc for #ident #ty_generics #where_clause {
+        impl #impl_generics ::gpt_rs_ir::rewrite::Doc for #ident #ty_generics #where_clause {
             fn name(&self) -> &'static str {
                 ::std::stringify!(#ident)
             }
@@ -3486,15 +3486,15 @@ fn expand_fold(args: TokenStream2, item: syn::ItemImpl) -> syn::Result<TokenStre
     Ok(quote! {
         #item
 
-        #[::gpt_rs_ir::linkme::distributed_slice(::gpt_rs_ir::op::FOLDS)]
+        #[::gpt_rs_ir::linkme::distributed_slice(::gpt_rs_ir::ir::FOLDS)]
         #[linkme(crate = ::gpt_rs_ir::linkme)]
-        static #entry: ::gpt_rs_ir::op::FoldEntry = ::gpt_rs_ir::op::FoldEntry {
+        static #entry: ::gpt_rs_ir::ir::FoldEntry = ::gpt_rs_ir::ir::FoldEntry {
             op: ::std::any::TypeId::of::<#ty>,
-            name: <#ty as ::gpt_rs_ir::op::OpKind>::INFO.name,
+            name: <#ty as ::gpt_rs_ir::ir::OpKind>::INFO.name,
             rust: #name,
             file: ::std::file!(),
             doc: #doc,
-            fold: ::gpt_rs_ir::op::fold_erased::<#ty>,
+            fold: ::gpt_rs_ir::ir::fold_erased::<#ty>,
         };
     })
 }
@@ -3540,13 +3540,13 @@ fn expand_cost(args: TokenStream2, item: syn::ItemImpl) -> syn::Result<TokenStre
     Ok(quote! {
         #item
 
-        #[::gpt_rs_ir::linkme::distributed_slice(::gpt_rs_ir::cost::COSTS)]
+        #[::gpt_rs_ir::linkme::distributed_slice(::gpt_rs_ir::analysis::COSTS)]
         #[linkme(crate = ::gpt_rs_ir::linkme)]
-        static #entry: ::gpt_rs_ir::cost::CostEntry = ::gpt_rs_ir::cost::CostEntry {
+        static #entry: ::gpt_rs_ir::analysis::CostEntry = ::gpt_rs_ir::analysis::CostEntry {
             op: ::std::any::TypeId::of::<#ty>,
             rust: #name,
             file: ::std::file!(),
-            cost: ::gpt_rs_ir::cost::cost_erased::<#ty>,
+            cost: ::gpt_rs_ir::analysis::cost_erased::<#ty>,
         };
     })
 }

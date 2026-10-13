@@ -1,7 +1,7 @@
 //! Where values are defined, as `Module::dominates` answers, and the order of instructions that
 //! `Module::is_before` and `Module::move_before` keep.
 
-use gpt_rs_ir::module::{Inst, Module, Region};
+use gpt_rs_ir::ir::{Inst, Module, Region};
 
 const TEXT: &str =
     "func.func @f(%0: tensor<i1>, %1: tensor<si32>) -> (tensor<si32>, tensor<si32>) {

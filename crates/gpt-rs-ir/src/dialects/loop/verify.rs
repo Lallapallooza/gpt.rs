@@ -5,10 +5,10 @@ use std::collections::BTreeSet;
 use anyhow::{anyhow, ensure, Result};
 
 use crate::dialects::r#loop::ir::*;
-use crate::index::{Expr, ReadKind};
-use crate::module::{Region, ValueDef};
-use crate::op::{NoRegions, OpDef, OwnedTypes, RegionOpDef, RegionSig, TypeCx, Types};
-use crate::types::{BufferType, DType, Dim, Space, Type};
+use crate::ir::{
+    BufferType, DType, Dim, Expr, NoRegions, OpDef, OwnedTypes, ReadKind, Region, RegionOpDef,
+    RegionSig, Space, Type, TypeCx, Types, ValueDef,
+};
 
 impl RegionOpDef for Func {
     fn region_signatures(&self, _ins: FuncOperands<Types<'_>>) -> Result<FuncRegions<RegionSig>> {

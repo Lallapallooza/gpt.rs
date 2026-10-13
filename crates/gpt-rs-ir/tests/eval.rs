@@ -1,9 +1,9 @@
 //! The semantic rules of the ops on values computed by hand: rounding, saturation, wrapping, ties,
 //! the random stream and the layouts of bits.
 
-use gpt_rs_ir::host::{HostTensor, HostValue, TensorData};
-use gpt_rs_ir::interp::run;
-use gpt_rs_ir::module::Module;
+use gpt_rs_ir::host::{HostTensor, TensorData};
+use gpt_rs_ir::interp::{run, HostValue};
+use gpt_rs_ir::ir::Module;
 
 fn f32s(dims: &[usize], values: &[f32]) -> HostValue {
     HostValue::Tensor(HostTensor::f32(dims, values.to_vec()).unwrap())

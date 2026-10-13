@@ -7,7 +7,7 @@ mod checkpoint_support;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use gpt_rs::gpt_rs_ir::module::Module;
+use gpt_rs::gpt_rs_ir::ir::Module;
 use gpt_rs::inference::decoder::PREFILL_CHUNK;
 use gpt_rs::inference::generate::{Generator, Sampling};
 use gpt_rs::ops::trace::{self, ExecutionTraceSink, ProgramContext, ProgramStats};

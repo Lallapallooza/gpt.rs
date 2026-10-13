@@ -15,10 +15,8 @@ use self::host::HostOp;
 use self::r#loop::LoopOp;
 use self::tensor::TensorOp;
 use self::tile::TileOp;
-use crate::dense::Dense;
-use crate::op::{InOp, OpDyn, SymbolOp};
+use crate::ir::{Dense, InOp, OpDyn, SymbolOp, Type};
 use crate::traits::OpTrait;
-use crate::types::Type;
 
 /// Every op of every dialect.
 #[derive(crate::DialectSet, Debug, Clone, PartialEq, Eq, Hash)]
@@ -52,7 +50,7 @@ impl Op {
         T::cast(self)
     }
 
-    /// The value of a [`ConstantOp`](crate::op::ConstantOp), such as `tensor.constant`, or
+    /// The value of a [`ConstantOp`](crate::ir::ConstantOp), such as `tensor.constant`, or
     /// `arith.constant` as a rank-0 constant.
     pub fn as_constant(&self) -> Option<&Dense> {
         self.dyn_constant()

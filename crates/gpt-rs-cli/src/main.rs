@@ -17,7 +17,7 @@ use gpt_rs::runtime::{LoadOptions, LoadedModel, ModelHandle};
 use gpt_rs::tensor::HostTensor;
 use gpt_rs::tokenizer::{StreamDecoder, Tokenizer};
 use gpt_rs_ir::dialects::func::Func;
-use gpt_rs_ir::module::Module;
+use gpt_rs_ir::ir::Module;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -921,7 +921,7 @@ fn run_conversion(args: ConvertArgs) -> Result<()> {
     let src =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let module = Module::from_text(&src).with_context(|| format!("{}", path.display()))?;
-    gpt_rs_ir::verify::verify(&module).map_err(|err| anyhow!("{}: {err}", path.display()))?;
+    gpt_rs_ir::ir::verify(&module).map_err(|err| anyhow!("{}: {err}", path.display()))?;
     let run_time: Vec<String> = module
         .funcs()
         .into_iter()

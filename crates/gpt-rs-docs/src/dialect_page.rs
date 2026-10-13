@@ -6,8 +6,9 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{bail, Result};
-use gpt_rs_ir::attr::{AttrFormat, ATTR_ENUMS, ATTR_FORMATS};
-use gpt_rs_ir::op::{Arity, Effects, FamilyInfo, Group, Kind, OpInfo, FOLDS};
+use gpt_rs_ir::ir::{
+    Arity, AttrFormat, Effects, FamilyInfo, Group, Kind, OpInfo, ATTR_ENUMS, ATTR_FORMATS, FOLDS,
+};
 use gpt_rs_ir::rewrite::RootInfo;
 use gpt_rs_ir::traits::OpTrait;
 

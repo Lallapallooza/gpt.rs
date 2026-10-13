@@ -1,7 +1,7 @@
 //! The folders of the elementwise ops.
 
 use crate::dialects::tensor::ir::*;
-use crate::op::{fold, Fold, FoldCx, FoldOut, Folded, Folding};
+use crate::ir::{fold, Fold, FoldCx, FoldOut, Folded, Folding};
 
 /// `select(pred, on_true, on_false)` is `on_true` when `pred` is all true or both branches are
 /// the same value, and `on_false` when `pred` is all false.

@@ -5,7 +5,7 @@
 use std::ops::{Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive};
 
 use gpt_rs_ir::dialects::tensor::Slice;
-use gpt_rs_ir::types::Ranked;
+use gpt_rs_ir::ir::Ranked;
 use smallvec::SmallVec;
 
 /// One entry of a Python-style index, as [`s!`](crate::s) writes it.

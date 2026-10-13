@@ -5,7 +5,7 @@ use std::fmt;
 
 use anyhow::{ensure, Result};
 
-use crate::types::{DType, TensorType};
+use crate::ir::{DType, TensorType};
 
 /// A class of dtypes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

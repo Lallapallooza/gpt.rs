@@ -2,7 +2,7 @@
 //! encoding. They cover the elements of MX, NVFP4 and FP8 quantization, bf16, f16 and the `e8m0`
 //! scales.
 
-use crate::types::DType;
+use crate::ir::DType;
 
 /// `floor(log2(x))` of a finite `x > 0` whose f64 is normal, exactly: its exponent.
 pub fn floor_log2(x: f64) -> i32 {
@@ -253,4 +253,30 @@ pub fn e8m0_decode(code: u8) -> f64 {
 /// The `e8m0` code of `2^exponent`, clamped to the codes of finite scales.
 pub fn e8m0_encode(exponent: i32) -> u8 {
     (exponent + 127).clamp(0, 254) as u8
+}
+
+/// `float8_e4m3fn`: 4 exponent bits with bias 7, 3 mantissa bits, no infinities, and NaN at
+/// `S.1111.111`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(transparent)]
+pub struct F8E4M3(pub u8);
+
+impl F8E4M3 {
+    /// The value, exactly: every e4m3 value is an f32. It computes the normal and the subnormal
+    /// form and selects one, so loops over weights vectorize.
+    pub fn to_f32(self) -> f32 {
+        let bits = u32::from(self.0);
+        let sign = (bits & 0x80) << 24;
+        let magnitude = bits & 0x7f;
+        // A normal value keeps its fields, its exponent moved from bias 7 to f32's bias 127.
+        let normal = f32::from_bits(sign | ((magnitude << 20) + (120 << 23)));
+        // A subnormal is its mantissa times 2^-9.
+        let subnormal = f32::from_bits(sign | (magnitude as f32 / 512.0).to_bits());
+        let value = if magnitude < 0x08 { subnormal } else { normal };
+        if magnitude == 0x7f {
+            f32::NAN
+        } else {
+            value
+        }
+    }
 }

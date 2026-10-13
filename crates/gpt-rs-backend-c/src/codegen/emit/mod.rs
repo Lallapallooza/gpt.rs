@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use gpt_rs_ir::dialects::tensor::TensorOp;
-use gpt_rs_ir::module::Value;
+use gpt_rs_ir::ir::Value;
 
 use super::outline::Outliner;
 use super::profile::{register_op_profile_generic, OpProfile};

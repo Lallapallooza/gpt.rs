@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args as ClapArgs, ValueEnum};
-use gpt_rs_ir::cost::{Cost, CostSummary};
+use gpt_rs_ir::analysis::{Cost, CostSummary};
 use gpt_rs_ir::dialects::func::Func;
-use gpt_rs_ir::module::{Inst, Module};
+use gpt_rs_ir::ir::{Inst, Module};
 
 /// How the tables group the ops.
 #[derive(Clone, Copy, ValueEnum)]

@@ -13,15 +13,15 @@ use super::utils::{
     store,
 };
 use crate::dialects::arith;
-use crate::dialects::tile::{Block, CombineKind, Fold, Index};
-use crate::index::{
-    AccessExpr, Cmp, Constraint, IndexExpr, IterKind, OperandRef, Read, Relation, Root, Source,
+use crate::dialects::tile::{
+    Block, CombineKind, Fold, Index, IterKind, Parallelism, Read, Schedule, Source, Step,
 };
-use crate::module::{Module, Region, Value};
+use crate::ir::{
+    AccessExpr, Cmp, Constraint, DType, Dim, IndexExpr, Module, OperandRef, Region, Relation, Root,
+    Value,
+};
 use crate::rewrite::Builder;
-use crate::schedule::{Parallelism, Schedule, Step};
 use crate::traits::Terminator;
-use crate::types::{DType, Dim};
 
 /// The value of each iterator in scope, by position.
 type Point = Vec<Option<Value>>;

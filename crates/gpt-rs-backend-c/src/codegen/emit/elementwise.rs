@@ -2,8 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, ensure, Result};
 use gpt_rs_ir::dialects::tensor::TensorOp;
-use gpt_rs_ir::module::Value;
-use gpt_rs_ir::types::DType;
+use gpt_rs_ir::ir::{DType, Value};
 
 use super::super::profile::{
     register_op_profile_binary, register_op_profile_generic, register_op_profile_unary,

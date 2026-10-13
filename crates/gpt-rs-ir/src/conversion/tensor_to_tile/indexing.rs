@@ -1,17 +1,15 @@
 use std::marker::PhantomData;
 
 use super::utils::{access, cast_to, copy};
+use crate::dialects::arith::math::Combiner;
 use crate::dialects::tensor::utils::shape::axis_index;
 use crate::dialects::tensor::{
     DynamicSlice, DynamicUpdateSlice, Gather, Iota, Scatter, ScatterReplace, Take,
 };
-use crate::dialects::tile::{par_iters, Block, CombineKind, Fold};
-use crate::index::{AccessExpr, Read, Write};
-use crate::op::Matched;
+use crate::dialects::tile::{par_iters, Block, CombineKind, Fold, Read, Write};
+use crate::ir::{AccessExpr, Dim, Matched, TensorType};
 use crate::require;
 use crate::rewrite::{pattern, NoMatch, Pattern, Rewriter};
-use crate::scalar::Combiner;
-use crate::types::{Dim, TensorType};
 
 /// `tensor.iota` is a block that yields `tile.index` of its axis.
 #[pattern]

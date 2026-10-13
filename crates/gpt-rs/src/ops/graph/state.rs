@@ -7,8 +7,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use foldhash::fast::FixedState;
-use gpt_rs_ir::location::Location;
-use gpt_rs_ir::types::{DType, Ranked, TensorType, Type};
+use gpt_rs_ir::ir::{DType, Location, Ranked, TensorType, Type};
 use gpt_rs_ir::Op;
 
 use crate::backend::PortableBackend;

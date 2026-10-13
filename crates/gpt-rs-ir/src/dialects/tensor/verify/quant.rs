@@ -4,8 +4,7 @@ use anyhow::{bail, ensure, Result};
 
 use crate::dialects::tensor::ir::*;
 use crate::dialects::tensor::utils::class::{ensure_class, ensure_dtype_class, Class};
-use crate::op::{NoRegions, OpDef, OwnedTypes, TypeCx, Types};
-use crate::types::{DType, Dim, Ranked, TensorType};
+use crate::ir::{DType, Dim, NoRegions, OpDef, OwnedTypes, Ranked, TensorType, TypeCx, Types};
 
 impl OpDef for Dequantize {
     fn result_types(

@@ -6,9 +6,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use gpt_rs_ir::location::Location;
-use gpt_rs_ir::module::Module;
-use gpt_rs_ir::types::TensorType;
+use gpt_rs_ir::ir::{Location, Module, TensorType};
 use gpt_rs_ir::Op;
 use lru::LruCache;
 use once_cell::sync::Lazy;

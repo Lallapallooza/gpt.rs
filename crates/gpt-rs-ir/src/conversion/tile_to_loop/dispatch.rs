@@ -5,13 +5,10 @@ use anyhow::{anyhow, bail, Result};
 use super::block::{copy, BlockLowering};
 use super::utils::alloc;
 use crate::dialects::r#loop::{self, Access, Return};
-use crate::dialects::tile::{Block, Dispatch};
-use crate::module::{Module, Value};
-use crate::op::Matched;
+use crate::dialects::tile::{Block, Dispatch, Schedule};
+use crate::ir::{BufferType, Dim, Matched, Module, Space, Type, Value};
 use crate::rewrite::{pattern, Builder, NoMatch, Pattern, Rewriter};
-use crate::schedule::Schedule;
 use crate::traits::Terminator;
-use crate::types::{BufferType, Dim, Space, Type};
 
 /// `tile.dispatch` becomes the `loop.func` of its name: an `in` buffer for each argument, an `out`
 /// buffer for each result, and its blocks lowered in order.
@@ -73,7 +70,7 @@ fn dims(module: &Module, value: Value) -> Result<Vec<Dim>> {
 /// parameters are `params`: its arguments, then its results.
 fn lower_body(
     module: &Module,
-    body: crate::module::Region,
+    body: crate::ir::Region,
     schedule: &Schedule,
     builder: &mut Builder<'_>,
     params: &[Value],

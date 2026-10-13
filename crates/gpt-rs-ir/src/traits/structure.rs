@@ -3,8 +3,7 @@
 use std::fmt;
 
 use super::{FoldResult, OpRef, OpTrait};
-use crate::dense::Dense;
-use crate::op::Folded;
+use crate::ir::{Dense, Folded};
 use crate::Doc;
 
 /// Each result element depends only on the operand elements at its own position, so every tensor

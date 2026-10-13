@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use gpt_rs::backend::{ParamStore, PortableBackend};
-use gpt_rs::gpt_rs_ir::module::Module;
+use gpt_rs::gpt_rs_ir::ir::Module;
 use gpt_rs::tensor::{DeviceTensor, HostTensor};
 use gpt_rs_backend_ref_cpu::CpuPortableBackend;
 

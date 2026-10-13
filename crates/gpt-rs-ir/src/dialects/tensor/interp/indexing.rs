@@ -9,12 +9,11 @@ use super::kernels::{
     accumulate, cast, from_ints, gather_elements, offsets, strided, strides, unravel, Accumulation,
     Chunks,
 };
+use crate::dialects::arith::math::Combiner;
 use crate::dialects::tensor::ir::*;
 use crate::dialects::tensor::utils::shape::{axis_index, check_size};
 use crate::host::HostTensor;
-use crate::op::{Eval, EvalCx, Host, NoRegions, OwnedHost};
-use crate::scalar::Combiner;
-use crate::types::DType;
+use crate::ir::{DType, Eval, EvalCx, Host, NoRegions, OwnedHost};
 
 impl Eval for Iota {
     fn eval(

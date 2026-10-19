@@ -2,19 +2,23 @@
 
 use smallvec::SmallVec;
 
-use crate::ir::{Constraint, DType, IndexExpr, Ranked, Type, F64};
+use crate::ir::{Constraint, DType, IndexExpr, Level, Ranked, Space, Type, F64};
+use crate::targets::TargetRef;
 use crate::traits::{IsolatedFromAbove, Terminator};
 
 // ------------------------------------------------------------------------------------------------
 // `loop.func` and `loop.return`.
 
-/// `loop.func`: one launch of a dispatch. A top-level symbol, called by `host.dispatch`.
+/// `loop.func`: one launch of a dispatch. A top-level symbol, called by `host.dispatch` with
+/// tensors and by `host.launch` with buffers.
 ///
 /// - Its body's block arguments are its parameters, `global` buffers, and `access` says how it
 ///   uses each.
-/// - It gives no results: it writes them into its `out` parameters. A call with tensors puts each
-///   argument into an `in` parameter, in order, and gives the elements of each `out` parameter as a
-///   result, in order.
+/// - It gives no results: it writes them into its `out` and `inout` parameters. A call with tensors
+///   puts each argument into an `in` or `inout` parameter, in order, and gives the elements of each
+///   `inout` or `out` parameter as a result, in order.
+/// - When it names a `target`, each `loop.forall` of its body runs at an execution level of the
+///   target, and each `loop.prefetch` asks a memory that the target prefetches into for a line.
 #[crate::op(
     "loop.func",
     regions(body(Block(Return))),
@@ -25,6 +29,13 @@ pub struct Func {
     pub name: String,
     pub args: Vec<Type>,
     pub access: Vec<Access>,
+    /// The target the dispatch's schedule was chosen for, which `loop-to-isa` writes vectors for.
+    #[attr(default)]
+    pub target: Option<TargetRef>,
+    /// Whether a product and the sum it enters may round once, as one `arith.fma`: the dispatch's
+    /// `numerics.contract`, which the `contract` pass realizes.
+    #[attr(default)]
+    pub contract: bool,
 }
 
 /// How a `loop.func` uses a parameter.
@@ -32,8 +43,17 @@ pub struct Func {
 pub enum Access {
     /// It reads the parameter and never writes it.
     In,
-    /// It writes every element of the parameter, which holds nothing it reads before.
-    Out,
+    /// It writes every element of the parameter, which holds nothing it reads before. With
+    /// `over`, the parameter may share the buffer of the `in` parameter at that position. No other
+    /// parameter may share that buffer, and the launch MUST read its elements only at positions
+    /// that it has not written yet.
+    Out {
+        #[attr(default)]
+        over: Option<usize>,
+    },
+    /// It updates the parameter in place: the parameter holds the elements of the argument when
+    /// the launch starts, and those of the result when it ends.
+    Inout,
 }
 
 /// `loop.return`: ends the body of a `loop.func`.
@@ -41,7 +61,7 @@ pub enum Access {
 pub struct Return;
 
 // ------------------------------------------------------------------------------------------------
-// Control flow: `loop.for`, `loop.if` and `loop.yield`.
+// Control flow: `loop.for`, `loop.forall`, `loop.if`, `loop.atom` and `loop.yield`.
 
 /// `loop.for`: runs its body once for each index from `start` up to, not including, `end`, in
 /// increasing order. The body's block argument is the index. It runs no time when `end` is not
@@ -70,18 +90,25 @@ pub struct Forall {
 #[crate::op("loop.if", operands(condition(Scalar)), regions(then(Block(Yield))))]
 pub struct If;
 
-/// `loop.yield`: ends the body of a `loop.for`, a `loop.forall` or a `loop.if`.
+/// `loop.atom`: runs its body once for each point of the box `tile` whose coordinates are below
+/// `extents`, one per axis, in row-major order. The points are those of a register tile, which
+/// `loop-to-isa` computes at once in vectors of `lanes` elements along the last axis. The body's
+/// block arguments are the point's coordinates. `extents` MUST NOT exceed `tile`. An extent of 0
+/// runs no point. Each point is a unit of work: two points MUST NOT access one element of a buffer
+/// when one of them writes it.
+#[crate::op(
+    "loop.atom",
+    operands(extents(Variadic(Index))),
+    regions(body(Block(Yield)))
+)]
+pub struct Atom {
+    pub tile: Ranked<usize>,
+    pub lanes: usize,
+}
+
+/// `loop.yield`: ends the body of a `loop.for`, a `loop.forall`, a `loop.if` or a `loop.atom`.
 #[crate::op("loop.yield", traits(Terminator))]
 pub struct Yield;
-
-/// An execution level of a CPU, from the outermost.
-#[derive(crate::Attr, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Level {
-    /// The cores that share one last-level cache.
-    L3,
-    /// One core.
-    Core,
-}
 
 // ------------------------------------------------------------------------------------------------
 // Index values: `loop.index` and `loop.predicate`.
@@ -105,19 +132,33 @@ pub struct Predicate {
 }
 
 // ------------------------------------------------------------------------------------------------
-// Buffers: `loop.alloc`, `loop.load` and `loop.store`.
+// Buffers: `loop.alloc`, `loop.pick`, `loop.load`, `loop.store` and `loop.prefetch`.
 
-/// `loop.alloc`: a `private` buffer of `dtype` with the static extents `shape`, which lives as long
-/// as the region that allocates it. No element holds a value until a store writes it.
+/// `loop.alloc`: a buffer of `dtype` with the static extents `shape`, in `private` scratch or in
+/// `reg` vector registers, which lives as long as the region that allocates it. No element holds a
+/// value until a store writes it.
 #[crate::op("loop.alloc", results(output(Buffer)), effects(alloc))]
 pub struct Alloc {
     pub shape: Ranked<usize>,
     pub dtype: DType,
+    #[attr(default)]
+    pub space: Space,
 }
 
+/// `loop.pick`: the buffer of `buffers` at position `index`, which MUST be one of them. The
+/// buffers are of one type, and the result is the picked buffer itself: a store into it writes
+/// that buffer.
+#[crate::op(
+    "loop.pick",
+    operands(index(Index), buffers(Variadic(Buffer))),
+    results(output(Buffer))
+)]
+pub struct Pick;
+
 /// `loop.load`: the element of `buffer` at `indices`, one per axis. Without `pad`, the position
-/// MUST be inside the buffer, and a store MUST have written the element. With `pad v`, a position
-/// outside the buffer gives `v`, a value of the buffer's dtype.
+/// MUST be inside the buffer, and the element MUST hold a value: the caller's, in an `in` or
+/// `inout` parameter, or one a store wrote. With `pad v`, a position outside the buffer gives `v`,
+/// a value of the buffer's dtype.
 #[crate::op(
     "loop.load",
     operands(buffer(Buffer), indices(Variadic(Index))),
@@ -138,21 +179,36 @@ pub struct Load {
 )]
 pub struct Store;
 
+/// `loop.prefetch`: asks the memory `level`, one that the target prefetches into, for the line that
+/// holds the element of `buffer` at `indices`, one per axis, which a later load reads. A hint: it
+/// computes and changes nothing, and a position outside the buffer reads nothing.
+#[crate::op(
+    "loop.prefetch",
+    operands(buffer(Buffer), indices(Variadic(Index))),
+    effects(read(buffer))
+)]
+pub struct Prefetch {
+    pub level: Level,
+}
+
 // ------------------------------------------------------------------------------------------------
 // The dialect
 
 #[derive(crate::Dialect, Debug, Clone, PartialEq, Eq, Hash)]
 #[dialect(name = "loop", op = Loop)]
-pub enum LoopOp {
+pub enum LoopOps {
     Func(Func),
     Return(Return),
     For(For),
     Forall(Forall),
     If(If),
+    Atom(Atom),
     Yield(Yield),
     Index(Index),
     Predicate(Predicate),
     Alloc(Alloc),
+    Pick(Pick),
     Load(Load),
     Store(Store),
+    Prefetch(Prefetch),
 }

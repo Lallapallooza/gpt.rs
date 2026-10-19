@@ -56,6 +56,15 @@ loop.func @load_pad(%input: !loop.buf<4xsi32, global>) attributes {access = [in]
 
 // -----
 
+// ERROR: loop.prefetch: the index count is 3, but !loop.buf<4x4xf32, global> has rank 2
+loop.func @prefetch_rank(%input: !loop.buf<4x4xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  loop.prefetch(%input, %zero, %zero, %zero) {level = l2} : (!loop.buf<4x4xf32, global>, index, index, index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
 // ERROR: loop.store: the index count is 0, but !loop.buf<4xf32, private> has rank 1
 loop.func @store_rank(%input: !loop.buf<f32, global>) attributes {access = [in]} {
   %value = loop.load(%input) : (!loop.buf<f32, global>) -> f32
@@ -101,4 +110,75 @@ func.func @double(%input: tensor<4xf32>) -> tensor<4xf32> {
 func.func @main(%input: tensor<4xf32>) -> tensor<4xf32> {
   %output = host.dispatch(%input) {callee = @double} : (tensor<4xf32>) -> tensor<4xf32>
   func.return(%output) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: loop.atom: a register tile has rank 1 to 3, not 4
+loop.func @atom_of_four_axes() attributes {access = []} {
+  %one = loop.index() {expr = 1} : () -> index
+  loop.atom(%one, %one, %one, %one) {tile = [1, 1, 1, 4], lanes = 4} ({
+  ^body(%first: index, %second: index, %third: index, %fourth: index):
+    loop.yield() : () -> ()
+  }) : (index, index, index, index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.atom: the extent count is 1, but the tile has rank 2
+loop.func @atom_with_one_extent() attributes {access = []} {
+  %one = loop.index() {expr = 1} : () -> index
+  loop.atom(%one) {tile = [2, 8], lanes = 4} ({
+  ^body(%row: index, %column: index):
+    loop.yield() : () -> ()
+  }) : (index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.atom: vectors of 4 lanes do not fill the 6 points of the tile's last axis
+loop.func @atom_of_partial_vectors() attributes {access = []} {
+  %one = loop.index() {expr = 1} : () -> index
+  loop.atom(%one) {tile = [6], lanes = 4} ({
+  ^body(%column: index):
+    loop.yield() : () -> ()
+  }) : (index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.alloc: it allocates global memory, which only the caller of a launch owns
+loop.func @alloc_of_global_memory() attributes {access = []} {
+  %scratch = loop.alloc() {shape = [4], dtype = f32, space = global} : () -> !loop.buf<4xf32, global>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: arith.fma: fma computes on f32 and f64, not bf16
+loop.func @fma_of_bf16(%input: !loop.buf<bf16, global>) attributes {access = [in]} {
+  %element = loop.load(%input) : (!loop.buf<bf16, global>) -> bf16
+  %fused = arith.fma(%element, %element, %element) : (bf16, bf16, bf16) -> bf16
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.pick: it picks from no buffer
+loop.func @pick_nothing(%input: !loop.buf<f32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %picked = loop.pick(%zero) : (index) -> !loop.buf<f32, global>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.pick: it picks from buffers of two types, !loop.buf<2xf32, global> and !loop.buf<3xf32, global> at position 1
+loop.func @pick_shapes(%short: !loop.buf<2xf32, global>, %long: !loop.buf<3xf32, global>) attributes {access = [in, in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %picked = loop.pick(%zero, %short, %long) : (index, !loop.buf<2xf32, global>, !loop.buf<3xf32, global>) -> !loop.buf<2xf32, global>
+  loop.return() : () -> ()
 }

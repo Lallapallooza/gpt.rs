@@ -21,7 +21,7 @@ loop.func @tensor_parameter(%input: tensor<4xf32>) attributes {access = [in]} {
 
 // -----
 
-// ERROR: loop.func: parameter 1 has the extent {N}, which no `in` parameter binds
+// ERROR: loop.func: parameter 1 has the extent {N}, which no `in` or `inout` parameter binds
 loop.func @unbound_extent(%input: !loop.buf<4xf32, global>, %output: !loop.buf<{N}xf32, global>) attributes {access = [in, out]} {
   loop.return() : () -> ()
 }
@@ -32,5 +32,59 @@ loop.func @unbound_extent(%input: !loop.buf<4xf32, global>, %output: !loop.buf<{
 loop.func @store_into_input(%input: !loop.buf<f32, global>) attributes {access = [in]} {
   %zero = arith.constant() {value = 0.0 : f32} : () -> f32
   loop.store(%zero, %input) : (f32, !loop.buf<f32, global>) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.func: it stores into parameter 0, which is `in`
+loop.func @store_into_picked_input(%input: !loop.buf<f32, global>, %output: !loop.buf<f32, global>) attributes {access = [in, out]} {
+  %first = loop.index() {expr = 0} : () -> index
+  %picked = loop.pick(%first, %output, %input) : (index, !loop.buf<f32, global>, !loop.buf<f32, global>) -> !loop.buf<f32, global>
+  %zero = arith.constant() {value = 0.0 : f32} : () -> f32
+  loop.store(%zero, %picked) : (f32, !loop.buf<f32, global>) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.func: parameter 1 may share the buffer of parameter 0, which is not `in`
+loop.func @over_an_output(%first: !loop.buf<4xf32, global>, %second: !loop.buf<4xf32, global>) attributes {access = [out, out<over = 0>]} {
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.func: parameter 1, !loop.buf<4xf64, global>, may share the buffer of parameter 0, !loop.buf<4xf32, global>, whose elements differ in size or position
+loop.func @over_wider_elements(%input: !loop.buf<4xf32, global>, %output: !loop.buf<4xf64, global>) attributes {access = [in, out<over = 0>]} {
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.func: parameters 1 and 2 may both share the buffer of parameter 0
+loop.func @two_over_one_input(%input: !loop.buf<4xf32, global>, %first: !loop.buf<4xf32, global>, %second: !loop.buf<4xf32, global>) attributes {access = [in, out<over = 0>, out<over = 0>]} {
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.func: a loop.forall runs on the units of cluster, which x86-64-v4 does not have
+loop.func @foreign_units(%output: !loop.buf<4xf32, global>) attributes {access = [out], target = "x86-64-v4@3928f7d3"} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 4} : () -> index
+  loop.forall(%zero, %count) {level = cluster} ({
+  ^body(%position: index):
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: loop.func: a loop.prefetch asks dram for lines, which is no memory that x86-64-v4 prefetches into
+loop.func @prefetch_into_dram(%input: !loop.buf<4xf32, global>) attributes {access = [in], target = "x86-64-v4@3928f7d3"} {
+  %zero = loop.index() {expr = 0} : () -> index
+  loop.prefetch(%input, %zero) {level = dram} : (!loop.buf<4xf32, global>, index) -> ()
   loop.return() : () -> ()
 }

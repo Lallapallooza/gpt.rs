@@ -1,7 +1,7 @@
 // RUN: roundtrip
 
-// A launch that adds a bias to each row, called with tensors: loops, index values, loads and
-// stores.
+// A launch that adds a bias to each row, called with tensors: loops, index values, loads, stores,
+// and a prefetch of the next row's element.
 // CHECK: loop.func @add_bias([[INPUT:%[0-9]+]]: !loop.buf<4x{N}xf32, global>, [[BIAS:%[0-9]+]]: !loop.buf<{N}xf32, global>, [[OUTPUT:%[0-9]+]]: !loop.buf<4x{N}xf32, global>) attributes {access = [in, in, out]} {
 // CHECK-NEXT: [[ZERO:%[0-9]+]] = loop.index() {expr = 0} : () -> index
 // CHECK-NEXT: [[ROWS:%[0-9]+]] = loop.index() {expr = 4} : () -> index
@@ -10,6 +10,8 @@
 // CHECK-NEXT: ^body([[ROW:%[0-9]+]]: index):
 // CHECK-NEXT: loop.for([[ZERO]], [[COLUMNS]]) ({
 // CHECK-NEXT: ^body([[COLUMN:%[0-9]+]]: index):
+// CHECK-NEXT: [[NEXT_ROW:%[0-9]+]] = loop.index([[ROW]]) {expr = d0 + 1} : (index) -> index
+// CHECK-NEXT: loop.prefetch([[INPUT]], [[NEXT_ROW]], [[COLUMN]]) {level = l2} : (!loop.buf<4x{N}xf32, global>, index, index) -> ()
 // CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load([[INPUT]], [[ROW]], [[COLUMN]]) : (!loop.buf<4x{N}xf32, global>, index, index) -> f32
 // CHECK-NEXT: [[SHIFT:%[0-9]+]] = loop.load([[BIAS]], [[COLUMN]]) : (!loop.buf<{N}xf32, global>, index) -> f32
 // CHECK-NEXT: [[SUM:%[0-9]+]] = arith.add([[ELEMENT]], [[SHIFT]]) : (f32, f32) -> f32
@@ -32,6 +34,8 @@ loop.func @add_bias(%input: !loop.buf<4x{N}xf32, global>, %bias: !loop.buf<{N}xf
   ^body(%row: index):
     loop.for(%zero, %columns) ({
     ^body(%column: index):
+      %next_row = loop.index(%row) {expr = d0 + 1} : (index) -> index
+      loop.prefetch(%input, %next_row, %column) {level = l2} : (!loop.buf<4x{N}xf32, global>, index, index) -> ()
       %element = loop.load(%input, %row, %column) : (!loop.buf<4x{N}xf32, global>, index, index) -> f32
       %shift = loop.load(%bias, %column) : (!loop.buf<{N}xf32, global>, index) -> f32
       %sum = arith.add(%element, %shift) : (f32, f32) -> f32
@@ -130,6 +134,149 @@ loop.func @rows(%input: !loop.buf<4x2xf32, global>, %output: !loop.buf<4x2xf32, 
       loop.store(%element, %output, %row, %column) : (f32, !loop.buf<4x2xf32, global>, index, index) -> ()
       loop.yield() : () -> ()
     }) : (index, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// A register tile of 2 rows by 8 columns, in vectors of 4 lanes, that doubles the 2x6 elements
+// of its input in a `reg` buffer: the atom runs the points below its extents, 2 by 6.
+// CHECK: loop.func @double_in_registers([[INPUT:%[0-9]+]]: !loop.buf<2x6xf32, global>, [[OUTPUT:%[0-9]+]]: !loop.buf<2x6xf32, global>) attributes {access = [in, out], target = "x86-64-v3@7d7ad928"} {
+// CHECK-NEXT: [[ROWS:%[0-9]+]] = loop.index() {expr = 2} : () -> index
+// CHECK-NEXT: [[COLUMNS:%[0-9]+]] = loop.index() {expr = 6} : () -> index
+// CHECK-NEXT: [[DOUBLED:%[0-9]+]] = loop.alloc() {shape = [2, 8], dtype = f32, space = reg} : () -> !loop.buf<2x8xf32, reg>
+// CHECK-NEXT: loop.atom([[ROWS]], [[COLUMNS]]) {tile = [2, 8], lanes = 4} ({
+// CHECK-NEXT: ^body([[ROW:%[0-9]+]]: index, [[COLUMN:%[0-9]+]]: index):
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load([[INPUT]], [[ROW]], [[COLUMN]]) : (!loop.buf<2x6xf32, global>, index, index) -> f32
+// CHECK-NEXT: [[TWICE:%[0-9]+]] = arith.add([[ELEMENT]], [[ELEMENT]]) : (f32, f32) -> f32
+// CHECK-NEXT: loop.store([[TWICE]], [[DOUBLED]], [[ROW]], [[COLUMN]]) : (f32, !loop.buf<2x8xf32, reg>, index, index) -> ()
+// CHECK-NEXT: loop.yield() : () -> ()
+// CHECK-NEXT: }) : (index, index) -> ()
+// CHECK-NEXT: loop.atom([[ROWS]], [[COLUMNS]]) {tile = [2, 8], lanes = 4} ({
+// CHECK-NEXT: ^body([[ROW:%[0-9]+]]: index, [[COLUMN:%[0-9]+]]: index):
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load([[DOUBLED]], [[ROW]], [[COLUMN]]) : (!loop.buf<2x8xf32, reg>, index, index) -> f32
+// CHECK-NEXT: loop.store([[ELEMENT]], [[OUTPUT]], [[ROW]], [[COLUMN]]) : (f32, !loop.buf<2x6xf32, global>, index, index) -> ()
+// CHECK-NEXT: loop.yield() : () -> ()
+// CHECK-NEXT: }) : (index, index) -> ()
+// CHECK-NEXT: loop.return() : () -> ()
+// CHECK-NEXT: }
+loop.func @double_in_registers(%input: !loop.buf<2x6xf32, global>, %output: !loop.buf<2x6xf32, global>) attributes {access = [in, out], target = "x86-64-v3@7d7ad928"} {
+  %rows = loop.index() {expr = 2} : () -> index
+  %columns = loop.index() {expr = 6} : () -> index
+  %doubled = loop.alloc() {shape = [2, 8], dtype = f32, space = reg} : () -> !loop.buf<2x8xf32, reg>
+  loop.atom(%rows, %columns) {tile = [2, 8], lanes = 4} ({
+  ^body(%row: index, %column: index):
+    %element = loop.load(%input, %row, %column) : (!loop.buf<2x6xf32, global>, index, index) -> f32
+    %twice = arith.add(%element, %element) : (f32, f32) -> f32
+    loop.store(%twice, %doubled, %row, %column) : (f32, !loop.buf<2x8xf32, reg>, index, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.atom(%rows, %columns) {tile = [2, 8], lanes = 4} ({
+  ^body(%row: index, %column: index):
+    %element = loop.load(%doubled, %row, %column) : (!loop.buf<2x8xf32, reg>, index, index) -> f32
+    loop.store(%element, %output, %row, %column) : (f32, !loop.buf<2x6xf32, global>, index, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// Parameters a launch updates: an `inout` row it adds to in place, and an output that may share
+// the buffer of the input it scales.
+// CHECK: loop.func @update([[ACCUMULATOR:%[0-9]+]]: !loop.buf<4xf32, global>, [[ADDEND:%[0-9]+]]: !loop.buf<4xf32, global>, [[SCALED:%[0-9]+]]: !loop.buf<4xf32, global>) attributes {access = [inout, in, out<over = 1>]} {
+// CHECK-NEXT: [[ZERO:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[COUNT:%[0-9]+]] = loop.index() {expr = 4} : () -> index
+// CHECK-NEXT: loop.for([[ZERO]], [[COUNT]]) ({
+// CHECK-NEXT: ^body([[POSITION:%[0-9]+]]: index):
+// CHECK-NEXT: [[TERM:%[0-9]+]] = loop.load([[ADDEND]], [[POSITION]]) : (!loop.buf<4xf32, global>, index) -> f32
+// CHECK-NEXT: [[SO_FAR:%[0-9]+]] = loop.load([[ACCUMULATOR]], [[POSITION]]) : (!loop.buf<4xf32, global>, index) -> f32
+// CHECK-NEXT: [[SUM:%[0-9]+]] = arith.add([[SO_FAR]], [[TERM]]) : (f32, f32) -> f32
+// CHECK-NEXT: loop.store([[SUM]], [[ACCUMULATOR]], [[POSITION]]) : (f32, !loop.buf<4xf32, global>, index) -> ()
+// CHECK-NEXT: [[DOUBLED:%[0-9]+]] = arith.add([[TERM]], [[TERM]]) : (f32, f32) -> f32
+// CHECK-NEXT: loop.store([[DOUBLED]], [[SCALED]], [[POSITION]]) : (f32, !loop.buf<4xf32, global>, index) -> ()
+// CHECK-NEXT: loop.yield() : () -> ()
+// CHECK-NEXT: }) : (index, index) -> ()
+// CHECK-NEXT: loop.return() : () -> ()
+// CHECK-NEXT: }
+loop.func @update(%accumulator: !loop.buf<4xf32, global>, %addend: !loop.buf<4xf32, global>, %scaled: !loop.buf<4xf32, global>) attributes {access = [inout, in, out<over = 1>]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 4} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %term = loop.load(%addend, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %so_far = loop.load(%accumulator, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %sum = arith.add(%so_far, %term) : (f32, f32) -> f32
+    loop.store(%sum, %accumulator, %position) : (f32, !loop.buf<4xf32, global>, index) -> ()
+    %doubled = arith.add(%term, %term) : (f32, f32) -> f32
+    loop.store(%doubled, %scaled, %position) : (f32, !loop.buf<4xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// A scale and a shift in a function that contracts, which round once: `arith.fma` multiplies and
+// adds.
+// CHECK: loop.func @scale_shift([[INPUT:%[0-9]+]]: !loop.buf<8xf64, global>, [[SCALE:%[0-9]+]]: !loop.buf<8xf64, global>, [[SHIFT:%[0-9]+]]: !loop.buf<8xf64, global>, [[OUTPUT:%[0-9]+]]: !loop.buf<8xf64, global>) attributes {access = [in, in, in, out], contract = true} {
+// CHECK-NEXT: [[ZERO:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[COUNT:%[0-9]+]] = loop.index() {expr = 8} : () -> index
+// CHECK-NEXT: loop.for([[ZERO]], [[COUNT]]) ({
+// CHECK-NEXT: ^body([[AT:%[0-9]+]]: index):
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load([[INPUT]], [[AT]]) : (!loop.buf<8xf64, global>, index) -> f64
+// CHECK-NEXT: [[FACTOR:%[0-9]+]] = loop.load([[SCALE]], [[AT]]) : (!loop.buf<8xf64, global>, index) -> f64
+// CHECK-NEXT: [[OFFSET:%[0-9]+]] = loop.load([[SHIFT]], [[AT]]) : (!loop.buf<8xf64, global>, index) -> f64
+// CHECK-NEXT: [[SHIFTED:%[0-9]+]] = arith.fma([[ELEMENT]], [[FACTOR]], [[OFFSET]]) : (f64, f64, f64) -> f64
+// CHECK-NEXT: loop.store([[SHIFTED]], [[OUTPUT]], [[AT]]) : (f64, !loop.buf<8xf64, global>, index) -> ()
+// CHECK-NEXT: loop.yield() : () -> ()
+// CHECK-NEXT: }) : (index, index) -> ()
+// CHECK-NEXT: loop.return() : () -> ()
+// CHECK-NEXT: }
+loop.func @scale_shift(%input: !loop.buf<8xf64, global>, %scale: !loop.buf<8xf64, global>, %shift: !loop.buf<8xf64, global>, %output: !loop.buf<8xf64, global>) attributes {access = [in, in, in, out], contract = true} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 8} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%at: index):
+    %element = loop.load(%input, %at) : (!loop.buf<8xf64, global>, index) -> f64
+    %factor = loop.load(%scale, %at) : (!loop.buf<8xf64, global>, index) -> f64
+    %offset = loop.load(%shift, %at) : (!loop.buf<8xf64, global>, index) -> f64
+    %shifted = arith.fma(%element, %factor, %offset) : (f64, f64, f64) -> f64
+    loop.store(%shifted, %output, %at) : (f64, !loop.buf<8xf64, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// A pick of one of two tables by an index element, then a load from the picked table.
+// CHECK: loop.func @pick_table([[FIRST:%[0-9]+]]: !loop.buf<2xf32, global>, [[SECOND:%[0-9]+]]: !loop.buf<2xf32, global>, [[WHICH:%[0-9]+]]: !loop.buf<si32, global>, [[OUTPUT:%[0-9]+]]: !loop.buf<2xf32, global>) attributes {access = [in, in, in, out]} {
+// CHECK-NEXT: [[ZERO:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[END:%[0-9]+]] = loop.index() {expr = 2} : () -> index
+// CHECK-NEXT: [[CODE:%[0-9]+]] = loop.load([[WHICH]]) : (!loop.buf<si32, global>) -> si32
+// CHECK-NEXT: [[POSITION:%[0-9]+]] = arith.to_index([[CODE]]) : (si32) -> index
+// CHECK-NEXT: [[TABLE:%[0-9]+]] = loop.pick([[POSITION]], [[FIRST]], [[SECOND]]) : (index, !loop.buf<2xf32, global>, !loop.buf<2xf32, global>) -> !loop.buf<2xf32, global>
+// CHECK-NEXT: loop.for([[ZERO]], [[END]]) ({
+// CHECK-NEXT: ^body([[COLUMN:%[0-9]+]]: index):
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load([[TABLE]], [[COLUMN]]) : (!loop.buf<2xf32, global>, index) -> f32
+// CHECK-NEXT: loop.store([[ELEMENT]], [[OUTPUT]], [[COLUMN]]) : (f32, !loop.buf<2xf32, global>, index) -> ()
+// CHECK-NEXT: loop.yield() : () -> ()
+// CHECK-NEXT: }) : (index, index) -> ()
+// CHECK-NEXT: loop.return() : () -> ()
+// CHECK-NEXT: }
+loop.func @pick_table(%first: !loop.buf<2xf32, global>, %second: !loop.buf<2xf32, global>, %which: !loop.buf<si32, global>, %output: !loop.buf<2xf32, global>) attributes {access = [in, in, in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %end = loop.index() {expr = 2} : () -> index
+  %code = loop.load(%which) : (!loop.buf<si32, global>) -> si32
+  %position = arith.to_index(%code) : (si32) -> index
+  %table = loop.pick(%position, %first, %second) : (index, !loop.buf<2xf32, global>, !loop.buf<2xf32, global>) -> !loop.buf<2xf32, global>
+  loop.for(%zero, %end) ({
+  ^body(%column: index):
+    %element = loop.load(%table, %column) : (!loop.buf<2xf32, global>, index) -> f32
+    loop.store(%element, %output, %column) : (f32, !loop.buf<2xf32, global>, index) -> ()
     loop.yield() : () -> ()
   }) : (index, index) -> ()
   loop.return() : () -> ()

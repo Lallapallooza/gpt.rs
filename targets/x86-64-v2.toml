@@ -1,0 +1,114 @@
+# x86-64-v2: the Intel Core i7-920, a Nehalem part of the x86-64 level with SSE4.2 and POPCNT, as
+# the x86-64 psABI defines its microarchitecture levels. For another part, probe the machine
+# (`host`) or write a target file.
+#
+# Sources: Intel's specifications of the Core i7-920 for its 4 cores and its 8 MiB L3; the Intel 64
+# and IA-32 Architectures Optimization Reference Manual (the Nehalem microarchitecture) for the
+# cache geometry, an L1d of 32 KiB and an L2 of 256 KiB in 8 ways per core, an L3 in 16 ways that
+# the cores share, and 64-byte lines; and uops.info for the costs of Nehalem's instructions.
+description = "Intel Core i7-920 (Nehalem), 4 cores, from Intel's documents and uops.info"
+
+[isa]
+arch = "x86_64"
+features = ["sse4.2", "popcnt"]
+vector_bits = [128]
+vector_registers = 16
+cc_march = "x86-64-v2"
+page = 4096
+
+# The execution levels: the L3 domains, each the cores that share one L3, and the cores.
+[[level]]
+name = "l3"
+units = 1
+
+[[level]]
+name = "core"
+units = 4
+
+# The memories: the registers, the L1 and L2 of a core, the L3 of a domain, and DRAM. A copy held
+# for a cache lives in a core's private scratch, and a prefetch asks the L1, L2 and L3 for lines
+# with the hints T0, T1 and T2.
+[[memory]]
+name = "registers"
+kind = "registers"
+level = "core"
+
+[[memory]]
+name = "l1"
+kind = "cache"
+bytes = 32768
+level = "core"
+line = 64
+ways = 8
+space = "private"
+prefetch = "t0"
+
+[[memory]]
+name = "l2"
+kind = "cache"
+bytes = 262144
+level = "core"
+line = 64
+ways = 8
+space = "private"
+prefetch = "t1"
+
+[[memory]]
+name = "l3"
+kind = "cache"
+bytes = 8388608
+level = "l3"
+line = 64
+ways = 16
+space = "private"
+prefetch = "t2"
+
+# DRAM holds the buffers of a launch, which start at a multiple of 64 bytes: the line that the x86
+# runtime aligns its arenas and tensors to.
+[[memory]]
+name = "dram"
+kind = "main"
+alignment = 64
+
+# The costs are those of Nehalem on 128-bit vectors of f32 (uops.info), stated for every dtype.
+# SSE has no broadcast from memory: it is a load and a shuffle, one a cycle.
+[[cost]]
+op = "isa.add"
+width = 128
+latency = 3
+issue = 1
+
+# Minimum and maximum run on the adder, at its latency and rate.
+[[cost]]
+op = "isa.maximum"
+width = 128
+latency = 3
+issue = 1
+
+[[cost]]
+op = "isa.minimum"
+width = 128
+latency = 3
+issue = 1
+
+[[cost]]
+op = "isa.mul"
+width = 128
+latency = 4
+issue = 1
+
+[[cost]]
+op = "isa.load"
+width = 128
+issue = 1
+
+[[cost]]
+op = "isa.broadcast"
+width = 128
+issue = 1
+
+# A store issues one a cycle.
+[[cost]]
+op = "isa.store"
+width = 128
+issue = 1

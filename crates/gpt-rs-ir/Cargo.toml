@@ -15,9 +15,17 @@ gpt-rs-ir-macros = { path = "../gpt-rs-ir-macros", version = "0.1.0" }
 half = { version = "2.6", features = ["bytemuck"] }
 libm = "0.2"
 linkme = "0.3"
+serde = { workspace = true }
 smallvec = { workspace = true }
 tinyvec = { workspace = true }
+toml = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 gpt-rs-filetests = { path = "../gpt-rs-filetests" }
 rand = { workspace = true }
+
+[lints]
+workspace = true

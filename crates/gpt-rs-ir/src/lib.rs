@@ -10,6 +10,7 @@
 //! - [`passes`]: the passes over any dialect.
 //! - [`analysis`]: what ops cost.
 //! - [`traits`]: op traits.
+//! - [`targets`]: the hardware a module compiles for: presets, the host probe.
 //! - [`dialects`]: the dialects, each with its own passes, and [`Op`](enum@Op), their union.
 //! - [`conversion`]: the conversions between dialects.
 
@@ -23,6 +24,7 @@ pub mod interp;
 pub mod ir;
 pub mod passes;
 pub mod rewrite;
+pub mod targets;
 pub mod text;
 pub mod traits;
 

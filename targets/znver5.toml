@@ -1,0 +1,128 @@
+# znver5: AMD Zen 5 (family 1Ah) with the full-width 512-bit datapath of the desktop parts. The
+# cores and L3 domains are those of a Ryzen 9 9950X. For another Zen 5 desktop part, probe the
+# machine (`host`). For any other part, write a target file.
+#
+# Sources: AMD Software Optimization Guide for the Zen 5 microarchitecture (58455, rev 1.00,
+# section 2.11) for the cache geometry and the pipes of each op; uops.info for the zmm instruction
+# costs; and throughput measured on a Ryzen 9 9950X3D with a 6x4 register tile of zmm
+# accumulators, operands in L1. `vmulps` + `vaddps` issue on separate pipes, but take twice the
+# instructions of `vfmadd231ps`. The costs are those of f32, stated for every dtype.
+description = "AMD Ryzen 9 9950X (Zen 5), 16 cores in two L3 domains, from AMD's guide and uops.info"
+
+[isa]
+arch = "x86_64"
+features = ["sse4.2", "popcnt", "avx", "avx2", "fma", "f16c", "bmi2", "avx512f", "avx512bw",
+            "avx512cd", "avx512dq", "avx512vl", "avx512bf16", "avx512vnni", "avx512vbmi",
+            "avx512vbmi2", "avx512ifma", "avx512bitalg", "avx512vpopcntdq", "avxvnni", "gfni",
+            "vaes", "vpclmulqdq"]
+vector_bits = [128, 256, 512]
+vector_registers = 32
+write_masks = 7
+cc_march = "znver5"
+page = 4096
+
+# The execution levels: the L3 domains, each the cores that share one L3, and the cores.
+[[level]]
+name = "l3"
+units = 2
+
+[[level]]
+name = "core"
+units = 16
+
+# The memories: the registers, the L1 and L2 of a core, the L3 of a domain, and DRAM. A copy held
+# for a cache lives in a core's private scratch, and a prefetch asks the L1, L2 and L3 for lines
+# with the hints T0, T1 and T2.
+[[memory]]
+name = "registers"
+kind = "registers"
+level = "core"
+
+[[memory]]
+name = "l1"
+kind = "cache"
+bytes = 49152
+level = "core"
+line = 64
+ways = 12
+space = "private"
+prefetch = "t0"
+
+[[memory]]
+name = "l2"
+kind = "cache"
+bytes = 1048576
+level = "core"
+line = 64
+ways = 16
+space = "private"
+prefetch = "t1"
+
+[[memory]]
+name = "l3"
+kind = "cache"
+bytes = 33554432
+level = "l3"
+line = 64
+ways = 16
+space = "private"
+prefetch = "t2"
+
+# DRAM holds the buffers of a launch, which start at a multiple of 64 bytes: the line that the x86
+# runtime aligns its arenas and tensors to.
+[[memory]]
+name = "dram"
+kind = "main"
+alignment = 64
+
+# FMUL and FMA run on pipes 0 and 1 and FADD on pipes 2 and 3, two of each a cycle, and a core
+# stores one vector a cycle.
+[[cost]]
+op = "isa.add"
+width = 512
+latency = 2
+issue = 2
+
+# Minimum and maximum run on the adder, at its latency and rate.
+[[cost]]
+op = "isa.maximum"
+width = 512
+latency = 2
+issue = 2
+
+[[cost]]
+op = "isa.minimum"
+width = 512
+latency = 2
+issue = 2
+
+[[cost]]
+op = "isa.mul"
+width = 512
+latency = 3
+issue = 2
+
+[[cost]]
+op = "isa.fma"
+width = 512
+latency = 4
+issue = 2
+
+# Two 512-bit loads a cycle, with a load-to-use latency of 7 to 8 cycles. A masked load costs the
+# same, and a broadcast from memory is a plain load.
+[[cost]]
+op = "isa.load"
+width = 512
+latency = 8
+issue = 2
+
+[[cost]]
+op = "isa.broadcast"
+width = 512
+latency = 8
+issue = 2
+
+[[cost]]
+op = "isa.store"
+width = 512
+issue = 1

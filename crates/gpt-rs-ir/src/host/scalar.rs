@@ -98,6 +98,16 @@ impl HostScalar {
         }
     }
 
+    /// The value as an f64, when an f64 holds it exactly: a float, or an integer that an f64
+    /// holds without rounding.
+    pub fn exact_f64(&self) -> Option<f64> {
+        let ScalarValue::Int(int) = self.value else {
+            return self.as_f64();
+        };
+        let float = int as f64;
+        (float as i128 == int).then_some(float)
+    }
+
     /// The scalar as an index: its integer value, which must fit `i64`.
     pub fn as_index(&self) -> Result<i64> {
         let value = self
@@ -166,9 +176,9 @@ impl Decoded {
     /// Element `index`.
     pub fn get(&self, index: usize) -> HostScalar {
         let value = match &self.values {
-            Values::Int(v) => ScalarValue::Int(v[index]),
-            Values::F32(v) => ScalarValue::F32(v[index]),
-            Values::F64(v) => ScalarValue::F64(v[index]),
+            Values::Int(ints) => ScalarValue::Int(ints[index]),
+            Values::F32(floats) => ScalarValue::F32(floats[index]),
+            Values::F64(floats) => ScalarValue::F64(floats[index]),
         };
         HostScalar {
             dtype: self.dtype,
@@ -179,12 +189,12 @@ impl Decoded {
 
 /// The elements `scalars`, each a value of `dtype`, as the data of a tensor of `dtype`.
 pub fn encode(dtype: DType, scalars: &[HostScalar]) -> Result<TensorData> {
-    if let Some(other) = scalars.iter().find(|s| s.dtype != dtype) {
+    if let Some(other) = scalars.iter().find(|scalar| scalar.dtype != dtype) {
         bail!("a {} element in a {dtype} tensor", other.dtype);
     }
     if dtype == DType::E8M0 {
         // An e8m0 element is a power of two, or NaN: its code is its exponent plus the bias.
-        let codes = scalars.iter().map(|s| match s.value {
+        let codes = scalars.iter().map(|scalar| match scalar.value {
             ScalarValue::F32(x) if x.is_nan() => 255,
             ScalarValue::F32(x) => {
                 let exponent = ((f64::from(x).to_bits() >> 52) & 0x7ff) as i32 - 1023;
@@ -199,18 +209,18 @@ pub fn encode(dtype: DType, scalars: &[HostScalar]) -> Result<TensorData> {
             dtype,
             scalars
                 .iter()
-                .map(|s| s.as_int().expect("an integer dtype")),
+                .map(|scalar| scalar.as_int().expect("an integer dtype")),
         ),
         Repr::F32 => encode_f32(
             dtype,
-            scalars.iter().map(|s| match s.value {
+            scalars.iter().map(|scalar| match scalar.value {
                 ScalarValue::F32(x) => x,
                 _ => unreachable!("f32 is the computation type of {dtype}"),
             }),
         ),
         Repr::F64 => from_f64(
             dtype,
-            scalars.iter().map(|s| match s.value {
+            scalars.iter().map(|scalar| match scalar.value {
                 ScalarValue::F64(x) => x,
                 _ => unreachable!("f64 is the computation type of f64"),
             }),

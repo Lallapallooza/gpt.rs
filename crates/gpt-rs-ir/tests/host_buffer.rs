@@ -15,7 +15,10 @@ struct Shifted {
 impl Shifted {
     fn new(shift: usize) -> Arc<Self> {
         let mut words = vec![0u32; VALUES.len() + 1];
-        let bytes: Vec<u8> = VALUES.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let bytes: Vec<u8> = VALUES
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect();
         bytemuck::cast_slice_mut::<u32, u8>(&mut words)[shift..shift + bytes.len()]
             .copy_from_slice(&bytes);
         Arc::new(Self { words, shift })

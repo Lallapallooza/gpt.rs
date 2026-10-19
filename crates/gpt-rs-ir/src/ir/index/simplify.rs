@@ -26,6 +26,33 @@ impl<R: ReadKind> Expr<R> {
         pop(&mut stack).1
     }
 
+    /// How many `floordiv` and `mod` the expression computes.
+    pub fn divisions(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|node| matches!(node, Node::Binary(BinaryOp::FloorDiv | BinaryOp::Mod)))
+            .count()
+    }
+
+    /// How many operations the expression computes: its arithmetic, `min` and `max`.
+    pub fn operations(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|node| matches!(node, Node::Binary(_) | Node::Neg))
+            .count()
+    }
+
+    /// The constant divisors of the `floordiv` and `mod` whose dividends use the iterator at
+    /// `position`.
+    pub fn divisors_of(&self, position: usize) -> Vec<i64> {
+        let mut divisors = Vec::new();
+        self.map(&mut |expr| {
+            divisors.extend(divisor_using(&expr, position));
+            expr
+        });
+        divisors
+    }
+
     /// Folds constants and drops the identities of `+`, `-` and `*`. Keeps the value.
     pub fn simplify(&self) -> Self {
         self.map(&mut Self::fold_root)
@@ -94,6 +121,15 @@ impl<R: ReadKind> Expr<R> {
     pub fn canonical(&self, extent: &dyn Fn(usize) -> Option<Dim>) -> Self {
         linear(self, extent).expr()
     }
+}
+
+/// The constant divisor of `expr` when it is a `floordiv` or `mod` whose dividend uses the
+/// iterator at `position`.
+fn divisor_using<R: ReadKind>(expr: &Expr<R>, position: usize) -> Option<i64> {
+    let Root::Binary(BinaryOp::FloorDiv | BinaryOp::Mod, dividend, divisor) = expr.root() else {
+        return None;
+    };
+    divisor.as_const().filter(|_| dividend.uses_iter(position))
 }
 
 /// The interval of `lhs op rhs` for operands in the intervals `lhs` and `rhs`.
@@ -348,6 +384,12 @@ fn linear<R: ReadKind>(expr: &Expr<R>, extent: &dyn Fn(usize) -> Option<Dim>) ->
             if below(&rest, &divisor, extent) {
                 return rest;
             }
+            if let Some((factor, reduced, high, low)) =
+                factor_out(&rest, divisor.as_const(), extent)
+            {
+                let inner = Expr::modulo(high.expr(), Expr::constant(reduced));
+                return linear(&inner, extent).scale(factor).add(low, 1);
+            }
             Linear::atom(Expr::modulo(rest.expr(), divisor))
         }
         Root::Binary(op @ (BinaryOp::Min | BinaryOp::Max), lhs, rhs) => {
@@ -362,10 +404,10 @@ fn linear_floordiv<R: ReadKind>(
     divisor: &Expr<R>,
     extent: &dyn Fn(usize) -> Option<Dim>,
 ) -> Linear<R> {
-    let divisor = divisor.canonical(extent);
+    let canonical_divisor = divisor.canonical(extent);
     // `(x floordiv c1) floordiv c2` is `x floordiv (c1 * c2)`.
     if let (Root::Binary(BinaryOp::FloorDiv, inner_dividend, inner_divisor), Some(outer)) =
-        (dividend.root(), divisor.as_const())
+        (dividend.root(), canonical_divisor.as_const())
     {
         if let Some(inner) = inner_divisor
             .as_const()
@@ -375,17 +417,75 @@ fn linear_floordiv<R: ReadKind>(
             return linear(&merged, extent);
         }
     }
-    if divisor.as_const().is_some_and(|value| value <= 0) {
-        return Linear::atom(Expr::floordiv(dividend.canonical(extent), divisor));
+    if canonical_divisor.as_const().is_some_and(|value| value <= 0) {
+        return Linear::atom(Expr::floordiv(
+            dividend.canonical(extent),
+            canonical_divisor,
+        ));
     }
-    let (quotient, rest) = split(linear(dividend, extent), &divisor);
-    if let (Some(remainder), Some(constant_divisor)) = (rest.as_constant(), divisor.as_const()) {
+    let (quotient, rest) = split(linear(dividend, extent), &canonical_divisor);
+    if let (Some(remainder), Some(constant_divisor)) =
+        (rest.as_constant(), canonical_divisor.as_const())
+    {
         return quotient.add(Linear::constant(remainder.div_euclid(constant_divisor)), 1);
     }
-    if below(&rest, &divisor, extent) {
+    if below(&rest, &canonical_divisor, extent) {
         return quotient;
     }
-    quotient.add(Linear::atom(Expr::floordiv(rest.expr(), divisor)), 1)
+    if let Some((_, reduced, high, _)) = factor_out(&rest, canonical_divisor.as_const(), extent) {
+        let inner = Expr::floordiv(high.expr(), Expr::constant(reduced));
+        return quotient.add(linear(&inner, extent), 1);
+    }
+    quotient.add(
+        Linear::atom(Expr::floordiv(rest.expr(), canonical_divisor)),
+        1,
+    )
+}
+
+/// `dividend` as `factor * high + low`, where `factor` divides `divisor` and `0 <= low < factor`
+/// at every point, with the largest such factor above 1: then `dividend floordiv divisor` is
+/// `high floordiv (divisor / factor)`, and `dividend mod divisor` is
+/// `factor * (high mod (divisor / factor)) + low`. The factors tried are those `divisor` shares
+/// with a coefficient of `dividend`. Returns `factor`, `divisor / factor`, `high` and `low`.
+fn factor_out<R: ReadKind>(
+    dividend: &Linear<R>,
+    constant_divisor: Option<i64>,
+    extent: &dyn Fn(usize) -> Option<Dim>,
+) -> Option<(i64, i64, Linear<R>, Linear<R>)> {
+    let divisor = constant_divisor.filter(|&value| value > 1)?;
+    let mut factors = Vec::new();
+    for &(_, coefficient) in &dividend.terms {
+        let factor = gcd(divisor, coefficient);
+        if factor > 1 && factor < divisor && !factors.contains(&factor) {
+            factors.push(factor);
+        }
+    }
+    factors.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+    for factor in factors {
+        let mut high = Linear::constant(dividend.constant.div_euclid(factor));
+        let mut low = Linear::constant(dividend.constant.rem_euclid(factor));
+        for (atom, coefficient) in &dividend.terms {
+            match coefficient % factor {
+                0 => high.terms.push((atom.clone(), coefficient / factor)),
+                _ => low.terms.push((atom.clone(), *coefficient)),
+            }
+        }
+        let in_range =
+            range_of(&low.expr(), extent).is_some_and(|(least, most)| least >= 0 && most < factor);
+        if in_range {
+            return Some((factor, divisor / factor, high, low));
+        }
+    }
+    None
+}
+
+/// The greatest common divisor of `lhs` and `rhs`, positive.
+fn gcd(lhs: i64, rhs: i64) -> i64 {
+    let (mut larger, mut smaller) = (lhs.unsigned_abs(), rhs.unsigned_abs());
+    while smaller != 0 {
+        (larger, smaller) = (smaller, larger % smaller);
+    }
+    larger as i64
 }
 
 /// The canonical linear form of `min(lhs, rhs)` when `is_min`, else of `max(lhs, rhs)`.

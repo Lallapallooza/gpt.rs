@@ -29,11 +29,11 @@ impl Dense {
 
     /// A tensor of `dims` whose every element is `element`, little-endian.
     pub fn splat(dtype: DType, dims: impl AsRef<[usize]>, element: &[u8]) -> Self {
-        let dims = dims.as_ref().to_vec();
-        let count: usize = dims.iter().product();
+        let extents = dims.as_ref().to_vec();
+        let count: usize = extents.iter().product();
         Self {
             dtype,
-            dims,
+            dims: extents,
             bytes: element.repeat(count).into(),
         }
     }
@@ -150,7 +150,7 @@ impl From<&Dense> for DenseText {
             dims.push(Dim::Static(extent));
         }
         let elements = match dense.element_texts() {
-            Some(texts) if !texts.is_empty() && texts.iter().all(|t| *t == texts[0]) => {
+            Some(texts) if !texts.is_empty() && texts.iter().all(|text| *text == texts[0]) => {
                 DenseElements::Splat(texts[0].clone())
             }
             Some(texts) => DenseElements::List(texts),
@@ -210,7 +210,7 @@ impl TryFrom<DenseText> for Dense {
             bytes.len()
         );
         ensure!(
-            dtype != DType::I1 || bytes.iter().all(|&b| b <= 1),
+            dtype != DType::I1 || bytes.iter().all(|&byte| byte <= 1),
             "i1 elements are 0 or 1"
         );
         Ok(Dense {

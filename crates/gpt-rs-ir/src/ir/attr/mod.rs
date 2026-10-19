@@ -68,10 +68,10 @@ pub trait Attr: Sized + Clone + PartialEq + Eq + Hash + fmt::Debug {
     }
 
     fn print(&self, out: &mut String);
-    fn parse(c: &mut Cursor<'_>) -> Result<Self>;
+    fn parse(cursor: &mut Cursor) -> Result<Self>;
     /// Whether the next token can start the text form. An optional group of a format, or a
     /// variant of an enum, that starts with this attribute is read only when it does.
-    fn peek(c: &Cursor<'_>) -> bool;
+    fn peek(cursor: &Cursor) -> bool;
 }
 
 /// The attributes that the ops of a family share, held in one struct: each op of the family is a
@@ -86,12 +86,12 @@ pub trait AttrGroup: Sized {
     /// handed to `other`, with its position.
     fn parse_attrs(
         op: &str,
-        c: &mut Cursor<'_>,
-        other: &mut dyn FnMut(&str, &mut Cursor<'_>, usize) -> Result<()>,
+        cursor: &mut Cursor,
+        other: &mut dyn FnMut(&str, &mut Cursor, usize) -> Result<()>,
     ) -> Result<Self>;
     /// Parses the optional parameters, `<key = value, ...>`, after `name`, the name of a variant of
     /// an attribute enum that holds the group.
-    fn parse_params(name: &str, c: &mut Cursor<'_>) -> Result<Self>;
+    fn parse_params(name: &str, cursor: &mut Cursor) -> Result<Self>;
 }
 
 /// An enum attribute type, which `#[derive(Attr)]` registers so that the generated docs can list
@@ -141,20 +141,23 @@ pub trait Mnemonic: Sized + Copy + 'static {
     }
 
     fn from_mnemonic(name: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|v| v.mnemonic() == name)
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|value| value.mnemonic() == name)
     }
 }
 
 /// Reads a value of the fieldless enum `T`, written by its name.
-pub fn parse_mnemonic<T: Mnemonic>(c: &mut Cursor<'_>, what: &str) -> Result<T> {
-    let start = c.position();
-    let name = c.ident()?;
-    T::from_mnemonic(name).ok_or_else(|| c.error_at(start, format!("unknown {what} `{name}`")))
+pub fn parse_mnemonic<T: Mnemonic>(cursor: &mut Cursor, what: &str) -> Result<T> {
+    let start = cursor.position();
+    let name = cursor.ident()?;
+    T::from_mnemonic(name).ok_or_else(|| cursor.error_at(start, format!("unknown {what} `{name}`")))
 }
 
 /// Whether the next token is the name of a value of the fieldless enum `T`.
-pub fn peek_mnemonic<T: Mnemonic>(c: &Cursor<'_>) -> bool {
-    let next = c.peek();
+pub fn peek_mnemonic<T: Mnemonic>(cursor: &Cursor) -> bool {
+    let next = cursor.peek();
     next.kind == TokenKind::Ident && T::from_mnemonic(next.text).is_some()
 }
 
@@ -166,15 +169,15 @@ macro_rules! int_attr {
             fn print(&self, out: &mut String) {
                 out.push_str(&self.to_string());
             }
-            fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-                let start = c.position();
-                let text = c.int_text()?;
+            fn parse(cursor: &mut Cursor) -> Result<Self> {
+                let start = cursor.position();
+                let text = cursor.int_text()?;
                 text.parse().map_err(|_| {
-                    c.error_at(start, format!("{text} does not fit {}", stringify!($t)))
+                    cursor.error_at(start, format!("{text} does not fit {}", stringify!($t)))
                 })
             }
-            fn peek(c: &Cursor<'_>) -> bool {
-                c.peek_unsigned().kind == TokenKind::Int
+            fn peek(cursor: &Cursor) -> bool {
+                cursor.peek_unsigned().kind == TokenKind::Int
             }
         }
     )*};
@@ -188,23 +191,23 @@ impl Attr for bool {
     fn print(&self, out: &mut String) {
         out.push_str(if *self { "true" } else { "false" });
     }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        if c.eat("true") {
+    fn parse(cursor: &mut Cursor) -> Result<Self> {
+        if cursor.eat("true") {
             Ok(true)
-        } else if c.eat("false") {
+        } else if cursor.eat("false") {
             Ok(false)
         } else {
-            Err(c.unexpected("`true` or `false`"))
+            Err(cursor.unexpected("`true` or `false`"))
         }
     }
-    fn peek(c: &Cursor<'_>) -> bool {
-        c.peek_is("true") || c.peek_is("false")
+    fn peek(cursor: &Cursor) -> bool {
+        cursor.peek_is("true") || cursor.peek_is("false")
     }
 }
 
-pub(crate) fn print_string(s: &str, out: &mut String) {
+pub(crate) fn print_string(text: &str, out: &mut String) {
     out.push('"');
-    for ch in s.chars() {
+    for ch in text.chars() {
         match ch {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
@@ -221,11 +224,11 @@ impl Attr for String {
     fn print(&self, out: &mut String) {
         print_string(self, out);
     }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        c.string()
+    fn parse(cursor: &mut Cursor) -> Result<Self> {
+        cursor.string()
     }
-    fn peek(c: &Cursor<'_>) -> bool {
-        c.peek_kind(TokenKind::String)
+    fn peek(cursor: &Cursor) -> bool {
+        cursor.peek_kind(TokenKind::String)
     }
 }
 
@@ -235,11 +238,11 @@ impl Attr for Arc<str> {
     fn print(&self, out: &mut String) {
         print_string(self, out);
     }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        c.string().map(Arc::from)
+    fn parse(cursor: &mut Cursor) -> Result<Self> {
+        cursor.string().map(Arc::from)
     }
-    fn peek(c: &Cursor<'_>) -> bool {
-        c.peek_kind(TokenKind::String)
+    fn peek(cursor: &Cursor) -> bool {
+        cursor.peek_kind(TokenKind::String)
     }
 }
 
@@ -249,14 +252,14 @@ impl Attr for DType {
     fn print(&self, out: &mut String) {
         out.push_str(self.mnemonic());
     }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        if !c.peek_kind(TokenKind::Ident) {
-            return Err(c.unexpected("a dtype"));
+    fn parse(cursor: &mut Cursor) -> Result<Self> {
+        if !cursor.peek_kind(TokenKind::Ident) {
+            return Err(cursor.unexpected("a dtype"));
         }
-        parse_mnemonic(c, "dtype")
+        parse_mnemonic(cursor, "dtype")
     }
-    fn peek(c: &Cursor<'_>) -> bool {
-        peek_mnemonic::<DType>(c)
+    fn peek(cursor: &Cursor) -> bool {
+        peek_mnemonic::<DType>(cursor)
     }
 }
 
@@ -267,19 +270,36 @@ impl Attr for Sym {
     fn print(&self, out: &mut String) {
         out.push_str(self.as_str());
     }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        c.ident().map(Sym::new)
+    fn parse(cursor: &mut Cursor) -> Result<Self> {
+        cursor.ident().map(Sym::new)
     }
-    fn peek(c: &Cursor<'_>) -> bool {
-        c.peek_kind(TokenKind::Ident)
+    fn peek(cursor: &Cursor) -> bool {
+        cursor.peek_kind(TokenKind::Ident)
+    }
+}
+
+/// A level of a target that a schedule names: a memory level, `l1`, where a copy stages and a
+/// prefetch asks for lines, or an execution level, `core`, whose units run the iterations of a
+/// parallel loop. Each target defines its levels.
+#[derive(crate::Attr, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[attr(format = "$0")]
+pub struct Level(Sym);
+
+impl Level {
+    pub fn new(name: impl AsRef<str>) -> Self {
+        Self(Sym::new(name))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
     }
 }
 
 /// Prints `items` as `[a, b, ...]`.
 fn print_list<T: Attr>(items: &[T], out: &mut String) {
     out.push('[');
-    for (i, item) in items.iter().enumerate() {
-        if i > 0 {
+    for (position, item) in items.iter().enumerate() {
+        if position > 0 {
             out.push_str(", ");
         }
         item.print(out);
@@ -297,12 +317,12 @@ impl<T: Attr> Attr for Vec<T> {
     fn print(&self, out: &mut String) {
         print_list(self, out);
     }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        c.expect("[")?;
-        c.list("]", T::parse)
+    fn parse(cursor: &mut Cursor) -> Result<Self> {
+        cursor.expect("[")?;
+        cursor.list("]", T::parse)
     }
-    fn peek(c: &Cursor<'_>) -> bool {
-        c.peek_is("[")
+    fn peek(cursor: &Cursor) -> bool {
+        cursor.peek_is("[")
     }
 }
 
@@ -319,11 +339,11 @@ where
     fn print(&self, out: &mut String) {
         print_list(self, out);
     }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        Vec::parse(c).map(SmallVec::from_vec)
+    fn parse(cursor: &mut Cursor) -> Result<Self> {
+        Vec::parse(cursor).map(SmallVec::from_vec)
     }
-    fn peek(c: &Cursor<'_>) -> bool {
-        c.peek_is("[")
+    fn peek(cursor: &Cursor) -> bool {
+        cursor.peek_is("[")
     }
 }
 
@@ -340,12 +360,12 @@ where
     fn print(&self, out: &mut String) {
         print_list(self, out);
     }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        let start = c.position();
-        let items = Vec::parse(c)?;
+    fn parse(cursor: &mut Cursor) -> Result<Self> {
+        let start = cursor.position();
+        let items = Vec::parse(cursor)?;
         ensure!(
             items.len() <= A::CAPACITY,
-            c.error_at(
+            cursor.error_at(
                 start,
                 format!(
                     "a list of {} entries, above its limit of {}",
@@ -356,8 +376,8 @@ where
         );
         Ok(items.into_iter().collect())
     }
-    fn peek(c: &Cursor<'_>) -> bool {
-        c.peek_is("[")
+    fn peek(cursor: &Cursor) -> bool {
+        cursor.peek_is("[")
     }
 }
 
@@ -374,15 +394,15 @@ impl<T: Attr> Attr for Option<T> {
             None => out.push_str("none"),
         }
     }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        if c.eat("none") {
+    fn parse(cursor: &mut Cursor) -> Result<Self> {
+        if cursor.eat("none") {
             Ok(None)
         } else {
-            T::parse(c).map(Some)
+            T::parse(cursor).map(Some)
         }
     }
-    fn peek(c: &Cursor<'_>) -> bool {
-        c.peek_is("none") || T::peek(c)
+    fn peek(cursor: &Cursor) -> bool {
+        cursor.peek_is("none") || T::peek(cursor)
     }
 }
 
@@ -400,16 +420,16 @@ impl<A: Attr, B: Attr> Attr for (A, B) {
         self.1.print(out);
         out.push(')');
     }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        c.expect("(")?;
-        let first = A::parse(c)?;
-        c.expect(",")?;
-        let second = B::parse(c)?;
-        c.expect(")")?;
+    fn parse(cursor: &mut Cursor) -> Result<Self> {
+        cursor.expect("(")?;
+        let first = A::parse(cursor)?;
+        cursor.expect(",")?;
+        let second = B::parse(cursor)?;
+        cursor.expect(")")?;
         Ok((first, second))
     }
-    fn peek(c: &Cursor<'_>) -> bool {
-        c.peek_is("(")
+    fn peek(cursor: &Cursor) -> bool {
+        cursor.peek_is("(")
     }
 }
 
@@ -417,19 +437,19 @@ impl<A: Attr, B: Attr> Attr for (A, B) {
 /// given the key and its position. It reads entries while a key comes next, and none when none
 /// does.
 pub fn parse_entries<'a>(
-    c: &mut Cursor<'a>,
+    cursor: &mut Cursor<'a>,
     mut entry: impl FnMut(&mut Cursor<'a>, &str, usize) -> Result<()>,
 ) -> Result<()> {
-    while c.peek_kind(TokenKind::Ident) || c.peek_kind(TokenKind::String) {
-        let at = c.position();
-        let key = if c.peek_kind(TokenKind::String) {
-            c.string()?
+    while cursor.peek_kind(TokenKind::Ident) || cursor.peek_kind(TokenKind::String) {
+        let at = cursor.position();
+        let key = if cursor.peek_kind(TokenKind::String) {
+            cursor.string()?
         } else {
-            c.ident()?.to_string()
+            cursor.ident()?.to_string()
         };
-        c.expect("=")?;
-        entry(c, &key, at)?;
-        if !c.eat(",") {
+        cursor.expect("=")?;
+        entry(cursor, &key, at)?;
+        if !cursor.eat(",") {
             break;
         }
     }
@@ -438,12 +458,12 @@ pub fn parse_entries<'a>(
 
 /// Reads `{key = value, ...}` when `{` comes next, handing each key to `entry`.
 pub fn parse_dict<'a>(
-    c: &mut Cursor<'a>,
+    cursor: &mut Cursor<'a>,
     entry: impl FnMut(&mut Cursor<'a>, &str, usize) -> Result<()>,
 ) -> Result<()> {
-    if c.eat("{") {
-        parse_entries(c, entry)?;
-        c.expect("}")?;
+    if cursor.eat("{") {
+        parse_entries(cursor, entry)?;
+        cursor.expect("}")?;
     }
     Ok(())
 }
@@ -459,8 +479,8 @@ impl<T: Attr> Attr for BTreeMap<String, T> {
 
     fn print(&self, out: &mut String) {
         out.push('{');
-        for (i, (key, value)) in self.iter().enumerate() {
-            if i > 0 {
+        for (position, (key, value)) in self.iter().enumerate() {
+            if position > 0 {
                 out.push_str(", ");
             }
             if key.starts_with(is_ident_start)
@@ -477,21 +497,21 @@ impl<T: Attr> Attr for BTreeMap<String, T> {
         }
         out.push('}');
     }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
+    fn parse(cursor: &mut Cursor) -> Result<Self> {
         let mut map = BTreeMap::new();
-        c.expect("{")?;
-        parse_entries(c, |c, key, at| {
-            let value = T::parse(c)?;
+        cursor.expect("{")?;
+        parse_entries(cursor, |entry_cursor, key, at| {
+            let value = T::parse(entry_cursor)?;
             if map.insert(key.to_string(), value).is_some() {
-                bail!(c.error_at(at, format!("duplicate key `{key}`")));
+                bail!(entry_cursor.error_at(at, format!("duplicate key `{key}`")));
             }
             Ok(())
         })?;
-        c.expect("}")?;
+        cursor.expect("}")?;
         Ok(map)
     }
-    fn peek(c: &Cursor<'_>) -> bool {
-        c.peek_is("{")
+    fn peek(cursor: &Cursor) -> bool {
+        cursor.peek_is("{")
     }
 }
 
@@ -519,15 +539,15 @@ where
 }
 
 /// `item`, or `(a, b, ...)` for any number of items but one.
-pub fn print_tuple<'t, T: Attr + 't>(items: impl IntoIterator<Item = &'t T>, out: &mut String) {
-    let items: Vec<&T> = items.into_iter().collect();
+pub fn print_tuple<'t, T: Attr + 't>(list: impl IntoIterator<Item = &'t T>, out: &mut String) {
+    let items: Vec<&T> = list.into_iter().collect();
     if let [item] = items.as_slice() {
         item.print(out);
         return;
     }
     out.push('(');
-    for (i, item) in items.iter().enumerate() {
-        if i > 0 {
+    for (position, item) in items.iter().enumerate() {
+        if position > 0 {
             out.push_str(", ");
         }
         item.print(out);
@@ -536,16 +556,16 @@ pub fn print_tuple<'t, T: Attr + 't>(items: impl IntoIterator<Item = &'t T>, out
 }
 
 /// Reads what [`print_tuple`] writes.
-pub fn parse_tuple<L: AttrList>(c: &mut Cursor<'_>) -> Result<L> {
-    if c.eat("(") {
-        return Ok(c.list(")", L::Item::parse)?.into_iter().collect());
+pub fn parse_tuple<L: AttrList>(cursor: &mut Cursor) -> Result<L> {
+    if cursor.eat("(") {
+        return Ok(cursor.list(")", L::Item::parse)?.into_iter().collect());
     }
-    Ok(std::iter::once(L::Item::parse(c)?).collect())
+    Ok(std::iter::once(L::Item::parse(cursor)?).collect())
 }
 
 /// Whether what [`print_tuple`] writes comes next.
-pub fn peek_tuple<L: AttrList>(c: &Cursor<'_>) -> bool {
-    c.peek_is("(") || L::Item::peek(c)
+pub fn peek_tuple<L: AttrList>(cursor: &Cursor) -> bool {
+    cursor.peek_is("(") || L::Item::peek(cursor)
 }
 
 /// `4x{T}xf32`: the extents of a tensor, each followed by `x`, then its dtype.
@@ -558,24 +578,24 @@ pub fn print_shape(dims: &[Dim], dtype: &DType, out: &mut String) {
 }
 
 /// Reads what [`print_shape`] writes.
-pub fn parse_shape(c: &mut Cursor<'_>) -> Result<(Ranked<Dim>, DType)> {
-    let start = c.position();
-    let mut dims = Vec::new();
-    while Dim::peek(c) {
-        dims.push(Dim::parse(c)?);
-        c.shape_x()?;
+pub fn parse_shape(cursor: &mut Cursor) -> Result<(Ranked<Dim>, DType)> {
+    let start = cursor.position();
+    let mut extents = Vec::new();
+    while Dim::peek(cursor) {
+        extents.push(Dim::parse(cursor)?);
+        cursor.shape_x()?;
     }
-    if !c.peek_kind(TokenKind::Ident) {
-        return Err(c.unexpected("an extent or a dtype"));
+    if !cursor.peek_kind(TokenKind::Ident) {
+        return Err(cursor.unexpected("an extent or a dtype"));
     }
-    let dtype = DType::parse(c)?;
-    let dims = ranked(dims).map_err(|err| c.error_at(start, err))?;
+    let dtype = DType::parse(cursor)?;
+    let dims = ranked(extents).map_err(|err| cursor.error_at(start, err))?;
     Ok((dims, dtype))
 }
 
 /// Whether what [`print_shape`] writes comes next.
-pub fn peek_shape(c: &Cursor<'_>) -> bool {
-    Dim::peek(c) || DType::peek(c)
+pub fn peek_shape(cursor: &Cursor) -> bool {
+    Dim::peek(cursor) || DType::peek(cursor)
 }
 
 /// The name of a top-level symbol, such as a `tile.dispatch`, written `@name`.
@@ -589,13 +609,15 @@ impl Attr for SymbolRef {
         out.push('@');
         out.push_str(&self.0);
     }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
+    fn parse(cursor: &mut Cursor) -> Result<Self> {
         Ok(SymbolRef(
-            c.sigil_name(TokenKind::Symbol, "a symbol")?.to_string(),
+            cursor
+                .sigil_name(TokenKind::Symbol, "a symbol")?
+                .to_string(),
         ))
     }
-    fn peek(c: &Cursor<'_>) -> bool {
-        c.peek_kind(TokenKind::Symbol)
+    fn peek(cursor: &Cursor) -> bool {
+        cursor.peek_kind(TokenKind::Symbol)
     }
 }
 
@@ -635,11 +657,11 @@ impl Attr for F64 {
     fn print(&self, out: &mut String) {
         print_float(self.0, out);
     }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        c.float().map(F64)
+    fn parse(cursor: &mut Cursor) -> Result<Self> {
+        cursor.float().map(F64)
     }
-    fn peek(c: &Cursor<'_>) -> bool {
-        c.peek_float()
+    fn peek(cursor: &Cursor) -> bool {
+        cursor.peek_float()
     }
 }
 
@@ -661,10 +683,10 @@ impl Attr for Number {
     fn print(&self, out: &mut String) {
         out.push_str(&self.0);
     }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        c.number().map(Number)
+    fn parse(cursor: &mut Cursor) -> Result<Self> {
+        cursor.number().map(Number)
     }
-    fn peek(c: &Cursor<'_>) -> bool {
-        c.peek_number()
+    fn peek(cursor: &Cursor) -> bool {
+        cursor.peek_number()
     }
 }

@@ -1,11 +1,12 @@
-//! The greedy driver: removes dead ops, folds, and applies patterns until nothing changes.
+//! The greedy driver: removes dead ops, folds, and applies patterns until nothing changes, then
+//! applies the once-rewrites to each op once.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{ensure, Result};
 
 use crate::ir::{Inst, Module, OpKey, Region};
-use crate::rewrite::{fold_inst, Applied, Editor, PatternSet};
+use crate::rewrite::{fold_inst, Applied, Editor, PatternSet, Rewriting, KEY};
 use crate::traits::IsolatedFromAbove;
 
 /// The folds and patterns a greedy rewrite applies.
@@ -14,8 +15,12 @@ pub struct Rewrites {
     /// Whether ops fold: by their `#[fold]` folders, and by their traits. The constants of a
     /// function then go to its start, and equal ones become one.
     pub folds: bool,
-    /// The patterns to apply.
+    /// The patterns to apply until none applies.
     pub patterns: PatternSet,
+    /// The once-rewrites, applied after the patterns: each op of the module, in order, gets one
+    /// try of them, and the first that applies rewrites it. An op that a once-rewrite creates gets
+    /// none.
+    pub once: PatternSet,
 }
 
 impl Rewrites {
@@ -25,8 +30,19 @@ impl Rewrites {
         let mut patterns = PatternSet::new();
         populate(&mut patterns);
         Rewrites {
-            folds: false,
             patterns,
+            ..Rewrites::default()
+        }
+    }
+
+    /// The once-rewrites that `populate` adds: the rewrites of a pass that rewrites each of its
+    /// roots once.
+    pub fn once(populate: fn(&mut PatternSet)) -> Rewrites {
+        let mut once = PatternSet::new();
+        populate(&mut once);
+        Rewrites {
+            once,
+            ..Rewrites::default()
         }
     }
 }
@@ -47,7 +63,7 @@ pub struct GreedyReport {
     pub folded: usize,
     /// Dead ops erased.
     pub erased: usize,
-    /// Ops rewritten by a pattern.
+    /// Ops rewritten by a pattern or a once-rewrite.
     pub rewritten: usize,
 }
 
@@ -86,14 +102,26 @@ impl Greedy {
         self
     }
 
-    /// Runs the driver to a fixed point, or until its fuel runs out.
-    pub fn run(&self, module: &mut Module) -> Result<GreedyReport> {
+    /// Runs the driver to a fixed point, or until its fuel runs out, then applies the
+    /// once-rewrites.
+    pub fn run(&self, rewriting: &mut Rewriting) -> Result<GreedyReport> {
+        let module = &mut *rewriting.module;
+        let mut report = self.run_to_fixpoint(module)?;
+        report.rewritten += self.run_once(module)?;
+        Ok(report)
+    }
+
+    /// Erases, folds and applies the patterns until nothing changes, or until the fuel runs out.
+    fn run_to_fixpoint(&self, module: &mut Module) -> Result<GreedyReport> {
+        let mut report = GreedyReport::default();
+        if !self.erase_dead && !self.rewrites.folds && self.rewrites.patterns.is_empty() {
+            return Ok(report);
+        }
         let mut queue: VecDeque<Inst> = module.walk(module.body()).into();
         let mut queued: HashSet<Inst> = queue.iter().copied().collect();
         // A converging rewrite takes a few steps per op and pattern. Rewrites that undo each other
         // run past this bound.
         let bound = (queue.len() + 1) * (self.rewrites.patterns.len() + 3);
-        let mut report = GreedyReport::default();
         let mut constants = Constants::default();
         let mut steps = 0usize;
         while let Some(inst) = queue.pop_front() {
@@ -114,13 +142,32 @@ impl Greedy {
             }
             steps += 1;
             ensure!(steps <= bound, "did not converge within {bound} steps");
-            for touched in touched {
-                if queued.insert(touched) {
-                    queue.push_back(touched);
+            for changed in touched {
+                if queued.insert(changed) {
+                    queue.push_back(changed);
                 }
             }
         }
         Ok(report)
+    }
+
+    /// Gives each op of the module, in order, one try of the once-rewrites, and returns how many
+    /// it rewrote.
+    fn run_once(&self, module: &mut Module) -> Result<usize> {
+        let once = &self.rewrites.once;
+        if once.is_empty() {
+            return Ok(0);
+        }
+        let mut rewritten = 0;
+        for inst in module.walk(module.body()) {
+            if module.is_erased(inst) {
+                continue;
+            }
+            if let Applied::Rewritten { .. } = once.apply_to(module, inst, false)? {
+                rewritten += 1;
+            }
+        }
+        Ok(rewritten)
     }
 
     /// Applies the first step that changes `inst`, and returns it with the instructions it
@@ -141,16 +188,18 @@ impl Greedy {
                 return Ok(Some((Step::Folded, touched)));
             }
         }
-        let fold = self.rewrites.folds.then(|| fold_inst(module, inst));
-        if let Some(fold) = fold.flatten() {
+        let folded = self.rewrites.folds.then(|| fold_inst(module, inst));
+        if let Some(fold) = folded.flatten() {
             let mut editor = Editor::new(module);
             editor.apply_fold(inst, fold)?;
             return Ok(Some((Step::Folded, editor.touched)));
         }
-        Ok(match self.rewrites.patterns.apply(module, inst, false)? {
-            Applied::Rewritten { touched, .. } => Some((Step::Rewritten, touched)),
-            Applied::NoMatch(_) => None,
-        })
+        Ok(
+            match self.rewrites.patterns.apply_to(module, inst, false)? {
+                Applied::Rewritten { touched, .. } => Some((Step::Rewritten, touched)),
+                Applied::NoMatch(_) => None,
+            },
+        )
     }
 }
 
@@ -231,5 +280,5 @@ fn lead(module: &mut Module, inst: Inst, home: Region) {
         }
     }
     let anchor = after_constants.expect("a region ends with its terminator");
-    module.move_before(inst, anchor);
+    module.move_before(&KEY, inst, anchor);
 }

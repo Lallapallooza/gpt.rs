@@ -67,8 +67,9 @@ impl Entry {
 /// The code that reads `key = value, ...` into an `Option` slot per entry ([`Entry::slot`]): the
 /// declarations of the slots, and the closure that `parse_entries` and `parse_dict` take. A key
 /// given twice is an error, and so is a key no entry has, unless `unknown` reads it, with `key`,
-/// `c` and `at` in scope. `owner`, an expression, and `kind` name them in the errors:
-/// ``tile.block has no attribute `x` ``, ``duplicate attribute `x` ``.
+/// `cursor` and `at` in scope. The errors name the owner with `owner`, an expression, and the
+/// entries with `kind`, such as `attribute`: ``tile.block has no attribute `x` ``,
+/// ``duplicate attribute `x` ``.
 pub(crate) fn read_entries(
     entries: &[Entry],
     owner: &TokenStream2,
@@ -84,22 +85,22 @@ pub(crate) fn read_entries(
         quote! {
             #key => {
                 if #slot.is_some() {
-                    ::anyhow::bail!(c.error_at(at, format!(concat!("duplicate ", #kind, " `{}`"), key)));
+                    ::anyhow::bail!(cursor.error_at(at, format!(concat!("duplicate ", #kind, " `{}`"), key)));
                 }
-                #slot = ::std::option::Option::Some(<#ty as ::gpt_rs_ir::ir::Attr>::parse(c)?);
+                #slot = ::std::option::Option::Some(<#ty as ::gpt_rs_ir::ir::Attr>::parse(cursor)?);
             }
         }
     });
-    let unknown = unknown.unwrap_or_else(|| {
+    let unknown_arm = unknown.unwrap_or_else(|| {
         quote! {
-            ::anyhow::bail!(c.error_at(at, format!(concat!("{} has no ", #kind, " `{}`"), #owner, key)))
+            ::anyhow::bail!(cursor.error_at(at, format!(concat!("{} has no ", #kind, " `{}`"), #owner, key)))
         }
     });
     let reader = quote! {
-        |c: &mut ::gpt_rs_ir::text::Cursor<'_>, key: &str, at: usize| -> ::anyhow::Result<()> {
+        |cursor: &mut ::gpt_rs_ir::text::Cursor<'_>, key: &str, at: usize| -> ::anyhow::Result<()> {
             match key {
                 #(#arms)*
-                _ => #unknown,
+                _ => #unknown_arm,
             }
             ::std::result::Result::Ok(())
         }
@@ -114,7 +115,7 @@ pub(crate) fn entry_value(entry: &Entry, owner: &TokenStream2, kind: &str) -> To
     match &entry.default {
         Some(default) => quote!(#slot.unwrap_or_else(|| #default)),
         None => quote! {
-            #slot.ok_or_else(|| c.error(format!(concat!("{} needs ", #kind, " `{}`"), #owner, #key)))?
+            #slot.ok_or_else(|| cursor.error(format!(concat!("{} needs ", #kind, " `{}`"), #owner, #key)))?
         },
     }
 }
@@ -159,9 +160,9 @@ pub(crate) enum Element {
 pub(crate) struct Compiled {
     /// Statements that print the fields, bound by reference to their bindings, into `out`.
     pub print: TokenStream2,
-    /// Statements that read the fields from `c` into their bindings.
+    /// Statements that read the fields from `cursor` into their bindings.
     pub parse: TokenStream2,
-    /// Whether the next token of `c` starts the text.
+    /// Whether the next token of `cursor` starts the text.
     pub peek: TokenStream2,
     /// The literal the text starts with, when it starts with one.
     pub leading: Option<String>,
@@ -484,8 +485,8 @@ fn check(elements: &[Element], fields: &[FormatField], span: Span) -> syn::Resul
             Element::Optional(inner) => {
                 check_group(inner, fields, &error)?;
                 // The token after the group must tell that the group is not there.
-                let after = leading_literal(&elements[index + 1..]);
-                if let (Some(first), Some(after)) = (leading_literal(inner), after) {
+                let following = leading_literal(&elements[index + 1..]);
+                if let (Some(first), Some(after)) = (leading_literal(inner), following) {
                     if first == after {
                         return Err(error(format!(
                             "an optional group starts with `{first}`, which also follows it"
@@ -601,23 +602,23 @@ fn first(elements: &[Element], fields: &[FormatField]) -> (Vec<TokenStream2>, bo
                 continue;
             }
             Element::Struct { .. } => {
-                alternatives.push(quote!(c.peek_kind(::gpt_rs_ir::text::TokenKind::Ident)));
+                alternatives.push(quote!(cursor.peek_kind(::gpt_rs_ir::text::TokenKind::Ident)));
                 continue;
             }
-            Element::Literal(text) => quote!(c.peek_is(#text)),
+            Element::Literal(text) => quote!(cursor.peek_is(#text)),
             Element::Field { field, anchor } => {
                 let written = &fields[*field];
                 let ty = match (anchor, written.option_inner()) {
                     (true, Some(inner)) => inner,
                     _ => &written.ty,
                 };
-                quote!(<#ty as ::gpt_rs_ir::ir::Attr>::peek(c))
+                quote!(<#ty as ::gpt_rs_ir::ir::Attr>::peek(cursor))
             }
             Element::Tuple { field, .. } => {
                 let ty = &fields[*field].ty;
-                quote!(::gpt_rs_ir::ir::peek_tuple::<#ty>(c))
+                quote!(::gpt_rs_ir::ir::peek_tuple::<#ty>(cursor))
             }
-            Element::Shape { .. } => quote!(::gpt_rs_ir::ir::peek_shape(c)),
+            Element::Shape { .. } => quote!(::gpt_rs_ir::ir::peek_shape(cursor)),
         };
         alternatives.push(test);
         return (alternatives, false);
@@ -706,52 +707,58 @@ fn print_element(element: &Element, fields: &[FormatField]) -> TokenStream2 {
             }
         }
         Element::Shape { dims, dtype } => {
-            let (dims, dtype) = (&fields[*dims].binding, &fields[*dtype].binding);
+            let (dims_binding, dtype_binding) = (&fields[*dims].binding, &fields[*dtype].binding);
             quote! {
                 #space_before
-                ::gpt_rs_ir::ir::print_shape(&#dims[..], #dtype, out);
+                ::gpt_rs_ir::ir::print_shape(&#dims_binding[..], #dtype_binding, out);
                 space = true;
             }
         }
         Element::Struct {
-            fields: entries, ..
-        } => {
-            let entries = entries.iter().map(|&index| {
-                let field = &fields[index];
-                let (binding, ty, key) = (&field.binding, &field.ty, &field.name);
-                let present = match field.default_value() {
-                    Some(default) => quote!(*#binding != #default),
-                    None => quote!(true),
-                };
-                quote! {
-                    if #present {
-                        if !first {
-                            out.push_str(", ");
-                        } else if space {
-                            out.push(' ');
-                        }
-                        out.push_str(concat!(#key, " = "));
-                        <#ty as ::gpt_rs_ir::ir::Attr>::print(#binding, out);
-                        first = false;
-                    }
-                }
-            });
-            quote! {
-                let mut first = true;
-                #(#entries)*
-                if !first {
-                    space = true;
-                }
-            }
-        }
+            fields: written, ..
+        } => print_struct(written, fields),
         Element::Optional(inner) => {
             let present = anchor_present(inner, fields);
-            let prints = inner.iter().map(|element| print_element(element, fields));
+            let prints = inner
+                .iter()
+                .map(|inner_element| print_element(inner_element, fields));
             quote! {
                 if #present {
                     #(#prints)*
                 }
             }
+        }
+    }
+}
+
+/// Prints the `key = value` entries of the fields `written`, leaving out each that holds its
+/// default.
+fn print_struct(written: &[usize], fields: &[FormatField]) -> TokenStream2 {
+    let entries = written.iter().map(|&index| {
+        let field = &fields[index];
+        let (binding, ty, key) = (&field.binding, &field.ty, &field.name);
+        let present = match field.default_value() {
+            Some(default) => quote!(*#binding != #default),
+            None => quote!(true),
+        };
+        quote! {
+            if #present {
+                if !first {
+                    out.push_str(", ");
+                } else if space {
+                    out.push(' ');
+                }
+                out.push_str(concat!(#key, " = "));
+                <#ty as ::gpt_rs_ir::ir::Attr>::print(#binding, out);
+                first = false;
+            }
+        }
+    });
+    quote! {
+        let mut first = true;
+        #(#entries)*
+        if !first {
+            space = true;
         }
     }
 }
@@ -773,27 +780,27 @@ fn parse_element(
         }
     };
     match element {
-        Element::Literal(text) => quote!(c.expect(#text)?;),
+        Element::Literal(text) => quote!(cursor.expect(#text)?;),
         Element::Glue => quote!(),
         Element::Field { field, anchor } => {
             let ty = &fields[*field].ty;
             let value = match (anchor, fields[*field].option_inner()) {
                 (true, Some(inner)) => quote! {
-                    ::std::option::Option::Some(<#inner as ::gpt_rs_ir::ir::Attr>::parse(c)?)
+                    ::std::option::Option::Some(<#inner as ::gpt_rs_ir::ir::Attr>::parse(cursor)?)
                 },
-                _ => quote!(<#ty as ::gpt_rs_ir::ir::Attr>::parse(c)?),
+                _ => quote!(<#ty as ::gpt_rs_ir::ir::Attr>::parse(cursor)?),
             };
             bind(*field, value)
         }
         Element::Tuple { field, .. } => {
             let ty = &fields[*field].ty;
-            bind(*field, quote!(::gpt_rs_ir::ir::parse_tuple::<#ty>(c)?))
+            bind(*field, quote!(::gpt_rs_ir::ir::parse_tuple::<#ty>(cursor)?))
         }
         Element::Shape { dims, dtype } => {
             let dims_value = bind(*dims, quote!(::std::convert::Into::into(shape.0)));
             let dtype_value = bind(*dtype, quote!(::std::convert::Into::into(shape.1)));
             quote! {
-                let shape = ::gpt_rs_ir::ir::parse_shape(c)?;
+                let shape = ::gpt_rs_ir::ir::parse_shape(cursor)?;
                 #dims_value
                 #dtype_value
             }
@@ -810,15 +817,14 @@ fn parse_element(
                     default: field.default_value(),
                 });
             }
-            let owner = quote!(#owner);
-            let (slots, reader) = read_entries(&entries, &owner, "parameter", None);
-            let values = written
-                .iter()
-                .zip(&entries)
-                .map(|(&index, entry)| bind(index, entry_value(entry, &owner, "parameter")));
+            let owner_literal = quote!(#owner);
+            let (slots, reader) = read_entries(&entries, &owner_literal, "parameter", None);
+            let values = written.iter().zip(&entries).map(|(&index, entry)| {
+                bind(index, entry_value(entry, &owner_literal, "parameter"))
+            });
             quote! {
                 #slots
-                ::gpt_rs_ir::ir::parse_entries(c, #reader)?;
+                ::gpt_rs_ir::ir::parse_entries(cursor, #reader)?;
                 #(#values)*
             }
         }
@@ -826,7 +832,7 @@ fn parse_element(
             let (alternatives, _) = first(inner, fields);
             let parses = inner
                 .iter()
-                .map(|element| parse_element(element, fields, owner, declared));
+                .map(|inner_element| parse_element(inner_element, fields, owner, declared));
             quote! {
                 if #(#alternatives)||* {
                     #(#parses)*

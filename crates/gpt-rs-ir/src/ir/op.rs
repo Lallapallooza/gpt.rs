@@ -16,9 +16,10 @@ use smallvec::SmallVec;
 use crate::host::{HostScalar, HostTensor};
 use crate::interp::{HostBuffer, HostValue, Unit};
 use crate::ir::{
-    BufferType, DType, Dense, Element, IndexEnv, Inst, Module, Region, RegionRef, TensorType, Type,
-    Value, ValueRef,
+    AsInst, BufferType, DType, Dense, Element, IndexEnv, Inst, Module, Region, RegionRef,
+    TensorType, Type, Value, ValueRef, VectorType,
 };
+use crate::rewrite::Rewriter;
 use crate::text::Cursor;
 use crate::traits::Traits;
 use crate::Op;
@@ -28,10 +29,12 @@ pub trait View {
     type Any;
     type Tensor;
     type Buffer;
+    type Vector;
     type Index;
     type Scalar;
     fn tensor(x: Self::Any) -> Option<Self::Tensor>;
     fn buffer(x: Self::Any) -> Option<Self::Buffer>;
+    fn vector(x: Self::Any) -> Option<Self::Vector>;
     fn index(x: Self::Any) -> Option<Self::Index>;
     fn scalar(x: Self::Any) -> Option<Self::Scalar>;
 }
@@ -40,6 +43,7 @@ pub trait View {
 pub trait Embed: View {
     fn from_tensor(x: Self::Tensor) -> Self::Any;
     fn from_buffer(x: Self::Buffer) -> Self::Any;
+    fn from_vector(x: Self::Vector) -> Self::Any;
     fn from_index(x: Self::Index) -> Self::Any;
     fn from_scalar(x: Self::Scalar) -> Self::Any;
 }
@@ -51,6 +55,7 @@ impl<'a> View for Types<'a> {
     type Any = &'a Type;
     type Tensor = &'a TensorType;
     type Buffer = &'a BufferType;
+    type Vector = &'a VectorType;
     type Index = ();
     type Scalar = DType;
     fn tensor(x: &'a Type) -> Option<&'a TensorType> {
@@ -58,6 +63,9 @@ impl<'a> View for Types<'a> {
     }
     fn buffer(x: &'a Type) -> Option<&'a BufferType> {
         x.as_buffer()
+    }
+    fn vector(x: &'a Type) -> Option<&'a VectorType> {
+        x.as_vector()
     }
     fn index(x: &'a Type) -> Option<()> {
         x.is_index().then_some(())
@@ -74,17 +82,24 @@ impl View for OwnedTypes {
     type Any = Type;
     type Tensor = TensorType;
     type Buffer = BufferType;
+    type Vector = VectorType;
     type Index = ();
     type Scalar = DType;
     fn tensor(x: Type) -> Option<TensorType> {
         match x {
-            Type::Tensor(t) => Some(t),
+            Type::Tensor(tensor) => Some(tensor),
             _ => None,
         }
     }
     fn buffer(x: Type) -> Option<BufferType> {
         match x {
-            Type::Buffer(b) => Some(b),
+            Type::Buffer(buffer) => Some(buffer),
+            _ => None,
+        }
+    }
+    fn vector(x: Type) -> Option<VectorType> {
+        match x {
+            Type::Vector(vector) => Some(vector),
             _ => None,
         }
     }
@@ -103,6 +118,9 @@ impl Embed for OwnedTypes {
     fn from_buffer(x: BufferType) -> Type {
         Type::Buffer(x)
     }
+    fn from_vector(x: VectorType) -> Type {
+        Type::Vector(x)
+    }
     fn from_index(_: ()) -> Type {
         Type::Index
     }
@@ -118,6 +136,7 @@ impl<'a> View for Host<'a> {
     type Any = &'a HostValue;
     type Tensor = &'a HostTensor;
     type Buffer = &'a HostBuffer;
+    type Vector = &'a HostTensor;
     type Index = i64;
     type Scalar = HostScalar;
     fn tensor(x: &'a HostValue) -> Option<&'a HostTensor> {
@@ -125,19 +144,25 @@ impl<'a> View for Host<'a> {
     }
     fn buffer(x: &'a HostValue) -> Option<&'a HostBuffer> {
         match x {
-            HostValue::Buffer(b) => Some(b),
+            HostValue::Buffer(buffer) => Some(buffer),
+            _ => None,
+        }
+    }
+    fn vector(x: &'a HostValue) -> Option<&'a HostTensor> {
+        match x {
+            HostValue::Vector(vector) => Some(vector),
             _ => None,
         }
     }
     fn index(x: &'a HostValue) -> Option<i64> {
         match x {
-            HostValue::Index(i) => Some(*i),
+            HostValue::Index(index) => Some(*index),
             _ => None,
         }
     }
     fn scalar(x: &'a HostValue) -> Option<HostScalar> {
         match x {
-            HostValue::Scalar(s) => Some(*s),
+            HostValue::Scalar(scalar) => Some(*scalar),
             _ => None,
         }
     }
@@ -150,29 +175,36 @@ impl View for OwnedHost {
     type Any = HostValue;
     type Tensor = HostTensor;
     type Buffer = HostBuffer;
+    type Vector = HostTensor;
     type Index = i64;
     type Scalar = HostScalar;
     fn tensor(x: HostValue) -> Option<HostTensor> {
         match x {
-            HostValue::Tensor(t) => Some(t),
+            HostValue::Tensor(tensor) => Some(tensor),
             _ => None,
         }
     }
     fn buffer(x: HostValue) -> Option<HostBuffer> {
         match x {
-            HostValue::Buffer(b) => Some(b),
+            HostValue::Buffer(buffer) => Some(buffer),
+            _ => None,
+        }
+    }
+    fn vector(x: HostValue) -> Option<HostTensor> {
+        match x {
+            HostValue::Vector(vector) => Some(vector),
             _ => None,
         }
     }
     fn index(x: HostValue) -> Option<i64> {
         match x {
-            HostValue::Index(i) => Some(i),
+            HostValue::Index(index) => Some(index),
             _ => None,
         }
     }
     fn scalar(x: HostValue) -> Option<HostScalar> {
         match x {
-            HostValue::Scalar(s) => Some(s),
+            HostValue::Scalar(scalar) => Some(scalar),
             _ => None,
         }
     }
@@ -184,6 +216,9 @@ impl Embed for OwnedHost {
     }
     fn from_buffer(x: HostBuffer) -> HostValue {
         HostValue::Buffer(x)
+    }
+    fn from_vector(x: HostTensor) -> HostValue {
+        HostValue::Vector(x)
     }
     fn from_index(x: i64) -> HostValue {
         HostValue::Index(x)
@@ -201,12 +236,16 @@ impl View for Values {
     type Any = Value;
     type Tensor = Value;
     type Buffer = Value;
+    type Vector = Value;
     type Index = Value;
     type Scalar = Value;
     fn tensor(x: Value) -> Option<Value> {
         Some(x)
     }
     fn buffer(x: Value) -> Option<Value> {
+        Some(x)
+    }
+    fn vector(x: Value) -> Option<Value> {
         Some(x)
     }
     fn index(x: Value) -> Option<Value> {
@@ -224,6 +263,9 @@ impl Embed for Values {
     fn from_buffer(x: Value) -> Value {
         x
     }
+    fn from_vector(x: Value) -> Value {
+        x
+    }
     fn from_index(x: Value) -> Value {
         x
     }
@@ -238,6 +280,7 @@ pub enum Kind {
     Any,
     Tensor,
     Buffer,
+    Vector,
     Index,
     Scalar,
 }
@@ -385,12 +428,12 @@ pub trait OpKind: Clone + PartialEq + Eq + Hash + fmt::Debug + 'static {
     /// position.
     fn parse(
         name: &str,
-        c: &mut Cursor<'_>,
-        other_attr: &mut dyn FnMut(&str, &mut Cursor<'_>, usize) -> Result<()>,
+        cursor: &mut Cursor,
+        other_attr: &mut dyn FnMut(&str, &mut Cursor, usize) -> Result<()>,
     ) -> Option<Result<Self>>;
     /// Returns `None` unless this op is a [`SymbolOp`] named `name`. Otherwise parses its
     /// signature.
-    fn parse_symbol(_name: &str, _c: &mut Cursor<'_>) -> Option<Result<ParsedSymbol<Self>>> {
+    fn parse_symbol(_name: &str, _c: &mut Cursor) -> Option<Result<ParsedSymbol<Self>>> {
         None
     }
 }
@@ -408,7 +451,7 @@ pub struct NamedArg {
 
 /// An op that holds a constant value, which constant queries and folds read. `#[op(..., constant)]`
 /// declares an op as one.
-pub trait ConstantOp {
+pub trait ConstantValue {
     fn value(&self) -> &Dense;
 }
 
@@ -423,7 +466,7 @@ pub trait SymbolOp {
     /// with `arg_names` the names of the body's arguments.
     fn print_signature(&self, arg_names: &[String], out: &mut String);
     /// The signature after the op's name, up to its body: the op, and the arguments of its body.
-    fn parse_signature(c: &mut Cursor<'_>) -> Result<ParsedSymbol<Self>>
+    fn parse_signature(cursor: &mut Cursor) -> Result<ParsedSymbol<Self>>
     where
         Self: Sized;
 }
@@ -475,8 +518,8 @@ pub trait OpDef: OpKind {
     /// invalid.
     fn result_types(
         &self,
-        ins: Operands<Self, Types<'_>>,
-        cx: &TypeCx<'_, Regions<Self, Region>>,
+        ins: Operands<Self, Types>,
+        cx: &TypeCx<Regions<Self, Region>>,
     ) -> Result<Results<Self, OwnedTypes>>;
 }
 
@@ -485,20 +528,34 @@ pub trait OpDef: OpKind {
 pub trait Eval: OpKind {
     fn eval(
         &self,
-        ins: Operands<Self, Host<'_>>,
-        cx: &mut EvalCx<'_, Regions<Self, Region>>,
+        ins: Operands<Self, Host>,
+        cx: &mut EvalCx<Regions<Self, Region>>,
     ) -> Result<Results<Self, OwnedHost>>;
 }
 
 /// What an op author implements in addition for an op that declares regions.
 pub trait RegionOpDef: OpKind + DeclaresRegions {
-    fn region_signatures(&self, ins: Operands<Self, Types<'_>>)
-        -> Result<Regions<Self, RegionSig>>;
+    fn region_signatures(&self, ins: Operands<Self, Types>) -> Result<Regions<Self, RegionSig>>;
 }
 
+/// What a type rule reads beside the operand types: the module that holds the op's regions, the
+/// regions, and, for an op a rewrite stages, the module the rewrite reads.
 pub struct TypeCx<'a, R> {
     pub module: &'a Module,
     pub regions: R,
+    pub rewritten: Option<&'a Module>,
+}
+
+impl<'a, R> TypeCx<'a, R> {
+    /// The op that defines the top-level symbol `name`: in the module, or for an op a rewrite
+    /// stages, among the symbols it adds and those of the module it reads.
+    pub fn symbol(&self, name: &str) -> Option<&'a Op> {
+        if let Some(inst) = self.module.symbol(name) {
+            return Some(self.module.op(inst));
+        }
+        let rewritten = self.rewritten?;
+        Some(rewritten.op(rewritten.symbol(name)?))
+    }
 }
 
 /// Runs a region of the op being evaluated.
@@ -521,9 +578,9 @@ pub trait RegionRunner {
         &OUTSIDE
     }
 
-    /// Runs `region` once for each index from `start` up to `end`, each as a unit of one run of a
-    /// forall, which may run at the same time as the others.
-    fn run_units(&mut self, _region: Region, _start: i64, _end: i64) -> Result<()> {
+    /// Runs `region` once with each of `units`, its block arguments, as the units of work of one
+    /// run, which may run at the same time as each other.
+    fn run_units(&mut self, _region: Region, _units: Vec<Vec<HostValue>>) -> Result<()> {
         anyhow::bail!("only a run of a function runs units")
     }
 }
@@ -565,9 +622,10 @@ impl<R> EvalCx<'_, R> {
         self.runner.unit()
     }
 
-    /// Runs `region` once for each index from `start` up to `end`, as units of one run of a forall.
-    pub fn run_units(&mut self, region: Region, start: i64, end: i64) -> Result<()> {
-        self.runner.run_units(region, start, end)
+    /// Runs `region` once with each of `units`, its block arguments, as the units of work of one
+    /// run.
+    pub fn run_units(&mut self, region: Region, units: Vec<Vec<HostValue>>) -> Result<()> {
+        self.runner.run_units(region, units)
     }
 
     /// The result types, with this run's dimensions bound.
@@ -605,7 +663,8 @@ pub struct FoldIn<'a> {
 impl FoldIn<'_> {
     /// Whether the operand is a constant whose every element is `value`, compared by bits.
     pub fn is_splat<T: Element>(&self, value: T) -> bool {
-        self.constant.is_some_and(|c| c.is_splat(value))
+        self.constant
+            .is_some_and(|constant| constant.is_splat(value))
     }
 }
 
@@ -616,12 +675,16 @@ impl<'a> View for Folding<'a> {
     type Any = FoldIn<'a>;
     type Tensor = FoldIn<'a>;
     type Buffer = FoldIn<'a>;
+    type Vector = FoldIn<'a>;
     type Index = FoldIn<'a>;
     type Scalar = FoldIn<'a>;
     fn tensor(x: FoldIn<'a>) -> Option<FoldIn<'a>> {
         Some(x)
     }
     fn buffer(x: FoldIn<'a>) -> Option<FoldIn<'a>> {
+        Some(x)
+    }
+    fn vector(x: FoldIn<'a>) -> Option<FoldIn<'a>> {
         Some(x)
     }
     fn index(x: FoldIn<'a>) -> Option<FoldIn<'a>> {
@@ -642,7 +705,7 @@ pub enum Folded {
 }
 
 impl From<FoldIn<'_>> for Folded {
-    fn from(input: FoldIn<'_>) -> Self {
+    fn from(input: FoldIn) -> Self {
         Folded::Value(input.value)
     }
 }
@@ -654,12 +717,16 @@ impl View for FoldOut {
     type Any = Folded;
     type Tensor = Folded;
     type Buffer = Folded;
+    type Vector = Folded;
     type Index = Folded;
     type Scalar = Folded;
     fn tensor(x: Folded) -> Option<Folded> {
         Some(x)
     }
     fn buffer(x: Folded) -> Option<Folded> {
+        Some(x)
+    }
+    fn vector(x: Folded) -> Option<Folded> {
         Some(x)
     }
     fn index(x: Folded) -> Option<Folded> {
@@ -675,6 +742,9 @@ impl Embed for FoldOut {
         x
     }
     fn from_buffer(x: Folded) -> Folded {
+        x
+    }
+    fn from_vector(x: Folded) -> Folded {
         x
     }
     fn from_index(x: Folded) -> Folded {
@@ -696,7 +766,7 @@ impl FoldCx<'_> {
 
     /// `input` itself, when it has the type of the op's one result: the fold of an op that leaves
     /// its input as it is.
-    pub fn identity(&self, input: FoldIn<'_>) -> Option<Folded> {
+    pub fn identity(&self, input: FoldIn) -> Option<Folded> {
         (input.ty == self.result_type(0)).then(|| input.into())
     }
 
@@ -717,11 +787,7 @@ pub trait DeclaresRegions {}
 /// becomes an existing value, or a constant made by repeating or moving constant bytes.
 pub trait Fold: OpKind {
     /// The folded results, or `None` when the op does not fold.
-    fn fold(
-        &self,
-        ins: Operands<Self, Folding<'_>>,
-        cx: &FoldCx<'_>,
-    ) -> Option<Results<Self, FoldOut>>;
+    fn fold(&self, ins: Operands<Self, Folding>, cx: &FoldCx) -> Option<Results<Self, FoldOut>>;
 }
 
 /// A folder behind a signature without the op's types: the op, its operands, their segments and
@@ -755,12 +821,12 @@ pub fn folder_of(op: TypeId) -> Option<FoldFn> {
 
 /// `T`'s folder as a [`FoldFn`], which `#[fold]` registers.
 pub fn fold_erased<T: Fold + 'static>(
-    op: &dyn Any,
-    ins: &[FoldIn<'_>],
+    erased_op: &dyn Any,
+    ins: &[FoldIn],
     segments: Option<&[usize]>,
     results: &[Type],
 ) -> Option<Vec<Folded>> {
-    let op = op.downcast_ref::<T>()?;
+    let op = erased_op.downcast_ref::<T>()?;
     let typed = T::Groups::split_operands::<Folding<'_>>(ins.iter().cloned(), segments).ok()?;
     let out = op.fold(typed, &FoldCx { results })?;
     crate::rewrite::fired(crate::rewrite::Fired::Fold(T::INFO.name));
@@ -776,12 +842,16 @@ pub trait OpDyn {
     /// `#[cost]`.
     fn dyn_any(&self) -> &dyn Any;
 
+    /// The result types of the op on operands of types `ins`, with its regions `regions` of
+    /// `module`. `rewritten` is the module a rewrite reads when the op is one it stages, whose
+    /// symbols the op may name too.
     fn dyn_result_types(
         &self,
         ins: &[&Type],
         segments: Option<&[usize]>,
         regions: &[Region],
         module: &Module,
+        rewritten: Option<&Module>,
     ) -> Result<(Flat<Type>, Option<Vec<usize>>)>;
 
     fn dyn_region_signatures(
@@ -794,7 +864,7 @@ pub trait OpDyn {
     /// does not fold.
     fn dyn_fold(
         &self,
-        ins: &[FoldIn<'_>],
+        ins: &[FoldIn],
         segments: Option<&[usize]>,
         results: &[Type],
     ) -> Option<Vec<Folded>>;
@@ -809,7 +879,7 @@ pub trait OpDyn {
         runner: &mut dyn RegionRunner,
     ) -> Result<Vec<HostValue>>;
 
-    /// The value of a [`ConstantOp`].
+    /// The value of a [`ConstantValue`].
     fn dyn_constant(&self) -> Option<&Dense> {
         None
     }
@@ -830,7 +900,7 @@ pub trait InOp: OpKind + Into<Op> {
 /// op or its family declares them. The accessors return [`ValueRef`]s and [`RegionRef`]s.
 /// `#[op]` and `#[family]` implement them on the groups `G`, so code generic over the ops of a
 /// family can call them too. It holds references only, so it is free to make and pass around.
-pub struct Matched<'m, T: OpKind, G: Groups = <T as OpKind>::Groups> {
+pub struct OpRef<'m, T: OpKind, G: Groups = <T as OpKind>::Groups> {
     inst: Inst,
     op: &'m T,
     module: &'m Module,
@@ -839,7 +909,7 @@ pub struct Matched<'m, T: OpKind, G: Groups = <T as OpKind>::Groups> {
     pub(crate) regions: G::Regions<RegionRef<'m>>,
 }
 
-impl<'m, T: InOp> Matched<'m, T> {
+impl<'m, T: InOp> OpRef<'m, T> {
     /// The op of `inst` as a `T`, when it is one.
     pub(crate) fn new(module: &'m Module, inst: Inst) -> Option<Self> {
         let op = T::cast(module.op(inst))?;
@@ -859,12 +929,12 @@ impl<'m, T: InOp> Matched<'m, T> {
             module.result_segments(inst),
         )
         .ok()?;
-        let regions = module
+        let region_refs = module
             .regions(inst)
             .iter()
             .map(|&region| module.region_ref(region))
             .collect();
-        let regions = T::Groups::split_regions(regions).ok()?;
+        let regions = T::Groups::split_regions(region_refs).ok()?;
         Some(Self {
             inst,
             op,
@@ -876,7 +946,13 @@ impl<'m, T: InOp> Matched<'m, T> {
     }
 }
 
-impl<'m, T: OpKind, G: Groups> Matched<'m, T, G> {
+impl<T: OpKind, G: Groups> AsInst for OpRef<'_, T, G> {
+    fn inst(&self) -> Inst {
+        self.inst
+    }
+}
+
+impl<'m, T: OpKind, G: Groups> OpRef<'m, T, G> {
     pub fn inst(&self) -> Inst {
         self.inst
     }
@@ -902,7 +978,18 @@ impl<'m, T: OpKind, G: Groups> Matched<'m, T, G> {
     }
 }
 
-impl<T: OpKind, G: Groups> std::ops::Deref for Matched<'_, T, G> {
+impl<T: InOp + Clone> OpRef<'_, T> {
+    /// Stages a change of the op's attributes: `change` edits a copy of them, which `rewriter`
+    /// stores in the op when the rewrite applies. The op stays a `T`. Another op replaces it
+    /// through `Rewriter::replace_op`.
+    pub fn update(&self, rewriter: &mut Rewriter, change: impl FnOnce(&mut T)) {
+        let mut changed = self.op.clone();
+        change(&mut changed);
+        rewriter.set_op(self, changed);
+    }
+}
+
+impl<T: OpKind, G: Groups> std::ops::Deref for OpRef<'_, T, G> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -910,19 +997,23 @@ impl<T: OpKind, G: Groups> std::ops::Deref for Matched<'_, T, G> {
     }
 }
 
-/// Operand and result values read together with their module, as [`Matched`] holds them.
+/// Operand and result values read together with their module, as [`OpRef`] holds them.
 pub struct Refs<'m>(PhantomData<&'m ()>);
 
 impl<'m> View for Refs<'m> {
     type Any = ValueRef<'m>;
     type Tensor = ValueRef<'m>;
     type Buffer = ValueRef<'m>;
+    type Vector = ValueRef<'m>;
     type Index = ValueRef<'m>;
     type Scalar = ValueRef<'m>;
     fn tensor(x: ValueRef<'m>) -> Option<ValueRef<'m>> {
         Some(x)
     }
     fn buffer(x: ValueRef<'m>) -> Option<ValueRef<'m>> {
+        Some(x)
+    }
+    fn vector(x: ValueRef<'m>) -> Option<ValueRef<'m>> {
         Some(x)
     }
     fn index(x: ValueRef<'m>) -> Option<ValueRef<'m>> {
@@ -945,23 +1036,23 @@ pub fn group_sizes(
     segments: Option<&[usize]>,
     what: &str,
 ) -> Result<Flat<usize>> {
-    if let Some(segments) = segments {
+    if let Some(sizes) = segments {
         anyhow::ensure!(
-            segments.len() == groups.len(),
+            sizes.len() == groups.len(),
             "expected {} {what} segments, got {}",
             groups.len(),
-            segments.len()
+            sizes.len()
         );
         anyhow::ensure!(
-            segments.iter().sum::<usize>() == count,
-            "{what} segments {segments:?} do not add up to {count}"
+            sizes.iter().sum::<usize>() == count,
+            "{what} segments {sizes:?} do not add up to {count}"
         );
-        for (group, &size) in groups.iter().zip(segments) {
+        for (group, &size) in groups.iter().zip(sizes) {
             ensure_size(group, size, what)?;
         }
-        return Ok(SmallVec::from_slice(segments));
+        return Ok(SmallVec::from_slice(sizes));
     }
-    let fixed = groups.iter().filter(|g| !g.is_variable()).count();
+    let fixed = groups.iter().filter(|group| !group.is_variable()).count();
     let variable = groups.len() - fixed;
     match variable {
         0 => {
@@ -975,7 +1066,13 @@ pub fn group_sizes(
             );
             let sizes: Flat<usize> = groups
                 .iter()
-                .map(|g| if g.is_variable() { count - fixed } else { 1 })
+                .map(|group| {
+                    if group.is_variable() {
+                        count - fixed
+                    } else {
+                        1
+                    }
+                })
                 .collect();
             for (group, &size) in groups.iter().zip(&sizes) {
                 ensure_size(group, size, what)?;
@@ -984,7 +1081,7 @@ pub fn group_sizes(
         }
         _ if count == fixed => Ok(groups
             .iter()
-            .map(|g| usize::from(!g.is_variable()))
+            .map(|group| usize::from(!group.is_variable()))
             .collect()),
         _ => anyhow::bail!(
             "an op with {variable} optional or variadic {what} groups needs explicit segments"
@@ -1026,12 +1123,12 @@ pub fn take_one<T, A>(
 /// kind.
 pub fn take_optional<T, A>(
     items: &mut impl Iterator<Item = A>,
-    n: usize,
+    count: usize,
     project: impl FnOnce(A) -> Option<T>,
     group: &Group,
     what: &str,
 ) -> Result<Option<T>> {
-    (n == 1)
+    (count == 1)
         .then(|| take_one(items, project, group, what))
         .transpose()
 }
@@ -1039,12 +1136,12 @@ pub fn take_optional<T, A>(
 /// Takes the next `n` elements of a variadic group and projects each to the group's kind.
 pub fn take_many<T, A>(
     items: &mut impl Iterator<Item = A>,
-    n: usize,
+    count: usize,
     project: impl Fn(A) -> Option<T>,
     group: &Group,
     what: &str,
 ) -> Result<Vec<T>> {
-    (0..n)
+    (0..count)
         .map(|_| take_one(items, &project, group, what))
         .collect()
 }
@@ -1054,6 +1151,7 @@ fn kind_name(kind: Kind) -> &'static str {
         Kind::Any => "a value",
         Kind::Tensor => "a tensor",
         Kind::Buffer => "a buffer",
+        Kind::Vector => "a vector",
         Kind::Index => "an index",
         Kind::Scalar => "a scalar",
     }
@@ -1062,7 +1160,10 @@ fn kind_name(kind: Kind) -> &'static str {
 /// Segments to store for a flattened group struct: only needed with more than one optional or
 /// variadic group, one of which holds a value.
 pub fn segments_if_needed(groups: &[Group], sizes: &[usize]) -> Option<Vec<usize>> {
-    let variable = groups.iter().zip(sizes).filter(|(g, _)| g.is_variable());
+    let variable = groups
+        .iter()
+        .zip(sizes)
+        .filter(|(group, _)| group.is_variable());
     let (count, filled) = variable.fold((0, false), |(count, filled), (_, &size)| {
         (count + 1, filled || size > 0)
     });

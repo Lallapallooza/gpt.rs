@@ -109,7 +109,7 @@ impl Constraint {
 }
 
 impl fmt::Display for Constraint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         for (position, cmp) in self.0.iter().enumerate() {
             if position > 0 {
                 f.write_str(" or ")?;

@@ -66,8 +66,8 @@ pub fn every_item<T>(items: Vec<Option<T>>, key: &str, what: &str) -> Result<Vec
         return Ok(Vec::new());
     }
     let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        let Some(item) = item else {
+    for entry in items {
+        let Some(item) = entry else {
             return Err(format!("some {what} have `{key}` and some do not"));
         };
         out.push(item);

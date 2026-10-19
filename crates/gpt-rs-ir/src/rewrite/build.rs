@@ -4,6 +4,7 @@
 
 use std::ops;
 
+use super::Builder;
 use crate::dialects::constant_op;
 use crate::dialects::tensor::{Add, BroadcastTo, Cast, Constant, Mul, Reshape, Transpose};
 use crate::host::HostScalar;
@@ -25,8 +26,47 @@ pub trait Build: Sized {
         segments: Option<Vec<usize>>,
     ) -> (Vec<Value>, Option<Vec<usize>>);
 
+    /// Creates `op`, which has no regions, on `operands`, as it is, and gives its results.
+    fn create<T: InOp>(&mut self, op: T, operands: impl Into<Operands<T, Values>>) -> Created<T>;
+
+    /// Creates `op`, an op with regions, on `operands`: `body(index, builder, args)` fills region
+    /// `index`, whose block arguments are `args`, and ends it with its terminator. Gives the
+    /// results.
+    fn create_with_regions<T: InOp>(
+        &mut self,
+        op: T,
+        operands: impl Into<Operands<T, Values>>,
+        body: impl FnMut(usize, &mut Builder, &[Value]),
+    ) -> Created<T>;
+
+    /// Creates `op`, an op of one region, on `operands`: `body(builder, args)` fills the region,
+    /// whose block arguments are `args`, and ends it with its terminator. Fails as `body` fails.
+    #[track_caller]
+    fn create_with_body<T: InOp>(
+        &mut self,
+        op: T,
+        operands: impl Into<Operands<T, Values>>,
+        body: impl FnOnce(&mut Builder, &[Value]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Created<T>> {
+        let mut pending = Some(body);
+        let mut outcome = Ok(());
+        let created = self.create_with_regions(op, operands, |_, builder, args| {
+            let build = pending.take().expect("an op of one region fills it once");
+            outcome = build(builder, args);
+        });
+        outcome.map(|()| created)
+    }
+
+    /// The type of `value`, whether the module holds it or this build created it.
+    fn value_type(&self, value: Value) -> &Type;
+
     /// The type of `value`, a tensor.
-    fn tensor_type(&self, value: Value) -> &TensorType;
+    #[track_caller]
+    fn tensor_type(&self, value: Value) -> &TensorType {
+        let ty = self.value_type(value);
+        ty.as_tensor()
+            .unwrap_or_else(|| panic!("{value:?} is {ty}, not a tensor"))
+    }
 
     /// Creates `op`, which has no regions, on `operands`, or gives what it folds to, as `create`
     /// gives the results of an op.
@@ -36,13 +76,10 @@ pub trait Build: Sized {
         op: T,
         operands: impl Into<Operands<T, Values>>,
     ) -> Created<T> {
-        let (operands, segments) = T::Groups::flatten_operands::<Values>(operands.into());
+        let (flat_operands, segments) = T::Groups::flatten_operands::<Values>(operands.into());
         let (values, result_segments) =
-            self.create_or_fold_op(op.into(), operands.into_vec(), segments);
-        let results =
-            T::Groups::split_results::<Values>(values.into_iter(), result_segments.as_deref())
-                .expect("the type rule gave the result groups");
-        T::Groups::created(results)
+            self.create_or_fold_op(op.into(), flat_operands.into_vec(), segments);
+        created::<T>(values, result_segments)
     }
 
     /// `scalar` repeated to the extents `dims`: a constant of rank 0, broadcast to them.
@@ -143,6 +180,13 @@ impl<B: Build, V: Into<Value>> ops::Add<V> for Chain<'_, B> {
             value,
         }
     }
+}
+
+/// The results of an op of type `T` from its result values and their groups.
+fn created<T: InOp>(values: Vec<Value>, segments: Option<Vec<usize>>) -> Created<T> {
+    let results = T::Groups::split_results::<Values>(values.into_iter(), segments.as_deref())
+        .expect("the type rule gave the result groups");
+    T::Groups::created(results)
 }
 
 /// The values of folded results of types `types`: an existing value, or the constant op that

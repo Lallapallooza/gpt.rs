@@ -6,7 +6,7 @@ use crate::dialects::func::ir::*;
 use crate::ir::{OpDef, OwnedTypes, Region, RegionOpDef, RegionSig, TypeCx, Types};
 
 impl RegionOpDef for Func {
-    fn region_signatures(&self, _ins: FuncOperands<Types<'_>>) -> Result<FuncRegions<RegionSig>> {
+    fn region_signatures(&self, _ins: FuncOperands<Types>) -> Result<FuncRegions<RegionSig>> {
         Ok(FuncRegions {
             body: RegionSig::new(self.args.clone(), self.results.clone()),
         })
@@ -16,8 +16,8 @@ impl RegionOpDef for Func {
 impl OpDef for Func {
     fn result_types(
         &self,
-        _ins: FuncOperands<Types<'_>>,
-        _cx: &TypeCx<'_, FuncRegions<Region>>,
+        _ins: FuncOperands<Types>,
+        _cx: &TypeCx<FuncRegions<Region>>,
     ) -> Result<FuncResults<OwnedTypes>> {
         ensure!(
             self.params.is_empty() || self.params.len() == self.args.len(),
@@ -31,7 +31,7 @@ impl OpDef for Func {
                 "a load-time function binds every result to a parameter"
             );
             ensure!(
-                (0..self.args.len()).all(|i| self.param(i).is_some()),
+                (0..self.args.len()).all(|index| self.param(index).is_some()),
                 "a load-time function reads only parameters"
             );
         }
@@ -42,8 +42,8 @@ impl OpDef for Func {
 impl OpDef for Return {
     fn result_types(
         &self,
-        _ins: ReturnOperands<Types<'_>>,
-        _cx: &TypeCx<'_, crate::ir::NoRegions>,
+        _ins: ReturnOperands<Types>,
+        _cx: &TypeCx<crate::ir::NoRegions>,
     ) -> Result<ReturnResults<OwnedTypes>> {
         Ok(ReturnResults::default())
     }

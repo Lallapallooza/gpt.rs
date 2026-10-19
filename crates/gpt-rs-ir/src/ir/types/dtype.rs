@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use anyhow::{bail, Result};
 
-use super::float::Format;
+use super::float::{Format, E8M0_BIAS};
 use crate::ir::Mnemonic;
 
 /// Scalar element type.
@@ -111,6 +111,12 @@ impl DType {
         )
     }
 
+    /// Whether the IR computes on elements of this dtype in f32, rounding each result once to the
+    /// dtype: bf16 and f16, whose values f32 holds exactly.
+    pub fn computes_in_f32(self) -> bool {
+        matches!(self, DType::Bf16 | DType::F16)
+    }
+
     pub fn is_integer(self) -> bool {
         matches!(
             self,
@@ -170,7 +176,8 @@ impl DType {
         match (self, self.int_format()) {
             (DType::E8M0, _) => {
                 let exponent = value.log2();
-                exponent.fract() == 0.0 && (-127.0..=127.0).contains(&exponent)
+                let bias = f64::from(E8M0_BIAS);
+                exponent.fract() == 0.0 && (-bias..=bias).contains(&exponent)
             }
             // `as` saturates, so a value beyond i128 falls outside the range too.
             (_, Some(int)) => {
@@ -311,7 +318,7 @@ impl Elements {
 }
 
 impl fmt::Display for DType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(self.mnemonic())
     }
 }

@@ -18,7 +18,7 @@ pub use self::algebra::{
     Absorbing, Associative, Commutative, DistributesOver, Idempotent, IntValue, Involution,
     PerClass, RightIdentity, NEG_ZERO,
 };
-pub use self::structure::{Elementwise, IsolatedFromAbove, Movement, Terminator};
+pub use self::structure::{Elementwise, IsolatedFromAbove, Movement, NarrowInF32, Terminator};
 use crate::ir::{DType, Dense, Module, Type, Value};
 use crate::rewrite::{Doc, FoldResult};
 use crate::Op;
@@ -28,7 +28,7 @@ use crate::Op;
 /// dialect reference shows it, and `#[derive(Doc)]` gives its name and doc comment.
 pub trait OpTrait: Any + Sync + fmt::Debug + fmt::Display + Doc {
     /// What the op folds to by this trait alone.
-    fn fold(&self, _op: &OpRef<'_>) -> Option<FoldResult> {
+    fn fold(&self, _op: &Operation) -> Option<FoldResult> {
         None
     }
 
@@ -55,8 +55,8 @@ impl Traits {
 
     /// The trait `T`, with its parameters, when the op has it.
     pub fn get<T: OpTrait>(&self) -> Option<&'static T> {
-        self.iter().find_map(|t| {
-            let any: &'static dyn Any = t;
+        self.iter().find_map(|op_trait| {
+            let any: &'static dyn Any = op_trait;
             any.downcast_ref()
         })
     }
@@ -66,15 +66,16 @@ impl Traits {
     }
 }
 
-/// An op with its operands, as a trait's fold sees it.
-pub struct OpRef<'a> {
+/// An op with its operands and result types, untyped, as a trait's fold sees it: an op of the
+/// module, or one a builder is about to create.
+pub struct Operation<'a> {
     pub module: &'a Module,
     pub op: &'a Op,
     pub operands: &'a [Value],
     pub results: &'a [Type],
 }
 
-impl OpRef<'_> {
+impl Operation<'_> {
     /// The constant that defines operand `index`, if one does.
     pub fn constant(&self, index: usize) -> Option<&Dense> {
         self.module.constant(self.operands[index])
@@ -103,16 +104,18 @@ fn first_dtype(module: &Module, operands: &[Value]) -> Option<DType> {
     module.ty(*operands.first()?).dtype()
 }
 
-/// A side of a law.
+/// A side of a law, whose values are tensors of the operand type, or scalars of it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Term {
-    /// Variable `index`: a tensor of the operand type.
+    /// Variable `index`: a value of the operand type.
     Var(usize),
     /// The op itself applied to these terms.
     Apply(Vec<Term>),
     /// Another op applied to these terms.
     Other(Box<Op>, Vec<Term>),
-    /// A tensor of the operand type whose every element has these bytes.
+    /// The term converted to the dtype: by `tensor.cast` on a tensor, by `arith.cast` on a scalar.
+    Cast(DType, Box<Term>),
+    /// A value of the operand type whose every element has these bytes.
     Splat(Vec<u8>),
 }
 

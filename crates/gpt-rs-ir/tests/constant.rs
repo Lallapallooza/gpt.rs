@@ -13,7 +13,7 @@ fn constant_bytes_must_hold_its_elements() {
         dims: vec![4],
         bytes: vec![0u8; 8].into(),
     };
-    let _ = Module::new().build_func("f", Vec::new(), Vec::new(), |builder, _| {
+    let _ = Module::new().build_func("f", Vec::new(), Vec::new(), Vec::new(), |builder, _| {
         Ok(vec![builder.create(Constant { value }, ())])
     });
 }

@@ -16,8 +16,8 @@ impl Pattern for GroupStatic {
 
     fn rewrite(
         &self,
-        outer: WithTrait<'_, Associative>,
-        rewriter: &mut Rewriter<'_>,
+        outer: WithTrait<Associative>,
+        rewriter: &mut Rewriter,
     ) -> Result<(), NoMatch> {
         require!(let &[inner_result, outer_static] = outer.operands.as_slice(), "the op takes another number of operands");
         let associative =
@@ -29,8 +29,11 @@ impl Pattern for GroupStatic {
             module.op(inner) == outer.op,
             "the lhs comes from another op"
         );
-        require!(let &[dynamic, inner_static] = module.operands(inner), "the inner op takes another number of operands");
-        let (dynamic, inner_static) = (module.value_ref(dynamic), module.value_ref(inner_static));
+        require!(let &[dynamic_id, inner_static_id] = module.operands(inner), "the inner op takes another number of operands");
+        let (dynamic, inner_static) = (
+            module.value_ref(dynamic_id),
+            module.value_ref(inner_static_id),
+        );
         require!(inner_result.has_one_use(), "the inner op has other users");
         require!(
             inner_static.known_before_run(),
@@ -61,26 +64,28 @@ impl Pattern for GroupStatic {
 #[pattern(canonical)]
 struct Factor;
 
-/// The operand that `f(u)` and `f(v)` share and their other operands, `a` and `(b, c)` for
-/// `f(a, b)` and `f(a, c)`.
-fn shared(u: &[Value], v: &[Value], commutative: bool) -> Option<(Value, Value, Value)> {
-    let (&[u0, u1], &[v0, v1]) = (u, v) else {
+/// The operand that `f(first)` and `f(second)` share and their other operands, `a` and `(b, c)`
+/// for `f(a, b)` and `f(a, c)`.
+fn shared(first: &[Value], second: &[Value], commutative: bool) -> Option<(Value, Value, Value)> {
+    let (&[first0, first1], &[second0, second1]) = (first, second) else {
         return None;
     };
     let orders: &[(Value, Value, Value, Value)] = if commutative {
         &[
-            (u0, u1, v0, v1),
-            (u0, u1, v1, v0),
-            (u1, u0, v0, v1),
-            (u1, u0, v1, v0),
+            (first0, first1, second0, second1),
+            (first0, first1, second1, second0),
+            (first1, first0, second0, second1),
+            (first1, first0, second1, second0),
         ]
     } else {
-        &[(u0, u1, v0, v1)]
+        &[(first0, first1, second0, second1)]
     };
     orders
         .iter()
-        .find(|(a, _, a2, _)| a == a2)
-        .map(|&(a, b, _, c)| (a, b, c))
+        .find(|(first_shared, _, second_shared, _)| first_shared == second_shared)
+        .map(|&(shared_operand, first_rest, _, second_rest)| {
+            (shared_operand, first_rest, second_rest)
+        })
 }
 
 impl Pattern for Factor {
@@ -88,8 +93,8 @@ impl Pattern for Factor {
 
     fn rewrite(
         &self,
-        first: WithTrait<'_, DistributesOver>,
-        rewriter: &mut Rewriter<'_>,
+        first: WithTrait<DistributesOver>,
+        rewriter: &mut Rewriter,
     ) -> Result<(), NoMatch> {
         require!(let &[first_result] = first.results.as_slice(), "the op gives another number of results");
         let distributes =
@@ -142,6 +147,6 @@ impl Pattern for Factor {
 }
 
 /// The dtype of the first of `operands`.
-fn operands_dtype(operands: &[ValueRef<'_>]) -> Option<DType> {
+fn operands_dtype(operands: &[ValueRef]) -> Option<DType> {
     operands.first()?.value_type().dtype()
 }

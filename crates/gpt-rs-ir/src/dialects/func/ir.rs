@@ -40,7 +40,7 @@ pub struct Return;
 
 #[derive(crate::Dialect, Debug, Clone, PartialEq, Eq, Hash)]
 #[dialect(name = "func", op = Func)]
-pub enum FuncOp {
+pub enum FuncOps {
     Func(Func),
     Return(Return),
 }

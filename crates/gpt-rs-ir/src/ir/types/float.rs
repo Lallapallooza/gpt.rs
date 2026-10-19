@@ -224,9 +224,10 @@ impl Format {
         } else if rounded < 2f64.powi(min_normal) {
             (rounded / 2f64.powi(min_normal - man)) as u32
         } else {
-            let exponent = binade(rounded);
-            let mantissa = (rounded / 2f64.powi(exponent - man)) as u32 - (1 << self.man_bits);
-            ((exponent + self.bias) as u32) << self.man_bits | mantissa
+            let rounded_exponent = binade(rounded);
+            let mantissa =
+                (rounded / 2f64.powi(rounded_exponent - man)) as u32 - (1 << self.man_bits);
+            ((rounded_exponent + self.bias) as u32) << self.man_bits | mantissa
         };
         if code == 0 && self.specials == Specials::Fnuz {
             return 0;
@@ -242,17 +243,21 @@ fn binade(x: f64) -> i32 {
     biased.max(0) - 1023
 }
 
+/// The bias of the exponent of `e8m0`: the code `e` is `2^(e - 127)`, so its finite scales run
+/// from `2^-127` to `2^127`, and `0xFF` is NaN.
+pub const E8M0_BIAS: i32 = 127;
+
 /// The value of the `e8m0` code `code`: `2^(code - 127)`, or NaN for `0xFF`.
 pub fn e8m0_decode(code: u8) -> f64 {
     if code == 0xFF {
         return f64::NAN;
     }
-    2f64.powi(i32::from(code) - 127)
+    2f64.powi(i32::from(code) - E8M0_BIAS)
 }
 
 /// The `e8m0` code of `2^exponent`, clamped to the codes of finite scales.
 pub fn e8m0_encode(exponent: i32) -> u8 {
-    (exponent + 127).clamp(0, 254) as u8
+    (exponent + E8M0_BIAS).clamp(0, 2 * E8M0_BIAS) as u8
 }
 
 /// `float8_e4m3fn`: 4 exponent bits with bias 7, 3 mantissa bits, no infinities, and NaN at

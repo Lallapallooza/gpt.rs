@@ -28,11 +28,11 @@ thread_local! {
     static FIRED: RefCell<Option<Vec<Fired>>> = const { RefCell::new(None) };
 }
 
-/// Runs `f`, and returns its result with the rewrites that fired on this thread meanwhile, in
+/// Runs `body`, and returns its result with the rewrites that fired on this thread meanwhile, in
 /// order.
-pub fn record_fired<R>(f: impl FnOnce() -> R) -> (R, Vec<Fired>) {
+pub fn record_fired<R>(body: impl FnOnce() -> R) -> (R, Vec<Fired>) {
     let outer = FIRED.with(|fired| fired.replace(Some(Vec::new())));
-    let result = f();
+    let result = body();
     let fired = FIRED.with(|fired| fired.replace(outer)).unwrap_or_default();
     (result, fired)
 }

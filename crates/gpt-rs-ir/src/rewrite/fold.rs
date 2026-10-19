@@ -2,7 +2,7 @@
 
 use crate::ir::{FoldIn, Folded, Inst, Module, OpDyn, Type, Value};
 use crate::rewrite::{fired, Fired};
-use crate::traits::OpRef;
+use crate::traits::Operation;
 use crate::Op;
 
 /// What an op folds to.
@@ -33,15 +33,15 @@ fn fold_by_traits(
     operands: &[Value],
     results: &[Type],
 ) -> Option<FoldResult> {
-    let view = OpRef {
+    let view = Operation {
         module,
         op,
         operands,
         results,
     };
-    op.traits().iter().find_map(|t| {
-        let fold = t.fold(&view)?;
-        fired(Fired::TraitFold(t.name()));
+    op.traits().iter().find_map(|op_trait| {
+        let fold = op_trait.fold(&view)?;
+        fired(Fired::TraitFold(op_trait.name()));
         Some(fold)
     })
 }

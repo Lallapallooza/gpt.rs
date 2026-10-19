@@ -9,15 +9,32 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, ensure, Result};
 
-use crate::dialects::func::Func;
+use crate::dialects::func::{Func, FuncOp};
 use crate::host::HostScalar;
-use crate::ir::{Dense, Flat, InOp, Location, Matched, OpDyn, TensorType, Type};
-use crate::text::any_items;
+use crate::ir::{Dense, Flat, InOp, Location, OpDyn, OpRef, RunningPass, TensorType, Type};
+use crate::rewrite::EditKey;
 use crate::traits::{IsolatedFromAbove, Terminator};
 use crate::Op;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Inst(u32);
+
+/// An instruction, or what holds one: a view of an op.
+pub trait AsInst {
+    fn inst(&self) -> Inst;
+}
+
+impl AsInst for Inst {
+    fn inst(&self) -> Inst {
+        *self
+    }
+}
+
+impl<A: AsInst> AsInst for &A {
+    fn inst(&self) -> Inst {
+        (*self).inst()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Value(u32);
@@ -135,6 +152,8 @@ pub struct Module {
     values: Vec<ValueData>,
     regions: Vec<RegionData>,
     body: Region,
+    /// The pass that runs on the module. Each op it makes records the pass on its trail.
+    pub(super) running: RunningPass,
 }
 
 impl Default for Module {
@@ -154,6 +173,7 @@ impl Module {
             values: Vec::new(),
             regions: Vec::new(),
             body: Region(0),
+            running: RunningPass::default(),
         };
         module.body = module.new_region(Vec::new());
         module
@@ -164,12 +184,12 @@ impl Module {
         self.body
     }
 
-    fn inst(&self, inst: Inst) -> &InstData {
-        &self.insts[idx(inst.0)]
+    fn inst(&self, op: impl AsInst) -> &InstData {
+        &self.insts[idx(op.inst().0)]
     }
 
-    fn inst_mut(&mut self, inst: Inst) -> &mut InstData {
-        &mut self.insts[idx(inst.0)]
+    fn inst_mut(&mut self, op: impl AsInst) -> &mut InstData {
+        &mut self.insts[idx(op.inst().0)]
     }
 
     fn value(&self, value: Value) -> &ValueData {
@@ -192,48 +212,69 @@ impl Module {
         &mut self.regions[idx(region.0)]
     }
 
-    pub fn op(&self, inst: Inst) -> &Op {
-        &self.inst(inst).op
+    pub fn op(&self, op: impl AsInst) -> &Op {
+        &self.inst(op).op
     }
 
-    /// Replaces the op of `inst` with one of the same shape. The caller keeps operands and results
-    /// consistent with it.
-    pub fn set_op(&mut self, inst: Inst, op: Op) {
-        self.inst_mut(inst).op = op;
+    /// Replaces the op of `op` with `new`, an op of the same kind and shape. The caller keeps
+    /// operands and results consistent with it.
+    pub fn set_op(&mut self, _key: &EditKey, op: impl AsInst, new: Op) {
+        let inst = op.inst();
+        debug_assert_eq!(
+            self.op(inst).name(),
+            new.name(),
+            "an op keeps its kind once made"
+        );
+        self.inst_mut(inst).op = new;
         self.refresh(vec![inst]);
         for region in self.inst(inst).regions.clone() {
             self.refresh_args(region);
         }
+        if let Some(region) = self.inst(inst).parent {
+            self.refresh_holders(region);
+        }
     }
 
-    pub fn operands(&self, inst: Inst) -> &[Value] {
-        &self.inst(inst).operands
+    pub fn operands(&self, op: impl AsInst) -> &[Value] {
+        &self.inst(op).operands
     }
 
-    pub fn operand_segments(&self, inst: Inst) -> Option<&[usize]> {
-        self.inst(inst).operand_segments.as_deref()
+    pub fn operand_segments(&self, op: impl AsInst) -> Option<&[usize]> {
+        self.inst(op).operand_segments.as_deref()
     }
 
-    pub fn results(&self, inst: Inst) -> &[Value] {
-        &self.inst(inst).results
+    pub fn results(&self, op: impl AsInst) -> &[Value] {
+        &self.inst(op).results
     }
 
-    pub fn result_segments(&self, inst: Inst) -> Option<&[usize]> {
-        self.inst(inst).result_segments.as_deref()
+    pub fn result_segments(&self, op: impl AsInst) -> Option<&[usize]> {
+        self.inst(op).result_segments.as_deref()
     }
 
-    pub fn regions(&self, inst: Inst) -> &[Region] {
-        &self.inst(inst).regions
+    pub fn regions(&self, op: impl AsInst) -> &[Region] {
+        &self.inst(op).regions
     }
 
-    /// The region that holds `inst`, or `None` while it is detached.
-    pub fn parent_region(&self, inst: Inst) -> Option<Region> {
-        self.inst(inst).parent
+    /// The region that holds `op`, or `None` while it is detached.
+    pub fn parent_region(&self, op: impl AsInst) -> Option<Region> {
+        self.inst(op).parent
     }
 
     /// The op whose region this is, or `None` for the module body.
     pub fn parent_op(&self, region: Region) -> Option<Inst> {
         self.region(region).parent
+    }
+
+    /// The op of the module body that holds `op` in its regions, or `op` when it is one.
+    pub fn top_level_op(&self, op: impl AsInst) -> Inst {
+        let mut outer = op.inst();
+        while let Some(parent) = self
+            .parent_region(outer)
+            .and_then(|region| self.parent_op(region))
+        {
+            outer = parent;
+        }
+        outer
     }
 
     pub fn args(&self, region: Region) -> &[Value] {
@@ -252,8 +293,8 @@ impl Module {
         &self.value(value).uses
     }
 
-    pub fn is_erased(&self, inst: Inst) -> bool {
-        self.inst(inst).erased
+    pub fn is_erased(&self, op: impl AsInst) -> bool {
+        self.inst(op).erased
     }
 
     /// The instruction that defines `value`, unless it is a block argument.
@@ -292,10 +333,10 @@ impl Module {
         inst: Inst,
         map: &mut HashMap<Value, Value>,
     ) -> Result<Inst> {
-        let mapped = |values: &[Value], map: &HashMap<Value, Value>| -> Result<Vec<Value>> {
+        let mapped = |values: &[Value], copies: &HashMap<Value, Value>| -> Result<Vec<Value>> {
             values
                 .iter()
-                .map(|value| match map.get(value) {
+                .map(|value| match copies.get(value) {
                     Some(&mapped) => Ok(mapped),
                     None => bail!(
                         "{} reads a value from outside what it copies",
@@ -309,7 +350,7 @@ impl Module {
             let arg_types: Vec<Type> = source
                 .args(region)
                 .iter()
-                .map(|&v| source.ty(v).clone())
+                .map(|&arg| source.ty(arg).clone())
                 .collect();
             let copy = self.new_region(arg_types);
             map.extend(
@@ -321,7 +362,7 @@ impl Module {
             );
             for inner in source.insts(region) {
                 let inner_copy = self.copy_inst(source, inner, map)?;
-                self.append(copy, inner_copy);
+                self.link_last(copy, inner_copy);
             }
             regions.push(copy);
         }
@@ -345,7 +386,8 @@ impl Module {
     }
 
     /// `inst` and every live instruction in its regions, outer before inner, in order.
-    pub fn walk_inst(&self, inst: Inst) -> Vec<Inst> {
+    pub fn walk_inst(&self, op: impl AsInst) -> Vec<Inst> {
+        let inst = op.inst();
         let mut out = vec![inst];
         for &inner in self.regions(inst) {
             self.walk_into(inner, &mut out);
@@ -363,16 +405,22 @@ impl Module {
     }
 
     /// The `func.func` ops at the top level.
-    pub fn funcs(&self) -> Vec<Inst> {
-        self.insts(self.body)
-            .filter(|&inst| self.op(inst).get::<Func>().is_some())
-            .collect()
+    pub fn funcs(&self) -> Vec<FuncOp<'_>> {
+        let mut funcs = Vec::new();
+        for inst in self.insts(self.body) {
+            funcs.extend(self.op_as::<Func>(inst));
+        }
+        funcs
     }
 
     /// The `func.func` named `name`.
-    pub fn func(&self, name: &str) -> Option<Inst> {
-        self.insts(self.body)
-            .find(|&inst| self.op(inst).get::<Func>().is_some_and(|f| f.name == name))
+    pub fn func(&self, name: &str) -> Option<FuncOp<'_>> {
+        for inst in self.insts(self.body) {
+            if let Some(func) = self.op_as::<Func>(inst).filter(|func| func.name == name) {
+                return Some(func);
+            }
+        }
+        None
     }
 
     /// The top-level op that defines the symbol `name`: a `func.func` or a `tile.dispatch`.
@@ -400,44 +448,12 @@ impl Module {
     }
 
     /// Adds a block argument of type `ty` after the arguments `region` has.
-    pub fn append_arg(&mut self, region: Region, ty: Type) -> Value {
+    pub fn append_arg(&mut self, _key: &EditKey, region: Region, ty: Type) -> Value {
         let index = self.region(region).args.len();
         let value = self.new_value(ty, ValueDef::Arg(region, index));
         self.region_mut(region).args.push(value);
         self.value_mut(value).facts = self.arg_facts(region, index);
         value
-    }
-
-    /// Removes argument `index` of the function `func`, with the parameter it binds. The argument
-    /// must have no uses.
-    pub fn remove_arg(&mut self, func: Inst, index: usize) -> Result<()> {
-        let Some(mut attrs) = self.op(func).get::<Func>().cloned() else {
-            bail!("{} is not a function", self.op(func).name());
-        };
-        let body = self.regions(func)[0];
-        let args = self.args(body);
-        let Some(&arg) = args.get(index) else {
-            bail!(
-                "@{} has {} arguments, so no argument {index}",
-                attrs.name,
-                args.len()
-            );
-        };
-        if let Some(user) = self.uses(arg).first() {
-            bail!(
-                "argument {index} of @{} is still used by {}",
-                attrs.name,
-                self.op(user.inst).name()
-            );
-        }
-        self.remove_region_arg(body, index)?;
-        attrs.args.remove(index);
-        if !attrs.params.is_empty() {
-            attrs.params.remove(index);
-        }
-        attrs.params = any_items(attrs.params);
-        self.set_op(func, attrs.into());
-        Ok(())
     }
 
     fn new_value(&mut self, ty: Type, def: ValueDef) -> Value {
@@ -481,11 +497,8 @@ impl Module {
             .enumerate()
             .map(|(index, ty)| self.new_value(ty, ValueDef::Result(inst, index)))
             .collect();
-        let facts = self.result_facts(inst);
-        for &result in &results {
-            self.value_mut(result).facts = facts;
-        }
         self.inst_mut(inst).results = results;
+        self.refresh(vec![inst]);
         for region in self.inst(inst).regions.clone() {
             self.refresh_args(region);
         }
@@ -493,13 +506,18 @@ impl Module {
     }
 
     /// Appends a detached instruction to the end of `region`.
-    pub fn append(&mut self, region: Region, inst: Inst) {
+    pub fn append(&mut self, _key: &EditKey, region: Region, inst: Inst) {
+        self.link_last(region, inst);
+    }
+
+    fn link_last(&mut self, region: Region, inst: Inst) {
+        self.number_for_trails();
         debug_assert!(
             self.inst(inst).parent.is_none(),
             "instruction already placed"
         );
         let last = self.region(region).last;
-        let order = last.map_or(0, |last| self.inst(last).order) + ORDER_GAP;
+        let order = last.map_or(0, |tail| self.inst(tail).order) + ORDER_GAP;
         {
             let data = self.inst_mut(inst);
             data.parent = Some(region);
@@ -508,25 +526,31 @@ impl Module {
             data.order = order;
         }
         match last {
-            Some(last) => self.inst_mut(last).next = Some(inst),
+            Some(tail) => self.inst_mut(tail).next = Some(inst),
             None => self.region_mut(region).first = Some(inst),
         }
         self.region_mut(region).last = Some(inst);
+        self.refresh_holders(region);
     }
 
     /// Places a detached instruction right before `anchor`.
-    pub fn insert_before(&mut self, anchor: Inst, inst: Inst) {
+    pub fn insert_before(&mut self, _key: &EditKey, anchor: Inst, inst: Inst) {
+        self.link_before(anchor, inst);
+    }
+
+    fn link_before(&mut self, anchor: Inst, inst: Inst) {
+        self.number_for_trails();
         debug_assert!(
             self.inst(inst).parent.is_none(),
             "instruction already placed"
         );
         let region = self.inst(anchor).parent.expect("anchor is placed");
         let prev = self.inst(anchor).prev;
-        let lower = prev.map_or(0, |prev| self.inst(prev).order);
-        if self.inst(anchor).order - lower < 2 {
+        let gap = self.inst(anchor).order - prev.map_or(0, |before| self.inst(before).order);
+        if gap < 2 {
             self.renumber(region);
         }
-        let lower = prev.map_or(0, |prev| self.inst(prev).order);
+        let lower = prev.map_or(0, |before| self.inst(before).order);
         let order = lower + (self.inst(anchor).order - lower) / 2;
         {
             let data = self.inst_mut(inst);
@@ -537,9 +561,10 @@ impl Module {
         }
         self.inst_mut(anchor).prev = Some(inst);
         match prev {
-            Some(prev) => self.inst_mut(prev).next = Some(inst),
+            Some(before) => self.inst_mut(before).next = Some(inst),
             None => self.region_mut(region).first = Some(inst),
         }
+        self.refresh_holders(region);
     }
 
     /// Spreads the order keys of `region`'s instructions [`ORDER_GAP`] apart again.
@@ -555,19 +580,20 @@ impl Module {
 
     /// Moves `inst`, which must be placed, right before `anchor`, which may be in another region.
     /// Its operands must be defined before `anchor`, and its results used after it.
-    pub fn move_before(&mut self, inst: Inst, anchor: Inst) {
+    pub fn move_before(&mut self, _key: &EditKey, op: impl AsInst, anchor: impl AsInst) {
+        let inst = op.inst();
         self.unlink(inst);
-        self.insert_before(anchor, inst);
+        self.link_before(anchor.inst(), inst);
     }
 
-    /// Whether `a` comes before `b`, two instructions of one region.
-    pub fn is_before(&self, a: Inst, b: Inst) -> bool {
+    /// Whether `first` comes before `second`, two instructions of one region.
+    pub fn is_before(&self, first: Inst, second: Inst) -> bool {
         debug_assert_eq!(
-            self.inst(a).parent,
-            self.inst(b).parent,
+            self.inst(first).parent,
+            self.inst(second).parent,
             "the instructions are in different regions"
         );
-        self.inst(a).order < self.inst(b).order
+        self.inst(first).order < self.inst(second).order
     }
 
     /// The instruction of `region` that holds `inst`: `inst` itself, or the op of `region` whose
@@ -604,35 +630,42 @@ impl Module {
     }
 
     /// Where the op of `inst` comes from, when that is known.
-    pub fn location(&self, inst: Inst) -> Option<&Location> {
-        self.inst(inst).location.as_ref()
+    pub fn location(&self, op: impl AsInst) -> Option<&Location> {
+        self.inst(op).location.as_ref()
     }
 
-    pub fn set_location(&mut self, inst: Inst, location: Option<Location>) {
-        self.inst_mut(inst).location = location;
+    pub fn set_location(&mut self, _key: &EditKey, op: impl AsInst, location: Option<Location>) {
+        self.inst_mut(op).location = location;
     }
 
     fn unlink(&mut self, inst: Inst) {
+        self.number_for_trails();
         let Some(region) = self.inst(inst).parent else {
             return;
         };
         let (prev, next) = (self.inst(inst).prev, self.inst(inst).next);
         match prev {
-            Some(prev) => self.inst_mut(prev).next = next,
+            Some(before) => self.inst_mut(before).next = next,
             None => self.region_mut(region).first = next,
         }
         match next {
-            Some(next) => self.inst_mut(next).prev = prev,
+            Some(after) => self.inst_mut(after).prev = prev,
             None => self.region_mut(region).last = prev,
         }
         let data = self.inst_mut(inst);
         data.parent = None;
         data.prev = None;
         data.next = None;
+        self.refresh_holders(region);
     }
 
     /// Removes block argument `index` of `region`, which nothing may use.
-    pub fn remove_region_arg(&mut self, region: Region, index: usize) -> Result<()> {
+    pub fn remove_region_arg(
+        &mut self,
+        _key: &EditKey,
+        region: Region,
+        index: usize,
+    ) -> Result<()> {
         let Some(&arg) = self.args(region).get(index) else {
             bail!("the region has no argument {index}");
         };
@@ -643,25 +676,26 @@ impl Module {
             );
         }
         self.region_mut(region).args.remove(index);
-        for (i, later) in self
+        for (position, later) in self
             .args(region)
             .to_vec()
             .into_iter()
             .enumerate()
             .skip(index)
         {
-            self.value_mut(later).def = ValueDef::Arg(region, i);
+            self.value_mut(later).def = ValueDef::Arg(region, position);
         }
         Ok(())
     }
 
     /// Replaces every operand of `inst` with `operands`. The operand groups stay when the count
     /// does, and otherwise must follow from the op, which has at most one variable group.
-    pub fn set_operands(&mut self, inst: Inst, operands: Vec<Value>) {
+    pub fn set_operands(&mut self, _key: &EditKey, op: impl AsInst, operands: Vec<Value>) {
+        let inst = op.inst();
         for (index, &old) in self.inst(inst).operands.clone().iter().enumerate() {
             self.value_mut(old)
                 .uses
-                .retain(|u| !(u.inst == inst && u.index == index));
+                .retain(|use_site| !(use_site.inst == inst && use_site.index == index));
         }
         for (index, &value) in operands.iter().enumerate() {
             self.value_mut(value).uses.push(Use { inst, index });
@@ -674,32 +708,34 @@ impl Module {
         self.refresh(vec![inst]);
     }
 
-    pub fn set_operand(&mut self, inst: Inst, index: usize, value: Value) {
+    pub fn set_operand(&mut self, _key: &EditKey, op: impl AsInst, index: usize, value: Value) {
+        let inst = op.inst();
         let old = self.inst(inst).operands[index];
         self.value_mut(old)
             .uses
-            .retain(|u| !(u.inst == inst && u.index == index));
+            .retain(|use_site| !(use_site.inst == inst && use_site.index == index));
         self.inst_mut(inst).operands[index] = value;
         self.value_mut(value).uses.push(Use { inst, index });
         self.refresh(vec![inst]);
     }
 
     /// Makes every use of `from` a use of `to`, terminators included.
-    pub fn replace_all_uses(&mut self, from: Value, to: Value) {
+    pub fn replace_all_uses(&mut self, _key: &EditKey, from: Value, to: Value) {
         if from == to {
             return;
         }
         let uses = std::mem::take(&mut self.value_mut(from).uses);
-        for u in &uses {
-            self.inst_mut(u.inst).operands[u.index] = to;
+        for use_site in &uses {
+            self.inst_mut(use_site.inst).operands[use_site.index] = to;
         }
-        let users = uses.iter().map(|u| u.inst).collect();
+        let users = uses.iter().map(|use_site| use_site.inst).collect();
         self.value_mut(to).uses.extend(uses);
         self.refresh(users);
     }
 
     /// Removes `inst` and everything in its regions. Fails while a result is still used outside.
-    pub fn erase(&mut self, inst: Inst) -> Result<()> {
+    pub fn erase(&mut self, _key: &EditKey, op: impl AsInst) -> Result<()> {
+        let inst = op.inst();
         ensure!(!self.inst(inst).erased, "instruction is already erased");
         let nested: Vec<Inst> = self
             .regions(inst)
@@ -707,9 +743,9 @@ impl Module {
             .flat_map(|&region| self.walk(region))
             .collect();
         let inside_set: HashSet<Inst> = nested.iter().copied().collect();
-        let inside = |u: &Use| u.inst == inst || inside_set.contains(&u.inst);
+        let inside = |use_site: &Use| use_site.inst == inst || inside_set.contains(&use_site.inst);
         for &result in self.results(inst) {
-            if let Some(user) = self.uses(result).iter().find(|u| !inside(u)) {
+            if let Some(user) = self.uses(result).iter().find(|use_site| !inside(use_site)) {
                 bail!(
                     "cannot erase {}: result {} is still used by {}",
                     self.op(inst).name(),
@@ -727,7 +763,7 @@ impl Module {
 
     fn def_index(&self, value: Value) -> usize {
         match self.def(value) {
-            ValueDef::Result(_, i) | ValueDef::Arg(_, i) => i,
+            ValueDef::Result(_, index) | ValueDef::Arg(_, index) => index,
         }
     }
 
@@ -737,30 +773,38 @@ impl Module {
         for (index, operand) in operands.into_iter().enumerate() {
             self.value_mut(operand)
                 .uses
-                .retain(|u| !(u.inst == inst && u.index == index));
+                .retain(|use_site| !(use_site.inst == inst && use_site.index == index));
         }
         self.inst_mut(inst).erased = true;
     }
 
-    pub fn operand_types(&self, inst: Inst) -> Vec<&Type> {
-        self.operands(inst).iter().map(|&v| self.ty(v)).collect()
+    pub fn operand_types(&self, op: impl AsInst) -> Vec<&Type> {
+        self.operands(op)
+            .iter()
+            .map(|&operand| self.ty(operand))
+            .collect()
     }
 
     /// The result types and result groups that `op` gives on `operands`, in the groups
-    /// `segments`, with `regions`: what its type rule says.
+    /// `segments`, with `regions`: what its type rule says. `rewritten` is the module a rewrite
+    /// reads, when this module holds the ops it stages.
     pub fn infer_results(
         &self,
         op: &Op,
         operands: &[Value],
         segments: Option<&[usize]>,
         regions: &[Region],
+        rewritten: Option<&Module>,
     ) -> Result<(Flat<Type>, Option<Vec<usize>>)> {
-        let types: Vec<&Type> = operands.iter().map(|&v| self.ty(v)).collect();
-        op.dyn_result_types(&types, segments, regions, self)
+        let types: Vec<&Type> = operands.iter().map(|&operand| self.ty(operand)).collect();
+        op.dyn_result_types(&types, segments, regions, self, rewritten)
     }
 
-    pub fn result_types(&self, inst: Inst) -> Vec<&Type> {
-        self.results(inst).iter().map(|&v| self.ty(v)).collect()
+    pub fn result_types(&self, op: impl AsInst) -> Vec<&Type> {
+        self.results(op)
+            .iter()
+            .map(|&result| self.ty(result))
+            .collect()
     }
 
     /// The constant that defines `value`, if one does.
@@ -768,18 +812,33 @@ impl Module {
         self.op(self.def_inst(value)?).as_constant()
     }
 
-    /// Whether `inst` can go: it is pure, no result is used, and it is neither a terminator nor an
-    /// isolated op without results such as `func.func`, which no SSA value uses.
+    /// Whether `inst` can go: it and every op its regions hold are pure, no result is used, and it
+    /// is neither a terminator nor an isolated op without results such as `func.func`, which no
+    /// SSA value uses.
     pub fn is_trivially_dead(&self, inst: Inst) -> bool {
         let op = self.op(inst);
-        op.effects().is_pure()
-            && !op.has_trait::<Terminator>()
+        !op.has_trait::<Terminator>()
             && !(op.has_trait::<IsolatedFromAbove>() && self.results(inst).is_empty())
-            && self.results(inst).iter().all(|&v| self.uses(v).is_empty())
+            && self
+                .results(inst)
+                .iter()
+                .all(|&result| self.uses(result).is_empty())
+            && self.is_pure_within(inst)
+    }
+
+    /// Whether neither `inst` nor any op its regions hold has an effect: a loop whose body stores
+    /// has the store's.
+    fn is_pure_within(&self, inst: Inst) -> bool {
+        self.op(inst).effects().is_pure()
+            && self
+                .regions(inst)
+                .iter()
+                .all(|&region| self.insts(region).all(|inner| self.is_pure_within(inner)))
     }
 
     /// Whether `value` is known before the run: a constant, a function argument bound to a
-    /// parameter, or a result of a pure op without regions whose operands are all known.
+    /// parameter, or a result of a pure op whose operands are all known, and whose regions, if it
+    /// has any, read only their own arguments and hold only pure ops.
     pub fn known_before_run(&self, value: Value) -> bool {
         self.value(value).facts.known_before_run
     }
@@ -793,12 +852,20 @@ impl Module {
     /// The facts of the results of `inst`, from its op and the facts of its operands.
     fn result_facts(&self, inst: Inst) -> Facts {
         let data = self.inst(inst);
-        let operands = || data.operands.iter().map(|&v| self.value(v).facts);
+        if data.results.is_empty() {
+            return Facts::default();
+        }
+        let operands = || {
+            data.operands
+                .iter()
+                .map(|&operand| self.value(operand).facts)
+        };
+        let isolated = data.regions.is_empty() || data.op.has_trait::<IsolatedFromAbove>();
         Facts {
-            known_before_run: data.op.effects().is_pure()
-                && data.regions.is_empty()
-                && operands().all(|f| f.known_before_run),
-            depends_on_parameter: operands().any(|f| f.depends_on_parameter),
+            known_before_run: isolated
+                && operands().all(|facts| facts.known_before_run)
+                && self.is_pure_within(inst),
+            depends_on_parameter: operands().any(|facts| facts.depends_on_parameter),
         }
     }
 
@@ -818,10 +885,24 @@ impl Module {
             for index in 0..self.inst(inst).results.len() {
                 let result = self.inst(inst).results[index];
                 if std::mem::replace(&mut self.value_mut(result).facts, facts) != facts {
-                    insts.extend(self.uses(result).iter().map(|u| u.inst));
+                    insts.extend(self.uses(result).iter().map(|use_site| use_site.inst));
                 }
             }
         }
+    }
+
+    /// Recomputes the facts of the ops that hold `region`, which depend on what their regions hold,
+    /// and of everything computed from them.
+    fn refresh_holders(&mut self, region: Region) {
+        let mut holders = Vec::new();
+        let mut current = self.parent_op(region);
+        while let Some(holder) = current {
+            holders.push(holder);
+            current = self
+                .parent_region(holder)
+                .and_then(|outer| self.parent_op(outer));
+        }
+        self.refresh(holders);
     }
 
     /// Recomputes the facts of the block arguments of `region`, and of everything computed from
@@ -830,7 +911,11 @@ impl Module {
         for (index, arg) in self.region(region).args.clone().into_iter().enumerate() {
             let facts = self.arg_facts(region, index);
             if std::mem::replace(&mut self.value_mut(arg).facts, facts) != facts {
-                let users = self.uses(arg).iter().map(|u| u.inst).collect();
+                let users = self
+                    .uses(arg)
+                    .iter()
+                    .map(|use_site| use_site.inst)
+                    .collect();
                 self.refresh(users);
             }
         }
@@ -859,8 +944,8 @@ impl Module {
     }
 
     /// The op of `inst` as a `T`, with its named groups, when it is one.
-    pub fn op_as<T: InOp>(&self, inst: Inst) -> Option<Matched<'_, T>> {
-        Matched::new(self, inst)
+    pub fn op_as<T: InOp>(&self, inst: Inst) -> Option<OpRef<'_, T>> {
+        OpRef::new(self, inst)
     }
 
     /// `value` read together with this module.
@@ -904,7 +989,7 @@ impl<'m> ValueRef<'m> {
     }
 
     /// The op that defines the value, when it is a `T`.
-    pub fn defining_op<T: InOp>(self) -> Option<Matched<'m, T>> {
+    pub fn defining_op<T: InOp>(self) -> Option<OpRef<'m, T>> {
         self.module.op_as(self.defining_inst()?)
     }
 
@@ -958,7 +1043,7 @@ impl<'m> ValueRef<'m> {
 }
 
 impl From<ValueRef<'_>> for Value {
-    fn from(value: ValueRef<'_>) -> Value {
+    fn from(value: ValueRef) -> Value {
         value.value
     }
 }
@@ -972,7 +1057,7 @@ impl PartialEq for ValueRef<'_> {
 impl Eq for ValueRef<'_> {}
 
 impl std::fmt::Debug for ValueRef<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         self.value.fmt(f)
     }
 }
@@ -1020,7 +1105,7 @@ impl<'m> RegionRef<'m> {
 }
 
 impl From<RegionRef<'_>> for Region {
-    fn from(region: RegionRef<'_>) -> Region {
+    fn from(region: RegionRef) -> Region {
         region.region
     }
 }

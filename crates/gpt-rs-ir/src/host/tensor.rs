@@ -58,7 +58,7 @@ impl AsRef<[u8]> for ExternalBytes {
 }
 
 impl fmt::Debug for ExternalBytes {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ExternalBytes")
             .field("offset", &self.offset)
             .field("len", &self.len)
@@ -236,7 +236,7 @@ impl<T: Pod> FromIterator<T> for Buffer<T> {
 }
 
 impl<T: Pod + fmt::Debug> fmt::Debug for Buffer<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
@@ -334,7 +334,7 @@ impl Packed {
         let bit = index * self.dtype.bits();
         let (byte, shift) = (bit / 8, bit % 8);
         let low = u16::from(self.bytes[byte]);
-        let high = self.bytes.get(byte + 1).map_or(0, |&b| u16::from(b));
+        let high = self.bytes.get(byte + 1).map_or(0, |&next| u16::from(next));
         (((high << 8 | low) >> shift) & self.mask()) as u8
     }
 
@@ -402,14 +402,14 @@ impl TensorData {
             let bytes = dtype
                 .bytes_for(count)
                 .ok_or_else(|| anyhow!("{count} {dtype} elements take more bytes than fit"))?;
-            let fill = match fill {
+            let packed_fill = match fill {
                 Fill::Zeros(_) => Fill::Zeros(bytes),
                 other => other,
             };
             return Ok(TensorData::Packed(Packed::new(
                 dtype,
                 count,
-                fill.buffer()?,
+                packed_fill.buffer()?,
             )?));
         }
         Ok(match dtype {
@@ -478,49 +478,49 @@ impl TensorData {
 
     fn elements(&self) -> &dyn Elements {
         match self {
-            TensorData::F64(v) => v,
-            TensorData::F32(v) => v,
-            TensorData::F16(v) => v,
-            TensorData::Bf16(v) => v,
-            TensorData::F8E4M3(v) => v,
-            TensorData::F8E5M2(v)
-            | TensorData::F8E4M3Fnuz(v)
-            | TensorData::F8E5M2Fnuz(v)
-            | TensorData::E8M0(v)
-            | TensorData::Ui8(v)
-            | TensorData::I1(v) => v,
-            TensorData::Si8(v) => v,
-            TensorData::Si16(v) => v,
-            TensorData::Ui16(v) => v,
-            TensorData::Si32(v) => v,
-            TensorData::Ui32(v) => v,
-            TensorData::Si64(v) => v,
-            TensorData::Ui64(v) => v,
-            TensorData::Packed(v) => v,
+            TensorData::F64(buffer) => buffer,
+            TensorData::F32(buffer) => buffer,
+            TensorData::F16(buffer) => buffer,
+            TensorData::Bf16(buffer) => buffer,
+            TensorData::F8E4M3(buffer) => buffer,
+            TensorData::F8E5M2(buffer)
+            | TensorData::F8E4M3Fnuz(buffer)
+            | TensorData::F8E5M2Fnuz(buffer)
+            | TensorData::E8M0(buffer)
+            | TensorData::Ui8(buffer)
+            | TensorData::I1(buffer) => buffer,
+            TensorData::Si8(buffer) => buffer,
+            TensorData::Si16(buffer) => buffer,
+            TensorData::Ui16(buffer) => buffer,
+            TensorData::Si32(buffer) => buffer,
+            TensorData::Ui32(buffer) => buffer,
+            TensorData::Si64(buffer) => buffer,
+            TensorData::Ui64(buffer) => buffer,
+            TensorData::Packed(packed) => packed,
         }
     }
 
     fn elements_mut(&mut self) -> &mut dyn Elements {
         match self {
-            TensorData::F64(v) => v,
-            TensorData::F32(v) => v,
-            TensorData::F16(v) => v,
-            TensorData::Bf16(v) => v,
-            TensorData::F8E4M3(v) => v,
-            TensorData::F8E5M2(v)
-            | TensorData::F8E4M3Fnuz(v)
-            | TensorData::F8E5M2Fnuz(v)
-            | TensorData::E8M0(v)
-            | TensorData::Ui8(v)
-            | TensorData::I1(v) => v,
-            TensorData::Si8(v) => v,
-            TensorData::Si16(v) => v,
-            TensorData::Ui16(v) => v,
-            TensorData::Si32(v) => v,
-            TensorData::Ui32(v) => v,
-            TensorData::Si64(v) => v,
-            TensorData::Ui64(v) => v,
-            TensorData::Packed(v) => v,
+            TensorData::F64(buffer) => buffer,
+            TensorData::F32(buffer) => buffer,
+            TensorData::F16(buffer) => buffer,
+            TensorData::Bf16(buffer) => buffer,
+            TensorData::F8E4M3(buffer) => buffer,
+            TensorData::F8E5M2(buffer)
+            | TensorData::F8E4M3Fnuz(buffer)
+            | TensorData::F8E5M2Fnuz(buffer)
+            | TensorData::E8M0(buffer)
+            | TensorData::Ui8(buffer)
+            | TensorData::I1(buffer) => buffer,
+            TensorData::Si8(buffer) => buffer,
+            TensorData::Si16(buffer) => buffer,
+            TensorData::Ui16(buffer) => buffer,
+            TensorData::Si32(buffer) => buffer,
+            TensorData::Ui32(buffer) => buffer,
+            TensorData::Si64(buffer) => buffer,
+            TensorData::Ui64(buffer) => buffer,
+            TensorData::Packed(packed) => packed,
         }
     }
 
@@ -567,16 +567,19 @@ pub struct HostTensor {
 
 impl HostTensor {
     pub fn new(dims: impl AsRef<[usize]>, data: TensorData) -> Result<Self> {
-        let dims = ranked(dims.as_ref().iter().copied())?;
-        let count = dims
+        let extents = ranked(dims.as_ref().iter().copied())?;
+        let count = extents
             .iter()
             .try_fold(1usize, |count, &extent| count.checked_mul(extent));
         ensure!(
             count == Some(data.len()),
-            "a tensor of shape {dims:?} does not hold {} elements",
+            "a tensor of shape {extents:?} does not hold {} elements",
             data.len()
         );
-        Ok(Self { dims, data })
+        Ok(Self {
+            dims: extents,
+            data,
+        })
     }
 
     pub fn f32(dims: impl AsRef<[usize]>, values: Vec<f32>) -> Result<Self> {
@@ -658,14 +661,14 @@ impl HostTensor {
 
     pub fn as_f32(&self) -> Result<&[f32]> {
         match &self.data {
-            TensorData::F32(v) => Ok(v),
+            TensorData::F32(values) => Ok(values),
             other => bail!("expected f32 data, got {}", other.dtype()),
         }
     }
 
     pub fn as_si32(&self) -> Result<&[i32]> {
         match &self.data {
-            TensorData::Si32(v) => Ok(v),
+            TensorData::Si32(values) => Ok(values),
             other => bail!("expected si32 data, got {}", other.dtype()),
         }
     }
@@ -673,15 +676,17 @@ impl HostTensor {
     /// The elements of an si32 or si64 tensor, as indices and offsets are.
     pub fn as_indices(&self) -> Result<std::borrow::Cow<'_, [i64]>> {
         match &self.data {
-            TensorData::Si32(v) => Ok(v.iter().map(|&i| i64::from(i)).collect()),
-            TensorData::Si64(v) => Ok(std::borrow::Cow::Borrowed(v)),
+            TensorData::Si32(indices) => {
+                Ok(indices.iter().map(|&index| i64::from(index)).collect())
+            }
+            TensorData::Si64(indices) => Ok(std::borrow::Cow::Borrowed(indices)),
             other => bail!("expected si32 or si64 indices, got {}", other.dtype()),
         }
     }
 
     pub fn as_i1(&self) -> Result<&[u8]> {
         match &self.data {
-            TensorData::I1(v) => Ok(v),
+            TensorData::I1(values) => Ok(values),
             other => bail!("expected i1 data, got {}", other.dtype()),
         }
     }

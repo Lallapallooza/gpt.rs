@@ -66,7 +66,7 @@ pub fn ranked<T: Default>(items: impl IntoIterator<Item = T>) -> Result<Ranked<T
 impl Dim {
     pub fn as_static(&self) -> Option<usize> {
         match self {
-            Dim::Static(n) => Some(*n),
+            Dim::Static(extent) => Some(*extent),
             Dim::Dynamic(_) => None,
         }
     }
@@ -78,8 +78,8 @@ impl Dim {
 }
 
 impl From<usize> for Dim {
-    fn from(n: usize) -> Self {
-        Dim::Static(n)
+    fn from(extent: usize) -> Self {
+        Dim::Static(extent)
     }
 }
 
@@ -174,7 +174,7 @@ impl FromIterator<usize> for Perm {
     #[track_caller]
     fn from_iter<I: IntoIterator<Item = usize>>(axes: I) -> Self {
         match ranked(axes) {
-            Ok(axes) => Self(axes),
+            Ok(ranked_axes) => Self(ranked_axes),
             Err(err) => panic!("permutation: {err}"),
         }
     }
@@ -193,14 +193,14 @@ impl SymBindings {
             param.dtype == arg.dtype && param.rank() == arg.rank(),
             "{arg} does not match {param}"
         );
-        for (p, a) in param.dims.iter().zip(&arg.dims) {
-            match p {
-                Dim::Static(_) => ensure!(p == a, "{arg} does not match {param}"),
+        for (param_dim, arg_dim) in param.dims.iter().zip(&arg.dims) {
+            match param_dim {
+                Dim::Static(_) => ensure!(param_dim == arg_dim, "{arg} does not match {param}"),
                 Dim::Dynamic(sym) => {
-                    let previous = self.0.entry(sym.clone()).or_insert_with(|| a.clone());
+                    let previous = self.0.entry(sym.clone()).or_insert_with(|| arg_dim.clone());
                     ensure!(
-                        previous == a,
-                        "{{{}}} is bound to both {previous} and {a}",
+                        previous == arg_dim,
+                        "{{{}}} is bound to both {previous} and {arg_dim}",
                         sym.as_str()
                     );
                 }

@@ -2,8 +2,8 @@
 
 use std::fmt;
 
-use super::{FoldResult, OpRef, OpTrait};
-use crate::ir::{Dense, Folded};
+use super::{FoldResult, Law, OpTrait, Operation, Term};
+use crate::ir::{DType, Dense, Folded};
 use crate::Doc;
 
 /// Each result element depends only on the operand elements at its own position, so every tensor
@@ -14,8 +14,60 @@ pub struct Elementwise;
 impl OpTrait for Elementwise {}
 
 impl fmt::Display for Elementwise {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str("elementwise")
+    }
+}
+
+/// On floats that the IR computes on in f32 ([`DType::computes_in_f32`], bf16 and f16), the op is
+/// the op on their f32 values, with its float result rounded once to the operands' dtype, or, for
+/// a comparison, kept as it is. A backend without arithmetic on such floats computes the op in f32.
+#[derive(Debug, Doc)]
+pub struct NarrowInF32 {
+    /// Whether the result is a float of the operands' dtype, which the f32 result rounds to.
+    pub rounds: bool,
+}
+
+impl NarrowInF32 {
+    /// An op whose result is a float of its operands' dtype.
+    pub const ROUNDED: Self = Self { rounds: true };
+    /// A comparison, whose result is `i1`.
+    pub const COMPARED: Self = Self { rounds: false };
+}
+
+impl fmt::Display for NarrowInF32 {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self.rounds {
+            true => "narrow in f32, rounded once",
+            false => "narrow in f32, compared",
+        })
+    }
+}
+
+impl OpTrait for NarrowInF32 {
+    fn laws(&self, arity: usize, dtype: DType) -> Vec<Law> {
+        if !dtype.computes_in_f32() {
+            return Vec::new();
+        }
+        let mut wide = Vec::with_capacity(arity);
+        let mut vars = Vec::with_capacity(arity);
+        for index in 0..arity {
+            wide.push(Term::Cast(DType::F32, Box::new(Term::Var(index))));
+            vars.push(Term::Var(index));
+        }
+        let in_f32 = Term::Apply(wide);
+        let (name, rhs) = match self.rounds {
+            true => (
+                "f(a, ..) = f(f32(a), ..), rounded to the dtype",
+                Term::Cast(dtype, Box::new(in_f32)),
+            ),
+            false => ("f(a, ..) = f(f32(a), ..)", in_f32),
+        };
+        vec![Law {
+            name,
+            lhs: Term::Apply(vars),
+            rhs,
+        }]
     }
 }
 
@@ -41,7 +93,7 @@ impl Movement {
 }
 
 impl fmt::Display for Movement {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.data {
             None => f.write_str("movement"),
             Some(1) => f.write_str("movement of operand 0"),
@@ -51,25 +103,25 @@ impl fmt::Display for Movement {
 }
 
 impl OpTrait for Movement {
-    fn fold(&self, op: &OpRef<'_>) -> Option<FoldResult> {
-        let [result] = op.results else {
+    fn fold(&self, op: &Operation) -> Option<FoldResult> {
+        let [result_type] = op.results else {
             return None;
         };
-        let result = result.as_tensor()?;
+        let result = result_type.as_tensor()?;
         let dims = result.static_dims()?;
         let data = self.data(op.operands);
         let operand_elements: usize = data
             .iter()
-            .map(|&v| op.module.constant(v).map(Dense::element_count))
+            .map(|&operand| op.module.constant(operand).map(Dense::element_count))
             .sum::<Option<usize>>()?;
         if dims.iter().product::<usize>() > operand_elements {
             return None;
         }
         let (first, rest) = data.split_first()?;
         let element = op.module.constant(*first)?.splat_bytes()?;
-        let same = |&v| {
+        let same = |&operand| {
             op.module
-                .constant(v)
+                .constant(operand)
                 .and_then(Dense::splat_bytes)
                 .is_some_and(|bytes| bytes == element)
         };
@@ -90,7 +142,7 @@ pub struct Terminator;
 impl OpTrait for Terminator {}
 
 impl fmt::Display for Terminator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str("terminator")
     }
 }
@@ -102,7 +154,7 @@ pub struct IsolatedFromAbove;
 impl OpTrait for IsolatedFromAbove {}
 
 impl fmt::Display for IsolatedFromAbove {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str("isolated from above")
     }
 }

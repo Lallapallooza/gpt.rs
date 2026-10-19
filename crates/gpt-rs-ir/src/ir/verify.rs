@@ -44,8 +44,11 @@ impl Verifier<'_> {
             "only func.func, tile.dispatch and loop.func may appear at the top level"
         );
         let operands = module.operands(inst);
-        if let Some(i) = operands.iter().position(|&v| !module.dominates(v, inst)) {
-            bail!("operand {i} is not defined before this op");
+        if let Some(position) = operands
+            .iter()
+            .position(|&operand| !module.dominates(operand, inst))
+        {
+            bail!("operand {position} is not defined before this op");
         }
         ensure!(
             last || !op.has_trait::<Terminator>(),
@@ -55,7 +58,7 @@ impl Verifier<'_> {
         let segments = module.operand_segments(inst);
         let regions = module.regions(inst);
         let (types, result_segments) =
-            module.infer_results(op, module.operands(inst), segments, regions)?;
+            module.infer_results(op, module.operands(inst), segments, regions, None)?;
         let stored = module.result_types(inst);
         let inferred: Vec<&Type> = types.iter().collect();
         ensure!(
@@ -80,28 +83,32 @@ impl Verifier<'_> {
     /// which yields the types of `sig`.
     fn check_region(&self, op: &Op, index: usize, region: Region, sig: &RegionSig) -> Result<()> {
         let module = self.module;
-        let args: Vec<&Type> = module.args(region).iter().map(|&v| module.ty(v)).collect();
-        let expected: Vec<&Type> = sig.args.iter().collect();
+        let args: Vec<&Type> = module
+            .args(region)
+            .iter()
+            .map(|&arg| module.ty(arg))
+            .collect();
+        let expected_args: Vec<&Type> = sig.args.iter().collect();
         ensure!(
-            args == expected,
+            args == expected_args,
             "region {index} has arguments {}, expected {}",
             type_list(&args),
-            type_list(&expected)
+            type_list(&expected_args)
         );
         let terminator = module
             .last_inst(region)
             .filter(|&last| op.is_region_terminator(index, module.op(last)))
             .ok_or_else(|| anyhow!("region {index} does not end with its terminator"))?;
-        let Some(expected) = &sig.yields else {
+        let Some(yield_types) = &sig.yields else {
             return Ok(());
         };
         let yields = module.operand_types(terminator);
-        let expected: Vec<&Type> = expected.iter().collect();
+        let expected_yields: Vec<&Type> = yield_types.iter().collect();
         ensure!(
-            yields == expected,
+            yields == expected_yields,
             "region {index} yields {}, expected {}",
             type_list(&yields),
-            type_list(&expected)
+            type_list(&expected_yields)
         );
         Ok(())
     }

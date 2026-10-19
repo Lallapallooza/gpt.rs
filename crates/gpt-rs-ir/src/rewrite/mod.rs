@@ -1,10 +1,11 @@
 //! Building and rewriting IR. [`Builder`] builds ops into a module directly. A [`Pattern`] reads
-//! its root op as a [`Matched`] or a [`WithTrait`], and changes the module only through its
+//! its root op as an [`OpRef`] or a [`WithTrait`], and changes the module only through its
 //! [`Rewriter`], which stages the changes; the driver applies them when the pattern returns `Ok`.
 //! A pattern that does not apply returns [`NoMatch`], with the reason, and changes nothing.
 
 mod build;
 mod builder;
+mod cse;
 mod doc;
 mod editor;
 mod fold;
@@ -14,18 +15,20 @@ mod rewriter;
 use std::borrow::Cow;
 use std::fmt;
 use std::marker::PhantomData;
+use std::ops::Deref;
 
 use anyhow::{bail, Result};
 pub use gpt_rs_ir_macros::{matched, pattern};
 
 pub use self::build::{Build, Chain};
 pub use self::builder::Builder;
+pub use self::cse::cse;
 pub use self::doc::*;
 pub(crate) use self::editor::Editor;
 pub use self::fold::*;
 pub use self::greedy::{Greedy, GreedyReport, Rewrites};
 pub use self::rewriter::{Rewriter, Staged};
-use crate::ir::{InOp, Inst, Matched, Module, Value, ValueRef};
+use crate::ir::{AsInst, InOp, Inst, Module, OpRef, RunningPass, Value, ValueRef};
 use crate::traits::OpTrait;
 use crate::Op;
 
@@ -43,7 +46,7 @@ impl NoMatch {
     }
 
     /// The reason `args` gives, formatted only when it has arguments.
-    pub fn because(args: fmt::Arguments<'_>) -> Self {
+    pub fn because(args: fmt::Arguments) -> Self {
         match args.as_str() {
             Some(reason) => Self(Cow::Borrowed(reason)),
             None => Self(Cow::Owned(args.to_string())),
@@ -58,7 +61,7 @@ impl From<&'static str> for NoMatch {
 }
 
 impl fmt::Display for NoMatch {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
@@ -87,32 +90,49 @@ macro_rules! require {
 
 pub use crate::require;
 
-/// An instruction, or what holds one: an op a pattern matched.
-pub trait AsInst {
-    fn inst(&self) -> Inst;
+/// The right to change a module in place, which the raw edits of [`Module`] take. Only this
+/// module holds one: its editor, which applies what rewrites stage, its drivers and its builders.
+/// Code that has a module only as a [`Rewriting`] changes it through the drivers alone.
+pub struct EditKey(());
+
+/// The key of this module's editor, drivers and builders.
+const KEY: EditKey = EditKey(());
+
+/// A module wrapped for one pass. It gives the module through `Deref`, and the drivers that apply
+/// rewrites, such as [`Greedy::run`], take it to change the module.
+pub struct Rewriting<'m> {
+    module: &'m mut Module,
+    /// The pass that ran on the module before this one, which it runs on again once this ends.
+    previous: Option<RunningPass>,
 }
 
-impl AsInst for Inst {
-    fn inst(&self) -> Inst {
-        *self
+impl<'m> Rewriting<'m> {
+    /// Wraps `module` for the pass `name`, which the pass manager runs. While this value lives,
+    /// each op the pass makes records `name` on its trail.
+    pub(crate) fn new(module: &'m mut Module, name: &str) -> Self {
+        let previous = Some(module.start_pass(name));
+        Self { module, previous }
     }
 }
 
-impl<T: crate::ir::OpKind, G: crate::ir::Groups> AsInst for Matched<'_, T, G> {
-    fn inst(&self) -> Inst {
-        Matched::inst(self)
+impl Drop for Rewriting<'_> {
+    fn drop(&mut self) {
+        let previous = self.previous.take().unwrap_or_default();
+        self.module.finish_pass(previous);
+    }
+}
+
+impl Deref for Rewriting<'_> {
+    type Target = Module;
+
+    fn deref(&self) -> &Module {
+        self.module
     }
 }
 
 impl<T: OpTrait> AsInst for WithTrait<'_, T> {
     fn inst(&self) -> Inst {
         self.inst
-    }
-}
-
-impl<A: AsInst> AsInst for &A {
-    fn inst(&self) -> Inst {
-        (*self).inst()
     }
 }
 
@@ -154,8 +174,8 @@ impl<V: Into<Value>, const N: usize> IntoValues for [V; N] {
 /// What a pattern is rooted at: ops of one type, or every op that has a trait ([`Has`]).
 pub trait Root {
     /// The root as the pattern reads it.
-    type Matched<'m>;
-    fn find(module: &Module, inst: Inst) -> Option<Self::Matched<'_>>;
+    type OpRef<'m>;
+    fn find(module: &Module, inst: Inst) -> Option<Self::OpRef<'_>>;
     fn info() -> RootInfo;
 }
 
@@ -169,8 +189,8 @@ pub enum RootInfo {
 }
 
 impl<T: InOp> Root for T {
-    type Matched<'m> = Matched<'m, T>;
-    fn find(module: &Module, inst: Inst) -> Option<Matched<'_, T>> {
+    type OpRef<'m> = OpRef<'m, T>;
+    fn find(module: &Module, inst: Inst) -> Option<OpRef<'_, T>> {
         module.op_as(inst)
     }
     fn info() -> RootInfo {
@@ -192,11 +212,16 @@ pub struct WithTrait<'m, T: 'static> {
 }
 
 impl<T: OpTrait> Root for Has<T> {
-    type Matched<'m> = WithTrait<'m, T>;
+    type OpRef<'m> = WithTrait<'m, T>;
     fn find(module: &Module, inst: Inst) -> Option<WithTrait<'_, T>> {
         let op = module.op(inst);
         let fact = op.get_trait::<T>()?;
-        let refs = |values: &[Value]| values.iter().map(|&v| module.value_ref(v)).collect();
+        let refs = |values: &[Value]| {
+            values
+                .iter()
+                .map(|&value| module.value_ref(value))
+                .collect()
+        };
         Some(WithTrait {
             inst,
             op,
@@ -219,7 +244,7 @@ pub trait Pattern: Doc {
     /// changes.
     fn rewrite<'m>(
         &self,
-        root: <Self::Root as Root>::Matched<'m>,
+        root: <Self::Root as Root>::OpRef<'m>,
         rewriter: &mut Rewriter<'m>,
     ) -> Result<(), NoMatch>;
 }
@@ -279,7 +304,11 @@ impl PatternSet {
 
     /// Tries the patterns on `inst` in order, and applies what the first that applies staged.
     /// With `explain`, it keeps the reasons the patterns rooted at the op gave for not applying.
-    pub fn apply(&self, module: &mut Module, inst: Inst, explain: bool) -> Result<Applied> {
+    pub fn apply(&self, module: &mut Rewriting, inst: Inst, explain: bool) -> Result<Applied> {
+        self.apply_to(module.module, inst, explain)
+    }
+
+    fn apply_to(&self, module: &mut Module, inst: Inst, explain: bool) -> Result<Applied> {
         let mut reasons = Vec::new();
         for pattern in self.iter() {
             let staged = match pattern.try_rewrite(module, inst) {

@@ -1,6 +1,6 @@
 //! [`Rewriter`]: what a pattern changes, staged while the pattern reads the module.
 //!
-//! A pattern reads the module through shared references, [`Matched`](crate::ir::Matched) and
+//! A pattern reads the module through shared references, [`OpRef`](crate::ir::OpRef) and
 //! [`ValueRef`](crate::ir::ValueRef), for as long as it runs, so the rewriter cannot change the
 //! module while it does. It stages the changes instead: it builds new ops into a scratch module and
 //! records the edits of existing ops, in order. When the pattern succeeds the driver applies them,
@@ -11,12 +11,14 @@
 
 use std::collections::HashMap;
 
+use crate::dialects::func::{FuncOp, ParamId};
 use crate::ir::{
-    Created, FoldIn, Groups, InOp, Inst, Location, Module, OpDyn, OpKind, Operands, Region,
+    AsInst, Created, FoldIn, Groups, InOp, Inst, Location, Module, OpDyn, OpKind, Operands, Region,
     TensorType, Type, Value, Values,
 };
 use crate::rewrite::build::materialize;
-use crate::rewrite::{AsInst, Build, Builder, IntoValues};
+use crate::rewrite::builder::StagedRegions;
+use crate::rewrite::{Build, Builder, IntoValues, KEY};
 use crate::Op;
 
 /// What a pattern changes, staged until the driver applies it.
@@ -24,8 +26,12 @@ pub struct Rewriter<'m> {
     module: &'m Module,
     /// The instruction new ops go before: the pattern's root, unless the pattern moves it.
     insertion_point: Inst,
-    /// The location of the ops the pattern creates: its root's.
-    location: Option<Location>,
+    /// The op that the ops the pattern creates are made from: its root, unless the pattern sets
+    /// another ([`Rewriter::set_origin`]).
+    origin: Inst,
+    /// The location of the ops the pattern creates, once the pattern creates the first: the
+    /// location of their origin, with the running pass on its trail.
+    location: Option<Option<Location>>,
     staging: Option<Box<Staging>>,
     edits: Vec<Edit>,
 }
@@ -41,16 +47,63 @@ pub(crate) struct Staging {
     staged_region: Region,
     /// Each staged op, with the instruction of the module it goes before.
     pub(crate) anchors: Vec<(Inst, Inst)>,
+    /// The region that holds a placeholder argument for each argument a function gains.
+    added_args_region: Region,
+    /// The ops of the module that move into the regions of staged ops, in order.
+    pub(crate) moves: Vec<Move>,
+}
+
+/// An op of the module that moves into a region of a staged op: before the op at `position` among
+/// the staged ops of the region, all of which the builder of the region creates.
+pub(crate) struct Move {
+    pub(crate) op: Inst,
+    pub(crate) region: Region,
+    pub(crate) position: usize,
 }
 
 /// An edit of the module's existing IR. Values in it may be staged.
 pub(crate) enum Edit {
-    ReplaceOp { inst: Inst, values: Vec<Value> },
-    ReplaceAllUses { from: Value, to: Value },
-    SetOp { inst: Inst, op: Box<Op> },
-    SetOperands { inst: Inst, operands: Vec<Value> },
+    ReplaceOp {
+        inst: Inst,
+        values: Vec<Value>,
+    },
+    ReplaceAllUses {
+        from: Value,
+        to: Value,
+    },
+    SetOp {
+        inst: Inst,
+        op: Box<Op>,
+    },
+    SetOperands {
+        inst: Inst,
+        operands: Vec<Value>,
+    },
+    SetOperand {
+        inst: Inst,
+        index: usize,
+        value: Value,
+    },
     Erase(Inst),
-    RemoveArg { region: Region, index: usize },
+    /// The ops of `region`, all but its terminator, moved before `before`, each argument of the
+    /// region replaced by the value at its position in `args`.
+    Inline {
+        region: Region,
+        before: Inst,
+        args: Vec<Value>,
+    },
+    RemoveArg {
+        region: Region,
+        index: usize,
+    },
+    /// An argument of type `ty` that the function `func` gains, bound to the parameter `param`,
+    /// which the scratch argument `placeholder` stands for.
+    AddArg {
+        func: Inst,
+        ty: Type,
+        param: Option<ParamId>,
+        placeholder: Value,
+    },
 }
 
 /// The changes of a pattern that succeeded, for the driver to apply.
@@ -62,7 +115,11 @@ pub struct Staged {
 impl Staged {
     /// Whether the pattern staged no change.
     pub(crate) fn is_empty(&self) -> bool {
-        self.edits.is_empty() && self.staging.as_ref().is_none_or(|s| s.anchors.is_empty())
+        self.edits.is_empty()
+            && self
+                .staging
+                .as_ref()
+                .is_none_or(|staging| staging.anchors.is_empty())
     }
 }
 
@@ -72,7 +129,8 @@ impl<'m> Rewriter<'m> {
         Self {
             module,
             insertion_point: root,
-            location: module.location(root).cloned(),
+            origin: root,
+            location: None,
             staging: None,
             edits: Vec::new(),
         }
@@ -92,19 +150,22 @@ impl<'m> Rewriter<'m> {
 
     /// The type of `value`, a tensor, whether the module holds it or this rewrite created it.
     pub fn tensor_type(&self, value: impl Into<Value>) -> &TensorType {
-        let value = value.into();
-        let ty = match value.staged_index() {
-            Some(index) => {
-                let staging = self
-                    .staging
-                    .as_ref()
-                    .expect("a staged value comes from a create");
-                staging.scratch.ty(Value::at(index))
-            }
-            None => self.module.ty(value),
-        };
-        ty.as_tensor()
-            .unwrap_or_else(|| panic!("{value:?} is {ty}, not a tensor"))
+        Build::tensor_type(self, value.into())
+    }
+
+    /// The location of the ops the pattern creates.
+    fn created_location(&mut self) -> Option<Location> {
+        let (module, origin) = (self.module, self.origin);
+        self.location
+            .get_or_insert_with(|| module.made_from(origin))
+            .clone()
+    }
+
+    /// New ops are made from `op`, another op the pattern reads, from here on, in place of its
+    /// root: they take its location, with the running pass on its trail.
+    pub fn set_origin(&mut self, op: impl AsInst) {
+        self.origin = op.inst();
+        self.location = None;
     }
 
     /// New ops go before `inst` from here on.
@@ -119,8 +180,8 @@ impl<'m> Rewriter<'m> {
         op: T,
         operands: impl Into<Operands<T, Values>>,
     ) -> Created<T> {
-        let (operands, segments) = T::Groups::flatten_operands::<Values>(operands.into());
-        let inst = self.stage(op.into(), &operands, segments);
+        let (flat_operands, segments) = T::Groups::flatten_operands::<Values>(operands.into());
+        let inst = self.stage(op.into(), &flat_operands, segments);
         let staging = self.staging();
         staged_results::<T>(&staging.scratch, inst)
     }
@@ -133,16 +194,16 @@ impl<'m> Rewriter<'m> {
         &mut self,
         op: T,
         operands: impl Into<Operands<T, Values>>,
-        body: impl FnMut(usize, &mut Builder<'_>, &[Value]),
+        body: impl FnMut(usize, &mut Builder, &[Value]),
     ) -> Created<T> {
-        let (operands, segments) = T::Groups::flatten_operands::<Values>(operands.into());
-        let operands = self.import_all(&operands);
+        let (flat_operands, segments) = T::Groups::flatten_operands::<Values>(operands.into());
+        let imported = self.import_all(&flat_operands);
         let anchor = self.insertion_point;
-        let location = self.location.clone();
-        let staging = self.staging();
-        let mut builder = Builder::at_end(&mut staging.scratch, staging.staged_region);
+        let location = self.created_location();
+        let mut builder = self.staged_builder();
         builder.set_location(location);
-        let inst = builder.create_op_with_regions(op.into(), operands, segments, body);
+        let inst = builder.create_op_with_regions(op.into(), imported, segments, body);
+        let staging = self.staging();
         staging.anchors.push((inst, anchor));
         staged_results::<T>(&staging.scratch, inst)
     }
@@ -171,9 +232,9 @@ impl<'m> Rewriter<'m> {
         });
     }
 
-    /// Gives `op` the op value `new`, which computes the same results, such as the same op with
-    /// its attributes in canonical form.
-    pub fn set_op(&mut self, op: impl AsInst, new: impl Into<Op>) {
+    /// Gives `op` the op value `new`, of the same kind, which computes the same results: what
+    /// [`OpRef::update`](crate::ir::OpRef::update) stages.
+    pub(crate) fn set_op(&mut self, op: impl AsInst, new: impl Into<Op>) {
         self.edits.push(Edit::SetOp {
             inst: op.inst(),
             op: Box::new(new.into()),
@@ -189,13 +250,39 @@ impl<'m> Rewriter<'m> {
         });
     }
 
+    /// Makes operand `index` of `op` use `value`.
+    pub fn set_operand(&mut self, op: impl AsInst, index: usize, value: impl Into<Value>) {
+        self.edits.push(Edit::SetOperand {
+            inst: op.inst(),
+            index,
+            value: value.into(),
+        });
+    }
+
     /// Erases `op`, whose results nothing may use once the edits before it apply.
     pub fn erase(&mut self, op: impl AsInst) {
         self.edits.push(Edit::Erase(op.inst()));
     }
 
+    /// Moves the ops of `region`, all but its terminator, before `before`, each use of an argument
+    /// of the region using the value at its position in `args`. The terminator stays in the region,
+    /// for the op that holds it to go with.
+    pub fn inline_region(
+        &mut self,
+        region: impl Into<Region>,
+        before: impl AsInst,
+        args: impl IntoValues,
+    ) {
+        self.edits.push(Edit::Inline {
+            region: region.into(),
+            before: before.inst(),
+            args: args.into_values(),
+        });
+    }
+
     /// Removes block argument `index` of `region`, which nothing may use once the edits before
-    /// it apply.
+    /// it apply. A function loses the argument from its signature too, with the parameter it
+    /// binds.
     pub fn remove_arg(&mut self, region: impl Into<Region>, index: usize) {
         self.edits.push(Edit::RemoveArg {
             region: region.into(),
@@ -203,19 +290,66 @@ impl<'m> Rewriter<'m> {
         });
     }
 
+    /// Adds an argument of type `ty` after the arguments of the function `func`, bound to the
+    /// parameter `param`, and gives it.
+    pub fn add_arg(&mut self, func: &FuncOp, ty: Type, param: Option<ParamId>) -> Value {
+        let staging = self.staging();
+        let placeholder = staging
+            .scratch
+            .append_arg(&KEY, staging.added_args_region, ty.clone());
+        self.edits.push(Edit::AddArg {
+            func: func.inst(),
+            ty,
+            param,
+            placeholder,
+        });
+        staged(placeholder)
+    }
+
+    /// Adds a copy of `symbol`, a top-level op of `source` such as a function or a dispatch,
+    /// before the top-level op that holds the insertion point. A symbol whose text names it, such
+    /// as a dispatch named by the hash of its body, is built in a module of its own first.
+    pub fn add_symbol(&mut self, source: &Module, symbol: impl AsInst) {
+        let anchor = self.module.top_level_op(self.insertion_point);
+        let location = self.created_location();
+        let staging = self.staging();
+        // At the top of the scratch module, where the type rules of staged ops that name it find it.
+        let top = staging.scratch.body();
+        let mut builder = Builder::at_end(&mut staging.scratch, top);
+        let copy = builder
+            .create_copy(source, symbol, &mut HashMap::new())
+            .expect("a symbol reads no value from outside it");
+        staging.scratch.set_location(&KEY, copy, location);
+        staging.anchors.push((copy, anchor));
+    }
+
     /// Creates the op value `op`, which has no regions, on `operands` in the groups `segments`, in
     /// the scratch module, before the insertion point.
     #[track_caller]
     fn stage(&mut self, op: Op, operands: &[Value], segments: Option<Vec<usize>>) -> Inst {
-        let operands = self.import_all(operands);
+        let imported = self.import_all(operands);
         let anchor = self.insertion_point;
-        let location = self.location.clone();
-        let staging = self.staging();
-        let mut builder = Builder::at_end(&mut staging.scratch, staging.staged_region);
+        let location = self.created_location();
+        let mut builder = self.staged_builder();
         builder.set_location(location);
-        let inst = builder.create_op(op, operands, segments, Vec::new());
-        staging.anchors.push((inst, anchor));
+        let inst = builder.create_op(op, imported, segments, Vec::new());
+        self.staging().anchors.push((inst, anchor));
         inst
+    }
+
+    /// The builder of staged ops, at the end of the staged region: the type rules of the ops it
+    /// creates also see the symbols of the module the rewrite reads, and the builders of their
+    /// regions move ops of that module.
+    fn staged_builder(&mut self) -> Builder<'_> {
+        let source = self.module;
+        let staging = self.staging();
+        let staged = StagedRegions {
+            source,
+            moves: &mut staging.moves,
+            imports: &mut staging.imports,
+            imports_region: staging.imports_region,
+        };
+        Builder::staged(&mut staging.scratch, staging.staged_region, staged)
     }
 
     /// The results of the staged op `inst`, as staged values, and their groups.
@@ -260,8 +394,12 @@ impl<'m> Rewriter<'m> {
             });
         }
         let types: Vec<&Type> = ins.iter().map(|input| input.ty).collect();
+        let (module, rewritten) = match scratch {
+            Some(scratch_module) => (scratch_module, Some(self.module)),
+            None => (self.module, None),
+        };
         let (result_types, result_segments) = op
-            .dyn_result_types(&types, segments, &[], self.module)
+            .dyn_result_types(&types, segments, &[], module, rewritten)
             .unwrap_or_else(|err| panic!("building {}: {err:#}", op.name()));
         let folded = op.dyn_fold(&ins, segments, &result_types)?;
         let values = materialize(folded, &result_types, |constant| {
@@ -275,12 +413,15 @@ impl<'m> Rewriter<'m> {
             let mut scratch = Module::new();
             let imports_region = scratch.new_region(Vec::new());
             let staged_region = scratch.new_region(Vec::new());
+            let added_args_region = scratch.new_region(Vec::new());
             Box::new(Staging {
                 scratch,
                 imports: HashMap::new(),
                 imports_region,
                 staged_region,
                 anchors: Vec::new(),
+                added_args_region,
+                moves: Vec::new(),
             })
         })
     }
@@ -296,7 +437,7 @@ impl<'m> Rewriter<'m> {
                 Some(index) => Value::at(index),
                 None => *staging.imports.entry(value).or_insert_with(|| {
                     let ty = module.ty(value).clone();
-                    staging.scratch.append_arg(staging.imports_region, ty)
+                    staging.scratch.append_arg(&KEY, staging.imports_region, ty)
                 }),
             })
             .collect()
@@ -304,6 +445,15 @@ impl<'m> Rewriter<'m> {
 }
 
 impl Build for Rewriter<'_> {
+    fn create_with_regions<T: InOp>(
+        &mut self,
+        op: T,
+        operands: impl Into<Operands<T, Values>>,
+        body: impl FnMut(usize, &mut Builder, &[Value]),
+    ) -> Created<T> {
+        Rewriter::create_with_regions(self, op, operands, body)
+    }
+
     #[track_caller]
     fn create_or_fold_op(
         &mut self,
@@ -318,8 +468,22 @@ impl Build for Rewriter<'_> {
         self.staged_values(inst)
     }
 
-    fn tensor_type(&self, value: Value) -> &TensorType {
-        Rewriter::tensor_type(self, value)
+    #[track_caller]
+    fn create<T: InOp>(&mut self, op: T, operands: impl Into<Operands<T, Values>>) -> Created<T> {
+        Rewriter::create(self, op, operands)
+    }
+
+    fn value_type(&self, value: Value) -> &Type {
+        match value.staged_index() {
+            Some(index) => {
+                let staging = self
+                    .staging
+                    .as_ref()
+                    .expect("a staged value comes from a create");
+                staging.scratch.ty(Value::at(index))
+            }
+            None => self.module.ty(value),
+        }
     }
 }
 

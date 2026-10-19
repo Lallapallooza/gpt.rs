@@ -183,6 +183,24 @@ pub trait IndexEnv {
     fn read(&self, operand: usize, coords: &[i64]) -> Result<i64>;
 }
 
+/// Every iterator at 0 and no symbol bound: an expression evaluates to its value at the origin, and
+/// fails where it uses a symbol or reads an operand.
+pub struct AtOrigin;
+
+impl IndexEnv for AtOrigin {
+    fn iter(&self, _position: usize) -> Option<i64> {
+        Some(0)
+    }
+
+    fn sym(&self, _sym: &Sym) -> Option<i64> {
+        None
+    }
+
+    fn read(&self, operand: usize, _coords: &[i64]) -> Result<i64> {
+        bail!("the expression reads operand {operand}")
+    }
+}
+
 /// The start of the subexpression of `nodes` whose root is at `end`.
 fn subexpression_start<R: ReadKind>(nodes: &[Node<R>], end: usize) -> usize {
     let mut needed = 1;
@@ -368,6 +386,32 @@ impl<R: ReadKind> Expr<R> {
         positions
     }
 
+    /// How the expression moves with the iterator at `position`. It is 0 when the expression does
+    /// not use the iterator, and the constant `c` when the expression is `c` times the iterator
+    /// plus terms without it. It is `None` when the iterator appears any other way, as inside
+    /// `floordiv` or a read.
+    pub fn coefficient(&self, position: usize) -> Option<i64> {
+        if !self.uses_iter(position) {
+            return Some(0);
+        }
+        match self.root() {
+            Root::Iter(_) => Some(1),
+            Root::Neg(operand) => operand.coefficient(position).map(|value| -value),
+            Root::Binary(BinaryOp::Add, lhs, rhs) => {
+                Some(lhs.coefficient(position)? + rhs.coefficient(position)?)
+            }
+            Root::Binary(BinaryOp::Sub, lhs, rhs) => {
+                Some(lhs.coefficient(position)? - rhs.coefficient(position)?)
+            }
+            Root::Binary(BinaryOp::Mul, lhs, rhs) => match (lhs.as_const(), rhs.as_const()) {
+                (Some(factor), _) => Some(factor * rhs.coefficient(position)?),
+                (_, Some(factor)) => Some(factor * lhs.coefficient(position)?),
+                (None, None) => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Whether the expression uses the iterator at `position`.
     pub fn uses_iter(&self, position: usize) -> bool {
         self.nodes
@@ -448,9 +492,9 @@ impl<R: ReadKind> Expr<R> {
     }
 
     /// The expression with each iterator that `subst` maps replaced by its expression.
-    pub fn substitute(&self, subst: &dyn Fn(usize) -> Option<IndexExpr>) -> Self {
+    pub fn substitute(&self, subst: &dyn Fn(usize) -> Option<Self>) -> Self {
         self.map(&mut |expr| match expr.as_iter().and_then(subst) {
-            Some(replacement) => Self::from_pure(&replacement),
+            Some(replacement) => replacement,
             None => expr,
         })
     }
@@ -460,12 +504,12 @@ impl AccessExpr {
     /// The element of operand `operand` at `coords`, read as an integer.
     #[track_caller]
     pub fn read(operand: usize, coords: impl IntoIterator<Item = impl Into<AccessExpr>>) -> Self {
-        let coords: Vec<AccessExpr> = coords.into_iter().map(Into::into).collect();
+        let coord_exprs: Vec<AccessExpr> = coords.into_iter().map(Into::into).collect();
         assert!(
-            coords.len() <= MAX_RANK,
+            coord_exprs.len() <= MAX_RANK,
             "a read has one coordinate per axis, at most {MAX_RANK}"
         );
-        Self::on(Node::Read(operand, coords.len() as u8), coords)
+        Self::on(Node::Read(operand, coord_exprs.len() as u8), coord_exprs)
     }
 
     /// The expression with operand `i` renamed to `rename(i)`.
@@ -518,7 +562,7 @@ impl<R: ReadKind> std::ops::Neg for Expr<R> {
 impl<R: ReadKind> fmt::Display for Expr<R> {
     /// The right operand of `-` and of a product binds tighter, so `a - (b + c)` keeps its
     /// parentheses and `a - b + c` reads left to right.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // Per subexpression: its text and its binding strength.
         let mut stack: Vec<(String, u8)> = Vec::new();
         let side = |(text, precedence): &(String, u8), min: u8| {
@@ -560,7 +604,7 @@ impl<R: ReadKind> fmt::Display for Expr<R> {
 }
 
 impl<R: ReadKind> fmt::Debug for Expr<R> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Display::fmt(self, f)
     }
 }
@@ -599,32 +643,32 @@ impl Attr for IterRef {
     fn print(&self, out: &mut String) {
         out.push_str(&self.to_string());
     }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        let start = c.position();
-        let name = c.ident()?;
+    fn parse(cursor: &mut Cursor) -> Result<Self> {
+        let start = cursor.position();
+        let name = cursor.ident()?;
         let Some(position) = iter_position(name) else {
-            bail!(c.error_at(
+            bail!(cursor.error_at(
                 start,
                 format!("`{name}` is no iterator: an iterator is `d` and its position, such as d0")
             ));
         };
         ensure!(
             position < MAX_ITERS,
-            c.error_at(
+            cursor.error_at(
                 start,
                 format!("a block has at most {MAX_ITERS} iterators, not {name}")
             )
         );
         Ok(Self(position as u8))
     }
-    fn peek(c: &Cursor<'_>) -> bool {
-        let next = c.peek();
+    fn peek(cursor: &Cursor) -> bool {
+        let next = cursor.peek();
         next.kind == TokenKind::Ident && iter_position(next.text).is_some()
     }
 }
 
 impl fmt::Display for IterRef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "d{}", self.0)
     }
 }
@@ -639,21 +683,21 @@ impl Attr for OperandRef {
     fn print(&self, out: &mut String) {
         out.push_str(&self.to_string());
     }
-    fn parse(c: &mut Cursor<'_>) -> Result<Self> {
-        let start = c.position();
-        let text = c.token(TokenKind::Operand, "an operand")?;
+    fn parse(cursor: &mut Cursor) -> Result<Self> {
+        let start = cursor.position();
+        let text = cursor.token(TokenKind::Operand, "an operand")?;
         let operand = text[1..]
             .parse()
-            .map_err(|_| c.error_at(start, format!("no operand is {text}")))?;
+            .map_err(|_| cursor.error_at(start, format!("no operand is {text}")))?;
         Ok(Self(operand))
     }
-    fn peek(c: &Cursor<'_>) -> bool {
-        c.peek_kind(TokenKind::Operand)
+    fn peek(cursor: &Cursor) -> bool {
+        cursor.peek_kind(TokenKind::Operand)
     }
 }
 
 impl fmt::Display for OperandRef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "${}", self.0)
     }
 }

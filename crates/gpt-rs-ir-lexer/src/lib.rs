@@ -67,14 +67,14 @@ pub const PUNCTUATION: [&str; 21] = [
     "-", "*", "%",
 ];
 
-/// Whether `c` may continue an identifier or the name after a sigil.
-pub fn is_name_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_' || c == '.'
+/// Whether `character` may continue an identifier or the name after a sigil.
+pub fn is_name_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_' || character == '.'
 }
 
-/// Whether `c` may start an identifier.
-pub fn is_ident_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_'
+/// Whether `character` may start an identifier.
+pub fn is_ident_start(character: char) -> bool {
+    character.is_ascii_alphabetic() || character == '_'
 }
 
 /// The position of the first character at or after `pos` that is neither whitespace nor in a
@@ -139,7 +139,7 @@ fn lex(rest: &str, first: char) -> (TokenKind, usize) {
     }
     if first == '$' {
         let digits = rest[1..]
-            .find(|c: char| !c.is_ascii_digit())
+            .find(|character: char| !character.is_ascii_digit())
             .unwrap_or(rest.len() - 1);
         if digits > 0 {
             return (TokenKind::Operand, 1 + digits);
@@ -153,7 +153,9 @@ fn lex(rest: &str, first: char) -> (TokenKind, usize) {
 
 /// The length of the name at the start of `rest`, which ends before `..`.
 fn name_len(rest: &str) -> usize {
-    let end = rest.find(|c| !is_name_char(c)).unwrap_or(rest.len());
+    let end = rest
+        .find(|character| !is_name_char(character))
+        .unwrap_or(rest.len());
     rest[..end].find("..").unwrap_or(end)
 }
 

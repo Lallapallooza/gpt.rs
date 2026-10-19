@@ -4,13 +4,14 @@ use std::fmt;
 
 use half::{bf16, f16};
 
-use super::{FoldResult, Law, OpRef, OpTrait, Term};
-use crate::ir::{DType, Folded};
+use super::{FoldResult, Law, OpTrait, Operation, Term};
+use crate::host::HostScalar;
+use crate::ir::{DType, Folded, IntFormat};
 use crate::{Doc, Op};
 
-const A: Term = Term::Var(0);
-const B: Term = Term::Var(1);
-const C: Term = Term::Var(2);
+const VAR_A: Term = Term::Var(0);
+const VAR_B: Term = Term::Var(1);
+const VAR_C: Term = Term::Var(2);
 
 fn apply<const N: usize>(terms: [Term; N]) -> Term {
     Term::Apply(terms.into())
@@ -28,20 +29,20 @@ fn covers(float: bool, dtype: DType) -> bool {
 pub struct Commutative;
 
 impl fmt::Display for Commutative {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str("commutative")
     }
 }
 
 impl OpTrait for Commutative {
-    fn fold(&self, op: &OpRef<'_>) -> Option<FoldResult> {
+    fn fold(&self, op: &Operation) -> Option<FoldResult> {
         let &[lhs, rhs] = op.operands else {
             return None;
         };
-        let rank = |v| {
+        let rank = |value| {
             (
-                op.module.known_before_run(v),
-                op.module.constant(v).is_some(),
+                op.module.known_before_run(value),
+                op.module.constant(value).is_some(),
             )
         };
         (rank(lhs) > rank(rhs)).then(|| FoldResult::Operands(vec![rhs, lhs]))
@@ -53,8 +54,8 @@ impl OpTrait for Commutative {
         }
         vec![Law {
             name: "f(a, b) = f(b, a)",
-            lhs: apply([A, B]),
-            rhs: apply([B, A]),
+            lhs: apply([VAR_A, VAR_B]),
+            rhs: apply([VAR_B, VAR_A]),
         }]
     }
 }
@@ -76,18 +77,18 @@ impl Associative {
 }
 
 impl fmt::Display for Associative {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str("associative")?;
         for_integers(self.float, f)
     }
 }
 
 /// The scope of a trait that holds for floats only when `float` is set.
-fn for_integers(float: bool, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+fn for_integers(float: bool, formatter: &mut fmt::Formatter) -> fmt::Result {
     if float {
         Ok(())
     } else {
-        f.write_str(" on integers")
+        formatter.write_str(" on integers")
     }
 }
 
@@ -98,8 +99,8 @@ impl OpTrait for Associative {
         }
         vec![Law {
             name: "f(f(a, b), c) = f(a, f(b, c))",
-            lhs: apply([apply([A, B]), C]),
-            rhs: apply([A, apply([B, C])]),
+            lhs: apply([apply([VAR_A, VAR_B]), VAR_C]),
+            rhs: apply([VAR_A, apply([VAR_B, VAR_C])]),
         }]
     }
 }
@@ -116,7 +117,7 @@ pub enum IntValue {
 }
 
 impl fmt::Display for IntValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(match self {
             IntValue::Zero => "0",
             IntValue::One => "1",
@@ -136,16 +137,36 @@ pub struct PerClass {
 }
 
 impl PerClass {
+    /// The value as an integer of `int`, or `None` when the trait has no integer value.
+    fn int_value(&self, int: IntFormat) -> Option<i128> {
+        Some(match self.int? {
+            IntValue::Zero => 0,
+            IntValue::One => 1,
+            IntValue::Min => int.min(),
+            IntValue::Max => int.max(),
+            IntValue::AllOnes => int.wrap(-1),
+        })
+    }
+
+    /// The value as a scalar of `dtype`, exactly, or `None` when the trait has no value there.
+    pub fn value(&self, dtype: DType) -> Option<HostScalar> {
+        if let Some(int) = dtype.int_format() {
+            return HostScalar::int(dtype, self.int_value(int)?).ok();
+        }
+        let float = self.float?;
+        // Traits name only signed zeros, 1 and infinities. Each is exact in every dtype here.
+        match dtype {
+            DType::F64 | DType::F32 | DType::Bf16 | DType::F16 => {
+                HostScalar::from_f64(dtype, float).ok()
+            }
+            _ => None,
+        }
+    }
+
     /// The value as one element of `dtype`, or `None` when the trait has no value there.
     pub fn bytes(&self, dtype: DType) -> Option<Vec<u8>> {
         if let Some(int) = dtype.int_format() {
-            let value = match self.int? {
-                IntValue::Zero => 0,
-                IntValue::One => 1,
-                IntValue::Min => int.min(),
-                IntValue::Max => int.max(),
-                IntValue::AllOnes => int.wrap(-1),
-            };
+            let value = self.int_value(int)?;
             return Some(int.to_le_bytes(value, dtype.size_in_bytes()?));
         }
         let float = self.float?;
@@ -170,7 +191,7 @@ pub const NEG_ZERO: f64 = -0.0;
 pub struct RightIdentity(pub PerClass);
 
 impl fmt::Display for PerClass {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match (self.float, self.int) {
             (Some(float), Some(int)) => write!(f, "{float:?} on floats, {int} on integers"),
             (Some(float), None) => write!(f, "{float:?} on floats"),
@@ -181,7 +202,7 @@ impl fmt::Display for PerClass {
 }
 
 impl fmt::Display for RightIdentity {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "right identity {}", self.0)
     }
 }
@@ -204,7 +225,7 @@ impl RightIdentity {
 }
 
 impl OpTrait for RightIdentity {
-    fn fold(&self, op: &OpRef<'_>) -> Option<FoldResult> {
+    fn fold(&self, op: &Operation) -> Option<FoldResult> {
         let &[lhs, _] = op.operands else {
             return None;
         };
@@ -219,8 +240,8 @@ impl OpTrait for RightIdentity {
         };
         vec![Law {
             name: "f(a, e) = a",
-            lhs: apply([A, Term::Splat(identity)]),
-            rhs: A,
+            lhs: apply([VAR_A, Term::Splat(identity)]),
+            rhs: VAR_A,
         }]
     }
 }
@@ -230,14 +251,14 @@ impl OpTrait for RightIdentity {
 pub struct Absorbing(IntValue);
 
 impl fmt::Display for Absorbing {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "absorbing {} on integers", self.0)
     }
 }
 
 impl Absorbing {
-    pub const fn int(z: IntValue) -> Self {
-        Self(z)
+    pub const fn int(zero: IntValue) -> Self {
+        Self(zero)
     }
 
     fn bytes(&self, dtype: DType) -> Option<Vec<u8>> {
@@ -250,7 +271,7 @@ impl Absorbing {
 }
 
 impl OpTrait for Absorbing {
-    fn fold(&self, op: &OpRef<'_>) -> Option<FoldResult> {
+    fn fold(&self, op: &Operation) -> Option<FoldResult> {
         let &[_, rhs] = op.operands else {
             return None;
         };
@@ -265,7 +286,7 @@ impl OpTrait for Absorbing {
         };
         vec![Law {
             name: "f(a, z) = z",
-            lhs: apply([A, Term::Splat(absorbing.clone())]),
+            lhs: apply([VAR_A, Term::Splat(absorbing.clone())]),
             rhs: Term::Splat(absorbing),
         }]
     }
@@ -276,13 +297,13 @@ impl OpTrait for Absorbing {
 pub struct Idempotent;
 
 impl fmt::Display for Idempotent {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str("idempotent")
     }
 }
 
 impl OpTrait for Idempotent {
-    fn fold(&self, op: &OpRef<'_>) -> Option<FoldResult> {
+    fn fold(&self, op: &Operation) -> Option<FoldResult> {
         let kept = match *op.operands {
             [operand] => op.same_op_operands(0).map(|_| operand),
             [lhs, rhs] => (lhs == rhs).then_some(lhs),
@@ -295,13 +316,13 @@ impl OpTrait for Idempotent {
         match arity {
             1 => vec![Law {
                 name: "f(f(a)) = f(a)",
-                lhs: apply([apply([A])]),
-                rhs: apply([A]),
+                lhs: apply([apply([VAR_A])]),
+                rhs: apply([VAR_A]),
             }],
             2 => vec![Law {
                 name: "f(a, a) = a",
-                lhs: apply([A, A]),
-                rhs: A,
+                lhs: apply([VAR_A, VAR_A]),
+                rhs: VAR_A,
             }],
             _ => Vec::new(),
         }
@@ -313,13 +334,13 @@ impl OpTrait for Idempotent {
 pub struct Involution;
 
 impl fmt::Display for Involution {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str("involution")
     }
 }
 
 impl OpTrait for Involution {
-    fn fold(&self, op: &OpRef<'_>) -> Option<FoldResult> {
+    fn fold(&self, op: &Operation) -> Option<FoldResult> {
         let &[inner] = op.same_op_operands(0)? else {
             return None;
         };
@@ -332,8 +353,8 @@ impl OpTrait for Involution {
         }
         vec![Law {
             name: "f(f(a)) = a",
-            lhs: apply([apply([A])]),
-            rhs: A,
+            lhs: apply([apply([VAR_A])]),
+            rhs: VAR_A,
         }]
     }
 }
@@ -366,7 +387,7 @@ fn build<T: Default + Into<Op>>() -> Op {
 }
 
 impl fmt::Display for DistributesOver {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "distributes over `{}`", (self.over)().name())?;
         for_integers(self.float, f)
     }
@@ -380,8 +401,8 @@ impl OpTrait for DistributesOver {
         let over = |lhs: Term, rhs: Term| Term::Other(Box::new((self.over)()), vec![lhs, rhs]);
         vec![Law {
             name: "f(a, g(b, c)) = g(f(a, b), f(a, c))",
-            lhs: apply([A, over(B, C)]),
-            rhs: over(apply([A, B]), apply([A, C])),
+            lhs: apply([VAR_A, over(VAR_B, VAR_C)]),
+            rhs: over(apply([VAR_A, VAR_B]), apply([VAR_A, VAR_C])),
         }]
     }
 }

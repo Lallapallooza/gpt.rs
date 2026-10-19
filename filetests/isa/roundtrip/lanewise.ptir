@@ -1,0 +1,106 @@
+// RUN: roundtrip
+
+// The lane-wise ops of floats on one register, each the `arith` op of its name on each lane: all
+// but add, mul and maximum, which memory.ptir shows.
+// CHECK: [[ZERO:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[LANES:%[0-9]+]] = isa.load([[INPUT:%[0-9]+]], [[ZERO]]) {dims = [8]} : (!loop.buf<8xf32, global>, index) -> !isa.vec<8xf32>
+// CHECK-NEXT: [[NEGATED:%[0-9]+]] = isa.neg([[LANES]]) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+// CHECK-NEXT: [[MAGNITUDES:%[0-9]+]] = isa.abs([[NEGATED]]) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+// CHECK-NEXT: [[POWERS:%[0-9]+]] = isa.exp([[MAGNITUDES]]) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+// CHECK-NEXT: [[LOGS:%[0-9]+]] = isa.log([[POWERS]]) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+// CHECK-NEXT: [[TANHS:%[0-9]+]] = isa.tanh([[LOGS]]) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+// CHECK-NEXT: [[ERFS:%[0-9]+]] = isa.erf([[TANHS]]) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+// CHECK-NEXT: [[ROOTS:%[0-9]+]] = isa.rsqrt([[ERFS]]) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+// CHECK-NEXT: [[INVERSES:%[0-9]+]] = isa.reciprocal([[ROOTS]]) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+// CHECK-NEXT: [[SINES:%[0-9]+]] = isa.sin([[INVERSES]]) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+// CHECK-NEXT: [[COSINES:%[0-9]+]] = isa.cos([[SINES]]) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+// CHECK-NEXT: [[DIFFERENCES:%[0-9]+]] = isa.sub([[LANES]], [[COSINES]]) : (!isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xf32>
+// CHECK-NEXT: [[QUOTIENTS:%[0-9]+]] = isa.div([[DIFFERENCES]], [[COSINES]]) : (!isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xf32>
+// CHECK-NEXT: [[SMALLER:%[0-9]+]] = isa.minimum([[QUOTIENTS]], [[LANES]]) : (!isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xf32>
+// CHECK-NEXT: [[BELOW:%[0-9]+]] = isa.less([[SMALLER]], [[COSINES]]) : (!isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xi1>
+// CHECK-NEXT: [[AT_MOST:%[0-9]+]] = isa.less_equal([[SMALLER]], [[COSINES]]) : (!isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xi1>
+// CHECK-NEXT: [[SAME:%[0-9]+]] = isa.equal([[SMALLER]], [[COSINES]]) : (!isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xi1>
+// CHECK-NEXT: [[AT_LEAST:%[0-9]+]] = isa.greater_equal([[SMALLER]], [[COSINES]]) : (!isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xi1>
+// CHECK-NEXT: [[ABOVE:%[0-9]+]] = isa.greater([[SMALLER]], [[COSINES]]) : (!isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xi1>
+// CHECK-NEXT: [[DIFFERENT:%[0-9]+]] = isa.not_equal([[SMALLER]], [[COSINES]]) : (!isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xi1>
+// CHECK-NEXT: [[CHOSEN:%[0-9]+]] = isa.select([[BELOW]], [[SMALLER]], [[COSINES]]) : (!isa.vec<8xi1>, !isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xf32>
+// CHECK-NEXT: [[NARROW:%[0-9]+]] = isa.cast([[CHOSEN]]) {to = bf16} : (!isa.vec<8xf32>) -> !isa.vec<8xbf16>
+// CHECK-NEXT: isa.store([[NARROW]], [[OUTPUT:%[0-9]+]], [[ZERO]]) : (!isa.vec<8xbf16>, !loop.buf<8xbf16, global>, index) -> ()
+// CHECK-NEXT: loop.return() : () -> ()
+loop.func @float_lanes(%input: !loop.buf<8xf32, global>, %output: !loop.buf<8xbf16, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %lanes = isa.load(%input, %zero) {dims = [8]} : (!loop.buf<8xf32, global>, index) -> !isa.vec<8xf32>
+  %negated = isa.neg(%lanes) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+  %magnitudes = isa.abs(%negated) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+  %powers = isa.exp(%magnitudes) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+  %logs = isa.log(%powers) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+  %tanhs = isa.tanh(%logs) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+  %erfs = isa.erf(%tanhs) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+  %roots = isa.rsqrt(%erfs) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+  %inverses = isa.reciprocal(%roots) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+  %sines = isa.sin(%inverses) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+  %cosines = isa.cos(%sines) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+  %differences = isa.sub(%lanes, %cosines) : (!isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xf32>
+  %quotients = isa.div(%differences, %cosines) : (!isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xf32>
+  %smaller = isa.minimum(%quotients, %lanes) : (!isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xf32>
+  %below = isa.less(%smaller, %cosines) : (!isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xi1>
+  %at_most = isa.less_equal(%smaller, %cosines) : (!isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xi1>
+  %same = isa.equal(%smaller, %cosines) : (!isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xi1>
+  %at_least = isa.greater_equal(%smaller, %cosines) : (!isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xi1>
+  %above = isa.greater(%smaller, %cosines) : (!isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xi1>
+  %different = isa.not_equal(%smaller, %cosines) : (!isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xi1>
+  %chosen = isa.select(%below, %smaller, %cosines) : (!isa.vec<8xi1>, !isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xf32>
+  %narrow = isa.cast(%chosen) {to = bf16} : (!isa.vec<8xf32>) -> !isa.vec<8xbf16>
+  isa.store(%narrow, %output, %zero) : (!isa.vec<8xbf16>, !loop.buf<8xbf16, global>, index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// The lane-wise ops of integers on one register, and their bits read as floats.
+// CHECK: [[ZERO:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[LANES:%[0-9]+]] = isa.load([[INPUT:%[0-9]+]], [[ZERO]]) {dims = [16]} : (!loop.buf<16xsi32, global>, index) -> !isa.vec<16xsi32>
+// CHECK-NEXT: [[INVERTED:%[0-9]+]] = isa.not([[LANES]]) : (!isa.vec<16xsi32>) -> !isa.vec<16xsi32>
+// CHECK-NEXT: [[BOTH:%[0-9]+]] = isa.and([[LANES]], [[INVERTED]]) : (!isa.vec<16xsi32>, !isa.vec<16xsi32>) -> !isa.vec<16xsi32>
+// CHECK-NEXT: [[EITHER:%[0-9]+]] = isa.or([[BOTH]], [[LANES]]) : (!isa.vec<16xsi32>, !isa.vec<16xsi32>) -> !isa.vec<16xsi32>
+// CHECK-NEXT: [[ALL_ONES:%[0-9]+]] = isa.xor([[EITHER]], [[INVERTED]]) : (!isa.vec<16xsi32>, !isa.vec<16xsi32>) -> !isa.vec<16xsi32>
+// CHECK-NEXT: [[COUNT:%[0-9]+]] = arith.constant() {value = 3 : si32} : () -> si32
+// CHECK-NEXT: [[COUNTS:%[0-9]+]] = isa.splat([[COUNT]]) {dims = [16]} : (si32) -> !isa.vec<16xsi32>
+// CHECK-NEXT: [[LEFT:%[0-9]+]] = isa.shift_left([[ALL_ONES]], [[COUNTS]]) : (!isa.vec<16xsi32>, !isa.vec<16xsi32>) -> !isa.vec<16xsi32>
+// CHECK-NEXT: [[LOGICAL:%[0-9]+]] = isa.shift_right_logical([[LEFT]], [[COUNTS]]) : (!isa.vec<16xsi32>, !isa.vec<16xsi32>) -> !isa.vec<16xsi32>
+// CHECK-NEXT: [[SHIFTED:%[0-9]+]] = isa.shift_right_arithmetic([[LOGICAL]], [[COUNTS]]) : (!isa.vec<16xsi32>, !isa.vec<16xsi32>) -> !isa.vec<16xsi32>
+// CHECK-NEXT: [[FLOATS:%[0-9]+]] = isa.bitcast([[SHIFTED]]) {to = f32} : (!isa.vec<16xsi32>) -> !isa.vec<16xf32>
+// CHECK-NEXT: isa.store([[FLOATS]], [[OUTPUT:%[0-9]+]], [[ZERO]]) : (!isa.vec<16xf32>, !loop.buf<16xf32, global>, index) -> ()
+// CHECK-NEXT: loop.return() : () -> ()
+loop.func @integer_lanes(%input: !loop.buf<16xsi32, global>, %output: !loop.buf<16xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %lanes = isa.load(%input, %zero) {dims = [16]} : (!loop.buf<16xsi32, global>, index) -> !isa.vec<16xsi32>
+  %inverted = isa.not(%lanes) : (!isa.vec<16xsi32>) -> !isa.vec<16xsi32>
+  %both = isa.and(%lanes, %inverted) : (!isa.vec<16xsi32>, !isa.vec<16xsi32>) -> !isa.vec<16xsi32>
+  %either = isa.or(%both, %lanes) : (!isa.vec<16xsi32>, !isa.vec<16xsi32>) -> !isa.vec<16xsi32>
+  %all_ones = isa.xor(%either, %inverted) : (!isa.vec<16xsi32>, !isa.vec<16xsi32>) -> !isa.vec<16xsi32>
+  %count = arith.constant() {value = 3 : si32} : () -> si32
+  %counts = isa.splat(%count) {dims = [16]} : (si32) -> !isa.vec<16xsi32>
+  %left = isa.shift_left(%all_ones, %counts) : (!isa.vec<16xsi32>, !isa.vec<16xsi32>) -> !isa.vec<16xsi32>
+  %logical = isa.shift_right_logical(%left, %counts) : (!isa.vec<16xsi32>, !isa.vec<16xsi32>) -> !isa.vec<16xsi32>
+  %shifted = isa.shift_right_arithmetic(%logical, %counts) : (!isa.vec<16xsi32>, !isa.vec<16xsi32>) -> !isa.vec<16xsi32>
+  %floats = isa.bitcast(%shifted) {to = f32} : (!isa.vec<16xsi32>) -> !isa.vec<16xf32>
+  isa.store(%floats, %output, %zero) : (!isa.vec<16xf32>, !loop.buf<16xf32, global>, index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// A multiply and an add that round once, on each lane: `x * x + x`.
+// CHECK: [[ZERO:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[LANES:%[0-9]+]] = isa.load([[INPUT:%[0-9]+]], [[ZERO]]) {dims = [16]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<16xf32>
+// CHECK-NEXT: [[SQUARE_PLUS:%[0-9]+]] = isa.fma([[LANES]], [[LANES]], [[LANES]]) : (!isa.vec<16xf32>, !isa.vec<16xf32>, !isa.vec<16xf32>) -> !isa.vec<16xf32>
+// CHECK-NEXT: isa.store([[SQUARE_PLUS]], [[OUTPUT:%[0-9]+]], [[ZERO]]) : (!isa.vec<16xf32>, !loop.buf<16xf32, global>, index) -> ()
+// CHECK-NEXT: loop.return() : () -> ()
+loop.func @square_plus(%input: !loop.buf<16xf32, global>, %output: !loop.buf<16xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %lanes = isa.load(%input, %zero) {dims = [16]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<16xf32>
+  %square_plus = isa.fma(%lanes, %lanes, %lanes) : (!isa.vec<16xf32>, !isa.vec<16xf32>, !isa.vec<16xf32>) -> !isa.vec<16xf32>
+  isa.store(%square_plus, %output, %zero) : (!isa.vec<16xf32>, !loop.buf<16xf32, global>, index) -> ()
+  loop.return() : () -> ()
+}

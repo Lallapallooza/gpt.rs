@@ -1,0 +1,110 @@
+// RUN: roundtrip
+
+// Two rows of 16 lanes scaled by one element and shifted by a bias: a group load, a broadcast, a
+// bias row repeated for each row, lane-wise arithmetic and a group store.
+// CHECK: [[ZERO:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[ROWS:%[0-9]+]] = isa.load([[INPUT:%[0-9]+]], [[ZERO]], [[ZERO]]) {dims = [2, 1, 16], steps = [[1, 0], [0, 16]]} : (!loop.buf<2x16xf32, global>, index, index) -> !isa.vec<2x1x16xf32>
+// CHECK-NEXT: [[BIAS_ROW:%[0-9]+]] = isa.load([[BIAS:%[0-9]+]], [[ZERO]]) {dims = [1, 1, 16], steps = [[0], [16]]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<1x1x16xf32>
+// CHECK-NEXT: [[BIAS_ROWS:%[0-9]+]] = isa.expand([[BIAS_ROW]]) {dims = [2, 1, 16]} : (!isa.vec<1x1x16xf32>) -> !isa.vec<2x1x16xf32>
+// CHECK-NEXT: [[FACTOR:%[0-9]+]] = isa.broadcast([[SCALE:%[0-9]+]]) {dims = [2, 1, 16], steps = [[], []]} : (!loop.buf<f32, global>) -> !isa.vec<2x1x16xf32>
+// CHECK-NEXT: [[SCALED:%[0-9]+]] = isa.mul([[ROWS]], [[FACTOR]]) : (!isa.vec<2x1x16xf32>, !isa.vec<2x1x16xf32>) -> !isa.vec<2x1x16xf32>
+// CHECK-NEXT: [[SHIFTED:%[0-9]+]] = isa.add([[SCALED]], [[BIAS_ROWS]]) : (!isa.vec<2x1x16xf32>, !isa.vec<2x1x16xf32>) -> !isa.vec<2x1x16xf32>
+// CHECK-NEXT: isa.store([[SHIFTED]], [[OUTPUT:%[0-9]+]], [[ZERO]], [[ZERO]]) {steps = [[1, 0], [0, 16]]} : (!isa.vec<2x1x16xf32>, !loop.buf<2x16xf32, global>, index, index) -> ()
+loop.func @scale_and_shift(%input: !loop.buf<2x16xf32, global>, %bias: !loop.buf<16xf32, global>, %scale: !loop.buf<f32, global>, %output: !loop.buf<2x16xf32, global>) attributes {access = [in, in, in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %rows = isa.load(%input, %zero, %zero) {dims = [2, 1, 16], steps = [[1, 0], [0, 16]]} : (!loop.buf<2x16xf32, global>, index, index) -> !isa.vec<2x1x16xf32>
+  %bias_row = isa.load(%bias, %zero) {dims = [1, 1, 16], steps = [[0], [16]]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<1x1x16xf32>
+  %bias_rows = isa.expand(%bias_row) {dims = [2, 1, 16]} : (!isa.vec<1x1x16xf32>) -> !isa.vec<2x1x16xf32>
+  %factor = isa.broadcast(%scale) {dims = [2, 1, 16], steps = [[], []]} : (!loop.buf<f32, global>) -> !isa.vec<2x1x16xf32>
+  %scaled = isa.mul(%rows, %factor) : (!isa.vec<2x1x16xf32>, !isa.vec<2x1x16xf32>) -> !isa.vec<2x1x16xf32>
+  %shifted = isa.add(%scaled, %bias_rows) : (!isa.vec<2x1x16xf32>, !isa.vec<2x1x16xf32>) -> !isa.vec<2x1x16xf32>
+  isa.store(%shifted, %output, %zero, %zero) {steps = [[1, 0], [0, 16]]} : (!isa.vec<2x1x16xf32>, !loop.buf<2x16xf32, global>, index, index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// Two rows of 16 lanes and the two that follow them: a prefetch asks L2 for the first lane of
+// each register that the load of the following rows reads. isa.maximum and isa.minimum give the
+// larger and the smaller lane of each pair of rows.
+// CHECK: [[ZERO:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[TWO:%[0-9]+]] = loop.index() {expr = 2} : () -> index
+// CHECK-NEXT: [[ROWS:%[0-9]+]] = isa.load([[INPUT:%[0-9]+]], [[ZERO]], [[ZERO]]) {dims = [2, 1, 16], steps = [[1, 0], [0, 16]]} : (!loop.buf<4x16xf32, global>, index, index) -> !isa.vec<2x1x16xf32>
+// CHECK-NEXT: isa.prefetch([[INPUT]], [[TWO]], [[ZERO]]) {dims = [2, 1, 16], steps = [[1, 0], [0, 16]], level = l2} : (!loop.buf<4x16xf32, global>, index, index) -> ()
+// CHECK-NEXT: [[NEXT_ROWS:%[0-9]+]] = isa.load([[INPUT]], [[TWO]], [[ZERO]]) {dims = [2, 1, 16], steps = [[1, 0], [0, 16]]} : (!loop.buf<4x16xf32, global>, index, index) -> !isa.vec<2x1x16xf32>
+// CHECK-NEXT: [[LARGER:%[0-9]+]] = isa.maximum([[ROWS]], [[NEXT_ROWS]]) : (!isa.vec<2x1x16xf32>, !isa.vec<2x1x16xf32>) -> !isa.vec<2x1x16xf32>
+// CHECK-NEXT: [[SMALLER:%[0-9]+]] = isa.minimum([[ROWS]], [[NEXT_ROWS]]) : (!isa.vec<2x1x16xf32>, !isa.vec<2x1x16xf32>) -> !isa.vec<2x1x16xf32>
+loop.func @pairs(%input: !loop.buf<4x16xf32, global>, %larger_out: !loop.buf<2x16xf32, global>, %smaller_out: !loop.buf<2x16xf32, global>) attributes {access = [in, out, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %two = loop.index() {expr = 2} : () -> index
+  %rows = isa.load(%input, %zero, %zero) {dims = [2, 1, 16], steps = [[1, 0], [0, 16]]} : (!loop.buf<4x16xf32, global>, index, index) -> !isa.vec<2x1x16xf32>
+  isa.prefetch(%input, %two, %zero) {dims = [2, 1, 16], steps = [[1, 0], [0, 16]], level = l2} : (!loop.buf<4x16xf32, global>, index, index) -> ()
+  %next_rows = isa.load(%input, %two, %zero) {dims = [2, 1, 16], steps = [[1, 0], [0, 16]]} : (!loop.buf<4x16xf32, global>, index, index) -> !isa.vec<2x1x16xf32>
+  %larger = isa.maximum(%rows, %next_rows) : (!isa.vec<2x1x16xf32>, !isa.vec<2x1x16xf32>) -> !isa.vec<2x1x16xf32>
+  %smaller = isa.minimum(%rows, %next_rows) : (!isa.vec<2x1x16xf32>, !isa.vec<2x1x16xf32>) -> !isa.vec<2x1x16xf32>
+  isa.store(%larger, %larger_out, %zero, %zero) {steps = [[1, 0], [0, 16]]} : (!isa.vec<2x1x16xf32>, !loop.buf<2x16xf32, global>, index, index) -> ()
+  isa.store(%smaller, %smaller_out, %zero, %zero) {steps = [[1, 0], [0, 16]]} : (!isa.vec<2x1x16xf32>, !loop.buf<2x16xf32, global>, index, index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// The last 8 columns of a row of 40, in a register of 16 lanes: a tile mask keeps the lanes of
+// the tail, and the masked load and store touch only those. ReLU against a splatted zero, and a
+// masked broadcast of a scale into the lanes of the tail.
+// CHECK: [[MASK:%[0-9]+]] = isa.tile_mask([[VALID:%[0-9]+]]) {dims = [1, 16]} : (index) -> !isa.vec<1x16xi1>
+// CHECK-NEXT: [[TAIL:%[0-9]+]] = isa.masked_load([[MASK]], [[INPUT:%[0-9]+]], [[START:%[0-9]+]]) {dims = [1, 16], steps = [[16]]} : (!isa.vec<1x16xi1>, !loop.buf<40xf32, global>, index) -> !isa.vec<1x16xf32>
+// CHECK-NEXT: [[FACTOR:%[0-9]+]] = isa.masked_broadcast([[MASK]], [[SCALE:%[0-9]+]]) {dims = [1, 16], steps = [[]]} : (!isa.vec<1x16xi1>, !loop.buf<f32, global>) -> !isa.vec<1x16xf32>
+// CHECK-NEXT: [[SCALED:%[0-9]+]] = isa.mul([[TAIL]], [[FACTOR]])
+// CHECK-NEXT: [[ZEROS:%[0-9]+]] = isa.splat([[ZERO_VALUE:%[0-9]+]]) {dims = [1, 16]} : (f32) -> !isa.vec<1x16xf32>
+// CHECK-NEXT: [[RECTIFIED:%[0-9]+]] = isa.maximum([[SCALED]], [[ZEROS]])
+// CHECK-NEXT: isa.masked_store([[MASK]], [[RECTIFIED]], [[OUTPUT:%[0-9]+]], [[START]]) {steps = [[16]]} : (!isa.vec<1x16xi1>, !isa.vec<1x16xf32>, !loop.buf<40xf32, global>, index) -> ()
+loop.func @relu_tail(%input: !loop.buf<40xf32, global>, %scale: !loop.buf<f32, global>, %output: !loop.buf<40xf32, global>) attributes {access = [in, in, out]} {
+  %start = loop.index() {expr = 32} : () -> index
+  %valid = loop.index() {expr = 8} : () -> index
+  %zero = arith.constant() {value = 0.0 : f32} : () -> f32
+  %mask = isa.tile_mask(%valid) {dims = [1, 16]} : (index) -> !isa.vec<1x16xi1>
+  %tail = isa.masked_load(%mask, %input, %start) {dims = [1, 16], steps = [[16]]} : (!isa.vec<1x16xi1>, !loop.buf<40xf32, global>, index) -> !isa.vec<1x16xf32>
+  %factor = isa.masked_broadcast(%mask, %scale) {dims = [1, 16], steps = [[]]} : (!isa.vec<1x16xi1>, !loop.buf<f32, global>) -> !isa.vec<1x16xf32>
+  %scaled = isa.mul(%tail, %factor) : (!isa.vec<1x16xf32>, !isa.vec<1x16xf32>) -> !isa.vec<1x16xf32>
+  %zeros = isa.splat(%zero) {dims = [1, 16]} : (f32) -> !isa.vec<1x16xf32>
+  %rectified = isa.maximum(%scaled, %zeros) : (!isa.vec<1x16xf32>, !isa.vec<1x16xf32>) -> !isa.vec<1x16xf32>
+  isa.masked_store(%mask, %rectified, %output, %start) {steps = [[16]]} : (!isa.vec<1x16xi1>, !isa.vec<1x16xf32>, !loop.buf<40xf32, global>, index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// A row of 16 lanes that starts 2 elements before its buffer, and one element 3 past its end:
+// with `pad`, the lanes and registers outside the buffer hold the pad and read nothing.
+// CHECK: [[SHIFTED:%[0-9]+]] = isa.load([[INPUT:%[0-9]+]], [[BEFORE:%[0-9]+]]) {dims = [1, 16], steps = [[16]], pad = 0.0} : (!loop.buf<20xf32, global>, index) -> !isa.vec<1x16xf32>
+// CHECK-NEXT: [[MASK:%[0-9]+]] = isa.tile_mask([[VALID:%[0-9]+]]) {dims = [1, 16]} : (index) -> !isa.vec<1x16xi1>
+// CHECK-NEXT: [[TAIL:%[0-9]+]] = isa.masked_load([[MASK]], [[INPUT]], [[BEFORE]]) {dims = [1, 16], steps = [[16]], pad = -1.0} : (!isa.vec<1x16xi1>, !loop.buf<20xf32, global>, index) -> !isa.vec<1x16xf32>
+// CHECK-NEXT: [[OUTSIDE:%[0-9]+]] = isa.broadcast([[INPUT]], [[PAST:%[0-9]+]]) {dims = [1, 16], steps = [[0]], pad = 1.0} : (!loop.buf<20xf32, global>, index) -> !isa.vec<1x16xf32>
+// CHECK-NEXT: [[MASKED_OUTSIDE:%[0-9]+]] = isa.masked_broadcast([[MASK]], [[INPUT]], [[PAST]]) {dims = [1, 16], steps = [[0]], pad = 1.0} : (!isa.vec<1x16xi1>, !loop.buf<20xf32, global>, index) -> !isa.vec<1x16xf32>
+loop.func @padded_reads(%input: !loop.buf<20xf32, global>, %output: !loop.buf<4x16xf32, global>) attributes {access = [in, out]} {
+  %before = loop.index() {expr = -2} : () -> index
+  %past = loop.index() {expr = 23} : () -> index
+  %valid = loop.index() {expr = 8} : () -> index
+  %zero = loop.index() {expr = 0} : () -> index
+  %shifted = isa.load(%input, %before) {dims = [1, 16], steps = [[16]], pad = 0.0} : (!loop.buf<20xf32, global>, index) -> !isa.vec<1x16xf32>
+  %mask = isa.tile_mask(%valid) {dims = [1, 16]} : (index) -> !isa.vec<1x16xi1>
+  %tail = isa.masked_load(%mask, %input, %before) {dims = [1, 16], steps = [[16]], pad = -1.0} : (!isa.vec<1x16xi1>, !loop.buf<20xf32, global>, index) -> !isa.vec<1x16xf32>
+  %outside = isa.broadcast(%input, %past) {dims = [1, 16], steps = [[0]], pad = 1.0} : (!loop.buf<20xf32, global>, index) -> !isa.vec<1x16xf32>
+  %masked_outside = isa.masked_broadcast(%mask, %input, %past) {dims = [1, 16], steps = [[0]], pad = 1.0} : (!isa.vec<1x16xi1>, !loop.buf<20xf32, global>, index) -> !isa.vec<1x16xf32>
+  isa.store(%shifted, %output, %zero, %zero) {steps = [[0, 16]]} : (!isa.vec<1x16xf32>, !loop.buf<4x16xf32, global>, index, index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// Two rows of 16 lanes from 2 elements before the buffer: the first one's lanes may fall outside
+// it, and the read checks them, and the second one's stay inside, and it checks none.
+// CHECK: [[ROWS:%[0-9]+]] = isa.load([[INPUT:%[0-9]+]], [[BEFORE:%[0-9]+]]) {dims = [2, 16], steps = [[16]], pad = 0.0, checked = [[0], []]} : (!loop.buf<40xf32, global>, index) -> !isa.vec<2x16xf32>
+loop.func @checked_rows(%input: !loop.buf<40xf32, global>, %output: !loop.buf<2x16xf32, global>) attributes {access = [in, out]} {
+  %before = loop.index() {expr = -2} : () -> index
+  %zero = loop.index() {expr = 0} : () -> index
+  %rows = isa.load(%input, %before) {dims = [2, 16], steps = [[16]], pad = 0.0, checked = [[0], []]} : (!loop.buf<40xf32, global>, index) -> !isa.vec<2x16xf32>
+  isa.store(%rows, %output, %zero, %zero) {steps = [[1, 0]]} : (!isa.vec<2x16xf32>, !loop.buf<2x16xf32, global>, index, index) -> ()
+  loop.return() : () -> ()
+}

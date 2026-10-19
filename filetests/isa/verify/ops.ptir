@@ -1,0 +1,258 @@
+// RUN: verify
+
+// ERROR: isa.not: the input must be an i1 or integer dtype, got f32
+loop.func @not_of_floats(%input: !loop.buf<8xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %lanes = isa.load(%input, %zero) {dims = [8]} : (!loop.buf<8xf32, global>, index) -> !isa.vec<8xf32>
+  %inverted = isa.not(%lanes) : (!isa.vec<8xf32>) -> !isa.vec<8xf32>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.add: operands must have equal types, got !isa.vec<16xf32> and !isa.vec<2x8xf32>
+loop.func @add_of_two_shapes(%input: !loop.buf<16xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %wide = isa.load(%input, %zero) {dims = [16]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<16xf32>
+  %halves = isa.load(%input, %zero) {dims = [2, 8], steps = [[8]]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<2x8xf32>
+  %sum = isa.add(%wide, %halves) : (!isa.vec<16xf32>, !isa.vec<2x8xf32>) -> !isa.vec<16xf32>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.add: each operand must be an integer or float dtype, got i1
+loop.func @add_of_masks() attributes {access = []} {
+  %valid = loop.index() {expr = 4} : () -> index
+  %mask = isa.tile_mask(%valid) {dims = [16]} : (index) -> !isa.vec<16xi1>
+  %sum = isa.add(%mask, %mask) : (!isa.vec<16xi1>, !isa.vec<16xi1>) -> !isa.vec<16xi1>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.less: each operand must be an i1, integer or float dtype, got f8e4m3
+loop.func @less_of_fp8(%input: !loop.buf<16xf8e4m3, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %lanes = isa.load(%input, %zero) {dims = [16]} : (!loop.buf<16xf8e4m3, global>, index) -> !isa.vec<16xf8e4m3>
+  %below = isa.less(%lanes, %lanes) : (!isa.vec<16xf8e4m3>, !isa.vec<16xf8e4m3>) -> !isa.vec<16xi1>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.cast: to must be an i1, integer, float or narrow float dtype, got e8m0
+loop.func @cast_to_scales(%input: !loop.buf<16xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %lanes = isa.load(%input, %zero) {dims = [16]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<16xf32>
+  %scales = isa.cast(%lanes) {to = e8m0} : (!isa.vec<16xf32>) -> !isa.vec<16xe8m0>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.bitcast: a bitcast keeps the width: f32 has 32 bits and f64 has 64
+loop.func @bitcast_to_wider(%input: !loop.buf<8xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %lanes = isa.load(%input, %zero) {dims = [8]} : (!loop.buf<8xf32, global>, index) -> !isa.vec<8xf32>
+  %wide = isa.bitcast(%lanes) {to = f64} : (!isa.vec<8xf32>) -> !isa.vec<8xf64>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.select: pred is !isa.vec<8xf32>, not a mask of the extents [8]
+loop.func @select_by_floats(%input: !loop.buf<8xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %lanes = isa.load(%input, %zero) {dims = [8]} : (!loop.buf<8xf32, global>, index) -> !isa.vec<8xf32>
+  %chosen = isa.select(%lanes, %lanes, %lanes) : (!isa.vec<8xf32>, !isa.vec<8xf32>, !isa.vec<8xf32>) -> !isa.vec<8xf32>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.select: on_true and on_false must have equal types, got !isa.vec<8xf32> and !isa.vec<8xsi32>
+loop.func @select_of_two_dtypes(%floats: !loop.buf<8xf32, global>, %integers: !loop.buf<8xsi32, global>) attributes {access = [in, in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %valid = loop.index() {expr = 4} : () -> index
+  %mask = isa.tile_mask(%valid) {dims = [8]} : (index) -> !isa.vec<8xi1>
+  %float_lanes = isa.load(%floats, %zero) {dims = [8]} : (!loop.buf<8xf32, global>, index) -> !isa.vec<8xf32>
+  %integer_lanes = isa.load(%integers, %zero) {dims = [8]} : (!loop.buf<8xsi32, global>, index) -> !isa.vec<8xsi32>
+  %chosen = isa.select(%mask, %float_lanes, %integer_lanes) : (!isa.vec<8xi1>, !isa.vec<8xf32>, !isa.vec<8xsi32>) -> !isa.vec<8xf32>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.splat: a vector has lanes and a group rank of at most 3, not the extents []
+loop.func @splat_without_lanes() attributes {access = []} {
+  %zero = arith.constant() {value = 0.0 : f32} : () -> f32
+  %lanes = isa.splat(%zero) {dims = []} : (f32) -> !isa.vec<8xf32>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.expand: !isa.vec<2x8xf32> repeats only axes of extent 1 to !isa.vec<4x8xf32>
+loop.func @expand_a_full_axis(%input: !loop.buf<16xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %halves = isa.load(%input, %zero) {dims = [2, 8], steps = [[8]]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<2x8xf32>
+  %more = isa.expand(%halves) {dims = [4, 8]} : (!isa.vec<2x8xf32>) -> !isa.vec<4x8xf32>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.expand: !isa.vec<2x8xf32> has other lanes or another number of axes than !isa.vec<2x16xf32>
+loop.func @expand_the_lanes(%input: !loop.buf<16xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %halves = isa.load(%input, %zero) {dims = [2, 8], steps = [[8]]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<2x8xf32>
+  %wider = isa.expand(%halves) {dims = [2, 16]} : (!isa.vec<2x8xf32>) -> !isa.vec<2x16xf32>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.expand: !isa.vec<2x8xf32> has other lanes or another number of axes than !isa.vec<3x2x8xf32>
+loop.func @expand_to_another_rank(%input: !loop.buf<16xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %halves = isa.load(%input, %zero) {dims = [2, 8], steps = [[8]]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<2x8xf32>
+  %rows = isa.expand(%halves) {dims = [3, 2, 8]} : (!isa.vec<2x8xf32>) -> !isa.vec<3x2x8xf32>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.tile_mask: the extent count is 1, but the tile has rank 2
+loop.func @mask_of_one_extent() attributes {access = []} {
+  %rows = loop.index() {expr = 3} : () -> index
+  %mask = isa.tile_mask(%rows) {dims = [4, 2, 16]} : (index) -> !isa.vec<4x2x16xi1>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.load: the base index count is 1, but !loop.buf<4x16xf32, global> has rank 2
+loop.func @load_with_one_index(%input: !loop.buf<4x16xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %lanes = isa.load(%input, %zero) {dims = [16]} : (!loop.buf<4x16xf32, global>, index) -> !isa.vec<16xf32>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.load: the step count is 0, but the group rank of !isa.vec<4x16xf32> is 1
+loop.func @load_without_steps(%input: !loop.buf<4x16xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %rows = isa.load(%input, %zero, %zero) {dims = [4, 16]} : (!loop.buf<4x16xf32, global>, index, index) -> !isa.vec<4x16xf32>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.broadcast: a step's length is 1, but !loop.buf<4x16xf32, global> has rank 2
+loop.func @broadcast_with_short_steps(%input: !loop.buf<4x16xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %rows = isa.broadcast(%input, %zero, %zero) {dims = [4, 16], steps = [[1]]} : (!loop.buf<4x16xf32, global>, index, index) -> !isa.vec<4x16xf32>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.load: it pads with 0.5, which si32 cannot hold
+loop.func @load_padded_with_a_fraction(%input: !loop.buf<16xsi32, global>) attributes {access = [in]} {
+  %start = loop.index() {expr = -2} : () -> index
+  %lanes = isa.load(%input, %start) {dims = [16], pad = 0.5} : (!loop.buf<16xsi32, global>, index) -> !isa.vec<16xsi32>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.masked_load: the mask is !isa.vec<16xf32>, not a mask of the extents [16]
+loop.func @mask_of_floats(%input: !loop.buf<16xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %lanes = isa.load(%input, %zero) {dims = [16]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<16xf32>
+  %again = isa.masked_load(%lanes, %input, %zero) {dims = [16]} : (!isa.vec<16xf32>, !loop.buf<16xf32, global>, index) -> !isa.vec<16xf32>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.store: the value is !isa.vec<16xf32>, but !loop.buf<16xsi32, global> holds si32
+loop.func @store_into_integers(%input: !loop.buf<16xf32, global>, %output: !loop.buf<16xsi32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %lanes = isa.load(%input, %zero) {dims = [16]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<16xf32>
+  isa.store(%lanes, %output, %zero) : (!isa.vec<16xf32>, !loop.buf<16xsi32, global>, index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.masked_store: the mask is !isa.vec<8xi1>, not a mask of the extents [16]
+loop.func @store_with_a_short_mask(%input: !loop.buf<16xf32, global>, %output: !loop.buf<16xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %valid = loop.index() {expr = 4} : () -> index
+  %lanes = isa.load(%input, %zero) {dims = [16]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<16xf32>
+  %mask = isa.tile_mask(%valid) {dims = [8]} : (index) -> !isa.vec<8xi1>
+  isa.masked_store(%mask, %lanes, %output, %zero) : (!isa.vec<8xi1>, !isa.vec<16xf32>, !loop.buf<16xf32, global>, index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.fma: lhs and rhs must have equal types, got !isa.vec<16xf32> and !isa.vec<2x8xf32>
+loop.func @fma_of_two_shapes(%input: !loop.buf<16xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %lanes = isa.load(%input, %zero) {dims = [16]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<16xf32>
+  %rows = isa.load(%input, %zero) {dims = [2, 8], steps = [[8]]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<2x8xf32>
+  %fused = isa.fma(%lanes, %rows, %lanes) : (!isa.vec<16xf32>, !isa.vec<2x8xf32>, !isa.vec<16xf32>) -> !isa.vec<16xf32>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.fma: lhs and acc must have equal types, got !isa.vec<16xf32> and !isa.vec<2x8xf32>
+loop.func @fma_into_other_rows(%input: !loop.buf<16xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %lanes = isa.load(%input, %zero) {dims = [16]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<16xf32>
+  %rows = isa.load(%input, %zero) {dims = [2, 8], steps = [[8]]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<2x8xf32>
+  %fused = isa.fma(%lanes, %lanes, %rows) : (!isa.vec<16xf32>, !isa.vec<16xf32>, !isa.vec<2x8xf32>) -> !isa.vec<16xf32>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.fma: fma computes on f32 and f64, not si32
+loop.func @fma_of_integers(%input: !loop.buf<16xsi32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %lanes = isa.load(%input, %zero) {dims = [16]} : (!loop.buf<16xsi32, global>, index) -> !isa.vec<16xsi32>
+  %fused = isa.fma(%lanes, %lanes, %lanes) : (!isa.vec<16xsi32>, !isa.vec<16xsi32>, !isa.vec<16xsi32>) -> !isa.vec<16xsi32>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.load: it names checked axes but has no pad
+loop.func @checks_without_pad(%input: !loop.buf<40xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %lanes = isa.load(%input, %zero) {dims = [16], checked = [[0]]} : (!loop.buf<40xf32, global>, index) -> !isa.vec<16xf32>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.load: `checked` has one entry per register, and holds 1 for the 2 registers of !isa.vec<2x16xf32>
+loop.func @checks_one_of_two(%input: !loop.buf<40xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %rows = isa.load(%input, %zero) {dims = [2, 16], steps = [[16]], pad = 0.0, checked = [[0]]} : (!loop.buf<40xf32, global>, index) -> !isa.vec<2x16xf32>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: isa.broadcast: it checks axis 1 of !loop.buf<40xf32, global>, which has no axis 1
+loop.func @checks_a_missing_axis(%input: !loop.buf<40xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %lanes = isa.broadcast(%input, %zero) {dims = [16], pad = 0.0, checked = [[1]]} : (!loop.buf<40xf32, global>, index) -> !isa.vec<16xf32>
+  loop.return() : () -> ()
+}

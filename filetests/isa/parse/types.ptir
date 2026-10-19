@@ -1,0 +1,17 @@
+// RUN: parse
+
+// ERROR: 4:91: a vector's extents are static, not {N}
+loop.func @symbolic_lanes(%input: !loop.buf<{N}xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %lanes = isa.load(%input, %zero) {dims = [16]} : (!loop.buf<{N}xf32, global>, index) -> !isa.vec<{N}xf32>
+  loop.return() : () -> ()
+}
+
+// -----
+
+// ERROR: 4:102: a vector has lanes and a group rank of at most 3, not the extents [1, 1, 1, 1, 16]
+loop.func @five_axes(%input: !loop.buf<16xf32, global>) attributes {access = [in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %lanes = isa.load(%input, %zero) {dims = [1, 1, 1, 1, 16]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<1x1x1x1x16xf32>
+  loop.return() : () -> ()
+}

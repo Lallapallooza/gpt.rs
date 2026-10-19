@@ -117,11 +117,11 @@ Defined by `Func` in [crates/gpt-rs-ir/src/dialects/loops/ir.rs](../../crates/gp
 Example, from `filetests/isa/roundtrip/lanewise.ptir`:
 
 ```text
-loop.func @scale_shift(%input: !loop.buf<16xf32, global>, %output: !loop.buf<16xf32, global>) attributes {access = [in, out]} {
+loop.func @square_plus(%input: !loop.buf<16xf32, global>, %output: !loop.buf<16xf32, global>) attributes {access = [in, out]} {
   %zero = loop.index() {expr = 0} : () -> index
   %lanes = isa.load(%input, %zero) {dims = [16]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<16xf32>
-  %shifted = isa.fma(%lanes, %lanes, %lanes) : (!isa.vec<16xf32>, !isa.vec<16xf32>, !isa.vec<16xf32>) -> !isa.vec<16xf32>
-  isa.store(%shifted, %output, %zero) : (!isa.vec<16xf32>, !loop.buf<16xf32, global>, index) -> ()
+  %square_plus = isa.fma(%lanes, %lanes, %lanes) : (!isa.vec<16xf32>, !isa.vec<16xf32>, !isa.vec<16xf32>) -> !isa.vec<16xf32>
+  isa.store(%square_plus, %output, %zero) : (!isa.vec<16xf32>, !loop.buf<16xf32, global>, index) -> ()
   loop.return() : () -> ()
 }
 ```
@@ -156,11 +156,11 @@ Defined by `Return` in [crates/gpt-rs-ir/src/dialects/loops/ir.rs](../../crates/
 Example, from `filetests/isa/roundtrip/lanewise.ptir`:
 
 ```text
-loop.func @scale_shift(%input: !loop.buf<16xf32, global>, %output: !loop.buf<16xf32, global>) attributes {access = [in, out]} {
+loop.func @square_plus(%input: !loop.buf<16xf32, global>, %output: !loop.buf<16xf32, global>) attributes {access = [in, out]} {
   %zero = loop.index() {expr = 0} : () -> index
   %lanes = isa.load(%input, %zero) {dims = [16]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<16xf32>
-  %shifted = isa.fma(%lanes, %lanes, %lanes) : (!isa.vec<16xf32>, !isa.vec<16xf32>, !isa.vec<16xf32>) -> !isa.vec<16xf32>
-  isa.store(%shifted, %output, %zero) : (!isa.vec<16xf32>, !loop.buf<16xf32, global>, index) -> ()
+  %square_plus = isa.fma(%lanes, %lanes, %lanes) : (!isa.vec<16xf32>, !isa.vec<16xf32>, !isa.vec<16xf32>) -> !isa.vec<16xf32>
+  isa.store(%square_plus, %output, %zero) : (!isa.vec<16xf32>, !loop.buf<16xf32, global>, index) -> ()
   loop.return() : () -> ()
 }
 ```
@@ -384,11 +384,11 @@ Defined by `Index` in [crates/gpt-rs-ir/src/dialects/loops/ir.rs](../../crates/g
 Example, from `filetests/isa/roundtrip/lanewise.ptir`:
 
 ```text
-loop.func @scale_shift(%input: !loop.buf<16xf32, global>, %output: !loop.buf<16xf32, global>) attributes {access = [in, out]} {
+loop.func @square_plus(%input: !loop.buf<16xf32, global>, %output: !loop.buf<16xf32, global>) attributes {access = [in, out]} {
   %zero = loop.index() {expr = 0} : () -> index
   %lanes = isa.load(%input, %zero) {dims = [16]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<16xf32>
-  %shifted = isa.fma(%lanes, %lanes, %lanes) : (!isa.vec<16xf32>, !isa.vec<16xf32>, !isa.vec<16xf32>) -> !isa.vec<16xf32>
-  isa.store(%shifted, %output, %zero) : (!isa.vec<16xf32>, !loop.buf<16xf32, global>, index) -> ()
+  %square_plus = isa.fma(%lanes, %lanes, %lanes) : (!isa.vec<16xf32>, !isa.vec<16xf32>, !isa.vec<16xf32>) -> !isa.vec<16xf32>
+  isa.store(%square_plus, %output, %zero) : (!isa.vec<16xf32>, !loop.buf<16xf32, global>, index) -> ()
   loop.return() : () -> ()
 }
 ```

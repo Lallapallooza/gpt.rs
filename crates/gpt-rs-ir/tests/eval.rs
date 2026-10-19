@@ -1,5 +1,5 @@
 //! The semantic rules of the ops on values computed by hand: rounding, saturation, wrapping, ties,
-//! the random stream and the layouts of bits.
+//! the random stream and the layouts of bits, and the reads that the rules reject.
 
 use gpt_rs_ir::host::{HostTensor, TensorData};
 use gpt_rs_ir::interp::{run, HostValue};
@@ -448,7 +448,7 @@ fn bitcast_reads_the_bits_of_each_row() {
         panic!("ui4 elements are packed");
     };
     assert_eq!(
-        (0..8).map(|i| nibbles.get(i)).collect::<Vec<_>>(),
+        (0..8).map(|index| nibbles.get(index)).collect::<Vec<_>>(),
         [0, 1, 2, 3, 4, 5, 6, 7]
     );
     // The f4e2m1 codes 1, 2, 3 and 4.
@@ -622,7 +622,7 @@ fn iota_converts_each_count_as_a_cast_does() {
         .as_chunks::<2>()
         .0
         .iter()
-        .map(|&b| u16::from_le_bytes(b))
+        .map(|&pair| u16::from_le_bytes(pair))
         .collect();
     assert_eq!(bits, [0x437F, 0x4380, 0x4380, 0x4381, 0x4382]);
     // ui8 saturates at 255, as an integer cast does. Counting in ui8 would wrap to 0.
@@ -636,4 +636,25 @@ fn iota_converts_each_count_as_a_cast_does() {
         Vec::new(),
     );
     assert_eq!(out[0].as_si32().unwrap(), [0, 1, 2, 0, 1, 2]);
+}
+
+#[test]
+fn a_padded_read_outside_its_buffer_on_an_axis_it_does_not_check_fails() {
+    let text = "loop.func @shifted(%input: !loop.buf<20xf32, global>, %output: !loop.buf<16xf32, global>) attributes {access = [in, out]} {
+  %before = loop.index() {expr = -2} : () -> index
+  %zero = loop.index() {expr = 0} : () -> index
+  %lanes = isa.load(%input, %before) {dims = [16], pad = 0.0, checked = [[]]} : (!loop.buf<20xf32, global>, index) -> !isa.vec<16xf32>
+  isa.store(%lanes, %output, %zero) : (!isa.vec<16xf32>, !loop.buf<16xf32, global>, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<20xf32>) -> tensor<16xf32> {
+  %output = host.dispatch(%input) {callee = @shifted} : (tensor<20xf32>) -> tensor<16xf32>
+  func.return(%output) : (tensor<16xf32>) -> ()
+}";
+    let module = Module::from_text(text).expect("the module parses");
+    let err = run(&module, "main", vec![f32s(&[20], &[1.0; 20])]).unwrap_err();
+    assert_eq!(
+        format!("{:#}", err.root_cause()),
+        "lane [-2] is outside !loop.buf<20xf32, global> on axis 0, which register 0 does not check"
+    );
 }

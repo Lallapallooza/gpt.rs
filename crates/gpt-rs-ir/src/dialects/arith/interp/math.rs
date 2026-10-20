@@ -13,6 +13,7 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use anyhow::{anyhow, ensure, Result};
 
+use crate::dialects::arith::{ensure_bitcast, ensure_fma};
 use crate::dialects::tensor::interp::elementwise::{binary_data, compare_data, unary_data, Arith};
 use crate::dialects::tensor::interp::kernels::cast as cast_data;
 use crate::dialects::tensor::interp::random::element_words;
@@ -22,7 +23,8 @@ use crate::host::{element, repr, HostScalar, HostTensor, Repr, ScalarValue};
 use crate::ir::{DType, IntFormat, OpKind, TensorType};
 
 /// A float type the interpreter computes in, f32 or f64: the operations the per-element
-/// functions use, each IEEE 754 in the type's own precision.
+/// functions use, each IEEE 754 in the type's own precision. `exp`, `ln`, `tanh`, `erf`, `sin` and
+/// `cos` are the `libm` crate's, so the reference gives the same bits on every host.
 pub trait Float:
     Copy
     + PartialOrd
@@ -50,7 +52,7 @@ pub trait Float:
 }
 
 macro_rules! float {
-    ($t:ty, $erf:path) => {
+    ($t:ty, $exp:path, $ln:path, $tanh:path, $erf:path, $sin:path, $cos:path) => {
         impl Float for $t {
             const ZERO: $t = 0.0;
             const ONE: $t = 1.0;
@@ -61,13 +63,13 @@ macro_rules! float {
                 <$t>::abs(self)
             }
             fn exp(self) -> $t {
-                <$t>::exp(self)
+                $exp(self)
             }
             fn ln(self) -> $t {
-                <$t>::ln(self)
+                $ln(self)
             }
             fn tanh(self) -> $t {
-                <$t>::tanh(self)
+                $tanh(self)
             }
             fn erf(self) -> $t {
                 $erf(self)
@@ -76,10 +78,10 @@ macro_rules! float {
                 <$t>::sqrt(self)
             }
             fn sin(self) -> $t {
-                <$t>::sin(self)
+                $sin(self)
             }
             fn cos(self) -> $t {
-                <$t>::cos(self)
+                $cos(self)
             }
             fn is_nan(self) -> bool {
                 <$t>::is_nan(self)
@@ -91,9 +93,35 @@ macro_rules! float {
     };
 }
 
-float!(f32, libm::erff);
+/// `$name`, the f32 function that rounds the `libm` crate's f64 function `$wide` to f32: the
+/// reference of the f32 math functions. It is closer to the true value than the crate's f32
+/// functions, whose `tanhf` is 2 ulp off on some inputs.
+macro_rules! rounded_from_f64 {
+    ($name:ident, $wide:path) => {
+        fn $name(value: f32) -> f32 {
+            $wide(f64::from(value)) as f32
+        }
+    };
+}
 
-float!(f64, libm::erf);
+rounded_from_f64!(exp_f32, libm::exp);
+rounded_from_f64!(log_f32, libm::log);
+rounded_from_f64!(tanh_f32, libm::tanh);
+rounded_from_f64!(erf_f32, libm::erf);
+rounded_from_f64!(sin_f32, libm::sin);
+rounded_from_f64!(cos_f32, libm::cos);
+
+float!(f32, exp_f32, log_f32, tanh_f32, erf_f32, sin_f32, cos_f32);
+
+float!(
+    f64,
+    libm::exp,
+    libm::log,
+    libm::tanh,
+    libm::erf,
+    libm::sin,
+    libm::cos
+);
 
 /// An op on one element: its function on floats and on integers. Integer results are exact; the
 /// caller wraps them to the dtype.
@@ -186,36 +214,42 @@ pub fn unary<T: UnaryMath>(x: HostScalar) -> Result<HostScalar> {
     Ok(element(&unary_data::<T>(&x.to_data()?)?))
 }
 
-/// The op `T` on `x` and `y`, of one dtype.
-pub fn binary<T: BinaryMath>(x: HostScalar, y: HostScalar) -> Result<HostScalar> {
+/// The op `T` on `lhs` and `rhs`, of one dtype.
+pub fn binary<T: BinaryMath>(lhs: HostScalar, rhs: HostScalar) -> Result<HostScalar> {
     ensure!(
-        y.dtype == x.dtype,
+        rhs.dtype == lhs.dtype,
         "{} operands differ in dtype: {} and {}",
         T::INFO.name,
-        x.dtype,
-        y.dtype
+        lhs.dtype,
+        rhs.dtype
     );
-    Ok(element(&binary_data::<T>(&x.to_data()?, &y.to_data()?)?))
+    Ok(element(&binary_data::<T>(
+        &lhs.to_data()?,
+        &rhs.to_data()?,
+    )?))
 }
 
-/// Whether the relation of `T` holds between `x` and `y`, as an `i1` scalar.
-pub fn compare<T: CompareMath>(x: HostScalar, y: HostScalar) -> Result<HostScalar> {
+/// Whether the relation of `T` holds between `lhs` and `rhs`, as an `i1` scalar.
+pub fn compare<T: CompareMath>(lhs: HostScalar, rhs: HostScalar) -> Result<HostScalar> {
     ensure!(
-        x.dtype == y.dtype,
+        lhs.dtype == rhs.dtype,
         "compared operands differ in dtype: {} and {}",
-        x.dtype,
-        y.dtype
+        lhs.dtype,
+        rhs.dtype
     );
-    Ok(element(&compare_data::<T>(&x.to_data()?, &y.to_data()?)?))
+    Ok(element(&compare_data::<T>(
+        &lhs.to_data()?,
+        &rhs.to_data()?,
+    )?))
 }
 
-/// How `x` orders against `y`, of one dtype, with NaN above every number and equal to NaN: the
-/// order of `tensor.argmax` and `tensor.top_k`.
-pub fn order(x: HostScalar, y: HostScalar) -> Ordering {
-    match (x.value, y.value) {
-        (ScalarValue::Int(a), ScalarValue::Int(b)) => i128::order(a, b),
-        (ScalarValue::F32(a), ScalarValue::F32(b)) => f32::order(a, b),
-        (ScalarValue::F64(a), ScalarValue::F64(b)) => f64::order(a, b),
+/// How `lhs` orders against `rhs`, of one dtype, with NaN above every number and equal to NaN:
+/// the order of `tensor.argmax` and `tensor.top_k`.
+pub fn order(lhs: HostScalar, rhs: HostScalar) -> Ordering {
+    match (lhs.value, rhs.value) {
+        (ScalarValue::Int(left), ScalarValue::Int(right)) => i128::order(left, right),
+        (ScalarValue::F32(left), ScalarValue::F32(right)) => f32::order(left, right),
+        (ScalarValue::F64(left), ScalarValue::F64(right)) => f64::order(left, right),
         _ => unreachable!("ordered scalars share a dtype"),
     }
 }
@@ -236,14 +270,35 @@ pub fn cast(x: HostScalar, to: DType) -> Result<HostScalar> {
 
 /// The bits of `x` read as an element of `to`, of the same width.
 pub fn bitcast(x: HostScalar, to: DType) -> Result<HostScalar> {
-    ensure!(
-        x.dtype.bits() == to.bits() && x.dtype != DType::I1 && to != DType::I1,
-        "a bitcast of one element keeps its width: {} to {to}",
-        x.dtype
-    );
+    ensure_bitcast(x.dtype, to)?;
     let data = x.to_data()?;
     let tensor = HostTensor::from_le_bytes(&TensorType::new(to, [1usize]), data.bytes())?;
     Ok(element(&tensor.data))
+}
+
+/// `lhs * rhs + acc`, rounded once to the dtype, f32 or f64.
+pub fn fma(lhs: HostScalar, rhs: HostScalar, acc: HostScalar) -> Result<HostScalar> {
+    ensure!(
+        lhs.dtype == rhs.dtype && lhs.dtype == acc.dtype,
+        "fma operands differ in dtype: {}, {} and {}",
+        lhs.dtype,
+        rhs.dtype,
+        acc.dtype
+    );
+    ensure_fma(lhs.dtype)?;
+    let value = match (lhs.value, rhs.value, acc.value) {
+        (ScalarValue::F32(factor), ScalarValue::F32(multiplier), ScalarValue::F32(addend)) => {
+            ScalarValue::F32(factor.mul_add(multiplier, addend))
+        }
+        (ScalarValue::F64(factor), ScalarValue::F64(multiplier), ScalarValue::F64(addend)) => {
+            ScalarValue::F64(factor.mul_add(multiplier, addend))
+        }
+        _ => unreachable!("an f32 or f64 scalar holds its value in its own type"),
+    };
+    Ok(HostScalar {
+        dtype: lhs.dtype,
+        value,
+    })
 }
 
 /// `on_true` where `pred` is set and `on_false` elsewhere.

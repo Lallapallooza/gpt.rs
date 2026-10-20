@@ -163,10 +163,15 @@ impl DType {
 
     /// The significant bits of a float dtype, its implicit leading bit included.
     pub fn significand_bits(self) -> Option<u32> {
+        self.float_format().map(|format| format.man_bits + 1)
+    }
+
+    /// The bit fields of a float dtype, f32 and f64 included.
+    pub fn float_format(self) -> Option<Format> {
         match self {
-            DType::F64 => Some(53),
-            DType::F32 => Some(24),
-            other => crate::ir::Format::of(other).map(|format| format.man_bits + 1),
+            DType::F64 => Some(Format::F64),
+            DType::F32 => Some(Format::F32),
+            other => Format::of(other),
         }
     }
 
@@ -185,6 +190,18 @@ impl DType {
             }
             (_, None) => true,
         }
+    }
+
+    /// The signed integer dtype of `bits` bits.
+    pub fn signed(bits: usize) -> Result<DType> {
+        Ok(match bits {
+            4 => DType::Si4,
+            8 => DType::Si8,
+            16 => DType::Si16,
+            32 => DType::Si32,
+            64 => DType::Si64,
+            other => anyhow::bail!("no signed integer dtype has {other} bits"),
+        })
     }
 
     /// The unsigned integer dtype of `bits` bits.

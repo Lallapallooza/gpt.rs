@@ -7,7 +7,7 @@ use crate::dialects::tensor::utils::class::{Class, ARITHMETIC, FLOATS, INTEGERS,
 use crate::ir::{DType, Dense};
 use crate::traits::{
     Absorbing, Associative, Commutative, DistributesOver, Idempotent, IntValue, Involution,
-    RightIdentity, NEG_ZERO,
+    NarrowInF32, RightIdentity, NEG_ZERO,
 };
 
 /// A scalar value of a dtype, written `0.5 : f32`, `-3 : si32` or `1 : i1`. It is held as a
@@ -27,6 +27,7 @@ pub struct Constant {
 #[crate::family(
     operands(input(Scalar)),
     results(output(Scalar)),
+    traits(NarrowInF32::ROUNDED),
     rule(crate::dialects::arith::verify::unary),
     eval(crate::dialects::arith::interp::unary)
 )]
@@ -84,6 +85,7 @@ pub struct Not;
 #[crate::family(
     operands(lhs(Scalar), rhs(Scalar)),
     results(output(Scalar)),
+    traits(NarrowInF32::ROUNDED),
     rule(crate::dialects::arith::verify::binary),
     eval(crate::dialects::arith::interp::binary)
 )]
@@ -230,6 +232,7 @@ pub struct ShiftRightArithmetic;
 #[crate::family(
     operands(lhs(Scalar), rhs(Scalar)),
     results(output(Scalar)),
+    traits(NarrowInF32::COMPARED),
     rule(crate::dialects::arith::verify::compare),
     eval(crate::dialects::arith::interp::compare)
 )]
@@ -266,6 +269,16 @@ pub struct NotEqual;
     results(output(Scalar))
 )]
 pub struct Select;
+
+/// `arith.fma`: `lhs * rhs + acc`, rounded once to the dtype, f32 or f64. No `tensor` op computes
+/// it: it enters below `tile`, where a dispatch's numerics contract lets a product and the sum it
+/// enters round once.
+#[crate::op(
+    "arith.fma",
+    operands(lhs(Scalar), rhs(Scalar), acc(Scalar)),
+    results(output(Scalar))
+)]
+pub struct Fma;
 
 /// `arith.cast`: the scalar converted to `to`, as `tensor.cast` converts each element.
 #[crate::op("arith.cast", operands(input(Scalar)), results(output(Scalar)))]
@@ -322,7 +335,7 @@ pub struct RngNormal(pub RngAttrs);
 
 #[derive(crate::Dialect, Debug, Clone, PartialEq, Eq, Hash)]
 #[dialect(name = "arith", op = Arith)]
-pub enum ArithOp {
+pub enum ArithOps {
     Constant(Constant),
     Neg(Neg),
     Abs(Abs),
@@ -354,6 +367,7 @@ pub enum ArithOp {
     Greater(Greater),
     NotEqual(NotEqual),
     Select(Select),
+    Fma(Fma),
     Cast(Cast),
     Bitcast(Bitcast),
     FromIndex(FromIndex),

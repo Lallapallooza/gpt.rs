@@ -1,0 +1,163 @@
+// RUN: pass expand-random
+
+// An f32 draw: the block of the stream that holds the element's word, its ten rounds of Philox,
+// the word picked by its place in the block, and its top 24 bits scaled by 2^-24.
+// CHECK: ^body([[KEY:%[0-9]+]]: ui64, [[COUNTER:%[0-9]+]]: ui64):
+// CHECK-NEXT: [[INDEX:%[0-9]+]] = tile.index() {expr = d0, dtype = ui64} : () -> ui64
+// CHECK: [[BLOCK:%[0-9]+]] = arith.add([[COUNTER]], {{%[0-9]+}}) : (ui64, ui64) -> ui64
+// CHECK-NEXT: [[WRAPPED:%[0-9]+]] = arith.less([[BLOCK]], [[COUNTER]]) : (ui64, ui64) -> i1
+// CHECK: arith.constant() {value = 3528531795 : ui64}
+// CHECK: [[EIGHT:%[0-9]+]] = arith.constant() {value = 8 : ui64} : () -> ui64
+// CHECK-NEXT: [[TOP:%[0-9]+]] = arith.shift_right_logical({{%[0-9]+}}, [[EIGHT]]) : (ui64, ui64) -> ui64
+// CHECK-NEXT: [[WHOLE:%[0-9]+]] = arith.cast([[TOP]]) {to = f32} : (ui64) -> f32
+// CHECK-NEXT: [[SCALE:%[0-9]+]] = arith.constant() {value = 5.9604645e-8 : f32} : () -> f32
+// CHECK-NEXT: [[UNIT:%[0-9]+]] = arith.mul([[WHOLE]], [[SCALE]]) : (f32, f32) -> f32
+// CHECK-NEXT: tile.yield([[UNIT]]) : (f32) -> ()
+// CHECK-NOT: arith.rng_uniform
+tile.dispatch @uniform_f32(%state: tensor<2xui64>) -> tensor<16xf32> {
+  %drawn = tile.block(%state) {iters = [par 16], reads = [$0[0], $0[1]], folds = [none -> [d0]]} ({
+  ^body(%key: ui64, %counter: ui64):
+    %index = tile.index() {expr = d0, dtype = ui64} : () -> ui64
+    %value = arith.rng_uniform(%key, %counter, %index) {dtype = f32} : (ui64, ui64, ui64) -> f32
+    tile.yield(%value) : (f32) -> ()
+  }) : (tensor<2xui64>) -> tensor<16xf32>
+  func.return(%drawn) : (tensor<16xf32>) -> ()
+}
+func.func @main(%state: tensor<2xui64>) -> tensor<16xf32> {
+  %drawn = host.dispatch(%state) {callee = @uniform_f32} : (tensor<2xui64>) -> tensor<16xf32>
+  func.return(%drawn) : (tensor<16xf32>) -> ()
+}
+
+// -----
+
+// An f64 draw takes the two words of one block: its block is the index shifted right by one, and
+// its first word's place in the block the index shifted left by one. The second word is the high
+// half, and the draw their top 53 bits.
+// CHECK: [[INDEX:%[0-9]+]] = tile.index() {expr = d0, dtype = ui64} : () -> ui64
+// CHECK-NEXT: [[ONE:%[0-9]+]] = arith.constant() {value = 1 : ui64} : () -> ui64
+// CHECK-NEXT: arith.shift_right_logical([[INDEX]], [[ONE]]) : (ui64, ui64) -> ui64
+// CHECK: arith.shift_left([[INDEX]], {{%[0-9]+}}) : (ui64, ui64) -> ui64
+// CHECK: [[HIGH:%[0-9]+]] = arith.shift_left({{%[0-9]+}}, {{%[0-9]+}}) : (ui64, ui64) -> ui64
+// CHECK-NEXT: [[BOTH:%[0-9]+]] = arith.or([[HIGH]], {{%[0-9]+}}) : (ui64, ui64) -> ui64
+// CHECK-NEXT: [[ELEVEN:%[0-9]+]] = arith.constant() {value = 11 : ui64} : () -> ui64
+// CHECK-NEXT: [[TOP:%[0-9]+]] = arith.shift_right_logical([[BOTH]], [[ELEVEN]]) : (ui64, ui64) -> ui64
+// CHECK-NEXT: [[WHOLE:%[0-9]+]] = arith.cast([[TOP]]) {to = f64} : (ui64) -> f64
+// CHECK-NEXT: [[SCALE:%[0-9]+]] = arith.constant() {value = 1.1102230246251565e-16 : f64} : () -> f64
+// CHECK-NEXT: [[UNIT:%[0-9]+]] = arith.mul([[WHOLE]], [[SCALE]]) : (f64, f64) -> f64
+// CHECK-NEXT: tile.yield([[UNIT]]) : (f64) -> ()
+// CHECK-NOT: arith.rng_uniform
+tile.dispatch @uniform_f64(%state: tensor<2xui64>) -> tensor<8xf64> {
+  %drawn = tile.block(%state) {iters = [par 8], reads = [$0[0], $0[1]], folds = [none -> [d0]]} ({
+  ^body(%key: ui64, %counter: ui64):
+    %index = tile.index() {expr = d0, dtype = ui64} : () -> ui64
+    %value = arith.rng_uniform(%key, %counter, %index) {dtype = f64} : (ui64, ui64, ui64) -> f64
+    tile.yield(%value) : (f64) -> ()
+  }) : (tensor<2xui64>) -> tensor<8xf64>
+  func.return(%drawn) : (tensor<8xf64>) -> ()
+}
+func.func @main(%state: tensor<2xui64>) -> tensor<8xf64> {
+  %drawn = host.dispatch(%state) {callee = @uniform_f64} : (tensor<2xui64>) -> tensor<8xf64>
+  func.return(%drawn) : (tensor<8xf64>) -> ()
+}
+
+// -----
+
+// An si32 draw is the low 32 bits of its word, read as two's complement.
+// CHECK: arith.equal(
+// CHECK: arith.equal(
+// CHECK: [[PLACE:%[0-9]+]] = arith.equal({{%[0-9]+}}, {{%[0-9]+}}) : (ui64, ui64) -> i1
+// CHECK-NEXT: [[WORD:%[0-9]+]] = arith.select([[PLACE]], {{%[0-9]+}}, {{%[0-9]+}}) : (i1, ui64, ui64) -> ui64
+// CHECK-NEXT: [[LOW_MASK:%[0-9]+]] = arith.constant() {value = 4294967295 : ui64} : () -> ui64
+// CHECK-NEXT: [[LOW:%[0-9]+]] = arith.and([[WORD]], [[LOW_MASK]]) : (ui64, ui64) -> ui64
+// CHECK-NEXT: [[UNSIGNED:%[0-9]+]] = arith.cast([[LOW]]) {to = ui32} : (ui64) -> ui32
+// CHECK-NEXT: [[SIGNED:%[0-9]+]] = arith.bitcast([[UNSIGNED]]) {to = si32} : (ui32) -> si32
+// CHECK-NEXT: tile.yield([[SIGNED]]) : (si32) -> ()
+// CHECK-NOT: arith.rng_uniform
+tile.dispatch @uniform_si32(%state: tensor<2xui64>) -> tensor<16xsi32> {
+  %drawn = tile.block(%state) {iters = [par 16], reads = [$0[0], $0[1]], folds = [none -> [d0]]} ({
+  ^body(%key: ui64, %counter: ui64):
+    %index = tile.index() {expr = d0, dtype = ui64} : () -> ui64
+    %value = arith.rng_uniform(%key, %counter, %index) {dtype = si32} : (ui64, ui64, ui64) -> si32
+    tile.yield(%value) : (si32) -> ()
+  }) : (tensor<2xui64>) -> tensor<16xsi32>
+  func.return(%drawn) : (tensor<16xsi32>) -> ()
+}
+func.func @main(%state: tensor<2xui64>) -> tensor<16xsi32> {
+  %drawn = host.dispatch(%state) {callee = @uniform_si32} : (tensor<2xui64>) -> tensor<16xsi32>
+  func.return(%drawn) : (tensor<16xsi32>) -> ()
+}
+
+// -----
+
+// A ui64 draw is its two words, the second the high half.
+// CHECK: [[INDEX:%[0-9]+]] = tile.index() {expr = d0, dtype = ui64} : () -> ui64
+// CHECK: arith.shift_left([[INDEX]], {{%[0-9]+}}) : (ui64, ui64) -> ui64
+// CHECK: [[HIGH:%[0-9]+]] = arith.shift_left({{%[0-9]+}}, {{%[0-9]+}}) : (ui64, ui64) -> ui64
+// CHECK-NEXT: [[BOTH:%[0-9]+]] = arith.or([[HIGH]], {{%[0-9]+}}) : (ui64, ui64) -> ui64
+// CHECK-NEXT: tile.yield([[BOTH]]) : (ui64) -> ()
+// CHECK-NOT: arith.rng_uniform
+tile.dispatch @uniform_ui64(%state: tensor<2xui64>) -> tensor<8xui64> {
+  %drawn = tile.block(%state) {iters = [par 8], reads = [$0[0], $0[1]], folds = [none -> [d0]]} ({
+  ^body(%key: ui64, %counter: ui64):
+    %index = tile.index() {expr = d0, dtype = ui64} : () -> ui64
+    %value = arith.rng_uniform(%key, %counter, %index) {dtype = ui64} : (ui64, ui64, ui64) -> ui64
+    tile.yield(%value) : (ui64) -> ()
+  }) : (tensor<2xui64>) -> tensor<8xui64>
+  func.return(%drawn) : (tensor<8xui64>) -> ()
+}
+func.func @main(%state: tensor<2xui64>) -> tensor<8xui64> {
+  %drawn = host.dispatch(%state) {callee = @uniform_ui64} : (tensor<2xui64>) -> tensor<8xui64>
+  func.return(%drawn) : (tensor<8xui64>) -> ()
+}
+
+// -----
+
+// A bf16 draw scales the top 8 bits of its word in f32, where the value is exact, then rounds it
+// to bf16, which keeps it.
+// CHECK: arith.equal(
+// CHECK: arith.equal(
+// CHECK: [[PLACE:%[0-9]+]] = arith.equal({{%[0-9]+}}, {{%[0-9]+}}) : (ui64, ui64) -> i1
+// CHECK-NEXT: [[WORD:%[0-9]+]] = arith.select([[PLACE]], {{%[0-9]+}}, {{%[0-9]+}}) : (i1, ui64, ui64) -> ui64
+// CHECK-NEXT: [[DROP:%[0-9]+]] = arith.constant() {value = 24 : ui64} : () -> ui64
+// CHECK-NEXT: [[TOP:%[0-9]+]] = arith.shift_right_logical([[WORD]], [[DROP]]) : (ui64, ui64) -> ui64
+// CHECK-NEXT: [[WHOLE:%[0-9]+]] = arith.cast([[TOP]]) {to = f32} : (ui64) -> f32
+// CHECK-NEXT: [[SCALE:%[0-9]+]] = arith.constant() {value = 0.00390625 : f32} : () -> f32
+// CHECK-NEXT: [[UNIT:%[0-9]+]] = arith.mul([[WHOLE]], [[SCALE]]) : (f32, f32) -> f32
+// CHECK-NEXT: [[NARROW:%[0-9]+]] = arith.cast([[UNIT]]) {to = bf16} : (f32) -> bf16
+// CHECK-NEXT: tile.yield([[NARROW]]) : (bf16) -> ()
+// CHECK-NOT: arith.rng_uniform
+tile.dispatch @uniform_bf16(%state: tensor<2xui64>) -> tensor<16xbf16> {
+  %drawn = tile.block(%state) {iters = [par 16], reads = [$0[0], $0[1]], folds = [none -> [d0]]} ({
+  ^body(%key: ui64, %counter: ui64):
+    %index = tile.index() {expr = d0, dtype = ui64} : () -> ui64
+    %value = arith.rng_uniform(%key, %counter, %index) {dtype = bf16} : (ui64, ui64, ui64) -> bf16
+    tile.yield(%value) : (bf16) -> ()
+  }) : (tensor<2xui64>) -> tensor<16xbf16>
+  func.return(%drawn) : (tensor<16xbf16>) -> ()
+}
+func.func @main(%state: tensor<2xui64>) -> tensor<16xbf16> {
+  %drawn = host.dispatch(%state) {callee = @uniform_bf16} : (tensor<2xui64>) -> tensor<16xbf16>
+  func.return(%drawn) : (tensor<16xbf16>) -> ()
+}
+
+// -----
+
+// An si32 draw at an si32 index: the index becomes a ui64 first.
+// CHECK: ^body([[KEY:%[0-9]+]]: ui64, [[COUNTER:%[0-9]+]]: ui64):
+// CHECK-NEXT: [[INDEX:%[0-9]+]] = tile.index() {expr = d0, dtype = si32} : () -> si32
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = arith.cast([[INDEX]]) {to = ui64} : (si32) -> ui64
+// CHECK: arith.shift_right_logical([[ELEMENT]], {{%[0-9]+}}) : (ui64, ui64) -> ui64
+// CHECK-NOT: arith.rng_uniform
+tile.dispatch @uniform_at_si32(%state: tensor<2xui64>) -> tensor<16xsi32> {
+  %drawn = tile.block(%state) {iters = [par 16], reads = [$0[0], $0[1]], folds = [none -> [d0]]} ({
+  ^body(%key: ui64, %counter: ui64):
+    %index = tile.index() {expr = d0, dtype = si32} : () -> si32
+    %value = arith.rng_uniform(%key, %counter, %index) {dtype = si32} : (ui64, ui64, si32) -> si32
+    tile.yield(%value) : (si32) -> ()
+  }) : (tensor<2xui64>) -> tensor<16xsi32>
+  func.return(%drawn) : (tensor<16xsi32>) -> ()
+}
+func.func @main(%state: tensor<2xui64>) -> tensor<16xsi32> {
+  %drawn = host.dispatch(%state) {callee = @uniform_at_si32} : (tensor<2xui64>) -> tensor<16xsi32>
+  func.return(%drawn) : (tensor<16xsi32>) -> ()
+}

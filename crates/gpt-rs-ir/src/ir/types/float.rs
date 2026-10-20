@@ -86,8 +86,15 @@ impl Format {
         bias: 16,
         specials: Specials::Fnuz,
     };
-    /// IEEE binary64, whose bit fields the block builders read; [`Format::of`] leaves f32 and f64
-    /// out, as no quantized dtype is one.
+    /// IEEE binary32, whose bit fields the scalar builders read ([`DType::float_format`]).
+    /// [`Format::of`] leaves it out, as no quantized dtype is one.
+    pub const F32: Format = Format {
+        exp_bits: 8,
+        man_bits: 23,
+        bias: 127,
+        specials: Specials::Ieee,
+    };
+    /// IEEE binary64, which [`Format::of`] leaves out as it does binary32.
     pub const F64: Format = Format {
         exp_bits: 11,
         man_bits: 52,

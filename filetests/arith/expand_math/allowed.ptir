@@ -1,0 +1,20 @@
+// RUN: pass expand-math
+
+// exp of `math.ptir`, under a compilation that does not allow the polynomials' rounding: it stays.
+// CHECK: arith.exp({{%[0-9]+}}) : (f32) -> f32
+loop.func @exp_each(%input: !loop.buf<64xf32, global>, %output: !loop.buf<64xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 64} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %element = loop.load(%input, %position) : (!loop.buf<64xf32, global>, index) -> f32
+    %power = arith.exp(%element) : (f32) -> f32
+    loop.store(%power, %output, %position) : (f32, !loop.buf<64xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<64xf32>) -> tensor<64xf32> {
+  %output = host.dispatch(%input) {callee = @exp_each} : (tensor<64xf32>) -> tensor<64xf32>
+  func.return(%output) : (tensor<64xf32>) -> ()
+}

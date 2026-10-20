@@ -1,0 +1,361 @@
+// RUN: pass expand-math {numerics = <expand_math = true>}
+
+// ROUNDING: poly: the polynomial is within 1 ulp of the interpreter's exp
+// exp of each element: the input clamped, rounded to a multiple of ln 2 by adding and subtracting
+// 2^23, the remainder's polynomial, and 2^n built in the exponent bits of two halves; a NaN passes
+// through.
+// CHECK: ^body([[POSITION:%[0-9]+]]: index):
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load({{%[0-9]+}}, [[POSITION]])
+// CHECK-NEXT: [[NAN:%[0-9]+]] = arith.not_equal([[ELEMENT]], [[ELEMENT]]) : (f32, f32) -> i1
+// CHECK: arith.constant() {value = -104.0 : f32}
+// CHECK: arith.constant() {value = 89.0 : f32}
+// CHECK: [[FIRST_WHOLE:%[0-9]+]] = arith.constant() {value = 8388608.0 : f32}
+// CHECK-NEXT: [[SHIFTED:%[0-9]+]] = arith.add({{%[0-9]+}}, [[FIRST_WHOLE]]) : (f32, f32) -> f32
+// CHECK-NEXT: arith.sub([[SHIFTED]], [[FIRST_WHOLE]]) : (f32, f32) -> f32
+// CHECK: [[EXPONENT:%[0-9]+]] = arith.cast({{%[0-9]+}}) {to = si32} : (f32) -> si32
+// CHECK: [[HALF:%[0-9]+]] = arith.shift_right_arithmetic([[EXPONENT]], {{%[0-9]+}}) : (si32, si32) -> si32
+// CHECK: [[BIAS:%[0-9]+]] = arith.constant() {value = 127 : si32}
+// CHECK-NEXT: [[BIASED:%[0-9]+]] = arith.add([[HALF]], [[BIAS]]) : (si32, si32) -> si32
+// CHECK: [[HALF_BITS:%[0-9]+]] = arith.shift_left([[BIASED]], {{%[0-9]+}}) : (si32, si32) -> si32
+// CHECK-NEXT: [[HALF_SCALE:%[0-9]+]] = arith.bitcast([[HALF_BITS]]) {to = f32} : (si32) -> f32
+// CHECK: arith.mul({{%[0-9]+}}, [[HALF_SCALE]]) : (f32, f32) -> f32
+// CHECK: [[POWER:%[0-9]+]] = arith.select([[NAN]], [[ELEMENT]], {{%[0-9]+}}) : (i1, f32, f32) -> f32
+// CHECK-NEXT: loop.store([[POWER]], {{%[0-9]+}}, [[POSITION]])
+// CHECK-NOT: arith.exp
+loop.func @exp_each(%input: !loop.buf<64xf32, global>, %output: !loop.buf<64xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 64} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %element = loop.load(%input, %position) : (!loop.buf<64xf32, global>, index) -> f32
+    %power = arith.exp(%element) : (f32) -> f32
+    loop.store(%power, %output, %position) : (f32, !loop.buf<64xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<64xf32>) -> tensor<64xf32> {
+  %output = host.dispatch(%input) {callee = @exp_each} : (tensor<64xf32>) -> tensor<64xf32>
+  func.return(%output) : (tensor<64xf32>) -> ()
+}
+
+// -----
+
+// ROUNDING: poly: the polynomial is within 1 ulp of the interpreter's tanh
+// tanh of each element: an odd polynomial below 0.625 in magnitude, and above it
+// 1 - 2 / (e^(2|x|) + 1) with the sign of x, the exponential written as exp's polynomial. A zero
+// is its own tanh, -0 included.
+// CHECK: ^body([[POSITION:%[0-9]+]]: index):
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load({{%[0-9]+}}, [[POSITION]])
+// CHECK-NEXT: [[MAGNITUDE:%[0-9]+]] = arith.abs([[ELEMENT]]) : (f32) -> f32
+// CHECK-NEXT: arith.mul([[ELEMENT]], [[ELEMENT]]) : (f32, f32) -> f32
+// CHECK: [[SMALL:%[0-9]+]] = arith.add({{%[0-9]+}}, [[ELEMENT]]) : (f32, f32) -> f32
+// CHECK-NEXT: arith.add([[MAGNITUDE]], [[MAGNITUDE]]) : (f32, f32) -> f32
+// CHECK: arith.div({{%[0-9]+}}, {{%[0-9]+}}) : (f32, f32) -> f32
+// CHECK: [[LARGE:%[0-9]+]] = arith.select({{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}) : (i1, f32, f32) -> f32
+// CHECK-NEXT: [[THRESHOLD:%[0-9]+]] = arith.constant() {value = 0.625 : f32}
+// CHECK-NEXT: [[FAR:%[0-9]+]] = arith.greater_equal([[MAGNITUDE]], [[THRESHOLD]]) : (f32, f32) -> i1
+// CHECK-NEXT: [[RESULT:%[0-9]+]] = arith.select([[FAR]], [[LARGE]], [[SMALL]]) : (i1, f32, f32) -> f32
+// CHECK-NEXT: [[AT_ZERO:%[0-9]+]] = arith.equal([[ELEMENT]], {{%[0-9]+}}) : (f32, f32) -> i1
+// CHECK-NEXT: [[SQUASHED:%[0-9]+]] = arith.select([[AT_ZERO]], [[ELEMENT]], [[RESULT]]) : (i1, f32, f32) -> f32
+// CHECK-NEXT: loop.store([[SQUASHED]], {{%[0-9]+}}, [[POSITION]])
+// CHECK-NOT: arith.tanh
+// CHECK-NOT: arith.exp
+loop.func @tanh_each(%input: !loop.buf<64xf32, global>, %output: !loop.buf<64xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 64} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %element = loop.load(%input, %position) : (!loop.buf<64xf32, global>, index) -> f32
+    %squashed = arith.tanh(%element) : (f32) -> f32
+    loop.store(%squashed, %output, %position) : (f32, !loop.buf<64xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<64xf32>) -> tensor<64xf32> {
+  %output = host.dispatch(%input) {callee = @tanh_each} : (tensor<64xf32>) -> tensor<64xf32>
+  func.return(%output) : (tensor<64xf32>) -> ()
+}
+
+// -----
+
+// The polynomials are for f32: exp of an f64 stays.
+// CHECK: arith.exp({{%[0-9]+}}) : (f64) -> f64
+loop.func @exp_f64(%input: !loop.buf<64xf64, global>, %output: !loop.buf<64xf64, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 64} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %element = loop.load(%input, %position) : (!loop.buf<64xf64, global>, index) -> f64
+    %power = arith.exp(%element) : (f64) -> f64
+    loop.store(%power, %output, %position) : (f64, !loop.buf<64xf64, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<64xf64>) -> tensor<64xf64> {
+  %output = host.dispatch(%input) {callee = @exp_f64} : (tensor<64xf64>) -> tensor<64xf64>
+  func.return(%output) : (tensor<64xf64>) -> ()
+}
+
+// -----
+
+// ROUNDING: poly: the polynomial is within 1 ulp of the interpreter's log
+// log of each element: m 2^k with m near 1 from the bits, a subnormal told apart by its bits, then
+// k ln 2 and the polynomial of s = (m - 1) / (m + 1); a zero gives -inf.
+// CHECK: ^body([[POSITION:%[0-9]+]]: index):
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load({{%[0-9]+}}, [[POSITION]])
+// CHECK-NEXT: [[BITS:%[0-9]+]] = arith.bitcast([[ELEMENT]]) {to = ui32} : (f32) -> ui32
+// CHECK-NEXT: [[SMALLEST_NORMAL:%[0-9]+]] = arith.constant() {value = 8388608 : ui32}
+// CHECK-NEXT: arith.less([[BITS]], [[SMALLEST_NORMAL]]) : (ui32, ui32) -> i1
+// CHECK: arith.shift_right_logical({{%[0-9]+}}, {{%[0-9]+}}) : (ui32, ui32) -> ui32
+// CHECK: arith.div({{%[0-9]+}}, {{%[0-9]+}}) : (f32, f32) -> f32
+// CHECK: [[NEGATIVE_INFINITY:%[0-9]+]] = arith.constant() {value = -inf : f32}
+// CHECK-NEXT: [[LOGARITHM:%[0-9]+]] = arith.select({{%[0-9]+}}, [[NEGATIVE_INFINITY]], {{%[0-9]+}}) : (i1, f32, f32) -> f32
+// CHECK-NEXT: loop.store([[LOGARITHM]], {{%[0-9]+}}, [[POSITION]])
+// CHECK-NOT: arith.log
+loop.func @log_each(%input: !loop.buf<64xf32, global>, %output: !loop.buf<64xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 64} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %element = loop.load(%input, %position) : (!loop.buf<64xf32, global>, index) -> f32
+    %logarithm = arith.log(%element) : (f32) -> f32
+    loop.store(%logarithm, %output, %position) : (f32, !loop.buf<64xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<64xf32>) -> tensor<64xf32> {
+  %output = host.dispatch(%input) {callee = @log_each} : (tensor<64xf32>) -> tensor<64xf32>
+  func.return(%output) : (tensor<64xf32>) -> ()
+}
+
+// -----
+
+// ROUNDING: poly: the polynomial is within 1 ulp of the interpreter's sin
+// sin of each element: the reduction by multiples of pi/2 and both polynomials in f64, each
+// rounded once to f32, picked and negated by the quarter turns plus 0; a zero is its own sine.
+// CHECK: ^body([[POSITION:%[0-9]+]]: index):
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load({{%[0-9]+}}, [[POSITION]])
+// CHECK-NEXT: arith.cast([[ELEMENT]]) {to = f64} : (f32) -> f64
+// CHECK: [[QUARTER:%[0-9]+]] = arith.select({{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}) : (i1, si32, si32) -> si32
+// CHECK: [[NO_TURN:%[0-9]+]] = arith.constant() {value = 0 : si32}
+// CHECK-NEXT: arith.add([[QUARTER]], [[NO_TURN]]) : (si32, si32) -> si32
+// CHECK: [[SINE:%[0-9]+]] = arith.select({{%[0-9]+}}, [[ELEMENT]], {{%[0-9]+}}) : (i1, f32, f32) -> f32
+// CHECK-NEXT: loop.store([[SINE]], {{%[0-9]+}}, [[POSITION]])
+// CHECK-NOT: arith.sin
+loop.func @sin_each(%input: !loop.buf<64xf32, global>, %output: !loop.buf<64xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 64} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %element = loop.load(%input, %position) : (!loop.buf<64xf32, global>, index) -> f32
+    %sine = arith.sin(%element) : (f32) -> f32
+    loop.store(%sine, %output, %position) : (f32, !loop.buf<64xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<64xf32>) -> tensor<64xf32> {
+  %output = host.dispatch(%input) {callee = @sin_each} : (tensor<64xf32>) -> tensor<64xf32>
+  func.return(%output) : (tensor<64xf32>) -> ()
+}
+
+// -----
+
+// ROUNDING: poly: the polynomial is within 1 ulp of the interpreter's cos
+// cos of each element: the polynomials of sin, picked by the quarter turns plus 1; an infinity
+// gives NaN.
+// CHECK: ^body([[POSITION:%[0-9]+]]: index):
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load({{%[0-9]+}}, [[POSITION]])
+// CHECK-NEXT: arith.cast([[ELEMENT]]) {to = f64} : (f32) -> f64
+// CHECK: [[QUARTER:%[0-9]+]] = arith.select({{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}) : (i1, si32, si32) -> si32
+// CHECK: [[ONE_TURN:%[0-9]+]] = arith.constant() {value = 1 : si32}
+// CHECK-NEXT: arith.add([[QUARTER]], [[ONE_TURN]]) : (si32, si32) -> si32
+// CHECK: [[NAN:%[0-9]+]] = arith.constant() {value = NaN : f32}
+// CHECK-NEXT: [[COSINE:%[0-9]+]] = arith.select({{%[0-9]+}}, [[NAN]], {{%[0-9]+}}) : (i1, f32, f32) -> f32
+// CHECK-NEXT: loop.store([[COSINE]], {{%[0-9]+}}, [[POSITION]])
+// CHECK-NOT: arith.cos
+loop.func @cos_each(%input: !loop.buf<64xf32, global>, %output: !loop.buf<64xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 64} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %element = loop.load(%input, %position) : (!loop.buf<64xf32, global>, index) -> f32
+    %cosine = arith.cos(%element) : (f32) -> f32
+    loop.store(%cosine, %output, %position) : (f32, !loop.buf<64xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<64xf32>) -> tensor<64xf32> {
+  %output = host.dispatch(%input) {callee = @cos_each} : (tensor<64xf32>) -> tensor<64xf32>
+  func.return(%output) : (tensor<64xf32>) -> ()
+}
+
+// -----
+
+// ROUNDING: poly: the polynomial is within 1 ulp of the interpreter's erf
+// erf of each element: a rational function of x^2 near 0 and of |x| - 1 near 1, the tail through
+// two of exp's polynomials, picked by the magnitude; a NaN passes through.
+// CHECK: ^body([[POSITION:%[0-9]+]]: index):
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load({{%[0-9]+}}, [[POSITION]])
+// CHECK-NEXT: arith.abs([[ELEMENT]]) : (f32) -> f32
+// CHECK: arith.constant() {value = 0.5625 : f32}
+// CHECK: [[NAN:%[0-9]+]] = arith.not_equal([[ELEMENT]], [[ELEMENT]]) : (f32, f32) -> i1
+// CHECK-NEXT: [[INTEGRAL:%[0-9]+]] = arith.select([[NAN]], [[ELEMENT]], {{%[0-9]+}}) : (i1, f32, f32) -> f32
+// CHECK-NEXT: loop.store([[INTEGRAL]], {{%[0-9]+}}, [[POSITION]])
+// CHECK-NOT: arith.erf
+loop.func @erf_each(%input: !loop.buf<64xf32, global>, %output: !loop.buf<64xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 64} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %element = loop.load(%input, %position) : (!loop.buf<64xf32, global>, index) -> f32
+    %integral = arith.erf(%element) : (f32) -> f32
+    loop.store(%integral, %output, %position) : (f32, !loop.buf<64xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<64xf32>) -> tensor<64xf32> {
+  %output = host.dispatch(%input) {callee = @erf_each} : (tensor<64xf32>) -> tensor<64xf32>
+  func.return(%output) : (tensor<64xf32>) -> ()
+}
+
+// -----
+
+// ROUNDING: poly: each polynomial is within 1 ulp of the interpreter's function
+// Elements scaled past the paths the plain inputs reach: exp of up to 120 in magnitude, clamped,
+// with results below the normal range and infinite ones; the log of subnormals, which scale by
+// 2^25 first, and of negative numbers; erf from 6 on, where it is 1.
+// CHECK-NOT: arith.exp
+// CHECK-NOT: arith.log
+// CHECK-NOT: arith.erf
+loop.func @far_ranges(%input: !loop.buf<64xf32, global>, %output: !loop.buf<3x64xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 64} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %element = loop.load(%input, %position) : (!loop.buf<64xf32, global>, index) -> f32
+    %thirty = arith.constant() {value = 30.0 : f32} : () -> f32
+    %clamped_range = arith.mul(%element, %thirty) : (f32, f32) -> f32
+    %power = arith.exp(%clamped_range) : (f32) -> f32
+    %first = loop.index() {expr = 0} : () -> index
+    loop.store(%power, %output, %first, %position) : (f32, !loop.buf<3x64xf32, global>, index, index) -> ()
+    %tiny = arith.constant() {value = 1.0e-39 : f32} : () -> f32
+    %subnormal = arith.mul(%element, %tiny) : (f32, f32) -> f32
+    %logarithm = arith.log(%subnormal) : (f32) -> f32
+    %second = loop.index() {expr = 1} : () -> index
+    loop.store(%logarithm, %output, %second, %position) : (f32, !loop.buf<3x64xf32, global>, index, index) -> ()
+    %two = arith.constant() {value = 2.0 : f32} : () -> f32
+    %doubled = arith.mul(%element, %two) : (f32, f32) -> f32
+    %integral = arith.erf(%doubled) : (f32) -> f32
+    %third = loop.index() {expr = 2} : () -> index
+    loop.store(%integral, %output, %third, %position) : (f32, !loop.buf<3x64xf32, global>, index, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<64xf32>) -> tensor<3x64xf32> {
+  %output = host.dispatch(%input) {callee = @far_ranges} : (tensor<64xf32>) -> tensor<3x64xf32>
+  func.return(%output) : (tensor<3x64xf32>) -> ()
+}
+
+// -----
+
+// ROUNDING: poly: each polynomial is within 1 ulp of the interpreter's function, with its infinities
+// The functions of elements scaled to infinity: e^inf is inf and e^-inf 0, the log of inf is inf
+// and of -inf NaN, tanh and erf are 1 with the sign, and the sine NaN.
+// CHECK-NOT: arith.exp
+// CHECK-NOT: arith.log
+// CHECK-NOT: arith.tanh
+// CHECK-NOT: arith.erf
+// CHECK-NOT: arith.sin
+loop.func @infinities(%input: !loop.buf<64xf32, global>, %output: !loop.buf<5x64xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 64} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %element = loop.load(%input, %position) : (!loop.buf<64xf32, global>, index) -> f32
+    %largest = arith.constant() {value = 1.0e38 : f32} : () -> f32
+    %ten = arith.constant() {value = 10.0 : f32} : () -> f32
+    %huge = arith.mul(%element, %largest) : (f32, f32) -> f32
+    %infinite = arith.mul(%huge, %ten) : (f32, f32) -> f32
+    %power = arith.exp(%infinite) : (f32) -> f32
+    %first = loop.index() {expr = 0} : () -> index
+    loop.store(%power, %output, %first, %position) : (f32, !loop.buf<5x64xf32, global>, index, index) -> ()
+    %logarithm = arith.log(%infinite) : (f32) -> f32
+    %second = loop.index() {expr = 1} : () -> index
+    loop.store(%logarithm, %output, %second, %position) : (f32, !loop.buf<5x64xf32, global>, index, index) -> ()
+    %squashed = arith.tanh(%infinite) : (f32) -> f32
+    %third = loop.index() {expr = 2} : () -> index
+    loop.store(%squashed, %output, %third, %position) : (f32, !loop.buf<5x64xf32, global>, index, index) -> ()
+    %integral = arith.erf(%infinite) : (f32) -> f32
+    %fourth = loop.index() {expr = 3} : () -> index
+    loop.store(%integral, %output, %fourth, %position) : (f32, !loop.buf<5x64xf32, global>, index, index) -> ()
+    %sine = arith.sin(%infinite) : (f32) -> f32
+    %fifth = loop.index() {expr = 4} : () -> index
+    loop.store(%sine, %output, %fifth, %position) : (f32, !loop.buf<5x64xf32, global>, index, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<64xf32>) -> tensor<5x64xf32> {
+  %output = host.dispatch(%input) {callee = @infinities} : (tensor<64xf32>) -> tensor<5x64xf32>
+  func.return(%output) : (tensor<5x64xf32>) -> ()
+}
+
+// -----
+
+// ROUNDING: poly: each polynomial is within 1 ulp of the interpreter's sin and cos
+// The sine and cosine of elements scaled far past 2^28 pi/2, up to the largest f32s: their
+// quarter turns and remainder come exactly from the bits of 2/pi.
+// CHECK: arith.constant() {value = 2734261102 : ui64}
+// CHECK: arith.greater_equal({{%[0-9]+}}, {{%[0-9]+}}) : (f32, f32) -> i1
+// CHECK-NOT: arith.sin
+// CHECK-NOT: arith.cos
+loop.func @far_turns(%input: !loop.buf<64xf32, global>, %sines: !loop.buf<4x64xf32, global>, %cosines: !loop.buf<4x64xf32, global>) attributes {access = [in, out, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 64} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %element = loop.load(%input, %position) : (!loop.buf<64xf32, global>, index) -> f32
+    %billion = arith.constant() {value = 1.0e9 : f32} : () -> f32
+    %far = arith.mul(%element, %billion) : (f32, f32) -> f32
+    %far_sine = arith.sin(%far) : (f32) -> f32
+    %far_cosine = arith.cos(%far) : (f32) -> f32
+    %first = loop.index() {expr = 0} : () -> index
+    loop.store(%far_sine, %sines, %first, %position) : (f32, !loop.buf<4x64xf32, global>, index, index) -> ()
+    loop.store(%far_cosine, %cosines, %first, %position) : (f32, !loop.buf<4x64xf32, global>, index, index) -> ()
+    %huge = arith.constant() {value = 1.0e20 : f32} : () -> f32
+    %farther = arith.mul(%element, %huge) : (f32, f32) -> f32
+    %farther_sine = arith.sin(%farther) : (f32) -> f32
+    %farther_cosine = arith.cos(%farther) : (f32) -> f32
+    %second = loop.index() {expr = 1} : () -> index
+    loop.store(%farther_sine, %sines, %second, %position) : (f32, !loop.buf<4x64xf32, global>, index, index) -> ()
+    loop.store(%farther_cosine, %cosines, %second, %position) : (f32, !loop.buf<4x64xf32, global>, index, index) -> ()
+    %vast = arith.constant() {value = 3.0e30 : f32} : () -> f32
+    %vaster = arith.mul(%element, %vast) : (f32, f32) -> f32
+    %vast_sine = arith.sin(%vaster) : (f32) -> f32
+    %vast_cosine = arith.cos(%vaster) : (f32) -> f32
+    %third = loop.index() {expr = 2} : () -> index
+    loop.store(%vast_sine, %sines, %third, %position) : (f32, !loop.buf<4x64xf32, global>, index, index) -> ()
+    loop.store(%vast_cosine, %cosines, %third, %position) : (f32, !loop.buf<4x64xf32, global>, index, index) -> ()
+    %largest = arith.constant() {value = 8.0e37 : f32} : () -> f32
+    %last_far = arith.mul(%element, %largest) : (f32, f32) -> f32
+    %last_sine = arith.sin(%last_far) : (f32) -> f32
+    %last_cosine = arith.cos(%last_far) : (f32) -> f32
+    %fourth = loop.index() {expr = 3} : () -> index
+    loop.store(%last_sine, %sines, %fourth, %position) : (f32, !loop.buf<4x64xf32, global>, index, index) -> ()
+    loop.store(%last_cosine, %cosines, %fourth, %position) : (f32, !loop.buf<4x64xf32, global>, index, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<64xf32>) -> (tensor<4x64xf32>, tensor<4x64xf32>) {
+  %sines, %cosines = host.dispatch(%input) {callee = @far_turns} : (tensor<64xf32>) -> (tensor<4x64xf32>, tensor<4x64xf32>)
+  func.return(%sines, %cosines) : (tensor<4x64xf32>, tensor<4x64xf32>) -> ()
+}

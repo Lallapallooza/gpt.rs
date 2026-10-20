@@ -11,9 +11,11 @@ dialects agree bit for bit.
 - Each op is defined in `ir.rs`, and its type rule is in `verify.rs`. The ops of a family
   (`Unary`, `Binary`, `Compare`, `Rng`) share the family's type rule and `Eval`.
 - Each op's function is the one copy of its per-element semantics, which the `tensor` op of the
-  same name applies to every element. `interp/math.rs` defines `UnaryMath`, `BinaryMath`,
-  `CompareMath` and `Draw`. `interp/mod.rs` implements `UnaryMath`, `BinaryMath` and `CompareMath`
-  for the arith ops, and `tensor/interp/random.rs` implements `Draw`.
+  same name applies to every element. Three have no `tensor` op: `arith.fma`, which enters below
+  `tile` under a dispatch's numerics contract, and `arith.from_index` and `arith.to_index`.
+  `interp/math.rs` defines `UnaryMath`, `BinaryMath`, `CompareMath` and `Draw`. `interp/mod.rs`
+  implements `UnaryMath`, `BinaryMath` and `CompareMath` for the arith ops, and
+  `tensor/interp/random.rs` implements `Draw`.
 - Operands of one op have one dtype, as in `tensor`: there is no implicit promotion.
 - bf16 and f16 compute in f32 and round once per op to their dtype, as the `tensor` ops do.
 - `arith.constant` holds its value as a rank-0 constant, so constant queries, folds and trait
@@ -27,6 +29,7 @@ dialects agree bit for bit.
 - `arith.add`, `arith.sub`, `arith.mul`, `arith.div`, `arith.maximum`, `arith.minimum`, `arith.and`, `arith.or`, `arith.xor`, `arith.shift_left`, `arith.shift_right_logical`, `arith.shift_right_arithmetic`
 - `arith.less`, `arith.less_equal`, `arith.equal`, `arith.greater_equal`, `arith.greater`, `arith.not_equal`
 - `arith.select`
+- `arith.fma`
 - `arith.cast`
 - `arith.bitcast`
 - `arith.from_index`
@@ -76,8 +79,9 @@ Defined by `Unary` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates/g
 |---|---|
 | Operands | `input`: scalar |
 | Results | `output`: scalar |
+| Traits | narrow in f32, rounded once |
 | Effects | none |
-| Patterns | `FoldIndexArith` (`canonicalize`, at `arith.neg`) |
+| Patterns | `FoldIndexArith` (`canonicalize`, at `arith.neg`); `Expand` (`expand-math`, at `arith.exp`, `arith.log`, `arith.tanh`, `arith.erf`, `arith.sin`, `arith.cos`) |
 
 | Op | Traits | |
 |---|---|---|
@@ -149,8 +153,9 @@ Defined by `Binary` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates/
 |---|---|
 | Operands | `lhs`: scalar; `rhs`: scalar |
 | Results | `output`: scalar |
+| Traits | narrow in f32, rounded once |
 | Effects | none |
-| Patterns | `FoldIndexArith` (`canonicalize`, at `arith.add`, `arith.sub`, `arith.mul`, `arith.maximum`, `arith.minimum`) |
+| Patterns | `FoldIndexArith` (`canonicalize`, at `arith.add`, `arith.sub`, `arith.mul`, `arith.maximum`, `arith.minimum`); `FuseProduct` (`contract`, at `arith.add`) |
 
 | Op | Traits | |
 |---|---|---|
@@ -228,6 +233,7 @@ Defined by `Compare` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates
 |---|---|
 | Operands | `lhs`: scalar; `rhs`: scalar |
 | Results | `output`: scalar |
+| Traits | narrow in f32, compared |
 | Effects | none |
 
 | Op | |
@@ -318,6 +324,43 @@ func.func @scalar_ops(%input: tensor<4xf32>, %integers: tensor<4xsi32>, %state: 
   func.return(%uniforms, %combined_bits, %less_flags, %normals) : (tensor<4xf32>, tensor<4xsi32>, tensor<4xi1>, tensor<4xbf16>) -> ()
 }
 ```
+
+### `arith.fma`
+
+`lhs * rhs + acc`, rounded once to the dtype, f32 or f64. No `tensor` op computes
+it: it enters below `tile`, where a dispatch's numerics contract lets a product and the sum it
+enters round once.
+
+Defined by `Fma` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates/gpt-rs-ir/src/dialects/arith/ir.rs).
+
+| | |
+|---|---|
+| Operands | `lhs`: scalar; `rhs`: scalar; `acc`: scalar |
+| Results | `output`: scalar |
+| Effects | none |
+
+Example, from `filetests/loop/roundtrip/func.ptir`:
+
+```text
+loop.func @scale_shift(%input: !loop.buf<8xf64, global>, %scale: !loop.buf<8xf64, global>, %shift: !loop.buf<8xf64, global>, %output: !loop.buf<8xf64, global>) attributes {access = [in, in, in, out], contract = true} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 8} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%at: index):
+    %element = loop.load(%input, %at) : (!loop.buf<8xf64, global>, index) -> f64
+    %factor = loop.load(%scale, %at) : (!loop.buf<8xf64, global>, index) -> f64
+    %offset = loop.load(%shift, %at) : (!loop.buf<8xf64, global>, index) -> f64
+    %shifted = arith.fma(%element, %factor, %offset) : (f64, f64, f64) -> f64
+    loop.store(%shifted, %output, %at) : (f64, !loop.buf<8xf64, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+```
+
+Rejected, as the verify filetests pin it:
+
+- `arith.fma: fma computes on f32 and f64, not bf16`
 
 ### `arith.cast`
 
@@ -479,25 +522,16 @@ Defined by `ToIndex` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates
 Example, from `filetests/loop/roundtrip/func.ptir`:
 
 ```text
-loop.func @shifted_gather(%table: !loop.buf<6x3xf32, global>, %which: !loop.buf<si32, global>, %output: !loop.buf<3xf32, global>) attributes {access = [in, in, out]} {
-  %start = loop.index() {expr = 0} : () -> index
-  %end = loop.index() {expr = 3} : () -> index
-  %scratch = loop.alloc() {shape = [3], dtype = f32} : () -> !loop.buf<3xf32, private>
+loop.func @pick_table(%first: !loop.buf<2xf32, global>, %second: !loop.buf<2xf32, global>, %which: !loop.buf<si32, global>, %output: !loop.buf<2xf32, global>) attributes {access = [in, in, in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %end = loop.index() {expr = 2} : () -> index
   %code = loop.load(%which) : (!loop.buf<si32, global>) -> si32
-  %picked = arith.to_index(%code) : (si32) -> index
-  loop.for(%start, %end) ({
+  %position = arith.to_index(%code) : (si32) -> index
+  %table = loop.pick(%position, %first, %second) : (index, !loop.buf<2xf32, global>, !loop.buf<2xf32, global>) -> !loop.buf<2xf32, global>
+  loop.for(%zero, %end) ({
   ^body(%column: index):
-    %row = loop.index(%picked) {expr = d0 - 1} : (index) -> index
-    %element = loop.load(%table, %row, %column) {pad = 0.0} : (!loop.buf<6x3xf32, global>, index, index) -> f32
-    loop.store(%element, %scratch, %column) : (f32, !loop.buf<3xf32, private>, index) -> ()
-    %first = loop.predicate(%column) {constraints = [d0 == 0]} : (index) -> i1
-    loop.if(%first) ({
-      %position = arith.from_index(%column) {dtype = f32} : (index) -> f32
-      loop.store(%position, %scratch, %column) : (f32, !loop.buf<3xf32, private>, index) -> ()
-      loop.yield() : () -> ()
-    }) : (i1) -> ()
-    %value = loop.load(%scratch, %column) : (!loop.buf<3xf32, private>, index) -> f32
-    loop.store(%value, %output, %column) : (f32, !loop.buf<3xf32, global>, index) -> ()
+    %element = loop.load(%table, %column) : (!loop.buf<2xf32, global>, index) -> f32
+    loop.store(%element, %output, %column) : (f32, !loop.buf<2xf32, global>, index) -> ()
     loop.yield() : () -> ()
   }) : (index, index) -> ()
   loop.return() : () -> ()
@@ -522,6 +556,7 @@ Defined by `Rng` in [crates/gpt-rs-ir/src/dialects/arith/ir.rs](../../crates/gpt
 | Results | `output`: scalar |
 | Attributes | `dtype`: `DType` |
 | Effects | none |
+| Patterns | `ExpandRngUniform` (`expand-random`, at `arith.rng_uniform`) |
 
 | Op | |
 |---|---|
@@ -635,6 +670,18 @@ Ops: `arith.abs`, `arith.maximum`, `arith.minimum`, `arith.and`, `arith.or`.
 Defined by `Involution` in [crates/gpt-rs-ir/src/traits/algebra.rs](../../crates/gpt-rs-ir/src/traits/algebra.rs).
 
 Ops: `arith.neg`, `arith.not`.
+
+### `NarrowInF32`
+
+On floats that the IR computes on in f32 ([`DType::computes_in_f32`], bf16 and f16), the op is
+the op on their f32 values, with its float result rounded once to the operands' dtype, or, for
+a comparison, kept as it is. A backend without arithmetic on such floats computes the op in f32.
+
+Defined by `NarrowInF32` in [crates/gpt-rs-ir/src/traits/structure.rs](../../crates/gpt-rs-ir/src/traits/structure.rs).
+
+Ops: `arith.neg`, `arith.abs`, `arith.exp`, `arith.log`, `arith.tanh`, `arith.erf`, `arith.rsqrt`, `arith.reciprocal`, `arith.sin`, `arith.cos`, `arith.not`, `arith.add`, `arith.sub`, `arith.mul`, `arith.div`, `arith.maximum`, `arith.minimum`, `arith.and`, `arith.or`, `arith.xor`, `arith.shift_left`, `arith.shift_right_logical`, `arith.shift_right_arithmetic`, `arith.less`, `arith.less_equal`, `arith.equal`, `arith.greater_equal`, `arith.greater`, `arith.not_equal`.
+
+Patterns rooted at it: `ComputeInF32` (`widen-narrow-floats`).
 
 ### `RightIdentity`
 

@@ -221,8 +221,8 @@ func.func @experts(%input: tensor<{T}x8xf32>, %choices: tensor<{T}xsi32>, %first
 
 // -----
 
-// Blocks grouped over a grid, a sealed dispatch with symbol facts, and its call.
-// CHECK: tile.dispatch @rms([[INPUT:%[0-9]+]]: tensor<{T}x8xf32>) -> tensor<{T}xf32> attributes {grid = [d0], facts = {T = [16, 4096] % 16}} {
+// Grouped blocks, a sealed dispatch with symbol facts, and its call.
+// CHECK: tile.dispatch @rms([[INPUT:%[0-9]+]]: tensor<{T}x8xf32>) -> tensor<{T}xf32> attributes {facts = {T = [16, 4096] % 16}} {
 // CHECK-NEXT: [[SUM_OF_SQUARES:%[0-9]+]] = tile.block([[INPUT]]) {iters = [par {T}, red 8], reads = [$0[d0, d1]], folds = [sum -> [d0]]} ({
 // CHECK-NEXT: ^body([[ELEMENT:%[0-9]+]]: f32):
 // CHECK-NEXT: [[SQUARE:%[0-9]+]] = arith.mul([[ELEMENT]], [[ELEMENT]]) : (f32, f32) -> f32
@@ -232,7 +232,7 @@ func.func @experts(%input: tensor<{T}x8xf32>, %choices: tensor<{T}xsi32>, %first
 // CHECK-NEXT: }
 // CHECK: func.func @call([[INPUT:%[0-9]+]]: tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}x8xf32>) {
 // CHECK-NEXT: [[SUM_OF_SQUARES:%[0-9]+]] = host.dispatch([[INPUT]]) {callee = @rms} : (tensor<{T}x8xf32>) -> tensor<{T}xf32>
-// CHECK-NEXT: [[EXPONENTIALS:%[0-9]+]] = tile.group() {grid = [d0]} ({
+// CHECK-NEXT: [[EXPONENTIALS:%[0-9]+]] = tile.group() ({
 // CHECK-NEXT: [[BLOCK_EXPONENTIALS:%[0-9]+]] = tile.block([[INPUT]]) {iters = [par {T}, par 8], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
 // CHECK-NEXT: ^body([[ELEMENT:%[0-9]+]]: f32):
 // CHECK-NEXT: [[EXPONENTIAL:%[0-9]+]] = arith.exp([[ELEMENT]]) : (f32) -> f32
@@ -242,7 +242,7 @@ func.func @experts(%input: tensor<{T}x8xf32>, %choices: tensor<{T}xsi32>, %first
 // CHECK-NEXT: }) : () -> tensor<{T}x8xf32>
 // CHECK-NEXT: func.return([[SUM_OF_SQUARES]], [[EXPONENTIALS]]) : (tensor<{T}xf32>, tensor<{T}x8xf32>) -> ()
 // CHECK-NEXT: }
-tile.dispatch @rms(%input: tensor<{T}x8xf32>) -> tensor<{T}xf32> attributes {grid = [d0], facts = {T = [16, 4096] % 16}} {
+tile.dispatch @rms(%input: tensor<{T}x8xf32>) -> tensor<{T}xf32> attributes {facts = {T = [16, 4096] % 16}} {
   %sum_of_squares = tile.block(%input) {iters = [par {T}, red 8], reads = [$0[d0, d1]], folds = [sum -> [d0]]} ({
   ^body(%element: f32):
     %square = arith.mul(%element, %element) : (f32, f32) -> f32
@@ -253,7 +253,7 @@ tile.dispatch @rms(%input: tensor<{T}x8xf32>) -> tensor<{T}xf32> attributes {gri
 
 func.func @call(%input: tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}x8xf32>) {
   %sum_of_squares = host.dispatch(%input) {callee = @rms} : (tensor<{T}x8xf32>) -> tensor<{T}xf32>
-  %exponentials = tile.group() {grid = [d0]} ({
+  %exponentials = tile.group() ({
     %block_exponentials = tile.block(%input) {iters = [par {T}, par 8], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
     ^body(%element: f32):
       %exponential = arith.exp(%element) : (f32) -> f32

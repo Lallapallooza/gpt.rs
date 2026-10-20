@@ -1,15 +1,20 @@
 //! Outlining groups of blocks into dispatches.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::marker::PhantomData;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 
 use crate::dialects::func::Return;
 use crate::dialects::host;
-use crate::dialects::tile::{Block, Dispatch, Group, IterList};
-use crate::ir::{Dim, Inst, Module, Region, Sym, SymbolRef, Type, Value};
+use crate::dialects::tile::utils::in_function_outside_groups;
+use crate::dialects::tile::{Block, BlockOp, Dispatch, Group, GroupOp};
+use crate::ir::{Dim, InOp, Inst, Module, OpRef, Sym, SymbolRef, Type, Value};
 use crate::passes::{pass, Pass};
-use crate::rewrite::Builder;
+use crate::require;
+use crate::rewrite::{
+    pattern, Builder, Greedy, NoMatch, Pattern, PatternSet, Rewriter, Rewrites, Rewriting,
+};
 use crate::traits::IsolatedFromAbove;
 
 /// Outlines each group of blocks into a `tile.dispatch` that the function calls with
@@ -29,52 +34,80 @@ use crate::traits::IsolatedFromAbove;
 )]
 pub struct SealDispatches;
 
+fn populate_seal_dispatches_patterns(set: &mut PatternSet) {
+    set.add(Seal::<Group>(PhantomData));
+    set.add(Seal::<Block>(PhantomData));
+}
+
 impl Pass for SealDispatches {
-    fn run(&self, module: &mut Module) -> Result<bool> {
-        let mut sealed = 0;
-        for func in module.funcs() {
-            for root in groups(module, func) {
-                seal(module, func, root)?;
-                sealed += 1;
-            }
-        }
-        SealDispatches::SEALED.add(sealed);
-        Ok(sealed > 0)
+    fn rewrites(&self) -> Rewrites {
+        Rewrites::once(populate_seal_dispatches_patterns)
+    }
+
+    fn run(&self, module: &mut Rewriting) -> Result<bool> {
+        Ok(Greedy::new(self.rewrites()).run(module)?.changed())
     }
 }
 
-/// The `tile.group`s of `func` and its `tile.block`s outside a group, in order.
-fn groups(module: &Module, func: Inst) -> Vec<Inst> {
-    let mut roots = Vec::new();
-    for &region in module.regions(func) {
-        collect_groups(module, region, &mut roots);
-    }
-    roots
+/// What `seal-dispatches` outlines into a dispatch: a `tile.group`, or a `tile.block` outside
+/// one, as a group of its own.
+trait Sealed: InOp {
+    /// The ops that the dispatch for `op` holds, and the values of those ops it gives.
+    fn members(op: &OpRef<Self>) -> (Vec<Inst>, Vec<Value>);
 }
 
-/// Adds to `roots` the groups of `region` and of the regions of its other ops, in order.
-fn collect_groups(module: &Module, region: Region, roots: &mut Vec<Inst>) {
-    for inst in module.insts(region) {
-        let op = module.op(inst);
-        if op.get::<Group>().is_some() || op.get::<Block>().is_some() {
-            roots.push(inst);
-            continue;
-        }
-        for &inner in module.regions(inst) {
-            collect_groups(module, inner, roots);
-        }
+impl Sealed for Group {
+    fn members(group: &GroupOp) -> (Vec<Inst>, Vec<Value>) {
+        let body = group.body();
+        let mut ops: Vec<Inst> = body.insts().collect();
+        ops.pop();
+        let given = body.yielded().iter().map(|value| value.id()).collect();
+        (ops, given)
     }
 }
 
-/// The ops that a dispatch for `root` holds, and the values of those ops it gives.
-fn members(module: &Module, root: Inst) -> (Vec<Inst>, Vec<Value>) {
-    if module.op(root).get::<Group>().is_none() {
-        return (vec![root], module.results(root).to_vec());
+impl Sealed for Block {
+    fn members(block: &BlockOp) -> (Vec<Inst>, Vec<Value>) {
+        let given = block.outs().iter().map(|out| out.id()).collect();
+        (vec![block.inst()], given)
     }
-    let body = module.regions(root)[0];
-    let mut ops: Vec<Inst> = module.insts(body).collect();
-    ops.pop();
-    (ops, module.yielded(body).to_vec())
+}
+
+/// A group of a function, or a block of one outside a group, becomes a `tile.dispatch` that the
+/// function calls with `host.dispatch` in its place. Equal groups share one dispatch.
+#[pattern]
+struct Seal<T>(PhantomData<T>);
+
+impl<T: Sealed> Pattern for Seal<T> {
+    type Root = T;
+
+    fn rewrite(&self, root: OpRef<T>, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
+        let module = root.module();
+        require!(
+            in_function_outside_groups(module, root.inst()),
+            "the op is in a group, or outside a function"
+        );
+        let (ops, given) = T::members(&root);
+        let mut args = captured(module, &ops);
+        add_symbol_args(module, root.inst(), &ops, &mut args);
+        let outlined = Outlined {
+            module,
+            ops: &ops,
+            args: &args,
+            given: &given,
+        };
+        let name =
+            Dispatch::add_named_by_text(rewriter, |scratch, name| outlined.build(scratch, name));
+        let call = rewriter.create(
+            host::Dispatch {
+                callee: SymbolRef(name),
+            },
+            args,
+        );
+        rewriter.replace_op(&root, call);
+        SealDispatches::SEALED.add(1);
+        Ok(())
+    }
 }
 
 /// The values the ops of `ops` read from outside them, in the order they are first read.
@@ -128,12 +161,7 @@ fn visible_args(module: &Module, root: Inst) -> Vec<Value> {
 
 /// Adds to `captured` a region argument that `root` sees for each symbol that `ops` use and no
 /// captured value binds.
-fn add_symbol_args(
-    module: &Module,
-    root: Inst,
-    ops: &[Inst],
-    captured: &mut Vec<Value>,
-) -> Result<()> {
+fn add_symbol_args(module: &Module, root: Inst, ops: &[Inst], captured: &mut Vec<Value>) {
     let mut used = BTreeSet::new();
     for &inst in ops {
         for inner in module.walk_inst(inst) {
@@ -147,95 +175,64 @@ fn add_symbol_args(
     loop {
         let bound = syms_of(captured.iter().map(|&value| module.ty(value)));
         let Some(sym) = used.iter().find(|sym| !bound.contains(*sym)) else {
-            return Ok(());
+            return;
         };
         let binding = args
             .iter()
             .copied()
             .find(|&arg| syms_of([module.ty(arg)]).contains(sym))
-            .ok_or_else(|| anyhow!("no argument in reach binds {{{}}}", sym.as_str()))?;
+            .unwrap_or_else(|| panic!("no argument in reach binds {{{}}}", sym.as_str()));
         captured.push(binding);
     }
 }
 
-/// Outlines `root` of `func` into a dispatch, which the function calls in its place.
-fn seal(module: &mut Module, func: Inst, root: Inst) -> Result<()> {
-    let (ops, given) = members(module, root);
-    let mut args = captured(module, &ops);
-    add_symbol_args(module, root, &ops, &mut args)?;
-    let grid = module
-        .op(root)
-        .get::<Group>()
-        .map_or_else(IterList::default, |group| group.grid);
-
-    // The dispatch in a module of its own, whose text names it.
-    let mut scratch = Module::new();
-    let dispatch = outline(&mut scratch, module, &ops, &args, &given, grid)?;
-    let hash = blake3::hash(scratch.to_text().as_bytes());
-    let bytes: [u8; 16] = hash.as_bytes()[..16].try_into().expect("16 bytes");
-    let name = format!("dispatch.{:032x}", u128::from_le_bytes(bytes));
-    if module.symbol(&name).is_none() {
-        let mut op = scratch
-            .op(dispatch)
-            .get::<Dispatch>()
-            .expect("a dispatch")
-            .clone();
-        op.name = name.clone();
-        scratch.set_op(dispatch, op.into());
-        let mut map = HashMap::new();
-        let mut builder = Builder::before(module, func);
-        builder.create_copy(&scratch, dispatch, &mut map)?;
-    }
-
-    let mut builder = Builder::before(module, root);
-    let call = builder.create(
-        host::Dispatch {
-            callee: SymbolRef(name),
-        },
-        args,
-    );
-    for (from, to) in module.results(root).to_vec().into_iter().zip(call) {
-        module.replace_all_uses(from, to);
-    }
-    module.erase(root)
+/// The dispatch that `seal-dispatches` outlines: it copies `ops` of `module`, takes `args` and gives
+/// `given`.
+struct Outlined<'a> {
+    module: &'a Module,
+    ops: &'a [Inst],
+    args: &'a [Value],
+    given: &'a [Value],
 }
 
-/// Builds into `scratch` the dispatch that copies `ops` of `module`, taking `args` and giving
-/// `given`.
-fn outline(
-    scratch: &mut Module,
-    module: &Module,
-    ops: &[Inst],
-    args: &[Value],
-    given: &[Value],
-    grid: IterList,
-) -> Result<Inst> {
-    let arg_types: Vec<Type> = args.iter().map(|&arg| module.ty(arg).clone()).collect();
-    let results: Vec<Type> = given
-        .iter()
-        .map(|&value| module.ty(value).clone())
-        .collect();
-    let body = scratch.new_region(arg_types.clone());
-    let mut map: HashMap<Value, Value> = args
-        .iter()
-        .copied()
-        .zip(scratch.args(body).to_vec())
-        .collect();
-    let mut body_builder = Builder::at_end(scratch, body);
-    for &inst in ops {
-        body_builder.create_copy(module, inst, &mut map)?;
+impl Outlined<'_> {
+    /// Builds the dispatch into `scratch`, named `name`.
+    fn build(&self, scratch: &mut Module, name: &str) -> Inst {
+        let module = self.module;
+        let arg_types: Vec<Type> = self
+            .args
+            .iter()
+            .map(|&arg| module.ty(arg).clone())
+            .collect();
+        let results: Vec<Type> = self
+            .given
+            .iter()
+            .map(|&value| module.ty(value).clone())
+            .collect();
+        let body = scratch.new_region(arg_types.clone());
+        let mut map: HashMap<Value, Value> = self
+            .args
+            .iter()
+            .copied()
+            .zip(scratch.args(body).to_vec())
+            .collect();
+        let mut body_builder = Builder::at_end(scratch, body);
+        for &inst in self.ops {
+            body_builder
+                .create_copy(module, inst, &mut map)
+                .expect("a dispatch takes every value its ops read");
+        }
+        let returned: Vec<Value> = self.given.iter().map(|value| map[value]).collect();
+        body_builder.create(Return, returned);
+        let dispatch = Dispatch {
+            name: name.to_string(),
+            args: arg_types,
+            results,
+            facts: Default::default(),
+            target: None,
+            numerics: Default::default(),
+        };
+        let top = scratch.body();
+        Builder::at_end(scratch, top).create_op(dispatch.into(), Vec::new(), None, vec![body])
     }
-    let returned: Vec<Value> = given.iter().map(|value| map[value]).collect();
-    body_builder.create(Return, returned);
-    let dispatch = Dispatch {
-        name: "dispatch".to_string(),
-        args: arg_types,
-        results,
-        grid,
-        facts: Default::default(),
-        schedule: Default::default(),
-    };
-    let top = scratch.body();
-    let mut top_builder = Builder::at_end(scratch, top);
-    Ok(top_builder.create_op(dispatch.into(), Vec::new(), None, vec![body]))
 }

@@ -157,8 +157,8 @@ How a dispatch runs changes no value it computes, except by the rounding changes
   a size, run one after another, on the workers of an execution level, or at once in registers
   (`reg`), the innermost along the lanes of a vector (`lanes`). Every iterator outside the register
   tile ends in a mode of one point, so the modes say every loop. A block without modes walks one
-  point at a time, in the order that the op's entry gives. Its `clip` names the iterators whose
-  loops skip the points where a padded read falls outside its operand.
+  point at a time, in the order that the `tile.block` entry gives. Its `clip` names the iterators
+  whose loops skip the points where a padded read falls outside its operand.
 - A fold `held` in scratch keeps its state in a scratch that it starts before the loop of a mode, in
   each piece of the modes around that mode, and finishes after that loop. One that holds none keeps
   the register tile's points, or one element, from its first loop over a reduced iterator on.

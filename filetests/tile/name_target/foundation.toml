@@ -1,0 +1,8 @@
+# AVX-512 Foundation and Conflict Detection alone, as Knights Landing has them: no doubleword and
+# quadword, byte and word, or vector-length instructions. The rest is x86-64-v4's.
+base = "x86-64-v4"
+description = "AVX-512 Foundation without DQ, BW or VL"
+
+[isa]
+features = ["sse4.2", "popcnt", "avx", "avx2", "fma", "f16c", "bmi2", "avx512f", "avx512cd"]
+cc_march = "knl"

@@ -368,7 +368,8 @@ impl Block {
         walked
     }
 
-    /// The iterators of the block in the order its loops walk them by default:
+    /// The iterators of the block in the order its loops walk them by default, unless a fold
+    /// updates an operand where its points may collide (see [`Block::reference_modes`]):
     /// 1. the iterators that are not reduced and that the coordinates of its first write take, in
     ///    the order they take them;
     /// 2. the other iterators that are not reduced, in the order of the block;

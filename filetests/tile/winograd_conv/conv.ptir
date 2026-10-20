@@ -1,0 +1,139 @@
+// RUN: pass winograd-conv {numerics = <winograd = true>}
+
+// A 3x3 convolution with stride 1 over 8x8 points and 8 channels each way: the weight transform,
+// one block per row of `G`, the input transform, one per row of `B^T`, one contraction for the 16
+// pairs of matrices picked from lists, and the output transform at the convolution's coordinates.
+// ROUNDING: winograd: the transforms round on their own, where the convolution rounds each product sum
+// CHECK: func.func @conv([[WEIGHT:%[0-9]+]]: tensor<72x8xf32>, [[INPUT:%[0-9]+]]: tensor<1x8x8x8xf32>) -> tensor<1x8x8x8xf32> {
+// CHECK-NEXT: [[U00:%[0-9]+]], [[U01:%[0-9]+]], [[U02:%[0-9]+]], [[U03:%[0-9]+]] = tile.block([[WEIGHT]]) {iters = [par 8, par 8], reads = [$0[d0, d1], $0[d0 + 8, d1], $0[d0 + 16, d1], $0[d0 + 24, d1], $0[d0 + 32, d1], $0[d0 + 40, d1], $0[d0 + 48, d1], $0[d0 + 56, d1], $0[d0 + 64, d1]], folds = [none -> [d0, d1], none -> [d0, d1], none -> [d0, d1], none -> [d0, d1]]} ({
+// CHECK: [[U10:%[0-9]+]], [[U11:%[0-9]+]], [[U12:%[0-9]+]], [[U13:%[0-9]+]] = tile.block([[WEIGHT]])
+// CHECK-NEXT: ^body([[TAP00:%[0-9]+]]: f32, [[TAP01:%[0-9]+]]: f32, [[TAP02:%[0-9]+]]: f32, [[TAP10:%[0-9]+]]: f32, [[TAP11:%[0-9]+]]: f32, [[TAP12:%[0-9]+]]: f32, [[TAP20:%[0-9]+]]: f32, [[TAP21:%[0-9]+]]: f32, [[TAP22:%[0-9]+]]: f32):
+// CHECK-NEXT: [[HALF:%[0-9]+]] = arith.constant() {value = 0.5 : f32} : () -> f32
+// CHECK-NEXT: [[ENDS0:%[0-9]+]] = arith.add([[TAP00]], [[TAP10]])
+// CHECK-NEXT: [[SUM0:%[0-9]+]] = arith.add([[ENDS0]], [[TAP20]])
+// CHECK-NEXT: [[ROW0:%[0-9]+]] = arith.mul([[SUM0]], [[HALF]])
+// CHECK-NEXT: [[ENDS1:%[0-9]+]] = arith.add([[TAP01]], [[TAP11]])
+// CHECK-NEXT: [[SUM1:%[0-9]+]] = arith.add([[ENDS1]], [[TAP21]])
+// CHECK-NEXT: [[ROW1:%[0-9]+]] = arith.mul([[SUM1]], [[HALF]])
+// CHECK-NEXT: [[ENDS2:%[0-9]+]] = arith.add([[TAP02]], [[TAP12]])
+// CHECK-NEXT: [[SUM2:%[0-9]+]] = arith.add([[ENDS2]], [[TAP22]])
+// CHECK-NEXT: [[ROW2:%[0-9]+]] = arith.mul([[SUM2]], [[HALF]])
+// CHECK-NEXT: [[OUTER:%[0-9]+]] = arith.add([[ROW0]], [[ROW2]])
+// CHECK-NEXT: [[ALL:%[0-9]+]] = arith.add([[OUTER]], [[ROW1]])
+// CHECK-NEXT: [[ALTERNATE:%[0-9]+]] = arith.sub([[OUTER]], [[ROW1]])
+// CHECK-NEXT: [[HALF_ALL:%[0-9]+]] = arith.mul([[ALL]], [[HALF]])
+// CHECK-NEXT: [[HALF_ALTERNATE:%[0-9]+]] = arith.mul([[ALTERNATE]], [[HALF]])
+// CHECK-NEXT: tile.yield([[ROW0]], [[HALF_ALL]], [[HALF_ALTERNATE]], [[ROW2]])
+// CHECK: [[V00:%[0-9]+]], [[V01:%[0-9]+]], [[V02:%[0-9]+]], [[V03:%[0-9]+]] = tile.block([[INPUT]]) {iters = [par 4, par 4, par 8], reads = [$0[0, d0 * 2 - 1, d1 * 2 - 1, d2] pad 0.0, $0[0, d0 * 2 - 1, d1 * 2, d2] pad 0.0, $0[0, d0 * 2 - 1, d1 * 2 + 1, d2] pad 0.0, $0[0, d0 * 2 - 1, d1 * 2 + 2, d2] pad 0.0, $0[0, d0 * 2, d1 * 2 - 1, d2] pad 0.0,
+// CHECK-NEXT: ^body([[D00:%[0-9]+]]: f32, [[D01:%[0-9]+]]: f32, [[D02:%[0-9]+]]: f32, [[D03:%[0-9]+]]: f32, {{%[0-9]+}}: f32, {{%[0-9]+}}: f32, {{%[0-9]+}}: f32, {{%[0-9]+}}: f32, [[D20:%[0-9]+]]: f32, [[D21:%[0-9]+]]: f32, [[D22:%[0-9]+]]: f32, [[D23:%[0-9]+]]: f32,
+// CHECK-NEXT: [[C0:%[0-9]+]] = arith.sub([[D00]], [[D20]])
+// CHECK-NEXT: [[C1:%[0-9]+]] = arith.sub([[D01]], [[D21]])
+// CHECK-NEXT: [[C2:%[0-9]+]] = arith.sub([[D02]], [[D22]])
+// CHECK-NEXT: [[C3:%[0-9]+]] = arith.sub([[D03]], [[D23]])
+// CHECK-NEXT: [[V0:%[0-9]+]] = arith.sub([[C0]], [[C2]])
+// CHECK-NEXT: [[V1:%[0-9]+]] = arith.add([[C1]], [[C2]])
+// CHECK-NEXT: [[V2:%[0-9]+]] = arith.sub([[C2]], [[C1]])
+// CHECK-NEXT: [[V3:%[0-9]+]] = arith.sub([[C1]], [[C3]])
+// CHECK-NEXT: tile.yield([[V0]], [[V1]], [[V2]], [[V3]])
+// CHECK: [[PRODUCTS:%[0-9]+]] = tile.block([[V00]], [[V01]], [[V02]], [[V03]], {{.*}}, [[U00]], [[U01]], [[U02]], [[U03]], [[U10]], {{.*}}) {iters = [par 16, par 4, par 4, par 8, red 8], reads = [$0..$15[d0][d1, d2, d4], $16..$31[d0][d4, d3]], folds = [sum -> [d1, d2, d0, d3]]} ({
+// CHECK: -> tensor<4x4x16x8xf32>
+// CHECK-NEXT: [[OUTPUT:%[0-9]+]] = tile.block([[PRODUCTS]]) {iters = [par 8, par 8, par 8], reads = [$0[d0 floordiv 2, d1 floordiv 2, 0, d2], $0[d0 floordiv 2, d1 floordiv 2, 1, d2], {{.*}}, $0[d0 floordiv 2, d1 floordiv 2, 15, d2]], folds = [none -> [0, d0, d1, d2]]} ({
+// CHECK: [[ROW_PARITY:%[0-9]+]] = tile.index() {expr = d0 mod 2, dtype = si64} : () -> si64
+// CHECK-NEXT: [[EVEN_ROW:%[0-9]+]] = arith.equal([[ROW_PARITY]], [[ZERO:%[0-9]+]])
+// CHECK-NEXT: [[COLUMN_PARITY:%[0-9]+]] = tile.index() {expr = d1 mod 2, dtype = si64} : () -> si64
+// CHECK-NEXT: [[EVEN_COLUMN:%[0-9]+]] = arith.equal([[COLUMN_PARITY]], [[ZERO]])
+// CHECK: arith.select([[EVEN_ROW]],
+// CHECK: [[ELEMENT:%[0-9]+]] = arith.select([[EVEN_COLUMN]],
+// CHECK-NEXT: tile.yield([[ELEMENT]])
+// CHECK: func.return([[OUTPUT]])
+func.func @conv(%weight: tensor<72x8xf32>, %input: tensor<1x8x8x8xf32>) -> tensor<1x8x8x8xf32> {
+  %output = tile.block(%weight, %input) {iters = [par 8, par 8, par 8, red 3, red 3, red 8], reads = [$1[0, d0 + d3 - 1, d1 + d4 - 1, d5] pad 0.0, $0[d3 * 24 + d4 * 8 + d5, d2]], folds = [sum -> [0, d0, d1, d2]]} ({
+  ^body(%element: f32, %tap: f32):
+    %product = arith.mul(%element, %tap) : (f32, f32) -> f32
+    tile.yield(%product) : (f32) -> ()
+  }) : (tensor<72x8xf32>, tensor<1x8x8x8xf32>) -> tensor<1x8x8x8xf32>
+  func.return(%output) : (tensor<1x8x8x8xf32>) -> ()
+}
+
+// -----
+
+// A 3x3 convolution with stride 1 over 7x7 points: 4x4 tiles of 2x2 outputs cover them, the input
+// tiles of the last row and column read the pad past the input, and the output transform writes
+// only the 7x7 outputs.
+// ROUNDING: winograd: the transforms round on their own, where the convolution rounds each product sum
+// CHECK: func.func @conv([[WEIGHT:%[0-9]+]]: tensor<72x8xf32>, [[INPUT:%[0-9]+]]: tensor<1x7x7x8xf32>) -> tensor<1x7x7x8xf32> {
+// CHECK: tile.block([[INPUT]]) {iters = [par 4, par 4, par 8], reads = [$0[0, d0 * 2 - 1, d1 * 2 - 1, d2] pad 0.0,
+// CHECK: [[PRODUCTS:%[0-9]+]] = tile.block({{.*}}) {iters = [par 16, par 4, par 4, par 8, red 8]
+// CHECK: -> tensor<4x4x16x8xf32>
+// CHECK-NEXT: [[OUTPUT:%[0-9]+]] = tile.block([[PRODUCTS]]) {iters = [par 7, par 7, par 8], reads = [$0[d0 floordiv 2, d1 floordiv 2, 0, d2],
+// CHECK: }) : (tensor<4x4x16x8xf32>) -> tensor<1x7x7x8xf32>
+// CHECK-NEXT: func.return([[OUTPUT]])
+func.func @conv(%weight: tensor<72x8xf32>, %input: tensor<1x7x7x8xf32>) -> tensor<1x7x7x8xf32> {
+  %output = tile.block(%weight, %input) {iters = [par 7, par 7, par 8, red 3, red 3, red 8], reads = [$1[0, d0 + d3 - 1, d1 + d4 - 1, d5] pad 0.0, $0[d3 * 24 + d4 * 8 + d5, d2]], folds = [sum -> [0, d0, d1, d2]]} ({
+  ^body(%element: f32, %tap: f32):
+    %product = arith.mul(%element, %tap) : (f32, f32) -> f32
+    tile.yield(%product) : (f32) -> ()
+  }) : (tensor<72x8xf32>, tensor<1x7x7x8xf32>) -> tensor<1x7x7x8xf32>
+  func.return(%output) : (tensor<1x7x7x8xf32>) -> ()
+}
+
+// -----
+
+// A 3x3 convolution with stride 2: the input coordinates step by 2 along the outputs, so the block
+// stays.
+// CHECK: tile.block({{%[0-9]+}}, {{%[0-9]+}}) {iters = [par 4, par 4, par 8, red 3, red 3, red 8]
+// CHECK-NOT: tile.block
+func.func @conv(%weight: tensor<72x8xf32>, %input: tensor<1x8x8x8xf32>) -> tensor<1x4x4x8xf32> {
+  %output = tile.block(%weight, %input) {iters = [par 4, par 4, par 8, red 3, red 3, red 8], reads = [$1[0, d0 * 2 + d3 - 1, d1 * 2 + d4 - 1, d5] pad 0.0, $0[d3 * 24 + d4 * 8 + d5, d2]], folds = [sum -> [0, d0, d1, d2]]} ({
+  ^body(%element: f32, %tap: f32):
+    %product = arith.mul(%element, %tap) : (f32, f32) -> f32
+    tile.yield(%product) : (f32) -> ()
+  }) : (tensor<72x8xf32>, tensor<1x8x8x8xf32>) -> tensor<1x4x4x8xf32>
+  func.return(%output) : (tensor<1x4x4x8xf32>) -> ()
+}
+
+// -----
+
+// A 5x5 convolution with stride 1: F(2x2, 3x3) takes 3 taps a side, so the block stays.
+// CHECK: tile.block({{%[0-9]+}}, {{%[0-9]+}}) {iters = [par 8, par 8, par 8, red 5, red 5, red 8]
+// CHECK-NOT: tile.block
+func.func @conv(%weight: tensor<200x8xf32>, %input: tensor<1x8x8x8xf32>) -> tensor<1x8x8x8xf32> {
+  %output = tile.block(%weight, %input) {iters = [par 8, par 8, par 8, red 5, red 5, red 8], reads = [$1[0, d0 + d3 - 2, d1 + d4 - 2, d5] pad 0.0, $0[d3 * 40 + d4 * 8 + d5, d2]], folds = [sum -> [0, d0, d1, d2]]} ({
+  ^body(%element: f32, %tap: f32):
+    %product = arith.mul(%element, %tap) : (f32, f32) -> f32
+    tile.yield(%product) : (f32) -> ()
+  }) : (tensor<200x8xf32>, tensor<1x8x8x8xf32>) -> tensor<1x8x8x8xf32>
+  func.return(%output) : (tensor<1x8x8x8xf32>) -> ()
+}
+
+// -----
+
+// A 3x3 convolution with stride 1 of a batch of 2 images: the pass convolves one image, so the
+// block, whose batch is an iterator of its own, stays.
+// CHECK: tile.block({{%[0-9]+}}, {{%[0-9]+}}) {iters = [par 2, par 8, par 8, par 8, red 3, red 3, red 8]
+// CHECK-NOT: tile.block
+func.func @conv(%weight: tensor<72x8xf32>, %input: tensor<2x8x8x8xf32>) -> tensor<2x8x8x8xf32> {
+  %output = tile.block(%weight, %input) {iters = [par 2, par 8, par 8, par 8, red 3, red 3, red 8], reads = [$1[d0, d1 + d4 - 1, d2 + d5 - 1, d6] pad 0.0, $0[d4 * 24 + d5 * 8 + d6, d3]], folds = [sum -> [d0, d1, d2, d3]]} ({
+  ^body(%element: f32, %tap: f32):
+    %product = arith.mul(%element, %tap) : (f32, f32) -> f32
+    tile.yield(%product) : (f32) -> ()
+  }) : (tensor<72x8xf32>, tensor<2x8x8x8xf32>) -> tensor<2x8x8x8xf32>
+  func.return(%output) : (tensor<2x8x8x8xf32>) -> ()
+}
+
+// -----
+
+// A 3x3 convolution with stride 1 of bf16 elements, which its body widens to f32 before it
+// multiplies them: the pass computes f32 products of the elements as read, so the block stays.
+// CHECK: tile.block({{%[0-9]+}}, {{%[0-9]+}}) {iters = [par 8, par 8, par 8, red 3, red 3, red 8]
+// CHECK-NOT: tile.block
+func.func @conv(%weight: tensor<72x8xbf16>, %input: tensor<1x8x8x8xbf16>) -> tensor<1x8x8x8xf32> {
+  %output = tile.block(%weight, %input) {iters = [par 8, par 8, par 8, red 3, red 3, red 8], reads = [$1[0, d0 + d3 - 1, d1 + d4 - 1, d5] pad 0.0, $0[d3 * 24 + d4 * 8 + d5, d2]], folds = [sum -> [0, d0, d1, d2]]} ({
+  ^body(%element: bf16, %tap: bf16):
+    %wide_element = arith.cast(%element) {to = f32} : (bf16) -> f32
+    %wide_tap = arith.cast(%tap) {to = f32} : (bf16) -> f32
+    %product = arith.mul(%wide_element, %wide_tap) : (f32, f32) -> f32
+    tile.yield(%product) : (f32) -> ()
+  }) : (tensor<72x8xbf16>, tensor<1x8x8x8xbf16>) -> tensor<1x8x8x8xf32>
+  func.return(%output) : (tensor<1x8x8x8xf32>) -> ()
+}

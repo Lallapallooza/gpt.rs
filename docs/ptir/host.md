@@ -79,7 +79,7 @@ Defined by `Dispatch` in [crates/gpt-rs-ir/src/dialects/host/ir.rs](../../crates
 Example, from `filetests/tile/roundtrip/block.ptir`:
 
 ```text
-tile.dispatch @rms(%input: tensor<{T}x8xf32>) -> tensor<{T}xf32> attributes {grid = [d0], facts = {T = [16, 4096] % 16}} {
+tile.dispatch @rms(%input: tensor<{T}x8xf32>) -> tensor<{T}xf32> attributes {facts = {T = [16, 4096] % 16}} {
   %sum_of_squares = tile.block(%input) {iters = [par {T}, red 8], reads = [$0[d0, d1]], folds = [sum -> [d0]]} ({
   ^body(%element: f32):
     %square = arith.mul(%element, %element) : (f32, f32) -> f32
@@ -89,7 +89,7 @@ tile.dispatch @rms(%input: tensor<{T}x8xf32>) -> tensor<{T}xf32> attributes {gri
 }
 func.func @call(%input: tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}x8xf32>) {
   %sum_of_squares = host.dispatch(%input) {callee = @rms} : (tensor<{T}x8xf32>) -> tensor<{T}xf32>
-  %exponentials = tile.group() {grid = [d0]} ({
+  %exponentials = tile.group() ({
     %block_exponentials = tile.block(%input) {iters = [par {T}, par 8], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
     ^body(%element: f32):
       %exponential = arith.exp(%element) : (f32) -> f32

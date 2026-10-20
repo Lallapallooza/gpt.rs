@@ -1,0 +1,14 @@
+// RUN: pass winograd-conv
+
+// The convolution of `conv.ptir`, under a compilation that does not allow Winograd's rounding: the
+// convolution stays.
+// CHECK: tile.block({{%[0-9]+}}, {{%[0-9]+}}) {iters = [par 8, par 8, par 8, red 3, red 3, red 8]
+// CHECK-NOT: tile.block
+func.func @conv(%weight: tensor<72x8xf32>, %input: tensor<1x8x8x8xf32>) -> tensor<1x8x8x8xf32> {
+  %output = tile.block(%weight, %input) {iters = [par 8, par 8, par 8, red 3, red 3, red 8], reads = [$1[0, d0 + d3 - 1, d1 + d4 - 1, d5] pad 0.0, $0[d3 * 24 + d4 * 8 + d5, d2]], folds = [sum -> [0, d0, d1, d2]]} ({
+  ^body(%element: f32, %tap: f32):
+    %product = arith.mul(%element, %tap) : (f32, f32) -> f32
+    tile.yield(%product) : (f32) -> ()
+  }) : (tensor<72x8xf32>, tensor<1x8x8x8xf32>) -> tensor<1x8x8x8xf32>
+  func.return(%output) : (tensor<1x8x8x8xf32>) -> ()
+}

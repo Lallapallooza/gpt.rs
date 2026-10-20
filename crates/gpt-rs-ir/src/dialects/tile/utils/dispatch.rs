@@ -88,22 +88,27 @@ impl Dispatch {
         format!("dispatch.{:032x}", u128::from_le_bytes(bytes))
     }
 
-    /// Adds through `rewriter` the dispatch that `build` builds alone into an empty module under
-    /// the name it is given, and gives its name: the one its text gives it under the name
-    /// `dispatch`. A dispatch of that name in the module is the same one, so it is not added
-    /// again.
+    /// Builds the dispatch with `build` into an empty module under the name `dispatch`, and names
+    /// it by a hash of that module's text. Adds it through `rewriter` under that name unless the
+    /// rewritten module already holds it, and gives the name.
     pub(crate) fn add_named_by_text(
         rewriter: &mut Rewriter,
-        build: impl Fn(&mut Module, &str) -> Inst,
+        build: impl FnOnce(&mut Module, &str) -> Inst,
     ) -> String {
-        let mut unnamed = Module::new();
-        build(&mut unnamed, "dispatch");
-        let name = Self::name_from_text(&unnamed);
-        if rewriter.module().symbol(&name).is_none() {
-            let mut named = Module::new();
-            let dispatch = build(&mut named, &name);
-            rewriter.add_symbol(&named, dispatch);
+        let mut scratch = Module::new();
+        let built = build(&mut scratch, "dispatch");
+        let name = Self::name_from_text(&scratch);
+        if rewriter.module().symbol(&name).is_some() {
+            return name;
         }
+        let Some(unnamed) = scratch.op_as::<Dispatch>(built) else {
+            panic!("`build` builds a dispatch");
+        };
+        let named = Dispatch {
+            name: name.clone(),
+            ..unnamed.attrs().clone()
+        };
+        rewriter.add_symbol_as(&scratch, built, named.into());
         name
     }
 

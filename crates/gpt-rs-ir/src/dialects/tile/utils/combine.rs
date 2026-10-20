@@ -13,6 +13,7 @@ use crate::dialects::tile::IterList;
 use crate::dialects::{arith, tensor};
 use crate::host::HostScalar;
 use crate::ir::{Constraint, DType, Dim, InOp, IndexExpr, Relation};
+use crate::traits::RightIdentity;
 use crate::Op;
 
 /// How a combine kind folds the points of one element, over scalar operations whose values,
@@ -145,6 +146,14 @@ impl CombineKind {
     /// What the kind takes and gives.
     pub fn rule(&self) -> &dyn CombineRule {
         self.fold::<(), (), ()>()
+    }
+
+    /// The right identity of the kind's step on `dtype`, which leaves every state of the fold as
+    /// it is: -0.0 for a float `sum`, -inf for a float `max`. `None` for a kind without a step, or
+    /// a step without an identity on `dtype`.
+    pub fn identity(&self, dtype: DType) -> Option<HostScalar> {
+        let step = self.rule().step()?;
+        step.get_trait::<RightIdentity>()?.0.value(dtype)
     }
 }
 

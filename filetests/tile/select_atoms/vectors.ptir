@@ -1,0 +1,80 @@
+// RUN: pass name-target {target = "x86-64-v4", numerics = <contract = true>}, select-atoms {target = "x86-64-v4"}
+
+// A map of 4 rows of 40 elements computes on vectors of 16 lanes along the rows, the widest the
+// target's registers hold of f32: it walks the row's vectors, the last one holding the 8 elements
+// the others leave. The dispatch names the target, and contracts a product and its sum, which the
+// target computes as one `isa.fma`.
+// CHECK: tile.dispatch @negate([[INPUT:%[0-9]+]]: tensor<4x40xf32>) -> tensor<4x40xf32> attributes {target = "x86-64-v4@{{[0-9a-f]+}}", numerics = <contract = true>} {
+// CHECK-NEXT: {{%[0-9]+}} = tile.block([[INPUT]]) {iters = [par 4, par 40], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 1, d1 by 16, d1 by 16 : lanes]} ({
+tile.dispatch @negate(%input: tensor<4x40xf32>) -> tensor<4x40xf32> {
+  %negated = tile.block(%input) {iters = [par 4, par 40], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    %negative = arith.neg(%element) : (f32) -> f32
+    tile.yield(%negative) : (f32) -> ()
+  }) : (tensor<4x40xf32>) -> tensor<4x40xf32>
+  func.return(%negated) : (tensor<4x40xf32>) -> ()
+}
+func.func @main(%input: tensor<4x40xf32>) -> tensor<4x40xf32> {
+  %negated = host.dispatch(%input) {callee = @negate} : (tensor<4x40xf32>) -> tensor<4x40xf32>
+  func.return(%negated) : (tensor<4x40xf32>) -> ()
+}
+
+// -----
+
+// Rows of one vector each: the block runs each row in the lanes, with no loop over its vectors.
+// CHECK: tile.block({{%[0-9]+}}) {iters = [par 3, par 16], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 1, d1 by 16 : lanes]} ({
+tile.dispatch @one_vector(%input: tensor<3x16xf32>) -> tensor<3x16xf32> {
+  %negated = tile.block(%input) {iters = [par 3, par 16], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    %negative = arith.neg(%element) : (f32) -> f32
+    tile.yield(%negative) : (f32) -> ()
+  }) : (tensor<3x16xf32>) -> tensor<3x16xf32>
+  func.return(%negated) : (tensor<3x16xf32>) -> ()
+}
+func.func @main(%input: tensor<3x16xf32>) -> tensor<3x16xf32> {
+  %negated = host.dispatch(%input) {callee = @one_vector} : (tensor<3x16xf32>) -> tensor<3x16xf32>
+  func.return(%negated) : (tensor<3x16xf32>) -> ()
+}
+
+// -----
+
+// A read that takes the elements of a row of the output from a column of the input takes no whole
+// vectors along the rows, so the block computes on scalars, and only the dispatch changes.
+// CHECK: tile.dispatch @transposed([[INPUT:%[0-9]+]]: tensor<40x4xf32>) -> tensor<4x40xf32> attributes {target = "x86-64-v4@{{[0-9a-f]+}}", numerics = <contract = true>} {
+// CHECK-NEXT: {{%[0-9]+}} = tile.block([[INPUT]]) {iters = [par 4, par 40], reads = [$0[d1, d0]], folds = [none -> [d0, d1]]} ({
+tile.dispatch @transposed(%input: tensor<40x4xf32>) -> tensor<4x40xf32> {
+  %negated = tile.block(%input) {iters = [par 4, par 40], reads = [$0[d1, d0]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    %negative = arith.neg(%element) : (f32) -> f32
+    tile.yield(%negative) : (f32) -> ()
+  }) : (tensor<40x4xf32>) -> tensor<4x40xf32>
+  func.return(%negated) : (tensor<4x40xf32>) -> ()
+}
+func.func @main(%input: tensor<40x4xf32>) -> tensor<4x40xf32> {
+  %negated = host.dispatch(%input) {callee = @transposed} : (tensor<40x4xf32>) -> tensor<4x40xf32>
+  func.return(%negated) : (tensor<4x40xf32>) -> ()
+}
+
+// -----
+
+// A projection and the bias added to it, its epilogue, which computes in the same lanes: the
+// projection computes on vectors along the output's columns, and the bias block keeps no loops.
+// CHECK: [[PRODUCT:%[0-9]+]] = tile.block({{%[0-9]+}}, {{%[0-9]+}}) {iters = [par 4, par 32, red 8], reads = [$0[d0, d2], $1[d2, d1]], folds = [sum -> [d0, d1]], loops = [d0 by 1, d1 by 16, d2 by 1, d1 by 16 : lanes]} ({
+// CHECK: {{%[0-9]+}} = tile.block([[PRODUCT]], {{%[0-9]+}}) {iters = [par 4, par 32], reads = [$0[d0, d1], $1[d1]], folds = [none -> [d0, d1]]} ({
+tile.dispatch @project(%input: tensor<4x8xf32>, %weight: tensor<8x32xf32>, %bias: tensor<32xf32>) -> tensor<4x32xf32> {
+  %product = tile.block(%input, %weight) {iters = [par 4, par 32, red 8], reads = [$0[d0, d2], $1[d2, d1]], folds = [sum -> [d0, d1]]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<4x8xf32>, tensor<8x32xf32>) -> tensor<4x32xf32>
+  %biased = tile.block(%product, %bias) {iters = [par 4, par 32], reads = [$0[d0, d1], $1[d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%sum: f32, %offset: f32):
+    %total = arith.add(%sum, %offset) : (f32, f32) -> f32
+    tile.yield(%total) : (f32) -> ()
+  }) : (tensor<4x32xf32>, tensor<32xf32>) -> tensor<4x32xf32>
+  func.return(%biased) : (tensor<4x32xf32>) -> ()
+}
+func.func @main(%input: tensor<4x8xf32>, %weight: tensor<8x32xf32>, %bias: tensor<32xf32>) -> tensor<4x32xf32> {
+  %biased = host.dispatch(%input, %weight, %bias) {callee = @project} : (tensor<4x8xf32>, tensor<8x32xf32>, tensor<32xf32>) -> tensor<4x32xf32>
+  func.return(%biased) : (tensor<4x32xf32>) -> ()
+}

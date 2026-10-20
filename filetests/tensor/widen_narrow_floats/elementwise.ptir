@@ -1,0 +1,18 @@
+// RUN: pass widen-narrow-floats
+
+// A product of bf16 tensors is the product of their f32 values, rounded to bf16, and a comparison
+// of bf16 tensors is the comparison of their f32 values, which needs no rounding.
+// CHECK: func.func @scale([[WEIGHT:%[0-9]+]]: tensor<4xbf16>, [[SCALE:%[0-9]+]]: tensor<4xbf16>)
+// CHECK-NEXT: [[WIDE_WEIGHT:%[0-9]+]] = tensor.cast([[WEIGHT]]) {to = f32} : (tensor<4xbf16>) -> tensor<4xf32>
+// CHECK-NEXT: [[WIDE_SCALE:%[0-9]+]] = tensor.cast([[SCALE]]) {to = f32} : (tensor<4xbf16>) -> tensor<4xf32>
+// CHECK-NEXT: [[WIDE_PRODUCT:%[0-9]+]] = tensor.mul([[WIDE_WEIGHT]], [[WIDE_SCALE]]) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+// CHECK-NEXT: [[SCALED:%[0-9]+]] = tensor.cast([[WIDE_PRODUCT]]) {to = bf16} : (tensor<4xf32>) -> tensor<4xbf16>
+// CHECK-NEXT: [[WIDE_SCALED:%[0-9]+]] = tensor.cast([[SCALED]]) {to = f32} : (tensor<4xbf16>) -> tensor<4xf32>
+// CHECK-NEXT: [[WIDE_BOUND:%[0-9]+]] = tensor.cast([[SCALE]]) {to = f32} : (tensor<4xbf16>) -> tensor<4xf32>
+// CHECK-NEXT: [[POSITIVE:%[0-9]+]] = tensor.greater([[WIDE_SCALED]], [[WIDE_BOUND]]) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+// CHECK-NEXT: func.return([[SCALED]], [[POSITIVE]])
+func.func @scale(%weight: tensor<4xbf16>, %scale: tensor<4xbf16>) -> (tensor<4xbf16>, tensor<4xi1>) {
+  %scaled = tensor.mul(%weight, %scale) : (tensor<4xbf16>, tensor<4xbf16>) -> tensor<4xbf16>
+  %positive = tensor.greater(%scaled, %scale) : (tensor<4xbf16>, tensor<4xbf16>) -> tensor<4xi1>
+  func.return(%scaled, %positive) : (tensor<4xbf16>, tensor<4xi1>) -> ()
+}

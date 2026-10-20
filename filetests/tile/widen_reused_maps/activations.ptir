@@ -1,0 +1,82 @@
+// RUN: pass widen-reused-maps
+
+// Two projections read one activation rounded to bf16 and widen it at each of their 32 outputs:
+// the rounding widens it once, and both read the f32 values.
+// CHECK: [[ROUNDED:%[0-9]+]] = tile.block({{%[0-9]+}}) {iters = [par 8, par 64], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+// CHECK-NEXT: ^body([[ELEMENT:%[0-9]+]]: f32):
+// CHECK-NEXT: [[NARROW:%[0-9]+]] = arith.cast([[ELEMENT]]) {to = bf16} : (f32) -> bf16
+// CHECK-NEXT: [[WIDE:%[0-9]+]] = arith.cast([[NARROW]]) {to = f32} : (bf16) -> f32
+// CHECK-NEXT: tile.yield([[WIDE]]) : (f32) -> ()
+// CHECK-NEXT: }) : (tensor<8x64xf32>) -> tensor<8x64xf32>
+// CHECK-NEXT: tile.block([[ROUNDED]], {{%[0-9]+}}) {iters = [par 8, par 32, red 64], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
+// CHECK-NEXT: ^body([[GATE_ACTIVATION:%[0-9]+]]: f32, [[GATE_COEFFICIENT:%[0-9]+]]: f32):
+// CHECK-NEXT: {{%[0-9]+}} = arith.mul([[GATE_ACTIVATION]], [[GATE_COEFFICIENT]]) : (f32, f32) -> f32
+// CHECK: tile.block([[ROUNDED]], {{%[0-9]+}}) {iters = [par 8, par 32, red 64], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
+// CHECK-NEXT: ^body([[UP_ACTIVATION:%[0-9]+]]: f32, [[UP_COEFFICIENT:%[0-9]+]]: f32):
+// CHECK-NEXT: {{%[0-9]+}} = arith.mul([[UP_ACTIVATION]], [[UP_COEFFICIENT]]) : (f32, f32) -> f32
+func.func @projections(%input: tensor<8x64xf32>, %gate: tensor<32x64xf32>, %up: tensor<32x64xf32>) -> (tensor<8x32xf32>, tensor<8x32xf32>) {
+  %rounded = tile.block(%input) {iters = [par 8, par 64], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    %narrow = arith.cast(%element) {to = bf16} : (f32) -> bf16
+    tile.yield(%narrow) : (bf16) -> ()
+  }) : (tensor<8x64xf32>) -> tensor<8x64xbf16>
+  %gated = tile.block(%rounded, %gate) {iters = [par 8, par 32, red 64], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
+  ^body(%activation: bf16, %coefficient: f32):
+    %wide = arith.cast(%activation) {to = f32} : (bf16) -> f32
+    %term = arith.mul(%wide, %coefficient) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<8x64xbf16>, tensor<32x64xf32>) -> tensor<8x32xf32>
+  %raised = tile.block(%rounded, %up) {iters = [par 8, par 32, red 64], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
+  ^body(%activation: bf16, %coefficient: f32):
+    %wide = arith.cast(%activation) {to = f32} : (bf16) -> f32
+    %term = arith.mul(%wide, %coefficient) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<8x64xbf16>, tensor<32x64xf32>) -> tensor<8x32xf32>
+  func.return(%gated, %raised) : (tensor<8x32xf32>, tensor<8x32xf32>) -> ()
+}
+
+// -----
+
+// A reader that widens each element at one point gains nothing from a wider result: the rounding
+// stays bf16.
+// CHECK: tile.block({{%[0-9]+}}) {iters = [par 8, par 64], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+// CHECK-NEXT: ^body([[ELEMENT:%[0-9]+]]: f32):
+// CHECK-NEXT: [[NARROW:%[0-9]+]] = arith.cast([[ELEMENT]]) {to = bf16} : (f32) -> bf16
+// CHECK-NEXT: tile.yield([[NARROW]]) : (bf16) -> ()
+func.func @elementwise(%input: tensor<8x64xf32>, %bias: tensor<8x64xf32>) -> tensor<8x64xf32> {
+  %rounded = tile.block(%input) {iters = [par 8, par 64], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    %narrow = arith.cast(%element) {to = bf16} : (f32) -> bf16
+    tile.yield(%narrow) : (bf16) -> ()
+  }) : (tensor<8x64xf32>) -> tensor<8x64xbf16>
+  %shifted = tile.block(%rounded, %bias) {iters = [par 8, par 64], reads = [$0[d0, d1], $1[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%value: bf16, %offset: f32):
+    %wide = arith.cast(%value) {to = f32} : (bf16) -> f32
+    %sum = arith.add(%wide, %offset) : (f32, f32) -> f32
+    tile.yield(%sum) : (f32) -> ()
+  }) : (tensor<8x64xbf16>, tensor<8x64xf32>) -> tensor<8x64xf32>
+  func.return(%shifted) : (tensor<8x64xf32>) -> ()
+}
+
+// -----
+
+// The weight rounded to bf16 is known before the run: `outline-static` stores it in bf16 at load
+// time, and the pass widens only maps that run at each call.
+// CHECK: tile.block({{%[0-9]+}}) {iters = [par 32, par 64], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+// CHECK-NEXT: ^body([[ELEMENT:%[0-9]+]]: f32):
+// CHECK-NEXT: [[NARROW:%[0-9]+]] = arith.cast([[ELEMENT]]) {to = bf16} : (f32) -> bf16
+// CHECK-NEXT: tile.yield([[NARROW]]) : (bf16) -> ()
+func.func @weights(%input: tensor<8x64xf32>, %weight: tensor<32x64xf32> {param = 1}) -> tensor<8x32xf32> {
+  %rounded = tile.block(%weight) {iters = [par 32, par 64], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    %narrow = arith.cast(%element) {to = bf16} : (f32) -> bf16
+    tile.yield(%narrow) : (bf16) -> ()
+  }) : (tensor<32x64xf32>) -> tensor<32x64xbf16>
+  %projected = tile.block(%input, %rounded) {iters = [par 8, par 32, red 64], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
+  ^body(%activation: f32, %coefficient: bf16):
+    %wide = arith.cast(%coefficient) {to = f32} : (bf16) -> f32
+    %term = arith.mul(%activation, %wide) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<8x64xf32>, tensor<32x64xbf16>) -> tensor<8x32xf32>
+  func.return(%projected) : (tensor<8x32xf32>) -> ()
+}

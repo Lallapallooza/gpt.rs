@@ -402,24 +402,18 @@ pub trait CombineRule {
 ///
 /// - The body holds `tile.block`s, which read values of the enclosing function, and ends with
 ///   `tile.yield`.
-/// - `grid` lists the parallel iterators, by position, that every block of the group shares and
-///   that a schedule may split across workers.
 #[crate::op(
     "tile.group",
     results(outs(Variadic(Tensor))),
     regions(body(Block(Yield)))
 )]
-pub struct Group {
-    #[attr(default)]
-    pub grid: IterList,
-}
+pub struct Group;
 
 /// `tile.dispatch`: one fused group of blocks, which becomes one generated function. A top-level
 /// symbol, called by `host.dispatch`.
 ///
 /// - Its body's block arguments are its arguments, and its `func.return` gives its results.
-/// - `grid` lists the parallel iterators, by position, that its blocks share. `facts` gives a
-///   range and a divisor of each dimension symbol of its arguments.
+/// - `facts` gives a range and a divisor of each dimension symbol of its arguments.
 /// - `target` names the target its blocks' loops are for, and `numerics` the rounding changes the
 ///   lowerings below `tile` may make: how it runs changes no value it computes, except by those.
 #[crate::op(
@@ -432,8 +426,6 @@ pub struct Dispatch {
     pub name: String,
     pub args: Vec<Type>,
     pub results: Vec<Type>,
-    #[attr(default)]
-    pub grid: IterList,
     #[attr(default)]
     pub facts: BTreeMap<String, SymFact>,
     #[attr(default)]

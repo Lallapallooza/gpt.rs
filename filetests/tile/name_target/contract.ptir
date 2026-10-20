@@ -1,0 +1,19 @@
+// RUN: pass name-target {target = "x86-64-v2", numerics = <contract = true>}, select-atoms {target = "x86-64-v2"}
+
+// A target without `isa.fma` rounds each product and each sum: the dispatch names it and keeps
+// them apart, though the pass allows contracting them. gpt.rs writes x86 vector code with AVX-512
+// alone, which the target lacks, so the block computes on scalars.
+// CHECK: tile.dispatch @scale([[INPUT:%[0-9]+]]: tensor<8xf32>, [[FACTOR:%[0-9]+]]: tensor<8xf32>) -> tensor<8xf32> attributes {target = "x86-64-v2@{{[0-9a-f]+}}"} {
+// CHECK-NEXT: {{%[0-9]+}} = tile.block([[INPUT]], [[FACTOR]]) {iters = [par 8], reads = [$0[d0], $1[d0]], folds = [none -> [d0]]} ({
+tile.dispatch @scale(%input: tensor<8xf32>, %factor: tensor<8xf32>) -> tensor<8xf32> {
+  %scaled = tile.block(%input, %factor) {iters = [par 8], reads = [$0[d0], $1[d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f32, %by: f32):
+    %product = arith.mul(%element, %by) : (f32, f32) -> f32
+    tile.yield(%product) : (f32) -> ()
+  }) : (tensor<8xf32>, tensor<8xf32>) -> tensor<8xf32>
+  func.return(%scaled) : (tensor<8xf32>) -> ()
+}
+func.func @main(%input: tensor<8xf32>, %factor: tensor<8xf32>) -> tensor<8xf32> {
+  %scaled = host.dispatch(%input, %factor) {callee = @scale} : (tensor<8xf32>, tensor<8xf32>) -> tensor<8xf32>
+  func.return(%scaled) : (tensor<8xf32>) -> ()
+}

@@ -1,0 +1,18 @@
+// RUN: pass name-target {target = "x86-64-v4"}
+
+// The error function of a vector of 16 lanes, which no AVX-512 instruction computes: without
+// `expand-math`, which writes it as a polynomial, the dispatch's verifier rejects the vectors the
+// block pins once `name-target` names the target.
+// ERROR: after name-target {target = "x86-64-v4"}: tile.dispatch: block 0: isa.erf of f32 lanes has no AVX-512 form; expand-math writes the math functions of f32 as polynomials
+tile.dispatch @error_function(%input: tensor<32xf32>) -> tensor<32xf32> {
+  %errors = tile.block(%input) {iters = [par 32], reads = [$0[d0]], folds = [none -> [d0]], loops = [d0 by 32 : reg, d0 by 16 : lanes]} ({
+  ^body(%element: f32):
+    %error = arith.erf(%element) : (f32) -> f32
+    tile.yield(%error) : (f32) -> ()
+  }) : (tensor<32xf32>) -> tensor<32xf32>
+  func.return(%errors) : (tensor<32xf32>) -> ()
+}
+func.func @main(%input: tensor<32xf32>) -> tensor<32xf32> {
+  %errors = host.dispatch(%input) {callee = @error_function} : (tensor<32xf32>) -> tensor<32xf32>
+  func.return(%errors) : (tensor<32xf32>) -> ()
+}

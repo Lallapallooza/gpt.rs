@@ -1,0 +1,118 @@
+// RUN: pass tensor-to-tile, canonicalize
+
+// A read of a copy reads the copy's operand: `exp` reads its input in the transposed order.
+// CHECK: func.func @transposed_input([[INPUT:%[0-9]+]]: tensor<3x4xf32>)
+// CHECK-NEXT: [[EXPONENTIALS:%[0-9]+]] = tile.block([[INPUT]]) {iters = [par 4, par 3], reads = [$0[d1, d0]], folds = [none -> [d0, d1]]}
+// CHECK-NOT: tile.block
+// CHECK: func.return([[EXPONENTIALS]])
+func.func @transposed_input(%input: tensor<3x4xf32>) -> tensor<4x3xf32> {
+  %transposed = tensor.transpose(%input) {perm = [1, 0]} : (tensor<3x4xf32>) -> tensor<4x3xf32>
+  %exponentials = tensor.exp(%transposed) : (tensor<4x3xf32>) -> tensor<4x3xf32>
+  func.return(%exponentials) : (tensor<4x3xf32>) -> ()
+}
+
+// -----
+
+// When the only reader of a block's result is a transpose, the block writes it transposed. Its
+// iterators follow the order it writes them in: it is the block of `exp` of the transposed input.
+// CHECK: func.func @transposed_output([[INPUT:%[0-9]+]]: tensor<3x4xf32>)
+// CHECK-NEXT: [[EXPONENTIALS:%[0-9]+]] = tile.block([[INPUT]]) {iters = [par 4, par 3], reads = [$0[d1, d0]], folds = [none -> [d0, d1]]}
+// CHECK-NOT: tile.block
+// CHECK: func.return([[EXPONENTIALS]])
+func.func @transposed_output(%input: tensor<3x4xf32>) -> tensor<4x3xf32> {
+  %exponentials = tensor.exp(%input) : (tensor<3x4xf32>) -> tensor<3x4xf32>
+  %transposed = tensor.transpose(%exponentials) {perm = [1, 0]} : (tensor<3x4xf32>) -> tensor<4x3xf32>
+  func.return(%transposed) : (tensor<4x3xf32>) -> ()
+}
+
+// -----
+
+// The rows a `take` copies are read where its reader reads them, at the index the ids give.
+// CHECK: func.func @embedded([[EMBEDDING:%[0-9]+]]: tensor<10x4xf32>, [[TOKEN_IDS:%[0-9]+]]: tensor<3xsi32>)
+// CHECK-NEXT: [[EXPONENTIALS:%[0-9]+]] = tile.block([[EMBEDDING]], [[TOKEN_IDS]]) {iters = [par 3, par 4], reads = [$0[$1[d0], d1]], folds = [none -> [d0, d1]]}
+// CHECK-NOT: tile.block
+// CHECK: func.return([[EXPONENTIALS]])
+func.func @embedded(%embedding: tensor<10x4xf32>, %token_ids: tensor<3xsi32>) -> tensor<3x4xf32> {
+  %rows = tensor.take(%embedding, %token_ids) : (tensor<10x4xf32>, tensor<3xsi32>) -> tensor<3x4xf32>
+  %exponentials = tensor.exp(%rows) : (tensor<3x4xf32>) -> tensor<3x4xf32>
+  func.return(%exponentials) : (tensor<3x4xf32>) -> ()
+}
+
+// -----
+
+// `maximum` with a broadcast zero reads the zero as a constant of its body.
+// CHECK: func.func @relu([[INPUT:%[0-9]+]]: tensor<2x3xf32>)
+// CHECK-NEXT: [[RECTIFIED:%[0-9]+]] = tile.block([[INPUT]]) {iters = [par 2, par 3], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]}
+// CHECK-NEXT: ^body([[ELEMENT:%[0-9]+]]: f32):
+// CHECK-NEXT: [[ZERO:%[0-9]+]] = arith.constant() {value = 0.0 : f32}
+// CHECK-NEXT: arith.maximum([[ELEMENT]], [[ZERO]])
+// CHECK-NOT: tile.block
+// CHECK: func.return([[RECTIFIED]])
+func.func @relu(%input: tensor<2x3xf32>) -> tensor<2x3xf32> {
+  %zero = tensor.constant() {value = dense<f32: 0.0>} : () -> tensor<f32>
+  %zeros = tensor.broadcast_to(%zero) {shape = [2, 3]} : (tensor<f32>) -> tensor<2x3xf32>
+  %rectified = tensor.maximum(%input, %zeros) : (tensor<2x3xf32>, tensor<2x3xf32>) -> tensor<2x3xf32>
+  func.return(%rectified) : (tensor<2x3xf32>) -> ()
+}
+
+// -----
+
+// A reduction over a flattened tensor reads it at its two coordinates: the flat iterator splits
+// into one per axis, in the same order, so the sum keeps its bits.
+// CHECK: func.func @flattened_sum([[INPUT:%[0-9]+]]: tensor<4x6xf32>)
+// CHECK-NEXT: [[SUM:%[0-9]+]] = tile.block([[INPUT]]) {iters = [red 4, red 6], reads = [$0[d0, d1]], folds = [sum -> []]}
+// CHECK-NOT: tile.block
+// CHECK: func.return([[SUM]])
+func.func @flattened_sum(%input: tensor<4x6xf32>) -> tensor<f32> {
+  %flat = tensor.reshape(%input) {shape = [24]} : (tensor<4x6xf32>) -> tensor<24xf32>
+  %sum = tensor.reduce_sum(%flat) {axes = [0], keepdims = false} : (tensor<24xf32>) -> tensor<f32>
+  func.return(%sum) : (tensor<f32>) -> ()
+}
+
+// -----
+
+// A 3x3 convolution with stride 2, as the functional records it: the patches compose into one
+// padded read of the input, and the reduction over the 18 elements of a patch splits into its
+// window rows, columns and channels, so every read is affine. The weight is read in place.
+// CHECK: func.func @strided_conv([[INPUT:%[0-9]+]]: tensor<1x6x6x2xf32>, [[WEIGHT:%[0-9]+]]: tensor<18x4xf32>)
+// CHECK-NEXT: [[OUTPUT:%[0-9]+]] = tile.block([[WEIGHT]], [[INPUT]]) {iters = [par 3, par 3, par 4, red 3, red 3, red 2], reads = [$1[0, d0 * 2 + d3 - 1, d1 * 2 + d4 - 1, d5] pad 0.0, $0[d3 * 6 + d4 * 2 + d5, d2]], folds = [sum -> [0, d0, d1, d2]]}
+// CHECK-NOT: tile.block
+// CHECK: func.return([[OUTPUT]])
+func.func @strided_conv(%input: tensor<1x6x6x2xf32>, %weight: tensor<18x4xf32>) -> tensor<1x3x3x4xf32> {
+  %patches = tensor.extract_patches(%input) {window = [3, 3], strides = [2, 2], dilation = [1, 1], padding = [(1, 1), (1, 1)], pad_value = 0.0} : (tensor<1x6x6x2xf32>) -> tensor<1x3x3x18xf32>
+  %output = tensor.dot_general(%patches, %weight) {contract_lhs = [3], contract_rhs = [0]} : (tensor<1x3x3x18xf32>, tensor<18x4xf32>) -> tensor<1x3x3x4xf32>
+  func.return(%output) : (tensor<1x3x3x4xf32>) -> ()
+}
+
+// -----
+
+// A depthwise 3x3 convolution, as the functional records it: the patches and their reshape
+// compose into one padded read of the input, and the dot writes its result in the order that the
+// transpose and the reshape after it give, its iterators numbered in that order: rows, columns,
+// channels.
+// CHECK: func.func @depthwise_conv([[INPUT:%[0-9]+]]: tensor<1x4x4x2xf32>, [[WEIGHT:%[0-9]+]]: tensor<2x1x1x3x3xf32>)
+// CHECK-NEXT: [[OUTPUT:%[0-9]+]] = tile.block([[WEIGHT]], [[INPUT]]) {iters = [par 4, par 4, par 2, red 3, red 3], reads = [$1[0, d0 + d3 - 1, d1 + d4 - 1, d2] pad 0.0, $0[d2, 0, 0, d3, d4]], folds = [sum -> [0, d0, d1, d2]]}
+// CHECK-NOT: tile.block
+// CHECK: func.return([[OUTPUT]])
+func.func @depthwise_conv(%input: tensor<1x4x4x2xf32>, %weight: tensor<2x1x1x3x3xf32>) -> tensor<1x4x4x2xf32> {
+  %patches = tensor.extract_patches(%input) {window = [3, 3], strides = [1, 1], dilation = [1, 1], padding = [(1, 1), (1, 1)], pad_value = 0.0} : (tensor<1x4x4x2xf32>) -> tensor<1x4x4x18xf32>
+  %taps = tensor.reshape(%patches) {shape = [1, 4, 4, 3, 3, 2, 1]} : (tensor<1x4x4x18xf32>) -> tensor<1x4x4x3x3x2x1xf32>
+  %channels_first = tensor.dot_general(%taps, %weight) {batch_lhs = [5], batch_rhs = [0], contract_lhs = [3, 4, 6], contract_rhs = [3, 4, 2]} : (tensor<1x4x4x3x3x2x1xf32>, tensor<2x1x1x3x3xf32>) -> tensor<2x1x4x4x1xf32>
+  %channels_last = tensor.transpose(%channels_first) {perm = [1, 2, 3, 0, 4]} : (tensor<2x1x4x4x1xf32>) -> tensor<1x4x4x2x1xf32>
+  %output = tensor.reshape(%channels_last) {shape = [1, 4, 4, 2]} : (tensor<1x4x4x2x1xf32>) -> tensor<1x4x4x2xf32>
+  func.return(%output) : (tensor<1x4x4x2xf32>) -> ()
+}
+
+// -----
+
+// A padded read composes only where it leaves the copy's operand with the copy's result. `concat`
+// reads the broadcast past its rows, but the broadcast reads its operand at no row coordinate, so
+// it stays a copy.
+// CHECK: func.func @concat_broadcast([[ROW:%[0-9]+]]: tensor<3xf32>, [[BOTTOM:%[0-9]+]]: tensor<2x3xf32>)
+// CHECK-NEXT: [[ROWS:%[0-9]+]] = tile.block([[ROW]]) {iters = [par 2, par 3], reads = [$0[d1]], folds = [none -> [d0, d1]]}
+// CHECK: tile.block([[ROWS]], [[BOTTOM]])
+func.func @concat_broadcast(%row: tensor<3xf32>, %bottom: tensor<2x3xf32>) -> tensor<4x3xf32> {
+  %rows = tensor.broadcast_to(%row) {shape = [2, 3]} : (tensor<3xf32>) -> tensor<2x3xf32>
+  %stacked = tensor.concat(%rows, %bottom) {axis = 0} : (tensor<2x3xf32>, tensor<2x3xf32>) -> tensor<4x3xf32>
+  func.return(%stacked) : (tensor<4x3xf32>) -> ()
+}

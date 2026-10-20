@@ -1,0 +1,71 @@
+// RUN: pass pad-with-identity
+
+// A max pool whose constraints skip the window elements in the padding: they keep the one read
+// inside the input, so the read pads with -inf, the right identity of `max`, and they go.
+// CHECK: reads = [$0[d0, d1 * 2 + d2 - 1] pad -inf], folds = [max -> [d0, d1]]} ({
+func.func @main(%image: tensor<2x4xf32>) -> tensor<2x2xf32> {
+  %pooled = tile.block(%image) {iters = [par 2, par 2, red 3], reads = [$0[d0, d1 * 2 + d2 - 1]], folds = [max -> [d0, d1]], constraints = [0 <= d1 * 2 + d2 - 1, d1 * 2 + d2 - 1 <= 3]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<2x4xf32>) -> tensor<2x2xf32>
+  func.return(%pooled) : (tensor<2x2xf32>) -> ()
+}
+
+// -----
+
+// A window sum over a dilated input: the bounds of the read become a pad of -0.0, the right
+// identity of the sum, through the cast to f32, and the holes between dilated elements stay
+// constraints.
+// CHECK: reads = [$0[(d0 + d1 - 1) floordiv 2] pad -0.0], folds = [sum -> [d0]], constraints = [(d0 + d1 - 1) mod 2 == 0]} ({
+func.func @main(%input: tensor<3xbf16>) -> tensor<6xf32> {
+  %sums = tile.block(%input) {iters = [par 6, red 2], reads = [$0[(d0 + d1 - 1) floordiv 2]], folds = [sum -> [d0]], constraints = [(d0 + d1 - 1) mod 2 == 0, 0 <= (d0 + d1 - 1) floordiv 2, (d0 + d1 - 1) floordiv 2 <= 2]} ({
+  ^body(%element: bf16):
+    %widened = arith.cast(%element) {to = f32} : (bf16) -> f32
+    tile.yield(%widened) : (f32) -> ()
+  }) : (tensor<3xbf16>) -> tensor<6xf32>
+  func.return(%sums) : (tensor<6xf32>) -> ()
+}
+
+// -----
+
+// The maximum of si8 elements widened to si32: the identity of `max` on si8, -128, casts to no
+// identity of si32, so a window wholly in the padding would give -128 where the constraints give
+// the fold's start. The block keeps its constraints.
+// CHECK-NOT: pad
+func.func @main(%input: tensor<4xsi8>) -> tensor<2xsi32> {
+  %maxima = tile.block(%input) {iters = [par 2, red 3], reads = [$0[d0 * 2 + d1 - 1]], folds = [max -> [d0]], constraints = [0 <= d0 * 2 + d1 - 1, d0 * 2 + d1 - 1 <= 3]} ({
+  ^body(%element: si8):
+    %widened = arith.cast(%element) {to = si32} : (si8) -> si32
+    tile.yield(%widened) : (si32) -> ()
+  }) : (tensor<4xsi8>) -> tensor<2xsi32>
+  func.return(%maxima) : (tensor<2xsi32>) -> ()
+}
+
+// -----
+
+// A causal sum: the constraint keeps the reduction below the diagonal, not the read inside its
+// operand, so it stays.
+// CHECK-NOT: pad
+func.func @main(%scores: tensor<4x4xf32>) -> tensor<4xf32> {
+  %sums = tile.block(%scores) {iters = [par 4, red 4], reads = [$0[d0, d1]], folds = [sum -> [d0]], constraints = [d1 <= d0]} ({
+  ^body(%score: f32):
+    tile.yield(%score) : (f32) -> ()
+  }) : (tensor<4x4xf32>) -> tensor<4xf32>
+  func.return(%sums) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// The maximum of f32 elements cast through si8 and back: f32 holds -inf, the identity of `max`,
+// at both ends, but the cast to si8 saturates it to -128, so a point in the padding would give
+// -128.0, larger than the elements below it. The block keeps its constraints.
+// CHECK-NOT: pad
+func.func @main(%input: tensor<4xf32>) -> tensor<2xf32> {
+  %maxima = tile.block(%input) {iters = [par 2, red 3], reads = [$0[d0 * 2 + d1 - 1]], folds = [max -> [d0]], constraints = [0 <= d0 * 2 + d1 - 1, d0 * 2 + d1 - 1 <= 3]} ({
+  ^body(%element: f32):
+    %narrowed = arith.cast(%element) {to = si8} : (f32) -> si8
+    %widened = arith.cast(%narrowed) {to = f32} : (si8) -> f32
+    tile.yield(%widened) : (f32) -> ()
+  }) : (tensor<4xf32>) -> tensor<2xf32>
+  func.return(%maxima) : (tensor<2xf32>) -> ()
+}

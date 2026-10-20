@@ -1,0 +1,22 @@
+// RUN: pass widen-narrow-floats
+
+// The body of a block on f16 computes each op in f32 and rounds its result to f16, as the ops do:
+// the product rounds before the negation reads it.
+// CHECK: ^body([[ELEMENT:%[0-9]+]]: f16, [[FACTOR:%[0-9]+]]: f16):
+// CHECK-NEXT: [[WIDE_ELEMENT:%[0-9]+]] = arith.cast([[ELEMENT]]) {to = f32} : (f16) -> f32
+// CHECK-NEXT: [[WIDE_FACTOR:%[0-9]+]] = arith.cast([[FACTOR]]) {to = f32} : (f16) -> f32
+// CHECK-NEXT: [[WIDE_PRODUCT:%[0-9]+]] = arith.mul([[WIDE_ELEMENT]], [[WIDE_FACTOR]]) : (f32, f32) -> f32
+// CHECK-NEXT: [[PRODUCT:%[0-9]+]] = arith.cast([[WIDE_PRODUCT]]) {to = f16} : (f32) -> f16
+// CHECK-NEXT: [[REWIDENED:%[0-9]+]] = arith.cast([[PRODUCT]]) {to = f32} : (f16) -> f32
+// CHECK-NEXT: [[WIDE_NEGATED:%[0-9]+]] = arith.neg([[REWIDENED]]) : (f32) -> f32
+// CHECK-NEXT: [[NEGATED:%[0-9]+]] = arith.cast([[WIDE_NEGATED]]) {to = f16} : (f32) -> f16
+// CHECK-NEXT: tile.yield([[NEGATED]]) : (f16) -> ()
+func.func @scale(%weight: tensor<4xf16>, %scale: tensor<4xf16>) -> tensor<4xf16> {
+  %scaled = tile.block(%weight, %scale) {iters = [par 4], reads = [$0[d0], $1[d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f16, %factor: f16):
+    %product = arith.mul(%element, %factor) : (f16, f16) -> f16
+    %negated = arith.neg(%product) : (f16) -> f16
+    tile.yield(%negated) : (f16) -> ()
+  }) : (tensor<4xf16>, tensor<4xf16>) -> tensor<4xf16>
+  func.return(%scaled) : (tensor<4xf16>) -> ()
+}

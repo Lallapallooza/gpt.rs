@@ -1,0 +1,153 @@
+// RUN: pass form-groups
+
+// A dot, its bias and its ReLU: each block is the one use of the result before it and runs on
+// each of its elements where the block before writes it, so the three are one group, which stands
+// where the ReLU stood.
+// CHECK: func.func @dense([[INPUT:%[0-9]+]]: tensor<2x4xf32>, [[WEIGHT:%[0-9]+]]: tensor<4x3xf32>, [[BIAS:%[0-9]+]]: tensor<3xf32>) -> tensor<2x3xf32> {
+// CHECK-NEXT: [[ACTIVATED:%[0-9]+]] = tile.group() ({
+// CHECK-NEXT: [[PRODUCT:%[0-9]+]] = tile.block([[INPUT]], [[WEIGHT]]) {iters = [par 2, par 3, red 4]
+// CHECK: [[SHIFTED:%[0-9]+]] = tile.block([[PRODUCT]], [[BIAS]]) {iters = [par 2, par 3]
+// CHECK: [[RECTIFIED:%[0-9]+]] = tile.block([[SHIFTED]]) {iters = [par 2, par 3]
+// CHECK: tile.yield([[RECTIFIED]]) : (tensor<2x3xf32>) -> ()
+// CHECK-NEXT: }) : () -> tensor<2x3xf32>
+// CHECK-NEXT: func.return([[ACTIVATED]]) : (tensor<2x3xf32>) -> ()
+func.func @dense(%input: tensor<2x4xf32>, %weight: tensor<4x3xf32>, %bias: tensor<3xf32>) -> tensor<2x3xf32> {
+  %product = tile.block(%input, %weight) {iters = [par 2, par 3, red 4], reads = [$0[d0, d2], $1[d2, d1]], folds = [sum -> [d0, d1]]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<2x4xf32>, tensor<4x3xf32>) -> tensor<2x3xf32>
+  %shifted = tile.block(%product, %bias) {iters = [par 2, par 3], reads = [$0[d0, d1], $1[d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%sum: f32, %offset: f32):
+    %added = arith.add(%sum, %offset) : (f32, f32) -> f32
+    tile.yield(%added) : (f32) -> ()
+  }) : (tensor<2x3xf32>, tensor<3xf32>) -> tensor<2x3xf32>
+  %rectified = tile.block(%shifted) {iters = [par 2, par 3], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%value: f32):
+    %zero = arith.constant() {value = 0.0 : f32} : () -> f32
+    %clamped = arith.maximum(%value, %zero) : (f32, f32) -> f32
+    tile.yield(%clamped) : (f32) -> ()
+  }) : (tensor<2x3xf32>) -> tensor<2x3xf32>
+  func.return(%rectified) : (tensor<2x3xf32>) -> ()
+}
+
+// -----
+
+// The dot's result is also returned, so the bias is not its one use: nothing groups.
+// CHECK-NOT: tile.group
+func.func @returned(%input: tensor<2x4xf32>, %weight: tensor<4x3xf32>, %bias: tensor<3xf32>) -> (tensor<2x3xf32>, tensor<2x3xf32>) {
+  %product = tile.block(%input, %weight) {iters = [par 2, par 3, red 4], reads = [$0[d0, d2], $1[d2, d1]], folds = [sum -> [d0, d1]]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<2x4xf32>, tensor<4x3xf32>) -> tensor<2x3xf32>
+  %shifted = tile.block(%product, %bias) {iters = [par 2, par 3], reads = [$0[d0, d1], $1[d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%sum: f32, %offset: f32):
+    %added = arith.add(%sum, %offset) : (f32, f32) -> f32
+    tile.yield(%added) : (f32) -> ()
+  }) : (tensor<2x3xf32>, tensor<3xf32>) -> tensor<2x3xf32>
+  func.return(%product, %shifted) : (tensor<2x3xf32>, tensor<2x3xf32>) -> ()
+}
+
+// -----
+
+// A transpose reads each element where the dot does not write it, and a sum over the rows folds
+// several elements into one: neither runs on the elements as they are written, so nothing groups.
+// CHECK-NOT: tile.group
+func.func @not_elementwise(%input: tensor<3x4xf32>, %weight: tensor<4x3xf32>) -> (tensor<3x3xf32>, tensor<3xf32>) {
+  %product = tile.block(%input, %weight) {iters = [par 3, par 3, red 4], reads = [$0[d0, d2], $1[d2, d1]], folds = [sum -> [d0, d1]]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<3x4xf32>, tensor<4x3xf32>) -> tensor<3x3xf32>
+  %transposed = tile.block(%product) {iters = [par 3, par 3], reads = [$0[d1, d0]], folds = [none -> [d0, d1]]} ({
+  ^body(%value: f32):
+    tile.yield(%value) : (f32) -> ()
+  }) : (tensor<3x3xf32>) -> tensor<3x3xf32>
+  %square = tile.block(%input, %weight) {iters = [par 3, par 3, red 4], reads = [$0[d0, d2], $1[d2, d1]], folds = [sum -> [d0, d1]]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<3x4xf32>, tensor<4x3xf32>) -> tensor<3x3xf32>
+  %columns = tile.block(%square) {iters = [par 3, red 3], reads = [$0[d1, d0]], folds = [sum -> [d0]]} ({
+  ^body(%value: f32):
+    tile.yield(%value) : (f32) -> ()
+  }) : (tensor<3x3xf32>) -> tensor<3xf32>
+  func.return(%transposed, %columns) : (tensor<3x3xf32>, tensor<3xf32>) -> ()
+}
+
+// -----
+
+// The sum reads two results that only it uses, so it could end either chain: it joins the first,
+// the exponential's, and the logarithm's block stays alone.
+// CHECK: func.func @both(%{{[0-9]+}}: tensor<4xf32>) -> tensor<4xf32> {
+// CHECK-NEXT: [[LOGARITHM:%[0-9]+]] = tile.block
+// CHECK: [[SUMMED:%[0-9]+]] = tile.group() ({
+// CHECK-NEXT: [[EXPONENTIAL:%[0-9]+]] = tile.block
+// CHECK: [[SUM:%[0-9]+]] = tile.block([[EXPONENTIAL]], [[LOGARITHM]])
+// CHECK: tile.yield([[SUM]]) : (tensor<4xf32>) -> ()
+// CHECK-NOT: tile.group
+func.func @both(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %exponential = tile.block(%input) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    %raised = arith.exp(%element) : (f32) -> f32
+    tile.yield(%raised) : (f32) -> ()
+  }) : (tensor<4xf32>) -> tensor<4xf32>
+  %logarithm = tile.block(%input) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    %lowered = arith.log(%element) : (f32) -> f32
+    tile.yield(%lowered) : (f32) -> ()
+  }) : (tensor<4xf32>) -> tensor<4xf32>
+  %sum = tile.block(%exponential, %logarithm) {iters = [par 4], reads = [$0[d0], $1[d0]], folds = [none -> [d0]]} ({
+  ^body(%raised: f32, %lowered: f32):
+    %added = arith.add(%raised, %lowered) : (f32, f32) -> f32
+    tile.yield(%added) : (f32) -> ()
+  }) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%sum) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// The widened weight is known before the run and its product with the input is not: the widening
+// runs once, when the parameters load, so the product joins no chain of the widening, and nothing
+// groups.
+// CHECK-NOT: tile.group
+func.func @phases(%input: tensor<4xf32>, %weight: tensor<4xbf16> {param = 1}) -> tensor<4xf32> {
+  %widened = tile.block(%weight) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0]]} ({
+  ^body(%element: bf16):
+    %wide = arith.cast(%element) {to = f32} : (bf16) -> f32
+    tile.yield(%wide) : (f32) -> ()
+  }) : (tensor<4xbf16>) -> tensor<4xf32>
+  %scaled = tile.block(%widened, %input) {iters = [par 4], reads = [$0[d0], $1[d0]], folds = [none -> [d0]]} ({
+  ^body(%scale: f32, %element: f32):
+    %product = arith.mul(%scale, %element) : (f32, f32) -> f32
+    tile.yield(%product) : (f32) -> ()
+  }) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%scaled) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// The exponential's one use is a block in a branch of a condition, another region: that block
+// runs only where the branch does, so it joins no chain of the exponential, and nothing groups.
+// CHECK-NOT: tile.group
+func.func @branch(%predicate: tensor<i1>, %input: tensor<4xf32>) -> tensor<4xf32> {
+  %exponential = tile.block(%input) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    %raised = arith.exp(%element) : (f32) -> f32
+    tile.yield(%raised) : (f32) -> ()
+  }) : (tensor<4xf32>) -> tensor<4xf32>
+  %result = tensor.cond(%predicate, %input) {results = [tensor<4xf32>]} ({
+  ^then_branch(%then_input: tensor<4xf32>):
+    %negated = tile.block(%exponential) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0]]} ({
+    ^body(%raised: f32):
+      %flipped = arith.neg(%raised) : (f32) -> f32
+      tile.yield(%flipped) : (f32) -> ()
+    }) : (tensor<4xf32>) -> tensor<4xf32>
+    tensor.yield(%negated) : (tensor<4xf32>) -> ()
+  }, {
+  ^else_branch(%else_input: tensor<4xf32>):
+    tensor.yield(%else_input) : (tensor<4xf32>) -> ()
+  }) : (tensor<i1>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%result) : (tensor<4xf32>) -> ()
+}

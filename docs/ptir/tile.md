@@ -159,8 +159,8 @@ How a dispatch runs changes no value it computes, except by the rounding changes
   a size, run one after another, on the workers of an execution level, or at once in registers
   (`reg`), the innermost along the lanes of a vector (`lanes`). Every iterator outside the register
   tile ends in a mode of one point, so the modes say every loop. A block without modes walks one
-  point at a time, in the order that the op's entry gives. Its `clip` names the iterators whose
-  loops skip the points where a padded read falls outside its operand.
+  point at a time, in the order that the `tile.block` entry gives. Its `clip` names the iterators
+  whose loops skip the points where a padded read falls outside its operand.
 - A fold `held` in scratch keeps its state in a scratch that it starts before the loop of a mode, in
   each piece of the modes around that mode, and finishes after that loop. One that holds none keeps
   the register tile's points, or one element, from its first loop over a reduced iterator on.
@@ -408,8 +408,6 @@ results are the tensors its body yields.
 
 - The body holds `tile.block`s, which read values of the enclosing function, and ends with
   `tile.yield`.
-- `grid` lists the parallel iterators, by position, that every block of the group shares and
-  that a schedule may split across workers.
 
 Defined by `Group` in [crates/gpt-rs-ir/src/dialects/tile/ir.rs](../../crates/gpt-rs-ir/src/dialects/tile/ir.rs).
 
@@ -418,14 +416,13 @@ Defined by `Group` in [crates/gpt-rs-ir/src/dialects/tile/ir.rs](../../crates/gp
 | Operands | none |
 | Results | `outs`: tensors |
 | Regions | `body` |
-| Attributes | `grid`: `IterList`, optional |
 | Effects | none |
 | Patterns | `Seal` (`seal-dispatches`) |
 
 Example, from `filetests/tile/roundtrip/block.ptir`:
 
 ```text
-tile.dispatch @rms(%input: tensor<{T}x8xf32>) -> tensor<{T}xf32> attributes {grid = [d0], facts = {T = [16, 4096] % 16}} {
+tile.dispatch @rms(%input: tensor<{T}x8xf32>) -> tensor<{T}xf32> attributes {facts = {T = [16, 4096] % 16}} {
   %sum_of_squares = tile.block(%input) {iters = [par {T}, red 8], reads = [$0[d0, d1]], folds = [sum -> [d0]]} ({
   ^body(%element: f32):
     %square = arith.mul(%element, %element) : (f32, f32) -> f32
@@ -435,7 +432,7 @@ tile.dispatch @rms(%input: tensor<{T}x8xf32>) -> tensor<{T}xf32> attributes {gri
 }
 func.func @call(%input: tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}x8xf32>) {
   %sum_of_squares = host.dispatch(%input) {callee = @rms} : (tensor<{T}x8xf32>) -> tensor<{T}xf32>
-  %exponentials = tile.group() {grid = [d0]} ({
+  %exponentials = tile.group() ({
     %block_exponentials = tile.block(%input) {iters = [par {T}, par 8], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
     ^body(%element: f32):
       %exponential = arith.exp(%element) : (f32) -> f32
@@ -453,8 +450,7 @@ One fused group of blocks, which becomes one generated function. A top-level
 symbol, called by `host.dispatch`.
 
 - Its body's block arguments are its arguments, and its `func.return` gives its results.
-- `grid` lists the parallel iterators, by position, that its blocks share. `facts` gives a
-  range and a divisor of each dimension symbol of its arguments.
+- `facts` gives a range and a divisor of each dimension symbol of its arguments.
 - `target` names the target its blocks' loops are for, and `numerics` the rounding changes the
   lowerings below `tile` may make: how it runs changes no value it computes, except by those.
 
@@ -465,7 +461,7 @@ Defined by `Dispatch` in [crates/gpt-rs-ir/src/dialects/tile/ir.rs](../../crates
 | Operands | none |
 | Results | none |
 | Regions | `body` |
-| Attributes | `name`: `String`; `args`: `[Type]`; `results`: `[Type]`; `grid`: `IterList`, optional; `facts`: `{name = SymFact}`, optional; `target`: `TargetRef`, optional; `numerics`: `Numerics`, optional |
+| Attributes | `name`: `String`; `args`: `[Type]`; `results`: `[Type]`; `facts`: `{name = SymFact}`, optional; `target`: `TargetRef`, optional; `numerics`: `Numerics`, optional |
 | Traits | isolated from above |
 | Effects | none |
 | Patterns | `NameDispatchTarget` (`name-target`); `PlaceAtRegisterTile` (`place-epilogues`); `ScheduleFirstBlock` (`schedule`); `SelectVectors` (`select-atoms`); `SplitIntoLanes` (`split-lane-folds`); `DispatchToLoop` (`tile-to-loop`) |

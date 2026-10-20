@@ -7,10 +7,9 @@ use anyhow::{anyhow, bail, ensure, Result};
 use smallvec::SmallVec;
 use tinyvec::ArrayVec;
 
-use crate::dialects::arith::{self, math};
 use crate::dialects::func::Func;
 use crate::dialects::tile::ir::*;
-use crate::dialects::{isa, tensor};
+use crate::dialects::{arith, isa};
 use crate::host::HostScalar;
 use crate::ir::{
     AccessExpr, DType, Dim, Inst, IterRef, Module, OperandRef, Region, Root, Sym, TensorType,
@@ -309,14 +308,9 @@ impl Block {
         let arg = module.args(body)[read];
         let dtype = module.ty(value).as_scalar()?;
         if value == arg {
-            let identity = match fold.combine {
-                CombineKind::Sum => math::fold_init::<tensor::Add>(dtype),
-                CombineKind::Max => math::fold_init::<tensor::Maximum>(dtype),
-                CombineKind::Min => math::fold_init::<tensor::Minimum>(dtype),
-                _ => return None,
-            };
+            let identity = fold.combine.identity(dtype)?;
             let padded = HostScalar::from_f64(dtype, pad.0).ok()?;
-            let same = identity.ok()?.to_data().ok()?.bytes() == padded.to_data().ok()?.bytes();
+            let same = identity.to_data().ok()?.bytes() == padded.to_data().ok()?.bytes();
             return same.then_some(PadSkip::Exact);
         }
         if fold.combine != CombineKind::Sum || pad.0 != 0.0 {
@@ -905,6 +899,11 @@ impl Read {
             at: None,
             held: None,
         }
+    }
+
+    /// Whether a coordinate of the read takes the iterator at `position`.
+    pub fn uses_iter(&self, position: usize) -> bool {
+        self.coords.iter().any(|coord| coord.uses_iter(position))
     }
 
     /// Whether the read takes the iterator at `position` only in its last coordinate, with step

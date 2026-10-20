@@ -1,0 +1,43 @@
+// RUN: pass canonicalize
+
+// When the only reader of a map's result is a copy into the cache, the map writes into the cache
+// itself. It writes at the copy's row: the doubled row goes straight where the copy put it.
+// CHECK: func.func @store_row([[CACHE:%[0-9]+]]: tensor<4x8xf32>, [[ROW:%[0-9]+]]: tensor<1x8xf32>, [[POSITION:%[0-9]+]]: tensor<si32>) -> tensor<4x8xf32> {
+// CHECK-NEXT: [[STORED:%[0-9]+]] = tile.block([[ROW]], [[CACHE]], [[POSITION]]) {iters = [par 8], reads = [$0[0, d0]], folds = [none -> $1[min(max($2[], 0), 3), d0]]} ({
+// CHECK-NEXT: ^body([[ELEMENT:%[0-9]+]]: f32):
+// CHECK-NEXT: [[TWICE:%[0-9]+]] = arith.add([[ELEMENT]], [[ELEMENT]]) : (f32, f32) -> f32
+// CHECK-NEXT: tile.yield([[TWICE]]) : (f32) -> ()
+// CHECK-NEXT: }) : (tensor<1x8xf32>, tensor<4x8xf32>, tensor<si32>) -> tensor<4x8xf32>
+// CHECK-NEXT: func.return([[STORED]]) : (tensor<4x8xf32>) -> ()
+func.func @store_row(%cache: tensor<4x8xf32>, %row: tensor<1x8xf32>, %position: tensor<si32>) -> tensor<4x8xf32> {
+  %doubled = tile.block(%row) {iters = [par 1, par 8], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    %twice = arith.add(%element, %element) : (f32, f32) -> f32
+    tile.yield(%twice) : (f32) -> ()
+  }) : (tensor<1x8xf32>) -> tensor<1x8xf32>
+  %stored = tile.block(%cache, %doubled, %position) {iters = [par 1, par 8], reads = [$1[d0, d1]], folds = [none -> $0[min(max($2[], 0), 3) + d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x8xf32>, tensor<1x8xf32>, tensor<si32>) -> tensor<4x8xf32>
+  func.return(%stored) : (tensor<4x8xf32>) -> ()
+}
+
+// -----
+
+// A map whose result the function also returns keeps it, and the copy stays.
+// CHECK: func.func @store_and_keep([[CACHE:%[0-9]+]]: tensor<4x8xf32>, [[ROW:%[0-9]+]]: tensor<1x8xf32>, [[POSITION:%[0-9]+]]: tensor<si32>) -> (tensor<4x8xf32>, tensor<1x8xf32>) {
+// CHECK-NEXT: [[DOUBLED:%[0-9]+]] = tile.block([[ROW]]) {iters = [par 8], reads = [$0[0, d0]], folds = [none -> [0, d0]]} ({
+// CHECK: [[STORED:%[0-9]+]] = tile.block([[CACHE]], [[DOUBLED]], [[POSITION]]) {iters = [par 8], reads = [$1[0, d0]], folds = [none -> $0[min(max($2[], 0), 3), d0]]} ({
+// CHECK: func.return([[STORED]], [[DOUBLED]]) : (tensor<4x8xf32>, tensor<1x8xf32>) -> ()
+func.func @store_and_keep(%cache: tensor<4x8xf32>, %row: tensor<1x8xf32>, %position: tensor<si32>) -> (tensor<4x8xf32>, tensor<1x8xf32>) {
+  %doubled = tile.block(%row) {iters = [par 1, par 8], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    %twice = arith.add(%element, %element) : (f32, f32) -> f32
+    tile.yield(%twice) : (f32) -> ()
+  }) : (tensor<1x8xf32>) -> tensor<1x8xf32>
+  %stored = tile.block(%cache, %doubled, %position) {iters = [par 1, par 8], reads = [$1[d0, d1]], folds = [none -> $0[min(max($2[], 0), 3) + d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x8xf32>, tensor<1x8xf32>, tensor<si32>) -> tensor<4x8xf32>
+  func.return(%stored, %doubled) : (tensor<4x8xf32>, tensor<1x8xf32>) -> ()
+}

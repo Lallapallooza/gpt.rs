@@ -56,3 +56,15 @@ func.func @split_axis(%input: tensor<4x6xf32>) -> tensor<4x2x3xf32> {
   %split = tensor.reshape(%input) {shape = [4, 2, 3]} : (tensor<4x6xf32>) -> tensor<4x2x3xf32>
   func.return(%split) : (tensor<4x2x3xf32>) -> ()
 }
+
+// -----
+
+// `x * x` reads `x` once, and multiplies that element by itself.
+// CHECK: func.func @square([[INPUT:%[0-9]+]]: tensor<4xf32>)
+// CHECK-NEXT: tile.block([[INPUT]]) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0]]}
+// CHECK-NEXT: ^body([[ELEMENT:%[0-9]+]]: f32):
+// CHECK-NEXT: arith.mul([[ELEMENT]], [[ELEMENT]])
+func.func @square(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %squares = tensor.mul(%input, %input) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%squares) : (tensor<4xf32>) -> ()
+}

@@ -1,0 +1,87 @@
+// RUN: pass name-target {target = "x86-64-v4", numerics = <contract = true, reassoc = true>}, select-atoms {target = "x86-64-v4"}, split-lane-folds {target = "x86-64-v4"}
+
+// Rows of a matrix times a vector: vectors along the 24 rows of the result would read the matrix
+// down its columns, so the lanes run along the 64 points of the sum instead. The points fall into
+// 16 lanes over 4 tiles, each lane taking the point at its own position in every tile. The block
+// that adds them sums the 16 lanes of each element in halves: lane 0 with lane 8, ..., then pairs
+// of those, until one is left.
+// ROUNDING: reassoc: the lanes add their points in another order than the reference's one sum
+// CHECK: tile.dispatch @rows_of_matrix([[VECTOR:%[0-9]+]]: tensor<1x64xf32>, [[MATRIX:%[0-9]+]]: tensor<24x64xf32>) -> tensor<1x24xf32> attributes {target = "x86-64-v4@{{[0-9a-f]+}}", numerics = <contract = true, reassoc = true>} {
+// CHECK-NEXT: [[LANE_SUMS:%[0-9]+]] = tile.block([[VECTOR]], [[MATRIX]]) {iters = [par 24, red 4, par 16], reads = [$0[0, d1 * 16 + d2], $1[d0, d1 * 16 + d2]], folds = [sum -> [0, d0, d2]], loops = [d0 by 1, d1 by 1, d2 by 16 : lanes]} ({
+// CHECK: }) : (tensor<1x64xf32>, tensor<24x64xf32>) -> tensor<1x24x16xf32>
+// CHECK-NEXT: [[SUMS:%[0-9]+]] = tile.block([[LANE_SUMS]]) {iters = [par 24], reads = [$0[0, d0, 0], $0[0, d0, 1], $0[0, d0, 2], $0[0, d0, 3], $0[0, d0, 4], $0[0, d0, 5], $0[0, d0, 6], $0[0, d0, 7], $0[0, d0, 8], $0[0, d0, 9], $0[0, d0, 10], $0[0, d0, 11], $0[0, d0, 12], $0[0, d0, 13], $0[0, d0, 14], $0[0, d0, 15]], folds = [none -> [0, d0]]} ({
+// CHECK-NEXT: ^body([[LANE_0:%[0-9]+]]: f32, [[LANE_1:%[0-9]+]]: f32, [[LANE_2:%[0-9]+]]: f32, [[LANE_3:%[0-9]+]]: f32, [[LANE_4:%[0-9]+]]: f32, [[LANE_5:%[0-9]+]]: f32, [[LANE_6:%[0-9]+]]: f32, [[LANE_7:%[0-9]+]]: f32, [[LANE_8:%[0-9]+]]: f32, [[LANE_9:%[0-9]+]]: f32, [[LANE_10:%[0-9]+]]: f32, [[LANE_11:%[0-9]+]]: f32, [[LANE_12:%[0-9]+]]: f32, [[LANE_13:%[0-9]+]]: f32, [[LANE_14:%[0-9]+]]: f32, [[LANE_15:%[0-9]+]]: f32):
+// CHECK-NEXT: [[PAIR:%[0-9]+]] = arith.add([[LANE_0]], [[LANE_8]]) : (f32, f32) -> f32
+// CHECK: [[QUARTER:%[0-9]+]] = arith.add([[PAIR]], {{%[0-9]+}}) : (f32, f32) -> f32
+// CHECK: [[HALF:%[0-9]+]] = arith.add([[QUARTER]], {{%[0-9]+}}) : (f32, f32) -> f32
+// CHECK: [[TOTAL:%[0-9]+]] = arith.add([[HALF]], {{%[0-9]+}}) : (f32, f32) -> f32
+// CHECK-NEXT: tile.yield([[TOTAL]]) : (f32) -> ()
+// CHECK: func.return([[SUMS]]) : (tensor<1x24xf32>) -> ()
+tile.dispatch @rows_of_matrix(%vector: tensor<1x64xf32>, %matrix: tensor<24x64xf32>) -> tensor<1x24xf32> {
+  %product = tile.block(%vector, %matrix) {iters = [par 24, red 64], reads = [$0[0, d1], $1[d0, d1]], folds = [sum -> [0, d0]]} ({
+  ^body(%element: f32, %weight: f32):
+    %term = arith.mul(%element, %weight) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<1x64xf32>, tensor<24x64xf32>) -> tensor<1x24xf32>
+  func.return(%product) : (tensor<1x24xf32>) -> ()
+}
+func.func @main(%vector: tensor<1x64xf32>, %matrix: tensor<24x64xf32>) -> tensor<1x24xf32> {
+  %product = host.dispatch(%vector, %matrix) {callee = @rows_of_matrix} : (tensor<1x64xf32>, tensor<24x64xf32>) -> tensor<1x24xf32>
+  func.return(%product) : (tensor<1x24xf32>) -> ()
+}
+
+// -----
+
+// A sum whose points the lanes do not fill stays on scalars where the numerics do not skip the
+// products of the pad 0 (`skip_pad`): the vectors past its end would read the pad, and a 0 times
+// another read's value adds nothing only where that value is finite.
+// CHECK: tile.block({{%[0-9]+}}, {{%[0-9]+}}) {iters = [par 24, red 40], reads = [$0[0, d1], $1[d0, d1]], folds = [sum -> [0, d0]]} ({
+tile.dispatch @ragged(%vector: tensor<1x40xf32>, %matrix: tensor<24x40xf32>) -> tensor<1x24xf32> {
+  %product = tile.block(%vector, %matrix) {iters = [par 24, red 40], reads = [$0[0, d1], $1[d0, d1]], folds = [sum -> [0, d0]]} ({
+  ^body(%element: f32, %weight: f32):
+    %term = arith.mul(%element, %weight) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<1x40xf32>, tensor<24x40xf32>) -> tensor<1x24xf32>
+  func.return(%product) : (tensor<1x24xf32>) -> ()
+}
+func.func @main(%vector: tensor<1x40xf32>, %matrix: tensor<24x40xf32>) -> tensor<1x24xf32> {
+  %product = host.dispatch(%vector, %matrix) {callee = @ragged} : (tensor<1x40xf32>, tensor<24x40xf32>) -> tensor<1x24xf32>
+  func.return(%product) : (tensor<1x24xf32>) -> ()
+}
+
+// -----
+
+// The sum of each of 12 rows of 70 scores, which the 16 lanes do not fill, splits without
+// `skip_pad`: past the 70th score, the lanes read the pad -0, the identity of the sum, which adds
+// nothing to any sum.
+// ROUNDING: reassoc: the lanes add their points in another order than the reference's one sum
+// CHECK: [[LANE_SUMS:%[0-9]+]] = tile.block({{%[0-9]+}}) {iters = [par 12, red 5, par 16], reads = [$0[d0, d1 * 16 + d2] pad -0.0], folds = [sum -> [d0, d2]], loops = [d0 by 1, d1 by 1, d2 by 16 : lanes]} ({
+// CHECK: tile.block([[LANE_SUMS]]) {iters = [par 12], reads = [$0[d0, 0],
+tile.dispatch @row_sums(%scores: tensor<12x70xf32>) -> tensor<12xf32> {
+  %sums = tile.block(%scores) {iters = [par 12, red 70], reads = [$0[d0, d1]], folds = [sum -> [d0]]} ({
+  ^body(%score: f32):
+    tile.yield(%score) : (f32) -> ()
+  }) : (tensor<12x70xf32>) -> tensor<12xf32>
+  func.return(%sums) : (tensor<12xf32>) -> ()
+}
+func.func @main(%scores: tensor<12x70xf32>) -> tensor<12xf32> {
+  %sums = host.dispatch(%scores) {callee = @row_sums} : (tensor<12x70xf32>) -> tensor<12xf32>
+  func.return(%sums) : (tensor<12xf32>) -> ()
+}
+
+// -----
+
+// A sum whose points fold in order (`red_ordered`) keeps its order, and stays on scalars.
+// CHECK: tile.block({{%[0-9]+}}, {{%[0-9]+}}) {iters = [par 24, red_ordered 64], reads = [$0[0, d1], $1[d0, d1]], folds = [sum -> [0, d0]]} ({
+tile.dispatch @ordered(%vector: tensor<1x64xf32>, %matrix: tensor<24x64xf32>) -> tensor<1x24xf32> {
+  %product = tile.block(%vector, %matrix) {iters = [par 24, red_ordered 64], reads = [$0[0, d1], $1[d0, d1]], folds = [sum -> [0, d0]]} ({
+  ^body(%element: f32, %weight: f32):
+    %term = arith.mul(%element, %weight) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<1x64xf32>, tensor<24x64xf32>) -> tensor<1x24xf32>
+  func.return(%product) : (tensor<1x24xf32>) -> ()
+}
+func.func @main(%vector: tensor<1x64xf32>, %matrix: tensor<24x64xf32>) -> tensor<1x24xf32> {
+  %product = host.dispatch(%vector, %matrix) {callee = @ordered} : (tensor<1x64xf32>, tensor<24x64xf32>) -> tensor<1x24xf32>
+  func.return(%product) : (tensor<1x24xf32>) -> ()
+}

@@ -1,0 +1,93 @@
+// RUN: pass inline-static-maps, canonicalize
+
+// A projection reads its bf16 weight widened to f32: the widening is computed where the
+// projection reads each element, so the projection reads the weight as stored.
+// CHECK: tile.block({{%[0-9]+}}, {{%[0-9]+}}) {iters = [par 4, par 32, red 8], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
+// CHECK-NEXT: ^body([[ACTIVATION:%[0-9]+]]: f32, [[STORED:%[0-9]+]]: bf16):
+// CHECK-NEXT: [[WIDE:%[0-9]+]] = arith.cast([[STORED]]) {to = f32} : (bf16) -> f32
+// CHECK-NEXT: [[TERM:%[0-9]+]] = arith.mul([[ACTIVATION]], [[WIDE]]) : (f32, f32) -> f32
+// CHECK-NEXT: tile.yield([[TERM]]) : (f32) -> ()
+// CHECK-NOT: tile.block
+func.func @widened(%input: tensor<4x8xf32>, %weight: tensor<32x8xbf16> {param = 1}) -> tensor<4x32xf32> {
+  %wide = tile.block(%weight) {iters = [par 32, par 8], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: bf16):
+    %widened = arith.cast(%element) {to = f32} : (bf16) -> f32
+    tile.yield(%widened) : (f32) -> ()
+  }) : (tensor<32x8xbf16>) -> tensor<32x8xf32>
+  %projected = tile.block(%input, %wide) {iters = [par 4, par 32, red 8], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
+  ^body(%activation: f32, %coefficient: f32):
+    %term = arith.mul(%activation, %coefficient) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<4x8xf32>, tensor<32x8xf32>) -> tensor<4x32xf32>
+  func.return(%projected) : (tensor<4x32xf32>) -> ()
+}
+
+// -----
+
+// A weight of 4-bit codes dequantized with a scale and an offset per group of 4 codes along a
+// row, which the map reads at the group's coordinate: the projection reads the codes, the scales
+// and the offsets at the coordinates the map reads them at its point, and `canonicalize` splits
+// its sum at the groups.
+// CHECK: tile.block({{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}) {iters = [par 2, par 16, red 2, red 4], reads = [$0[d0, d2 * 4 + d3], $1[d1, d2 * 4 + d3], $2[d1, d2], $3[d1, d2]], folds = [sum -> [d0, d1]]} ({
+// CHECK-NEXT: ^body([[ACTIVATION:%[0-9]+]]: f32, [[CODE:%[0-9]+]]: ui4, [[SCALE:%[0-9]+]]: f32, [[OFFSET:%[0-9]+]]: f32):
+// CHECK-NEXT: [[VALUE:%[0-9]+]] = arith.cast([[CODE]]) {to = f32} : (ui4) -> f32
+// CHECK-NEXT: [[SCALED:%[0-9]+]] = arith.mul([[VALUE]], [[SCALE]]) : (f32, f32) -> f32
+// CHECK-NEXT: [[DEQUANTIZED:%[0-9]+]] = arith.add([[SCALED]], [[OFFSET]]) : (f32, f32) -> f32
+// CHECK-NEXT: [[TERM:%[0-9]+]] = arith.mul([[ACTIVATION]], [[DEQUANTIZED]]) : (f32, f32) -> f32
+// CHECK-NEXT: tile.yield([[TERM]]) : (f32) -> ()
+// CHECK-NOT: tile.block
+func.func @dequantized(%input: tensor<2x8xf32>, %codes: tensor<16x8xui4> {param = 1}, %scales: tensor<16x2xf32> {param = 2}, %offsets: tensor<16x2xf32> {param = 3}) -> tensor<2x16xf32> {
+  %weight = tile.block(%codes, %scales, %offsets) {iters = [par 16, par 8], reads = [$0[d0, d1], $1[d0, d1 floordiv 4], $2[d0, d1 floordiv 4]], folds = [none -> [d0, d1]]} ({
+  ^body(%code: ui4, %scale: f32, %offset: f32):
+    %value = arith.cast(%code) {to = f32} : (ui4) -> f32
+    %scaled = arith.mul(%value, %scale) : (f32, f32) -> f32
+    %dequantized = arith.add(%scaled, %offset) : (f32, f32) -> f32
+    tile.yield(%dequantized) : (f32) -> ()
+  }) : (tensor<16x8xui4>, tensor<16x2xf32>, tensor<16x2xf32>) -> tensor<16x8xf32>
+  %projected = tile.block(%input, %weight) {iters = [par 2, par 16, red 8], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
+  ^body(%activation: f32, %coefficient: f32):
+    %term = arith.mul(%activation, %coefficient) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<2x8xf32>, tensor<16x8xf32>) -> tensor<2x16xf32>
+  func.return(%projected) : (tensor<2x16xf32>) -> ()
+}
+
+// -----
+
+// A weight scaled before the run takes no more bytes than the weight and the scale it reads:
+// `outline-static` computes it once at load time, and the projection reads the result.
+// CHECK: [[SCALED:%[0-9]+]] = tile.block({{%[0-9]+}}, {{%[0-9]+}}) {iters = [par 32, par 8], reads = [$0[d0, d1], $1[d0]], folds = [none -> [d0, d1]]} ({
+// CHECK: tile.block({{%[0-9]+}}, [[SCALED]]) {iters = [par 4, par 32, red 8], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
+func.func @scaled(%input: tensor<4x8xf32>, %weight: tensor<32x8xf32> {param = 1}, %scale: tensor<32xf32> {param = 2}) -> tensor<4x32xf32> {
+  %scaled = tile.block(%weight, %scale) {iters = [par 32, par 8], reads = [$0[d0, d1], $1[d0]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32, %factor: f32):
+    %product = arith.mul(%element, %factor) : (f32, f32) -> f32
+    tile.yield(%product) : (f32) -> ()
+  }) : (tensor<32x8xf32>, tensor<32xf32>) -> tensor<32x8xf32>
+  %projected = tile.block(%input, %scaled) {iters = [par 4, par 32, red 8], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
+  ^body(%activation: f32, %coefficient: f32):
+    %term = arith.mul(%activation, %coefficient) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<4x8xf32>, tensor<32x8xf32>) -> tensor<4x32xf32>
+  func.return(%projected) : (tensor<4x32xf32>) -> ()
+}
+
+// -----
+
+// Activations widened at run time are no copy of the parameters: the projection reads the
+// widened values.
+// CHECK: [[WIDE:%[0-9]+]] = tile.block({{%[0-9]+}}) {iters = [par 4, par 8], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+// CHECK: tile.block([[WIDE]], {{%[0-9]+}}) {iters = [par 4, par 32, red 8], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
+func.func @activations(%input: tensor<4x8xbf16>, %weight: tensor<32x8xf32> {param = 1}) -> tensor<4x32xf32> {
+  %wide = tile.block(%input) {iters = [par 4, par 8], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: bf16):
+    %widened = arith.cast(%element) {to = f32} : (bf16) -> f32
+    tile.yield(%widened) : (f32) -> ()
+  }) : (tensor<4x8xbf16>) -> tensor<4x8xf32>
+  %projected = tile.block(%wide, %weight) {iters = [par 4, par 32, red 8], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
+  ^body(%activation: f32, %coefficient: f32):
+    %term = arith.mul(%activation, %coefficient) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<4x8xf32>, tensor<32x8xf32>) -> tensor<4x32xf32>
+  func.return(%projected) : (tensor<4x32xf32>) -> ()
+}

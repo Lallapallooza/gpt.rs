@@ -310,6 +310,20 @@ impl<'m> Rewriter<'m> {
     /// before the top-level op that holds the insertion point. A symbol whose text names it, such
     /// as a dispatch named by the hash of its body, is built in a module of its own first.
     pub fn add_symbol(&mut self, source: &Module, symbol: impl AsInst) {
+        self.copy_symbol(source, symbol);
+    }
+
+    /// Adds a copy of `symbol` as [`Rewriter::add_symbol`] does, with `op` in place of its op: an
+    /// op of the same kind under other attributes, such as the name that its text gives it once
+    /// built.
+    pub fn add_symbol_as(&mut self, source: &Module, symbol: impl AsInst, op: Op) {
+        let copy = self.copy_symbol(source, symbol);
+        self.staging().scratch.set_op(&KEY, copy, op);
+    }
+
+    /// Stages a copy of `symbol` of `source` before the top-level op that holds the insertion
+    /// point, and gives it.
+    fn copy_symbol(&mut self, source: &Module, symbol: impl AsInst) -> Inst {
         let anchor = self.module.top_level_op(self.insertion_point);
         let location = self.created_location();
         let staging = self.staging();
@@ -321,6 +335,7 @@ impl<'m> Rewriter<'m> {
             .expect("a symbol reads no value from outside it");
         staging.scratch.set_location(&KEY, copy, location);
         staging.anchors.push((copy, anchor));
+        copy
     }
 
     /// Creates the op value `op`, which has no regions, on `operands` in the groups `segments`, in

@@ -31,8 +31,8 @@ func.func @twice(%lhs: tensor<4xf32>, %rhs: tensor<4xf32>) -> tensor<4xf32> {
 
 // -----
 
-// A group is one dispatch: its blocks, its grid, and what it yields.
-// CHECK: tile.dispatch @[[GROUP:dispatch\.[0-9a-f]+]]([[INPUT:%[0-9]+]]: tensor<2x3xf32>, [[BIAS:%[0-9]+]]: tensor<3xf32>) -> tensor<2x3xf32> attributes {grid = [d0, d1]} {
+// A group is one dispatch: its blocks, and what it yields.
+// CHECK: tile.dispatch @[[GROUP:dispatch\.[0-9a-f]+]]([[INPUT:%[0-9]+]]: tensor<2x3xf32>, [[BIAS:%[0-9]+]]: tensor<3xf32>) -> tensor<2x3xf32> {
 // CHECK-NEXT: [[SHIFTED:%[0-9]+]] = tile.block([[INPUT]], [[BIAS]])
 // CHECK: [[RECTIFIED:%[0-9]+]] = tile.block([[SHIFTED]])
 // CHECK: func.return([[RECTIFIED]]) : (tensor<2x3xf32>) -> ()
@@ -41,7 +41,7 @@ func.func @twice(%lhs: tensor<4xf32>, %rhs: tensor<4xf32>) -> tensor<4xf32> {
 // CHECK-NEXT: func.return([[ACTIVATED]]) : (tensor<2x3xf32>) -> ()
 // CHECK-NOT: tile.group
 func.func @grouped(%input: tensor<2x3xf32>, %bias: tensor<3xf32>) -> tensor<2x3xf32> {
-  %activated = tile.group() {grid = [d0, d1]} ({
+  %activated = tile.group() ({
     %shifted = tile.block(%input, %bias) {iters = [par 2, par 3], reads = [$0[d0, d1], $1[d1]], folds = [none -> [d0, d1]]} ({
     ^body(%element: f32, %shift: f32):
       %sum = arith.add(%element, %shift) : (f32, f32) -> f32

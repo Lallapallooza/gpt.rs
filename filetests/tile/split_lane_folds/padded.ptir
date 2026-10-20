@@ -1,0 +1,59 @@
+// RUN: pass name-target {target = "x86-64-v4", numerics = <contract = true, reassoc = true, skip_pad = true>}, select-atoms {target = "x86-64-v4"}, split-lane-folds {target = "x86-64-v4"}
+
+// Rows of a matrix times a vector over 40 points, which the 16 lanes do not fill: the lane sums run
+// over 3 vectors, and the reads past the 40th point read the pad -0, the identity of the sum,
+// whose products the numerics skip (`skip_pad`), so that they add nothing to the sums.
+// ROUNDING: reassoc: the lanes add their points in another order than the reference's one sum
+// CHECK: [[LANE_SUMS:%[0-9]+]] = tile.block({{%[0-9]+}}, {{%[0-9]+}}) {iters = [par 24, red 3, par 16], reads = [$0[0, d1 * 16 + d2] pad -0.0, $1[d0, d1 * 16 + d2] pad -0.0], folds = [sum -> [0, d0, d2]], loops = [d0 by 1, d1 by 1, d2 by 16 : lanes]} ({
+// CHECK: tile.block([[LANE_SUMS]]) {iters = [par 24], reads = [$0[0, d0, 0],
+tile.dispatch @ragged(%vector: tensor<1x40xf32>, %matrix: tensor<24x40xf32>) -> tensor<1x24xf32> {
+  %product = tile.block(%vector, %matrix) {iters = [par 24, red 40], reads = [$0[0, d1], $1[d0, d1]], folds = [sum -> [0, d0]]} ({
+  ^body(%element: f32, %weight: f32):
+    %term = arith.mul(%element, %weight) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<1x40xf32>, tensor<24x40xf32>) -> tensor<1x24xf32>
+  func.return(%product) : (tensor<1x24xf32>) -> ()
+}
+func.func @main(%vector: tensor<1x40xf32>, %matrix: tensor<24x40xf32>) -> tensor<1x24xf32> {
+  %product = host.dispatch(%vector, %matrix) {callee = @ragged} : (tensor<1x40xf32>, tensor<24x40xf32>) -> tensor<1x24xf32>
+  func.return(%product) : (tensor<1x24xf32>) -> ()
+}
+
+// -----
+
+// Heads of 8 elements that share an axis with the heads: a point past the 8th of a head reads the
+// next head, not the pad, so the sum the lanes do not fill stays on scalars.
+// CHECK: tile.block({{%[0-9]+}}, {{%[0-9]+}}) {iters = [par 2, par 6, red 8], reads = [$0[0, d0 * 8 + d2], $1[d1, d0 * 8 + d2]], folds = [sum -> [0, d0, d1]]} ({
+tile.dispatch @heads(%query: tensor<1x16xf32>, %keys: tensor<6x16xf32>) -> tensor<1x2x6xf32> {
+  %scores = tile.block(%query, %keys) {iters = [par 2, par 6, red 8], reads = [$0[0, d0 * 8 + d2], $1[d1, d0 * 8 + d2]], folds = [sum -> [0, d0, d1]]} ({
+  ^body(%element: f32, %key: f32):
+    %term = arith.mul(%element, %key) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<1x16xf32>, tensor<6x16xf32>) -> tensor<1x2x6xf32>
+  func.return(%scores) : (tensor<1x2x6xf32>) -> ()
+}
+func.func @main(%query: tensor<1x16xf32>, %keys: tensor<6x16xf32>) -> tensor<1x2x6xf32> {
+  %scores = host.dispatch(%query, %keys) {callee = @heads} : (tensor<1x16xf32>, tensor<6x16xf32>) -> tensor<1x2x6xf32>
+  func.return(%scores) : (tensor<1x2x6xf32>) -> ()
+}
+
+// -----
+
+// Scales, padded on the axis of the rows, times 40 scores shifted by a shift, which the 16 lanes do
+// not fill: a point past the 40th would read the pad -0 of the scores and add the scale times the
+// shift. The products of the scales' own pad add nothing, but the scales do not take the reduced
+// iterator, so the sum stays on scalars.
+// CHECK: tile.block({{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}) {iters = [par 24, red 40], reads = [$0[d0 - 1] pad 0.0, $1[d0, d1], $2[d0]], folds = [sum -> [d0]]} ({
+tile.dispatch @scaled_shifted(%scales: tensor<24xf32>, %scores: tensor<24x40xf32>, %shifts: tensor<24xf32>) -> tensor<24xf32> {
+  %sums = tile.block(%scales, %scores, %shifts) {iters = [par 24, red 40], reads = [$0[d0 - 1] pad 0.0, $1[d0, d1], $2[d0]], folds = [sum -> [d0]]} ({
+  ^body(%scale: f32, %score: f32, %shift: f32):
+    %shifted = arith.add(%score, %shift) : (f32, f32) -> f32
+    %term = arith.mul(%scale, %shifted) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<24xf32>, tensor<24x40xf32>, tensor<24xf32>) -> tensor<24xf32>
+  func.return(%sums) : (tensor<24xf32>) -> ()
+}
+func.func @main(%scales: tensor<24xf32>, %scores: tensor<24x40xf32>, %shifts: tensor<24xf32>) -> tensor<24xf32> {
+  %sums = host.dispatch(%scales, %scores, %shifts) {callee = @scaled_shifted} : (tensor<24xf32>, tensor<24x40xf32>, tensor<24xf32>) -> tensor<24xf32>
+  func.return(%sums) : (tensor<24xf32>) -> ()
+}

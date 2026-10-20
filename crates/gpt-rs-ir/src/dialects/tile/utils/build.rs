@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use smallvec::SmallVec;
 
 use crate::dialects::arith::ScalarBuilder;
-use crate::dialects::tile::ir::{Block, Fold, Index, IterList, Yield};
+use crate::dialects::tile::ir::{Block, Fold, Index, IterList, Iters, Yield};
 use crate::dialects::tile::{Iter, IterKind, Read};
 use crate::ir::{AccessExpr, Constraint, DType, Dim, IndexExpr, Module, Region, Value, MAX_ITERS};
 use crate::rewrite::{Build, Builder};
@@ -14,15 +14,9 @@ use crate::traits::Terminator;
 
 impl Block {
     /// A block over `iters` with these reads and folds, and no constraints.
-    #[track_caller]
-    pub fn new(iters: Vec<Iter>, reads: Vec<Read>, folds: Vec<Fold>) -> Self {
-        assert!(
-            iters.len() <= MAX_ITERS,
-            "a block has at most {MAX_ITERS} iterators, not {}",
-            iters.len()
-        );
+    pub fn new(iters: Iters, reads: Vec<Read>, folds: Vec<Fold>) -> Self {
         Self {
-            iters: iters.into_iter().collect(),
+            iters,
             reads: reads.into(),
             folds: folds.into(),
             constraints: SmallVec::new(),
@@ -108,8 +102,9 @@ impl Inputs {
 
 /// One parallel iterator over each of `dims`, the first ones of a block, with the expressions
 /// that name them.
-pub fn par_iters(dims: &[Dim]) -> (Vec<Iter>, Vec<IndexExpr>) {
-    let mut iters = Vec::with_capacity(dims.len());
+#[track_caller]
+pub fn par_iters(dims: &[Dim]) -> (Iters, Vec<IndexExpr>) {
+    let mut iters = Iters::new();
     for dim in dims {
         push_iter(&mut iters, IterKind::Par, dim.clone());
     }
@@ -122,7 +117,12 @@ pub fn par_iters(dims: &[Dim]) -> (Vec<Iter>, Vec<IndexExpr>) {
 
 /// Adds an iterator of `kind` over `extent` after `iters`, and gives the expression that names
 /// it.
-pub fn push_iter(iters: &mut Vec<Iter>, kind: IterKind, extent: Dim) -> IndexExpr {
+#[track_caller]
+pub fn push_iter(iters: &mut Iters, kind: IterKind, extent: Dim) -> IndexExpr {
+    assert!(
+        iters.len() < MAX_ITERS,
+        "a block has at most {MAX_ITERS} iterators"
+    );
     iters.push(Iter::new(kind, extent));
     IndexExpr::iter(iters.len() - 1)
 }

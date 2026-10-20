@@ -1,20 +1,21 @@
 //! The type rules of `tile.block`, `tile.index` and `tile.yield`: the types each op gives, and what
 //! it rejects.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{anyhow, bail, ensure, Result};
 
+use super::schedule::check_schedule;
 use crate::dialects::tensor::utils::class::{ensure_dtype_class, ARITHMETIC};
 use crate::dialects::tile::ir::*;
-use crate::dialects::tile::{Iter, IterKind, Write};
+use crate::dialects::tile::{Iter, IterKind, Read, Write};
 use crate::ir::{
-    ranked, DType, Dim, Expr, NoRegions, OpDef, OperandRef, OwnedTypes, ReadKind, Region,
-    RegionOpDef, RegionSig, TensorType, Type, TypeCx, Types,
+    ranked, DType, Dim, Expr, IndexEnv, Module, NoRegions, OpDef, OperandRef, OwnedTypes, ReadKind,
+    Region, RegionOpDef, RegionSig, Sym, TensorType, Type, TypeCx, Types, Value, MAX_ITERS,
 };
 
 impl RegionOpDef for Block {
-    fn region_signatures(&self, ins: BlockOperands<Types<'_>>) -> Result<BlockRegions<RegionSig>> {
+    fn region_signatures(&self, ins: BlockOperands<Types>) -> Result<BlockRegions<RegionSig>> {
         let args = self
             .reads
             .iter()
@@ -39,8 +40,8 @@ impl RegionOpDef for Block {
 impl OpDef for Block {
     fn result_types(
         &self,
-        ins: BlockOperands<Types<'_>>,
-        cx: &TypeCx<'_, BlockRegions<Region>>,
+        ins: BlockOperands<Types>,
+        cx: &TypeCx<BlockRegions<Region>>,
     ) -> Result<BlockResults<OwnedTypes>> {
         let operands: &[&TensorType] = &ins.ins;
         let scope = Scope {
@@ -63,38 +64,8 @@ impl OpDef for Block {
             "a block with a prefix iterator has no reduction iterators"
         );
 
-        for (index, read) in self.reads.iter().enumerate() {
-            let range = read.source.operands();
-            ensure!(
-                range.end <= operands.len(),
-                "read {index} names operand ${}, but the block has {} operands",
-                range.end - 1,
-                operands.len()
-            );
-            let ty = operands[range.start];
-            for &other in &operands[range.clone()] {
-                ensure!(
-                    other == ty,
-                    "the operands of read {index} differ in type: {ty} and {other}"
-                );
-            }
-            ensure!(
-                read.coords.len() == ty.rank(),
-                "read {index} gives {} coordinates for {ty}",
-                read.coords.len()
-            );
-            for expr in read.exprs() {
-                scope.check(expr, &format!("read {index}"))?;
-            }
-            if let Some(pad) = read.pad {
-                ensure!(
-                    ty.dtype.represents(pad.0),
-                    "read {index} pads with {}, which is not a {} value",
-                    pad.0,
-                    ty.dtype
-                );
-            }
-        }
+        check_reads(self, &scope)?;
+        check_schedule(self)?;
         for (index, constraint) in self.constraints.iter().enumerate() {
             for expr in constraint.exprs() {
                 scope.check(expr, &format!("constraint {index}"))?;
@@ -109,11 +80,9 @@ impl OpDef for Block {
             }
         }
         let yields = Block::yield_types(module, body)?;
-        let taken: usize = self
-            .folds
-            .iter()
-            .map(|fold| fold.combine.rule().yields())
-            .sum();
+        let depends = yield_iters(self, module, body);
+        let ranges = self.fold_ranges();
+        let taken = ranges.last().map_or(0, |(yielded, _)| yielded.end);
         ensure!(
             taken == yields.len(),
             "the folds take {taken} yielded values, but the body yields {}",
@@ -127,41 +96,7 @@ impl OpDef for Block {
             reductions + prefixes == 0 || folding,
             "a block with reduction or prefix iterators needs a fold other than none"
         );
-        let mut outs = Vec::new();
-        let mut first_yield = 0;
-        for (index, fold) in self.folds.iter().enumerate() {
-            let kind = &fold.combine;
-            ensure!(
-                fold.writes.len() == kind.rule().results(),
-                "fold {index} has {} writes, but {} gives {} results",
-                fold.writes.len(),
-                kind.name(),
-                kind.rule().results()
-            );
-            for lane in kind.rule().lanes().positions() {
-                ensure!(
-                    self.iters.get(lane).map(|iter| iter.kind) == Some(IterKind::Par),
-                    "lane d{lane} is not a parallel iterator of the block"
-                );
-            }
-            let dtypes = kind
-                .rule()
-                .result_dtypes(&yields[first_yield..first_yield + kind.rule().yields()])?;
-            let first_result = outs.len();
-            for (result, (&dtype, write)) in dtypes.iter().zip(&fold.writes).enumerate() {
-                let what = format!("write {}", outs.len());
-                ensure!(
-                    self.constraints.is_empty()
-                        || write.into.is_some()
-                        || *kind != CombineKind::None,
-                    "result {} is a plain new tensor, which a block with constraints cannot write",
-                    outs.len()
-                );
-                outs.push(write_type(self, &scope, write, &what, kind, result, dtype)?);
-            }
-            check_init(fold, operands, &outs[first_result..])?;
-            first_yield += kind.rule().yields();
-        }
+        let outs = fold_types(self, &scope, &yields, &depends)?;
         Ok(BlockResults { outs })
     }
 }
@@ -169,8 +104,8 @@ impl OpDef for Block {
 impl OpDef for Index {
     fn result_types(
         &self,
-        _ins: IndexOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        _ins: IndexOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<IndexResults<OwnedTypes>> {
         ensure_dtype_class("dtype", self.dtype, ARITHMETIC)?;
         Ok(IndexResults { output: self.dtype })
@@ -180,11 +115,119 @@ impl OpDef for Index {
 impl OpDef for Yield {
     fn result_types(
         &self,
-        _ins: YieldOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        _ins: YieldOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<YieldResults<OwnedTypes>> {
         Ok(YieldResults::default())
     }
+}
+
+/// Checks the reads of `block`: the operands each names and their types, its coordinates and
+/// its pad.
+fn check_reads(block: &Block, scope: &Scope) -> Result<()> {
+    let operands = scope.operands;
+    for (index, read) in block.reads.iter().enumerate() {
+        let range = read.source.operands();
+        ensure!(
+            range.end <= operands.len(),
+            "read {index} names operand ${}, but the block has {} operands",
+            range.end - 1,
+            operands.len()
+        );
+        let ty = operands[range.start];
+        for &other in &operands[range.clone()] {
+            ensure!(
+                other == ty,
+                "the operands of read {index} differ in type: {ty} and {other}"
+            );
+        }
+        ensure!(
+            read.coords.len() == ty.rank(),
+            "read {index} gives {} coordinates for {ty}",
+            read.coords.len()
+        );
+        for expr in read.exprs() {
+            scope.check(expr, &format!("read {index}"))?;
+        }
+        if read.pad.is_none() && block.constraints.is_empty() {
+            check_corners(block, index, read, ty)?;
+        }
+        if let Some(pad) = read.pad {
+            ensure!(
+                ty.dtype.represents(pad.0),
+                "read {index} pads with {}, which is not a {} value",
+                pad.0,
+                ty.dtype
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The types of the results of the folds of `block`, which take the values of dtypes `yields`
+/// that its body yields, each depending on the iterators `depends` holds for it.
+fn fold_types(
+    block: &Block,
+    scope: &Scope,
+    yields: &[DType],
+    depends: &[BTreeSet<usize>],
+) -> Result<Vec<TensorType>> {
+    let mut outs = Vec::new();
+    let ranges = block.fold_ranges();
+    for (index, (fold, (taken, _))) in block.folds.iter().zip(ranges).enumerate() {
+        let kind = &fold.combine;
+        ensure!(
+            fold.writes.len() == kind.rule().results(),
+            "fold {index} has {} writes, but {} gives {} results",
+            fold.writes.len(),
+            kind.name(),
+            kind.rule().results()
+        );
+        check_value_iters(block, kind, taken.start, depends)?;
+        let dtypes = kind.rule().result_dtypes(kind.name(), &yields[taken])?;
+        let first_result = outs.len();
+        for (result, (&dtype, write)) in dtypes.iter().zip(&fold.writes).enumerate() {
+            let what = format!("write {}", outs.len());
+            ensure!(
+                block.constraints.is_empty() || write.into.is_some() || *kind != CombineKind::None,
+                "result {} is a plain new tensor, which a block with constraints cannot write",
+                outs.len()
+            );
+            outs.push(write_type(block, scope, write, &what, kind, result, dtype)?);
+        }
+        check_init(fold, scope.operands, &outs[first_result..])?;
+    }
+    Ok(outs)
+}
+
+/// Checks that each of the value's iterators of `kind`, the combine kind of a fold whose yields
+/// start at `first_yield`, is a parallel iterator of `block`, and that no value the fold takes and
+/// keeps apart from them depends on one.
+fn check_value_iters(
+    block: &Block,
+    kind: &CombineKind,
+    first_yield: usize,
+    depends: &[BTreeSet<usize>],
+) -> Result<()> {
+    for value_iter in kind.rule().value_iters().positions() {
+        ensure!(
+            block.iters.get(value_iter).map(|iter| iter.kind) == Some(IterKind::Par),
+            "the value's iterator d{value_iter} is not a parallel iterator of the block"
+        );
+        for yielded in 0..kind.rule().yields() {
+            if !kind.rule().independent_of_value_iters(yielded) {
+                continue;
+            }
+            let position = first_yield + yielded;
+            ensure!(
+                !depends[position].contains(&value_iter),
+                "yielded value {position}, which {} keeps apart from the value's iterators, \
+                 depends on d{value_iter}",
+                kind.name()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// What the type rule of a block knows: its iterators and its operands.
@@ -227,11 +270,106 @@ impl Scope<'_> {
     }
 }
 
+/// Fails when read `index` of `block`, which has no pad, leaves `ty` at a corner of the block's
+/// points, where each iterator stands at its first or its last point: a point the block computes,
+/// unless constraints skip it, which the caller rules out. A coordinate that reads an operand or
+/// names a symbol, and a block without points, are left to the interpreter.
+fn check_corners(block: &Block, index: usize, read: &Read, ty: &TensorType) -> Result<()> {
+    let count = block.iters.len();
+    let mut lasts = [0_i64; MAX_ITERS];
+    for (position, iter) in block.iters.iter().enumerate() {
+        let Some(extent) = iter.extent.as_static() else {
+            return Ok(());
+        };
+        if extent == 0 {
+            return Ok(());
+        }
+        lasts[position] = extent as i64 - 1;
+    }
+    for (axis, coord) in read.coords.iter().enumerate() {
+        let Some(extent) = ty.dims[axis].as_static() else {
+            continue;
+        };
+        let used: Vec<usize> = coord.iters().into_iter().collect();
+        for corner in 0..1u32 << used.len() {
+            let mut point = [0_i64; MAX_ITERS];
+            for (bit, &position) in used.iter().enumerate() {
+                if corner >> bit & 1 == 1 {
+                    point[position] = lasts[position];
+                }
+            }
+            let at_corner = &point[..count];
+            let Ok(value) = coord.eval(&Corner(at_corner)) else {
+                break;
+            };
+            ensure!(
+                (0..extent as i64).contains(&value),
+                "read {index} has no pad, but coordinate {axis} is {value} at the point \
+                 {at_corner:?}, outside {ty}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A point of a block's iterators, for an expression that reads nothing and names no symbol.
+struct Corner<'p>(&'p [i64]);
+
+impl IndexEnv for Corner<'_> {
+    fn iter(&self, position: usize) -> Option<i64> {
+        self.0.get(position).copied()
+    }
+
+    fn sym(&self, _sym: &Sym) -> Option<i64> {
+        None
+    }
+
+    fn read(&self, _operand: usize, _coords: &[i64]) -> Result<i64> {
+        bail!("a corner reads no operand")
+    }
+}
+
+/// The iterators that each value the body of `block` yields depends on: through the reads whose
+/// values it uses, at the iterators their coordinates and picks name, and through the
+/// `tile.index` values it uses.
+fn yield_iters(block: &Block, module: &Module, body: Region) -> Vec<BTreeSet<usize>> {
+    let mut depends: HashMap<Value, BTreeSet<usize>> = HashMap::new();
+    for (arg, read) in module.args(body).iter().zip(&block.reads) {
+        let mut iters = BTreeSet::new();
+        for expr in read.exprs() {
+            iters.extend(expr.iters());
+        }
+        depends.insert(*arg, iters);
+    }
+    for inst in module.insts(body) {
+        let mut iters = BTreeSet::new();
+        for operand in module.operands(inst) {
+            if let Some(known) = depends.get(operand) {
+                iters.extend(known.iter().copied());
+            }
+        }
+        if let Some(index) = module.op(inst).get::<Index>() {
+            iters.extend(index.expr.iters());
+        }
+        if module.op(inst).get::<Yield>().is_some() {
+            let mut yielded = Vec::with_capacity(module.operands(inst).len());
+            for operand in module.operands(inst) {
+                yielded.push(depends.get(operand).cloned().unwrap_or_default());
+            }
+            return yielded;
+        }
+        for &result in module.results(inst) {
+            depends.insert(result, iters.clone());
+        }
+    }
+    Vec::new()
+}
+
 /// The type of the result that `write` places, result `result` of `kind`, of dtype `dtype`.
 /// `what` names the write in errors.
 fn write_type(
     block: &Block,
-    scope: &Scope<'_>,
+    scope: &Scope,
     write: &Write,
     what: &str,
     kind: &CombineKind,
@@ -282,11 +420,11 @@ fn write_type(
         ensure!(named.insert(position), "{what} names d{position} twice");
         dims.push(iter.extent.clone());
     }
-    let lanes = kind.rule().lanes();
+    let value_iters = kind.rule().value_iters();
     let mut expected = BTreeSet::new();
     for (position, iter) in block.iters.iter().enumerate() {
         let folded = *kind != CombineKind::None && iter.kind.is_reduced();
-        let dropped = kind.rule().drops_lanes(result) && lanes.contains(position);
+        let dropped = kind.rule().drops_value_iters(result) && value_iters.contains(position);
         if !folded && !dropped {
             expected.insert(position);
         }

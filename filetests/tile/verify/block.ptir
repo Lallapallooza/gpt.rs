@@ -133,9 +133,9 @@ func.func @constrained_plain_result(%input: tensor<4xf32>) -> tensor<4xf32> {
 
 // -----
 
-// ERROR: tile.block: lane d1 is not a parallel iterator of the block
-func.func @lane_not_parallel(%scores: tensor<4x8xf32>) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) {
-  %max, %sum, %accumulated = tile.block(%scores) {iters = [par 4, red 8], reads = [$0[d0, d1]], folds = [online_softmax<lanes = [d1]> -> ([d0], [d0], [d0])]} ({
+// ERROR: tile.block: the value's iterator d1 is not a parallel iterator of the block
+func.func @value_iter_not_parallel(%scores: tensor<4x8xf32>) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) {
+  %max, %sum, %accumulated = tile.block(%scores) {iters = [par 4, red 8], reads = [$0[d0, d1]], folds = [online_softmax<value_iters = [d1]> -> ([d0], [d0], [d0])]} ({
   ^body(%score: f32):
     tile.yield(%score, %score) : (f32, f32) -> ()
   }) : (tensor<4x8xf32>) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>)
@@ -215,4 +215,116 @@ func.func @arith_rng_dtype(%state: tensor<2xui64>) -> tensor<4xsi32> {
     tile.yield(%normal) : (si32) -> ()
   }) : (tensor<2xui64>) -> tensor<4xsi32>
   func.return(%normals) : (tensor<4xsi32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: a block has at most one prefix iterator
+func.func @two_prefixes(%input: tensor<4x4xf32>) -> tensor<4x4xf32> {
+  %output = tile.block(%input) {iters = [prefix 4, prefix 4], reads = [$0[d0, d1]], folds = [sum -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x4xf32>) -> tensor<4x4xf32>
+  func.return(%output) : (tensor<4x4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: read 0 names operand $1, but the block has 1 operands
+func.func @missing_operand(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %output = tile.block(%input) {iters = [par 4], reads = [$1[d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%output) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: read 0 names operand $2, but the block has 2 operands
+func.func @list_past_operands(%first: tensor<4xf32>, %second: tensor<4xf32>) -> tensor<4xf32> {
+  %output = tile.block(%first, %second) {iters = [par 4], reads = [$0..$2[0][d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%output) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: the operands of read 0 differ in type: tensor<4xf32> and tensor<8xf32>
+func.func @list_of_types(%first: tensor<4xf32>, %second: tensor<8xf32>) -> tensor<4xf32> {
+  %output = tile.block(%first, %second) {iters = [par 4], reads = [$0..$1[0][d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4xf32>, tensor<8xf32>) -> tensor<4xf32>
+  func.return(%output) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: fold 0 has 1 writes, but argmax gives 2 results
+func.func @argmax_one_write(%scores: tensor<4x4xf32>) -> tensor<4xf32> {
+  %best = tile.block(%scores) {iters = [par 4, red 4], reads = [$0[d0, d1]], folds = [argmax -> [d0]]} ({
+  ^body(%score: f32):
+    %index = tile.index() {expr = d1, dtype = si64} : () -> si64
+    tile.yield(%score, %index) : (f32, si64) -> ()
+  }) : (tensor<4x4xf32>) -> tensor<4xf32>
+  func.return(%best) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: write 0 updates $1, but the block has 1 operands
+func.func @update_missing(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %output = tile.block(%input) {iters = [par 4], reads = [$0[d0]], folds = [none -> $1[d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%output) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: write 0 writes f32 values into tensor<4xsi32>
+func.func @update_dtype(%input: tensor<4xf32>, %counts: tensor<4xsi32>) -> tensor<4xsi32> {
+  %output = tile.block(%input, %counts) {iters = [par 4], reads = [$0[d0]], folds = [none -> $1[d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4xf32>, tensor<4xsi32>) -> tensor<4xsi32>
+  func.return(%output) : (tensor<4xsi32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: init lists 2 operands, but sum starts from 1 states
+func.func @init_count(%input: tensor<4x4xf32>, %start: tensor<4xf32>) -> tensor<4xf32> {
+  %output = tile.block(%input, %start) {iters = [par 4, red 4], reads = [$0[d0, d1]], folds = [sum -> [d0] init ($1, $1)]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%output) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: read 0 has no pad, but coordinate 0 is 4 at the point [3], outside tensor<4xf32>
+func.func @read_past_the_end(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %shifted = tile.block(%input) {iters = [par 4], reads = [$0[d0 + 1]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%shifted) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: yielded value 0, which online_softmax keeps apart from the value's iterators, depends on d1
+func.func @score_of_a_value_iter(%query: tensor<4x8xf32>, %key: tensor<6x8xf32>, %value: tensor<6x8xf32>) -> (tensor<4xf32>, tensor<4xf32>, tensor<4x8xf32>) {
+  %max, %sum, %accumulated = tile.block(%query, %key, %value) {iters = [par 4, par 8, red 6], reads = [$0[d0, d1], $1[d2, d1], $2[d2, d1]], folds = [online_softmax<value_iters = [d1]> -> ([d0], [d0], [d0, d1])]} ({
+  ^body(%query_element: f32, %key_element: f32, %value_element: f32):
+    %product = arith.mul(%query_element, %key_element) : (f32, f32) -> f32
+    tile.yield(%product, %value_element) : (f32, f32) -> ()
+  }) : (tensor<4x8xf32>, tensor<6x8xf32>, tensor<6x8xf32>) -> (tensor<4xf32>, tensor<4xf32>, tensor<4x8xf32>)
+  func.return(%max, %sum, %accumulated) : (tensor<4xf32>, tensor<4xf32>, tensor<4x8xf32>) -> ()
 }

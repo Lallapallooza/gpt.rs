@@ -41,7 +41,7 @@
 // CHECK-NEXT: loop.store({{%[0-9]+}}, [[SUM]], [[QUERY]])
 // CHECK-NEXT: loop.store({{%[0-9]+}}, [[WEIGHTED]], [[QUERY]], [[LANE]])
 func.func @attention(%scores: tensor<{T}x{S}xf32>, %values: tensor<{S}x4xf32>, %sink_max: tensor<{T}xf32>, %sink_sum: tensor<{T}xf32>, %sink_weighted: tensor<{T}x4xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x4xf32>) {
-  %max, %sum, %weighted = tile.block(%scores, %values, %sink_max, %sink_sum, %sink_weighted) {iters = [par {T}, par 4, red {S}], reads = [$0[d0, d2], $1[d2, d1]], folds = [online_softmax<lanes = [d1]> -> ([d0], [d0], [d0, d1]) init ($2, $3, $4)]} ({
+  %max, %sum, %weighted = tile.block(%scores, %values, %sink_max, %sink_sum, %sink_weighted) {iters = [par {T}, par 4, red {S}], reads = [$0[d0, d2], $1[d2, d1]], folds = [online_softmax<value_iters = [d1]> -> ([d0], [d0], [d0, d1]) init ($2, $3, $4)]} ({
   ^body(%score: f32, %value: f32):
     tile.yield(%score, %value) : (f32, f32) -> ()
   }) : (tensor<{T}x{S}xf32>, tensor<{S}x4xf32>, tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x4xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x4xf32>)
@@ -68,7 +68,7 @@ func.func @attention(%scores: tensor<{T}x{S}xf32>, %values: tensor<{S}x4xf32>, %
 // CHECK-NEXT: arith.add([[KEPT]], [[ADDED]]) : (f32, f32) -> f32
 // CHECK: arith.mul([[PART_WEIGHTED]], [[POINT]]) : (f32, f32) -> f32
 func.func @merge(%maxes: tensor<3x2xf32>, %sums: tensor<3x2xf32>, %weighted: tensor<3x2x4xf32>) -> (tensor<3xf32>, tensor<3xf32>, tensor<3x4xf32>) {
-  %max, %sum, %merged = tile.block(%maxes, %sums, %weighted) {iters = [par 3, par 4, red 2], reads = [$0[d0, d2], $1[d0, d2], $2[d0, d2, d1]], folds = [online_softmax_merge<lanes = [d1]> -> ([d0], [d0], [d0, d1])]} ({
+  %max, %sum, %merged = tile.block(%maxes, %sums, %weighted) {iters = [par 3, par 4, red 2], reads = [$0[d0, d2], $1[d0, d2], $2[d0, d2, d1]], folds = [online_softmax_merge<value_iters = [d1]> -> ([d0], [d0], [d0, d1])]} ({
   ^body(%part_max: f32, %part_sum: f32, %part_weighted: f32):
     tile.yield(%part_max, %part_sum, %part_weighted) : (f32, f32, f32) -> ()
   }) : (tensor<3x2xf32>, tensor<3x2xf32>, tensor<3x2x4xf32>) -> (tensor<3xf32>, tensor<3xf32>, tensor<3x4xf32>)

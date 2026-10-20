@@ -1,0 +1,947 @@
+// RUN: verify
+
+// ERROR: tile.block: mode 0 walks d2, which the block does not have
+tile.dispatch @missing_iterator(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d2 by 2]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%output) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: mode 0 walks pieces of no points
+tile.dispatch @empty_tiles(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 0, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%output) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: mode 0 runs pieces of d1 on workers, which is not a parallel iterator: that splits a fold
+tile.dispatch @split(%input: tensor<4x6xf32>) -> tensor<4xf32> {
+  %sums = tile.block(%input) {iters = [par 4, red 6], reads = [$0[d0, d1]], folds = [sum -> [d0]], loops = [d1 by 3 : workers<level = core>, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4xf32>
+  func.return(%sums) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: mode 0 walks d1 in pieces of 3 points, a prefix iterator, which its loop walks one point at a time
+tile.dispatch @prefix(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %sums = tile.block(%input) {iters = [par 4, prefix 6], reads = [$0[d0, d1]], folds = [sum -> [d0, d1]], loops = [d1 by 3, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%sums) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: mode 0 walks d1 in pieces of 3 points, a reduction in order, which its loop walks one point at a time
+tile.dispatch @ordered(%input: tensor<4x6xf32>) -> tensor<4xf32> {
+  %sums = tile.block(%input) {iters = [par 4, red_ordered 6], reads = [$0[d0, d1]], folds = [sum -> [d0]], loops = [d1 by 3, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4xf32>
+  func.return(%sums) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: fold 0 starts its state outside the loop over d1, the prefix iterator, whose point each element folds up to
+tile.dispatch @prefix_held_outside(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %sums = tile.block(%input) {iters = [par 4, prefix 6], reads = [$0[d0, d1]], folds = [sum -> [d0, d1] held scratch<at = 0>], loops = [d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%sums) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: the register tile has no lanes mode
+tile.dispatch @reg_without_atom(%input: tensor<4x16xf32>) -> tensor<4x16xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 16], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 1, d1 by 16 : reg]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x16xf32>) -> tensor<4x16xf32>
+  func.return(%output) : (tensor<4x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: mode 1 holds d1 in the register tile, which is not a parallel iterator
+tile.dispatch @reg_of_reduction(%input: tensor<4x16xf32>) -> tensor<4xf32> {
+  %output = tile.block(%input) {iters = [par 4, red 16], reads = [$0[d0, d1]], folds = [sum -> [d0]], loops = [d0 by 1, d1 by 16 : reg, d1 by 8 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x16xf32>) -> tensor<4xf32>
+  func.return(%output) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: mode 1 is a mode of the register tile, and walks the pieces of a memory
+tile.dispatch @lanes_in_memory(%input: tensor<4x16xf32>) -> tensor<4x16xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 16], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 1, d1 by 16 : lanes in l1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x16xf32>) -> tensor<4x16xf32>
+  func.return(%output) : (tensor<4x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: read 0 is held at mode 3, of loops of 3 modes
+tile.dispatch @staged_outside(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1] held copy<level = l1, at = 3>], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%output) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: the block clips d2, which it does not have
+tile.dispatch @clip_of_missing_iterator(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %first = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0 - 1, d1] pad 0.0], folds = [none -> [d0, d1]], clip = [d2]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%first) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: mode 2 comes after the lanes, the innermost mode
+tile.dispatch @after_lanes(%input: tensor<4x16xf32>) -> tensor<4x16xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 16], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 1, d1 by 16 : lanes, d0 by 2]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x16xf32>) -> tensor<4x16xf32>
+  func.return(%output) : (tensor<4x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: mode 1 walks pieces of d1 inside the register tile, whose modes are the innermost
+tile.dispatch @inside_registers(%input: tensor<4x32xf32>) -> tensor<4x32xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 32], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 2 : reg, d1 by 16, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x32xf32>) -> tensor<4x32xf32>
+  func.return(%output) : (tensor<4x32xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: read 0 is held at mode 2, a mode of the register tile, which runs its points at once
+tile.dispatch @held_in_registers(%input: tensor<4x32xf32>) -> tensor<4x32xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 32], reads = [$0[d0, d1] held copy<level = l1, at = 2>], folds = [none -> [d0, d1]], loops = [d1 by 16, d0 by 1, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x32xf32>) -> tensor<4x32xf32>
+  func.return(%output) : (tensor<4x32xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: mode 1 walks pieces of 4 points of d1, inside pieces of 2
+tile.dispatch @growing_tiles(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d1 by 2, d1 by 4, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%output) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: modes of a block that updates an operand where its points may collide would reorder its writes
+tile.dispatch @into(%input: tensor<4x6xf32>, %update: tensor<4xf32>) -> tensor<4x6xf32> {
+  %updated = tile.block(%input, %update) {iters = [par 4], reads = [$1[d0]], folds = [none -> $0[d0 floordiv 2, 0]], loops = [d0 by 2, d0 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>, tensor<4xf32>) -> tensor<4x6xf32>
+  func.return(%updated) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: a block that folds with `online_softmax` or `logsumexp` takes no modes: its fold has no update of a piece
+tile.dispatch @logsumexp(%input: tensor<4x6xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
+  %max, %sum = tile.block(%input) {iters = [par 4, red 6], reads = [$0[d0, d1]], folds = [logsumexp -> ([d0], [d0])], loops = [d0 by 2, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> (tensor<4xf32>, tensor<4xf32>)
+  func.return(%max, %sum) : (tensor<4xf32>, tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: the state of fold 0 keeps the piece of d0, whose extent {N} is not static
+tile.dispatch @symbolic_state(%input: tensor<{N}x6xf32>) -> tensor<{N}xf32> {
+  %sums = tile.block(%input) {iters = [par {N}, red 6], reads = [$0[d0, d1]], folds = [sum -> [d0] held scratch<at = 0>], loops = [d1 by 2, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<{N}x6xf32>) -> tensor<{N}xf32>
+  func.return(%sums) : (tensor<{N}xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: the register tile holds d1 twice
+tile.dispatch @reg_twice(%input: tensor<4x16xf32>) -> tensor<4x16xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 16], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 1, d1 by 16 : reg, d1 by 16 : reg, d1 by 8 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x16xf32>) -> tensor<4x16xf32>
+  func.return(%output) : (tensor<4x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: a register tile holds at most 3 iterators, not 4
+tile.dispatch @reg_of_four(%input: tensor<2x2x2x16xf32>) -> tensor<2x2x2x16xf32> {
+  %output = tile.block(%input) {iters = [par 2, par 2, par 2, par 16], reads = [$0[d0, d1, d2, d3]], folds = [none -> [d0, d1, d2, d3]], loops = [d0 by 2 : reg, d1 by 2 : reg, d2 by 2 : reg, d3 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<2x2x2x16xf32>) -> tensor<2x2x2x16xf32>
+  func.return(%output) : (tensor<2x2x2x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: the register tile holds 16 points of d1, whose innermost piece has 8
+tile.dispatch @reg_inside_a_tile(%input: tensor<4x16xf32>) -> tensor<4x16xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 16], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d1 by 8, d0 by 1, d1 by 16 : reg, d1 by 8 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x16xf32>) -> tensor<4x16xf32>
+  func.return(%output) : (tensor<4x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: the register tile holds 12 points of d1, which vectors of 8 lanes do not fill
+tile.dispatch @partial_vectors(%input: tensor<4x12xf32>) -> tensor<4x12xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 12], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 1, d1 by 12 : reg, d1 by 8 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x12xf32>) -> tensor<4x12xf32>
+  func.return(%output) : (tensor<4x12xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: a register tile of a block with constraints would guard each point
+tile.dispatch @reg_with_constraints(%input: tensor<16x16xf32>) -> tensor<16xf32> {
+  %sums = tile.block(%input) {iters = [red 16, par 16], reads = [$0[d0, d1]], folds = [sum -> [d1]], constraints = [d0 <= d1], loops = [d0 by 1, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<16x16xf32>) -> tensor<16xf32>
+  func.return(%sums) : (tensor<16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: a block with a prefix iterator has no register tile
+tile.dispatch @reg_with_prefix(%input: tensor<4x16xf32>) -> tensor<4x16xf32> {
+  %sums = tile.block(%input) {iters = [prefix 4, par 16], reads = [$0[d0, d1]], folds = [sum -> [d0, d1]], loops = [d0 by 1, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x16xf32>) -> tensor<4x16xf32>
+  func.return(%sums) : (tensor<4x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: a fold in a register tile keeps one element per point
+tile.dispatch @reg_of_argmax(%input: tensor<6x16xf32>) -> (tensor<16xf32>, tensor<16xsi64>) {
+  %largest, %position = tile.block(%input) {iters = [red 6, par 16], reads = [$0[d0, d1]], folds = [argmax -> ([d1], [d1])], loops = [d0 by 1, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    %row = tile.index() {expr = d0, dtype = si64} : () -> si64
+    tile.yield(%element, %row) : (f32, si64) -> ()
+  }) : (tensor<6x16xf32>) -> (tensor<16xf32>, tensor<16xsi64>)
+  func.return(%largest, %position) : (tensor<16xf32>, tensor<16xsi64>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: the register tile holds d0, which a write leaves out: its points would write one element
+tile.dispatch @reg_left_out(%cache: tensor<1x16xf32>, %row: tensor<1x16xf32>) -> tensor<1x16xf32> {
+  %stored = tile.block(%cache, %row) {iters = [par 1, par 16], reads = [$1[d0, d1]], folds = [none -> $0[0, d1]], loops = [d0 by 1 : reg, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<1x16xf32>, tensor<1x16xf32>) -> tensor<1x16xf32>
+  func.return(%stored) : (tensor<1x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: read 1 holds $0, which another read holds
+tile.dispatch @read_twice(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1] held copy<level = l1, at = 0>, $0[d0, 5 - d1] held copy<level = l1, at = 0>], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32, %mirrored: f32):
+    %sum = arith.add(%element, %mirrored) : (f32, f32) -> f32
+    tile.yield(%sum) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%output) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: $0 is held in a copy, and the block uses it other than in one read of it alone
+tile.dispatch @copied_and_read(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1] held copy<level = l1, at = 0>, $0[d0, 5 - d1]], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32, %mirrored: f32):
+    %sum = arith.add(%element, %mirrored) : (f32, f32) -> f32
+    tile.yield(%sum) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%output) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: the copy of $0 has an axis of {N} elements, which is not static
+tile.dispatch @dynamic_copy(%input: tensor<4x{N}xf32>) -> tensor<4x{N}xf32> {
+  %output = tile.block(%input) {iters = [par 4, par {N}], reads = [$0[d0, d1] held copy<level = l1, at = 0>], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x{N}xf32>) -> tensor<4x{N}xf32>
+  func.return(%output) : (tensor<4x{N}xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: the register tile holds d0, which the read of $0 takes other than by a multiple of it
+tile.dispatch @grouped(%input: tensor<2x8xf32>) -> tensor<4x8xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 8], reads = [$0[d0 floordiv 2, d1]], folds = [none -> [d0, d1]], loops = [d0 by 4 : reg, d1 by 8 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<2x8xf32>) -> tensor<4x8xf32>
+  func.return(%output) : (tensor<4x8xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: the register tile holds d1, which the read of $0 takes other than by a multiple of it
+tile.dispatch @blocks_across_tiles(%input: tensor<3x2x32xf32>) -> tensor<2x96xf32> {
+  %output = tile.block(%input) {iters = [par 2, par 96], reads = [$0[d1 floordiv 32, d0, d1 mod 32]], folds = [none -> [d0, d1]], loops = [d1 by 48, d1 by 32, d0 by 2 : reg, d1 by 32 : reg, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<3x2x32xf32>) -> tensor<2x96xf32>
+  func.return(%output) : (tensor<2x96xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: the register tile holds d1, which the read of $0 takes other than by a multiple of it
+tile.dispatch @lanes_across_blocks(%input: tensor<4x2x16xf32>) -> tensor<2x64xf32> {
+  %output = tile.block(%input) {iters = [par 2, par 64], reads = [$0[d1 floordiv 16, d0, d1 mod 16]], folds = [none -> [d0, d1]], loops = [d1 by 32, d0 by 2 : reg, d1 by 32 : reg, d1 by 32 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x2x16xf32>) -> tensor<2x64xf32>
+  func.return(%output) : (tensor<2x64xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: the lanes run along d1, which the read of $0 takes other than in whole vectors of consecutive elements
+tile.dispatch @lanes_down_blocks(%input: tensor<16x2x3xf32>) -> tensor<2x48xf32> {
+  %output = tile.block(%input) {iters = [par 2, par 48], reads = [$0[d1 mod 16, d0, d1 floordiv 16]], folds = [none -> [d0, d1]], loops = [d0 by 2 : reg, d1 by 48 : reg, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<16x2x3xf32>) -> tensor<2x48xf32>
+  func.return(%output) : (tensor<2x48xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 1 does not run on the elements that the block before it finishes where it is placed: its read 0 takes axis 0 of the result at d1, where the block before it writes d0
+tile.dispatch @transposed_epilogue(%input: tensor<4x4xf32>) -> tensor<4x4xf32> {
+  %first = tile.block(%input) {iters = [par 4, par 4], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x4xf32>) -> tensor<4x4xf32>
+  %second = tile.block(%first) {iters = [par 4, par 4], reads = [$0[d1, d0] at reg], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x4xf32>) -> tensor<4x4xf32>
+  func.return(%second) : (tensor<4x4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 1 does not run on the elements that the block before it finishes where it is placed: it folds its points with sum
+tile.dispatch @placed_sum(%input: tensor<4x6xf32>) -> tensor<4xf32> {
+  %first = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  %sums = tile.block(%first) {iters = [par 4, red 6], reads = [$0[d0, d1] at reg], folds = [sum -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4xf32>
+  func.return(%sums) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 1 does not run on the elements that the block before it finishes where it is placed: it has 3 iterators, and the block before it 2
+tile.dispatch @placed_wider(%input: tensor<4x6xf32>) -> tensor<4x6x2xf32> {
+  %first = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  %pairs = tile.block(%first) {iters = [par 4, par 6, par 2], reads = [$0[d0, d1] at reg], folds = [none -> [d0, d1, d2]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6x2xf32>
+  func.return(%pairs) : (tensor<4x6x2xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 1 does not run on the elements that the block before it finishes where it is placed: its d0 is not a parallel iterator of the same extent in both blocks
+tile.dispatch @placed_on_columns(%input: tensor<4x6xf32>) -> tensor<6xf32> {
+  %first = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  %row = tile.block(%first) {iters = [par 6], reads = [$0[0, d0] at reg], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<6xf32>
+  func.return(%row) : (tensor<6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 1 does not run on the elements that the block before it finishes where it is placed: its read 0 takes the result of the block before it from a list or with a pad
+tile.dispatch @placed_padded(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %first = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  %shifted = tile.block(%first) {iters = [par 4, par 6], reads = [$0[d0, d1 - 1] pad 0.0 at reg], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%shifted) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 1 does not run on the elements that the block before it finishes where it is placed: an index expression of it reads the result of the block before it
+tile.dispatch @placed_index(%input: tensor<4x6xsi32>) -> tensor<4x6xsi32> {
+  %first = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: si32):
+    tile.yield(%element) : (si32) -> ()
+  }) : (tensor<4x6xsi32>) -> tensor<4x6xsi32>
+  %picked = tile.block(%first, %input) {iters = [par 4, par 6], reads = [$0[d0, d1] at reg, $1[d0, min(max($0[d0, d1], 0), 5)]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: si32, %other: si32):
+    %sum = arith.add(%element, %other) : (si32, si32) -> si32
+    tile.yield(%sum) : (si32) -> ()
+  }) : (tensor<4x6xsi32>, tensor<4x6xsi32>) -> tensor<4x6xsi32>
+  func.return(%picked) : (tensor<4x6xsi32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 1 runs in the loops of the block before it, whose result has another use
+tile.dispatch @returned_before(%input: tensor<4x6xf32>) -> (tensor<4x6xf32>, tensor<4x6xf32>) {
+  %first = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  %second = tile.block(%first) {iters = [par 4, par 6], reads = [$0[d0, d1] at reg], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%first, %second) : (tensor<4x6xf32>, tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: the register tile holds d0, by which a read picks its operand of a list
+tile.dispatch @reg_picks_list(%first: tensor<16xf32>, %second: tensor<16xf32>) -> tensor<2x16xf32> {
+  %output = tile.block(%first, %second) {iters = [par 2, par 16], reads = [$0..$1[d0][d1]], folds = [none -> [d0, d1]], loops = [d0 by 2 : reg, d1 by 16 : reg, d1 by 8 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<16xf32>, tensor<16xf32>) -> tensor<2x16xf32>
+  func.return(%output) : (tensor<2x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: $0 is copied where d0, by which its read picks the operand, does not stand at one point
+tile.dispatch @stage_moving_pick(%first: tensor<16xf32>, %second: tensor<16xf32>) -> tensor<2x16xf32> {
+  %output = tile.block(%first, %second) {iters = [par 2, par 16], reads = [$0..$1[d0][d1] held copy<level = l1, at = 0>], folds = [none -> [d0, d1]], loops = [d1 by 16, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<16xf32>, tensor<16xf32>) -> tensor<2x16xf32>
+  func.return(%output) : (tensor<2x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: $1 is prefetched at a mode over an iterator its read does not take
+tile.dispatch @prefetch_untaken(%input: tensor<4x8xf32>, %weight: tensor<8x6xf32>) -> tensor<4x6xf32> {
+  %product = tile.block(%input, %weight) {iters = [par 4, par 6, red 8], reads = [$0[d0, d2], $1[d2, d1] held prefetch<level = l2, at = 0>], folds = [sum -> [d0, d1] held scratch<at = 1>], loops = [d0 by 2, d2 by 4, d0 by 1, d1 by 1, d2 by 1]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<4x8xf32>, tensor<8x6xf32>) -> tensor<4x6xf32>
+  func.return(%product) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: $0 is prefetched, and the block uses it other than in one read of it alone
+tile.dispatch @prefetched_and_read(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1] held prefetch<level = l2, at = 0>, $0[d0, 5 - d1]], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32, %mirrored: f32):
+    %sum = arith.add(%element, %mirrored) : (f32, f32) -> f32
+    tile.yield(%sum) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%output) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: $0 is prefetched, and its read pads or picks it from a list
+tile.dispatch @prefetch_padded(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %shifted = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0 - 1, d1] pad 0.0 held prefetch<level = l2, at = 0>], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%shifted) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 2 is placed at 0, and the block before it at reg: the blocks of a run are placed at one piece
+tile.dispatch @two_pieces(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %first = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  %second = tile.block(%first) {iters = [par 4, par 6], reads = [$0[d0, d1] at reg], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  %third = tile.block(%second) {iters = [par 4, par 6], reads = [$0[d0, d1] at 0], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%third) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 0 is placed, and no block comes before it
+tile.dispatch @first_placed(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %first = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1] at reg], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%first) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 1 is placed by read 1, which does not read the result of the block before it
+tile.dispatch @placed_by_other(%input: tensor<4x6xf32>, %bias: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %first = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  %biased = tile.block(%first, %bias) {iters = [par 4, par 6], reads = [$0[d0, d1], $1[d0, d1] at reg], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32, %offset: f32):
+    %sum = arith.add(%element, %offset) : (f32, f32) -> f32
+    tile.yield(%sum) : (f32) -> ()
+  }) : (tensor<4x6xf32>, tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%biased) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 1 runs in the loops of the block before it, and has modes of its own
+tile.dispatch @placed_with_modes(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %first = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  %second = tile.block(%first) {iters = [par 4, par 6], reads = [$0[d0, d1] at reg], folds = [none -> [d0, d1]], loops = [d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%second) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 1 is placed by two of its reads, where it runs in one block's loops
+tile.dispatch @placed_twice(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %first = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  %doubled = tile.block(%first) {iters = [par 4, par 6], reads = [$0[d0, d1] at reg, $0[d0, d1] at reg], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32, %again: f32):
+    %sum = arith.add(%element, %again) : (f32, f32) -> f32
+    tile.yield(%sum) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%doubled) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 1 is placed at mode 3 of the first block of its run, of 3 modes
+tile.dispatch @mode_past_loops(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %first = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  %second = tile.block(%first) {iters = [par 4, par 6], reads = [$0[d0, d1] at 3], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%second) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 1 is placed at mode 2, a mode of the register tile, where a block is placed at `reg`
+tile.dispatch @mode_in_reg(%input: tensor<4x16xf32>) -> tensor<4x16xf32> {
+  %first = tile.block(%input) {iters = [par 4, par 16], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 1, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x16xf32>) -> tensor<4x16xf32>
+  %second = tile.block(%first) {iters = [par 4, par 16], reads = [$0[d0, d1] at 2], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x16xf32>) -> tensor<4x16xf32>
+  func.return(%second) : (tensor<4x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 1 reads the result of the block before it across the piece where it is placed, whose extent along d0 is not static
+tile.dispatch @symbolic_piece(%input: tensor<{N}x4xf32>) -> tensor<{N}xf32> {
+  %doubled = tile.block(%input) {iters = [par {N}, par 4], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d1 by 4, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    %twice = arith.add(%element, %element) : (f32, f32) -> f32
+    tile.yield(%twice) : (f32) -> ()
+  }) : (tensor<{N}x4xf32>) -> tensor<{N}x4xf32>
+  %sums = tile.block(%doubled) {iters = [par {N}], reads = [$0[d0, 0] at 0, $0[d0, 1]], folds = [none -> [d0]]} ({
+  ^body(%first: f32, %second: f32):
+    %sum = arith.add(%first, %second) : (f32, f32) -> f32
+    tile.yield(%sum) : (f32) -> ()
+  }) : (tensor<{N}x4xf32>) -> tensor<{N}xf32>
+  func.return(%sums) : (tensor<{N}xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 1 does not run on the elements that the block before it finishes where it is placed: its read 0 takes axis 2 of the result at 0, a constant along d2, which the piece where it is placed does not hold whole
+tile.dispatch @one_lane_per_piece(%vector: tensor<1x64xf32>, %matrix: tensor<24x64xf32>) -> tensor<1x24xf32> {
+  %partial = tile.block(%vector, %matrix) {iters = [par 24, red 4, par 16], reads = [$0[0, d1 * 16 + d2], $1[d0, d1 * 16 + d2]], folds = [sum -> [0, d0, d2]]} ({
+  ^body(%element: f32, %weight: f32):
+    %term = arith.mul(%element, %weight) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<1x64xf32>, tensor<24x64xf32>) -> tensor<1x24x16xf32>
+  %sums = tile.block(%partial) {iters = [par 24], reads = [$0[0, d0, 0] at reg, $0[0, d0, 8]], folds = [none -> [0, d0]]} ({
+  ^body(%lane_0: f32, %lane_1: f32):
+    %sum = arith.add(%lane_0, %lane_1) : (f32, f32) -> f32
+    tile.yield(%sum) : (f32) -> ()
+  }) : (tensor<1x24x16xf32>) -> tensor<1x24xf32>
+  func.return(%sums) : (tensor<1x24xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 1 does not run on the elements that the block before it finishes where it is placed: its read 1 takes axis 2 of the result at d0 mod 16, where the block before it writes d2
+tile.dispatch @lane_not_constant(%vector: tensor<1x64xf32>, %matrix: tensor<24x64xf32>) -> tensor<1x24xf32> {
+  %partial = tile.block(%vector, %matrix) {iters = [par 24, red 4, par 16], reads = [$0[0, d1 * 16 + d2], $1[d0, d1 * 16 + d2]], folds = [sum -> [0, d0, d2]], loops = [d0 by 8, d1 by 1, d0 by 8 : reg, d2 by 16 : lanes]} ({
+  ^body(%element: f32, %weight: f32):
+    %term = arith.mul(%element, %weight) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<1x64xf32>, tensor<24x64xf32>) -> tensor<1x24x16xf32>
+  %sums = tile.block(%partial) {iters = [par 24], reads = [$0[0, d0, 0] at reg, $0[0, d0, d0 mod 16]], folds = [none -> [0, d0]]} ({
+  ^body(%lane_0: f32, %lane_1: f32):
+    %sum = arith.add(%lane_0, %lane_1) : (f32, f32) -> f32
+    tile.yield(%sum) : (f32) -> ()
+  }) : (tensor<1x24x16xf32>) -> tensor<1x24xf32>
+  func.return(%sums) : (tensor<1x24xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 1 runs in the loops of the block before it, whose result has another use
+tile.dispatch @partial_returned(%vector: tensor<1x64xf32>, %matrix: tensor<24x64xf32>) -> (tensor<1x24xf32>, tensor<1x24x16xf32>) {
+  %partial = tile.block(%vector, %matrix) {iters = [par 24, red 4, par 16], reads = [$0[0, d1 * 16 + d2], $1[d0, d1 * 16 + d2]], folds = [sum -> [0, d0, d2]], loops = [d0 by 8, d1 by 1, d0 by 8 : reg, d2 by 16 : lanes]} ({
+  ^body(%element: f32, %weight: f32):
+    %term = arith.mul(%element, %weight) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<1x64xf32>, tensor<24x64xf32>) -> tensor<1x24x16xf32>
+  %sums = tile.block(%partial) {iters = [par 24], reads = [$0[0, d0, 0] at reg, $0[0, d0, 8]], folds = [none -> [0, d0]]} ({
+  ^body(%lane_0: f32, %lane_1: f32):
+    %sum = arith.add(%lane_0, %lane_1) : (f32, f32) -> f32
+    tile.yield(%sum) : (f32) -> ()
+  }) : (tensor<1x24x16xf32>) -> tensor<1x24xf32>
+  func.return(%sums, %partial) : (tensor<1x24xf32>, tensor<1x24x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: no mode walks d1
+tile.dispatch @unwalked(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%output) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: the modes walk d0 in pieces of 2 points, and none walks it one point at a time
+tile.dispatch @pieces_only(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 2, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%output) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: fold 0 holds its state at a mode, and the block has no modes
+tile.dispatch @held_without_modes(%input: tensor<4x6xf32>) -> tensor<4xf32> {
+  %output = tile.block(%input) {iters = [par 4, red 6], reads = [$0[d0, d1]], folds = [sum -> [d0] held scratch<at = 0>]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4xf32>
+  func.return(%output) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: fold 0 holds a state, and a fold of `none` keeps none
+tile.dispatch @held_map(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1]], folds = [none -> [d0, d1] held scratch<at = 0>], loops = [d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%output) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: fold 0 holds its state at mode 2, of loops of 2 modes
+tile.dispatch @held_past_modes(%input: tensor<4x6xf32>) -> tensor<4xf32> {
+  %output = tile.block(%input) {iters = [par 4, red 6], reads = [$0[d0, d1]], folds = [sum -> [d0] held scratch<at = 2>], loops = [d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4xf32>
+  func.return(%output) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: fold 0 starts its state inside a loop over d1, a reduced iterator: it would finish each element more than once
+tile.dispatch @held_inside_reduced(%input: tensor<4x6xf32>) -> tensor<4xf32> {
+  %output = tile.block(%input) {iters = [par 4, red 6], reads = [$0[d0, d1]], folds = [sum -> [d0] held scratch<at = 1>], loops = [d1 by 2, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4xf32>
+  func.return(%output) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: fold 0 holds no state, and its loops walk the elements of more than the register tile inside its first loop over a reduced iterator
+tile.dispatch @state_unheld(%input: tensor<4x6xf32>) -> tensor<4xf32> {
+  %output = tile.block(%input) {iters = [par 4, red 6], reads = [$0[d0, d1]], folds = [sum -> [d0]], loops = [d1 by 2, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4xf32>
+  func.return(%output) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: fold 0 holds its state at mode 2, a mode of the register tile, which runs its points at once
+tile.dispatch @held_in_lanes(%input: tensor<4x6x16xf32>) -> tensor<4x16xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 16, red 6], reads = [$0[d0, d2, d1]], folds = [sum -> [d0, d1] held scratch<at = 2>], loops = [d0 by 1, d2 by 1, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6x16xf32>) -> tensor<4x16xf32>
+  func.return(%output) : (tensor<4x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: op 0 is tensor.add, and a dispatch holds blocks
+tile.dispatch @op_not_block(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %sum = tensor.add(%input, %input) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%sum) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 0 gives a result of tensor<{N}xf32> that the dispatch does not give, which lives in scratch of its own, whose extents must be static
+tile.dispatch @symbolic_between(%input: tensor<{N}xf32>) -> tensor<{N}xf32> {
+  %doubled = tile.block(%input) {iters = [par {N}], reads = [$0[d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    %twice = arith.add(%element, %element) : (f32, f32) -> f32
+    tile.yield(%twice) : (f32) -> ()
+  }) : (tensor<{N}xf32>) -> tensor<{N}xf32>
+  %reversed = tile.block(%doubled) {iters = [par {N}], reads = [$0[{N} - 1 - d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<{N}xf32>) -> tensor<{N}xf32>
+  func.return(%reversed) : (tensor<{N}xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 1 runs in the loops of the block before it, and holds a read of its own
+tile.dispatch @placed_holding(%input: tensor<4x16xf32>, %bias: tensor<16xf32>) -> tensor<4x16xf32> {
+  %first = tile.block(%input) {iters = [par 4, par 16], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 1, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x16xf32>) -> tensor<4x16xf32>
+  %second = tile.block(%first, %bias) {iters = [par 4, par 16], reads = [$0[d0, d1] at reg, $1[d1] held copy<level = l1>], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32, %offset: f32):
+    %sum = arith.add(%element, %offset) : (f32, f32) -> f32
+    tile.yield(%sum) : (f32) -> ()
+  }) : (tensor<4x16xf32>, tensor<16xf32>) -> tensor<4x16xf32>
+  func.return(%second) : (tensor<4x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: the state of fold 1 keeps the piece of d1, whose extent {N} is not static
+tile.dispatch @reference_state(%counts: tensor<{N}xf32>, %input: tensor<8x{N}xf32>) -> (tensor<{N}xf32>, tensor<{N}xf32>) {
+  %updated, %sums = tile.block(%counts, %input) {iters = [red 8, par {N}], reads = [$1[d0, d1]], folds = [sum -> $0[d1], sum -> [d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element, %element) : (f32, f32) -> ()
+  }) : (tensor<{N}xf32>, tensor<8x{N}xf32>) -> (tensor<{N}xf32>, tensor<{N}xf32>)
+  func.return(%updated, %sums) : (tensor<{N}xf32>, tensor<{N}xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: the lanes run along d1, which the read of $0 takes other than in whole vectors of consecutive elements
+tile.dispatch @strided_lanes(%input: tensor<16x16xf32>) -> tensor<16x16xf32> {
+  %output = tile.block(%input) {iters = [par 16, par 16], reads = [$0[d1, d0]], folds = [none -> [d0, d1]], loops = [d0 by 1, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<16x16xf32>) -> tensor<16x16xf32>
+  func.return(%output) : (tensor<16x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.block: the lanes run along d1, which write 0 takes other than by 1 in its last coordinate
+tile.dispatch @scattered_lanes(%input: tensor<16x16xf32>) -> tensor<16x16xf32> {
+  %output = tile.block(%input) {iters = [par 16, par 16], reads = [$0[d0, d1]], folds = [none -> [d1, d0]], loops = [d0 by 1, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<16x16xf32>) -> tensor<16x16xf32>
+  func.return(%output) : (tensor<16x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 1: the lanes run along d1, which the read of $1 takes other than in whole vectors of consecutive elements
+tile.dispatch @strided_epilogue(%input: tensor<16x16xf32>, %other: tensor<16x16xf32>) -> tensor<16x16xf32> {
+  %first = tile.block(%input) {iters = [par 16, par 16], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 1, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<16x16xf32>) -> tensor<16x16xf32>
+  %second = tile.block(%first, %other) {iters = [par 16, par 16], reads = [$0[d0, d1] at reg, $1[d1, d0]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32, %across: f32):
+    %sum = arith.add(%element, %across) : (f32, f32) -> f32
+    tile.yield(%sum) : (f32) -> ()
+  }) : (tensor<16x16xf32>, tensor<16x16xf32>) -> tensor<16x16xf32>
+  func.return(%second) : (tensor<16x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 0: mode 0 runs on the workers of cluster, which x86-64-v4 does not have
+tile.dispatch @foreign_workers(%input: tensor<4x16xf32>) -> tensor<4x16xf32> attributes {target = "x86-64-v4@3928f7d3"} {
+  %output = tile.block(%input) {iters = [par 4, par 16], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 2 : workers<level = cluster>, d0 by 1, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x16xf32>) -> tensor<4x16xf32>
+  func.return(%output) : (tensor<4x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 0: the read of $0 is held for smem, a memory x86-64-v4 does not have
+tile.dispatch @foreign_memory(%input: tensor<4x16xf32>) -> tensor<4x16xf32> attributes {target = "x86-64-v4@3928f7d3"} {
+  %output = tile.block(%input) {iters = [par 4, par 16], reads = [$0[d0, d1] held copy<level = smem, at = 0>], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 1, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x16xf32>) -> tensor<4x16xf32>
+  func.return(%output) : (tensor<4x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 0: mode 0 walks the pieces of dram, which is not a cache or scratch of x86-64-v4
+tile.dispatch @pieces_of_dram(%input: tensor<4x16xf32>) -> tensor<4x16xf32> attributes {target = "x86-64-v4@3928f7d3"} {
+  %output = tile.block(%input) {iters = [par 4, par 16], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 2 in dram, d0 by 1, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x16xf32>) -> tensor<4x16xf32>
+  func.return(%output) : (tensor<4x16xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 0: the read of $0 is held for l2, for which %S/bare-l2.toml has no buffer space that holds a copy
+tile.dispatch @copy_without_space(%input: tensor<4x6xf32>) -> tensor<4x6xf32> attributes {target = "%S/bare-l2.toml@60326310"} {
+  %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1] held copy<level = l2, at = 0>], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%output) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 0: the read of $0 is held for l2, for which %S/bare-l2.toml has no prefetch that asks it for lines
+tile.dispatch @prefetch_without_hint(%input: tensor<4x6xf32>) -> tensor<4x6xf32> attributes {target = "%S/bare-l2.toml@60326310"} {
+  %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1] held prefetch<level = l2, at = 0>], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%output) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 0: 16 lanes of f64 take 1024 bits, and x86-64-v4 has registers of [128, 256, 512] bits
+tile.dispatch @too_wide(%input: tensor<4x16xf64>) -> tensor<4x16xf64> attributes {target = "x86-64-v4@3928f7d3"} {
+  %output = tile.block(%input) {iters = [par 4, par 16], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 1, d1 by 16 : lanes]} ({
+  ^body(%element: f64):
+    %twice = arith.add(%element, %element) : (f64, f64) -> f64
+    tile.yield(%twice) : (f64) -> ()
+  }) : (tensor<4x16xf64>) -> tensor<4x16xf64>
+  func.return(%output) : (tensor<4x16xf64>) -> ()
+}

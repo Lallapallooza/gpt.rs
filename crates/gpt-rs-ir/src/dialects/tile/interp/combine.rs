@@ -1,5 +1,8 @@
 //! [`Acc`], the fold of a combine kind as the interpreter runs it: one accumulator per result
-//! element, folding the values the body yields at each point of the reduction iterators.
+//! element, folding the values the body yields at each point with the semantics of the `tensor`
+//! reductions, one point at a time.
+
+use std::marker::PhantomData;
 
 use anyhow::{anyhow, bail, Result};
 
@@ -74,7 +77,7 @@ impl Accumulator for Last {
 /// `sum`, `max`, `min`, `and` and `or`: the running value of a fold with the `tensor` op `C`.
 struct Monoid<C> {
     value: HostScalar,
-    combiner: std::marker::PhantomData<C>,
+    combiner: PhantomData<C>,
 }
 
 impl<C: Combiner> Monoid<C> {
@@ -86,7 +89,7 @@ impl<C: Combiner> Monoid<C> {
         };
         Ok(Monoid {
             value,
-            combiner: std::marker::PhantomData,
+            combiner: PhantomData,
         })
     }
 }
@@ -102,26 +105,28 @@ impl<C: Combiner> Accumulator for Monoid<C> {
     }
 }
 
-/// `argmax`, `argmin`, `top_k` and `bottom_k`: every candidate `(value, index)`, the start state
-/// first, ranked when the fold finishes.
+/// `argmax`, `argmin`, `top_k` and `bottom_k`: the `kept` best candidates `(value, index)` so
+/// far, the start state among them, best first, as `tensor.argmax` and `tensor.top_k` rank them.
+/// A candidate that `kept` others rank before never ranks among the best again, so the fold keeps
+/// no other.
 struct Ranked {
-    k: usize,
+    kept: usize,
     largest: bool,
-    items: Vec<(HostScalar, HostScalar)>,
+    best: Vec<(HostScalar, HostScalar)>,
     value_dtype: DType,
     index_dtype: DType,
 }
 
 impl Ranked {
-    fn new(k: usize, largest: bool, dtypes: &[DType], init: &[HostScalar]) -> Self {
-        let items = match init {
+    fn new(kept: usize, largest: bool, dtypes: &[DType], init: &[HostScalar]) -> Self {
+        let best = match init {
             [value, index] => vec![(*value, *index)],
             _ => Vec::new(),
         };
         Ranked {
-            k,
+            kept,
             largest,
-            items,
+            best,
             value_dtype: dtypes[0],
             index_dtype: dtypes[1],
         }
@@ -129,32 +134,38 @@ impl Ranked {
 }
 
 impl Accumulator for Ranked {
+    /// Ranks the candidate among the kept ones and keeps the `kept` best. Equal values rank by
+    /// index, and equal indices in the order the candidates came: the candidates in index order,
+    /// each index's in the order they came, then ranked by value.
     fn push(&mut self, values: &[HostScalar]) -> Result<()> {
-        self.items.push((values[0], values[1]));
+        let mut by_index = self.best.clone();
+        by_index.push((values[0], values[1]));
+        by_index.sort_by_key(|&(_, index)| index.as_int());
+        let ranking = best_k(by_index.len(), self.kept, self.largest, |first, second| {
+            math::order(by_index[first].0, by_index[second].0)
+        });
+        self.best.clear();
+        for position in ranking {
+            self.best.push(by_index[position]);
+        }
         Ok(())
     }
 
-    /// The `k` best values, then their indices. A fold of fewer than `k` points fills the rest
-    /// with the identity of its order and the index -1.
+    /// The `kept` best values, then their indices. A fold of fewer than `kept` points fills the
+    /// rest with the identity of its order and the index -1.
     fn finish(&self) -> Result<Vec<HostScalar>> {
-        // Equal values rank by index: the candidates in index order, then ranked by value.
-        let mut by_index = self.items.clone();
-        by_index.sort_by_key(|&(_, index)| index.as_int());
-        let ranking = best_k(by_index.len(), self.k, self.largest, |first, second| {
-            math::order(by_index[first].0, by_index[second].0)
-        });
         let fill = if self.largest {
             math::fold_init::<tensor::Maximum>(self.value_dtype)?
         } else {
             math::fold_init::<tensor::Minimum>(self.value_dtype)?
         };
-        let mut values = Vec::with_capacity(self.k);
-        let mut indices = Vec::with_capacity(self.k);
-        for rank in 0..self.k {
-            match ranking.get(rank) {
-                Some(&position) => {
-                    values.push(by_index[position].0);
-                    indices.push(by_index[position].1);
+        let mut values = Vec::with_capacity(self.kept);
+        let mut indices = Vec::with_capacity(self.kept);
+        for rank in 0..self.kept {
+            match self.best.get(rank) {
+                Some(&(value, index)) => {
+                    values.push(value);
+                    indices.push(index);
                 }
                 None => {
                     values.push(fill);
@@ -168,15 +179,15 @@ impl Accumulator for Ranked {
 
 fn f32_of(value: HostScalar) -> Result<f32> {
     match value.value {
-        ScalarValue::F32(x) if value.dtype == DType::F32 => Ok(x),
+        ScalarValue::F32(number) if value.dtype == DType::F32 => Ok(number),
         _ => bail!("expected an f32 value, got a {}", value.dtype),
     }
 }
 
-fn f32_scalar(x: f32) -> HostScalar {
+fn f32_scalar(number: f32) -> HostScalar {
     HostScalar {
         dtype: DType::F32,
-        value: ScalarValue::F32(x),
+        value: ScalarValue::F32(number),
     }
 }
 
@@ -244,7 +255,8 @@ impl State {
 }
 
 /// `online_softmax` (`WITH_VALUE`) and `logsumexp` on scores: the start state, then every point's
-/// score and value, folded in two passes when the fold finishes.
+/// score and value, kept for the second of the fold's two sweeps over them, which the fold takes
+/// when it finishes.
 struct TwoPass<const WITH_VALUE: bool> {
     start: State,
     points: Vec<(f32, f32)>,

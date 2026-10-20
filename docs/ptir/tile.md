@@ -85,8 +85,8 @@ Each result has one write, in the fold that gives it.
 - A new tensor: `[c, ...]`, each coordinate a parallel or prefix iterator or `0`, which adds an
   axis of extent 1.
   - A result without a combine names every iterator once, so the block writes each element once.
-  - A folded result names every iterator that is not folded, except the lanes of its combine kind,
-    and the kind appends its own axes (`top_k` appends `k`).
+  - A folded result names every iterator that is not folded, except the value's iterators that
+    its combine kind leaves out, and the kind appends its own axes (`top_k` appends `k`).
 - An updated operand: `$k[e, ...]`, any expressions, for `dynamic_update_slice`, scatters and
   segment reductions. The result is a copy of operand `k` with the written elements replaced, or
   with `sum`, `max`, `min`, `and` and `or` folded into them.
@@ -116,15 +116,16 @@ its one yielded value per point.
 | `and`, `or` | `x` | from all ones, from 0 | yes |
 | `argmax`, `argmin` | `(x, i)` | the extreme value and its index; ties to the smaller index, NaN largest | yes |
 | `top_k<k>`, `bottom_k<k>` | `(x, i)` | the `k` largest or smallest values and their indices, along a new last axis; equal values in index order | yes |
-| `online_softmax<lanes>` | `(s, v)` | the state `(m, l, o)`: `m = max_j s_j`, `l = sum_j exp(s_j - m)`, `o = sum_j exp(s_j - m) v_j` | no |
-| `online_softmax_merge<lanes>` | `(m, l, o)` | the states merged into one | no |
+| `online_softmax<value_iters>` | `(s, v)` | the state `(m, l, o)`: `m = max_j s_j`, `l = sum_j exp(s_j - m)`, `o = sum_j exp(s_j - m) v_j` | no |
+| `online_softmax_merge<value_iters>` | `(m, l, o)` | the states merged into one | no |
 | `logsumexp` | `s` | the state `(m, l)` | no |
 | `logsumexp_merge` | `(m, l)` | the states merged into one | no |
 
 - Each kind is one computation: a kind that would switch its inputs or results on a parameter is
   two kinds instead, as `top_k` and `bottom_k`, or a kind and its merge.
-- `online_softmax` lanes are parallel iterators, by position, that only the value depends on; the
-  score MUST NOT depend on them. Its `m` and `l` results drop the lanes.
+- The `value_iters` of `online_softmax` are the value's iterators: parallel iterators, by
+  position, that only the value depends on; the score MUST NOT depend on them. Its `m` and `l`
+  results leave them out.
 - The softmax kinds give their state. The weighted sum is `o / l` and the log-sum-exp is
   `m + log(l)`, which a following block computes.
 - A fold's `init` names the operands that hold its starting state, one per state component, of
@@ -149,9 +150,33 @@ states in point order, and a state with maximum `-inf` contributes nothing to a 
 top-level symbol that `host.dispatch` calls. A dispatch runs on its arguments alone, so they bind
 every dimension symbol its blocks use.
 
-A dispatch carries its schedule, `#sched<...>`: how it runs, which changes no value it computes.
-`Schedule` in `ir.rs` declares its fields, and `verify/dispatch.rs` checks the rules a schedule
-follows.
+## Schedules
+
+How a dispatch runs changes no value it computes, except by the rounding changes its
+`numerics` names. The IR says it where it applies:
+
+- Each block's `loops` are its modes, outermost first, one loop each: an iterator cut into pieces of
+  a size, run one after another, on the workers of an execution level, or at once in registers
+  (`reg`), the innermost along the lanes of a vector (`lanes`). Every iterator outside the register
+  tile ends in a mode of one point, so the modes say every loop. A block without modes walks one
+  point at a time, in the order that the op's entry gives. Its `clip` names the iterators whose
+  loops skip the points where a padded read falls outside its operand.
+- A fold `held` in scratch keeps its state in a scratch that it starts before the loop of a mode, in
+  each piece of the modes around that mode, and finishes after that loop. One that holds none keeps
+  the register tile's points, or one element, from its first loop over a reduced iterator on.
+- A read placed `at` runs its block in the loops of the first block of its run, at a piece of
+  them: the register tile (`reg`) or a piece of a mode (`at 2`). It runs on each element of the
+  block before it as soon as that element is finished when it reads that element alone, and over
+  the piece once the piece is finished when it reads across it.
+- A read `held` keeps what it takes in a copy or asks a cache for it ahead (`prefetch`), at a mode
+  of the block's loops.
+- The dispatch names its `target`, by its fingerprint, and its `numerics`.
+
+The passes that decide a schedule write it into the IR, and the verifier checks the rules it
+keeps (`verify/schedule.rs` for a block, `verify/dispatch.rs` for placements and the target).
+What follows from it, such as how a loop builds a piece that holds fewer points, is computed by
+one function each (`utils/schedule.rs`), which the lowering below `tile` reads: it realizes the
+schedule and decides nothing.
 
 ## Ops
 
@@ -181,6 +206,19 @@ A generalized reduction over the iteration domain `iters`, restricted by
   every operand as it was before the block.
 - The reference order folds the points in lexicographic order of `iters`, the first one
   outermost, rounding each step to the result dtype.
+- `loops` says how the block runs, which changes no value it computes: its modes, outermost
+  first, each cutting one iterator into pieces (see [`Mode`]). Every iterator outside the
+  register tile ends in a mode of one point, so the modes say every loop. Left out, the block
+  walks each iterator one point at a time, in this order:
+  1. the iterators that are not reduced and that the coordinates of its first write take, in
+     the order they take them;
+  2. the other iterators that are not reduced, in the order of `iters`;
+  3. the reduced ones, in the order of `iters`.
+
+  When a fold updates an operand where its points may collide, all come in the order of
+  `iters`.
+- `clip` names the iterators whose loops skip the points where a padded read falls outside its
+  operand, when such a point contributes nothing the fold keeps.
 
 Defined by `Block` in [crates/gpt-rs-ir/src/dialects/tile/ir.rs](../../crates/gpt-rs-ir/src/dialects/tile/ir.rs).
 
@@ -189,10 +227,10 @@ Defined by `Block` in [crates/gpt-rs-ir/src/dialects/tile/ir.rs](../../crates/gp
 | Operands | `ins`: tensors |
 | Results | `outs`: tensors |
 | Regions | `body` |
-| Attributes | `iters`: `[Iter]`; `reads`: `[Read]`; `folds`: `[Fold]`; `constraints`: `[Constraint]`, optional |
+| Attributes | `iters`: `[Iter]`; `reads`: `[Read]`; `folds`: `[Fold]`; `constraints`: `[Constraint]`, optional; `loops`: `[Mode]`, optional; `clip`: `IterList`, optional |
 | Traits | isolated from above |
 | Effects | none |
-| Patterns | `CanonicalIndices` (`canonicalize`); `CompactInputs` (`canonicalize`); `DropUnitIters` (`canonicalize`); `EraseIdentityBlock` (`canonicalize`); `SplatReads` (`canonicalize`) |
+| Patterns | `CanonicalIndices` (`canonicalize`); `CompactInputs` (`canonicalize`); `ComposeCopyReads` (`canonicalize`); `DelinearizeIters` (`canonicalize`); `DropUnitIters` (`canonicalize`); `EraseIdentityBlock` (`canonicalize`); `MergeEqualReads` (`canonicalize`); `OrderItersByWrite` (`canonicalize`); `SplatReads` (`canonicalize`); `WriteInCopyOrder` (`canonicalize`); `WriteIntoUpdate` (`canonicalize`); `GroupChain` (`form-groups`); `ComputeMapInReader` (`inline-static-maps`); `BoundsToPad` (`pad-with-identity`); `LanesLast` (`plan-layouts`); `Seal` (`seal-dispatches`); `WidenInMap` (`widen-reused-maps`); `ConvToWinograd` (`winograd-conv`) |
 
 | `iters` | Text form |
 |---|---|
@@ -200,25 +238,28 @@ Defined by `Block` in [crates/gpt-rs-ir/src/dialects/tile/ir.rs](../../crates/gp
 
 | `reads` | Text form |
 |---|---|
-| `Read` | ``` $source `` $coords (`pad` $pad^)? ``` |
+| `Read` | ``` $source `` $coords (`pad` $pad^)? (`at` $at^)? (`held` $held^)? ``` |
 | `SourceText` | `` $first (`..` $list^)? `` |
 | `OperandList` | `` $last `[` $pick `]` `` |
 
 | `folds` | Text form |
 |---|---|
-| `Fold` | `` $combine `->` tuple($writes) (`init` tuple($init)^)? `` |
+| `Fold` | `` $combine `->` tuple($writes) (`init` tuple($init)^)? (`held` $held^)? `` |
 | `Write` | ``` ($into^)? `` $coords ``` |
 
-Example, from `filetests/tile/roundtrip/block.ptir`:
+| `loops` | Text form |
+|---|---|
+| `Mode` | `` $iter `by` $size (`:` $kind^)? (`in` $memory^)? `` |
+
+Example, from `filetests/tile/roundtrip/loops.ptir`:
 
 ```text
-func.func @experts(%input: tensor<{T}x8xf32>, %choices: tensor<{T}xsi32>, %first_expert: tensor<4x8xf32>, %second_expert: tensor<4x8xf32>, %third_expert: tensor<4x8xf32>) -> tensor<{T}x4xf32> {
-  %output = tile.block(%input, %choices, %first_expert, %second_expert, %third_expert) {iters = [par {T}, par 4, red 8], reads = [$0[d0, d2], $2..$4[$1[d0]][d1, d2]], folds = [sum -> [d0, d1]]} ({
-  ^body(%activation: f32, %expert_weight: f32):
-    %product = arith.mul(%activation, %expert_weight) : (f32, f32) -> f32
-    tile.yield(%product) : (f32) -> ()
-  }) : (tensor<{T}x8xf32>, tensor<{T}xsi32>, tensor<4x8xf32>, tensor<4x8xf32>, tensor<4x8xf32>) -> tensor<{T}x4xf32>
-  func.return(%output) : (tensor<{T}x4xf32>) -> ()
+tile.dispatch @every_change(%input: tensor<4xf32>) -> tensor<4xf32> attributes {numerics = <contract = true, skip_pad = true, reassoc = true, winograd = true, scale_fold = true, expand_math = true>} {
+  %copied = tile.block(%input) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%copied) : (tensor<4xf32>) -> ()
 }
 ```
 
@@ -236,7 +277,66 @@ Rejected, as the verify filetests pin it:
 - `tile.block: write 0 writes a new tensor at d0 + 1; its coordinates are iterators or 0`
 - `tile.block: write 0 folds into an operand with argmax, but only none, sum, max, min, and and or fold into one`
 - `tile.block: result 0 is a plain new tensor, which a block with constraints cannot write`
-- `tile.block: lane d1 is not a parallel iterator of the block`
+- `tile.block: the value's iterator d1 is not a parallel iterator of the block`
+- `tile.block: a block has at most one prefix iterator`
+- `tile.block: read 0 names operand $1, but the block has 1 operands`
+- `tile.block: read 0 names operand $2, but the block has 2 operands`
+- `tile.block: the operands of read 0 differ in type: tensor<4xf32> and tensor<8xf32>`
+- `tile.block: fold 0 has 1 writes, but argmax gives 2 results`
+- `tile.block: write 0 updates $1, but the block has 1 operands`
+- `tile.block: write 0 writes f32 values into tensor<4xsi32>`
+- `tile.block: init lists 2 operands, but sum starts from 1 states`
+- `tile.block: read 0 has no pad, but coordinate 0 is 4 at the point [3], outside tensor<4xf32>`
+- `tile.block: yielded value 0, which online_softmax keeps apart from the value's iterators, depends on d1`
+- `tile.block: mode 0 walks d2, which the block does not have`
+- `tile.block: mode 0 walks pieces of no points`
+- `tile.block: mode 0 runs pieces of d1 on workers, which is not a parallel iterator: that splits a fold`
+- `tile.block: mode 0 walks d1 in pieces of 3 points, a prefix iterator, which its loop walks one point at a time`
+- `tile.block: mode 0 walks d1 in pieces of 3 points, a reduction in order, which its loop walks one point at a time`
+- `tile.block: fold 0 starts its state outside the loop over d1, the prefix iterator, whose point each element folds up to`
+- `tile.block: the register tile has no lanes mode`
+- `tile.block: mode 1 holds d1 in the register tile, which is not a parallel iterator`
+- `tile.block: mode 1 is a mode of the register tile, and walks the pieces of a memory`
+- `tile.block: read 0 is held at mode 3, of loops of 3 modes`
+- `tile.block: the block clips d2, which it does not have`
+- `tile.block: mode 2 comes after the lanes, the innermost mode`
+- `tile.block: mode 1 walks pieces of d1 inside the register tile, whose modes are the innermost`
+- `tile.block: read 0 is held at mode 2, a mode of the register tile, which runs its points at once`
+- `tile.block: mode 1 walks pieces of 4 points of d1, inside pieces of 2`
+- `tile.block: modes of a block that updates an operand where its points may collide would reorder its writes`
+- `tile.block: a block that folds with `online_softmax` or `logsumexp` takes no modes: its fold has no update of a piece`
+- `tile.block: the state of fold 0 keeps the piece of d0, whose extent {N} is not static`
+- `tile.block: the register tile holds d1 twice`
+- `tile.block: a register tile holds at most 3 iterators, not 4`
+- `tile.block: the register tile holds 16 points of d1, whose innermost piece has 8`
+- `tile.block: the register tile holds 12 points of d1, which vectors of 8 lanes do not fill`
+- `tile.block: a register tile of a block with constraints would guard each point`
+- `tile.block: a block with a prefix iterator has no register tile`
+- `tile.block: a fold in a register tile keeps one element per point`
+- `tile.block: the register tile holds d0, which a write leaves out: its points would write one element`
+- `tile.block: read 1 holds $0, which another read holds`
+- `tile.block: $0 is held in a copy, and the block uses it other than in one read of it alone`
+- `tile.block: the copy of $0 has an axis of {N} elements, which is not static`
+- `tile.block: the register tile holds d0, which the read of $0 takes other than by a multiple of it`
+- `tile.block: the register tile holds d1, which the read of $0 takes other than by a multiple of it`
+- `tile.block: the register tile holds d1, which the read of $0 takes other than by a multiple of it`
+- `tile.block: the lanes run along d1, which the read of $0 takes other than in whole vectors of consecutive elements`
+- `tile.block: the register tile holds d0, by which a read picks its operand of a list`
+- `tile.block: $0 is copied where d0, by which its read picks the operand, does not stand at one point`
+- `tile.block: $1 is prefetched at a mode over an iterator its read does not take`
+- `tile.block: $0 is prefetched, and the block uses it other than in one read of it alone`
+- `tile.block: $0 is prefetched, and its read pads or picks it from a list`
+- `tile.block: no mode walks d1`
+- `tile.block: the modes walk d0 in pieces of 2 points, and none walks it one point at a time`
+- `tile.block: fold 0 holds its state at a mode, and the block has no modes`
+- `tile.block: fold 0 holds a state, and a fold of `none` keeps none`
+- `tile.block: fold 0 holds its state at mode 2, of loops of 2 modes`
+- `tile.block: fold 0 starts its state inside a loop over d1, a reduced iterator: it would finish each element more than once`
+- `tile.block: fold 0 holds no state, and its loops walk the elements of more than the register tile inside its first loop over a reduced iterator`
+- `tile.block: fold 0 holds its state at mode 2, a mode of the register tile, which runs its points at once`
+- `tile.block: the state of fold 1 keeps the piece of d1, whose extent {N} is not static`
+- `tile.block: the lanes run along d1, which the read of $0 takes other than in whole vectors of consecutive elements`
+- `tile.block: the lanes run along d1, which write 0 takes other than by 1 in its last coordinate`
 
 ### `tile.index`
 
@@ -289,16 +389,15 @@ Defined by `Yield` in [crates/gpt-rs-ir/src/dialects/tile/ir.rs](../../crates/gp
 | Traits | terminator |
 | Effects | none |
 
-Example, from `filetests/tile/roundtrip/block.ptir`:
+Example, from `filetests/tile/roundtrip/loops.ptir`:
 
 ```text
-func.func @experts(%input: tensor<{T}x8xf32>, %choices: tensor<{T}xsi32>, %first_expert: tensor<4x8xf32>, %second_expert: tensor<4x8xf32>, %third_expert: tensor<4x8xf32>) -> tensor<{T}x4xf32> {
-  %output = tile.block(%input, %choices, %first_expert, %second_expert, %third_expert) {iters = [par {T}, par 4, red 8], reads = [$0[d0, d2], $2..$4[$1[d0]][d1, d2]], folds = [sum -> [d0, d1]]} ({
-  ^body(%activation: f32, %expert_weight: f32):
-    %product = arith.mul(%activation, %expert_weight) : (f32, f32) -> f32
-    tile.yield(%product) : (f32) -> ()
-  }) : (tensor<{T}x8xf32>, tensor<{T}xsi32>, tensor<4x8xf32>, tensor<4x8xf32>, tensor<4x8xf32>) -> tensor<{T}x4xf32>
-  func.return(%output) : (tensor<{T}x4xf32>) -> ()
+tile.dispatch @every_change(%input: tensor<4xf32>) -> tensor<4xf32> attributes {numerics = <contract = true, skip_pad = true, reassoc = true, winograd = true, scale_fold = true, expand_math = true>} {
+  %copied = tile.block(%input) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%copied) : (tensor<4xf32>) -> ()
 }
 ```
 
@@ -321,6 +420,7 @@ Defined by `Group` in [crates/gpt-rs-ir/src/dialects/tile/ir.rs](../../crates/gp
 | Regions | `body` |
 | Attributes | `grid`: `IterList`, optional |
 | Effects | none |
+| Patterns | `Seal` (`seal-dispatches`) |
 
 Example, from `filetests/tile/roundtrip/block.ptir`:
 
@@ -355,7 +455,8 @@ symbol, called by `host.dispatch`.
 - Its body's block arguments are its arguments, and its `func.return` gives its results.
 - `grid` lists the parallel iterators, by position, that its blocks share. `facts` gives a
   range and a divisor of each dimension symbol of its arguments.
-- `schedule` says how it runs, which changes no value it computes.
+- `target` names the target its blocks' loops are for, and `numerics` the rounding changes the
+  lowerings below `tile` may make: how it runs changes no value it computes, except by those.
 
 Defined by `Dispatch` in [crates/gpt-rs-ir/src/dialects/tile/ir.rs](../../crates/gpt-rs-ir/src/dialects/tile/ir.rs).
 
@@ -364,30 +465,28 @@ Defined by `Dispatch` in [crates/gpt-rs-ir/src/dialects/tile/ir.rs](../../crates
 | Operands | none |
 | Results | none |
 | Regions | `body` |
-| Attributes | `name`: `String`; `args`: `[Type]`; `results`: `[Type]`; `grid`: `IterList`, optional; `facts`: `{name = SymFact}`, optional; `schedule`: `Schedule`, optional |
+| Attributes | `name`: `String`; `args`: `[Type]`; `results`: `[Type]`; `grid`: `IterList`, optional; `facts`: `{name = SymFact}`, optional; `target`: `TargetRef`, optional; `numerics`: `Numerics`, optional |
 | Traits | isolated from above |
 | Effects | none |
-| Patterns | `DispatchToLoop` (`tile-to-loop`) |
+| Patterns | `NameDispatchTarget` (`name-target`); `PlaceAtRegisterTile` (`place-epilogues`); `ScheduleFirstBlock` (`schedule`); `SelectVectors` (`select-atoms`); `SplitIntoLanes` (`split-lane-folds`); `DispatchToLoop` (`tile-to-loop`) |
 
 | `facts` | Text form |
 |---|---|
 | `SymFact` | `` `[` $min `,` $max `]` (`%` $divisor^)? `` |
 
-| `schedule` | Text form |
+| `numerics` | Text form |
 |---|---|
-| `Schedule` | `` `#sched` `<` struct($nest) `>` `` |
-| `Loop` | `` $iter `by` $extent `:` $parallelism `` |
+| `Numerics` | `` `<` struct($contract, $skip_pad, $reassoc, $winograd, $scale_fold, $expand_math) `>` `` |
 
-Example, from `filetests/tile/roundtrip/schedule.ptir`:
+Example, from `filetests/tile/roundtrip/loops.ptir`:
 
 ```text
-tile.dispatch @project(%input: tensor<4x8xf32>, %weight: tensor<6x8xf32>) -> tensor<4x6xf32> attributes {schedule = #sched<nest = [d0 by 2 : par<level = l3, units = 2>, d1 by 3 : par<level = core>, d2 by 4 : seq]>} {
-  %product = tile.block(%input, %weight) {iters = [par 4, par 6, red 8], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
-  ^body(%element: f32, %scale: f32):
-    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
-    tile.yield(%term) : (f32) -> ()
-  }) : (tensor<4x8xf32>, tensor<6x8xf32>) -> tensor<4x6xf32>
-  func.return(%product) : (tensor<4x6xf32>) -> ()
+tile.dispatch @every_change(%input: tensor<4xf32>) -> tensor<4xf32> attributes {numerics = <contract = true, skip_pad = true, reassoc = true, winograd = true, scale_fold = true, expand_math = true>} {
+  %copied = tile.block(%input) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%copied) : (tensor<4xf32>) -> ()
 }
 ```
 
@@ -396,17 +495,34 @@ Rejected, as the verify filetests pin it:
 - `tile.dispatch: a block uses {T}, which no argument binds`
 - `tile.dispatch: facts give {T} the empty range [8, 4]`
 - `tile.dispatch: facts give {T} the divisor 0`
-- `tile.dispatch: a nest schedules the one block of a dispatch, and this one holds 2`
-- `tile.dispatch: loop 0 walks d2, which the block does not have`
-- `tile.dispatch: loop 0 walks empty tiles`
-- `tile.dispatch: loop 1 walks tiles of 4 points of d1, inside tiles of 2`
-- `tile.dispatch: loop 0 runs on no units`
-- `tile.dispatch: loop 1 runs at level l3, inside a loop at level core`
-- `tile.dispatch: loop 0 runs tiles of d1, a reduction iterator, in parallel: that splits the reduction`
-- `tile.dispatch: loop 0 walks d1, a prefix iterator, which a nest leaves whole`
-- `tile.dispatch: a nest of a block that updates an operand would reorder its writes`
-- `tile.dispatch: a nest of `online_softmax` or `logsumexp` needs their update of a tile`
-- `tile.dispatch: the state of a fold keeps the tile of d0, whose extent {N} is not static`
+- `tile.dispatch: block 1 does not run on the elements that the block before it finishes where it is placed: its read 0 takes axis 0 of the result at d1, where the block before it writes d0`
+- `tile.dispatch: block 1 does not run on the elements that the block before it finishes where it is placed: it folds its points with sum`
+- `tile.dispatch: block 1 does not run on the elements that the block before it finishes where it is placed: it has 3 iterators, and the block before it 2`
+- `tile.dispatch: block 1 does not run on the elements that the block before it finishes where it is placed: its d0 is not a parallel iterator of the same extent in both blocks`
+- `tile.dispatch: block 1 does not run on the elements that the block before it finishes where it is placed: its read 0 takes the result of the block before it from a list or with a pad`
+- `tile.dispatch: block 1 does not run on the elements that the block before it finishes where it is placed: an index expression of it reads the result of the block before it`
+- `tile.dispatch: block 1 runs in the loops of the block before it, whose result has another use`
+- `tile.dispatch: block 2 is placed at 0, and the block before it at reg: the blocks of a run are placed at one piece`
+- `tile.dispatch: block 0 is placed, and no block comes before it`
+- `tile.dispatch: block 1 is placed by read 1, which does not read the result of the block before it`
+- `tile.dispatch: block 1 runs in the loops of the block before it, and has modes of its own`
+- `tile.dispatch: block 1 is placed by two of its reads, where it runs in one block's loops`
+- `tile.dispatch: block 1 is placed at mode 3 of the first block of its run, of 3 modes`
+- `tile.dispatch: block 1 is placed at mode 2, a mode of the register tile, where a block is placed at `reg``
+- `tile.dispatch: block 1 reads the result of the block before it across the piece where it is placed, whose extent along d0 is not static`
+- `tile.dispatch: block 1 does not run on the elements that the block before it finishes where it is placed: its read 0 takes axis 2 of the result at 0, a constant along d2, which the piece where it is placed does not hold whole`
+- `tile.dispatch: block 1 does not run on the elements that the block before it finishes where it is placed: its read 1 takes axis 2 of the result at d0 mod 16, where the block before it writes d2`
+- `tile.dispatch: block 1 runs in the loops of the block before it, whose result has another use`
+- `tile.dispatch: op 0 is tensor.add, and a dispatch holds blocks`
+- `tile.dispatch: block 0 gives a result of tensor<{N}xf32> that the dispatch does not give, which lives in scratch of its own, whose extents must be static`
+- `tile.dispatch: block 1 runs in the loops of the block before it, and holds a read of its own`
+- `tile.dispatch: block 1: the lanes run along d1, which the read of $1 takes other than in whole vectors of consecutive elements`
+- `tile.dispatch: block 0: mode 0 runs on the workers of cluster, which x86-64-v4 does not have`
+- `tile.dispatch: block 0: the read of $0 is held for smem, a memory x86-64-v4 does not have`
+- `tile.dispatch: block 0: mode 0 walks the pieces of dram, which is not a cache or scratch of x86-64-v4`
+- `tile.dispatch: block 0: the read of $0 is held for l2, for which %S/bare-l2.toml has no buffer space that holds a copy`
+- `tile.dispatch: block 0: the read of $0 is held for l2, for which %S/bare-l2.toml has no prefetch that asks it for lines`
+- `tile.dispatch: block 0: 16 lanes of f64 take 1024 bits, and x86-64-v4 has registers of [128, 256, 512] bits`
 
 ## Traits
 

@@ -12,7 +12,7 @@ use crate::dialects::arith::{
     NotEqual, Or, ScalarBuilder, Select, ShiftLeft, ShiftRightArithmetic, ShiftRightLogical, Sin,
     Sub, Tanh, Unary,
 };
-use crate::dialects::tile::AllowedNumerics;
+use crate::dialects::tile::Numerics;
 use crate::ir::{DType, Format, OpRef, Value};
 use crate::passes::{pass, run_patterns, Pass};
 use crate::require;
@@ -29,12 +29,12 @@ trait Expanded: Unary {
 /// rounding.
 #[pattern]
 struct Expand<T> {
-    numerics: AllowedNumerics,
+    numerics: Numerics,
     function: PhantomData<T>,
 }
 
 impl<T> Expand<T> {
-    fn new(numerics: AllowedNumerics) -> Self {
+    fn new(numerics: Numerics) -> Self {
         Expand {
             numerics,
             function: PhantomData,
@@ -439,10 +439,10 @@ fn product_mod_2_96(
     [top, second, lowest]
 }
 
-/// The quarter turns of `|x| 2/pi mod 4`, rounded to the nearest and taken mod 4, and the rest in
+/// The quarter turns of `|x| 2/pi`, rounded to the nearest and taken mod 4, and the rest in
 /// radians in f64. `product` times `2^-94` is `|x| 2/pi mod 4`: its top two bits are the turns,
 /// and the 94 bits below them are the fraction of a turn. When bit 93 is set, the turns round up,
-/// and the rest is `2^94` less the fraction, negated.
+/// and the rest is the fraction less one turn.
 fn nearest_turn(
     body: &mut ScalarBuilder<Rewriter>,
     [top, second, lowest]: [Value; 3],
@@ -667,7 +667,8 @@ fn rational(
 }
 
 /// `erf` by the magnitude of `x`, with the sign of `x`:
-/// - below 0.84375, a rational function of `x^2`;
+/// - below `2^-28`, `2 x / sqrt(pi)`;
+/// - below 0.84375, `x` plus `x` times a rational function of `x^2`;
 /// - below 1.25, a rational function of `|x| - 1`;
 /// - below 6, `1 - e^(-z^2 - 0.5625) e^((z - |x|)(z + |x|) + R(1/x^2)) / |x|`, with `z` the
 ///   magnitude cut to 11 significant bits, `R` a rational function of two pieces split at
@@ -765,10 +766,10 @@ impl Expanded for Erf {
 pub struct ExpandMath {
     /// The rounding changes the compilation allows: the pass writes the polynomials only where
     /// they name `expand_math`.
-    pub numerics: AllowedNumerics,
+    pub numerics: Numerics,
 }
 
-fn populate_expand_math_patterns(set: &mut PatternSet, numerics: AllowedNumerics) {
+fn populate_expand_math_patterns(set: &mut PatternSet, numerics: Numerics) {
     set.add(Expand::<Exp>::new(numerics));
     set.add(Expand::<Tanh>::new(numerics));
     set.add(Expand::<Log>::new(numerics));

@@ -1,0 +1,22 @@
+# znver5 with an L2 that the hardware alone fills: the code can keep no copy in it and asks it for
+# no line, so that a dispatch that holds a read for it shows the rules of a holding's memory.
+base = "znver5"
+description = "znver5 with an L2 that holds no copy and takes no prefetch"
+
+[[memory]]
+name = "registers"
+kind = "registers"
+level = "core"
+
+[[memory]]
+name = "l2"
+kind = "cache"
+bytes = 1048576
+level = "core"
+line = 64
+ways = 16
+
+[[memory]]
+name = "dram"
+kind = "main"
+alignment = 64

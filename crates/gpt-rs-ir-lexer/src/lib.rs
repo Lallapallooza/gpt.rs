@@ -22,7 +22,7 @@ pub enum TokenKind {
     Label,
     /// `@` and a name: a symbol, `@main`.
     Symbol,
-    /// `#` and a name: a named attribute, `#sched`.
+    /// `#` and a name, `#name`, which a declared attribute format may take as a literal.
     Hash,
     /// `!` and a name: a type of a dialect, `!loop.buf`.
     Bang,

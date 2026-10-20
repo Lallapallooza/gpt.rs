@@ -86,16 +86,17 @@ func.func @folds(%scores: tensor<2x5xf32>, %flags: tensor<2x5xi1>) -> (tensor<2x
 
 // -----
 
-// Causal attention for one head: the scores fold with online softmax over the keys, the value
-// lanes `d1` drop from the states, and a sink starts each fold. The states merge, and the output is
-// `o / l`.
-// CHECK: func.func @attention([[QUERY:%[0-9]+]]: tensor<{T}x8xf32>, [[KEY:%[0-9]+]]: tensor<{S}x8xf32>, [[VALUE:%[0-9]+]]: tensor<{S}x8xf32>, [[SINK_MAX:%[0-9]+]]: tensor<{T}xf32>, [[SINK_SUM:%[0-9]+]]: tensor<{T}xf32>, [[SINK_ACCUMULATED:%[0-9]+]]: tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>, tensor<{T}x8xf32>) {
-// CHECK-NEXT: [[MAX:%[0-9]+]], [[SUM:%[0-9]+]], [[ACCUMULATED:%[0-9]+]] = tile.block([[QUERY]], [[KEY]], [[VALUE]], [[SINK_MAX]], [[SINK_SUM]], [[SINK_ACCUMULATED]]) {iters = [par {T}, par 8, red {S}], reads = [$0[d0, d1], $1[d2, d1], $2[d2, d1]], folds = [online_softmax<lanes = [d1]> -> ([d0], [d0], [d0, d1]) init ($3, $4, $5)], constraints = [d2 <= d0 or d2 < 4]} ({
-// CHECK-NEXT: ^body([[QUERY_ELEMENT:%[0-9]+]]: f32, [[KEY_ELEMENT:%[0-9]+]]: f32, [[VALUE_ELEMENT:%[0-9]+]]: f32):
-// CHECK-NEXT: [[PRODUCT:%[0-9]+]] = arith.mul([[QUERY_ELEMENT]], [[KEY_ELEMENT]]) : (f32, f32) -> f32
-// CHECK-NEXT: tile.yield([[PRODUCT]], [[VALUE_ELEMENT]]) : (f32, f32) -> ()
-// CHECK-NEXT: }) : (tensor<{T}x8xf32>, tensor<{S}x8xf32>, tensor<{S}x8xf32>, tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>)
-// CHECK-NEXT: [[MERGED_MAX:%[0-9]+]], [[MERGED_SUM:%[0-9]+]], [[MERGED_ACCUMULATED:%[0-9]+]] = tile.block([[MAX]], [[SUM]], [[ACCUMULATED]]) {iters = [par {T}, par 8], reads = [$0[d0], $1[d0], $2[d0, d1]], folds = [online_softmax_merge<lanes = [d1]> -> ([d0], [d0], [d0, d1])]} ({
+// Causal attention for one head on its scores: the scaled scores fold with online softmax over the
+// keys, the value's iterator `d1` drops from the states, and a sink starts each fold. The states
+// merge, and the output is `o / l`.
+// CHECK: func.func @attention([[SCORES:%[0-9]+]]: tensor<{T}x{S}xf32>, [[VALUE:%[0-9]+]]: tensor<{S}x8xf32>, [[SINK_MAX:%[0-9]+]]: tensor<{T}xf32>, [[SINK_SUM:%[0-9]+]]: tensor<{T}xf32>, [[SINK_ACCUMULATED:%[0-9]+]]: tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>, tensor<{T}x8xf32>) {
+// CHECK-NEXT: [[MAX:%[0-9]+]], [[SUM:%[0-9]+]], [[ACCUMULATED:%[0-9]+]] = tile.block([[SCORES]], [[VALUE]], [[SINK_MAX]], [[SINK_SUM]], [[SINK_ACCUMULATED]]) {iters = [par {T}, par 8, red {S}], reads = [$0[d0, d2], $1[d2, d1]], folds = [online_softmax<value_iters = [d1]> -> ([d0], [d0], [d0, d1]) init ($2, $3, $4)], constraints = [d2 <= d0 or d2 < 4]} ({
+// CHECK-NEXT: ^body([[SCORE:%[0-9]+]]: f32, [[VALUE_ELEMENT:%[0-9]+]]: f32):
+// CHECK-NEXT: [[SCALE:%[0-9]+]] = arith.constant() {value = 0.125 : f32} : () -> f32
+// CHECK-NEXT: [[SCALED:%[0-9]+]] = arith.mul([[SCORE]], [[SCALE]]) : (f32, f32) -> f32
+// CHECK-NEXT: tile.yield([[SCALED]], [[VALUE_ELEMENT]]) : (f32, f32) -> ()
+// CHECK-NEXT: }) : (tensor<{T}x{S}xf32>, tensor<{S}x8xf32>, tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>)
+// CHECK-NEXT: [[MERGED_MAX:%[0-9]+]], [[MERGED_SUM:%[0-9]+]], [[MERGED_ACCUMULATED:%[0-9]+]] = tile.block([[MAX]], [[SUM]], [[ACCUMULATED]]) {iters = [par {T}, par 8], reads = [$0[d0], $1[d0], $2[d0, d1]], folds = [online_softmax_merge<value_iters = [d1]> -> ([d0], [d0], [d0, d1])]} ({
 // CHECK-NEXT: ^body([[PARTIAL_MAX:%[0-9]+]]: f32, [[PARTIAL_SUM:%[0-9]+]]: f32, [[PARTIAL_ACCUMULATED:%[0-9]+]]: f32):
 // CHECK-NEXT: tile.yield([[PARTIAL_MAX]], [[PARTIAL_SUM]], [[PARTIAL_ACCUMULATED]]) : (f32, f32, f32) -> ()
 // CHECK-NEXT: }) : (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>)
@@ -106,13 +107,14 @@ func.func @folds(%scores: tensor<2x5xf32>, %flags: tensor<2x5xi1>) -> (tensor<2x
 // CHECK-NEXT: }) : (tensor<{T}xf32>, tensor<{T}x8xf32>) -> tensor<{T}x8xf32>
 // CHECK-NEXT: func.return([[MAX]], [[SUM]], [[ACCUMULATED]], [[OUTPUT]]) : (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>, tensor<{T}x8xf32>) -> ()
 // CHECK-NEXT: }
-func.func @attention(%query: tensor<{T}x8xf32>, %key: tensor<{S}x8xf32>, %value: tensor<{S}x8xf32>, %sink_max: tensor<{T}xf32>, %sink_sum: tensor<{T}xf32>, %sink_accumulated: tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>, tensor<{T}x8xf32>) {
-  %max, %sum, %accumulated = tile.block(%query, %key, %value, %sink_max, %sink_sum, %sink_accumulated) {iters = [par {T}, par 8, red {S}], reads = [$0[d0, d1], $1[d2, d1], $2[d2, d1]], folds = [online_softmax<lanes = [d1]> -> ([d0], [d0], [d0, d1]) init ($3, $4, $5)], constraints = [d2 <= d0 or d2 < 4]} ({
-  ^body(%query_element: f32, %key_element: f32, %value_element: f32):
-    %product = arith.mul(%query_element, %key_element) : (f32, f32) -> f32
-    tile.yield(%product, %value_element) : (f32, f32) -> ()
-  }) : (tensor<{T}x8xf32>, tensor<{S}x8xf32>, tensor<{S}x8xf32>, tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>)
-  %merged_max, %merged_sum, %merged_accumulated = tile.block(%max, %sum, %accumulated) {iters = [par {T}, par 8], reads = [$0[d0], $1[d0], $2[d0, d1]], folds = [online_softmax_merge<lanes = [d1]> -> ([d0], [d0], [d0, d1])]} ({
+func.func @attention(%scores: tensor<{T}x{S}xf32>, %value: tensor<{S}x8xf32>, %sink_max: tensor<{T}xf32>, %sink_sum: tensor<{T}xf32>, %sink_accumulated: tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>, tensor<{T}x8xf32>) {
+  %max, %sum, %accumulated = tile.block(%scores, %value, %sink_max, %sink_sum, %sink_accumulated) {iters = [par {T}, par 8, red {S}], reads = [$0[d0, d2], $1[d2, d1]], folds = [online_softmax<value_iters = [d1]> -> ([d0], [d0], [d0, d1]) init ($2, $3, $4)], constraints = [d2 <= d0 or d2 < 4]} ({
+  ^body(%score: f32, %value_element: f32):
+    %scale = arith.constant() {value = 0.125 : f32} : () -> f32
+    %scaled = arith.mul(%score, %scale) : (f32, f32) -> f32
+    tile.yield(%scaled, %value_element) : (f32, f32) -> ()
+  }) : (tensor<{T}x{S}xf32>, tensor<{S}x8xf32>, tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>)
+  %merged_max, %merged_sum, %merged_accumulated = tile.block(%max, %sum, %accumulated) {iters = [par {T}, par 8], reads = [$0[d0], $1[d0], $2[d0, d1]], folds = [online_softmax_merge<value_iters = [d1]> -> ([d0], [d0], [d0, d1])]} ({
   ^body(%partial_max: f32, %partial_sum: f32, %partial_accumulated: f32):
     tile.yield(%partial_max, %partial_sum, %partial_accumulated) : (f32, f32, f32) -> ()
   }) : (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>) -> (tensor<{T}xf32>, tensor<{T}xf32>, tensor<{T}x8xf32>)

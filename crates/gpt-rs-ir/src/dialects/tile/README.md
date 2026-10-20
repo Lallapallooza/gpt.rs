@@ -83,8 +83,8 @@ Each result has one write, in the fold that gives it.
 - A new tensor: `[c, ...]`, each coordinate a parallel or prefix iterator or `0`, which adds an
   axis of extent 1.
   - A result without a combine names every iterator once, so the block writes each element once.
-  - A folded result names every iterator that is not folded, except the lanes of its combine kind,
-    and the kind appends its own axes (`top_k` appends `k`).
+  - A folded result names every iterator that is not folded, except the value's iterators that
+    its combine kind leaves out, and the kind appends its own axes (`top_k` appends `k`).
 - An updated operand: `$k[e, ...]`, any expressions, for `dynamic_update_slice`, scatters and
   segment reductions. The result is a copy of operand `k` with the written elements replaced, or
   with `sum`, `max`, `min`, `and` and `or` folded into them.
@@ -114,15 +114,16 @@ its one yielded value per point.
 | `and`, `or` | `x` | from all ones, from 0 | yes |
 | `argmax`, `argmin` | `(x, i)` | the extreme value and its index; ties to the smaller index, NaN largest | yes |
 | `top_k<k>`, `bottom_k<k>` | `(x, i)` | the `k` largest or smallest values and their indices, along a new last axis; equal values in index order | yes |
-| `online_softmax<lanes>` | `(s, v)` | the state `(m, l, o)`: `m = max_j s_j`, `l = sum_j exp(s_j - m)`, `o = sum_j exp(s_j - m) v_j` | no |
-| `online_softmax_merge<lanes>` | `(m, l, o)` | the states merged into one | no |
+| `online_softmax<value_iters>` | `(s, v)` | the state `(m, l, o)`: `m = max_j s_j`, `l = sum_j exp(s_j - m)`, `o = sum_j exp(s_j - m) v_j` | no |
+| `online_softmax_merge<value_iters>` | `(m, l, o)` | the states merged into one | no |
 | `logsumexp` | `s` | the state `(m, l)` | no |
 | `logsumexp_merge` | `(m, l)` | the states merged into one | no |
 
 - Each kind is one computation: a kind that would switch its inputs or results on a parameter is
   two kinds instead, as `top_k` and `bottom_k`, or a kind and its merge.
-- `online_softmax` lanes are parallel iterators, by position, that only the value depends on; the
-  score MUST NOT depend on them. Its `m` and `l` results drop the lanes.
+- The `value_iters` of `online_softmax` are the value's iterators: parallel iterators, by
+  position, that only the value depends on; the score MUST NOT depend on them. Its `m` and `l`
+  results leave them out.
 - The softmax kinds give their state. The weighted sum is `o / l` and the log-sum-exp is
   `m + log(l)`, which a following block computes.
 - A fold's `init` names the operands that hold its starting state, one per state component, of
@@ -147,6 +148,30 @@ states in point order, and a state with maximum `-inf` contributes nothing to a 
 top-level symbol that `host.dispatch` calls. A dispatch runs on its arguments alone, so they bind
 every dimension symbol its blocks use.
 
-A dispatch carries its schedule, `#sched<...>`: how it runs, which changes no value it computes.
-`Schedule` in `ir.rs` declares its fields, and `verify/dispatch.rs` checks the rules a schedule
-follows.
+## Schedules
+
+How a dispatch runs changes no value it computes, except by the rounding changes its
+`numerics` names. The IR says it where it applies:
+
+- Each block's `loops` are its modes, outermost first, one loop each: an iterator cut into pieces of
+  a size, run one after another, on the workers of an execution level, or at once in registers
+  (`reg`), the innermost along the lanes of a vector (`lanes`). Every iterator outside the register
+  tile ends in a mode of one point, so the modes say every loop. A block without modes walks one
+  point at a time, in the order that the op's entry gives. Its `clip` names the iterators whose
+  loops skip the points where a padded read falls outside its operand.
+- A fold `held` in scratch keeps its state in a scratch that it starts before the loop of a mode, in
+  each piece of the modes around that mode, and finishes after that loop. One that holds none keeps
+  the register tile's points, or one element, from its first loop over a reduced iterator on.
+- A read placed `at` runs its block in the loops of the first block of its run, at a piece of
+  them: the register tile (`reg`) or a piece of a mode (`at 2`). It runs on each element of the
+  block before it as soon as that element is finished when it reads that element alone, and over
+  the piece once the piece is finished when it reads across it.
+- A read `held` keeps what it takes in a copy or asks a cache for it ahead (`prefetch`), at a mode
+  of the block's loops.
+- The dispatch names its `target`, by its fingerprint, and its `numerics`.
+
+The passes that decide a schedule write it into the IR, and the verifier checks the rules it
+keeps (`verify/schedule.rs` for a block, `verify/dispatch.rs` for placements and the target).
+What follows from it, such as how a loop builds a piece that holds fewer points, is computed by
+one function each (`utils/schedule.rs`), which the lowering below `tile` reads: it realizes the
+schedule and decides nothing.

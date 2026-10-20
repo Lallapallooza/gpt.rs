@@ -1,0 +1,101 @@
+// RUN: roundtrip
+
+// A dispatch for a target whose products round once with their sums and may skip a zero pad's
+// products. The projection runs pieces of two rows on workers at level l3, of sixteen columns on
+// cores, and pieces of four of the contracted points one after another, in a register tile of two
+// rows of one vector of sixteen lanes; it copies the input's pieces for l1 and asks l2 for the
+// weight's next pieces, and clips its contracted loop. The bias runs at its register tile.
+// CHECK: tile.dispatch @project([[INPUT:%[0-9]+]]: tensor<4x8xf32>, [[WEIGHT:%[0-9]+]]: tensor<8x32xf32>, [[BIAS_ROWS:%[0-9]+]]: tensor<4x32xf32>) -> tensor<4x32xf32> attributes {target = "x86-64-v4@3928f7d3", numerics = <contract = true, skip_pad = true>} {
+// CHECK-NEXT: [[PRODUCT:%[0-9]+]] = tile.block([[INPUT]], [[WEIGHT]]) {iters = [par 4, par 32, red 8], reads = [$0[d0, d2] held copy<level = l1, at = 2>, $1[d2, d1] held prefetch<level = l2, at = 2>], folds = [sum -> [d0, d1]], loops = [d0 by 2 : workers<level = l3>, d1 by 16 : workers<level = core>, d2 by 4, d2 by 1, d0 by 2 : reg, d1 by 16 : lanes], clip = [d2]} ({
+// CHECK-NEXT: ^body([[ELEMENT:%[0-9]+]]: f32, [[SCALE:%[0-9]+]]: f32):
+// CHECK-NEXT: [[TERM:%[0-9]+]] = arith.mul([[ELEMENT]], [[SCALE]]) : (f32, f32) -> f32
+// CHECK-NEXT: tile.yield([[TERM]]) : (f32) -> ()
+// CHECK-NEXT: }) : (tensor<4x8xf32>, tensor<8x32xf32>) -> tensor<4x32xf32>
+// CHECK-NEXT: [[BIASED:%[0-9]+]] = tile.block([[PRODUCT]], [[BIAS_ROWS]]) {iters = [par 4, par 32], reads = [$0[d0, d1] at reg, $1[d0, d1]], folds = [none -> [d0, d1]]} ({
+// CHECK-NEXT: ^body([[SUM:%[0-9]+]]: f32, [[BIAS:%[0-9]+]]: f32):
+// CHECK-NEXT: [[TOTAL:%[0-9]+]] = arith.add([[SUM]], [[BIAS]]) : (f32, f32) -> f32
+// CHECK-NEXT: tile.yield([[TOTAL]]) : (f32) -> ()
+// CHECK-NEXT: }) : (tensor<4x32xf32>, tensor<4x32xf32>) -> tensor<4x32xf32>
+// CHECK-NEXT: func.return([[BIASED]]) : (tensor<4x32xf32>) -> ()
+// CHECK-NEXT: }
+tile.dispatch @project(%input: tensor<4x8xf32>, %weight: tensor<8x32xf32>, %bias_rows: tensor<4x32xf32>) -> tensor<4x32xf32> attributes {target = "x86-64-v4@3928f7d3", numerics = <contract = true, skip_pad = true>} {
+  %product = tile.block(%input, %weight) {iters = [par 4, par 32, red 8], reads = [$0[d0, d2] held copy<level = l1, at = 2>, $1[d2, d1] held prefetch<level = l2, at = 2>], folds = [sum -> [d0, d1]], loops = [d0 by 2 : workers<level = l3>, d1 by 16 : workers<level = core>, d2 by 4, d2 by 1, d0 by 2 : reg, d1 by 16 : lanes], clip = [d2]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<4x8xf32>, tensor<8x32xf32>) -> tensor<4x32xf32>
+  %biased = tile.block(%product, %bias_rows) {iters = [par 4, par 32], reads = [$0[d0, d1] at reg, $1[d0, d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%sum: f32, %bias: f32):
+    %total = arith.add(%sum, %bias) : (f32, f32) -> f32
+    tile.yield(%total) : (f32) -> ()
+  }) : (tensor<4x32xf32>, tensor<4x32xf32>) -> tensor<4x32xf32>
+  func.return(%biased) : (tensor<4x32xf32>) -> ()
+}
+
+// -----
+
+// The sums of the lanes of a row and the block that adds them, placed at the register tile of the
+// lane sums: it reads the lanes of each row once the register tile is finished.
+// CHECK: reads = [$0[d0, 0] at reg, $0[d0, 1], $0[d0, 2], $0[d0, 3]]
+tile.dispatch @lanes_added(%input: tensor<4x8xf32>) -> tensor<4xf32> {
+  %lane_sums = tile.block(%input) {iters = [par 4, red 2, par 4], reads = [$0[d0, d1 * 4 + d2]], folds = [sum -> [d0, d2]], loops = [d0 by 1, d1 by 1, d2 by 4 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x8xf32>) -> tensor<4x4xf32>
+  %sums = tile.block(%lane_sums) {iters = [par 4], reads = [$0[d0, 0] at reg, $0[d0, 1], $0[d0, 2], $0[d0, 3]], folds = [none -> [d0]]} ({
+  ^body(%lane_0: f32, %lane_1: f32, %lane_2: f32, %lane_3: f32):
+    %pair_0 = arith.add(%lane_0, %lane_2) : (f32, f32) -> f32
+    %pair_1 = arith.add(%lane_1, %lane_3) : (f32, f32) -> f32
+    %total = arith.add(%pair_0, %pair_1) : (f32, f32) -> f32
+    tile.yield(%total) : (f32) -> ()
+  }) : (tensor<4x4xf32>) -> tensor<4xf32>
+  func.return(%sums) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// The rows of a matrix doubled, two rows at a time, and the block that adds each row, placed at
+// that mode: it reads the rows of each piece once the piece is finished.
+// CHECK: reads = [$0[d0, 0] at 0, $0[d0, 1], $0[d0, 2], $0[d0, 3]]
+tile.dispatch @rows_added(%input: tensor<4x4xf32>) -> tensor<4xf32> {
+  %doubled = tile.block(%input) {iters = [par 4, par 4], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    %twice = arith.add(%element, %element) : (f32, f32) -> f32
+    tile.yield(%twice) : (f32) -> ()
+  }) : (tensor<4x4xf32>) -> tensor<4x4xf32>
+  %sums = tile.block(%doubled) {iters = [par 4], reads = [$0[d0, 0] at 0, $0[d0, 1], $0[d0, 2], $0[d0, 3]], folds = [none -> [d0]]} ({
+  ^body(%first: f32, %second: f32, %third: f32, %fourth: f32):
+    %pair_0 = arith.add(%first, %second) : (f32, f32) -> f32
+    %pair_1 = arith.add(%third, %fourth) : (f32, f32) -> f32
+    %total = arith.add(%pair_0, %pair_1) : (f32, f32) -> f32
+    tile.yield(%total) : (f32) -> ()
+  }) : (tensor<4x4xf32>) -> tensor<4xf32>
+  func.return(%sums) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// A product whose contracted points run in pieces of eight outside the pieces of two rows: its sums
+// live in the scratch of each piece of four rows, started before the contracted pieces and
+// finished after them.
+// CHECK: folds = [sum -> [d0, d1] held scratch<at = 1>], loops = [d0 by 4, d2 by 8, d0 by 2, d2 by 1, d0 by 2 : reg, d1 by 16 : lanes]
+tile.dispatch @blocked(%input: tensor<8x32xf32>, %weight: tensor<32x16xf32>) -> tensor<8x16xf32> {
+  %product = tile.block(%input, %weight) {iters = [par 8, par 16, red 32], reads = [$0[d0, d2], $1[d2, d1]], folds = [sum -> [d0, d1] held scratch<at = 1>], loops = [d0 by 4, d2 by 8, d0 by 2, d2 by 1, d0 by 2 : reg, d1 by 16 : lanes]} ({
+  ^body(%element: f32, %weight_element: f32):
+    %term = arith.mul(%element, %weight_element) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<8x32xf32>, tensor<32x16xf32>) -> tensor<8x16xf32>
+  func.return(%product) : (tensor<8x16xf32>) -> ()
+}
+
+// -----
+
+// Every rounding change a dispatch records.
+// CHECK: tile.dispatch @every_change({{%[0-9]+}}: tensor<4xf32>) -> tensor<4xf32> attributes {numerics = <contract = true, skip_pad = true, reassoc = true, winograd = true, scale_fold = true, expand_math = true>} {
+tile.dispatch @every_change(%input: tensor<4xf32>) -> tensor<4xf32> attributes {numerics = <contract = true, skip_pad = true, reassoc = true, winograd = true, scale_fold = true, expand_math = true>} {
+  %copied = tile.block(%input) {iters = [par 4], reads = [$0[d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4xf32>) -> tensor<4xf32>
+  func.return(%copied) : (tensor<4xf32>) -> ()
+}

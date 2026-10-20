@@ -283,7 +283,8 @@ fn combine_laws() {
                 2 => vec![dtype, index],
                 _ => vec![dtype],
             };
-            if kind.rule().result_dtypes(&dtypes).is_err() || !kind.rule().exact(dtype) {
+            let typed = kind.rule().result_dtypes(kind.name(), &dtypes).is_ok();
+            if !typed || !kind.rule().exact(dtype) {
                 continue;
             }
             checked += 1;

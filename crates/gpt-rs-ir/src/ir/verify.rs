@@ -3,6 +3,7 @@
 //! It checks that:
 //! - the module's body holds only symbol ops: `func.func`, `tile.dispatch` and `loop.func`
 //! - each value is defined before it is used, and isolated regions read nothing from outside
+//! - an op with the trait `OnlyUse` is the only use of each of its operands
 //! - each op gets the operand counts and kinds its groups declare, and its `result_types` agree
 //!   with the stored result types and result segments
 //! - a terminator is the last op of its region
@@ -12,7 +13,7 @@
 use anyhow::{anyhow, bail, ensure, Result};
 
 use crate::ir::{type_list, Inst, Module, OpDyn, Region, RegionSig, Type};
-use crate::traits::Terminator;
+use crate::traits::{OnlyUse, Terminator};
 use crate::{Dialect, Op};
 
 struct Verifier<'m> {
@@ -49,6 +50,13 @@ impl Verifier<'_> {
             .position(|&operand| !module.dominates(operand, inst))
         {
             bail!("operand {position} is not defined before this op");
+        }
+        let only_use = op.has_trait::<OnlyUse>();
+        if let Some(position) = operands
+            .iter()
+            .position(|&operand| only_use && module.uses(operand).len() > 1)
+        {
+            bail!("operand {position} has another use, and this op must be its only one");
         }
         ensure!(
             last || !op.has_trait::<Terminator>(),

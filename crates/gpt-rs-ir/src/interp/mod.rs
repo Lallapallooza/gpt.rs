@@ -13,8 +13,8 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 
 pub use self::values::*;
 use crate::ir::{
-    BufferType, Dim, Inst, Module, OpDyn, Region, RegionRunner, Sym, SymBindings, TensorType, Type,
-    Value,
+    BufferType, Dim, Inst, Module, OpDyn, Region, RegionRunner, Space, Sym, SymBindings,
+    TensorType, Type, Value,
 };
 use crate::traits::Terminator;
 
@@ -48,8 +48,10 @@ impl<'m> Interp<'m> {
             }
             (Type::Buffer(buffer), HostValue::Buffer(host)) => {
                 let actual = host.ty();
+                // A launch reads a read-only buffer through a global `in` parameter.
+                let read = actual.space == Space::ReadOnly && buffer.space == Space::Global;
                 ensure!(
-                    actual.space == buffer.space,
+                    actual.space == buffer.space || read,
                     "the value has type {actual}, not {buffer}"
                 );
                 self.syms.bind(&buffer.tensor_type(), &actual.tensor_type())
@@ -82,7 +84,7 @@ impl<'m> Interp<'m> {
         let results = module.results(inst);
         let result_types: Vec<Type> = results
             .iter()
-            .map(|&v| self.resolve(module.ty(v)))
+            .map(|&result| self.resolve(module.ty(result)))
             .collect();
         let outputs = op
             .dyn_eval(
@@ -121,13 +123,13 @@ impl RegionRunner for Interp<'_> {
         &self.unit
     }
 
-    fn run_units(&mut self, region: Region, start: i64, end: i64) -> Result<()> {
+    fn run_units(&mut self, region: Region, units: Vec<Vec<HostValue>>) -> Result<()> {
         let run = self.runs;
         self.runs += 1;
         let outer = self.unit.clone();
-        for index in start..end {
-            self.unit = outer.enter(run, index);
-            let ran = self.run_region(region, vec![HostValue::Index(index)]);
+        for (index, args) in units.into_iter().enumerate() {
+            self.unit = outer.enter(run, index as i64);
+            let ran = self.run_region(region, args);
             self.unit = outer.clone();
             ran?;
         }
@@ -161,17 +163,17 @@ impl RegionRunner for Interp<'_> {
             let inputs: Vec<Rc<HostValue>> = module
                 .operands(inst)
                 .iter()
-                .map(|v| {
+                .map(|operand| {
                     self.env
-                        .get(v)
+                        .get(operand)
                         .cloned()
-                        .ok_or_else(|| anyhow!("{v:?} has no value"))
+                        .ok_or_else(|| anyhow!("{operand:?} has no value"))
                 })
                 .collect::<Result<_>>()?;
             if module.op(inst).has_trait::<Terminator>() {
-                return Ok(inputs.iter().map(|v| (**v).clone()).collect());
+                return Ok(inputs.iter().map(|input| (**input).clone()).collect());
             }
-            let refs: Vec<&HostValue> = inputs.iter().map(|v| &**v).collect();
+            let refs: Vec<&HostValue> = inputs.iter().map(|input| &**input).collect();
             let outputs = self.eval(inst, &refs)?;
             for (&result, output) in module.results(inst).iter().zip(outputs) {
                 self.env.insert(result, Rc::new(output));

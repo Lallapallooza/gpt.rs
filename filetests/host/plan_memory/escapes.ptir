@@ -1,0 +1,51 @@
+// RUN: pass plan-memory {target = "x86-64-v4"}
+
+// Values that cross between launches and other ops: a constant reaches its launch through
+// `host.to_buffer`, right after it is made. A result that another op reads has memory of its own,
+// and `host.to_tensor` gives the op its elements. The op's result reaches the next launch through
+// `host.to_buffer`.
+// CHECK: func.func @main([[INPUT:%[0-9]+]]: tensor<4xf32>) -> tensor<4xf32> {
+// CHECK-NEXT: [[DOUBLED_BUFFER:%[0-9]+]] = host.alloc() {shape = [4], dtype = f32, alignment = 64} : () -> !loop.buf<4xf32, global>
+// CHECK-NEXT: [[RESULT_BUFFER:%[0-9]+]] = host.alloc() {shape = [4], dtype = f32, alignment = 64} : () -> !loop.buf<4xf32, global>
+// CHECK-NEXT: [[INPUT_BUFFER:%[0-9]+]] = host.to_buffer([[INPUT]])
+// CHECK-NEXT: [[OFFSET:%[0-9]+]] = tensor.constant() {value = dense<4xf32: 0.5>} : () -> tensor<4xf32>
+// CHECK-NEXT: [[OFFSET_BUFFER:%[0-9]+]] = host.to_buffer([[OFFSET]])
+// CHECK-NEXT: host.launch([[INPUT_BUFFER]], [[DOUBLED_BUFFER]]) {callee = @double, operand_segments = [1, 1, 0]}
+// CHECK-NEXT: [[DOUBLED:%[0-9]+]] = host.to_tensor([[DOUBLED_BUFFER]])
+// CHECK-NEXT: [[SHIFTED:%[0-9]+]] = tensor.add([[DOUBLED]], [[OFFSET]])
+// CHECK-NEXT: [[SHIFTED_BUFFER:%[0-9]+]] = host.to_buffer([[SHIFTED]])
+// CHECK-NEXT: host.launch([[SHIFTED_BUFFER]], [[OFFSET_BUFFER]], [[RESULT_BUFFER]]) {callee = @scale, operand_segments = [2, 1, 0]}
+// CHECK-NEXT: [[RESULT:%[0-9]+]] = host.to_tensor([[RESULT_BUFFER]])
+// CHECK-NEXT: func.return([[RESULT]]) : (tensor<4xf32>) -> ()
+loop.func @double(%input: !loop.buf<4xf32, global>, %output: !loop.buf<4xf32, global>) attributes {access = [in, out<over = 0>]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 4} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %element = loop.load(%input, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %doubled = arith.add(%element, %element) : (f32, f32) -> f32
+    loop.store(%doubled, %output, %position) : (f32, !loop.buf<4xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+loop.func @scale(%input: !loop.buf<4xf32, global>, %factor: !loop.buf<4xf32, global>, %output: !loop.buf<4xf32, global>) attributes {access = [in, in, out<over = 0>]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 4} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %element = loop.load(%input, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %multiplier = loop.load(%factor, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %product = arith.mul(%element, %multiplier) : (f32, f32) -> f32
+    loop.store(%product, %output, %position) : (f32, !loop.buf<4xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %offset = tensor.constant() {value = dense<4xf32: 0.5>} : () -> tensor<4xf32>
+  %doubled = host.dispatch(%input) {callee = @double} : (tensor<4xf32>) -> tensor<4xf32>
+  %shifted = tensor.add(%doubled, %offset) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %result = host.dispatch(%shifted, %offset) {callee = @scale} : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%result) : (tensor<4xf32>) -> ()
+}

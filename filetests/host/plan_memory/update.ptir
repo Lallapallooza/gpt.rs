@@ -1,0 +1,153 @@
+// RUN: pass plan-memory {target = "x86-64-v4"}
+
+// An argument that an `inout` parameter updates last is taken: a runtime updates the caller's
+// memory when the caller holds the tensor no more, and the function returns it.
+// CHECK: func.func @update([[TOTALS:%[0-9]+]]: tensor<4xf32>, [[ADDEND:%[0-9]+]]: tensor<4xf32>) -> tensor<4xf32> {
+// CHECK-NEXT: [[TAKEN:%[0-9]+]] = host.take([[TOTALS]]) : (tensor<4xf32>) -> !loop.buf<4xf32, global>
+// CHECK-NEXT: [[ADDEND_BUFFER:%[0-9]+]] = host.to_buffer([[ADDEND]]) : (tensor<4xf32>) -> !loop.buf<4xf32, read_only>
+// CHECK-NEXT: host.launch([[ADDEND_BUFFER]], [[TAKEN]]) {callee = @accumulate, operand_segments = [1, 0, 1]}
+// CHECK-NEXT: [[SUMMED:%[0-9]+]] = host.to_tensor([[TAKEN]]) : (!loop.buf<4xf32, global>) -> tensor<4xf32>
+// CHECK-NEXT: func.return([[SUMMED]]) : (tensor<4xf32>) -> ()
+loop.func @accumulate(%totals: !loop.buf<4xf32, global>, %addend: !loop.buf<4xf32, global>) attributes {access = [inout, in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 4} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %term = loop.load(%addend, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %so_far = loop.load(%totals, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %sum = arith.add(%so_far, %term) : (f32, f32) -> f32
+    loop.store(%sum, %totals, %position) : (f32, !loop.buf<4xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @update(%totals: tensor<4xf32>, %addend: tensor<4xf32>) -> tensor<4xf32> {
+  %summed = host.dispatch(%totals, %addend) {callee = @accumulate} : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%summed) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// An argument that the function also returns stays as it is: the launch updates a copy.
+// CHECK: func.func @keep([[TOTALS:%[0-9]+]]: tensor<4xf32>, [[ADDEND:%[0-9]+]]: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
+// CHECK-NEXT: [[SUMMED_BUFFER:%[0-9]+]] = host.alloc() {shape = [4], dtype = f32, alignment = 64} : () -> !loop.buf<4xf32, global>
+// CHECK-NEXT: [[TOTALS_BUFFER:%[0-9]+]] = host.to_buffer([[TOTALS]]) : (tensor<4xf32>) -> !loop.buf<4xf32, read_only>
+// CHECK-NEXT: [[ADDEND_BUFFER:%[0-9]+]] = host.to_buffer([[ADDEND]]) : (tensor<4xf32>) -> !loop.buf<4xf32, read_only>
+// CHECK-NEXT: host.copy([[TOTALS_BUFFER]], [[SUMMED_BUFFER]]) : (!loop.buf<4xf32, read_only>, !loop.buf<4xf32, global>) -> ()
+// CHECK-NEXT: host.launch([[ADDEND_BUFFER]], [[SUMMED_BUFFER]]) {callee = @accumulate, operand_segments = [1, 0, 1]}
+// CHECK-NEXT: [[SUMMED:%[0-9]+]] = host.to_tensor([[SUMMED_BUFFER]]) : (!loop.buf<4xf32, global>) -> tensor<4xf32>
+// CHECK-NEXT: func.return([[SUMMED]], [[TOTALS]]) : (tensor<4xf32>, tensor<4xf32>) -> ()
+loop.func @accumulate(%totals: !loop.buf<4xf32, global>, %addend: !loop.buf<4xf32, global>) attributes {access = [inout, in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 4} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %term = loop.load(%addend, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %so_far = loop.load(%totals, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %sum = arith.add(%so_far, %term) : (f32, f32) -> f32
+    loop.store(%sum, %totals, %position) : (f32, !loop.buf<4xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @keep(%totals: tensor<4xf32>, %addend: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
+  %summed = host.dispatch(%totals, %addend) {callee = @accumulate} : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%summed, %totals) : (tensor<4xf32>, tensor<4xf32>) -> ()
+}
+
+// -----
+
+// A constant that an `inout` parameter updates last is the program's memory, not the function's
+// to write: the launch updates a copy of it.
+// CHECK: func.func @from_constant([[ADDEND:%[0-9]+]]: tensor<4xf32>) -> tensor<4xf32> {
+// CHECK-NEXT: [[SUMMED_BUFFER:%[0-9]+]] = host.alloc() {shape = [4], dtype = f32, alignment = 64} : () -> !loop.buf<4xf32, global>
+// CHECK-NEXT: [[ADDEND_BUFFER:%[0-9]+]] = host.to_buffer([[ADDEND]]) : (tensor<4xf32>) -> !loop.buf<4xf32, read_only>
+// CHECK-NEXT: [[START:%[0-9]+]] = tensor.constant() {value = dense<4xf32: 1.0>} : () -> tensor<4xf32>
+// CHECK-NEXT: [[START_BUFFER:%[0-9]+]] = host.to_buffer([[START]]) : (tensor<4xf32>) -> !loop.buf<4xf32, read_only>
+// CHECK-NEXT: host.copy([[START_BUFFER]], [[SUMMED_BUFFER]]) : (!loop.buf<4xf32, read_only>, !loop.buf<4xf32, global>) -> ()
+// CHECK-NEXT: host.launch([[ADDEND_BUFFER]], [[SUMMED_BUFFER]]) {callee = @accumulate, operand_segments = [1, 0, 1]}
+// CHECK-NEXT: [[SUMMED:%[0-9]+]] = host.to_tensor([[SUMMED_BUFFER]]) : (!loop.buf<4xf32, global>) -> tensor<4xf32>
+// CHECK-NEXT: func.return([[SUMMED]]) : (tensor<4xf32>) -> ()
+loop.func @accumulate(%totals: !loop.buf<4xf32, global>, %addend: !loop.buf<4xf32, global>) attributes {access = [inout, in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 4} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %term = loop.load(%addend, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %so_far = loop.load(%totals, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %sum = arith.add(%so_far, %term) : (f32, f32) -> f32
+    loop.store(%sum, %totals, %position) : (f32, !loop.buf<4xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @from_constant(%addend: tensor<4xf32>) -> tensor<4xf32> {
+  %start = tensor.constant() {value = dense<4xf32: 1.0>} : () -> tensor<4xf32>
+  %summed = host.dispatch(%start, %addend) {callee = @accumulate} : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%summed) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// A value of the arena that dies where it is updated, or where an output may share its buffer,
+// keeps its slice: three values, one after another, in one slice.
+// CHECK: func.func @twice([[INPUT:%[0-9]+]]: tensor<4xf32>, [[ADDEND:%[0-9]+]]: tensor<4xf32>) -> tensor<f32> {
+// CHECK-NEXT: [[ARENA:%[0-9]+]] = host.arena() {bytes = 64, alignment = 64} : () -> !loop.buf<64xui8, arena<alignment = 64>>
+// CHECK-NEXT: [[ROW:%[0-9]+]] = host.slice([[ARENA]]) {offset = 0, shape = [4], dtype = f32}
+// CHECK-NEXT: [[TOTAL_BUFFER:%[0-9]+]] = host.alloc() {shape = [], dtype = f32, alignment = 64} : () -> !loop.buf<f32, global>
+// CHECK-NEXT: [[INPUT_BUFFER:%[0-9]+]] = host.to_buffer([[INPUT]])
+// CHECK-NEXT: [[ADDEND_BUFFER:%[0-9]+]] = host.to_buffer([[ADDEND]])
+// CHECK-NEXT: host.launch([[INPUT_BUFFER]], [[ROW]]) {callee = @double, operand_segments = [1, 1, 0]}
+// CHECK-NEXT: host.launch([[ADDEND_BUFFER]], [[ROW]]) {callee = @accumulate, operand_segments = [1, 0, 1]}
+// CHECK-NEXT: host.launch([[ROW]], [[ROW]]) {callee = @double, operand_segments = [1, 1, 0]}
+// CHECK-NEXT: host.launch([[ROW]], [[TOTAL_BUFFER]]) {callee = @sum, operand_segments = [1, 1, 0]}
+// CHECK-NEXT: [[TOTAL:%[0-9]+]] = host.to_tensor([[TOTAL_BUFFER]]) : (!loop.buf<f32, global>) -> tensor<f32>
+// CHECK-NEXT: func.return([[TOTAL]]) : (tensor<f32>) -> ()
+loop.func @accumulate(%totals: !loop.buf<4xf32, global>, %addend: !loop.buf<4xf32, global>) attributes {access = [inout, in]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 4} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %term = loop.load(%addend, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %so_far = loop.load(%totals, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %sum = arith.add(%so_far, %term) : (f32, f32) -> f32
+    loop.store(%sum, %totals, %position) : (f32, !loop.buf<4xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+loop.func @double(%input: !loop.buf<4xf32, global>, %output: !loop.buf<4xf32, global>) attributes {access = [in, out<over = 0>]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 4} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %element = loop.load(%input, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %doubled = arith.add(%element, %element) : (f32, f32) -> f32
+    loop.store(%doubled, %output, %position) : (f32, !loop.buf<4xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+loop.func @sum(%input: !loop.buf<4xf32, global>, %output: !loop.buf<f32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 4} : () -> index
+  %first = loop.load(%input, %zero) : (!loop.buf<4xf32, global>, index) -> f32
+  loop.store(%first, %output) : (f32, !loop.buf<f32, global>) -> ()
+  %one = loop.index() {expr = 1} : () -> index
+  loop.for(%one, %count) ({
+  ^body(%position: index):
+    %element = loop.load(%input, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %so_far = loop.load(%output) : (!loop.buf<f32, global>) -> f32
+    %sum = arith.add(%so_far, %element) : (f32, f32) -> f32
+    loop.store(%sum, %output) : (f32, !loop.buf<f32, global>) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @twice(%input: tensor<4xf32>, %addend: tensor<4xf32>) -> tensor<f32> {
+  %doubled = host.dispatch(%input) {callee = @double} : (tensor<4xf32>) -> tensor<4xf32>
+  %summed = host.dispatch(%doubled, %addend) {callee = @accumulate} : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %redoubled = host.dispatch(%summed) {callee = @double} : (tensor<4xf32>) -> tensor<4xf32>
+  %total = host.dispatch(%redoubled) {callee = @sum} : (tensor<4xf32>) -> tensor<f32>
+  func.return(%total) : (tensor<f32>) -> ()
+}

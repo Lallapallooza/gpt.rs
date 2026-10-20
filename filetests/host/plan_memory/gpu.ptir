@@ -1,0 +1,41 @@
+// RUN: pass plan-memory {target = "%S/../../tile/schedule/gpu-shaped.toml"}
+
+// On a GPU-shaped target, buffers start at multiples of 256 bytes: two values that are live at once
+// take a 256-byte piece of the arena each, and the result's memory starts at a multiple of 256
+// bytes.
+// CHECK: func.func @main([[INPUT:%[0-9]+]]: tensor<4xf32>) -> tensor<4xf32> {
+// CHECK-NEXT: [[ARENA:%[0-9]+]] = host.arena() {bytes = 512, alignment = 256} : () -> !loop.buf<512xui8, arena<alignment = 256>>
+// CHECK-NEXT: [[DOUBLED:%[0-9]+]] = host.slice([[ARENA]]) {offset = 0, shape = [4], dtype = f32}
+// CHECK-NEXT: [[SUMMED:%[0-9]+]] = host.slice([[ARENA]]) {offset = 256, shape = [4], dtype = f32}
+// CHECK-NEXT: [[TOTAL:%[0-9]+]] = host.alloc() {shape = [4], dtype = f32, alignment = 256} : () -> !loop.buf<4xf32, global>
+loop.func @double(%input: !loop.buf<4xf32, global>, %output: !loop.buf<4xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 4} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %element = loop.load(%input, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %doubled = arith.add(%element, %element) : (f32, f32) -> f32
+    loop.store(%doubled, %output, %position) : (f32, !loop.buf<4xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+loop.func @add(%lhs: !loop.buf<4xf32, global>, %rhs: !loop.buf<4xf32, global>, %output: !loop.buf<4xf32, global>) attributes {access = [in, in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 4} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %left = loop.load(%lhs, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %right = loop.load(%rhs, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %sum = arith.add(%left, %right) : (f32, f32) -> f32
+    loop.store(%sum, %output, %position) : (f32, !loop.buf<4xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %doubled = host.dispatch(%input) {callee = @double} : (tensor<4xf32>) -> tensor<4xf32>
+  %summed = host.dispatch(%input, %doubled) {callee = @add} : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %total = host.dispatch(%doubled, %summed) {callee = @add} : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%total) : (tensor<4xf32>) -> ()
+}

@@ -1,0 +1,141 @@
+// RUN: verify
+
+// ERROR: host.slice: !loop.buf<4x8xf32, global> at byte 192 does not fit in the 256 bytes of the arena
+func.func @past_the_end() -> () {
+  %arena = host.arena() {bytes = 256, alignment = 64} : () -> !loop.buf<256xui8, arena<alignment = 64>>
+  %rows = host.slice(%arena) {offset = 192, shape = [4, 8], dtype = f32} : (!loop.buf<256xui8, arena<alignment = 64>>) -> !loop.buf<4x8xf32, global>
+  func.return() : () -> ()
+}
+
+// -----
+
+// ERROR: host.slice: byte 2 is not a multiple of the 4 bytes of a f32 element
+func.func @misaligned() -> () {
+  %arena = host.arena() {bytes = 64, alignment = 1} : () -> !loop.buf<64xui8, arena<alignment = 1>>
+  %row = host.slice(%arena) {offset = 2, shape = [4], dtype = f32} : (!loop.buf<64xui8, arena<alignment = 1>>) -> !loop.buf<4xf32, global>
+  func.return() : () -> ()
+}
+
+// -----
+
+// ERROR: host.slice: byte 16 is not a multiple of the 64 bytes that the arena aligns to
+func.func @off_the_alignment() -> () {
+  %arena = host.arena() {bytes = 128, alignment = 64} : () -> !loop.buf<128xui8, arena<alignment = 64>>
+  %row = host.slice(%arena) {offset = 16, shape = [4], dtype = f32} : (!loop.buf<128xui8, arena<alignment = 64>>) -> !loop.buf<4xf32, global>
+  func.return() : () -> ()
+}
+
+// -----
+
+// ERROR: host.arena: an alignment of 48 bytes is not a power of two
+func.func @uneven_alignment() -> () {
+  %arena = host.arena() {bytes = 96, alignment = 48} : () -> !loop.buf<96xui8, arena<alignment = 48>>
+  func.return() : () -> ()
+}
+
+// -----
+
+// ERROR: host.slice: !loop.buf<16xf32, global> is not an arena, the buffer of host.arena
+func.func @slice_of_values() -> () {
+  %values = host.alloc() {shape = [16], dtype = f32, alignment = 64} : () -> !loop.buf<16xf32, global>
+  %row = host.slice(%values) {offset = 0, shape = [4], dtype = f32} : (!loop.buf<16xf32, global>) -> !loop.buf<4xf32, global>
+  func.return() : () -> ()
+}
+
+// -----
+
+// Bytes of memory of their own are not an arena, whose bytes only `host.arena` gives.
+// ERROR: host.slice: !loop.buf<64xui8, global> is not an arena, the buffer of host.arena
+func.func @slice_of_bytes() -> () {
+  %bytes = host.alloc() {shape = [64], dtype = ui8, alignment = 64} : () -> !loop.buf<64xui8, global>
+  %row = host.slice(%bytes) {offset = 0, shape = [4], dtype = f32} : (!loop.buf<64xui8, global>) -> !loop.buf<4xf32, global>
+  func.return() : () -> ()
+}
+
+// -----
+
+// ERROR: host.launch: @copy has 1 `out` parameters, got 2 buffers
+loop.func @copy(%input: !loop.buf<4xf32, global>, %output: !loop.buf<4xf32, global>) attributes {access = [in, out]} {
+  loop.return() : () -> ()
+}
+func.func @two_outputs(%input: tensor<4xf32>) -> () {
+  %input_buffer = host.to_buffer(%input) : (tensor<4xf32>) -> !loop.buf<4xf32, read_only>
+  %first = host.alloc() {shape = [4], dtype = f32, alignment = 64} : () -> !loop.buf<4xf32, global>
+  %second = host.alloc() {shape = [4], dtype = f32, alignment = 64} : () -> !loop.buf<4xf32, global>
+  host.launch(%input_buffer, %first, %second) {callee = @copy, operand_segments = [1, 2, 0]} : (!loop.buf<4xf32, read_only>, !loop.buf<4xf32, global>, !loop.buf<4xf32, global>) -> ()
+  func.return() : () -> ()
+}
+
+// -----
+
+// ERROR: host.launch: parameter 0: tensor<4xf64> does not match tensor<4xf32>
+loop.func @copy(%input: !loop.buf<4xf32, global>, %output: !loop.buf<4xf32, global>) attributes {access = [in, out]} {
+  loop.return() : () -> ()
+}
+func.func @wider_input(%input: tensor<4xf64>) -> () {
+  %input_buffer = host.to_buffer(%input) : (tensor<4xf64>) -> !loop.buf<4xf64, read_only>
+  %output = host.alloc() {shape = [4], dtype = f32, alignment = 64} : () -> !loop.buf<4xf32, global>
+  host.launch(%input_buffer, %output) {callee = @copy, operand_segments = [1, 1, 0]} : (!loop.buf<4xf64, read_only>, !loop.buf<4xf32, global>) -> ()
+  func.return() : () -> ()
+}
+
+// -----
+
+// ERROR: host.launch: @main is not a loop.func
+func.func @main() -> () {
+  host.launch() {callee = @main, operand_segments = [0, 0, 0]} : () -> ()
+  func.return() : () -> ()
+}
+
+// -----
+
+// ERROR: host.copy: it copies !loop.buf<4xf32, global> into !loop.buf<8xf32, global>, a buffer of another type
+func.func @copy_into_more() -> () {
+  %from = host.alloc() {shape = [4], dtype = f32, alignment = 64} : () -> !loop.buf<4xf32, global>
+  %to = host.alloc() {shape = [8], dtype = f32, alignment = 64} : () -> !loop.buf<8xf32, global>
+  host.copy(%from, %to) : (!loop.buf<4xf32, global>, !loop.buf<8xf32, global>) -> ()
+  func.return() : () -> ()
+}
+
+// -----
+
+// A read-only buffer holds the elements of a tensor the function only reads: no launch writes it.
+// ERROR: host.launch: parameter 1 gets !loop.buf<4xf32, read_only>, not a global buffer
+loop.func @copy(%input: !loop.buf<4xf32, global>, %output: !loop.buf<4xf32, global>) attributes {access = [in, out]} {
+  loop.return() : () -> ()
+}
+func.func @write_into_an_input(%input: tensor<4xf32>, %other: tensor<4xf32>) -> () {
+  %input_buffer = host.to_buffer(%input) : (tensor<4xf32>) -> !loop.buf<4xf32, read_only>
+  %other_buffer = host.to_buffer(%other) : (tensor<4xf32>) -> !loop.buf<4xf32, read_only>
+  host.launch(%input_buffer, %other_buffer) {callee = @copy, operand_segments = [1, 1, 0]} : (!loop.buf<4xf32, read_only>, !loop.buf<4xf32, read_only>) -> ()
+  func.return() : () -> ()
+}
+
+// -----
+
+// ERROR: host.copy: it copies into !loop.buf<4xf32, read_only>, which is not a global buffer
+func.func @copy_into_an_input(%input: tensor<4xf32>) -> () {
+  %from = host.alloc() {shape = [4], dtype = f32, alignment = 64} : () -> !loop.buf<4xf32, global>
+  %input_buffer = host.to_buffer(%input) : (tensor<4xf32>) -> !loop.buf<4xf32, read_only>
+  host.copy(%from, %input_buffer) : (!loop.buf<4xf32, global>, !loop.buf<4xf32, read_only>) -> ()
+  func.return() : () -> ()
+}
+
+// -----
+
+// A slice of a read-only buffer of bytes would give writable buffers into an input.
+// ERROR: host.slice: !loop.buf<16xui8, read_only> is not an arena, the buffer of host.arena
+func.func @slice_of_an_input(%input: tensor<16xui8>) -> () {
+  %input_buffer = host.to_buffer(%input) : (tensor<16xui8>) -> !loop.buf<16xui8, read_only>
+  %row = host.slice(%input_buffer) {offset = 0, shape = [4], dtype = f32} : (!loop.buf<16xui8, read_only>) -> !loop.buf<4xf32, global>
+  func.return() : () -> ()
+}
+
+// -----
+
+// A tensor that the function reads again is not the function's to give to a launch to write.
+// ERROR: host.take: operand 0 has another use, and this op must be its only one
+func.func @take_a_returned_tensor(%totals: tensor<4xf32>) -> tensor<4xf32> {
+  %totals_buffer = host.take(%totals) : (tensor<4xf32>) -> !loop.buf<4xf32, global>
+  func.return(%totals) : (tensor<4xf32>) -> ()
+}

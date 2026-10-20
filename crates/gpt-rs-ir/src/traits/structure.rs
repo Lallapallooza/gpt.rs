@@ -147,6 +147,18 @@ impl fmt::Display for Terminator {
     }
 }
 
+/// It is the only use of each of its operands, whose value it takes over.
+#[derive(Debug, Doc)]
+pub struct OnlyUse;
+
+impl OpTrait for OnlyUse {}
+
+impl fmt::Display for OnlyUse {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("only use")
+    }
+}
+
 /// Its regions read no value defined outside them.
 #[derive(Debug, Doc)]
 pub struct IsolatedFromAbove;

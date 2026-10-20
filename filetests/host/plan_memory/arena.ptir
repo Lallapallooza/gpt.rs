@@ -1,0 +1,140 @@
+// RUN: pass plan-memory {target = "x86-64-v4"}
+
+// Values that are never live at once share bytes of the arena: the spread rows take the bytes of
+// the exponentials, which die at the first sum of pairs. The negation writes over the spread
+// rows, which die where it reads them, and the result has memory of its own.
+// CHECK: func.func @main([[INPUT:%[0-9]+]]: tensor<8xf32>) -> tensor<4xf32> {
+// CHECK-NEXT: [[ARENA:%[0-9]+]] = host.arena() {bytes = 128, alignment = 64} : () -> !loop.buf<128xui8, arena<alignment = 64>>
+// CHECK-NEXT: [[GROWN:%[0-9]+]] = host.slice([[ARENA]]) {offset = 0, shape = [8], dtype = f32}
+// CHECK-NEXT: [[SUMS:%[0-9]+]] = host.slice([[ARENA]]) {offset = 64, shape = [4], dtype = f32}
+// CHECK-NEXT: [[SPREAD:%[0-9]+]] = host.slice([[ARENA]]) {offset = 0, shape = [8], dtype = f32}
+// CHECK-NEXT: [[TOTAL:%[0-9]+]] = host.alloc() {shape = [4], dtype = f32, alignment = 64} : () -> !loop.buf<4xf32, global>
+// CHECK-NEXT: [[INPUT_BUFFER:%[0-9]+]] = host.to_buffer([[INPUT]]) : (tensor<8xf32>) -> !loop.buf<8xf32, read_only>
+// CHECK-NEXT: host.launch([[INPUT_BUFFER]], [[GROWN]]) {callee = @exp, operand_segments = [1, 1, 0]}
+// CHECK-NEXT: host.launch([[GROWN]], [[SUMS]]) {callee = @pairs, operand_segments = [1, 1, 0]}
+// CHECK-NEXT: host.launch([[SUMS]], [[SPREAD]]) {callee = @spread, operand_segments = [1, 1, 0]}
+// CHECK-NEXT: host.launch([[SPREAD]], [[SPREAD]]) {callee = @neg, operand_segments = [1, 1, 0]}
+// CHECK-NEXT: host.launch([[SPREAD]], [[TOTAL]]) {callee = @pairs, operand_segments = [1, 1, 0]}
+// CHECK-NEXT: [[RESULT:%[0-9]+]] = host.to_tensor([[TOTAL]]) : (!loop.buf<4xf32, global>) -> tensor<4xf32>
+// CHECK-NEXT: func.return([[RESULT]]) : (tensor<4xf32>) -> ()
+loop.func @exp(%input: !loop.buf<8xf32, global>, %output: !loop.buf<8xf32, global>) attributes {access = [in, out<over = 0>]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 8} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %element = loop.load(%input, %position) : (!loop.buf<8xf32, global>, index) -> f32
+    %grown = arith.exp(%element) : (f32) -> f32
+    loop.store(%grown, %output, %position) : (f32, !loop.buf<8xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+loop.func @neg(%input: !loop.buf<8xf32, global>, %output: !loop.buf<8xf32, global>) attributes {access = [in, out<over = 0>]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 8} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %element = loop.load(%input, %position) : (!loop.buf<8xf32, global>, index) -> f32
+    %flipped = arith.neg(%element) : (f32) -> f32
+    loop.store(%flipped, %output, %position) : (f32, !loop.buf<8xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+loop.func @pairs(%input: !loop.buf<8xf32, global>, %output: !loop.buf<4xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 4} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %even = loop.index(%position) {expr = d0 * 2} : (index) -> index
+    %odd = loop.index(%position) {expr = d0 * 2 + 1} : (index) -> index
+    %first = loop.load(%input, %even) : (!loop.buf<8xf32, global>, index) -> f32
+    %second = loop.load(%input, %odd) : (!loop.buf<8xf32, global>, index) -> f32
+    %sum = arith.add(%first, %second) : (f32, f32) -> f32
+    loop.store(%sum, %output, %position) : (f32, !loop.buf<4xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+loop.func @spread(%input: !loop.buf<4xf32, global>, %output: !loop.buf<8xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 8} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %half = loop.index(%position) {expr = d0 floordiv 2} : (index) -> index
+    %element = loop.load(%input, %half) : (!loop.buf<4xf32, global>, index) -> f32
+    loop.store(%element, %output, %position) : (f32, !loop.buf<8xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<8xf32>) -> tensor<4xf32> {
+  %grown = host.dispatch(%input) {callee = @exp} : (tensor<8xf32>) -> tensor<8xf32>
+  %sums = host.dispatch(%grown) {callee = @pairs} : (tensor<8xf32>) -> tensor<4xf32>
+  %spread = host.dispatch(%sums) {callee = @spread} : (tensor<4xf32>) -> tensor<8xf32>
+  %flipped = host.dispatch(%spread) {callee = @neg} : (tensor<8xf32>) -> tensor<8xf32>
+  %total = host.dispatch(%flipped) {callee = @pairs} : (tensor<8xf32>) -> tensor<4xf32>
+  func.return(%total) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// A value goes into the smallest gap that fits it, though an earlier gap is larger: the last sum
+// takes the 64 bytes of the middle sum, between the left and the right sums it reads, and not the
+// 128 bytes of the wide rows, before them. Both are dead when it is written.
+// CHECK: func.func @main([[INPUT:%[0-9]+]]: tensor<4xf32>) -> tensor<4xf32> {
+// CHECK-NEXT: [[ARENA:%[0-9]+]] = host.arena() {bytes = 320, alignment = 64} : () -> !loop.buf<320xui8, arena<alignment = 64>>
+// CHECK-NEXT: [[WIDE:%[0-9]+]] = host.slice([[ARENA]]) {offset = 0, shape = [32], dtype = f32}
+// CHECK-NEXT: [[LEFT:%[0-9]+]] = host.slice([[ARENA]]) {offset = 128, shape = [4], dtype = f32}
+// CHECK-NEXT: [[MIDDLE:%[0-9]+]] = host.slice([[ARENA]]) {offset = 192, shape = [4], dtype = f32}
+// CHECK-NEXT: [[RIGHT:%[0-9]+]] = host.slice([[ARENA]]) {offset = 256, shape = [4], dtype = f32}
+// CHECK-NEXT: [[LAST:%[0-9]+]] = host.slice([[ARENA]]) {offset = 192, shape = [4], dtype = f32}
+// CHECK: host.launch([[LEFT]], [[RIGHT]], [[LAST]]) {callee = @add, operand_segments = [2, 1, 0]}
+loop.func @spread(%input: !loop.buf<4xf32, global>, %output: !loop.buf<32xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 32} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %source = loop.index(%position) {expr = d0 floordiv 8} : (index) -> index
+    %element = loop.load(%input, %source) : (!loop.buf<4xf32, global>, index) -> f32
+    loop.store(%element, %output, %position) : (f32, !loop.buf<32xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+loop.func @add(%lhs: !loop.buf<4xf32, global>, %rhs: !loop.buf<4xf32, global>, %output: !loop.buf<4xf32, global>) attributes {access = [in, in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 4} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %left = loop.load(%lhs, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %right = loop.load(%rhs, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %sum = arith.add(%left, %right) : (f32, f32) -> f32
+    loop.store(%sum, %output, %position) : (f32, !loop.buf<4xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+loop.func @fold(%wide: !loop.buf<32xf32, global>, %addend: !loop.buf<4xf32, global>, %output: !loop.buf<4xf32, global>) attributes {access = [in, in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %count = loop.index() {expr = 4} : () -> index
+  loop.for(%zero, %count) ({
+  ^body(%position: index):
+    %row = loop.index(%position) {expr = d0 * 8} : (index) -> index
+    %element = loop.load(%wide, %row) : (!loop.buf<32xf32, global>, index) -> f32
+    %term = loop.load(%addend, %position) : (!loop.buf<4xf32, global>, index) -> f32
+    %sum = arith.add(%element, %term) : (f32, f32) -> f32
+    loop.store(%sum, %output, %position) : (f32, !loop.buf<4xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %wide = host.dispatch(%input) {callee = @spread} : (tensor<4xf32>) -> tensor<32xf32>
+  %left = host.dispatch(%input, %input) {callee = @add} : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %middle = host.dispatch(%wide, %input) {callee = @fold} : (tensor<32xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %right = host.dispatch(%wide, %middle) {callee = @fold} : (tensor<32xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %last = host.dispatch(%left, %right) {callee = @add} : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %total = host.dispatch(%last, %last) {callee = @add} : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%total) : (tensor<4xf32>) -> ()
+}

@@ -18,7 +18,9 @@ pub use self::algebra::{
     Absorbing, Associative, Commutative, DistributesOver, Idempotent, IntValue, Involution,
     PerClass, RightIdentity, NEG_ZERO,
 };
-pub use self::structure::{Elementwise, IsolatedFromAbove, Movement, NarrowInF32, Terminator};
+pub use self::structure::{
+    Elementwise, IsolatedFromAbove, Movement, NarrowInF32, OnlyUse, Terminator,
+};
 use crate::ir::{DType, Dense, Module, Type, Value};
 use crate::rewrite::{Doc, FoldResult};
 use crate::Op;

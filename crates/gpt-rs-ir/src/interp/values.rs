@@ -1,16 +1,18 @@
-//! The values the interpreter computes with: index values, scalars, tensors and `loop` buffers,
-//! with the units of work that access a buffer.
+//! The values the interpreter computes with: index values, scalars, tensors, `loop` buffers and
+//! `isa` vectors, with the units of work that access a buffer.
 
 use std::fmt;
+use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{anyhow, bail, ensure, Result};
 
 use crate::host::{HostScalar, HostTensor};
-use crate::ir::{BufferType, Space, Type};
+use crate::ir::{BufferType, Space, Type, VectorType};
 
-/// Where an access to a buffer runs: the iteration of each `loop.forall` around it, outermost
-/// first, as the run of the forall and its index.
+/// Where an access to a buffer runs: the unit of work of each `loop.forall` and `loop.atom`
+/// around it, outermost first, as the run of the op and the unit's number in it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Unit(Vec<(u64, i64)>);
 
@@ -41,7 +43,7 @@ impl Unit {
 }
 
 impl fmt::Display for Unit {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let indices: Vec<String> = self.0.iter().map(|(_, index)| index.to_string()).collect();
         write!(f, "[{}]", indices.join(", "))
     }
@@ -53,14 +55,94 @@ impl fmt::Display for Unit {
 ///
 /// Each element remembers the unit of its last write and the units that read it since, so that
 /// an access that races with one of them fails.
+///
+/// The buffers of the `host` buffer form also know their memory. A slice of an arena keeps its
+/// elements in cells of its own. The arena remembers which slice wrote each of its bytes last. A
+/// read through a slice fails when another slice wrote its bytes since, because then the memory
+/// plan let two live values share bytes.
+///
+/// A launch whose `out<over = k>` parameter may write the elements of its `in` parameter `k` gets
+/// a handle of each that knows which elements the `out` parameter wrote, so that a read through
+/// the `in` parameter of one of them fails.
 #[derive(Clone)]
-pub struct HostBuffer(Arc<Mutex<BufferCells>>);
+pub struct HostBuffer {
+    cells: Arc<Mutex<BufferCells>>,
+    over: Option<Over>,
+}
+
+/// The handle of an `in` parameter `k`, or of the `out<over = k>` parameter that may write its
+/// elements, in one launch.
+#[derive(Clone)]
+struct Over {
+    /// For each element, whether the `out` parameter wrote it.
+    written: Arc<Mutex<Vec<bool>>>,
+    /// Whether the handle is the `out` parameter's, whose stores mark what they write, rather than
+    /// the `in` parameter's, which reads only what is not marked.
+    writes: bool,
+}
 
 struct BufferCells {
+    /// The buffer's own number, which no other buffer of the process takes, even once this one
+    /// is gone.
+    identity: usize,
     ty: BufferType,
     dims: Vec<usize>,
     elements: Vec<Option<HostScalar>>,
     accesses: Vec<Accesses>,
+    memory: Memory,
+}
+
+/// The memory of a buffer, as the `host` buffer form sees it.
+#[derive(Clone)]
+enum Memory {
+    /// Memory of its own.
+    Own,
+    /// Memory of its own that no launch and no copy writes: a buffer of `host.to_buffer`.
+    ReadOnly,
+    /// An arena, whose slices hold the elements.
+    Arena(Arc<Mutex<Holders>>),
+    /// The bytes `bytes` of an arena. `written` is true once the slice writes them.
+    Slice {
+        arena: Arc<Mutex<Holders>>,
+        bytes: Range<u64>,
+        written: bool,
+    },
+}
+
+/// The number of the next buffer the process makes.
+static NEXT_BUFFER: AtomicUsize = AtomicUsize::new(0);
+
+/// Which slice wrote each byte of an arena last: disjoint byte ranges, each with the identity of
+/// the slice.
+#[derive(Default)]
+struct Holders(Vec<(Range<u64>, usize)>);
+
+impl Holders {
+    /// Gives `bytes` to the slice `holder`.
+    fn hold(&mut self, bytes: Range<u64>, holder: usize) {
+        let mut kept = Vec::with_capacity(self.0.len() + 2);
+        for (range, other) in self.0.drain(..) {
+            if range.end <= bytes.start || bytes.end <= range.start {
+                kept.push((range, other));
+                continue;
+            }
+            if range.start < bytes.start {
+                kept.push((range.start..bytes.start, other));
+            }
+            if bytes.end < range.end {
+                kept.push((bytes.end..range.end, other));
+            }
+        }
+        kept.push((bytes, holder));
+        self.0 = kept;
+    }
+
+    /// Whether the slice `holder` wrote all of `bytes` last.
+    fn holds(&self, bytes: &Range<u64>, holder: usize) -> bool {
+        self.0
+            .iter()
+            .any(|(range, other)| *other == holder && range == bytes)
+    }
 }
 
 /// The accesses to one element that a later access may race with.
@@ -87,6 +169,10 @@ impl BufferCells {
     }
 
     fn checked_position(&self, coords: &[i64]) -> Result<usize> {
+        ensure!(
+            !matches!(self.memory, Memory::Arena(_)),
+            "an arena holds no elements of its own; its slices do"
+        );
         self.position(coords).ok_or_else(|| {
             anyhow!(
                 "{coords:?} is outside {}, whose extents are {:?}",
@@ -117,18 +203,164 @@ impl BufferCells {
 impl HostBuffer {
     /// A buffer of type `ty`, whose extents must be static, with no element written.
     pub fn new(ty: BufferType) -> Result<Self> {
-        let dims = ty
-            .tensor_type()
-            .static_dims()
-            .ok_or_else(|| anyhow!("{ty} has extents that are not static"))?
-            .to_vec();
+        let dims = static_dims(&ty)?;
         let count = dims.iter().product();
-        Ok(Self(Arc::new(Mutex::new(BufferCells {
+        Ok(Self::of_cells(BufferCells {
+            identity: NEXT_BUFFER.fetch_add(1, Ordering::Relaxed),
             ty,
             dims,
             elements: vec![None; count],
             accesses: vec![Accesses::default(); count],
-        }))))
+            memory: Memory::Own,
+        }))
+    }
+
+    /// An arena of type `ty`, the bytes of `host.arena`, whose slices hold the elements.
+    pub fn arena(ty: BufferType) -> Result<Self> {
+        let dims = static_dims(&ty)?;
+        Ok(Self::of_cells(BufferCells {
+            identity: NEXT_BUFFER.fetch_add(1, Ordering::Relaxed),
+            ty,
+            dims,
+            elements: Vec::new(),
+            accesses: Vec::new(),
+            memory: Memory::Arena(Arc::default()),
+        }))
+    }
+
+    fn of_cells(cells: BufferCells) -> Self {
+        Self {
+            cells: Arc::new(Mutex::new(cells)),
+            over: None,
+        }
+    }
+
+    /// The handles of `input`, the `in` parameter `k` of a launch, and of `output`, its
+    /// `out<over = k>` parameter, which may be one buffer: a store through the output's handle
+    /// marks the element, a load through the input's handle of a marked element fails, and so does
+    /// one through the output's handle of an element it has not marked.
+    pub fn written_over(input: &HostBuffer, output: &HostBuffer) -> Result<(Self, Self)> {
+        let count = output.cells().elements.len();
+        ensure!(
+            input.cells().elements.len() == count,
+            "an `out<over = k>` parameter has other extents than parameter k"
+        );
+        let written = Arc::new(Mutex::new(vec![false; count]));
+        let handle = |buffer: &HostBuffer, writes: bool| Self {
+            cells: Arc::clone(&buffer.cells),
+            over: Some(Over {
+                written: Arc::clone(&written),
+                writes,
+            }),
+        };
+        Ok((handle(input, false), handle(output, true)))
+    }
+
+    /// The buffer of type `ty` at byte `offset` of this arena, with no element written.
+    pub fn slice(&self, offset: u64, ty: BufferType) -> Result<Self> {
+        let Memory::Arena(arena_holders) = &self.cells().memory else {
+            bail!("a slice is of an arena, not of {}", self.ty());
+        };
+        let arena = Arc::clone(arena_holders);
+        let buffer = Self::new(ty)?;
+        let bytes = {
+            let cells = buffer.cells();
+            let count = cells.elements.len();
+            let size = cells
+                .ty
+                .dtype
+                .bytes_for(count)
+                .ok_or_else(|| anyhow!("{} takes more bytes than fit", cells.ty))?;
+            offset..offset + size as u64
+        };
+        buffer.cells().memory = Memory::Slice {
+            arena,
+            bytes,
+            written: false,
+        };
+        Ok(buffer)
+    }
+
+    /// A buffer that holds the elements of `tensor` and that no launch and no copy writes.
+    pub fn read_only(tensor: &HostTensor) -> Result<Self> {
+        let buffer = Self::of_tensor(tensor, Space::ReadOnly)?;
+        buffer.cells().memory = Memory::ReadOnly;
+        Ok(buffer)
+    }
+
+    /// Takes the buffer's bytes for the elements that a launch or a copy is about to write. Fails
+    /// for a buffer that nothing may write.
+    pub fn hold(&self) -> Result<()> {
+        let mut guard = self.cells();
+        let cells = &mut *guard;
+        match &mut cells.memory {
+            Memory::Own => Ok(()),
+            Memory::ReadOnly => bail!(
+                "it writes {}, which holds the elements of a tensor that nothing may write",
+                cells.ty
+            ),
+            Memory::Arena(_) => bail!("it writes an arena, whose slices hold the elements"),
+            Memory::Slice {
+                arena,
+                bytes,
+                written,
+            } => {
+                let mut holders = arena.lock().unwrap_or_else(PoisonError::into_inner);
+                holders.hold(bytes.clone(), cells.identity);
+                *written = true;
+                Ok(())
+            }
+        }
+    }
+
+    /// Fails when the buffer is an arena, when it is a slice that no launch and no copy wrote, or
+    /// when another slice wrote one of its bytes after it wrote its elements.
+    pub fn check_held(&self) -> Result<()> {
+        let cells = self.cells();
+        match &cells.memory {
+            Memory::Own | Memory::ReadOnly => Ok(()),
+            Memory::Arena(_) => bail!("it reads an arena, whose slices hold the elements"),
+            Memory::Slice {
+                arena,
+                bytes,
+                written,
+            } => {
+                ensure!(
+                    *written,
+                    "it reads {} at bytes {}..{} of an arena, which no launch and no copy wrote",
+                    cells.ty,
+                    bytes.start,
+                    bytes.end
+                );
+                let holders = arena.lock().unwrap_or_else(PoisonError::into_inner);
+                ensure!(
+                    holders.holds(bytes, cells.identity),
+                    "it reads {} at bytes {}..{} of an arena, which another value wrote since",
+                    cells.ty,
+                    bytes.start,
+                    bytes.end
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Writes the elements of `from`, a buffer of the same extents and dtype, into this one. A copy
+    /// runs between launches, after every access before it and before every access after it, so
+    /// it leaves no access that a later one may race with.
+    pub fn copy_from(&self, from: &HostBuffer) -> Result<()> {
+        let elements = from.cells().elements.clone();
+        let mut cells = self.cells();
+        ensure!(
+            cells.elements.len() == elements.len(),
+            "it copies {} elements into {}",
+            elements.len(),
+            cells.ty
+        );
+        cells.elements = elements;
+        let count = cells.elements.len();
+        cells.accesses = vec![Accesses::default(); count];
+        Ok(())
     }
 
     /// A buffer of `space` that holds the elements of `tensor`.
@@ -144,7 +376,7 @@ impl HostBuffer {
     }
 
     fn cells(&self) -> MutexGuard<'_, BufferCells> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.cells.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The buffer's type, with its extents.
@@ -158,11 +390,24 @@ impl HostBuffer {
     }
 
     /// The element at `coords`, read by `unit`. Fails when it is out of range, when no store wrote
-    /// it, or when the read races with a write.
+    /// it, when the read races with a write, or when the handle may not read it: an `in`
+    /// parameter's element that the `out<over = k>` parameter wrote.
     pub fn load(&self, coords: &[i64], unit: &Unit) -> Result<HostScalar> {
         let mut cells = self.cells();
         let position = cells.checked_position(coords)?;
         cells.check_race(position, coords, unit, false)?;
+        if let Some(over) = &self.over {
+            let written = over.written.lock().unwrap_or_else(PoisonError::into_inner)[position];
+            match (over.writes, written) {
+                (false, true) => bail!(
+                    "it reads element {coords:?} of an `in` parameter that the `out<over = k>` \
+                     parameter wrote already, and a launch reads parameter k only at positions \
+                     that it has not written yet"
+                ),
+                (true, false) => bail!("no store wrote element {coords:?} of {}", cells.ty),
+                _ => {}
+            }
+        }
         let value = cells.elements[position]
             .ok_or_else(|| anyhow!("no store wrote element {coords:?} of {}", cells.ty))?;
         let reads = &mut cells.accesses[position].reads;
@@ -184,6 +429,9 @@ impl HostBuffer {
         );
         let position = cells.checked_position(coords)?;
         cells.check_race(position, coords, unit, true)?;
+        if let Some(over) = self.over.as_ref().filter(|over| over.writes) {
+            over.written.lock().unwrap_or_else(PoisonError::into_inner)[position] = true;
+        }
         cells.elements[position] = Some(value);
         cells.accesses[position] = Accesses {
             write: Some(unit.clone()),
@@ -207,16 +455,25 @@ impl HostBuffer {
 }
 
 impl fmt::Debug for HostBuffer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "HostBuffer({})", self.cells().ty)
     }
 }
 
-/// Two buffers are equal when they are one buffer.
+/// Two buffers are equal when they are one buffer, through any handles.
 impl PartialEq for HostBuffer {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.cells, &other.cells)
     }
+}
+
+/// The static extents of `ty`.
+fn static_dims(ty: &BufferType) -> Result<Vec<usize>> {
+    let dims = ty
+        .tensor_type()
+        .static_dims()
+        .ok_or_else(|| anyhow!("{ty} has extents that are not static"))?;
+    Ok(dims.to_vec())
 }
 
 /// Any run-time value.
@@ -226,22 +483,28 @@ pub enum HostValue {
     Scalar(HostScalar),
     Tensor(HostTensor),
     Buffer(HostBuffer),
+    /// The lanes of a group of `isa` vector registers, as a tensor of the vector type's extents.
+    Vector(HostTensor),
 }
 
 impl HostValue {
     /// The value's type, with its extents as static dimensions.
     pub fn ty(&self) -> Type {
         match self {
-            HostValue::Tensor(t) => Type::Tensor(t.tensor_type()),
-            HostValue::Buffer(b) => Type::Buffer(b.ty()),
+            HostValue::Tensor(tensor) => Type::Tensor(tensor.tensor_type()),
+            HostValue::Buffer(buffer) => Type::Buffer(buffer.ty()),
+            HostValue::Vector(lanes) => Type::Vector(VectorType {
+                dtype: lanes.dtype(),
+                dims: lanes.dims,
+            }),
             HostValue::Index(_) => Type::Index,
-            HostValue::Scalar(s) => Type::Scalar(s.dtype()),
+            HostValue::Scalar(scalar) => Type::Scalar(scalar.dtype()),
         }
     }
 
     pub fn as_tensor(&self) -> Option<&HostTensor> {
         match self {
-            HostValue::Tensor(t) => Some(t),
+            HostValue::Tensor(tensor) => Some(tensor),
             _ => None,
         }
     }
@@ -249,7 +512,7 @@ impl HostValue {
     /// The tensor this value holds.
     pub fn into_tensor(self) -> Result<HostTensor> {
         match self {
-            HostValue::Tensor(t) => Ok(t),
+            HostValue::Tensor(tensor) => Ok(tensor),
             other => Err(anyhow!("expected a tensor, got {}", other.ty())),
         }
     }
@@ -263,7 +526,7 @@ impl HostValue {
     pub fn of_tensors(tensors: &[&HostTensor]) -> Vec<HostValue> {
         tensors
             .iter()
-            .map(|&t| HostValue::Tensor(t.clone()))
+            .map(|&tensor| HostValue::Tensor(tensor.clone()))
             .collect()
     }
 }

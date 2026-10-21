@@ -1,0 +1,78 @@
+// RUN: pass tile-to-loop, contract
+// ROUNDING: contract: under the contract, a product rounds once with the sum it enters.
+
+// A dot whose record contracts: the `loop.func` says so, and the fold adds each product to the
+// running sum with one `arith.fma`, and no `arith.mul` remains.
+// CHECK: loop.func @dot([[LHS:%[0-9]+]]: !loop.buf<4x8xf32, global>, [[RHS:%[0-9]+]]: !loop.buf<8x2xf32, global>, [[OUTPUT:%[0-9]+]]: !loop.buf<4x2xf32, global>) attributes {access = [in, in, out], contract = true} {
+// CHECK-NOT: arith.mul
+// CHECK: [[ELEMENT:%[0-9]+]] = loop.load([[LHS]], {{%[0-9]+}}, {{%[0-9]+}}) : (!loop.buf<4x8xf32, global>, index, index) -> f32
+// CHECK-NEXT: [[WEIGHT:%[0-9]+]] = loop.load([[RHS]], {{%[0-9]+}}, {{%[0-9]+}}) : (!loop.buf<8x2xf32, global>, index, index) -> f32
+// CHECK-NEXT: [[SUM:%[0-9]+]] = loop.load([[STATE:%[0-9]+]]) : (!loop.buf<f32, private>) -> f32
+// CHECK-NEXT: [[FOLDED:%[0-9]+]] = arith.fma([[ELEMENT]], [[WEIGHT]], [[SUM]]) : (f32, f32, f32) -> f32
+// CHECK-NEXT: loop.store([[FOLDED]], [[STATE]]) : (f32, !loop.buf<f32, private>) -> ()
+// CHECK-NOT: arith.mul
+// CHECK: loop.return() : () -> ()
+tile.dispatch @dot(%lhs: tensor<4x8xf32>, %rhs: tensor<8x2xf32>) -> tensor<4x2xf32> attributes {numerics = <contract = true>} {
+  %product = tile.block(%lhs, %rhs) {iters = [par 4, par 2, red 8], reads = [$0[d0, d2], $1[d2, d1]], folds = [sum -> [d0, d1]]} ({
+  ^body(%element: f32, %weight: f32):
+    %term = arith.mul(%element, %weight) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<4x8xf32>, tensor<8x2xf32>) -> tensor<4x2xf32>
+  func.return(%product) : (tensor<4x2xf32>) -> ()
+}
+func.func @main(%lhs: tensor<4x8xf32>, %rhs: tensor<8x2xf32>) -> tensor<4x2xf32> {
+  %product = host.dispatch(%lhs, %rhs) {callee = @dot} : (tensor<4x8xf32>, tensor<8x2xf32>) -> tensor<4x2xf32>
+  func.return(%product) : (tensor<4x2xf32>) -> ()
+}
+
+// -----
+
+// A scale and a shift whose record contracts: the add of the product is one `arith.fma`. A
+// product that two ops use, the square, stays an `arith.mul`.
+// CHECK: loop.func @scale_shift([[INPUT:%[0-9]+]]: !loop.buf<6xf32, global>, [[SCALE:%[0-9]+]]: !loop.buf<6xf32, global>, [[SHIFT:%[0-9]+]]: !loop.buf<6xf32, global>, [[OUTPUT:%[0-9]+]]: !loop.buf<6xf32, global>)
+// CHECK: [[ELEMENT:%[0-9]+]] = loop.load([[INPUT]], [[AT:%[0-9]+]]) : (!loop.buf<6xf32, global>, index) -> f32
+// CHECK-NEXT: [[FACTOR:%[0-9]+]] = loop.load([[SCALE]], [[AT]]) : (!loop.buf<6xf32, global>, index) -> f32
+// CHECK-NEXT: [[OFFSET:%[0-9]+]] = loop.load([[SHIFT]], [[AT]]) : (!loop.buf<6xf32, global>, index) -> f32
+// CHECK-NEXT: [[SHIFTED:%[0-9]+]] = arith.fma([[ELEMENT]], [[FACTOR]], [[OFFSET]]) : (f32, f32, f32) -> f32
+// CHECK-NEXT: [[SQUARE:%[0-9]+]] = arith.mul([[SHIFTED]], [[SHIFTED]]) : (f32, f32) -> f32
+// CHECK-NEXT: [[BOTH:%[0-9]+]] = arith.add([[SQUARE]], [[SQUARE]]) : (f32, f32) -> f32
+// CHECK-NEXT: loop.store([[BOTH]], [[OUTPUT]], [[AT]]) : (f32, !loop.buf<6xf32, global>, index) -> ()
+tile.dispatch @scale_shift(%input: tensor<6xf32>, %scale: tensor<6xf32>, %shift: tensor<6xf32>) -> tensor<6xf32> attributes {numerics = <contract = true>} {
+  %out = tile.block(%input, %scale, %shift) {iters = [par 6], reads = [$0[d0], $1[d0], $2[d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f32, %factor: f32, %offset: f32):
+    %scaled = arith.mul(%element, %factor) : (f32, f32) -> f32
+    %shifted = arith.add(%scaled, %offset) : (f32, f32) -> f32
+    %square = arith.mul(%shifted, %shifted) : (f32, f32) -> f32
+    %both = arith.add(%square, %square) : (f32, f32) -> f32
+    tile.yield(%both) : (f32) -> ()
+  }) : (tensor<6xf32>, tensor<6xf32>, tensor<6xf32>) -> tensor<6xf32>
+  func.return(%out) : (tensor<6xf32>) -> ()
+}
+func.func @main(%input: tensor<6xf32>, %scale: tensor<6xf32>, %shift: tensor<6xf32>) -> tensor<6xf32> {
+  %out = host.dispatch(%input, %scale, %shift) {callee = @scale_shift} : (tensor<6xf32>, tensor<6xf32>, tensor<6xf32>) -> tensor<6xf32>
+  func.return(%out) : (tensor<6xf32>) -> ()
+}
+
+// -----
+
+// The same scale and shift under a record that does not contract: each product and each sum
+// rounds alone.
+// CHECK: loop.func @scale_shift([[INPUT:%[0-9]+]]: !loop.buf<6xf32, global>, [[SCALE:%[0-9]+]]: !loop.buf<6xf32, global>, [[SHIFT:%[0-9]+]]: !loop.buf<6xf32, global>, {{%[0-9]+}}: !loop.buf<6xf32, global>) attributes {access = [in, in, in, out<over = 0>]} {
+// CHECK-NOT: arith.fma
+// CHECK: [[SCALED:%[0-9]+]] = arith.mul({{%[0-9]+}}, {{%[0-9]+}}) : (f32, f32) -> f32
+// CHECK-NEXT: [[SHIFTED:%[0-9]+]] = arith.add([[SCALED]], {{%[0-9]+}}) : (f32, f32) -> f32
+// CHECK-NOT: arith.fma
+// CHECK: loop.return() : () -> ()
+tile.dispatch @scale_shift(%input: tensor<6xf32>, %scale: tensor<6xf32>, %shift: tensor<6xf32>) -> tensor<6xf32> {
+  %out = tile.block(%input, %scale, %shift) {iters = [par 6], reads = [$0[d0], $1[d0], $2[d0]], folds = [none -> [d0]]} ({
+  ^body(%element: f32, %factor: f32, %offset: f32):
+    %scaled = arith.mul(%element, %factor) : (f32, f32) -> f32
+    %shifted = arith.add(%scaled, %offset) : (f32, f32) -> f32
+    tile.yield(%shifted) : (f32) -> ()
+  }) : (tensor<6xf32>, tensor<6xf32>, tensor<6xf32>) -> tensor<6xf32>
+  func.return(%out) : (tensor<6xf32>) -> ()
+}
+func.func @main(%input: tensor<6xf32>, %scale: tensor<6xf32>, %shift: tensor<6xf32>) -> tensor<6xf32> {
+  %out = host.dispatch(%input, %scale, %shift) {callee = @scale_shift} : (tensor<6xf32>, tensor<6xf32>, tensor<6xf32>) -> tensor<6xf32>
+  func.return(%out) : (tensor<6xf32>) -> ()
+}

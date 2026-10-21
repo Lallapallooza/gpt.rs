@@ -76,7 +76,13 @@ impl Eval for Atom {
         let mut points: Vec<Vec<HostValue>> = vec![Vec::new()];
         for (&extent, &tile) in ins.extents.iter().zip(&self.tile) {
             ensure!(
-                (0..=tile as i64).contains(&extent),
+                extent >= 1,
+                "the extents {:?} run no point of the tile {:?}",
+                ins.extents,
+                self.tile
+            );
+            ensure!(
+                extent <= tile as i64,
                 "the extents {:?} exceed the tile {:?}",
                 ins.extents,
                 self.tile

@@ -54,9 +54,10 @@ each parameter, its `in` parameters first, then its `out` and its `inout` parame
 ## Register tiles
 
 `loop.atom` runs its body once for each point of a static box, the register tile of a dispatch,
-below its extents. `loop-to-isa` computes the points at once, in vectors along the tile's last
-axis, for the target that the `loop.func` names. Each point is a unit of work: two points MUST NOT
-access one element when one of them writes it, so every order of the points gives the same values.
+below its extents. Each extent MUST be at least 1 and at most the tile's, so an atom runs at least
+one point. `loop-to-isa` computes the points at once, in vectors along the tile's last axis, for the
+target that the `loop.func` names. Each point is a unit of work: two points MUST NOT access one
+element when one of them writes it, so every order of the points gives the same values.
 
 ## Units of work
 
@@ -288,9 +289,9 @@ Rejected, as the verify filetests pin it:
 Runs its body once for each point of the box `tile` whose coordinates are below
 `extents`, one per axis, in row-major order. The points are those of a register tile, which
 `loop-to-isa` computes at once in vectors of `lanes` elements along the last axis. The body's
-block arguments are the point's coordinates. `extents` MUST NOT exceed `tile`. An extent of 0
-runs no point. Each point is a unit of work: two points MUST NOT access one element of a buffer
-when one of them writes it.
+block arguments are the point's coordinates. Each extent MUST be at least 1 and MUST NOT exceed
+its axis of `tile`: an atom runs at least one point. Each point is a unit of work: two points
+MUST NOT access one element of a buffer when one of them writes it.
 
 Defined by `Atom` in [crates/gpt-rs-ir/src/dialects/loops/ir.rs](../../crates/gpt-rs-ir/src/dialects/loops/ir.rs).
 

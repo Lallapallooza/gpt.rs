@@ -7,16 +7,18 @@
 //! one per op, so an op without a decision does not compile. A conversion pattern that does not
 //! apply says why, and the conversion fails with that reason.
 
+mod loop_to_isa;
 mod tensor_to_tile;
 mod tile_to_loop;
 
 use anyhow::{bail, Result};
 
+pub use self::loop_to_isa::LoopToIsa;
 pub use self::tensor_to_tile::TensorToTile;
 pub use self::tile_to_loop::TileToLoop;
 use crate::dialects::Dialect;
 use crate::ir::{InOp, Module};
-use crate::rewrite::{AnyPattern, Applied, PatternSet};
+use crate::rewrite::{AnyPattern, Applied, PatternSet, Rewriting};
 use crate::Op;
 
 /// What a conversion does with one op.
@@ -158,7 +160,7 @@ pub enum Mode {
 /// op that no pattern rewrites, with the reasons the patterns gave, and in [`Mode::Full`] on an op
 /// that `target` does not make legal.
 pub fn apply_conversion(
-    module: &mut Module,
+    module: &mut Rewriting,
     target: &ConversionTarget,
     patterns: &PatternSet,
     mode: Mode,
@@ -188,9 +190,9 @@ pub fn apply_conversion(
             }
         };
         rewritten += 1;
-        for inst in touched.into_iter().rev() {
-            if !module.is_erased(inst) {
-                worklist.extend(module.walk_inst(inst).into_iter().rev());
+        for touched_inst in touched.into_iter().rev() {
+            if !module.is_erased(touched_inst) {
+                worklist.extend(module.walk_inst(touched_inst).into_iter().rev());
             }
         }
     }

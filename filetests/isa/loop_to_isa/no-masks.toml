@@ -1,0 +1,7 @@
+# x86-64-v4 with 3 vector registers and no mask registers, so that masks take vector registers.
+base = "x86-64-v4"
+description = "x86-64-v4 with 3 vector registers and no write masks"
+
+[isa]
+vector_registers = 3
+write_masks = 0

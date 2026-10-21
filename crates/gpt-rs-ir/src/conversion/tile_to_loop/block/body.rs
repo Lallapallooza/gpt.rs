@@ -154,8 +154,9 @@ impl BlockLowering<'_> {
     }
 
     /// The loop of the nest and the cache that the reads of operand `operand` ask for the
-    /// elements of the next tile, when a holding of its read places a prefetch. The walk names
-    /// the operands of the run's first block, so the blocks placed after it ask for none.
+    /// elements of the next tile, when a holding of its read places a prefetch. The walk's
+    /// prefetches name operands of the run's first block, so the blocks placed after it ask for
+    /// none.
     fn prefetched(&self, operand: usize) -> Option<(usize, Level)> {
         if self.input.is_some() {
             return None;

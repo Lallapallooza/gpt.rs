@@ -185,12 +185,12 @@ fn check_holdings_at(block: &Block) -> Result<()> {
 }
 
 /// Fails with the rule that the register tile of `block` and its atom break, under `walk`: at most
-/// [`MAX_GROUP_RANK`] iterators, each held once, over the innermost piece of its iterator; vectors
-/// of the lanes that fill the points of the last; no constraints and no prefix iterator;
-/// reads that take each iterator of the tile by multiples of it, in the terms of its tiles where
-/// they start at multiples of the tile's points ([`Walk::reads_in_steps`]), or from a copy, and
-/// pick no operand of a list by one; and folds that keep one element per point, whose plain
-/// writes name each iterator of the tile.
+/// [`MAX_GROUP_RANK`] iterators, each held once, over the innermost piece of its iterator, which
+/// holds at least one point; vectors of the lanes that fill the points of the last; no constraints
+/// and no prefix iterator; reads that take each iterator of the tile by multiples of it, in the
+/// terms of its tiles where they start at multiples of the tile's points
+/// ([`Walk::reads_in_steps`]), or from a copy, and pick no operand of a list by one; and folds that
+/// keep one element per point, whose plain writes name each iterator of the tile.
 fn check_reg(block: &Block, walk: &Walk) -> Result<()> {
     let Some(atom) = &walk.atom else {
         return Ok(());
@@ -213,11 +213,11 @@ fn check_reg(block: &Block, walk: &Walk) -> Result<()> {
             None => block.iters[position].extent.clone(),
         };
         // When no loop cuts an iterator, its one piece may hold fewer points than the register
-        // tile, like a last piece.
+        // tile, like a last piece, and at least one: an atom runs at least one point.
         let fewer = tiles[position].is_none()
             && innermost
                 .as_static()
-                .is_some_and(|points| points < dim.extent);
+                .is_some_and(|points| (1..dim.extent).contains(&points));
         ensure!(
             innermost == Dim::Static(dim.extent) || fewer,
             "the register tile holds {} points of {}, whose innermost piece has {innermost}",

@@ -1,0 +1,32 @@
+// RUN: pass loop-to-isa {target = "x86-64-v4"}
+
+// The magnitude of each element, as its bits: a negation, a comparison with zero that gives a
+// mask, a select of the negation where the mask is set, and a bitcast to si32, each the lane-wise
+// `isa` op of its family on one register.
+// CHECK: [[ELEMENTS:%[0-9]+]] = isa.load({{%[0-9]+}}, [[AT:%[0-9]+]]) {dims = [1, 16], steps = [[16]]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<1x16xf32>
+// CHECK-NEXT: [[NEGATED:%[0-9]+]] = isa.neg([[ELEMENTS]]) : (!isa.vec<1x16xf32>) -> !isa.vec<1x16xf32>
+// CHECK-NEXT: [[ZERO:%[0-9]+]] = arith.constant() {value = 0.0 : f32} : () -> f32
+// CHECK-NEXT: [[ZEROS:%[0-9]+]] = isa.splat([[ZERO]]) {dims = [1, 16]} : (f32) -> !isa.vec<1x16xf32>
+// CHECK-NEXT: [[NEGATIVE:%[0-9]+]] = isa.less([[ELEMENTS]], [[ZEROS]]) : (!isa.vec<1x16xf32>, !isa.vec<1x16xf32>) -> !isa.vec<1x16xi1>
+// CHECK-NEXT: [[MAGNITUDES:%[0-9]+]] = isa.select([[NEGATIVE]], [[NEGATED]], [[ELEMENTS]]) : (!isa.vec<1x16xi1>, !isa.vec<1x16xf32>, !isa.vec<1x16xf32>) -> !isa.vec<1x16xf32>
+// CHECK-NEXT: [[BITS:%[0-9]+]] = isa.bitcast([[MAGNITUDES]]) {to = si32} : (!isa.vec<1x16xf32>) -> !isa.vec<1x16xsi32>
+// CHECK-NEXT: isa.store([[BITS]], {{%[0-9]+}}, [[AT]]) {steps = [[16]]} : (!isa.vec<1x16xsi32>, !loop.buf<16xsi32, global>, index) -> ()
+loop.func @magnitude_bits(%input: !loop.buf<16xf32, global>, %output: !loop.buf<16xsi32, global>) attributes {access = [in, out], target = "x86-64-v4@3928f7d3"} {
+  %columns = loop.index() {expr = 16} : () -> index
+  loop.atom(%columns) {tile = [16], lanes = 16} ({
+  ^body(%column: index):
+    %element = loop.load(%input, %column) : (!loop.buf<16xf32, global>, index) -> f32
+    %negated = arith.neg(%element) : (f32) -> f32
+    %zero = arith.constant() {value = 0.0 : f32} : () -> f32
+    %negative = arith.less(%element, %zero) : (f32, f32) -> i1
+    %magnitude = arith.select(%negative, %negated, %element) : (i1, f32, f32) -> f32
+    %bits = arith.bitcast(%magnitude) {to = si32} : (f32) -> si32
+    loop.store(%bits, %output, %column) : (si32, !loop.buf<16xsi32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<16xf32>) -> tensor<16xsi32> {
+  %bits = host.dispatch(%input) {callee = @magnitude_bits} : (tensor<16xf32>) -> tensor<16xsi32>
+  func.return(%bits) : (tensor<16xsi32>) -> ()
+}

@@ -1,0 +1,36 @@
+// RUN: pass loop-to-isa {target = "%S/no-masks.toml"}
+
+// Rows of 40 elements scaled by a factor per row, in register tiles of 2 rows by two vectors of 16
+// lanes: 3 rows and 40 columns leave tiles that the atom's extents stop short of along both axes.
+// The input's load and the output's store take the mask of the whole tile, and the factor's
+// broadcast that of the rows. While the factor's mask is computed, the tile's is live until the
+// store: two masks at once, with the 2 vector registers that hold an element and its factor.
+// A target without mask registers holds the masks in vector registers: 4 of them, and it has 3.
+// ERROR: loop-to-isa {target = "%S/no-masks.toml"}: loop.func @scale_tail: its vector code holds 4 vector registers at once at loc("" via ["loop-to-isa"("loop.load":{{[0-9]+}})]), and %S/no-masks.toml has 3
+loop.func @scale_tail(%input: !loop.buf<3x40xf32, global>, %scale: !loop.buf<3xf32, global>, %output: !loop.buf<3x40xf32, global>) attributes {access = [in, in, out], target = "%S/no-masks.toml@62479d35"} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %two = loop.index() {expr = 2} : () -> index
+  loop.for(%zero, %two) ({
+  ^body(%row_tile: index):
+    %first_row = loop.index(%row_tile) {expr = d0 * 2} : (index) -> index
+    %rows = loop.index(%first_row) {expr = min(2, 3 - d0)} : (index) -> index
+    loop.for(%zero, %two) ({
+    ^body(%column_tile: index):
+      %first_column = loop.index(%column_tile) {expr = d0 * 32} : (index) -> index
+      %columns = loop.index(%first_column) {expr = min(32, 40 - d0)} : (index) -> index
+      loop.atom(%rows, %columns) {tile = [2, 32], lanes = 16} ({
+      ^body(%row_offset: index, %column_offset: index):
+        %row = loop.index(%first_row, %row_offset) {expr = d0 + d1} : (index, index) -> index
+        %column = loop.index(%first_column, %column_offset) {expr = d0 + d1} : (index, index) -> index
+        %element = loop.load(%input, %row, %column) : (!loop.buf<3x40xf32, global>, index, index) -> f32
+        %factor = loop.load(%scale, %row) : (!loop.buf<3xf32, global>, index) -> f32
+        %scaled = arith.mul(%element, %factor) : (f32, f32) -> f32
+        loop.store(%scaled, %output, %row, %column) : (f32, !loop.buf<3x40xf32, global>, index, index) -> ()
+        loop.yield() : () -> ()
+      }) : (index, index) -> ()
+      loop.yield() : () -> ()
+    }) : (index, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}

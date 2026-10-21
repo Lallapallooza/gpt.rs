@@ -52,9 +52,10 @@ each parameter, its `in` parameters first, then its `out` and its `inout` parame
 ## Register tiles
 
 `loop.atom` runs its body once for each point of a static box, the register tile of a dispatch,
-below its extents. `loop-to-isa` computes the points at once, in vectors along the tile's last
-axis, for the target that the `loop.func` names. Each point is a unit of work: two points MUST NOT
-access one element when one of them writes it, so every order of the points gives the same values.
+below its extents. Each extent MUST be at least 1 and at most the tile's, so an atom runs at least
+one point. `loop-to-isa` computes the points at once, in vectors along the tile's last axis, for the
+target that the `loop.func` names. Each point is a unit of work: two points MUST NOT access one
+element when one of them writes it, so every order of the points gives the same values.
 
 ## Units of work
 

@@ -1,0 +1,43 @@
+// RUN: pass loop-to-isa {target = "x86-64-v4"}
+
+// Rows of 32 elements scaled by a factor per row, in register tiles of 2 rows by two vectors of 16
+// lanes: 3 rows make a tile of 2 rows and one of 1, so the row extent may stop short of the tile
+// and the columns fill it. The input and the output move along the rows and the columns, and the
+// factor along the rows alone: each takes the mask of the rows, which the input's load and the
+// output's store repeat along the columns. The atom writes the mask and its repetition once, and
+// each access that takes them reads them. The factor's load is an `isa.masked_broadcast`.
+// CHECK: loop.func @scale_rows([[INPUT:%[0-9]+]]: !loop.buf<3x32xf32, global>, [[SCALE:%[0-9]+]]: !loop.buf<3xf32, global>, [[OUTPUT:%[0-9]+]]: !loop.buf<3x32xf32, global>)
+// CHECK: [[ROWS:%[0-9]+]] = loop.index({{%[0-9]+}}) {expr = min(2, 3 - d0)} : (index) -> index
+// CHECK: [[ROW_MASK:%[0-9]+]] = isa.tile_mask([[ROWS]], {{%[0-9]+}}) {dims = [2, 1, 16]} : (index, index) -> !isa.vec<2x1x16xi1>
+// CHECK-NEXT: [[TILE_MASK:%[0-9]+]] = isa.expand([[ROW_MASK]]) {dims = [2, 2, 16]} : (!isa.vec<2x1x16xi1>) -> !isa.vec<2x2x16xi1>
+// CHECK-NEXT: [[ELEMENTS:%[0-9]+]] = isa.masked_load([[TILE_MASK]], [[INPUT]], [[ROW:%[0-9]+]], [[COLUMN:%[0-9]+]]) {dims = [2, 2, 16], steps = [[1, 0], [0, 16]]} : (!isa.vec<2x2x16xi1>, !loop.buf<3x32xf32, global>, index, index) -> !isa.vec<2x2x16xf32>
+// CHECK-NEXT: [[FACTORS:%[0-9]+]] = isa.masked_broadcast([[ROW_MASK]], [[SCALE]], [[ROW]]) {dims = [2, 1, 16], steps = [[1], [0]]} : (!isa.vec<2x1x16xi1>, !loop.buf<3xf32, global>, index) -> !isa.vec<2x1x16xf32>
+// CHECK-NEXT: [[FACTOR_TILE:%[0-9]+]] = isa.expand([[FACTORS]]) {dims = [2, 2, 16]} : (!isa.vec<2x1x16xf32>) -> !isa.vec<2x2x16xf32>
+// CHECK-NEXT: [[SCALED:%[0-9]+]] = isa.mul([[ELEMENTS]], [[FACTOR_TILE]]) : (!isa.vec<2x2x16xf32>, !isa.vec<2x2x16xf32>) -> !isa.vec<2x2x16xf32>
+// CHECK-NEXT: isa.masked_store([[TILE_MASK]], [[SCALED]], [[OUTPUT]], [[ROW]], [[COLUMN]]) {steps = [[1, 0], [0, 16]]} : (!isa.vec<2x2x16xi1>, !isa.vec<2x2x16xf32>, !loop.buf<3x32xf32, global>, index, index) -> ()
+// CHECK-NEXT: loop.yield() : () -> ()
+loop.func @scale_rows(%input: !loop.buf<3x32xf32, global>, %scale: !loop.buf<3xf32, global>, %output: !loop.buf<3x32xf32, global>) attributes {access = [in, in, out], target = "x86-64-v4@3928f7d3"} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %two = loop.index() {expr = 2} : () -> index
+  %columns = loop.index() {expr = 32} : () -> index
+  loop.for(%zero, %two) ({
+  ^body(%tile: index):
+    %first_row = loop.index(%tile) {expr = d0 * 2} : (index) -> index
+    %rows = loop.index(%first_row) {expr = min(2, 3 - d0)} : (index) -> index
+    loop.atom(%rows, %columns) {tile = [2, 32], lanes = 16} ({
+    ^body(%row_offset: index, %column: index):
+      %row = loop.index(%first_row, %row_offset) {expr = d0 + d1} : (index, index) -> index
+      %element = loop.load(%input, %row, %column) : (!loop.buf<3x32xf32, global>, index, index) -> f32
+      %factor = loop.load(%scale, %row) : (!loop.buf<3xf32, global>, index) -> f32
+      %scaled = arith.mul(%element, %factor) : (f32, f32) -> f32
+      loop.store(%scaled, %output, %row, %column) : (f32, !loop.buf<3x32xf32, global>, index, index) -> ()
+      loop.yield() : () -> ()
+    }) : (index, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<3x32xf32>, %scale: tensor<3xf32>) -> tensor<3x32xf32> {
+  %output = host.dispatch(%input, %scale) {callee = @scale_rows} : (tensor<3x32xf32>, tensor<3xf32>) -> tensor<3x32xf32>
+  func.return(%output) : (tensor<3x32xf32>) -> ()
+}

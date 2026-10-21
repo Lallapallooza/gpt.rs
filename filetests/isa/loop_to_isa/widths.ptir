@@ -1,0 +1,14 @@
+// RUN: pass loop-to-isa {target = "x86-64-v4"}
+
+// Vectors of 32 f32 lanes are 1024 bits, wider than the widest register of x86-64-v4, 512 bits.
+// ERROR: loop-to-isa {target = "x86-64-v4"}: loop.func @too_wide: isa.load at loc("" via ["loop-to-isa"("loop.load":3)]): x86 computes in 512-bit registers, not 32 lanes of f32, 1024 bits
+loop.func @too_wide(%input: !loop.buf<32xf32, global>, %output: !loop.buf<32xf32, global>) attributes {access = [in, out], target = "x86-64-v4@3928f7d3"} {
+  %columns = loop.index() {expr = 32} : () -> index
+  loop.atom(%columns) {tile = [32], lanes = 32} ({
+  ^body(%column: index):
+    %element = loop.load(%input, %column) : (!loop.buf<32xf32, global>, index) -> f32
+    loop.store(%element, %output, %column) : (f32, !loop.buf<32xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index) -> ()
+  loop.return() : () -> ()
+}

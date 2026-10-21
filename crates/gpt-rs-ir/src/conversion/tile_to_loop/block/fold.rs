@@ -1,10 +1,10 @@
-//! A fold into new results. Its state holds one element for each point of the tiles that the
-//! loops inside its start walk. Each element starts there, folds every point in one or two sweeps,
-//! and then finishes into the results or goes to the blocks placed after it. Without a holding,
-//! the state lives in registers, or in one element of private scratch for a block without a
-//! register tile. The state of a holding lives in private scratch. Where the loops inside a
-//! register tile walk only reduced iterators, that tile folds into a copy of its part in
-//! registers.
+//! A fold into new results. The fold starts at one point of the loop nest. Its state holds one
+//! element for each point of the tiles that the loops inside that point walk. Each element starts
+//! there, folds every point in one or two sweeps, and then finishes into the results or goes to the
+//! blocks placed after it. Without a holding, the state lives in registers, or in one element of
+//! private scratch for a block without a register tile. The state of a holding lives in private
+//! scratch. Where the loops inside a register tile walk only reduced iterators, that tile folds
+//! into a copy of its part in registers.
 
 use std::rc::Rc;
 

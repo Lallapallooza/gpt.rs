@@ -282,6 +282,90 @@ pub trait Rules: Sync {
 // ------------------------------------------------------------------------------------------------
 // The registers of a register tile's code.
 
+/// The extents of the vectors that hold a register tile of extents `tile` in vectors of `lanes`
+/// lanes along its last axis: an axis of registers per tile axis, the last counting the vectors
+/// of lanes along the tile's last axis, then the lanes.
+pub fn tile_vectors(tile: &[usize], lanes: usize) -> Ranked<usize> {
+    let (&last, outer) = tile.split_last().expect("a register tile has an axis");
+    let mut dims = Ranked::new();
+    dims.extend_from_slice(outer);
+    dims.push(last / lanes);
+    dims.push(lanes);
+    dims
+}
+
+/// The lanes of the registers that hold the `reg` buffer `buffer`: those of the first `isa` op
+/// that reaches it, or none when none does.
+pub fn reg_lanes(module: &Module, buffer: Value) -> Option<usize> {
+    for used in module.uses(buffer) {
+        if let Some(access) = Access::of(module, used.inst) {
+            return Some(access.vector.lanes());
+        }
+    }
+    None
+}
+
+/// The registers of a `reg` buffer that `access`, an `isa` op that reaches it, moves: each by its
+/// place among the buffer's registers in row-major order, in the order of [`Access::positions`].
+/// Or the rule of a `reg` buffer that the access breaks. Vector code reaches a `reg` buffer in
+/// whole registers at positions fixed before the run, so that a backend holds the buffer in vector
+/// variables: by loads without a pad and stores of the buffer's dtype, in registers of the lanes of
+/// [`reg_lanes`], which divide its last extent, each register inside the buffer and starting at a
+/// multiple of the lanes.
+pub fn reg_registers(
+    module: &Module,
+    access: &Access,
+    forms: &mut AffineForms,
+) -> Result<Vec<usize>, &'static str> {
+    let ty = module
+        .ty(access.buffer)
+        .as_buffer()
+        .expect("an access reaches a buffer");
+    if !access.along || access.vector.dtype != ty.dtype {
+        return Err("which only loads and stores of its dtype reach");
+    }
+    if access.pad.is_some() {
+        return Err("which holds every element a read takes, with no pad");
+    }
+    let mut shape: Ranked<usize> = Ranked::new();
+    for dim in &ty.dims {
+        shape.push(
+            dim.as_static()
+                .expect("`loop.alloc` gives a reg buffer static extents"),
+        );
+    }
+    let (&last, rows) = shape
+        .split_last()
+        .expect("a load or a store moves along an axis");
+    let lanes = reg_lanes(module, access.buffer).expect("the access reaches the buffer");
+    if access.vector.lanes() != lanes || last % lanes != 0 {
+        return Err("whose registers hold one lane count that divides its last extent");
+    }
+    let mut base: Ranked<i64> = Ranked::new();
+    for &index in &access.base {
+        let Some(position) = forms.of(index).as_constant() else {
+            return Err("at a position fixed only during the run");
+        };
+        base.push(position);
+    }
+    let per_row = (last / lanes) as i64;
+    let mut registers = Vec::new();
+    for position in access.positions(&base) {
+        let (&column, coords) = position.split_last().expect("a position per axis");
+        let mut inside = (0..last as i64).contains(&column) && column % lanes as i64 == 0;
+        let mut row = 0;
+        for (&coord, &extent) in coords.iter().zip(rows) {
+            inside &= (0..extent as i64).contains(&coord);
+            row = row * extent as i64 + coord;
+        }
+        if !inside {
+            return Err("by a vector that straddles two of its registers or lies outside it");
+        }
+        registers.push((row * per_row + column / lanes as i64) as usize);
+    }
+    Ok(registers)
+}
+
 /// The extents of the group of registers that the `isa` op of `inst` computes or stores, or that
 /// a prefetch asks for, its lanes left out.
 fn group_of(module: &Module, inst: Inst) -> Option<PerGroupAxis<usize>> {
@@ -494,9 +578,9 @@ struct RegisterOp {
     /// The registers it reads.
     operands: Vec<Operand>,
     computes: Computes,
-    /// The registers of `reg` buffers that it reads or writes: each by the buffer's number and the
-    /// position of its first lane in the buffer.
-    buffer_registers: Vec<(usize, Ranked<i64>)>,
+    /// The registers of `reg` buffers that it reads or writes: each by the buffer's number and its
+    /// place among the buffer's registers ([`reg_registers`]).
+    buffer_registers: Vec<(usize, usize)>,
     /// The mask registers it holds besides its operands and its result: those of its code, and
     /// one for each constant mask that it reads.
     scratch_masks: usize,
@@ -611,34 +695,13 @@ fn constant_lanes(module: &Module, value: Value) -> Option<&[u8]> {
     module.constant(module.operands(inst)[0])?.splat_bytes()
 }
 
-/// The registers of a `reg` buffer that `access` reaches: each by the buffer's number in `buffers`,
-/// which numbers each buffer where it first comes, and the position of its first lane. None where
-/// a base index is not fixed before the run.
-fn held_registers(
-    access: &Access,
-    forms: &mut AffineForms,
-    buffers: &mut HashMap<Value, usize>,
-) -> Option<Vec<(usize, Ranked<i64>)>> {
-    let next = buffers.len();
-    let buffer = *buffers.entry(access.buffer).or_insert(next);
-    let mut base = Vec::with_capacity(access.base.len());
-    for &index in &access.base {
-        base.push(forms.of(index).as_constant()?);
-    }
-    let mut registers = Vec::new();
-    for position in access.positions(&base) {
-        registers.push((buffer, position));
-    }
-    Some(registers)
-}
-
 impl RegisterCode {
     /// The register model of `insts`, the `isa` ops of a run of [`vector_runs`], with what `rules`
     /// say the code of each op needs: the registers it holds besides its operands and its result,
     /// and the operands it reads from memory. An op reads a constant other than zero from memory
     /// in the first operand that can read it there, and every other constant in a register; code
     /// makes a zero in a register. Fails where the rules have no code for an op, or where an op
-    /// reaches a `reg` buffer at a position fixed only during the run.
+    /// reaches a `reg` buffer other than as [`reg_registers`] says.
     pub fn of_isa(module: &Module, insts: &[Inst], rules: &dyn Rules) -> Result<RegisterCode> {
         let mut positions: HashMap<Inst, usize> = HashMap::new();
         for (position, &inst) in insts.iter().enumerate() {
@@ -686,17 +749,21 @@ impl RegisterCode {
             }
             let held =
                 Access::of(module, inst).filter(|access| in_registers(module, access.buffer));
-            let buffer_registers = match &held {
-                Some(access) => {
-                    held_registers(access, &mut forms, &mut buffers).ok_or_else(|| {
-                        anyhow!(
-                            "{} reaches a reg buffer at a position fixed only during the run",
-                            module.op(inst).name()
-                        )
-                    })?
+            let mut buffer_registers = Vec::new();
+            if let Some(access) = &held {
+                let registers = reg_registers(module, access, &mut forms).map_err(|why| {
+                    anyhow!(
+                        "{} reaches a reg buffer of {}, {why}",
+                        module.op(inst).name(),
+                        module.ty(access.buffer)
+                    )
+                })?;
+                let next = buffers.len();
+                let buffer = *buffers.entry(access.buffer).or_insert(next);
+                for register in registers {
+                    buffer_registers.push((buffer, register));
                 }
-                None => Vec::new(),
-            };
+            }
             let reads_registers = held.is_some_and(|access| access.value.is_none());
             let read_after = module.results(inst).first().is_some_and(|&produced| {
                 module
@@ -816,7 +883,7 @@ impl RegisterCode {
     pub fn pressure(&self) -> Pressure {
         let order = self.order();
         let Reads { last_read, before } = self.reads(&order);
-        let mut held: HashSet<(usize, Ranked<i64>)> = HashSet::new();
+        let mut held: HashSet<(usize, usize)> = HashSet::new();
         for op in &self.ops {
             held.extend(op.buffer_registers.iter().copied());
         }

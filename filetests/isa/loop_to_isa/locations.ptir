@@ -1,0 +1,28 @@
+// RUN: pass loop-to-isa {target = "x86-64-v4"}
+// LOCATIONS: each op keeps the location of the op it comes from, with each pass on its trail
+
+// An add recorded at mlp.rs:7:5 in model.mlp, as tile-to-loop lowers it. Each vector op keeps the
+// location of the op of the atom's body it comes from, and adds loop-to-isa and that op to the
+// trail: the vector add comes from the body's arith.add, the loads and the store from its loads
+// and its store.
+// CHECK: loop.func @add([[LHS_BUFFER:%[0-9]+]]: !loop.buf<16xf32, global>, [[RHS_BUFFER:%[0-9]+]]: !loop.buf<16xf32, global>, [[OUT:%[0-9]+]]: !loop.buf<16xf32, global>)
+// CHECK: [[LHS:%[0-9]+]] = isa.load([[LHS_BUFFER]], [[AT:%[0-9]+]]) {dims = [1, 16], steps = [[16]]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<1x16xf32> loc("model.mlp"("mlp.rs":7:5) via ["tile-to-loop"("tile.block":1), "loop-to-isa"("loop.load":{{[0-9]+}})])
+// CHECK-NEXT: [[RHS:%[0-9]+]] = isa.load([[RHS_BUFFER]], [[AT]]) {dims = [1, 16], steps = [[16]]} : (!loop.buf<16xf32, global>, index) -> !isa.vec<1x16xf32> loc("model.mlp"("mlp.rs":7:5) via ["tile-to-loop"("tile.block":1), "loop-to-isa"("loop.load":{{[0-9]+}})])
+// CHECK-NEXT: [[SUM:%[0-9]+]] = isa.add([[LHS]], [[RHS]]) : (!isa.vec<1x16xf32>, !isa.vec<1x16xf32>) -> !isa.vec<1x16xf32> loc("model.mlp"("mlp.rs":7:5) via ["tile-to-loop"("arith.add":3), "loop-to-isa"("arith.add":{{[0-9]+}})])
+// CHECK-NEXT: isa.store([[SUM]], [[OUT]], [[AT]]) {steps = [[16]]} : (!isa.vec<1x16xf32>, !loop.buf<16xf32, global>, index) -> () loc("model.mlp"("mlp.rs":7:5) via ["tile-to-loop"("tile.block":1), "loop-to-isa"("loop.store":{{[0-9]+}})])
+loop.func @add(%lhs: !loop.buf<16xf32, global>, %rhs: !loop.buf<16xf32, global>, %out: !loop.buf<16xf32, global>) attributes {access = [in, in, out], target = "x86-64-v4@3928f7d3"} {
+  %columns = loop.index() {expr = 16} : () -> index loc("model.mlp"("mlp.rs":7:5) via ["tile-to-loop"("tile.block":1)])
+  loop.atom(%columns) {tile = [16], lanes = 16} ({
+  ^body(%column: index):
+    %left = loop.load(%lhs, %column) : (!loop.buf<16xf32, global>, index) -> f32 loc("model.mlp"("mlp.rs":7:5) via ["tile-to-loop"("tile.block":1)])
+    %right = loop.load(%rhs, %column) : (!loop.buf<16xf32, global>, index) -> f32 loc("model.mlp"("mlp.rs":7:5) via ["tile-to-loop"("tile.block":1)])
+    %total = arith.add(%left, %right) : (f32, f32) -> f32 loc("model.mlp"("mlp.rs":7:5) via ["tile-to-loop"("arith.add":3)])
+    loop.store(%total, %out, %column) : (f32, !loop.buf<16xf32, global>, index) -> () loc("model.mlp"("mlp.rs":7:5) via ["tile-to-loop"("tile.block":1)])
+    loop.yield() : () -> ()
+  }) : (index) -> () loc("model.mlp"("mlp.rs":7:5) via ["tile-to-loop"("tile.block":1)])
+  loop.return() : () -> ()
+}
+func.func @main(%lhs: tensor<16xf32>, %rhs: tensor<16xf32>) -> tensor<16xf32> {
+  %sum = host.dispatch(%lhs, %rhs) {callee = @add} : (tensor<16xf32>, tensor<16xf32>) -> tensor<16xf32>
+  func.return(%sum) : (tensor<16xf32>) -> ()
+}

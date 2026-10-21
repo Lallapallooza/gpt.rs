@@ -1,0 +1,15 @@
+// RUN: pass loop-to-isa
+
+// A `loop.func` decided for x86-64-v4, which a pass without a target cannot check its vectors
+// against.
+// ERROR: loop-to-isa: loop.func @copy was decided for x86-64-v4@3928f7d3, and the pass has no target
+loop.func @copy(%input: !loop.buf<16xf32, global>, %output: !loop.buf<16xf32, global>) attributes {access = [in, out], target = "x86-64-v4@3928f7d3"} {
+  %columns = loop.index() {expr = 16} : () -> index
+  loop.atom(%columns) {tile = [16], lanes = 16} ({
+  ^body(%column: index):
+    %element = loop.load(%input, %column) : (!loop.buf<16xf32, global>, index) -> f32
+    loop.store(%element, %output, %column) : (f32, !loop.buf<16xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index) -> ()
+  loop.return() : () -> ()
+}

@@ -113,8 +113,8 @@ func.func @main(%input: tensor<6x4xf32>, %weight: tensor<12x16xf32>) -> tensor<6
 // private scratch: started at 0 before the taps, copied into registers before the points of each
 // register tile and back after them, and written out after the taps. The tile of columns that a
 // cut keeps is built once for each count of columns it can keep. The whole tile keeps 2 to 4,
-// since the taps leave at most a column out at each end of the 6, and the last keeps 1 to 2. So
-// the register tile's shape stays known. Inside, the rows and the columns stay in range, and the
+// since the taps leave at most a column out at each end of the 6. The last keeps 1 to 2. So the
+// register tile's shape stays known. Inside, the rows and the columns stay in range, and the
 // input reads without its pad.
 // ROUNDING: skip_pad: a skipped product of the pad is 0 only where the weight is finite.
 // CHECK: loop.func @conv([[INPUT:%[0-9]+]]: !loop.buf<1x6x6x8xf32, global>, {{%[0-9]+}}: !loop.buf<3x3x8x16xf32, global>, [[OUTPUT:%[0-9]+]]: !loop.buf<1x6x6x16xf32, global>) attributes {access = [in, in, out], target = "x86-64-v4@3928f7d3"} {

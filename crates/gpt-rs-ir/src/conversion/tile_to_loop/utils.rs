@@ -123,7 +123,7 @@ pub(super) fn for_range(
 }
 
 /// A `loop.forall` at `level` from `start` up to `end`, whose body `body` builds from the index of
-/// the unit.
+/// the worker.
 pub(super) fn forall_range(
     builder: &mut Builder,
     level: Level,

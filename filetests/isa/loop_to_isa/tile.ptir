@@ -1,0 +1,80 @@
+// RUN: pass tile-to-loop, loop-to-isa {target = "x86-64-v4"}
+
+// A projection with a register tile of 3 rows by 32 columns, in vectors of 16 lanes, down to vector
+// code: per contracted point, a broadcast of each row's input and two vectors of weights, which
+// expand to the 3x2 registers of the tile, multiply, and add into the sums held in a `reg`
+// buffer. The 5 rows and 40 columns make full tiles, which take no mask, and last tiles of 2 rows
+// and of 8 columns. A last tile of rows is a register tile of 2 rows, with no mask. A last tile of
+// columns is one vector, whose reads of the weight and writes of the product take a mask along the
+// lanes. The sums, a `reg` buffer, take none.
+// CHECK: loop.func @project([[INPUT:%[0-9]+]]: !loop.buf<5x7xf32, global>, [[WEIGHT:%[0-9]+]]: !loop.buf<7x40xf32, global>, [[PRODUCT:%[0-9]+]]: !loop.buf<5x40xf32, global>) attributes {access = [in, in, out], target = "x86-64-v4@{{[0-9a-f]+}}"} {
+// CHECK: [[SUMS:%[0-9]+]] = loop.alloc() {shape = [3, 32], dtype = f32, space = reg} : () -> !loop.buf<3x32xf32, reg>
+// CHECK: [[ZERO_TILE:%[0-9]+]] = isa.expand({{%[0-9]+}}) {dims = [3, 2, 16]} : (!isa.vec<1x1x16xf32>) -> !isa.vec<3x2x16xf32>
+// CHECK-NEXT: isa.store([[ZERO_TILE]], [[SUMS]], {{%[0-9]+}}, {{%[0-9]+}}) {steps = [[1, 0], [0, 16]]}
+// CHECK: loop.for({{%[0-9]+}}, {{%[0-9]+}}) ({
+// CHECK-NEXT: ^body([[DEPTH:%[0-9]+]]: index):
+// CHECK: [[ELEMENTS:%[0-9]+]] = isa.broadcast([[INPUT]], {{%[0-9]+}}, [[DEPTH]]) {dims = [3, 1, 16], steps = [[1, 0], [0, 0]]}
+// CHECK-NEXT: [[SCALES:%[0-9]+]] = isa.load([[WEIGHT]], [[DEPTH]], {{%[0-9]+}}) {dims = [1, 2, 16], steps = [[0, 0], [0, 16]]}
+// CHECK-NEXT: [[ELEMENT_TILE:%[0-9]+]] = isa.expand([[ELEMENTS]]) {dims = [3, 2, 16]}
+// CHECK-NEXT: [[SCALE_TILE:%[0-9]+]] = isa.expand([[SCALES]]) {dims = [3, 2, 16]}
+// CHECK-NEXT: [[TERMS:%[0-9]+]] = isa.mul([[ELEMENT_TILE]], [[SCALE_TILE]]) : (!isa.vec<3x2x16xf32>, !isa.vec<3x2x16xf32>) -> !isa.vec<3x2x16xf32>
+// CHECK: [[SO_FAR:%[0-9]+]] = isa.load([[SUMS]], {{%[0-9]+}}, {{%[0-9]+}}) {dims = [3, 2, 16], steps = [[1, 0], [0, 16]]}
+// CHECK-NEXT: [[SUM:%[0-9]+]] = isa.add([[SO_FAR]], [[TERMS]]) : (!isa.vec<3x2x16xf32>, !isa.vec<3x2x16xf32>) -> !isa.vec<3x2x16xf32>
+// CHECK-NEXT: isa.store([[SUM]], [[SUMS]], {{%[0-9]+}}, {{%[0-9]+}}) {steps = [[1, 0], [0, 16]]}
+// CHECK: [[FINAL:%[0-9]+]] = isa.load([[SUMS]], {{%[0-9]+}}, {{%[0-9]+}}) {dims = [3, 2, 16], steps = [[1, 0], [0, 16]]}
+// CHECK-NEXT: isa.store([[FINAL]], [[PRODUCT]], {{%[0-9]+}}, {{%[0-9]+}}) {steps = [[1, 0], [0, 16]]}
+// CHECK-NOT: isa.tile_mask
+// CHECK: [[COLUMN_SUMS:%[0-9]+]] = loop.alloc() {shape = [3, 32], dtype = f32, space = reg}
+// CHECK: [[LANES:%[0-9]+]] = isa.tile_mask({{%[0-9]+}}, {{%[0-9]+}}) {dims = [1, 1, 16]} : (index, index) -> !isa.vec<1x1x16xi1>
+// CHECK-NEXT: [[COLUMN_SCALES:%[0-9]+]] = isa.masked_load([[LANES]], [[WEIGHT]], {{%[0-9]+}}, {{%[0-9]+}}) {dims = [1, 1, 16], steps = [[0, 0], [0, 16]]}
+// CHECK: isa.load([[COLUMN_SUMS]], {{%[0-9]+}}, {{%[0-9]+}}) {dims = [3, 1, 16], steps = [[1, 0], [0, 16]]}
+// CHECK: [[ROW_SUMS:%[0-9]+]] = loop.alloc() {shape = [3, 32], dtype = f32, space = reg}
+// CHECK-NOT: isa.tile_mask
+// CHECK: isa.broadcast([[INPUT]], {{%[0-9]+}}, {{%[0-9]+}}) {dims = [2, 1, 16], steps = [[1, 0], [0, 0]]}
+// CHECK-NOT: loop.atom
+tile.dispatch @project(%input: tensor<5x7xf32>, %weight: tensor<7x40xf32>) -> tensor<5x40xf32> attributes {target = "x86-64-v4@3928f7d3"} {
+  %product = tile.block(%input, %weight) {iters = [par 5, par 40, red 7], reads = [$0[d0, d2], $1[d2, d1]], folds = [sum -> [d0, d1]], loops = [d0 by 3, d1 by 32, d2 by 1, d0 by 3 : reg, d1 by 32 : reg, d1 by 16 : lanes]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<5x7xf32>, tensor<7x40xf32>) -> tensor<5x40xf32>
+  func.return(%product) : (tensor<5x40xf32>) -> ()
+}
+func.func @main(%input: tensor<5x7xf32>, %weight: tensor<7x40xf32>) -> tensor<5x40xf32> {
+  %product = host.dispatch(%input, %weight) {callee = @project} : (tensor<5x7xf32>, tensor<7x40xf32>) -> tensor<5x40xf32>
+  func.return(%product) : (tensor<5x40xf32>) -> ()
+}
+
+// -----
+
+// A projection whose weight is laid out in blocks of 16 columns, `[column block, depth, column in
+// block]`, which it reads as `$1[d1 floordiv 16, d2, d1 mod 16]`. Each tile of 32 columns starts
+// at a multiple of 16, so a row of its weights is one vector load from the block and the column
+// in block of the tile's first column, its `floordiv 16` and `mod 16`: the second vector is one
+// block further along the first index, `steps = [[0, 0, 0], [1, 0, 0]]`, and the lanes run along
+// the last. The last tile, of 16 columns, starts at 32 and loads one vector.
+// CHECK: loop.func @project_blocked([[INPUT:%[0-9]+]]: !loop.buf<5x7xf32, global>, [[WEIGHT:%[0-9]+]]: !loop.buf<3x7x16xf32, global>, [[PRODUCT:%[0-9]+]]: !loop.buf<5x48xf32, global>)
+// CHECK: loop.alloc() {shape = [3, 32], dtype = f32, space = reg}
+// CHECK: loop.for({{%[0-9]+}}, {{%[0-9]+}}) ({
+// CHECK-NEXT: ^body([[DEPTH:%[0-9]+]]: index):
+// CHECK: loop.index({{%[0-9]+}}, {{%[0-9]+}}) {expr = d0 + d1} : (index, index) -> index
+// CHECK-NEXT: [[COLUMN:%[0-9]+]] = loop.index({{%[0-9]+}}, {{%[0-9]+}}) {expr = d0 + d1} : (index, index) -> index
+// CHECK-NEXT: isa.broadcast([[INPUT]], {{%[0-9]+}}, [[DEPTH]]) {dims = [3, 1, 16], steps = [[1, 0], [0, 0]]}
+// CHECK-NEXT: [[BLOCK:%[0-9]+]] = loop.index([[COLUMN]]) {expr = d0 floordiv 16} : (index) -> index
+// CHECK-NEXT: [[IN_BLOCK:%[0-9]+]] = loop.index([[COLUMN]]) {expr = d0 mod 16} : (index) -> index
+// CHECK-NEXT: isa.load([[WEIGHT]], [[BLOCK]], [[DEPTH]], [[IN_BLOCK]]) {dims = [1, 2, 16], steps = [[0, 0, 0], [1, 0, 0]]}
+// CHECK: [[LAST_BLOCK:%[0-9]+]] = loop.index([[LAST_COLUMN:%[0-9]+]]) {expr = d0 floordiv 16} : (index) -> index
+// CHECK-NEXT: [[LAST_IN_BLOCK:%[0-9]+]] = loop.index([[LAST_COLUMN]]) {expr = d0 mod 16} : (index) -> index
+// CHECK-NEXT: isa.load([[WEIGHT]], [[LAST_BLOCK]], {{%[0-9]+}}, [[LAST_IN_BLOCK]]) {dims = [1, 1, 16], steps = [[0, 0, 0], [1, 0, 0]]}
+tile.dispatch @project_blocked(%input: tensor<5x7xf32>, %weight: tensor<3x7x16xf32>) -> tensor<5x48xf32> attributes {target = "x86-64-v4@3928f7d3"} {
+  %product = tile.block(%input, %weight) {iters = [par 5, par 48, red 7], reads = [$0[d0, d2], $1[d1 floordiv 16, d2, d1 mod 16]], folds = [sum -> [d0, d1]], loops = [d0 by 3, d1 by 32, d2 by 1, d0 by 3 : reg, d1 by 32 : reg, d1 by 16 : lanes]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<5x7xf32>, tensor<3x7x16xf32>) -> tensor<5x48xf32>
+  func.return(%product) : (tensor<5x48xf32>) -> ()
+}
+func.func @main(%input: tensor<5x7xf32>, %weight: tensor<3x7x16xf32>) -> tensor<5x48xf32> {
+  %product = host.dispatch(%input, %weight) {callee = @project_blocked} : (tensor<5x7xf32>, tensor<3x7x16xf32>) -> tensor<5x48xf32>
+  func.return(%product) : (tensor<5x48xf32>) -> ()
+}

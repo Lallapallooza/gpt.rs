@@ -161,8 +161,8 @@ fn check_copies_named(module: &Module, body: Region) -> Result<()> {
                 continue;
             };
             bail!(
-                "block {position}: the read of ${} is held in a copy for {}, which needs a memory \
-                 of the target, and the dispatch names no target",
+                "block {position}: the read of ${} is held in a copy for {}, and the dispatch \
+                 names no target, which a copy needs",
                 read.source.first(),
                 held.level
             );

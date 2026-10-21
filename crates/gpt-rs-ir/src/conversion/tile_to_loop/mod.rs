@@ -41,7 +41,7 @@ use crate::rewrite::{PatternSet, Rewrites, Rewriting};
 ///   ([`Block::fold_walks`](crate::dialects::tile::Block::fold_walks)), and every other fold walks
 ///   alone. Each of the block's modes but those of its register tile is a loop over the tiles of
 ///   its iterator, of the mode's size, outermost first: one after another, or one tile per worker
-///   of its level (`workers`). Workers' modes of one level, each right inside the one before it,
+///   of its level (`workers`). Worker modes of one level, each right inside the one before it,
 ///   over another iterator and not clipped, are one `loop.forall`. It walks the tuples of their
 ///   tiles, which a worker takes in turn. A mode of one point walks the points of its iterator's
 ///   innermost tile, so every iterator that the register tile leaves out ends in such a loop, in
@@ -80,12 +80,11 @@ use crate::rewrite::{PatternSet, Rewrites, Rewriting};
 /// - A loop over an iterator the block clips, around which the other iterators of a padded read's
 ///   coordinate stand fixed, narrows to the points where the coordinate stays in range, when a
 ///   point outside contributes nothing the fold keeps: the body yields the fold's identity at the
-///   pad, or products of a zero pad into a sum under `skip_pad`. A loop over tiles of an iterator of
-///   the register tile keeps its tiles and cuts each to its points in range instead, building the
-///   tile once for each count of points a cut tile can hold, under a check of the count, so that
-///   the register tile's shape stays known before the run. When the loops narrow every
-///   coordinate of a read this way, the read reads without its pad. The other reads keep their
-///   pad.
+///   pad, or products of a zero pad into a sum under `skip_pad`. A loop over tiles of an iterator
+///   of the register tile keeps its tiles and cuts each to its points in range instead, building
+///   the tile once for each count of points a cut tile can hold, under a check of the count, so
+///   that the register tile's shape stays known before the run. When the loops narrow every
+///   coordinate of a read this way, the read reads without its pad. The other reads keep their pad.
 /// - The `loop.func` names the dispatch's target, and says whether the dispatch contracts, which
 ///   `contract` then realizes.
 /// - `tile.block` and `tile.group` outside a dispatch are errors: `seal-dispatches` outlines them.

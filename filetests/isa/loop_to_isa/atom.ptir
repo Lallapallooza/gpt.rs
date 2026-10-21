@@ -1,0 +1,286 @@
+// RUN: pass loop-to-isa {target = "x86-64-v4"}
+
+// An atom whose extents are its tile: no mask. Each row of the input, the same scale for every
+// point, and a ReLU against a constant: the scale's load and the zero stay scalars, each where the
+// body computes it, and a splat puts each into lanes for the lane-wise op that takes it.
+// CHECK: loop.func @scale_relu([[INPUT:%[0-9]+]]: !loop.buf<2x16xf32, global>, [[SCALE:%[0-9]+]]: !loop.buf<f32, global>, [[OUTPUT:%[0-9]+]]: !loop.buf<2x16xf32, global>) attributes {access = [in, in, out], target = "x86-64-v4@{{[0-9a-f]+}}"} {
+// CHECK: [[FIRST:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[ROWS:%[0-9]+]] = isa.load([[INPUT]], [[FIRST]], [[FIRST]]) {dims = [2, 1, 16], steps = [[1, 0], [0, 16]]} : (!loop.buf<2x16xf32, global>, index, index) -> !isa.vec<2x1x16xf32>
+// CHECK-NEXT: [[FACTOR:%[0-9]+]] = loop.load([[SCALE]]) : (!loop.buf<f32, global>) -> f32
+// CHECK-NEXT: [[FACTORS:%[0-9]+]] = isa.splat([[FACTOR]]) {dims = [1, 1, 16]} : (f32) -> !isa.vec<1x1x16xf32>
+// CHECK-NEXT: [[FACTOR_ROWS:%[0-9]+]] = isa.expand([[FACTORS]]) {dims = [2, 1, 16]}
+// CHECK-NEXT: [[SCALED:%[0-9]+]] = isa.mul([[ROWS]], [[FACTOR_ROWS]])
+// CHECK-NEXT: [[ZERO:%[0-9]+]] = arith.constant() {value = 0.0 : f32} : () -> f32
+// CHECK-NEXT: [[ZEROS:%[0-9]+]] = isa.splat([[ZERO]]) {dims = [1, 1, 16]}
+// CHECK-NEXT: [[ZERO_ROWS:%[0-9]+]] = isa.expand([[ZEROS]]) {dims = [2, 1, 16]}
+// CHECK-NEXT: [[RECTIFIED:%[0-9]+]] = isa.maximum([[SCALED]], [[ZERO_ROWS]])
+// CHECK-NEXT: isa.store([[RECTIFIED]], [[OUTPUT]], [[FIRST]], [[FIRST]]) {steps = [[1, 0], [0, 16]]}
+// CHECK-NEXT: loop.return() : () -> ()
+loop.func @scale_relu(%input: !loop.buf<2x16xf32, global>, %scale: !loop.buf<f32, global>, %output: !loop.buf<2x16xf32, global>) attributes {access = [in, in, out], target = "x86-64-v4@3928f7d3"} {
+  %rows = loop.index() {expr = 2} : () -> index
+  %columns = loop.index() {expr = 16} : () -> index
+  loop.atom(%rows, %columns) {tile = [2, 16], lanes = 16} ({
+  ^body(%row: index, %column: index):
+    %element = loop.load(%input, %row, %column) : (!loop.buf<2x16xf32, global>, index, index) -> f32
+    %factor = loop.load(%scale) : (!loop.buf<f32, global>) -> f32
+    %scaled = arith.mul(%element, %factor) : (f32, f32) -> f32
+    %zero = arith.constant() {value = 0.0 : f32} : () -> f32
+    %rectified = arith.maximum(%scaled, %zero) : (f32, f32) -> f32
+    loop.store(%rectified, %output, %row, %column) : (f32, !loop.buf<2x16xf32, global>, index, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<2x16xf32>, %scale: tensor<f32>) -> tensor<2x16xf32> {
+  %output = host.dispatch(%input, %scale) {callee = @scale_relu} : (tensor<2x16xf32>, tensor<f32>) -> tensor<2x16xf32>
+  func.return(%output) : (tensor<2x16xf32>) -> ()
+}
+
+// -----
+
+// An `arith.fma` is one lane-wise `isa.fma`, whose scale stays a scalar, splatted into lanes.
+// CHECK: loop.func @scale_plus([[INPUT:%[0-9]+]]: !loop.buf<2x16xf32, global>, [[SCALE:%[0-9]+]]: !loop.buf<f32, global>, [[OUTPUT:%[0-9]+]]: !loop.buf<2x16xf32, global>)
+// CHECK: [[FIRST:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[ROWS:%[0-9]+]] = isa.load([[INPUT]], [[FIRST]], [[FIRST]]) {dims = [2, 1, 16], steps = [[1, 0], [0, 16]]}
+// CHECK: [[FACTOR_ROWS:%[0-9]+]] = isa.expand({{%[0-9]+}}) {dims = [2, 1, 16]}
+// CHECK-NEXT: [[SCALED_PLUS:%[0-9]+]] = isa.fma([[ROWS]], [[FACTOR_ROWS]], [[ROWS]]) : (!isa.vec<2x1x16xf32>, !isa.vec<2x1x16xf32>, !isa.vec<2x1x16xf32>) -> !isa.vec<2x1x16xf32>
+// CHECK-NEXT: isa.store([[SCALED_PLUS]], [[OUTPUT]], [[FIRST]], [[FIRST]]) {steps = [[1, 0], [0, 16]]}
+loop.func @scale_plus(%input: !loop.buf<2x16xf32, global>, %scale: !loop.buf<f32, global>, %output: !loop.buf<2x16xf32, global>) attributes {access = [in, in, out], target = "x86-64-v4@3928f7d3"} {
+  %rows = loop.index() {expr = 2} : () -> index
+  %columns = loop.index() {expr = 16} : () -> index
+  loop.atom(%rows, %columns) {tile = [2, 16], lanes = 16} ({
+  ^body(%row: index, %column: index):
+    %element = loop.load(%input, %row, %column) : (!loop.buf<2x16xf32, global>, index, index) -> f32
+    %factor = loop.load(%scale) : (!loop.buf<f32, global>) -> f32
+    %scaled_plus = arith.fma(%element, %factor, %element) : (f32, f32, f32) -> f32
+    loop.store(%scaled_plus, %output, %row, %column) : (f32, !loop.buf<2x16xf32, global>, index, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<2x16xf32>, %scale: tensor<f32>) -> tensor<2x16xf32> {
+  %output = host.dispatch(%input, %scale) {callee = @scale_plus} : (tensor<2x16xf32>, tensor<f32>) -> tensor<2x16xf32>
+  func.return(%output) : (tensor<2x16xf32>) -> ()
+}
+
+// -----
+
+// An embedding lookup: the row is the token id, the same for every point, so the id's load and
+// its conversion to an index are scalars before the vector code, and the row is one vector load.
+// CHECK: loop.func @lookup([[TABLE:%[0-9]+]]: !loop.buf<4x16xf32, global>, [[IDS:%[0-9]+]]: !loop.buf<2xsi32, global>, [[OUTPUT:%[0-9]+]]: !loop.buf<2x16xf32, global>)
+// CHECK: ^body([[ROW:%[0-9]+]]: index):
+// CHECK-NEXT: [[FIRST:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[ID:%[0-9]+]] = loop.load([[IDS]], [[ROW]]) : (!loop.buf<2xsi32, global>, index) -> si32
+// CHECK-NEXT: [[TABLE_ROW:%[0-9]+]] = arith.to_index([[ID]]) : (si32) -> index
+// CHECK-NEXT: [[ELEMENTS:%[0-9]+]] = isa.load([[TABLE]], [[TABLE_ROW]], [[FIRST]]) {dims = [1, 16], steps = [[0, 16]]} : (!loop.buf<4x16xf32, global>, index, index) -> !isa.vec<1x16xf32>
+// CHECK-NEXT: isa.store([[ELEMENTS]], [[OUTPUT]], [[ROW]], [[FIRST]]) {steps = [[0, 16]]}
+// CHECK-NEXT: loop.yield() : () -> ()
+loop.func @lookup(%table: !loop.buf<4x16xf32, global>, %ids: !loop.buf<2xsi32, global>, %output: !loop.buf<2x16xf32, global>) attributes {access = [in, in, out], target = "x86-64-v4@3928f7d3"} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %rows = loop.index() {expr = 2} : () -> index
+  %columns = loop.index() {expr = 16} : () -> index
+  loop.for(%zero, %rows) ({
+  ^body(%row: index):
+    loop.atom(%columns) {tile = [16], lanes = 16} ({
+    ^body(%column: index):
+      %id = loop.load(%ids, %row) : (!loop.buf<2xsi32, global>, index) -> si32
+      %table_row = arith.to_index(%id) : (si32) -> index
+      %element = loop.load(%table, %table_row, %column) : (!loop.buf<4x16xf32, global>, index, index) -> f32
+      loop.store(%element, %output, %row, %column) : (f32, !loop.buf<2x16xf32, global>, index, index) -> ()
+      loop.yield() : () -> ()
+    }) : (index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%table: tensor<4x16xf32>, %ids: tensor<2xsi32>) -> tensor<2x16xf32> {
+  %output = host.dispatch(%table, %ids) {callee = @lookup} : (tensor<4x16xf32>, tensor<2xsi32>) -> tensor<2x16xf32>
+  func.return(%output) : (tensor<2x16xf32>) -> ()
+}
+
+// -----
+
+// A transposing copy reads its input along the lanes with a stride: no vector load reads it.
+// ERROR: loop-to-isa {target = "x86-64-v4"}: loop.atom: failed to legalize: AtomToIsa: an atom loads from !loop.buf<16x16xf32, global> along its lanes with a stride: neither a vector load nor a broadcast
+loop.func @transpose(%input: !loop.buf<16x16xf32, global>, %output: !loop.buf<16x16xf32, global>) attributes {access = [in, out], target = "x86-64-v4@3928f7d3"} {
+  %one = loop.index() {expr = 1} : () -> index
+  %columns = loop.index() {expr = 16} : () -> index
+  %zero = loop.index() {expr = 0} : () -> index
+  loop.atom(%one, %columns) {tile = [1, 16], lanes = 16} ({
+  ^body(%row: index, %column: index):
+    %element = loop.load(%input, %column, %row) : (!loop.buf<16x16xf32, global>, index, index) -> f32
+    loop.store(%element, %output, %row, %column) : (f32, !loop.buf<16x16xf32, global>, index, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// An atom that picks one of two buffers by the row of an outer loop: the pick and its index are
+// the same at every point, so they come before the vector code, which loads from the picked
+// buffer.
+// CHECK: loop.func @pick_rows([[FIRST:%[0-9]+]]: !loop.buf<16xf32, global>, [[SECOND:%[0-9]+]]: !loop.buf<16xf32, global>, [[OUTPUT:%[0-9]+]]: !loop.buf<2x16xf32, global>)
+// CHECK: ^body([[ROW:%[0-9]+]]: index):
+// CHECK: [[ORIGIN:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[WHICH:%[0-9]+]] = loop.index([[ROW]]) {expr = d0} : (index) -> index
+// CHECK-NEXT: [[PICKED:%[0-9]+]] = loop.pick([[WHICH]], [[FIRST]], [[SECOND]])
+// CHECK-NEXT: [[ELEMENTS:%[0-9]+]] = isa.load([[PICKED]], [[ORIGIN]]) {dims = [1, 1, 16], steps = [[0], [16]]}
+// CHECK-NEXT: isa.store([[ELEMENTS]], [[OUTPUT]], [[ROW]], [[ORIGIN]])
+loop.func @pick_rows(%first: !loop.buf<16xf32, global>, %second: !loop.buf<16xf32, global>, %output: !loop.buf<2x16xf32, global>) attributes {access = [in, in, out], target = "x86-64-v4@3928f7d3"} {
+  %start = loop.index() {expr = 0} : () -> index
+  %rows = loop.index() {expr = 2} : () -> index
+  loop.for(%start, %rows) ({
+  ^body(%row: index):
+    %one = loop.index() {expr = 1} : () -> index
+    %columns = loop.index() {expr = 16} : () -> index
+    loop.atom(%one, %columns) {tile = [1, 16], lanes = 16} ({
+    ^body(%point: index, %column: index):
+      %which = loop.index(%row) {expr = d0} : (index) -> index
+      %picked = loop.pick(%which, %first, %second) : (index, !loop.buf<16xf32, global>, !loop.buf<16xf32, global>) -> !loop.buf<16xf32, global>
+      %element = loop.load(%picked, %column) : (!loop.buf<16xf32, global>, index) -> f32
+      loop.store(%element, %output, %row, %column) : (f32, !loop.buf<2x16xf32, global>, index, index) -> ()
+      loop.yield() : () -> ()
+    }) : (index, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%first: tensor<16xf32>, %second: tensor<16xf32>) -> tensor<2x16xf32> {
+  %output = host.dispatch(%first, %second) {callee = @pick_rows} : (tensor<16xf32>, tensor<16xf32>) -> tensor<2x16xf32>
+  func.return(%output) : (tensor<2x16xf32>) -> ()
+}
+
+// -----
+
+// An atom that asks L2 for the rows after its own, and L1 for an element that no coordinate
+// moves: an `isa.prefetch` of the first lane of each register that a load of those rows reads,
+// and one `loop.prefetch` before the vector code.
+// CHECK: [[FIRST:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[NEXT_ROW:%[0-9]+]] = loop.index([[FIRST]]) {expr = d0 + 2} : (index) -> index
+// CHECK-NEXT: isa.prefetch([[INPUT:%[0-9]+]], [[NEXT_ROW]], [[FIRST]]) {dims = [2, 1, 16], steps = [[1, 0], [0, 16]], level = l2} : (!loop.buf<4x16xf32, global>, index, index) -> ()
+// CHECK-NEXT: loop.prefetch({{%[0-9]+}}) {level = l1} : (!loop.buf<f32, global>) -> ()
+// CHECK-NEXT: {{%[0-9]+}} = isa.load([[INPUT]], [[FIRST]], [[FIRST]]) {dims = [2, 1, 16], steps = [[1, 0], [0, 16]]}
+loop.func @ahead(%input: !loop.buf<4x16xf32, global>, %scale: !loop.buf<f32, global>, %output: !loop.buf<2x16xf32, global>) attributes {access = [in, in, out], target = "x86-64-v4@3928f7d3"} {
+  %rows = loop.index() {expr = 2} : () -> index
+  %columns = loop.index() {expr = 16} : () -> index
+  loop.atom(%rows, %columns) {tile = [2, 16], lanes = 16} ({
+  ^body(%row: index, %column: index):
+    %next_row = loop.index(%row) {expr = d0 + 2} : (index) -> index
+    loop.prefetch(%input, %next_row, %column) {level = l2} : (!loop.buf<4x16xf32, global>, index, index) -> ()
+    loop.prefetch(%scale) {level = l1} : (!loop.buf<f32, global>) -> ()
+    %element = loop.load(%input, %row, %column) : (!loop.buf<4x16xf32, global>, index, index) -> f32
+    loop.store(%element, %output, %row, %column) : (f32, !loop.buf<2x16xf32, global>, index, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<4x16xf32>, %scale: tensor<f32>) -> tensor<2x16xf32> {
+  %output = host.dispatch(%input, %scale) {callee = @ahead} : (tensor<4x16xf32>, tensor<f32>) -> tensor<2x16xf32>
+  func.return(%output) : (tensor<2x16xf32>) -> ()
+}
+
+// -----
+
+// An atom of two lanes that picks one of two buffers by its lane: a buffer that differs from lane
+// to lane, which no vector op reads.
+// ERROR: loop-to-isa {target = "x86-64-v4"}: loop.atom: failed to legalize: AtomToIsa: loop.pick in an atom has no vector form
+loop.func @pick_by_lane(%first: !loop.buf<2xf32, global>, %second: !loop.buf<2xf32, global>, %output: !loop.buf<2xf32, global>) attributes {access = [in, in, out], target = "x86-64-v4@3928f7d3"} {
+  %columns = loop.index() {expr = 2} : () -> index
+  loop.atom(%columns) {tile = [2], lanes = 2} ({
+  ^body(%column: index):
+    %picked = loop.pick(%column, %first, %second) : (index, !loop.buf<2xf32, global>, !loop.buf<2xf32, global>) -> !loop.buf<2xf32, global>
+    %element = loop.load(%picked, %column) : (!loop.buf<2xf32, global>, index) -> f32
+    loop.store(%element, %output, %column) : (f32, !loop.buf<2xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// A transposing copy that loads along the lanes and stores across them: each lane would write
+// another row.
+// ERROR: loop-to-isa {target = "x86-64-v4"}: loop.atom: failed to legalize: AtomToIsa: an atom stores into !loop.buf<16x16xf32, global> other than along its lanes: its points would collide or scatter
+loop.func @scatter(%input: !loop.buf<16x16xf32, global>, %output: !loop.buf<16x16xf32, global>) attributes {access = [in, out], target = "x86-64-v4@3928f7d3"} {
+  %one = loop.index() {expr = 1} : () -> index
+  %columns = loop.index() {expr = 16} : () -> index
+  loop.atom(%one, %columns) {tile = [1, 16], lanes = 16} ({
+  ^body(%row: index, %column: index):
+    %element = loop.load(%input, %row, %column) : (!loop.buf<16x16xf32, global>, index, index) -> f32
+    loop.store(%element, %output, %column, %row) : (f32, !loop.buf<16x16xf32, global>, index, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// An atom of 2 rows that runs only the first, and stores the row it loads into the first row of
+// the output. The value varies with the row and the store's position does not, so the vector
+// store would write both rows of registers into one row.
+// ERROR: loop-to-isa {target = "x86-64-v4"}: loop.atom: failed to legalize: AtomToIsa: an atom stores a value that varies over points whose position does not
+loop.func @first_row(%input: !loop.buf<2x16xf32, global>, %output: !loop.buf<2x16xf32, global>) attributes {access = [in, out], target = "x86-64-v4@3928f7d3"} {
+  %one = loop.index() {expr = 1} : () -> index
+  %columns = loop.index() {expr = 16} : () -> index
+  %zero = loop.index() {expr = 0} : () -> index
+  loop.atom(%one, %columns) {tile = [2, 16], lanes = 16} ({
+  ^body(%row: index, %column: index):
+    %element = loop.load(%input, %row, %column) : (!loop.buf<2x16xf32, global>, index, index) -> f32
+    loop.store(%element, %output, %zero, %column) : (f32, !loop.buf<2x16xf32, global>, index, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// A nearest-neighbour upsampling, in which each pair of lanes reads one element of the input. Its
+// index, `column floordiv 2`, is not a base plus a multiple of the lane, so no vector load reads
+// it.
+// ERROR: loop-to-isa {target = "x86-64-v4"}: loop.atom: failed to legalize: AtomToIsa: the index d0 floordiv 2 is not a multiple of the point's coordinates plus a base
+loop.func @upsample(%input: !loop.buf<8xf32, global>, %output: !loop.buf<16xf32, global>) attributes {access = [in, out], target = "x86-64-v4@3928f7d3"} {
+  %columns = loop.index() {expr = 16} : () -> index
+  loop.atom(%columns) {tile = [16], lanes = 16} ({
+  ^body(%column: index):
+    %source = loop.index(%column) {expr = d0 floordiv 2} : (index) -> index
+    %element = loop.load(%input, %source) : (!loop.buf<8xf32, global>, index) -> f32
+    loop.store(%element, %output, %column) : (f32, !loop.buf<16xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// An index of the atom over 15 values from outside it, each a scalar converted to an index: with
+// the 2 entries of the point, its form would name 17 iterators, past the 16 that an expression
+// names.
+// ERROR: loop-to-isa {target = "x86-64-v4"}: loop.atom: failed to legalize: AtomToIsa: the indices of the atom name more than 14 values from outside it: an index expression names at most 16 iterators, 2 of them the entries of the point
+loop.func @far_offsets(%input: !loop.buf<256xf32, global>, %output: !loop.buf<16xf32, global>) attributes {access = [in, out], target = "x86-64-v4@3928f7d3"} {
+  %seven = arith.constant() {value = 7 : si32} : () -> si32
+  %offset_0 = arith.to_index(%seven) : (si32) -> index
+  %offset_1 = arith.to_index(%seven) : (si32) -> index
+  %offset_2 = arith.to_index(%seven) : (si32) -> index
+  %offset_3 = arith.to_index(%seven) : (si32) -> index
+  %offset_4 = arith.to_index(%seven) : (si32) -> index
+  %offset_5 = arith.to_index(%seven) : (si32) -> index
+  %offset_6 = arith.to_index(%seven) : (si32) -> index
+  %offset_7 = arith.to_index(%seven) : (si32) -> index
+  %offset_8 = arith.to_index(%seven) : (si32) -> index
+  %offset_9 = arith.to_index(%seven) : (si32) -> index
+  %offset_10 = arith.to_index(%seven) : (si32) -> index
+  %offset_11 = arith.to_index(%seven) : (si32) -> index
+  %offset_12 = arith.to_index(%seven) : (si32) -> index
+  %offset_13 = arith.to_index(%seven) : (si32) -> index
+  %offset_14 = arith.to_index(%seven) : (si32) -> index
+  %columns = loop.index() {expr = 16} : () -> index
+  loop.atom(%columns) {tile = [16], lanes = 16} ({
+  ^body(%column: index):
+    %position = loop.index(%offset_0, %offset_1, %offset_2, %offset_3, %offset_4, %offset_5, %offset_6, %offset_7, %offset_8, %offset_9, %offset_10, %offset_11, %offset_12, %offset_13, %offset_14, %column) {expr = d0 + d1 + d2 + d3 + d4 + d5 + d6 + d7 + d8 + d9 + d10 + d11 + d12 + d13 + d14 + d15} : (index, index, index, index, index, index, index, index, index, index, index, index, index, index, index, index) -> index
+    %element = loop.load(%input, %position) : (!loop.buf<256xf32, global>, index) -> f32
+    loop.store(%element, %output, %column) : (f32, !loop.buf<16xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index) -> ()
+  loop.return() : () -> ()
+}

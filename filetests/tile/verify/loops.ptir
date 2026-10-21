@@ -231,6 +231,18 @@ tile.dispatch @reg_inside_a_tile(%input: tensor<4x16xf32>) -> tensor<4x16xf32> {
 
 // -----
 
+// An iterator of no points that no loop cuts would make the register tile an atom of no points.
+// ERROR: tile.block: the register tile holds 16 points of d1, whose innermost piece has 0
+tile.dispatch @reg_of_no_points(%input: tensor<4x0xf32>) -> tensor<4x0xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 0], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 1, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x0xf32>) -> tensor<4x0xf32>
+  func.return(%output) : (tensor<4x0xf32>) -> ()
+}
+
+// -----
+
 // ERROR: tile.block: the register tile holds 12 points of d1, which vectors of 8 lanes do not fill
 tile.dispatch @partial_vectors(%input: tensor<4x12xf32>) -> tensor<4x12xf32> {
   %output = tile.block(%input) {iters = [par 4, par 12], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 1, d1 by 12 : reg, d1 by 8 : lanes]} ({
@@ -925,7 +937,7 @@ tile.dispatch @copy_without_space(%input: tensor<4x6xf32>) -> tensor<4x6xf32> at
 
 // -----
 
-// ERROR: tile.dispatch: block 0: the read of $0 is held in a copy for l1, which needs a memory of the target, and the dispatch names no target
+// ERROR: tile.dispatch: block 0: the read of $0 is held in a copy for l1, and the dispatch names no target, which a copy needs
 tile.dispatch @copy_without_target(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
   %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1] held copy<level = l1, at = 0>], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 1, d1 by 1]} ({
   ^body(%element: f32):

@@ -1,0 +1,192 @@
+// RUN: pass canonicalize
+
+// A read of panels of 4 columns, `[n floordiv 4, k, n mod 4]`, in an atom over the 4 columns of a
+// tile: the column is the tile's start, a multiple of 4, plus a coordinate below 4, so the panel
+// is the tile and the column in it the coordinate. No `floordiv` or `mod` stays.
+// CHECK: loop.for({{%[0-9]+}}, {{%[0-9]+}}) ({
+// CHECK-NEXT: ^body([[TILE:%[0-9]+]]: index):
+// CHECK: ^body([[OFFSET:%[0-9]+]]: index):
+// CHECK-NOT: floordiv
+// CHECK-NOT: mod
+// CHECK: [[ELEMENT:%[0-9]+]] = loop.load([[WEIGHT:%[0-9]+]], [[TILE]], {{%[0-9]+}}, [[OFFSET]]) : (!loop.buf<2x3x4xf32, global>, index, index, index) -> f32
+loop.func @panels(%weight: !loop.buf<2x3x4xf32, global>, %output: !loop.buf<8xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %tiles = loop.index() {expr = 2} : () -> index
+  loop.for(%zero, %tiles) ({
+  ^body(%tile: index):
+    %start = loop.index(%tile) {expr = d0 * 4} : (index) -> index
+    %columns = loop.index() {expr = 4} : () -> index
+    loop.atom(%columns) {tile = [4], lanes = 4} ({
+    ^body(%offset: index):
+      %column = loop.index(%start, %offset) {expr = d0 + d1} : (index, index) -> index
+      %panel = loop.index(%column) {expr = d0 floordiv 4} : (index) -> index
+      %within = loop.index(%column) {expr = d0 mod 4} : (index) -> index
+      %row = loop.index() {expr = 2} : () -> index
+      %element = loop.load(%weight, %panel, %row, %within) : (!loop.buf<2x3x4xf32, global>, index, index, index) -> f32
+      loop.store(%element, %output, %column) : (f32, !loop.buf<8xf32, global>, index) -> ()
+      loop.yield() : () -> ()
+    }) : (index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%weight: tensor<2x3x4xf32>) -> tensor<8xf32> {
+  %output = host.dispatch(%weight) {callee = @panels} : (tensor<2x3x4xf32>) -> tensor<8xf32>
+  func.return(%output) : (tensor<8xf32>) -> ()
+}
+
+// -----
+
+// A loop over the register tiles of a cache tile, from 4 times the cache tile up to at most 4
+// more: its variable is the start plus an offset below 4, so the variable over 4 is the cache
+// tile, and the variable mod 4 the variable less the start, which takes no division.
+// CHECK: ^body([[BLOCK:%[0-9]+]]: index):
+// CHECK: loop.for({{%[0-9]+}}, {{%[0-9]+}}) ({
+// CHECK-NEXT: ^body([[TILE:%[0-9]+]]: index):
+// CHECK-NEXT: [[WITHIN:%[0-9]+]] = loop.index([[TILE]], [[BLOCK]]) {expr = d0 - d1 * 4} : (index, index) -> index
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load({{%[0-9]+}}, [[BLOCK]], [[WITHIN]]) : (!loop.buf<3x4xf32, global>, index, index) -> f32
+loop.func @blocks(%input: !loop.buf<3x4xf32, global>, %output: !loop.buf<10xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %blocks = loop.index() {expr = 3} : () -> index
+  loop.for(%zero, %blocks) ({
+  ^body(%block: index):
+    %first = loop.index(%block) {expr = d0 * 4} : (index) -> index
+    %last = loop.index(%block) {expr = min(d0 * 4 + 4, 10)} : (index) -> index
+    loop.for(%first, %last) ({
+    ^body(%tile: index):
+      %outer = loop.index(%tile) {expr = d0 floordiv 4} : (index) -> index
+      %inner = loop.index(%tile) {expr = d0 mod 4} : (index) -> index
+      %element = loop.load(%input, %outer, %inner) : (!loop.buf<3x4xf32, global>, index, index) -> f32
+      loop.store(%element, %output, %tile) : (f32, !loop.buf<10xf32, global>, index) -> ()
+      loop.yield() : () -> ()
+    }) : (index, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<3x4xf32>) -> tensor<10xf32> {
+  %output = host.dispatch(%input) {callee = @blocks} : (tensor<3x4xf32>) -> tensor<10xf32>
+  func.return(%output) : (tensor<10xf32>) -> ()
+}
+
+// -----
+
+// Indices of constants are constants, the smaller of two constants is that constant, and an index
+// that names its operand is the operand.
+// CHECK: [[START:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[FIVE:%[0-9]+]] = loop.index() {expr = 5} : () -> index
+// CHECK-NEXT: [[END:%[0-9]+]] = loop.index() {expr = 5} : () -> index
+// CHECK-NEXT: loop.for([[START]], [[END]]) ({
+// CHECK: [[ELEMENT:%[0-9]+]] = loop.load({{%[0-9]+}}, [[FIVE]]) : (!loop.buf<6xf32, global>, index) -> f32
+loop.func @constants(%input: !loop.buf<6xf32, global>, %output: !loop.buf<6xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %six = loop.index() {expr = 6} : () -> index
+  %five = loop.index(%six) {expr = d0 - 1} : (index) -> index
+  %seven = loop.index() {expr = 7} : () -> index
+  %end = loop.index(%five, %seven) {expr = min(d0, d1)} : (index, index) -> index
+  loop.for(%zero, %end) ({
+  ^body(%position: index):
+    %element = loop.load(%input, %position) : (!loop.buf<6xf32, global>, index) -> f32
+    loop.store(%element, %output, %position) : (f32, !loop.buf<6xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  %last = loop.index(%five) {expr = d0} : (index) -> index
+  %element = loop.load(%input, %last) : (!loop.buf<6xf32, global>, index) -> f32
+  loop.store(%element, %output, %last) : (f32, !loop.buf<6xf32, global>, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<6xf32>) -> tensor<6xf32> {
+  %output = host.dispatch(%input) {callee = @constants} : (tensor<6xf32>) -> tensor<6xf32>
+  func.return(%output) : (tensor<6xf32>) -> ()
+}
+
+// -----
+
+// An index of a division that another op also takes stays: composing it would compute the
+// division twice.
+// CHECK: [[HALF:%[0-9]+]] = loop.index([[POSITION:%[0-9]+]]) {expr = d0 floordiv 2} : (index) -> index
+// CHECK-NEXT: [[NEXT:%[0-9]+]] = loop.index([[HALF]]) {expr = d0 + 1} : (index) -> index
+loop.func @shared(%input: !loop.buf<8xf32, global>, %output: !loop.buf<6xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %six = loop.index() {expr = 6} : () -> index
+  loop.for(%zero, %six) ({
+  ^body(%position: index):
+    %half = loop.index(%position) {expr = d0 floordiv 2} : (index) -> index
+    %next = loop.index(%half) {expr = d0 + 1} : (index) -> index
+    %low = loop.load(%input, %half) : (!loop.buf<8xf32, global>, index) -> f32
+    %high = loop.load(%input, %next) : (!loop.buf<8xf32, global>, index) -> f32
+    %sum = arith.add(%low, %high) : (f32, f32) -> f32
+    loop.store(%sum, %output, %position) : (f32, !loop.buf<6xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<8xf32>) -> tensor<6xf32> {
+  %output = host.dispatch(%input) {callee = @shared} : (tensor<8xf32>) -> tensor<6xf32>
+  func.return(%output) : (tensor<6xf32>) -> ()
+}
+
+// -----
+
+// A loop of one trip, from a start to the start plus 1, is its body with the index at the start:
+// the row loop of each tile of 1 row goes, and the tile's index takes its place.
+// CHECK: loop.for({{%[0-9]+}}, {{%[0-9]+}}) ({
+// CHECK-NEXT: ^body([[ROW:%[0-9]+]]: index):
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load([[INPUT:%[0-9]+]], [[ROW]]) : (!loop.buf<5xf32, global>, index) -> f32
+// CHECK-NEXT: loop.store([[ELEMENT]], [[OUTPUT:%[0-9]+]], [[ROW]]) : (f32, !loop.buf<5xf32, global>, index) -> ()
+// CHECK-NEXT: loop.yield() : () -> ()
+// CHECK-NOT: loop.for
+loop.func @rows(%input: !loop.buf<5xf32, global>, %output: !loop.buf<5xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %tiles = loop.index() {expr = 5} : () -> index
+  loop.for(%zero, %tiles) ({
+  ^body(%tile: index):
+    %next = loop.index(%tile) {expr = d0 + 1} : (index) -> index
+    loop.for(%tile, %next) ({
+    ^body(%row: index):
+      %element = loop.load(%input, %row) : (!loop.buf<5xf32, global>, index) -> f32
+      loop.store(%element, %output, %row) : (f32, !loop.buf<5xf32, global>, index) -> ()
+      loop.yield() : () -> ()
+    }) : (index, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<5xf32>) -> tensor<5xf32> {
+  %output = host.dispatch(%input) {callee = @rows} : (tensor<5xf32>) -> tensor<5xf32>
+  func.return(%output) : (tensor<5xf32>) -> ()
+}
+
+// -----
+
+// A loop of one trip whose body allocates a buffer stays: the buffer lives as long as the loop's
+// body, and inlining it would keep the buffer for the rest of the function.
+// CHECK: loop.for({{%[0-9]+}}, {{%[0-9]+}}) ({
+// CHECK-NEXT: ^body({{%[0-9]+}}: index):
+// CHECK-NEXT: [[NEXT:%[0-9]+]] = loop.index({{%[0-9]+}}) {expr = d0 + 1} : (index) -> index
+// CHECK-NEXT: loop.for({{%[0-9]+}}, [[NEXT]]) ({
+// CHECK-NEXT: ^body([[ROW:%[0-9]+]]: index):
+// CHECK-NEXT: [[CELL:%[0-9]+]] = loop.alloc() {shape = [], dtype = f32} : () -> !loop.buf<f32, private>
+loop.func @scratch(%input: !loop.buf<5xf32, global>, %output: !loop.buf<5xf32, global>) attributes {access = [in, out]} {
+  %zero = loop.index() {expr = 0} : () -> index
+  %tiles = loop.index() {expr = 5} : () -> index
+  loop.for(%zero, %tiles) ({
+  ^body(%tile: index):
+    %next = loop.index(%tile) {expr = d0 + 1} : (index) -> index
+    loop.for(%tile, %next) ({
+    ^body(%row: index):
+      %cell = loop.alloc() {shape = [], dtype = f32, space = private} : () -> !loop.buf<f32, private>
+      %element = loop.load(%input, %row) : (!loop.buf<5xf32, global>, index) -> f32
+      loop.store(%element, %cell) : (f32, !loop.buf<f32, private>) -> ()
+      %kept = loop.load(%cell) : (!loop.buf<f32, private>) -> f32
+      loop.store(%kept, %output, %row) : (f32, !loop.buf<5xf32, global>, index) -> ()
+      loop.yield() : () -> ()
+    }) : (index, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+func.func @main(%input: tensor<5xf32>) -> tensor<5xf32> {
+  %output = host.dispatch(%input) {callee = @scratch} : (tensor<5xf32>) -> tensor<5xf32>
+  func.return(%output) : (tensor<5xf32>) -> ()
+}

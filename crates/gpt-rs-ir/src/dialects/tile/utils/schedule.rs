@@ -9,6 +9,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use tinyvec::ArrayVec;
 
+use crate::dialects::isa;
 use crate::dialects::tile::ir::*;
 use crate::dialects::tile::verify::check_schedule;
 use crate::ir::{AccessExpr, DType, Dim, Inst, IterRef, Level, Module, OperandRef, MAX_ITERS};
@@ -96,8 +97,8 @@ pub enum CopyAxis {
     /// The tiles of loop `index` of the nest within its tile of the loop around it: `count` of
     /// them.
     Tiles { index: usize, count: Dim },
-    /// The `extent` points of the iterator at `position` in its innermost tile that has a `Tiles`
-    /// axis in the copy, or else in its tile around the copy.
+    /// The `extent` points of the iterator at `position` in its innermost tile whose loop has a
+    /// `Tiles` axis in the copy, or else in its tile around the copy.
     Points { position: usize, extent: Dim },
 }
 
@@ -574,12 +575,13 @@ impl Walk {
             .filter(|atom| atom.iter.position() == position)
             .map(|atom| atom.lanes);
         let (within, form) = match lanes_along {
-            Some(lanes) => (
-                vec![(next, dim.extent / lanes), (next + 1, lanes)],
-                start
+            Some(lanes) => {
+                let vectors = isa::tile_vectors(&[dim.extent], lanes);
+                let point = start
                     + AccessExpr::iter(next) * AccessExpr::constant(lanes as i64)
-                    + AccessExpr::iter(next + 1),
-            ),
+                    + AccessExpr::iter(next + 1);
+                (vec![(next, vectors[0]), (next + 1, vectors[1])], point)
+            }
             None => (vec![(next, dim.extent)], start + AccessExpr::iter(next)),
         };
         let extent = |at: usize| {

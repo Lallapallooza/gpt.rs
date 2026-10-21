@@ -1,0 +1,6 @@
+# x86-64-v4 with one mask register that can mask an op, where AVX-512 has seven.
+base = "x86-64-v4"
+description = "x86-64-v4 with one write mask"
+
+[isa]
+write_masks = 1

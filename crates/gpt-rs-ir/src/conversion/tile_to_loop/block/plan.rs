@@ -22,8 +22,8 @@ pub(super) enum Node<'p> {
     /// A copy in registers of the part of the state in memory that the register tile covers,
     /// which the nodes after it fold into.
     Copies(StateFold<'p>),
-    /// A piece of the run's loops, with the tile of each iterator there. The blocks placed after
-    /// the first that read across the piece take its elements from scratch once it is finished.
+    /// A piece of the run's loops, with the tile of each iterator there. The placed blocks that
+    /// read across the piece take its elements from scratch once it is finished.
     Piece(Vec<Dim>),
     /// The body at one point.
     Body(Leaf<'p>),

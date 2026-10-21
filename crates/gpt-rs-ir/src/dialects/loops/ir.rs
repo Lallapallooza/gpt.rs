@@ -93,9 +93,9 @@ pub struct If;
 /// `loop.atom`: runs its body once for each point of the box `tile` whose coordinates are below
 /// `extents`, one per axis, in row-major order. The points are those of a register tile, which
 /// `loop-to-isa` computes at once in vectors of `lanes` elements along the last axis. The body's
-/// block arguments are the point's coordinates. `extents` MUST NOT exceed `tile`. An extent of 0
-/// runs no point. Each point is a unit of work: two points MUST NOT access one element of a buffer
-/// when one of them writes it.
+/// block arguments are the point's coordinates. Each extent MUST be at least 1 and MUST NOT exceed
+/// its axis of `tile`: an atom runs at least one point. Each point is a unit of work: two points
+/// MUST NOT access one element of a buffer when one of them writes it.
 #[crate::op(
     "loop.atom",
     operands(extents(Variadic(Index))),

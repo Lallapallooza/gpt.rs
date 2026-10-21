@@ -1,0 +1,125 @@
+// RUN: pass loop-to-isa {target = "x86-64-v4"}
+
+// Copies of 4 rows of 16 lanes in a `reg` buffer, which an atom writes at the row of the loop
+// around it: a position fixed only during the run, so the vector code cannot hold the buffer in
+// vector variables.
+// ERROR: loop-to-isa {target = "x86-64-v4"}: loop.func @varying_row: isa.store at loc("" via ["loop-to-isa"("loop.store":{{[0-9]+}})]) reaches a reg buffer of !loop.buf<4x16xf32, reg>, at a position fixed only during the run
+loop.func @varying_row(%input: !loop.buf<4x16xf32, global>) attributes {access = [in], target = "x86-64-v4@3928f7d3"} {
+  %copies = loop.alloc() {shape = [4, 16], dtype = f32, space = reg} : () -> !loop.buf<4x16xf32, reg>
+  %zero = loop.index() {expr = 0} : () -> index
+  %rows = loop.index() {expr = 4} : () -> index
+  %lanes = loop.index() {expr = 16} : () -> index
+  loop.for(%zero, %rows) ({
+  ^body(%row: index):
+    loop.atom(%lanes) {tile = [16], lanes = 16} ({
+    ^body(%lane: index):
+      %element = loop.load(%input, %row, %lane) : (!loop.buf<4x16xf32, global>, index, index) -> f32
+      loop.store(%element, %copies, %row, %lane) : (f32, !loop.buf<4x16xf32, reg>, index, index) -> ()
+      loop.yield() : () -> ()
+    }) : (index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// A `reg` buffer that an atom writes and a scalar load after it reads: the vector code reaches the
+// buffer only in whole registers.
+// ERROR: loop-to-isa {target = "x86-64-v4"}: loop.func @scalar_read: loop.load reaches a reg buffer of !loop.buf<16xf32, reg>, which only whole registers reach
+loop.func @scalar_read(%input: !loop.buf<16xf32, global>, %output: !loop.buf<f32, global>) attributes {access = [in, out], target = "x86-64-v4@3928f7d3"} {
+  %copies = loop.alloc() {shape = [16], dtype = f32, space = reg} : () -> !loop.buf<16xf32, reg>
+  %lanes = loop.index() {expr = 16} : () -> index
+  loop.atom(%lanes) {tile = [16], lanes = 16} ({
+  ^body(%lane: index):
+    %element = loop.load(%input, %lane) : (!loop.buf<16xf32, global>, index) -> f32
+    loop.store(%element, %copies, %lane) : (f32, !loop.buf<16xf32, reg>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index) -> ()
+  %first = loop.index() {expr = 0} : () -> index
+  %kept = loop.load(%copies, %first) : (!loop.buf<16xf32, reg>, index) -> f32
+  loop.store(%kept, %output) : (f32, !loop.buf<f32, global>) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// Two rows of a `reg` buffer, each broadcast into the lanes of a row of the tile: a broadcast
+// reaches no whole register of the buffer.
+// ERROR: loop-to-isa {target = "x86-64-v4"}: loop.func @broadcast_rows: isa.broadcast at loc("" via ["loop-to-isa"("loop.load":{{[0-9]+}})]) reaches a reg buffer of !loop.buf<2x16xf32, reg>, which only loads and stores of its dtype reach
+loop.func @broadcast_rows(%input: !loop.buf<2x16xf32, global>, %output: !loop.buf<2x16xf32, global>) attributes {access = [in, out], target = "x86-64-v4@3928f7d3"} {
+  %copies = loop.alloc() {shape = [2, 16], dtype = f32, space = reg} : () -> !loop.buf<2x16xf32, reg>
+  %rows = loop.index() {expr = 2} : () -> index
+  %lanes = loop.index() {expr = 16} : () -> index
+  %zero = loop.index() {expr = 0} : () -> index
+  loop.atom(%rows, %lanes) {tile = [2, 16], lanes = 16} ({
+  ^body(%row: index, %lane: index):
+    %element = loop.load(%input, %row, %lane) : (!loop.buf<2x16xf32, global>, index, index) -> f32
+    loop.store(%element, %copies, %row, %lane) : (f32, !loop.buf<2x16xf32, reg>, index, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.atom(%rows, %lanes) {tile = [2, 16], lanes = 16} ({
+  ^body(%row: index, %lane: index):
+    %first = loop.load(%copies, %row, %zero) : (!loop.buf<2x16xf32, reg>, index, index) -> f32
+    loop.store(%first, %output, %row, %lane) : (f32, !loop.buf<2x16xf32, global>, index, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index, index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// A `reg` buffer read two lanes back, padded: its registers hold no pad.
+// ERROR: loop-to-isa {target = "x86-64-v4"}: loop.func @shifted_read: isa.load at loc("" via ["loop-to-isa"("loop.load":{{[0-9]+}})]) reaches a reg buffer of !loop.buf<16xf32, reg>, which holds every element a read takes, with no pad
+loop.func @shifted_read(%input: !loop.buf<16xf32, global>, %output: !loop.buf<16xf32, global>) attributes {access = [in, out], target = "x86-64-v4@3928f7d3"} {
+  %copies = loop.alloc() {shape = [16], dtype = f32, space = reg} : () -> !loop.buf<16xf32, reg>
+  %lanes = loop.index() {expr = 16} : () -> index
+  loop.atom(%lanes) {tile = [16], lanes = 16} ({
+  ^body(%lane: index):
+    %element = loop.load(%input, %lane) : (!loop.buf<16xf32, global>, index) -> f32
+    loop.store(%element, %copies, %lane) : (f32, !loop.buf<16xf32, reg>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index) -> ()
+  loop.atom(%lanes) {tile = [16], lanes = 16} ({
+  ^body(%lane: index):
+    %behind = loop.index(%lane) {expr = d0 - 2} : (index) -> index
+    %shifted = loop.load(%copies, %behind) {pad = 0.0} : (!loop.buf<16xf32, reg>, index) -> f32
+    loop.store(%shifted, %output, %lane) : (f32, !loop.buf<16xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// A `reg` buffer of 24 elements, which registers of 16 lanes do not divide.
+// ERROR: loop-to-isa {target = "x86-64-v4"}: loop.func @uneven: isa.store at loc("" via ["loop-to-isa"("loop.store":{{[0-9]+}})]) reaches a reg buffer of !loop.buf<24xf32, reg>, whose registers hold one lane count that divides its last extent
+loop.func @uneven(%input: !loop.buf<16xf32, global>) attributes {access = [in], target = "x86-64-v4@3928f7d3"} {
+  %copies = loop.alloc() {shape = [24], dtype = f32, space = reg} : () -> !loop.buf<24xf32, reg>
+  %lanes = loop.index() {expr = 16} : () -> index
+  loop.atom(%lanes) {tile = [16], lanes = 16} ({
+  ^body(%lane: index):
+    %element = loop.load(%input, %lane) : (!loop.buf<16xf32, global>, index) -> f32
+    loop.store(%element, %copies, %lane) : (f32, !loop.buf<24xf32, reg>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index) -> ()
+  loop.return() : () -> ()
+}
+
+// -----
+
+// A `reg` buffer of two registers that an atom writes from its eighth element: a register that
+// straddles the two.
+// ERROR: loop-to-isa {target = "x86-64-v4"}: loop.func @straddle: isa.store at loc("" via ["loop-to-isa"("loop.store":{{[0-9]+}})]) reaches a reg buffer of !loop.buf<32xf32, reg>, by a vector that straddles two of its registers or lies outside it
+loop.func @straddle(%input: !loop.buf<16xf32, global>) attributes {access = [in], target = "x86-64-v4@3928f7d3"} {
+  %copies = loop.alloc() {shape = [32], dtype = f32, space = reg} : () -> !loop.buf<32xf32, reg>
+  %lanes = loop.index() {expr = 16} : () -> index
+  loop.atom(%lanes) {tile = [16], lanes = 16} ({
+  ^body(%lane: index):
+    %element = loop.load(%input, %lane) : (!loop.buf<16xf32, global>, index) -> f32
+    %ahead = loop.index(%lane) {expr = d0 + 8} : (index) -> index
+    loop.store(%element, %copies, %ahead) : (f32, !loop.buf<32xf32, reg>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index) -> ()
+  loop.return() : () -> ()
+}

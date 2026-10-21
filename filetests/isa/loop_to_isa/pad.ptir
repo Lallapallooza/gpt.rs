@@ -1,0 +1,75 @@
+// RUN: pass tile-to-loop, loop-to-isa {target = "x86-64-v4"}
+
+// A convolution along 6 positions with 3 taps and padding 1, into 32 channels, with a register
+// tile of 3 positions by the 32 channels in two vectors of 16 lanes. Each position's input is
+// broadcast into its row of lanes, padded, so the rows hold 0 at the taps that fall before the
+// first position or past the last: the first row and the last one check their position, and the
+// middle one, which the loops keep inside the input, does not. The 6 positions are two full
+// tiles, so no read takes a mask.
+// CHECK: loop.func @conv([[INPUT:%[0-9]+]]: !loop.buf<6xf32, global>, [[WEIGHT:%[0-9]+]]: !loop.buf<3x32xf32, global>,
+// CHECK: loop.alloc() {shape = [3, 32], dtype = f32, space = reg} : () -> !loop.buf<3x32xf32, reg>
+// CHECK: loop.for({{%[0-9]+}}, {{%[0-9]+}}) ({
+// CHECK-NEXT: ^body([[TAP:%[0-9]+]]: index):
+// CHECK: [[INPUTS:%[0-9]+]] = isa.broadcast([[INPUT]], {{%[0-9]+}}) {dims = [3, 1, 16], steps = [[1], [0]], pad = 0.0, checked = [[0], [], [0]]} : (!loop.buf<6xf32, global>, index) -> !isa.vec<3x1x16xf32>
+// CHECK-NEXT: [[WEIGHTS:%[0-9]+]] = isa.load([[WEIGHT]], [[TAP]], {{%[0-9]+}}) {dims = [1, 2, 16], steps = [[0, 0], [0, 16]]} : (!loop.buf<3x32xf32, global>, index, index) -> !isa.vec<1x2x16xf32>
+// CHECK-NOT: isa.tile_mask
+// CHECK-NOT: loop.atom
+tile.dispatch @conv(%input: tensor<6xf32>, %weight: tensor<3x32xf32>) -> tensor<6x32xf32> attributes {target = "x86-64-v4@3928f7d3"} {
+  %output = tile.block(%input, %weight) {iters = [par 6, par 32, red 3], reads = [$0[d0 + d2 - 1] pad 0.0, $1[d2, d1]], folds = [sum -> [d0, d1]], loops = [d0 by 3, d2 by 1, d0 by 3 : reg, d1 by 32 : reg, d1 by 16 : lanes]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<6xf32>, tensor<3x32xf32>) -> tensor<6x32xf32>
+  func.return(%output) : (tensor<6x32xf32>) -> ()
+}
+func.func @main(%input: tensor<6xf32>, %weight: tensor<3x32xf32>) -> tensor<6x32xf32> {
+  %output = host.dispatch(%input, %weight) {callee = @conv} : (tensor<6xf32>, tensor<3x32xf32>) -> tensor<6x32xf32>
+  func.return(%output) : (tensor<6x32xf32>) -> ()
+}
+
+// -----
+
+// 40 elements shifted by 2 along the lanes, padded, in tiles of two vectors of 16 lanes: the first
+// two lanes hold 0. The full tile's padded load checks the lanes of its first vector and not
+// those of its second, which stays inside the input. The last tile, of 8 elements, is one vector
+// whose padded load takes a tile mask.
+// CHECK: loop.func @shift([[INPUT:%[0-9]+]]: !loop.buf<40xf32, global>, [[OUTPUT:%[0-9]+]]: !loop.buf<40xf32, global>)
+// CHECK: [[SHIFTED:%[0-9]+]] = isa.load([[INPUT]], {{%[0-9]+}}) {dims = [2, 16], steps = [[16]], pad = 0.0, checked = [[0], []]} : (!loop.buf<40xf32, global>, index) -> !isa.vec<2x16xf32>
+// CHECK-NEXT: isa.store([[SHIFTED]], [[OUTPUT]], {{%[0-9]+}}) {steps = [[16]]}
+// CHECK: [[MASK:%[0-9]+]] = isa.tile_mask({{%[0-9]+}}) {dims = [1, 16]} : (index) -> !isa.vec<1x16xi1>
+// CHECK-NEXT: [[TAIL:%[0-9]+]] = isa.masked_load([[MASK]], [[INPUT]], {{%[0-9]+}}) {dims = [1, 16], steps = [[16]], pad = 0.0, checked = [[0]]} : (!isa.vec<1x16xi1>, !loop.buf<40xf32, global>, index) -> !isa.vec<1x16xf32>
+// CHECK-NEXT: isa.masked_store([[MASK]], [[TAIL]], [[OUTPUT]], {{%[0-9]+}}) {steps = [[16]]}
+// CHECK-NOT: loop.atom
+tile.dispatch @shift(%input: tensor<40xf32>) -> tensor<40xf32> attributes {target = "x86-64-v4@3928f7d3"} {
+  %shifted = tile.block(%input) {iters = [par 40], reads = [$0[d0 - 2] pad 0.0], folds = [none -> [d0]], loops = [d0 by 32, d0 by 32 : reg, d0 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<40xf32>) -> tensor<40xf32>
+  func.return(%shifted) : (tensor<40xf32>) -> ()
+}
+func.func @main(%input: tensor<40xf32>) -> tensor<40xf32> {
+  %shifted = host.dispatch(%input) {callee = @shift} : (tensor<40xf32>) -> tensor<40xf32>
+  func.return(%shifted) : (tensor<40xf32>) -> ()
+}
+
+// -----
+
+// A convolution over 6 rows and 3 columns, its rows clipped: the loop over the rows, inside the
+// loops over the taps, runs over those whose input row lies inside the input. Its bounds, the
+// `max` and the `min` of the rows' limits with the tap, keep the row inside, so the register tile
+// of the 3 columns checks the row nowhere, and the column at its first and last register, which
+// fall outside the input at the first and the last tap.
+// ROUNDING: skip_pad: a skipped product of the pad is 0 only where the weight is finite.
+// CHECK: isa.broadcast({{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}) {dims = [3, 1, 16], steps = [[0, 1], [0, 0]], pad = 0.0, checked = [[1], [], [1]]} : (!loop.buf<6x3xf32, global>, index, index) -> !isa.vec<3x1x16xf32>
+tile.dispatch @rows(%input: tensor<6x3xf32>, %weight: tensor<3x3x32xf32>) -> tensor<6x3x32xf32> attributes {target = "x86-64-v4@3928f7d3", numerics = <skip_pad = true>} {
+  %output = tile.block(%input, %weight) {iters = [par 6, par 3, par 32, red 3, red 3], reads = [$0[d0 + d3 - 1, d1 + d4 - 1] pad 0.0, $1[d3, d4, d2]], folds = [sum -> [d0, d1, d2] held scratch<at = 0>], loops = [d3 by 1, d4 by 1, d0 by 1, d1 by 3 : reg, d2 by 32 : reg, d2 by 16 : lanes], clip = [d0]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<6x3xf32>, tensor<3x3x32xf32>) -> tensor<6x3x32xf32>
+  func.return(%output) : (tensor<6x3x32xf32>) -> ()
+}
+func.func @main(%input: tensor<6x3xf32>, %weight: tensor<3x3x32xf32>) -> tensor<6x3x32xf32> {
+  %output = host.dispatch(%input, %weight) {callee = @rows} : (tensor<6x3xf32>, tensor<3x3x32xf32>) -> tensor<6x3x32xf32>
+  func.return(%output) : (tensor<6x3x32xf32>) -> ()
+}

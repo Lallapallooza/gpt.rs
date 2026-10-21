@@ -1,0 +1,26 @@
+// RUN: pass name-target {target = "x86-64-v4"}, tile-to-loop, loop-to-isa {target = "x86-64-v4"}
+
+// A bf16 weight widened to f32, scaled and rounded back, in the vectors of 16 lanes that the
+// schedule names: the loads and the store move 16 lanes of each dtype, 256 bits of bf16 and 512 of
+// f32, and each cast converts 16 lanes.
+// CHECK: loop.func @widen_and_scale([[WEIGHT:%[0-9]+]]: !loop.buf<32xbf16, global>, [[SCALE:%[0-9]+]]: !loop.buf<32xf32, global>, [[OUT:%[0-9]+]]: !loop.buf<32xbf16, global>)
+// CHECK: [[ELEMENTS:%[0-9]+]] = isa.load([[WEIGHT]], [[AT:%[0-9]+]]) {dims = [2, 16], steps = [[16]]} : (!loop.buf<32xbf16, global>, index) -> !isa.vec<2x16xbf16>
+// CHECK-NEXT: [[FACTORS:%[0-9]+]] = isa.load([[SCALE]], [[AT]]) {dims = [2, 16], steps = [[16]]} : (!loop.buf<32xf32, global>, index) -> !isa.vec<2x16xf32>
+// CHECK-NEXT: [[WIDE:%[0-9]+]] = isa.cast([[ELEMENTS]]) {to = f32} : (!isa.vec<2x16xbf16>) -> !isa.vec<2x16xf32>
+// CHECK-NEXT: [[PRODUCTS:%[0-9]+]] = isa.mul([[WIDE]], [[FACTORS]]) : (!isa.vec<2x16xf32>, !isa.vec<2x16xf32>) -> !isa.vec<2x16xf32>
+// CHECK-NEXT: [[NARROW:%[0-9]+]] = isa.cast([[PRODUCTS]]) {to = bf16} : (!isa.vec<2x16xf32>) -> !isa.vec<2x16xbf16>
+// CHECK-NEXT: isa.store([[NARROW]], [[OUT]], [[AT]]) {steps = [[16]]} : (!isa.vec<2x16xbf16>, !loop.buf<32xbf16, global>, index) -> ()
+tile.dispatch @widen_and_scale(%weight: tensor<32xbf16>, %scale: tensor<32xf32>) -> tensor<32xbf16> {
+  %scaled = tile.block(%weight, %scale) {iters = [par 32], reads = [$0[d0], $1[d0]], folds = [none -> [d0]], loops = [d0 by 32 : reg, d0 by 16 : lanes]} ({
+  ^body(%element: bf16, %factor: f32):
+    %wide = arith.cast(%element) {to = f32} : (bf16) -> f32
+    %product = arith.mul(%wide, %factor) : (f32, f32) -> f32
+    %narrow = arith.cast(%product) {to = bf16} : (f32) -> bf16
+    tile.yield(%narrow) : (bf16) -> ()
+  }) : (tensor<32xbf16>, tensor<32xf32>) -> tensor<32xbf16>
+  func.return(%scaled) : (tensor<32xbf16>) -> ()
+}
+func.func @main(%weight: tensor<32xbf16>, %scale: tensor<32xf32>) -> tensor<32xbf16> {
+  %scaled = host.dispatch(%weight, %scale) {callee = @widen_and_scale} : (tensor<32xbf16>, tensor<32xf32>) -> tensor<32xbf16>
+  func.return(%scaled) : (tensor<32xbf16>) -> ()
+}

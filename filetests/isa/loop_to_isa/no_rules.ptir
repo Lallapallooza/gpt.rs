@@ -1,0 +1,15 @@
+// RUN: pass loop-to-isa {target = "x86-64-v3"}
+
+// Vectors of 8 f32 lanes fill the 256-bit registers of x86-64-v3, but gpt.rs writes x86 vector
+// code with AVX-512 alone, which x86-64-v3 lacks: it has no rules for the target's instruction set.
+// ERROR: loop-to-isa {target = "x86-64-v3"}: loop.func @no_rules: x86-64-v3 computes no isa.load code: gpt.rs has no rules for its instruction set
+loop.func @no_rules(%input: !loop.buf<8xf32, global>, %output: !loop.buf<8xf32, global>) attributes {access = [in, out], target = "x86-64-v3@7d7ad928"} {
+  %columns = loop.index() {expr = 8} : () -> index
+  loop.atom(%columns) {tile = [8], lanes = 8} ({
+  ^body(%column: index):
+    %element = loop.load(%input, %column) : (!loop.buf<8xf32, global>, index) -> f32
+    loop.store(%element, %output, %column) : (f32, !loop.buf<8xf32, global>, index) -> ()
+    loop.yield() : () -> ()
+  }) : (index) -> ()
+  loop.return() : () -> ()
+}

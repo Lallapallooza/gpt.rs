@@ -1,9 +1,9 @@
 //! The rules that choose a block's schedule from its facts: its register tile, the order of its
 //! loops, the workers' shares, the pieces of the caches and the copies into scratch. Each rule is a
 //! constraint on the target's facts or a count of what the schedule moves. Issue and fill rates
-//! enter only the constraints: that a step's loads or a cache's bytes keep up with the fold's
-//! steps, and that the accumulators cover the latency of the step. No time is predicted for a
-//! schedule, and none ranks schedules.
+//! enter only constraints: that a step's loads keep up with the fold's steps, that a cache's bytes
+//! keep up with them, and that the accumulators cover the latency of the fold's step. No time is
+//! predicted for a schedule, and none ranks schedules.
 
 use std::collections::HashMap;
 use std::ops::Range;

@@ -1,0 +1,6 @@
+# The thresholds of the code-shape lints of `[workspace.lints.clippy]`.
+too-many-lines-threshold = 80
+excessive-nesting-threshold = 6
+# The only one-letter names: `p`, the `nn::Params` of a layer's constructor, and `x`, the input of a
+# functional or a layer's `forward`, as CLAUDE.md writes them.
+allowed-idents-below-min-chars = ["p", "x"]

@@ -12,7 +12,12 @@ gpt-rs = { path = "../gpt-rs", version = "0.1.0" }
 gpt-rs-backend-ref-cpu = { path = "../gpt-rs-backend-ref-cpu", version = "0.1.0" }
 gpt-rs-backend-faer = { path = "../gpt-rs-backend-faer", version = "0.1.0", optional = true }
 gpt-rs-backend-c = { path = "../gpt-rs-backend-c", version = "0.1.0", optional = true, default-features = false }
+gpt-rs-backend-x86 = { path = "../gpt-rs-backend-x86", version = "0.1.0", optional = true }
 
 [features]
 faer = ["dep:gpt-rs-backend-faer"]
 c = ["dep:gpt-rs-backend-c"]
+x86 = ["dep:gpt-rs-backend-x86"]
+
+[lints]
+workspace = true

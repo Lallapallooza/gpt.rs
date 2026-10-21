@@ -3,18 +3,21 @@
 pub mod arith;
 pub mod func;
 pub mod host;
-pub mod r#loop;
+pub mod isa;
+pub mod loops;
 pub mod tensor;
 pub mod tile;
+pub mod x86;
 
 use anyhow::Result;
 
-use self::arith::ArithOp;
-use self::func::FuncOp;
-use self::host::HostOp;
-use self::r#loop::LoopOp;
-use self::tensor::TensorOp;
-use self::tile::TileOp;
+use self::arith::ArithOps;
+use self::func::FuncOps;
+use self::host::HostOps;
+use self::isa::IsaOps;
+use self::loops::LoopOps;
+use self::tensor::TensorOps;
+use self::tile::TileOps;
 use crate::ir::{Dense, InOp, OpDyn, SymbolOp, Type};
 use crate::traits::OpTrait;
 
@@ -22,12 +25,13 @@ use crate::traits::OpTrait;
 #[derive(crate::DialectSet, Debug, Clone, PartialEq, Eq, Hash)]
 #[dialect_set(kind(Dialect))]
 pub enum Op {
-    Func(FuncOp),
-    Tensor(TensorOp),
-    Arith(ArithOp),
-    Tile(TileOp),
-    Host(HostOp),
-    Loop(LoopOp),
+    Func(FuncOps),
+    Tensor(TensorOps),
+    Arith(ArithOps),
+    Tile(TileOps),
+    Host(HostOps),
+    Loop(LoopOps),
+    Isa(IsaOps),
 }
 
 impl Op {
@@ -50,7 +54,7 @@ impl Op {
         T::cast(self)
     }
 
-    /// The value of a [`ConstantOp`](crate::ir::ConstantOp), such as `tensor.constant`, or
+    /// The value of a [`ConstantValue`](crate::ir::ConstantValue), such as `tensor.constant`, or
     /// `arith.constant` as a rank-0 constant.
     pub fn as_constant(&self) -> Option<&Dense> {
         self.dyn_constant()

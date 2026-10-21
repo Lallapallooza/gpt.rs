@@ -1,0 +1,25 @@
+[package]
+name = "gpt-rs-backend-x86"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "x86 backend for gpt-rs: compiles PTIR through tile, loop and isa to C with AVX-512 intrinsics."
+
+[features]
+default = []
+torch = ["gpt-rs-backend-tests/torch"]
+
+[dependencies]
+anyhow = { workspace = true }
+gpt-rs = { path = "../gpt-rs", version = "0.1.0" }
+gpt-rs-ir = { path = "../gpt-rs-ir", version = "0.1.0" }
+libloading = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+gpt-rs-backend-tests = { path = "../gpt-rs-backend-tests", version = "0.1.0" }
+
+[lints]
+workspace = true

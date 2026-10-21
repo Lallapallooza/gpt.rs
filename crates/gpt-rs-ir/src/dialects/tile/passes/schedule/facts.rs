@@ -93,9 +93,8 @@ pub(super) struct ReadFacts {
     /// symbol or a read.
     pub offsets: Ranked<Option<i64>>,
     /// For each call of the dispatch, when the read's operand is a parameter of the dispatch, the
-    /// part of the call's argument that each worker of its writer wrote, in the
-    /// order of the workers ([`worker_parts`]); none where no dispatch of the run wrote it
-    /// ([`written`]).
+    /// part of the call's argument that each worker of its writer wrote, in the order of the
+    /// workers ([`worker_parts`]); none where no dispatch of the run wrote it ([`written`]).
     pub written: Vec<Vec<Part>>,
     /// Whether it depends on each iterator.
     pub depends: [bool; MAX_ITERS],

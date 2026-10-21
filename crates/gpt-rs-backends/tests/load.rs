@@ -1,10 +1,12 @@
 //! Choosing a backend by name.
 
 use gpt_rs::runtime::LoadOptions;
+use gpt_rs_backends::BackendOptions;
 
 #[test]
 fn an_unknown_backend_name_lists_the_backends_of_the_build() {
-    let err = gpt_rs_backends::load_model("tpu", "unused", LoadOptions::default())
+    let options = BackendOptions::default();
+    let err = gpt_rs_backends::load_model("tpu", &options, "unused", LoadOptions::default())
         .err()
         .expect("no backend is named tpu");
     let expected = format!(

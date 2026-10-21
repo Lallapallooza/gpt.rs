@@ -7,3 +7,6 @@ authors.workspace = true
 description = "The tokens of the gpt-rs-ir text form, shared by its parser and by the formats its macros compile."
 
 [dependencies]
+
+[lints]
+workspace = true

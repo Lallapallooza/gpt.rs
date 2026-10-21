@@ -1,0 +1,40 @@
+# A GPU's levels and memories on znver5's instructions, so that the rule of each memory shows on
+# them: 2 multiprocessors of 4 warps each; the registers of a warp; 16 KiB of shared memory on each
+# multiprocessor, which holds only what the code copies into it; an L2 of 64 KiB in 16 ways of
+# 128-byte lines, which every multiprocessor shares; and DRAM, whose buffers start at multiples of
+# 256 bytes, as CUDA's allocators align global memory.
+base = "znver5"
+description = "A GPU's levels and memories on znver5's instructions"
+
+[[level]]
+name = "sm"
+units = 2
+
+[[level]]
+name = "warp"
+units = 8
+
+[[memory]]
+name = "registers"
+kind = "registers"
+level = "warp"
+
+[[memory]]
+name = "shared"
+kind = "scratch"
+bytes = 16384
+level = "sm"
+space = "private"
+
+[[memory]]
+name = "l2"
+kind = "cache"
+bytes = 65536
+line = 128
+ways = 16
+space = "private"
+
+[[memory]]
+name = "dram"
+kind = "main"
+alignment = 256

@@ -19,8 +19,8 @@ use crate::targets::Target;
 /// Computes the points of each `loop.atom` at once, in the vectors of its lanes, and checks the
 /// vector code against the target. The rules of the target's architecture must have code for each
 /// `isa` op, and the target must have the extensions that code needs. A register tile's code must
-/// hold at once no more vector and mask registers than the target has, counted register by
-/// register in the order every backend follows ([`isa::RegisterCode::order`]). The
+/// hold at once no more vector and mask registers than the target has. The count goes register by
+/// register, in the order every backend follows ([`isa::RegisterCode::order`]). The
 /// `tile.dispatch` verifier checks the rules for the lane-wise ops and the register widths of each
 /// block that computes in vectors, but counts no registers. The code of a verified schedule may
 /// hold more registers than the target has, which fails here. A `loop.func` decided for another

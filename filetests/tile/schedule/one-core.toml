@@ -1,0 +1,72 @@
+# One core of a Zen 5 part: znver5's instructions, caches and costs, with the clock and the read
+# bandwidths that one core of a Ryzen 9 9950X3D measures, to two significant digits.
+base = "znver5"
+description = "One core of an AMD Ryzen 9 9950X3D, with its measured clock and read bandwidth"
+clock_hz = 4.3e9
+
+# One core, with the 96 MiB L3 of the part to itself. A list of tables replaces the base's whole,
+# so the memories restate znver5's.
+[[level]]
+name = "l3"
+units = 1
+
+[[level]]
+name = "core"
+units = 1
+
+[[memory]]
+name = "registers"
+kind = "registers"
+level = "core"
+
+[[memory]]
+name = "l1"
+kind = "cache"
+bytes = 49152
+level = "core"
+line = 64
+ways = 12
+space = "private"
+prefetch = "t0"
+
+[[memory]]
+name = "l2"
+kind = "cache"
+bytes = 1048576
+level = "core"
+line = 64
+ways = 16
+space = "private"
+prefetch = "t1"
+
+[[memory]]
+name = "l3"
+kind = "cache"
+bytes = 100663296
+level = "l3"
+line = 64
+ways = 16
+space = "private"
+prefetch = "t2"
+
+[[memory]]
+name = "dram"
+kind = "main"
+
+[[bandwidth]]
+memory = "dram"
+domains = 1
+cores_per_domain = [1]
+read_bytes_per_s = [6.0e10]
+
+[[bandwidth]]
+memory = "l3"
+domains = 1
+cores_per_domain = [1]
+read_bytes_per_s = [1.3e11]
+
+[[bandwidth]]
+memory = "l2"
+domains = 1
+cores_per_domain = [1]
+read_bytes_per_s = [2.7e11]

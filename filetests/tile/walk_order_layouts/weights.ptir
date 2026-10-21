@@ -1,0 +1,100 @@
+// RUN: pass walk-order-layouts
+
+// The weight of a convolution, transposed by a dispatch of its own from the checkpoint, which the
+// convolution alone reads. The convolution's modes walk the weight's output channels in pieces of
+// 32, then the kernel rows, the kernel columns and the input channels, and in the register tile the
+// 32 output channels of a piece: the transpose computes the weight in that order, reading each
+// output channel of the checkpoint at its piece and place in it, and the convolution reads it
+// there. The dispatches that no call names any more are erased.
+// CHECK-NOT: tile.dispatch @transpose
+// CHECK-NOT: tile.dispatch @conv
+// CHECK: tile.dispatch [[TRANSPOSE:@dispatch\.[0-9a-f]+]]({{%[0-9]+}}: tensor<64x8x3x3xf32>) -> tensor<2x3x3x8x32xf32>
+// CHECK-NEXT: tile.block({{%[0-9]+}}) {iters = [par 2, par 3, par 3, par 8, par 32], reads = [$0[d0 * 32 + d4, d3, d1, d2]], folds = [none -> [d0, d1, d2, d3, d4]]} ({
+// CHECK: tile.dispatch [[CONV:@dispatch\.[0-9a-f]+]]({{%[0-9]+}}: tensor<1x2x7x8xf32>, {{%[0-9]+}}: tensor<2x3x3x8x32xf32>) -> tensor<1x2x7x64xf32>
+// CHECK-NEXT: reads = [$0[0, d0 + d3 - 1, d1 + d4 - 1, d5] pad 0.0, $1[d2 floordiv 32, d3, d4, d5, d2 mod 32]]
+// CHECK: [[TRANSPOSED:%[0-9]+]] = host.dispatch({{%[0-9]+}}) {callee = [[TRANSPOSE]]}
+// CHECK-NEXT: host.dispatch({{%[0-9]+}}, [[TRANSPOSED]]) {callee = [[CONV]]}
+tile.dispatch @transpose(%weight: tensor<64x8x3x3xf32>) -> tensor<8x3x3x64xf32> attributes {numerics = <contract = true, skip_pad = true>} {
+  %transposed = tile.block(%weight) {iters = [par 8, par 3, par 3, par 64], reads = [$0[d3, d0, d1, d2]], folds = [none -> [d0, d1, d2, d3]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<64x8x3x3xf32>) -> tensor<8x3x3x64xf32>
+  func.return(%transposed) : (tensor<8x3x3x64xf32>) -> ()
+}
+tile.dispatch @conv(%input: tensor<1x2x7x8xf32>, %weight: tensor<8x3x3x64xf32>) -> tensor<1x2x7x64xf32> attributes {numerics = <contract = true, skip_pad = true>} {
+  %output = tile.block(%input, %weight) {iters = [par 2, par 7, par 64, red 3, red 3, red 8], reads = [$0[0, d0 + d3 - 1, d1 + d4 - 1, d5] pad 0.0, $1[d5, d3, d4, d2]], folds = [sum -> [0, d0, d1, d2]], loops = [d2 by 32, d0 by 1, d3 by 1, d4 by 1, d5 by 1, d1 by 7 : reg, d2 by 32 : reg, d2 by 16 : lanes], clip = [d0, d1, d3, d4]} ({
+  ^body(%pixel: f32, %tap: f32):
+    %term = arith.mul(%pixel, %tap) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<1x2x7x8xf32>, tensor<8x3x3x64xf32>) -> tensor<1x2x7x64xf32>
+  func.return(%output) : (tensor<1x2x7x64xf32>) -> ()
+}
+func.func @main(%input: tensor<1x2x7x8xf32>, %weight: tensor<64x8x3x3xf32> {param = 7}) -> tensor<1x2x7x64xf32> {
+  %transposed = host.dispatch(%weight) {callee = @transpose} : (tensor<64x8x3x3xf32>) -> tensor<8x3x3x64xf32>
+  %output = host.dispatch(%input, %transposed) {callee = @conv} : (tensor<1x2x7x8xf32>, tensor<8x3x3x64xf32>) -> tensor<1x2x7x64xf32>
+  func.return(%output) : (tensor<1x2x7x64xf32>) -> ()
+}
+
+// -----
+
+// Positions computed before the run by a block whose body takes its iterator through a
+// `tile.index`, which `@shift` alone reads: the index names the producer's iterators, the
+// coordinates of its result, so laying the positions out in the walk order of `@shift` would
+// change what it names. The layout stays.
+// CHECK: tile.block() {iters = [par 3, par 64], reads = [], folds = [none -> [d0, d1]]} ({
+// CHECK: reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d1 by 32, d0 by 3 : reg, d1 by 32 : reg, d1 by 16 : lanes]
+tile.dispatch @positions() -> tensor<3x64xsi32> attributes {numerics = <contract = true, skip_pad = true>} {
+  %positions = tile.block() {iters = [par 3, par 64], reads = [], folds = [none -> [d0, d1]]} ({
+  ^body():
+    %position = tile.index() {expr = d1, dtype = si32} : () -> si32
+    tile.yield(%position) : (si32) -> ()
+  }) : () -> tensor<3x64xsi32>
+  func.return(%positions) : (tensor<3x64xsi32>) -> ()
+}
+tile.dispatch @shift(%positions: tensor<3x64xsi32>) -> tensor<3x64xsi32> attributes {numerics = <contract = true, skip_pad = true>} {
+  %shifted = tile.block(%positions) {iters = [par 3, par 64], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d1 by 32, d0 by 3 : reg, d1 by 32 : reg, d1 by 16 : lanes]} ({
+  ^body(%position: si32):
+    %one = arith.constant() {value = 1 : si32} : () -> si32
+    %next = arith.add(%position, %one) : (si32, si32) -> si32
+    tile.yield(%next) : (si32) -> ()
+  }) : (tensor<3x64xsi32>) -> tensor<3x64xsi32>
+  func.return(%shifted) : (tensor<3x64xsi32>) -> ()
+}
+func.func @main() -> tensor<3x64xsi32> {
+  %positions = host.dispatch() {callee = @positions} : () -> tensor<3x64xsi32>
+  %shifted = host.dispatch(%positions) {callee = @shift} : (tensor<3x64xsi32>) -> tensor<3x64xsi32>
+  func.return(%shifted) : (tensor<3x64xsi32>) -> ()
+}
+
+// -----
+
+// The weight of a 1x1 convolution, transposed from the checkpoint by a block that writes its two
+// axes of one point at 0. The convolution walks its output channels in pieces of 32, then the
+// input channels, and in the register tile the 32 channels of a piece: the transpose computes the
+// weight in that order, the axes of one point gone, and the convolution reads it there.
+// CHECK: tile.dispatch [[TRANSPOSE:@dispatch\.[0-9a-f]+]]({{%[0-9]+}}: tensor<64x8x1x1xf32>) -> tensor<2x8x32xf32>
+// CHECK-NEXT: tile.block({{%[0-9]+}}) {iters = [par 2, par 8, par 32], reads = [$0[d0 * 32 + d2, d1, 0, 0]], folds = [none -> [d0, d1, d2]]} ({
+// CHECK: tile.dispatch [[POINTWISE:@dispatch\.[0-9a-f]+]]({{%[0-9]+}}: tensor<1x2x7x8xf32>, {{%[0-9]+}}: tensor<2x8x32xf32>) -> tensor<1x2x7x64xf32>
+// CHECK-NEXT: reads = [$0[0, d0, d1, d3], $1[d2 floordiv 32, d3, d2 mod 32]]
+// CHECK: [[TRANSPOSED:%[0-9]+]] = host.dispatch({{%[0-9]+}}) {callee = [[TRANSPOSE]]}
+// CHECK-NEXT: host.dispatch({{%[0-9]+}}, [[TRANSPOSED]]) {callee = [[POINTWISE]]}
+tile.dispatch @transpose(%weight: tensor<64x8x1x1xf32>) -> tensor<8x1x1x64xf32> attributes {numerics = <contract = true, skip_pad = true>} {
+  %transposed = tile.block(%weight) {iters = [par 8, par 64], reads = [$0[d1, d0, 0, 0]], folds = [none -> [d0, 0, 0, d1]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<64x8x1x1xf32>) -> tensor<8x1x1x64xf32>
+  func.return(%transposed) : (tensor<8x1x1x64xf32>) -> ()
+}
+tile.dispatch @pointwise(%input: tensor<1x2x7x8xf32>, %weight: tensor<8x1x1x64xf32>) -> tensor<1x2x7x64xf32> attributes {numerics = <contract = true, skip_pad = true>} {
+  %output = tile.block(%input, %weight) {iters = [par 2, par 7, par 64, red 8], reads = [$0[0, d0, d1, d3], $1[d3, 0, 0, d2]], folds = [sum -> [0, d0, d1, d2]], loops = [d2 by 32, d0 by 1, d3 by 1, d1 by 7 : reg, d2 by 32 : reg, d2 by 16 : lanes]} ({
+  ^body(%pixel: f32, %tap: f32):
+    %term = arith.mul(%pixel, %tap) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<1x2x7x8xf32>, tensor<8x1x1x64xf32>) -> tensor<1x2x7x64xf32>
+  func.return(%output) : (tensor<1x2x7x64xf32>) -> ()
+}
+func.func @main(%input: tensor<1x2x7x8xf32>, %weight: tensor<64x8x1x1xf32> {param = 7}) -> tensor<1x2x7x64xf32> {
+  %transposed = host.dispatch(%weight) {callee = @transpose} : (tensor<64x8x1x1xf32>) -> tensor<8x1x1x64xf32>
+  %output = host.dispatch(%input, %transposed) {callee = @pointwise} : (tensor<1x2x7x8xf32>, tensor<8x1x1x64xf32>) -> tensor<1x2x7x64xf32>
+  func.return(%output) : (tensor<1x2x7x64xf32>) -> ()
+}

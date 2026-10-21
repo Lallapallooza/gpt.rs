@@ -1,0 +1,107 @@
+// RUN: pass schedule {target = "%S/npu-shaped.toml"}
+
+// The weight, 8 KiB, which every tile of rows reads, fills the SRAM: it is copied there once, and
+// the tiles read that copy rather than DRAM.
+// CHECK: reads = [$0[d0, d2], $1[d2, d1] held copy<level = sram>], folds = [sum -> [d0, d1]], loops = [d1 by 64, d0 by 6, d2 by 1, d0 by 6 : reg, d1 by 64 : reg, d1 by 16 : lanes]
+tile.dispatch @projection(%input: tensor<32x16xf32>, %weight: tensor<16x128xf32>) -> tensor<32x128xf32> attributes {target = "%S/npu-shaped.toml@6916047f", numerics = <contract = true, skip_pad = true>} {
+  %product = tile.block(%input, %weight) {iters = [par 32, par 128, red 16], reads = [$0[d0, d2], $1[d2, d1]], folds = [sum -> [d0, d1]], loops = [d0 by 1, d1 by 16, d2 by 1, d1 by 16 : lanes]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<32x16xf32>, tensor<16x128xf32>) -> tensor<32x128xf32>
+  func.return(%product) : (tensor<32x128xf32>) -> ()
+}
+func.func @main(%input: tensor<32x16xf32>, %weight: tensor<16x128xf32>) -> tensor<32x128xf32> {
+  %result = host.dispatch(%input, %weight) {callee = @projection} : (tensor<32x16xf32>, tensor<16x128xf32>) -> tensor<32x128xf32>
+  func.return(%result) : (tensor<32x128xf32>) -> ()
+}
+
+// -----
+
+// Every element is read once, so nothing is copied.
+// CHECK: reads = [$0[d1, d0]], folds = [sum -> [d0]], loops = [d0 by 64, d1 by 1, d0 by 64 : reg, d0 by 16 : lanes]
+tile.dispatch @row_sums(%input: tensor<64x256xf32>) -> tensor<256xf32> attributes {target = "%S/npu-shaped.toml@6916047f", numerics = <contract = true, skip_pad = true>} {
+  %sums = tile.block(%input) {iters = [par 256, red 64], reads = [$0[d1, d0]], folds = [sum -> [d0]], loops = [d0 by 16, d1 by 1, d0 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<64x256xf32>) -> tensor<256xf32>
+  func.return(%sums) : (tensor<256xf32>) -> ()
+}
+func.func @main(%input: tensor<64x256xf32>) -> tensor<256xf32> {
+  %result = host.dispatch(%input) {callee = @row_sums} : (tensor<64x256xf32>) -> tensor<256xf32>
+  func.return(%result) : (tensor<256xf32>) -> ()
+}
+
+// -----
+
+// The factor, which the 5 tiles of rows read, is copied once.
+// CHECK: reads = [$0[d0, d1], $1[d1] held copy<level = sram>], folds = [none -> [d0, d1]], loops = [d1 by 16, d0 by 13, d0 by 13 : reg, d1 by 16 : lanes]
+tile.dispatch @scale(%input: tensor<64x256xf32>, %factor: tensor<256xf32>) -> tensor<64x256xf32> attributes {target = "%S/npu-shaped.toml@6916047f", numerics = <contract = true, skip_pad = true>} {
+  %scaled = tile.block(%input, %factor) {iters = [par 64, par 256], reads = [$0[d0, d1], $1[d1]], folds = [none -> [d0, d1]], loops = [d0 by 1, d1 by 16, d1 by 16 : lanes]} ({
+  ^body(%element: f32, %by: f32):
+    %product = arith.mul(%element, %by) : (f32, f32) -> f32
+    tile.yield(%product) : (f32) -> ()
+  }) : (tensor<64x256xf32>, tensor<256xf32>) -> tensor<64x256xf32>
+  func.return(%scaled) : (tensor<64x256xf32>) -> ()
+}
+func.func @main(%input: tensor<64x256xf32>, %factor: tensor<256xf32>) -> tensor<64x256xf32> {
+  %result = host.dispatch(%input, %factor) {callee = @scale} : (tensor<64x256xf32>, tensor<256xf32>) -> tensor<64x256xf32>
+  func.return(%result) : (tensor<64x256xf32>) -> ()
+}
+
+// -----
+
+// The input, which the taps read again, is copied into SRAM before the loops, 448 bytes; the
+// weight is read once. A tile of the 7 columns by 2 vectors loads the fewest vectors of the tiles
+// that fit the registers beside the one that holds the input's pad.
+// CHECK: reads = [$0[0, d0 + d3 - 1, d1 + d4 - 1, d5] pad 0.0 held copy<level = sram>, $1[d5, d3, d4, d2]], folds = [sum -> [0, d0, d1, d2]], loops = [d0 by 1, d3 by 1, d4 by 1, d5 by 1, d1 by 7 : reg, d2 by 32 : reg, d2 by 16 : lanes]
+tile.dispatch @conv(%input: tensor<1x2x7x8xf32>, %weight: tensor<8x3x3x32xf32>) -> tensor<1x2x7x32xf32> attributes {target = "%S/npu-shaped.toml@6916047f", numerics = <contract = true, skip_pad = true>} {
+  %output = tile.block(%input, %weight) {iters = [par 2, par 7, par 32, red 3, red 3, red 8], reads = [$0[0, d0 + d3 - 1, d1 + d4 - 1, d5] pad 0.0, $1[d5, d3, d4, d2]], folds = [sum -> [0, d0, d1, d2]], loops = [d0 by 1, d1 by 1, d2 by 16, d3 by 1, d4 by 1, d5 by 1, d2 by 16 : lanes]} ({
+  ^body(%pixel: f32, %tap: f32):
+    %term = arith.mul(%pixel, %tap) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<1x2x7x8xf32>, tensor<8x3x3x32xf32>) -> tensor<1x2x7x32xf32>
+  func.return(%output) : (tensor<1x2x7x32xf32>) -> ()
+}
+func.func @main(%input: tensor<1x2x7x8xf32>, %weight: tensor<8x3x3x32xf32>) -> tensor<1x2x7x32xf32> {
+  %result = host.dispatch(%input, %weight) {callee = @conv} : (tensor<1x2x7x8xf32>, tensor<8x3x3x32xf32>) -> tensor<1x2x7x32xf32>
+  func.return(%result) : (tensor<1x2x7x32xf32>) -> ()
+}
+
+// -----
+
+// The input, which the taps read again, and the weight, which every row reads, are copied before
+// the loops. Tiles of the 7 columns by 3 rows of one vector, the channels' 2 vectors in a loop
+// outside, load the fewest vectors, 936 against 1,008 for the 7 columns of one row by 2 vectors.
+// CHECK: reads = [$0[0, d0 + d3 - 1, d1 + d4 - 1, d2] pad 0.0 held copy<level = sram>, $1[0, 0, d3, d4, d2] held copy<level = sram>], folds = [sum -> [0, d0, d1, d2]], loops = [d2 by 16, d0 by 3, d3 by 1, d4 by 1, d1 by 7 : reg, d0 by 3 : reg, d2 by 16 : lanes]
+tile.dispatch @depthwise(%input: tensor<1x7x7x32xf32>, %weight: tensor<1x1x3x3x32xf32>) -> tensor<1x7x7x32xf32> attributes {target = "%S/npu-shaped.toml@6916047f", numerics = <contract = true, skip_pad = true>} {
+  %output = tile.block(%input, %weight) {iters = [par 7, par 7, par 32, red 3, red 3], reads = [$0[0, d0 + d3 - 1, d1 + d4 - 1, d2] pad 0.0, $1[0, 0, d3, d4, d2]], folds = [sum -> [0, d0, d1, d2]], loops = [d0 by 1, d1 by 1, d2 by 16, d3 by 1, d4 by 1, d2 by 16 : lanes]} ({
+  ^body(%pixel: f32, %tap: f32):
+    %term = arith.mul(%pixel, %tap) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<1x7x7x32xf32>, tensor<1x1x3x3x32xf32>) -> tensor<1x7x7x32xf32>
+  func.return(%output) : (tensor<1x7x7x32xf32>) -> ()
+}
+func.func @main(%input: tensor<1x7x7x32xf32>, %weight: tensor<1x1x3x3x32xf32>) -> tensor<1x7x7x32xf32> {
+  %result = host.dispatch(%input, %weight) {callee = @depthwise} : (tensor<1x7x7x32xf32>, tensor<1x1x3x3x32xf32>) -> tensor<1x7x7x32xf32>
+  func.return(%result) : (tensor<1x7x7x32xf32>) -> ()
+}
+
+// -----
+
+// The product of a weight stored `[out, in]`, the lanes along the reduction: both operands, which
+// the tiles read again, are copied into SRAM before the loops, and the register tile holds 6
+// outputs by 4 rows of the reduction's lanes, as on one core.
+// CHECK: reads = [$0[d0, d2 * 16 + d3] held copy<level = sram>, $1[d1, d2 * 16 + d3] held copy<level = sram>], folds = [sum -> [d0, d1, d3]], loops = [d1 by 6, d0 by 4, d2 by 1, d1 by 6 : reg, d0 by 4 : reg, d3 by 16 : lanes]
+tile.dispatch @projection(%input: tensor<8x64xf32>, %weight: tensor<12x64xf32>) -> tensor<8x12x16xf32> attributes {target = "%S/npu-shaped.toml@6916047f", numerics = <contract = true, skip_pad = true, reassoc = true>} {
+  %sums = tile.block(%input, %weight) {iters = [par 8, par 12, red 4, par 16], reads = [$0[d0, d2 * 16 + d3], $1[d1, d2 * 16 + d3]], folds = [sum -> [d0, d1, d3]], loops = [d0 by 1, d1 by 1, d2 by 1, d3 by 16 : lanes]} ({
+  ^body(%activation: f32, %coefficient: f32):
+    %term = arith.mul(%activation, %coefficient) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<8x64xf32>, tensor<12x64xf32>) -> tensor<8x12x16xf32>
+  func.return(%sums) : (tensor<8x12x16xf32>) -> ()
+}
+func.func @main(%input: tensor<8x64xf32>, %weight: tensor<12x64xf32>) -> tensor<8x12x16xf32> {
+  %sums = host.dispatch(%input, %weight) {callee = @projection} : (tensor<8x64xf32>, tensor<12x64xf32>) -> tensor<8x12x16xf32>
+  func.return(%sums) : (tensor<8x12x16xf32>) -> ()
+}

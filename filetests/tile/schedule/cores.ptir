@@ -1,0 +1,110 @@
+// RUN: pass schedule {target = "%S/sixteen-cores.toml"}
+
+// The 8 accumulators that cover the latency of the target's FMAs at their issue rate take tiles of
+// 8 rows by 2 vectors: a tile of 16 rows by one vector, which would move fewer bytes, broadcasts
+// more in a step than the load ports issue in the cycles of its FMAs. The 16 cores take 4 parts of
+// 32 lanes by 4 of 8 rows, one tile each, the iterator of the larger read, the weight, outermost.
+// CHECK: reads = [$0[d0, d2], $1[d2, d1]], folds = [sum -> [d0, d1]], loops = [d1 by 32 : workers<level = core>, d0 by 8 : workers<level = core>, d2 by 1, d0 by 8 : reg, d1 by 32 : reg, d1 by 16 : lanes]
+tile.dispatch @projection(%input: tensor<32x16xf32>, %weight: tensor<16x128xf32>) -> tensor<32x128xf32> attributes {numerics = <contract = true, skip_pad = true>} {
+  %product = tile.block(%input, %weight) {iters = [par 32, par 128, red 16], reads = [$0[d0, d2], $1[d2, d1]], folds = [sum -> [d0, d1]], loops = [d0 by 1, d1 by 16, d2 by 1, d1 by 16 : lanes]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<32x16xf32>, tensor<16x128xf32>) -> tensor<32x128xf32>
+  func.return(%product) : (tensor<32x128xf32>) -> ()
+}
+func.func @main(%input: tensor<32x16xf32>, %weight: tensor<16x128xf32>) -> tensor<32x128xf32> {
+  %result = host.dispatch(%input, %weight) {callee = @projection} : (tensor<32x16xf32>, tensor<16x128xf32>) -> tensor<32x128xf32>
+  func.return(%result) : (tensor<32x128xf32>) -> ()
+}
+
+// -----
+
+// Each core's 4 KiB arrive in L2 from L3 at 26 bytes a cycle while every core reads, slower than
+// its 64 adds at 2 a cycle, so one vector a tile covers the add's latency, and the 16 cores take
+// one tile of 16 lanes each, the fewest bytes for the busiest core.
+// CHECK: reads = [$0[d1, d0]], folds = [sum -> [d0]], loops = [d0 by 16 : workers<level = core>, d1 by 1, d0 by 16 : lanes]
+tile.dispatch @row_sums(%input: tensor<64x256xf32>) -> tensor<256xf32> attributes {numerics = <contract = true, skip_pad = true>} {
+  %sums = tile.block(%input) {iters = [par 256, red 64], reads = [$0[d1, d0]], folds = [sum -> [d0]], loops = [d0 by 16, d1 by 1, d0 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<64x256xf32>) -> tensor<256xf32>
+  func.return(%sums) : (tensor<256xf32>) -> ()
+}
+func.func @main(%input: tensor<64x256xf32>) -> tensor<256xf32> {
+  %result = host.dispatch(%input) {callee = @row_sums} : (tensor<64x256xf32>) -> tensor<256xf32>
+  func.return(%result) : (tensor<256xf32>) -> ()
+}
+
+// -----
+
+// Each core's 9,472 bytes, most of them the weight, arrive in L2 from L3 at 26 bytes a cycle while
+// every core reads, so that its 288 FMAs run at 0.8 a cycle, at which 4 accumulators cover the
+// FMA's latency of 4 cycles. Tiles of 2 columns by both vectors of the 32 channels let 8 cores take
+// one each, the 2 rows by 4 parts of the columns, and the weight that all of them read comes into
+// their L3 domain once: 1,408 bytes for the busiest core, the fewest.
+// CHECK: reads = [$0[0, d0 + d3 - 1, d1 + d4 - 1, d5] pad 0.0, $1[d5, d3, d4, d2]], folds = [sum -> [0, d0, d1, d2]], loops = [d0 by 1 : workers<level = core>, d1 by 2 : workers<level = core>, d3 by 1, d4 by 1, d5 by 1, d1 by 2 : reg, d2 by 32 : reg, d2 by 16 : lanes], clip = [d0, d1, d3, d4]
+tile.dispatch @conv(%input: tensor<1x2x7x8xf32>, %weight: tensor<8x3x3x32xf32>) -> tensor<1x2x7x32xf32> attributes {numerics = <contract = true, skip_pad = true>} {
+  %output = tile.block(%input, %weight) {iters = [par 2, par 7, par 32, red 3, red 3, red 8], reads = [$0[0, d0 + d3 - 1, d1 + d4 - 1, d5] pad 0.0, $1[d5, d3, d4, d2]], folds = [sum -> [0, d0, d1, d2]], loops = [d0 by 1, d1 by 1, d2 by 16, d3 by 1, d4 by 1, d5 by 1, d2 by 16 : lanes]} ({
+  ^body(%pixel: f32, %tap: f32):
+    %term = arith.mul(%pixel, %tap) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<1x2x7x8xf32>, tensor<8x3x3x32xf32>) -> tensor<1x2x7x32xf32>
+  func.return(%output) : (tensor<1x2x7x32xf32>) -> ()
+}
+func.func @main(%input: tensor<1x2x7x8xf32>, %weight: tensor<8x3x3x32xf32>) -> tensor<1x2x7x32xf32> {
+  %result = host.dispatch(%input, %weight) {callee = @conv} : (tensor<1x2x7x8xf32>, tensor<8x3x3x32xf32>) -> tensor<1x2x7x32xf32>
+  func.return(%result) : (tensor<1x2x7x32xf32>) -> ()
+}
+
+// -----
+
+// Alone, the depthwise convolution splits its 2 tiles of 16 channels first, then 8 parts of 2
+// rows: a core reads 4 rows of 16 channels with the window's halo, 2 KiB, where a core that takes
+// one row of all 32 channels reads 3 rows, 3 KiB. A core's tile is its 8 columns by its 2 rows,
+// which loads each weight vector once for 16 points: 153 loads, against 162 a row at a time.
+// CHECK: reads = [$0[0, d0 + d3 - 1, d1 + d4 - 1, d2] pad 0.0, $1[0, 0, d3, d4, d2]], folds = [sum -> [0, d0, d1, d2]], loops = [d2 by 16 : workers<level = core>, d0 by 2 : workers<level = core>, d3 by 1, d4 by 1, d1 by 8 : reg, d0 by 2 : reg, d2 by 16 : lanes], clip = [d0, d1, d3, d4]
+tile.dispatch @depthwise(%input: tensor<1x16x8x32xf32>, %weight: tensor<1x1x3x3x32xf32>) -> tensor<1x16x8x32xf32> attributes {numerics = <contract = true, skip_pad = true>} {
+  %output = tile.block(%input, %weight) {iters = [par 16, par 8, par 32, red 3, red 3], reads = [$0[0, d0 + d3 - 1, d1 + d4 - 1, d2] pad 0.0, $1[0, 0, d3, d4, d2]], folds = [sum -> [0, d0, d1, d2]], loops = [d0 by 1, d1 by 1, d2 by 16, d3 by 1, d4 by 1, d2 by 16 : lanes]} ({
+  ^body(%pixel: f32, %tap: f32):
+    %term = arith.mul(%pixel, %tap) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<1x16x8x32xf32>, tensor<1x1x3x3x32xf32>) -> tensor<1x16x8x32xf32>
+  func.return(%output) : (tensor<1x16x8x32xf32>) -> ()
+}
+func.func @main(%input: tensor<1x16x8x32xf32>, %weight: tensor<1x1x3x3x32xf32>) -> tensor<1x16x8x32xf32> {
+  %result = host.dispatch(%input, %weight) {callee = @depthwise} : (tensor<1x16x8x32xf32>, tensor<1x1x3x3x32xf32>) -> tensor<1x16x8x32xf32>
+  func.return(%result) : (tensor<1x16x8x32xf32>) -> ()
+}
+
+// -----
+
+// After a block that splits its rows among the cores, one each, the same convolution splits its
+// rows too, 8 parts of 2 rows by its 2 tiles of 16 channels: the cores of each L3 domain read the
+// rows that the cores of the domain wrote, but for a halo row at the edge of the domains, of which
+// a core reads half the channels, 656 bytes from outside its domain against 1,168 for a row of all
+// channels; the split of the channels first would have each domain read every row, half of them
+// written in the other domain. A core's tile is its 8 columns by its 2 rows, as alone.
+// CHECK: reads = [$0[0, d0, d1, d2]], folds = [none -> [0, d0, d1, d2]], loops = [d0 by 1 : workers<level = core>, d1 by 1, d2 by 16, d2 by 16 : lanes]
+// CHECK: reads = [$0[0, d0 + d3 - 1, d1 + d4 - 1, d2] pad 0.0, $1[0, 0, d3, d4, d2]], folds = [sum -> [0, d0, d1, d2]], loops = [d0 by 2 : workers<level = core>, d2 by 16 : workers<level = core>, d3 by 1, d4 by 1, d1 by 8 : reg, d0 by 2 : reg, d2 by 16 : lanes], clip = [d0, d1, d3, d4]
+tile.dispatch @square(%input: tensor<1x16x8x32xf32>) -> tensor<1x16x8x32xf32> attributes {numerics = <contract = true, skip_pad = true>} {
+  %squares = tile.block(%input) {iters = [par 16, par 8, par 32], reads = [$0[0, d0, d1, d2]], folds = [none -> [0, d0, d1, d2]], loops = [d0 by 1, d1 by 1, d2 by 16, d2 by 16 : lanes]} ({
+  ^body(%pixel: f32):
+    %square = arith.mul(%pixel, %pixel) : (f32, f32) -> f32
+    tile.yield(%square) : (f32) -> ()
+  }) : (tensor<1x16x8x32xf32>) -> tensor<1x16x8x32xf32>
+  func.return(%squares) : (tensor<1x16x8x32xf32>) -> ()
+}
+tile.dispatch @depthwise(%input: tensor<1x16x8x32xf32>, %weight: tensor<1x1x3x3x32xf32>) -> tensor<1x16x8x32xf32> attributes {numerics = <contract = true, skip_pad = true>} {
+  %output = tile.block(%input, %weight) {iters = [par 16, par 8, par 32, red 3, red 3], reads = [$0[0, d0 + d3 - 1, d1 + d4 - 1, d2] pad 0.0, $1[0, 0, d3, d4, d2]], folds = [sum -> [0, d0, d1, d2]], loops = [d0 by 1, d1 by 1, d2 by 16, d3 by 1, d4 by 1, d2 by 16 : lanes]} ({
+  ^body(%pixel: f32, %tap: f32):
+    %term = arith.mul(%pixel, %tap) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<1x16x8x32xf32>, tensor<1x1x3x3x32xf32>) -> tensor<1x16x8x32xf32>
+  func.return(%output) : (tensor<1x16x8x32xf32>) -> ()
+}
+func.func @main(%input: tensor<1x16x8x32xf32>, %weight: tensor<1x1x3x3x32xf32>) -> tensor<1x16x8x32xf32> {
+  %squares = host.dispatch(%input) {callee = @square} : (tensor<1x16x8x32xf32>) -> tensor<1x16x8x32xf32>
+  %result = host.dispatch(%squares, %weight) {callee = @depthwise} : (tensor<1x16x8x32xf32>, tensor<1x1x3x3x32xf32>) -> tensor<1x16x8x32xf32>
+  func.return(%result) : (tensor<1x16x8x32xf32>) -> ()
+}

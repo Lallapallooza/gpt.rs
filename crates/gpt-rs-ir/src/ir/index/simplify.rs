@@ -2,7 +2,7 @@
 //! its values.
 
 use super::expr::{pop, Node};
-use super::{BinaryOp, Expr, ReadKind, Root};
+use super::{gcd, BinaryOp, Expr, ReadKind, Root};
 use crate::ir::Dim;
 
 impl<R: ReadKind> Expr<R> {
@@ -455,7 +455,7 @@ fn factor_out<R: ReadKind>(
     let divisor = constant_divisor.filter(|&value| value > 1)?;
     let mut factors = Vec::new();
     for &(_, coefficient) in &dividend.terms {
-        let factor = gcd(divisor, coefficient);
+        let factor = gcd(divisor.unsigned_abs(), coefficient.unsigned_abs()) as i64;
         if factor > 1 && factor < divisor && !factors.contains(&factor) {
             factors.push(factor);
         }
@@ -477,15 +477,6 @@ fn factor_out<R: ReadKind>(
         }
     }
     None
-}
-
-/// The greatest common divisor of `lhs` and `rhs`, positive.
-fn gcd(lhs: i64, rhs: i64) -> i64 {
-    let (mut larger, mut smaller) = (lhs.unsigned_abs(), rhs.unsigned_abs());
-    while smaller != 0 {
-        (larger, smaller) = (smaller, larger % smaller);
-    }
-    larger as i64
 }
 
 /// The canonical linear form of `min(lhs, rhs)` when `is_min`, else of `max(lhs, rhs)`.

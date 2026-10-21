@@ -1,0 +1,28 @@
+# An NPU's levels and memories on znver5's instructions, so that the rule of each memory shows on
+# them: one core; its registers; 8 KiB of SRAM, which the code fills through a DMA engine; and
+# DRAM, whose buffers start at multiples of 16 bytes, as the DMA engine of an NPU such as
+# Arm's Ethos-U asks of the tensors it moves.
+base = "znver5"
+description = "An NPU's levels and memories on znver5's instructions"
+
+[[level]]
+name = "core"
+units = 1
+
+[[memory]]
+name = "registers"
+kind = "registers"
+level = "core"
+
+[[memory]]
+name = "sram"
+kind = "scratch"
+bytes = 8192
+level = "core"
+space = "private"
+fill = "dma"
+
+[[memory]]
+name = "dram"
+kind = "main"
+alignment = 16

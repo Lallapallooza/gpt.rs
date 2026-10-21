@@ -1,0 +1,38 @@
+// RUN: pass plan-layouts
+
+// A projection whose lanes run along its output's columns reads a weight, scaled before the run,
+// whose rows are the output's columns: it reads a copy that holds the weight's rows last, which
+// `canonicalize` then folds into the scaling, so that the scaled weight is written that way.
+// CHECK: [[SCALED:%[0-9]+]] = tile.block({{%[0-9]+}}, {{%[0-9]+}}) {iters = [par 32, par 8], reads = [$0[d0, d1], $1[d0]], folds = [none -> [d0, d1]]} ({
+// CHECK: [[COLUMNS_LAST:%[0-9]+]] = tile.block([[SCALED]]) {iters = [par 8, par 32], reads = [$0[d1, d0]], folds = [none -> [d0, d1]]} ({
+// CHECK-NEXT: ^body([[ELEMENT:%[0-9]+]]: f32):
+// CHECK-NEXT: tile.yield([[ELEMENT]]) : (f32) -> ()
+// CHECK-NEXT: }) : (tensor<32x8xf32>) -> tensor<8x32xf32>
+// CHECK-NEXT: {{%[0-9]+}} = tile.block({{%[0-9]+}}, [[COLUMNS_LAST]]) {iters = [par 4, par 32, red 8], reads = [$0[d0, d2], $1[d2, d1]], folds = [sum -> [d0, d1]]} ({
+func.func @project(%input: tensor<4x8xf32>, %weight: tensor<32x8xf32> {param = 1}, %scale: tensor<32xf32> {param = 2}) -> tensor<4x32xf32> {
+  %scaled = tile.block(%weight, %scale) {iters = [par 32, par 8], reads = [$0[d0, d1], $1[d0]], folds = [none -> [d0, d1]]} ({
+  ^body(%element: f32, %factor: f32):
+    %product = arith.mul(%element, %factor) : (f32, f32) -> f32
+    tile.yield(%product) : (f32) -> ()
+  }) : (tensor<32x8xf32>, tensor<32xf32>) -> tensor<32x8xf32>
+  %projected = tile.block(%input, %scaled) {iters = [par 4, par 32, red 8], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
+  ^body(%activation: f32, %coefficient: f32):
+    %term = arith.mul(%activation, %coefficient) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<4x8xf32>, tensor<32x8xf32>) -> tensor<4x32xf32>
+  func.return(%projected) : (tensor<4x32xf32>) -> ()
+}
+
+// -----
+
+// A weight of the checkpoint keeps its layout: a copy would hold it in memory twice.
+// CHECK: tile.block({{%[0-9]+}}, {{%[0-9]+}}) {iters = [par 4, par 32, red 8], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
+// CHECK-NOT: tile.block
+func.func @checkpoint(%input: tensor<4x8xf32>, %weight: tensor<32x8xf32> {param = 1}) -> tensor<4x32xf32> {
+  %projected = tile.block(%input, %weight) {iters = [par 4, par 32, red 8], reads = [$0[d0, d2], $1[d1, d2]], folds = [sum -> [d0, d1]]} ({
+  ^body(%activation: f32, %coefficient: f32):
+    %term = arith.mul(%activation, %coefficient) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<4x8xf32>, tensor<32x8xf32>) -> tensor<4x32xf32>
+  func.return(%projected) : (tensor<4x32xf32>) -> ()
+}

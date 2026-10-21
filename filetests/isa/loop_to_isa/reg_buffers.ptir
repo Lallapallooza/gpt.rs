@@ -108,7 +108,7 @@ loop.func @uneven(%input: !loop.buf<16xf32, global>) attributes {access = [in], 
 
 // -----
 
-// A `reg` buffer of two registers that an atom writes from its eighth element: a register that
+// A `reg` buffer of two registers that an atom writes from element 8: a vector that
 // straddles the two.
 // ERROR: loop-to-isa {target = "x86-64-v4"}: loop.func @straddle: isa.store at loc("" via ["loop-to-isa"("loop.store":{{[0-9]+}})]) reaches a reg buffer of !loop.buf<32xf32, reg>, by a vector that straddles two of its registers or lies outside it
 loop.func @straddle(%input: !loop.buf<16xf32, global>) attributes {access = [in], target = "x86-64-v4@3928f7d3"} {

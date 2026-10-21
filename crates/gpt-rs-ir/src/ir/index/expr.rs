@@ -609,6 +609,15 @@ impl<R: ReadKind> fmt::Debug for Expr<R> {
     }
 }
 
+/// The greatest common divisor of `first` and `second`, `first` where `second` is 0.
+pub fn gcd(first: u64, second: u64) -> u64 {
+    let (mut larger, mut smaller) = (first, second);
+    while smaller != 0 {
+        (larger, smaller) = (smaller, larger % smaller);
+    }
+    larger
+}
+
 /// An iterator of a block by its position, written `d` and the position: `d2`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct IterRef(u8);

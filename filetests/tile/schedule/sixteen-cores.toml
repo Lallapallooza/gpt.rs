@@ -1,0 +1,37 @@
+# The cores of `one-core.toml`, 16 of them in 2 domains of 8 that share an L3, with read bandwidths
+# for several cores reading at once. Each core reads its own L2 at the rate one does. The cores of
+# a domain share its L3's bandwidth, and all the cores share DRAM's.
+base = "one-core.toml"
+description = "16 cores of one-core.toml in two domains of 8, with read bandwidths for several cores"
+
+[[level]]
+name = "l3"
+units = 2
+
+[[level]]
+name = "core"
+units = 16
+
+[[bandwidth]]
+memory = "dram"
+domains = 1
+cores_per_domain = [1, 2, 4, 8]
+read_bytes_per_s = [6.0e10, 7.0e10, 7.5e10, 7.5e10]
+
+[[bandwidth]]
+memory = "dram"
+domains = 2
+cores_per_domain = [1, 2, 4, 8]
+read_bytes_per_s = [7.5e10, 8.0e10, 8.0e10, 8.0e10]
+
+[[bandwidth]]
+memory = "l3"
+domains = 1
+cores_per_domain = [1, 2, 4, 8]
+read_bytes_per_s = [1.3e11, 2.6e11, 5.0e11, 9.0e11]
+
+[[bandwidth]]
+memory = "l2"
+domains = 1
+cores_per_domain = [1]
+read_bytes_per_s = [2.7e11]

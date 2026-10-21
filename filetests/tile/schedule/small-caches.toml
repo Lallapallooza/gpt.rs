@@ -1,0 +1,52 @@
+# znver5's instructions and costs on one core with small caches, so that blocks of a few kilobytes
+# show the rule of each: an L1 of 2 KiB in 4 ways of 64-byte lines, 8 sets; an L2 of 8 KiB in 4
+# ways, 32 sets; an L3 of 16 KiB in 8 ways, 32 sets.
+base = "znver5"
+description = "One core of znver5 with caches of 2, 8 and 16 KiB"
+
+[[level]]
+name = "l3"
+units = 1
+
+[[level]]
+name = "core"
+units = 1
+
+[[memory]]
+name = "registers"
+kind = "registers"
+level = "core"
+
+[[memory]]
+name = "l1"
+kind = "cache"
+bytes = 2048
+level = "core"
+line = 64
+ways = 4
+space = "private"
+prefetch = "t0"
+
+[[memory]]
+name = "l2"
+kind = "cache"
+bytes = 8192
+level = "core"
+line = 64
+ways = 4
+space = "private"
+prefetch = "t1"
+
+[[memory]]
+name = "l3"
+kind = "cache"
+bytes = 16384
+level = "l3"
+line = 64
+ways = 8
+space = "private"
+prefetch = "t2"
+
+[[memory]]
+name = "dram"
+kind = "main"

@@ -236,8 +236,7 @@ loop.func @first_row(%input: !loop.buf<2x16xf32, global>, %output: !loop.buf<2x1
 // -----
 
 // A nearest-neighbour upsampling, in which each pair of lanes reads one element of the input. Its
-// index, `column floordiv 2`, is not a base plus a multiple of the lane, so no vector load reads
-// it.
+// index, `column floordiv 2`, is not a base plus a multiple of the lane: no vector load reads it.
 // ERROR: loop-to-isa {target = "x86-64-v4"}: loop.atom: failed to legalize: AtomToIsa: the index d0 floordiv 2 is not a multiple of the point's coordinates plus a base
 loop.func @upsample(%input: !loop.buf<8xf32, global>, %output: !loop.buf<16xf32, global>) attributes {access = [in, out], target = "x86-64-v4@3928f7d3"} {
   %columns = loop.index() {expr = 16} : () -> index

@@ -1,0 +1,145 @@
+// RUN: pass schedule {target = "%S/one-core.toml"}
+
+// Every read fits L1, so every tile moves each element into each cache once. Of the tiles whose
+// loads keep up with their FMAs, 6 rows by 4 vectors loads the fewest vectors: 112 per reduced
+// point.
+// CHECK: reads = [$0[d0, d2], $1[d2, d1]], folds = [sum -> [d0, d1]], loops = [d1 by 64, d0 by 6, d2 by 1, d0 by 6 : reg, d1 by 64 : reg, d1 by 16 : lanes]
+tile.dispatch @projection(%input: tensor<32x16xf32>, %weight: tensor<16x128xf32>) -> tensor<32x128xf32> attributes {numerics = <contract = true, skip_pad = true>} {
+  %product = tile.block(%input, %weight) {iters = [par 32, par 128, red 16], reads = [$0[d0, d2], $1[d2, d1]], folds = [sum -> [d0, d1]], loops = [d0 by 1, d1 by 16, d2 by 1, d1 by 16 : lanes]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<32x16xf32>, tensor<16x128xf32>) -> tensor<32x128xf32>
+  func.return(%product) : (tensor<32x128xf32>) -> ()
+}
+func.func @main(%input: tensor<32x16xf32>, %weight: tensor<16x128xf32>) -> tensor<32x128xf32> {
+  %result = host.dispatch(%input, %weight) {callee = @projection} : (tensor<32x16xf32>, tensor<16x128xf32>) -> tensor<32x128xf32>
+  func.return(%result) : (tensor<32x128xf32>) -> ()
+}
+
+// -----
+
+// The result takes the lanes' iterator alone, so the tile has no rows. Its 64 KiB arrive in L2
+// from L3 at 30 bytes a cycle, slower than its 1024 adds at 2 a cycle: at the 0.47 adds a cycle
+// that allows, one accumulator covers the add's latency of 2 cycles, and of the tiles that move
+// the same bytes one vector holds the fewest registers.
+// CHECK: reads = [$0[d1, d0]], folds = [sum -> [d0]], loops = [d0 by 16, d1 by 1, d0 by 16 : lanes]
+tile.dispatch @row_sums(%input: tensor<64x256xf32>) -> tensor<256xf32> attributes {numerics = <contract = true, skip_pad = true>} {
+  %sums = tile.block(%input) {iters = [par 256, red 64], reads = [$0[d1, d0]], folds = [sum -> [d0]], loops = [d0 by 16, d1 by 1, d0 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<64x256xf32>) -> tensor<256xf32>
+  func.return(%sums) : (tensor<256xf32>) -> ()
+}
+func.func @main(%input: tensor<64x256xf32>) -> tensor<256xf32> {
+  %result = host.dispatch(%input) {callee = @row_sums} : (tensor<64x256xf32>) -> tensor<256xf32>
+  func.return(%result) : (tensor<256xf32>) -> ()
+}
+
+// -----
+
+// The factor runs along the lanes alone, so a tile loads it once for all its rows. Tiles of 8
+// rows move the fewest bytes into L1, 66,560, the input and the factor once each, against 67,584
+// for tiles of 13 rows, which would load the factor least.
+// CHECK: reads = [$0[d0, d1], $1[d1]], folds = [none -> [d0, d1]], loops = [d1 by 16, d0 by 8, d0 by 8 : reg, d1 by 16 : lanes]
+tile.dispatch @scale(%input: tensor<64x256xf32>, %factor: tensor<256xf32>) -> tensor<64x256xf32> attributes {numerics = <contract = true, skip_pad = true>} {
+  %scaled = tile.block(%input, %factor) {iters = [par 64, par 256], reads = [$0[d0, d1], $1[d1]], folds = [none -> [d0, d1]], loops = [d0 by 1, d1 by 16, d1 by 16 : lanes]} ({
+  ^body(%element: f32, %by: f32):
+    %product = arith.mul(%element, %by) : (f32, f32) -> f32
+    tile.yield(%product) : (f32) -> ()
+  }) : (tensor<64x256xf32>, tensor<256xf32>) -> tensor<64x256xf32>
+  func.return(%scaled) : (tensor<64x256xf32>) -> ()
+}
+func.func @main(%input: tensor<64x256xf32>, %factor: tensor<256xf32>) -> tensor<64x256xf32> {
+  %result = host.dispatch(%input, %factor) {callee = @scale} : (tensor<64x256xf32>, tensor<256xf32>) -> tensor<64x256xf32>
+  func.return(%result) : (tensor<64x256xf32>) -> ()
+}
+
+// -----
+
+// Every read fits L1. A tile of the 7 columns by 2 vectors loads each weight vector once for the 7
+// columns and each pixel once for 2 vectors, the fewest loads of the tiles that fit the registers:
+// with both image rows, its accumulators, operands, and the register that holds the input's pad
+// take more than 32. The kernel rows run outermost of the reduced loops and the channels innermost,
+// by their strides.
+// CHECK: reads = [$0[0, d0 + d3 - 1, d1 + d4 - 1, d5] pad 0.0, $1[d5, d3, d4, d2]], folds = [sum -> [0, d0, d1, d2]], loops = [d0 by 1, d3 by 1, d4 by 1, d5 by 1, d1 by 7 : reg, d2 by 32 : reg, d2 by 16 : lanes], clip = [d0, d1, d3, d4]
+tile.dispatch @conv(%input: tensor<1x2x7x8xf32>, %weight: tensor<8x3x3x32xf32>) -> tensor<1x2x7x32xf32> attributes {numerics = <contract = true, skip_pad = true>} {
+  %output = tile.block(%input, %weight) {iters = [par 2, par 7, par 32, red 3, red 3, red 8], reads = [$0[0, d0 + d3 - 1, d1 + d4 - 1, d5] pad 0.0, $1[d5, d3, d4, d2]], folds = [sum -> [0, d0, d1, d2]], loops = [d0 by 1, d1 by 1, d2 by 16, d3 by 1, d4 by 1, d5 by 1, d2 by 16 : lanes]} ({
+  ^body(%pixel: f32, %tap: f32):
+    %term = arith.mul(%pixel, %tap) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<1x2x7x8xf32>, tensor<8x3x3x32xf32>) -> tensor<1x2x7x32xf32>
+  func.return(%output) : (tensor<1x2x7x32xf32>) -> ()
+}
+func.func @main(%input: tensor<1x2x7x8xf32>, %weight: tensor<8x3x3x32xf32>) -> tensor<1x2x7x32xf32> {
+  %result = host.dispatch(%input, %weight) {callee = @conv} : (tensor<1x2x7x8xf32>, tensor<8x3x3x32xf32>) -> tensor<1x2x7x32xf32>
+  func.return(%result) : (tensor<1x2x7x32xf32>) -> ()
+}
+
+// -----
+
+// The input runs along the rows, the columns and the lanes, so a step loads a vector for each
+// accumulator; the code loads those of one column at a time, the weight's vector for all. Tiles of
+// the 7 columns by 3 rows of one vector, the channels' 2 vectors in a loop outside, load 936
+// vectors, against 1,008 for the 7 columns of one row by 2 vectors.
+// CHECK: reads = [$0[0, d0 + d3 - 1, d1 + d4 - 1, d2] pad 0.0, $1[0, 0, d3, d4, d2]], folds = [sum -> [0, d0, d1, d2]], loops = [d2 by 16, d0 by 3, d3 by 1, d4 by 1, d1 by 7 : reg, d0 by 3 : reg, d2 by 16 : lanes], clip = [d0, d1, d3, d4]
+tile.dispatch @depthwise(%input: tensor<1x7x7x32xf32>, %weight: tensor<1x1x3x3x32xf32>) -> tensor<1x7x7x32xf32> attributes {numerics = <contract = true, skip_pad = true>} {
+  %output = tile.block(%input, %weight) {iters = [par 7, par 7, par 32, red 3, red 3], reads = [$0[0, d0 + d3 - 1, d1 + d4 - 1, d2] pad 0.0, $1[0, 0, d3, d4, d2]], folds = [sum -> [0, d0, d1, d2]], loops = [d0 by 1, d1 by 1, d2 by 16, d3 by 1, d4 by 1, d2 by 16 : lanes]} ({
+  ^body(%pixel: f32, %tap: f32):
+    %term = arith.mul(%pixel, %tap) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<1x7x7x32xf32>, tensor<1x1x3x3x32xf32>) -> tensor<1x7x7x32xf32>
+  func.return(%output) : (tensor<1x7x7x32xf32>) -> ()
+}
+func.func @main(%input: tensor<1x7x7x32xf32>, %weight: tensor<1x1x3x3x32xf32>) -> tensor<1x7x7x32xf32> {
+  %result = host.dispatch(%input, %weight) {callee = @depthwise} : (tensor<1x7x7x32xf32>, tensor<1x1x3x3x32xf32>) -> tensor<1x7x7x32xf32>
+  func.return(%result) : (tensor<1x7x7x32xf32>) -> ()
+}
+
+// -----
+
+// A projection of 4-bit codes whose rows share the dequantization of each output. A tile of 10
+// rows reads 80 KiB of activations over every reduced point, more than the 44 KiB of L1 a worker
+// keeps, whose loads from L2 cannot keep up with the steps. With tiles of 6 rows by 2 outputs in
+// an L1 piece of 6 rows by 8 of the 16 groups, L1 and L2 keep up, and of such plans these load the
+// fewest vectors; the sums go to scratch from the loop over the cut.
+// CHECK: folds = [sum -> [d0, d1, d4] held scratch<at = 1>], loops = [d0 by 6 in l1, d2 by 8 in l1, d1 by 2, d2 by 1, d3 by 1, d0 by 6 : reg, d1 by 2 : reg, d4 by 16 : lanes]
+tile.dispatch @project(%input: tensor<10x2048xf32>, %codes: tensor<8x2048xui4>, %scales: tensor<8x16xbf16>, %offsets: tensor<16x8xbf16>) -> tensor<10x8x16xf32> attributes {numerics = <contract = true, skip_pad = true, reassoc = true>} {
+  %sums = tile.block(%input, %codes, %scales, %offsets) {iters = [par 10, par 8, red 16, red 8, par 16], reads = [$0[d0, d2 * 128 + (d3 * 16 + d4)], $1[d1, d2 * 128 + (d3 * 16 + d4)], $2[d1, d2], $3[d2, d1]], folds = [sum -> [d0, d1, d4]], loops = [d0 by 1, d1 by 1, d2 by 1, d3 by 1, d4 by 16 : lanes]} ({
+  ^body(%activation: f32, %code: ui4, %scale: bf16, %offset: bf16):
+    %value = arith.cast(%code) {to = f32} : (ui4) -> f32
+    %wide_scale = arith.cast(%scale) {to = f32} : (bf16) -> f32
+    %scaled = arith.mul(%value, %wide_scale) : (f32, f32) -> f32
+    %wide_offset = arith.cast(%offset) {to = f32} : (bf16) -> f32
+    %weight = arith.add(%scaled, %wide_offset) : (f32, f32) -> f32
+    %rounded = arith.cast(%weight) {to = bf16} : (f32) -> bf16
+    %coefficient = arith.cast(%rounded) {to = f32} : (bf16) -> f32
+    %term = arith.mul(%activation, %coefficient) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<10x2048xf32>, tensor<8x2048xui4>, tensor<8x16xbf16>, tensor<16x8xbf16>) -> tensor<10x8x16xf32>
+  func.return(%sums) : (tensor<10x8x16xf32>) -> ()
+}
+func.func @main(%input: tensor<10x2048xf32>, %codes: tensor<8x2048xui4>, %scales: tensor<8x16xbf16>, %offsets: tensor<16x8xbf16>) -> tensor<10x8x16xf32> {
+  %sums = host.dispatch(%input, %codes, %scales, %offsets) {callee = @project} : (tensor<10x2048xf32>, tensor<8x2048xui4>, tensor<8x16xbf16>, tensor<16x8xbf16>) -> tensor<10x8x16xf32>
+  func.return(%sums) : (tensor<10x8x16xf32>) -> ()
+}
+
+// -----
+
+// A product whose weight is stored `[out, in]`, as `nn.Linear` stores it, so that the lanes run
+// along the reduction: the register tile holds rows by outputs, each accumulator one vector of the
+// reduction's lanes, 6 outputs by 4 rows, and a step loads 10 vectors for 24 FMAs. The code walks
+// the outputs outermost and holds the 4 rows' activation vectors across them, 29 registers.
+// CHECK: reads = [$0[d0, d2 * 16 + d3], $1[d1, d2 * 16 + d3]], folds = [sum -> [d0, d1, d3]], loops = [d1 by 6, d0 by 4, d2 by 1, d1 by 6 : reg, d0 by 4 : reg, d3 by 16 : lanes]
+tile.dispatch @projection(%input: tensor<8x64xf32>, %weight: tensor<12x64xf32>) -> tensor<8x12x16xf32> attributes {numerics = <contract = true, skip_pad = true, reassoc = true>} {
+  %sums = tile.block(%input, %weight) {iters = [par 8, par 12, red 4, par 16], reads = [$0[d0, d2 * 16 + d3], $1[d1, d2 * 16 + d3]], folds = [sum -> [d0, d1, d3]], loops = [d0 by 1, d1 by 1, d2 by 1, d3 by 16 : lanes]} ({
+  ^body(%activation: f32, %coefficient: f32):
+    %term = arith.mul(%activation, %coefficient) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<8x64xf32>, tensor<12x64xf32>) -> tensor<8x12x16xf32>
+  func.return(%sums) : (tensor<8x12x16xf32>) -> ()
+}
+func.func @main(%input: tensor<8x64xf32>, %weight: tensor<12x64xf32>) -> tensor<8x12x16xf32> {
+  %sums = host.dispatch(%input, %weight) {callee = @projection} : (tensor<8x64xf32>, tensor<12x64xf32>) -> tensor<8x12x16xf32>
+  func.return(%sums) : (tensor<8x12x16xf32>) -> ()
+}

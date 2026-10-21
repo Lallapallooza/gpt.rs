@@ -1,0 +1,240 @@
+// RUN: pass tile-to-loop
+
+// A projection that reads both operands from copies. Each worker copies its 8 rows of the input,
+// in the order its loops walk them: by tile of the contracted axis, then by tile of 2 rows, then
+// the points of the contracted axis, then the 2 rows of the register tile. Each tile of the
+// contracted axis copies the 8 by 16 elements of the weight that its tiles of rows read, in
+// vectors along the columns. The register tile reads both copies at the tiles its loops stand at.
+// CHECK: loop.func @project([[INPUT:%[0-9]+]]: !loop.buf<8x32xf32, global>, [[WEIGHT:%[0-9]+]]: !loop.buf<32x32xf32, global>, {{%[0-9]+}}: !loop.buf<8x32xf32, global>)
+// CHECK: loop.forall(
+// CHECK: [[ROWS:%[0-9]+]] = loop.alloc() {shape = [4, 4, 8, 2], dtype = f32} : () -> !loop.buf<4x4x8x2xf32, private>
+// CHECK: ^body([[DEPTH_TILE:%[0-9]+]]: index):
+// CHECK: ^body([[ROW_TILE:%[0-9]+]]: index):
+// CHECK: ^body([[DEPTH:%[0-9]+]]: index):
+// CHECK: ^body([[ROW:%[0-9]+]]: index):
+// CHECK: [[ELEMENT:%[0-9]+]] = loop.load([[INPUT]], {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK-NEXT: loop.store([[ELEMENT]], [[ROWS]], [[DEPTH_TILE]], [[ROW_TILE]], [[DEPTH]], [[ROW]])
+// CHECK: [[SUMS:%[0-9]+]] = loop.alloc() {shape = [8, 16], dtype = f32} : () -> !loop.buf<8x16xf32, private>
+// CHECK: [[ZERO:%[0-9]+]] = arith.constant() {value = 0.0 : f32} : () -> f32
+// CHECK-NEXT: loop.store([[ZERO]], [[SUMS]], {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK: ^body([[DEPTH_TILE_HERE:%[0-9]+]]: index):
+// CHECK-NEXT: {{%[0-9]+}} = loop.index(
+// CHECK-NEXT: {{%[0-9]+}} = loop.index(
+// CHECK-NEXT: [[PANEL:%[0-9]+]] = loop.alloc() {shape = [8, 16], dtype = f32} : () -> !loop.buf<8x16xf32, private>
+// CHECK: loop.atom({{%[0-9]+}}) {tile = [16], lanes = 16} ({
+// CHECK: [[SCALE:%[0-9]+]] = loop.load([[WEIGHT]], {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK-NEXT: loop.store([[SCALE]], [[PANEL]], {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK: ^body([[ROW_TILE_HERE:%[0-9]+]]: index):
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [2, 16], lanes = 16} ({
+// CHECK: [[COPIED:%[0-9]+]] = loop.load([[ROWS]], [[DEPTH_TILE_HERE]], [[ROW_TILE_HERE]], {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK: [[COPIED_SCALE:%[0-9]+]] = loop.load([[PANEL]], {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK-NEXT: {{%[0-9]+}} = arith.mul([[COPIED]], [[COPIED_SCALE]])
+tile.dispatch @project(%input: tensor<8x32xf32>, %weight: tensor<32x32xf32>) -> tensor<8x32xf32> attributes {target = "x86-64-v4@3928f7d3"} {
+  %product = tile.block(%input, %weight) {iters = [par 8, par 32, red 32], reads = [$0[d0, d2] held copy<level = l2, at = 0>, $1[d2, d1] held copy<level = l1, at = 2>], folds = [sum -> [d0, d1] held scratch<at = 2>], loops = [d0 by 8 : workers<level = core>, d1 by 16, d2 by 8, d0 by 2, d2 by 1, d0 by 2 : reg, d1 by 16 : lanes]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<8x32xf32>, tensor<32x32xf32>) -> tensor<8x32xf32>
+  func.return(%product) : (tensor<8x32xf32>) -> ()
+}
+func.func @main(%input: tensor<8x32xf32>, %weight: tensor<32x32xf32>) -> tensor<8x32xf32> {
+  %product = host.dispatch(%input, %weight) {callee = @project} : (tensor<8x32xf32>, tensor<32x32xf32>) -> tensor<8x32xf32>
+  func.return(%product) : (tensor<8x32xf32>) -> ()
+}
+
+// -----
+
+// A depthwise convolution whose weight holds the channels, the lanes, first: the copy before the
+// nest holds them last, so the register tile reads its taps in vectors. The copy moves one element
+// at a time, since the weight holds the lanes with a stride.
+// CHECK: loop.func @depthwise([[WEIGHT:%[0-9]+]]: !loop.buf<32x3x3xf32, global>, [[INPUT:%[0-9]+]]: !loop.buf<1x4x4x32xf32, global>, {{%[0-9]+}}: !loop.buf<1x4x4x32xf32, global>)
+// CHECK-NEXT: [[TAPS:%[0-9]+]] = loop.alloc() {shape = [3, 3, 32], dtype = f32} : () -> !loop.buf<3x3x32xf32, private>
+// CHECK: ^body([[ROW:%[0-9]+]]: index):
+// CHECK: ^body([[COLUMN:%[0-9]+]]: index):
+// CHECK: ^body([[CHANNEL_OFFSET:%[0-9]+]]: index):
+// CHECK: [[TAP:%[0-9]+]] = loop.load([[WEIGHT]], {{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK-NEXT: loop.store([[TAP]], [[TAPS]], [[ROW]], [[COLUMN]], [[CHANNEL_OFFSET]])
+// CHECK: loop.forall(
+// CHECK: loop.atom({{%[0-9]+}}) {tile = [32], lanes = 16} ({
+// CHECK: [[ELEMENT:%[0-9]+]] = loop.load([[INPUT]], {{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}) {pad = 0.0}
+// CHECK-NEXT: [[COPIED_TAP:%[0-9]+]] = loop.load([[TAPS]], {{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK-NEXT: {{%[0-9]+}} = arith.mul([[ELEMENT]], [[COPIED_TAP]])
+tile.dispatch @depthwise(%weight: tensor<32x3x3xf32>, %input: tensor<1x4x4x32xf32>) -> tensor<1x4x4x32xf32> attributes {target = "x86-64-v4@3928f7d3"} {
+  %out = tile.block(%weight, %input) {iters = [par 32, par 4, par 4, red 3, red 3], reads = [$1[0, d1 + d3 - 1, d2 + d4 - 1, d0] pad 0.0, $0[d0, d3, d4] held copy<level = l1>], folds = [sum -> [0, d1, d2, d0]], loops = [d1 by 1 : workers<level = core>, d2 by 1, d3 by 1, d4 by 1, d0 by 32 : reg, d0 by 16 : lanes]} ({
+  ^body(%element: f32, %tap: f32):
+    %term = arith.mul(%element, %tap) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<32x3x3xf32>, tensor<1x4x4x32xf32>) -> tensor<1x4x4x32xf32>
+  func.return(%out) : (tensor<1x4x4x32xf32>) -> ()
+}
+func.func @main(%weight: tensor<32x3x3xf32>, %input: tensor<1x4x4x32xf32>) -> tensor<1x4x4x32xf32> {
+  %out = host.dispatch(%weight, %input) {callee = @depthwise} : (tensor<32x3x3xf32>, tensor<1x4x4x32xf32>) -> tensor<1x4x4x32xf32>
+  func.return(%out) : (tensor<1x4x4x32xf32>) -> ()
+}
+
+// -----
+
+// The same projection reading its weight in place: no copy of it is made. The register tile reads
+// the weight at its point, and asks L2 for the element at the same place of the next tile of the
+// contracted axis, 8 points on.
+// CHECK: loop.func @project({{%[0-9]+}}: !loop.buf<8x32xf32, global>, [[WEIGHT:%[0-9]+]]: !loop.buf<32x32xf32, global>, {{%[0-9]+}}: !loop.buf<8x32xf32, global>)
+// CHECK: {{%[0-9]+}} = loop.load({{%[0-9]+}}, {{%[0-9]+}}, [[DEPTH:%[0-9]+]]) : (!loop.buf<8x32xf32, global>, index, index) -> f32
+// CHECK-NEXT: [[NEXT_DEPTH:%[0-9]+]] = loop.index([[DEPTH]]) {expr = d0 + 8} : (index) -> index
+// CHECK-NEXT: loop.prefetch([[WEIGHT]], [[NEXT_DEPTH]], [[COLUMN:%[0-9]+]]) {level = l2}
+// CHECK-NEXT: loop.load([[WEIGHT]], [[DEPTH]], [[COLUMN]]) : (!loop.buf<32x32xf32, global>, index, index) -> f32
+tile.dispatch @project(%input: tensor<8x32xf32>, %weight: tensor<32x32xf32>) -> tensor<8x32xf32> attributes {target = "x86-64-v4@3928f7d3"} {
+  %product = tile.block(%input, %weight) {iters = [par 8, par 32, red 32], reads = [$0[d0, d2], $1[d2, d1] held prefetch<level = l2, at = 2>], folds = [sum -> [d0, d1] held scratch<at = 2>], loops = [d0 by 8 : workers<level = core>, d1 by 16, d2 by 8, d0 by 2, d2 by 1, d0 by 2 : reg, d1 by 16 : lanes]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<8x32xf32>, tensor<32x32xf32>) -> tensor<8x32xf32>
+  func.return(%product) : (tensor<8x32xf32>) -> ()
+}
+func.func @main(%input: tensor<8x32xf32>, %weight: tensor<32x32xf32>) -> tensor<8x32xf32> {
+  %product = host.dispatch(%input, %weight) {callee = @project} : (tensor<8x32xf32>, tensor<32x32xf32>) -> tensor<8x32xf32>
+  func.return(%product) : (tensor<8x32xf32>) -> ()
+}
+
+// -----
+
+// The same projection with a bias added at its register tile. The prefetch names operand $1 of
+// the first block, the weight, so the bias, operand $1 of the add, is read with no request for the
+// next tile. Only the weight's read asks L2.
+// CHECK: loop.func @project_bias({{%[0-9]+}}: !loop.buf<8x32xf32, global>, [[WEIGHT:%[0-9]+]]: !loop.buf<32x32xf32, global>, [[BIAS:%[0-9]+]]: !loop.buf<32xf32, global>, {{%[0-9]+}}: !loop.buf<8x32xf32, global>)
+// CHECK: loop.prefetch([[WEIGHT]], {{%[0-9]+}}, {{%[0-9]+}}) {level = l2}
+// CHECK-NOT: loop.prefetch
+// CHECK: loop.load([[BIAS]], {{%[0-9]+}}) : (!loop.buf<32xf32, global>, index) -> f32
+// CHECK-NOT: loop.prefetch
+// CHECK: loop.return
+tile.dispatch @project_bias(%input: tensor<8x32xf32>, %weight: tensor<32x32xf32>, %bias: tensor<32xf32>) -> tensor<8x32xf32> attributes {target = "x86-64-v4@3928f7d3"} {
+  %product = tile.block(%input, %weight) {iters = [par 8, par 32, red 32], reads = [$0[d0, d2], $1[d2, d1] held prefetch<level = l2, at = 2>], folds = [sum -> [d0, d1] held scratch<at = 2>], loops = [d0 by 8 : workers<level = core>, d1 by 16, d2 by 8, d0 by 2, d2 by 1, d0 by 2 : reg, d1 by 16 : lanes]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<8x32xf32>, tensor<32x32xf32>) -> tensor<8x32xf32>
+  %biased = tile.block(%product, %bias) {iters = [par 8, par 32], reads = [$0[d0, d1] at reg, $1[d1]], folds = [none -> [d0, d1]]} ({
+  ^body(%sum: f32, %offset: f32):
+    %shifted = arith.add(%sum, %offset) : (f32, f32) -> f32
+    tile.yield(%shifted) : (f32) -> ()
+  }) : (tensor<8x32xf32>, tensor<32xf32>) -> tensor<8x32xf32>
+  func.return(%biased) : (tensor<8x32xf32>) -> ()
+}
+func.func @main(%input: tensor<8x32xf32>, %weight: tensor<32x32xf32>, %bias: tensor<32xf32>) -> tensor<8x32xf32> {
+  %biased = host.dispatch(%input, %weight, %bias) {callee = @project_bias} : (tensor<8x32xf32>, tensor<32x32xf32>, tensor<32xf32>) -> tensor<8x32xf32>
+  func.return(%biased) : (tensor<8x32xf32>) -> ()
+}
+
+// -----
+
+// A 1-D convolution whose loop over tiles of 2 taps is clipped to the taps where the input stays in
+// range, and whose taps are copied before the nest. The clipped loop numbers its tiles from where
+// it starts, so the copy has no axis for them: it holds all 3 taps by their offset from the first,
+// and each tap is read at its own.
+// CHECK: loop.func @conv1d({{%[0-9]+}}: !loop.buf<8xsi32, global>, [[WEIGHT:%[0-9]+]]: !loop.buf<3xsi32, global>, {{%[0-9]+}}: !loop.buf<8xsi32, global>)
+// CHECK-NEXT: [[TAPS:%[0-9]+]] = loop.alloc() {shape = [3], dtype = si32} : () -> !loop.buf<3xsi32, private>
+// CHECK: ^body([[TAP_OFFSET:%[0-9]+]]: index):
+// CHECK-NEXT: [[TAP_AT:%[0-9]+]] = loop.index({{%[0-9]+}}, [[TAP_OFFSET]]) {expr = d0 + d1} : (index, index) -> index
+// CHECK-NEXT: [[TAP_VALUE:%[0-9]+]] = loop.load([[WEIGHT]], [[TAP_AT]]) : (!loop.buf<3xsi32, global>, index) -> si32
+// CHECK-NEXT: loop.store([[TAP_VALUE]], [[TAPS]], [[TAP_OFFSET]]) : (si32, !loop.buf<3xsi32, private>, index) -> ()
+// CHECK: {{%[0-9]+}} = loop.index({{%[0-9]+}}, {{%[0-9]+}}) {expr = min(d0 + 2, d1)} : (index, index) -> index
+// CHECK-NEXT: loop.for(
+// CHECK-NEXT: ^body([[TAP:%[0-9]+]]: index):
+// CHECK-NEXT: {{%[0-9]+}} = loop.index({{%[0-9]+}}, [[TAP]]) {expr = d0 + d1 - 1} : (index, index) -> index
+// CHECK-NEXT: {{%[0-9]+}} = loop.load(
+// CHECK-NEXT: {{%[0-9]+}} = loop.load([[TAPS]], [[TAP]]) : (!loop.buf<3xsi32, private>, index) -> si32
+tile.dispatch @conv1d(%input: tensor<8xsi32>, %weight: tensor<3xsi32>) -> tensor<8xsi32> attributes {target = "x86-64-v4@3928f7d3"} {
+  %out = tile.block(%input, %weight) {iters = [par 8, red 3], reads = [$0[d0 + d1 - 1] pad 0.0, $1[d1] held copy<level = l1>], folds = [sum -> [d0]], loops = [d0 by 1, d1 by 2, d1 by 1], clip = [d1]} ({
+  ^body(%element: si32, %scale: si32):
+    %term = arith.mul(%element, %scale) : (si32, si32) -> si32
+    tile.yield(%term) : (si32) -> ()
+  }) : (tensor<8xsi32>, tensor<3xsi32>) -> tensor<8xsi32>
+  func.return(%out) : (tensor<8xsi32>) -> ()
+}
+func.func @main(%input: tensor<8xsi32>, %weight: tensor<3xsi32>) -> tensor<8xsi32> {
+  %out = host.dispatch(%input, %weight) {callee = @conv1d} : (tensor<8xsi32>, tensor<3xsi32>) -> tensor<8xsi32>
+  func.return(%out) : (tensor<8xsi32>) -> ()
+}
+
+// -----
+
+// The GPU-shaped target: each warp copies its 32 elements of the factor into the shared memory it
+// holds them for, in the buffer space the target gives it, and its register tiles of 8 rows read
+// them there.
+// CHECK: loop.func @scale({{%[0-9]+}}: !loop.buf<16x64xf32, global>, [[FACTOR:%[0-9]+]]: !loop.buf<64xf32, global>, {{%[0-9]+}}: !loop.buf<16x64xf32, global>)
+// CHECK: loop.forall({{%[0-9]+}}, {{%[0-9]+}}) {level = warp} ({
+// CHECK: [[FACTORS:%[0-9]+]] = loop.alloc() {shape = [2, 16], dtype = f32} : () -> !loop.buf<2x16xf32, private>
+// CHECK: [[FACTOR_VALUE:%[0-9]+]] = loop.load([[FACTOR]], {{%[0-9]+}}) : (!loop.buf<64xf32, global>, index) -> f32
+// CHECK-NEXT: loop.store([[FACTOR_VALUE]], [[FACTORS]], {{%[0-9]+}}, {{%[0-9]+}}) : (f32, !loop.buf<2x16xf32, private>, index, index) -> ()
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [8, 16], lanes = 16} ({
+// CHECK: {{%[0-9]+}} = loop.load([[FACTORS]], {{%[0-9]+}}, {{%[0-9]+}}) : (!loop.buf<2x16xf32, private>, index, index) -> f32
+tile.dispatch @scale(%input: tensor<16x64xf32>, %factor: tensor<64xf32>) -> tensor<16x64xf32> attributes {target = "%S/../../tile/schedule/gpu-shaped.toml@0f46f219"} {
+  %scaled = tile.block(%input, %factor) {iters = [par 16, par 64], reads = [$0[d0, d1], $1[d1] held copy<level = shared, at = 0>], folds = [none -> [d0, d1]], loops = [d1 by 32 : workers<level = warp>, d1 by 16, d0 by 8, d0 by 8 : reg, d1 by 16 : lanes]} ({
+  ^body(%element: f32, %by: f32):
+    %product = arith.mul(%element, %by) : (f32, f32) -> f32
+    tile.yield(%product) : (f32) -> ()
+  }) : (tensor<16x64xf32>, tensor<64xf32>) -> tensor<16x64xf32>
+  func.return(%scaled) : (tensor<16x64xf32>) -> ()
+}
+func.func @main(%input: tensor<16x64xf32>, %factor: tensor<64xf32>) -> tensor<16x64xf32> {
+  %scaled = host.dispatch(%input, %factor) {callee = @scale} : (tensor<16x64xf32>, tensor<64xf32>) -> tensor<16x64xf32>
+  func.return(%scaled) : (tensor<16x64xf32>) -> ()
+}
+
+// -----
+
+// The NPU-shaped target: the weight is copied before the nest into the SRAM it is held for, in the
+// buffer space the target gives it, in the order the loops walk it: its one tile of 64 columns,
+// the 4 rows of the contracted axis, then the columns of the register tile, which reads it there.
+// CHECK: loop.func @project({{%[0-9]+}}: !loop.buf<6x4xf32, global>, [[WEIGHT:%[0-9]+]]: !loop.buf<4x64xf32, global>, {{%[0-9]+}}: !loop.buf<6x64xf32, global>)
+// CHECK-NEXT: [[PANEL:%[0-9]+]] = loop.alloc() {shape = [1, 4, 64], dtype = f32} : () -> !loop.buf<1x4x64xf32, private>
+// CHECK: [[SCALE:%[0-9]+]] = loop.load([[WEIGHT]], {{%[0-9]+}}, {{%[0-9]+}}) : (!loop.buf<4x64xf32, global>, index, index) -> f32
+// CHECK-NEXT: loop.store([[SCALE]], [[PANEL]], {{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}) : (f32, !loop.buf<1x4x64xf32, private>, index, index, index) -> ()
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [6, 64], lanes = 16} ({
+// CHECK: {{%[0-9]+}} = loop.load([[PANEL]], {{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}) : (!loop.buf<1x4x64xf32, private>, index, index, index) -> f32
+tile.dispatch @project(%input: tensor<6x4xf32>, %weight: tensor<4x64xf32>) -> tensor<6x64xf32> attributes {target = "%S/../../tile/schedule/npu-shaped.toml@6916047f"} {
+  %product = tile.block(%input, %weight) {iters = [par 6, par 64, red 4], reads = [$0[d0, d2], $1[d2, d1] held copy<level = sram>], folds = [sum -> [d0, d1]], loops = [d1 by 64, d0 by 6, d2 by 1, d0 by 6 : reg, d1 by 64 : reg, d1 by 16 : lanes]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<6x4xf32>, tensor<4x64xf32>) -> tensor<6x64xf32>
+  func.return(%product) : (tensor<6x64xf32>) -> ()
+}
+func.func @main(%input: tensor<6x4xf32>, %weight: tensor<4x64xf32>) -> tensor<6x64xf32> {
+  %product = host.dispatch(%input, %weight) {callee = @project} : (tensor<6x4xf32>, tensor<4x64xf32>) -> tensor<6x64xf32>
+  func.return(%product) : (tensor<6x64xf32>) -> ()
+}
+
+// -----
+
+// A copy before the nest over tiles of 2 rows of 5, whose last tile holds one row: the copy builds
+// the whole tiles and the last as the register tile's loop builds them, each body of its own, and
+// copies the row of the last into the first row of its tile.
+// CHECK: loop.func @doubled([[INPUT:%[0-9]+]]: !loop.buf<5x16xf32, global>, [[OUTPUT:%[0-9]+]]: !loop.buf<5x16xf32, global>)
+// CHECK-NEXT: [[ROWS:%[0-9]+]] = loop.alloc() {shape = [3, 2, 16], dtype = f32} : () -> !loop.buf<3x2x16xf32, private>
+// CHECK: [[FULL_TILES:%[0-9]+]] = loop.index({{%[0-9]+}}, {{%[0-9]+}}) {expr = (d1 - d0) floordiv 2} : (index, index) -> index
+// CHECK: ^body([[TILE:%[0-9]+]]: index):
+// CHECK: ^body([[ROW:%[0-9]+]]: index):
+// CHECK: [[ELEMENT:%[0-9]+]] = loop.load([[INPUT]], {{%[0-9]+}}, {{%[0-9]+}}) : (!loop.buf<5x16xf32, global>, index, index) -> f32
+// CHECK-NEXT: loop.store([[ELEMENT]], [[ROWS]], [[TILE]], [[ROW]], {{%[0-9]+}}) : (f32, !loop.buf<3x2x16xf32, private>, index, index, index) -> ()
+// CHECK: [[REST_START:%[0-9]+]] = loop.index({{%[0-9]+}}, [[FULL_TILES]]) {expr = max(d0, d1)} : (index, index) -> index
+// CHECK-NEXT: loop.for([[REST_START]], {{%[0-9]+}}) ({
+// CHECK-NEXT: ^body([[LAST_TILE:%[0-9]+]]: index):
+// CHECK: ^body([[LAST_ROW:%[0-9]+]]: index):
+// CHECK: [[LAST_ELEMENT:%[0-9]+]] = loop.load([[INPUT]], {{%[0-9]+}}, {{%[0-9]+}}) : (!loop.buf<5x16xf32, global>, index, index) -> f32
+// CHECK-NEXT: loop.store([[LAST_ELEMENT]], [[ROWS]], [[LAST_TILE]], [[LAST_ROW]], {{%[0-9]+}}) : (f32, !loop.buf<3x2x16xf32, private>, index, index, index) -> ()
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [2, 16], lanes = 16} ({
+// CHECK: {{%[0-9]+}} = loop.load([[ROWS]], {{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}) : (!loop.buf<3x2x16xf32, private>, index, index, index) -> f32
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [1, 16], lanes = 16} ({
+// CHECK: {{%[0-9]+}} = loop.load([[ROWS]], {{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}) : (!loop.buf<3x2x16xf32, private>, index, index, index) -> f32
+tile.dispatch @doubled(%input: tensor<5x16xf32>) -> tensor<5x16xf32> attributes {target = "x86-64-v4@3928f7d3"} {
+  %doubled = tile.block(%input) {iters = [par 5, par 16], reads = [$0[d0, d1] held copy<level = l1>], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 2 : reg, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    %twice = arith.add(%element, %element) : (f32, f32) -> f32
+    tile.yield(%twice) : (f32) -> ()
+  }) : (tensor<5x16xf32>) -> tensor<5x16xf32>
+  func.return(%doubled) : (tensor<5x16xf32>) -> ()
+}
+func.func @main(%input: tensor<5x16xf32>) -> tensor<5x16xf32> {
+  %doubled = host.dispatch(%input) {callee = @doubled} : (tensor<5x16xf32>) -> tensor<5x16xf32>
+  func.return(%doubled) : (tensor<5x16xf32>) -> ()
+}

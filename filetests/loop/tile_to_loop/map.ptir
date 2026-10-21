@@ -1,8 +1,9 @@
 // RUN: pass seal-dispatches, tile-to-loop
 
 // A map over a symbolic extent: one loop per iterator, the reads and the body at each point, and
-// the store into the result's buffer.
-// CHECK: loop.func @dispatch.{{[0-9a-f]+}}([[INPUT:%[0-9]+]]: !loop.buf<{N}x4xf32, global>, [[FACTOR:%[0-9]+]]: !loop.buf<4xf32, global>, [[SCALED:%[0-9]+]]: !loop.buf<{N}x4xf32, global>) attributes {access = [in, in, out]} {
+// the store into the result's buffer. The map reads the input only at the point it writes, so the
+// result may share the input's buffer.
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}([[INPUT:%[0-9]+]]: !loop.buf<{N}x4xf32, global>, [[FACTOR:%[0-9]+]]: !loop.buf<4xf32, global>, [[SCALED:%[0-9]+]]: !loop.buf<{N}x4xf32, global>) attributes {access = [in, in, out<over = 0>]} {
 // CHECK-NEXT: [[ZERO:%[0-9]+]] = loop.index() {expr = 0} : () -> index
 // CHECK-NEXT: [[ROWS:%[0-9]+]] = loop.index() {expr = {N}} : () -> index
 // CHECK-NEXT: loop.for([[ZERO]], [[ROWS]]) ({
@@ -63,4 +64,46 @@ func.func @grouped(%input: tensor<2x3xf32>) -> (tensor<2x3xf32>, tensor<2x3xf32>
     tile.yield(%squared, %squared, %input) : (tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>) -> ()
   }) : () -> (tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>)
   func.return(%squares, %again, %same) : (tensor<2x3xf32>, tensor<2x3xf32>, tensor<2x3xf32>) -> ()
+}
+
+// -----
+
+// A map that keeps a unit axis at 0 still writes each point at an element of its own, so its
+// result may share the buffer of the input it reads at those coordinates.
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}({{%[0-9]+}}: !loop.buf<1x8xf32, global>, {{%[0-9]+}}: !loop.buf<1x8xf32, global>) attributes {access = [in, out<over = 0>]} {
+func.func @negate_row(%row: tensor<1x8xf32>) -> tensor<1x8xf32> {
+  %negated = tile.block(%row) {iters = [par 8], reads = [$0[0, d0]], folds = [none -> [0, d0]]} ({
+  ^body(%element: f32):
+    %flipped = arith.neg(%element) : (f32) -> f32
+    tile.yield(%flipped) : (f32) -> ()
+  }) : (tensor<1x8xf32>) -> tensor<1x8xf32>
+  func.return(%negated) : (tensor<1x8xf32>) -> ()
+}
+
+// -----
+
+// A block that writes two results without a combine: one walk over the points computes the body
+// once at each and stores each result there.
+// CHECK: loop.func @dispatch.{{[0-9a-f]+}}([[LEFT:%[0-9]+]]: !loop.buf<2x4xf32, global>, [[RIGHT:%[0-9]+]]: !loop.buf<2x4xf32, global>, [[SUMS:%[0-9]+]]: !loop.buf<2x4xf32, global>, [[DIFFERENCES:%[0-9]+]]: !loop.buf<2x4xf32, global>) attributes {access = [in, in, out, out]} {
+// CHECK: ^body([[ROW:%[0-9]+]]: index):
+// CHECK: ^body([[COLUMN:%[0-9]+]]: index):
+// CHECK-NEXT: [[FIRST:%[0-9]+]] = loop.load([[LEFT]], [[ROW]], [[COLUMN]])
+// CHECK-NEXT: [[SECOND:%[0-9]+]] = loop.load([[RIGHT]], [[ROW]], [[COLUMN]])
+// CHECK-NEXT: [[ADDED:%[0-9]+]] = arith.add([[FIRST]], [[SECOND]])
+// CHECK-NEXT: [[SUBTRACTED:%[0-9]+]] = arith.sub([[FIRST]], [[SECOND]])
+// CHECK-NEXT: loop.store([[ADDED]], [[SUMS]], [[ROW]], [[COLUMN]])
+// CHECK-NEXT: loop.store([[SUBTRACTED]], [[DIFFERENCES]], [[ROW]], [[COLUMN]])
+// CHECK-NEXT: loop.yield() : () -> ()
+// CHECK-NEXT: }) : (index, index) -> ()
+// CHECK-NEXT: loop.yield() : () -> ()
+// CHECK-NEXT: }) : (index, index) -> ()
+// CHECK-NEXT: loop.return() : () -> ()
+func.func @sum_and_difference(%left: tensor<2x4xf32>, %right: tensor<2x4xf32>) -> (tensor<2x4xf32>, tensor<2x4xf32>) {
+  %sum, %difference = tile.block(%left, %right) {iters = [par 2, par 4], reads = [$0[d0, d1], $1[d0, d1]], folds = [none -> [d0, d1], none -> [d0, d1]]} ({
+  ^body(%first: f32, %second: f32):
+    %added = arith.add(%first, %second) : (f32, f32) -> f32
+    %subtracted = arith.sub(%first, %second) : (f32, f32) -> f32
+    tile.yield(%added, %subtracted) : (f32, f32) -> ()
+  }) : (tensor<2x4xf32>, tensor<2x4xf32>) -> (tensor<2x4xf32>, tensor<2x4xf32>)
+  func.return(%sum, %difference) : (tensor<2x4xf32>, tensor<2x4xf32>) -> ()
 }

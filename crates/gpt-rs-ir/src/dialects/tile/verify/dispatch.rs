@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Result};
 
 use crate::dialects::tile::ir::*;
 use crate::dialects::tile::verify::check_lanes;
@@ -107,8 +107,9 @@ impl OpDef for Dispatch {
         }
         check_body(module, cx.regions.body)?;
         check_placements(module, &Dispatch::blocks(module, cx.regions.body))?;
-        if let Some(reference) = &self.target {
-            check_on_target(module, cx.regions.body, &reference.target()?)?;
+        match &self.target {
+            Some(reference) => check_on_target(module, cx.regions.body, &reference.target()?)?,
+            None => check_copies_named(module, cx.regions.body)?,
         }
         Ok(DispatchResults::default())
     }
@@ -145,6 +146,25 @@ fn check_body(module: &Module, body: Region) -> Result<()> {
                 given.contains(&result) || !dynamic,
                 "block {index} gives a result of {ty} that the dispatch does not give, which lives \
                  in scratch of its own, whose extents must be static"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Fails when a block of the dispatch body `body`, a body of a dispatch that names no target,
+/// holds a read in a copy: the copy lives in a memory of the target, which gives its buffer space.
+fn check_copies_named(module: &Module, body: Region) -> Result<()> {
+    for (position, &(_, block)) in Dispatch::blocks(module, body).iter().enumerate() {
+        for read in &block.reads {
+            let Some(Holding::Copy(held)) = &read.held else {
+                continue;
+            };
+            bail!(
+                "block {position}: the read of ${} is held in a copy for {}, which needs a memory \
+                 of the target, and the dispatch names no target",
+                read.source.first(),
+                held.level
             );
         }
     }

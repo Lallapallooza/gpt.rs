@@ -1,0 +1,270 @@
+// RUN: pass tile-to-loop
+
+// A sum of products of a read padded with 0, whose block clips the rows and whose numerics name
+// `skip_pad`: for each tap, the loop over the rows narrows to those whose input row stays in
+// range, from max(0, 1 - tap) up to min(6, 7 - tap), and reads the input there without its pad.
+// ROUNDING: skip_pad: a skipped product of the pad is 0 only where the weight is finite.
+// CHECK: loop.func @taps([[INPUT:%[0-9]+]]: !loop.buf<6x4xf32, global>, [[WEIGHT:%[0-9]+]]: !loop.buf<12x16xf32, global>, [[OUTPUT:%[0-9]+]]: !loop.buf<6x16xf32, global>) attributes {access = [in, in, out], target = "x86-64-v4@3928f7d3"} {
+// CHECK: [[ROW_AT_ZERO:%[0-9]+]] = loop.index({{%[0-9]+}}, [[TAP:%[0-9]+]]) {expr = d0 + d1 - 1} : (index, index) -> index
+// CHECK-NEXT: [[ROWS:%[0-9]+]] = loop.index() {expr = 6} : () -> index
+// CHECK-NEXT: [[FIRST:%[0-9]+]] = loop.index([[ROW_AT_ZERO]]) {expr = 0 - d0} : (index) -> index
+// CHECK-NEXT: [[AFTER:%[0-9]+]] = loop.index([[ROW_AT_ZERO]], [[ROWS]]) {expr = d1 - 1 - d0 + 1} : (index, index) -> index
+// CHECK-NEXT: [[LOW:%[0-9]+]] = loop.index({{%[0-9]+}}, [[FIRST]]) {expr = max(d0, d1)} : (index, index) -> index
+// CHECK-NEXT: [[HIGH:%[0-9]+]] = loop.index({{%[0-9]+}}, [[AFTER]]) {expr = min(d0, d1)} : (index, index) -> index
+// CHECK-NEXT: [[START:%[0-9]+]] = loop.index([[LOW]], {{%[0-9]+}}) {expr = min(d0, d1)} : (index, index) -> index
+// CHECK-NEXT: [[END:%[0-9]+]] = loop.index([[HIGH]], [[START]]) {expr = max(d0, d1)} : (index, index) -> index
+// CHECK-NEXT: loop.for([[START]], [[END]]) ({
+// CHECK-NOT: pad
+// CHECK: loop.load([[INPUT]], {{%[0-9]+}}, {{%[0-9]+}}) : (!loop.buf<6x4xf32, global>, index, index) -> f32
+// CHECK-NOT: pad
+// CHECK: loop.return() : () -> ()
+tile.dispatch @taps(%input: tensor<6x4xf32>, %weight: tensor<12x16xf32>) -> tensor<6x16xf32> attributes {target = "x86-64-v4@3928f7d3", numerics = <skip_pad = true>} {
+  %out = tile.block(%input, %weight) {iters = [par 6, par 16, red 3, red 4], reads = [$0[d0 + d2 - 1, d3] pad 0.0, $1[d2 * 4 + d3, d1]], folds = [sum -> [d0, d1] held scratch<at = 0>], loops = [d2 by 1, d0 by 1, d1 by 1, d3 by 1], clip = [d0]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<6x4xf32>, tensor<12x16xf32>) -> tensor<6x16xf32>
+  func.return(%out) : (tensor<6x16xf32>) -> ()
+}
+func.func @main(%input: tensor<6x4xf32>, %weight: tensor<12x16xf32>) -> tensor<6x16xf32> {
+  %out = host.dispatch(%input, %weight) {callee = @taps} : (tensor<6x4xf32>, tensor<12x16xf32>) -> tensor<6x16xf32>
+  func.return(%out) : (tensor<6x16xf32>) -> ()
+}
+
+// -----
+
+// A max pool padded with -inf, the identity of `max`: it clips the rows without naming a
+// rounding change, since a skipped point yields what the fold keeps anyway.
+// CHECK: loop.func @pool([[INPUT:%[0-9]+]]: !loop.buf<6x16xf32, global>, [[OUTPUT:%[0-9]+]]: !loop.buf<6x16xf32, global>) attributes {access = [in, out], target = "x86-64-v4@3928f7d3"} {
+// CHECK-NOT: pad
+// CHECK: loop.load([[INPUT]], {{%[0-9]+}}, {{%[0-9]+}}) : (!loop.buf<6x16xf32, global>, index, index) -> f32
+// CHECK-NOT: pad
+// CHECK: loop.return() : () -> ()
+tile.dispatch @pool(%input: tensor<6x16xf32>) -> tensor<6x16xf32> attributes {target = "x86-64-v4@3928f7d3"} {
+  %out = tile.block(%input) {iters = [par 6, par 16, red 3], reads = [$0[d0 + d2 - 1, d1] pad -inf], folds = [max -> [d0, d1] held scratch<at = 0>], loops = [d2 by 1, d0 by 1, d1 by 1], clip = [d0]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<6x16xf32>) -> tensor<6x16xf32>
+  func.return(%out) : (tensor<6x16xf32>) -> ()
+}
+func.func @main(%input: tensor<6x16xf32>) -> tensor<6x16xf32> {
+  %out = host.dispatch(%input) {callee = @pool} : (tensor<6x16xf32>) -> tensor<6x16xf32>
+  func.return(%out) : (tensor<6x16xf32>) -> ()
+}
+
+// -----
+
+// The sum of products of the first case, clipping the rows, under numerics that name no
+// `skip_pad`: a skipped product would change the sum where a weight is not finite, so the rows
+// keep their pad.
+// CHECK: loop.func @taps([[INPUT:%[0-9]+]]: !loop.buf<6x4xf32, global>
+// CHECK: loop.load([[INPUT]], {{%[0-9]+}}, {{%[0-9]+}}) {pad = 0.0} : (!loop.buf<6x4xf32, global>, index, index) -> f32
+tile.dispatch @taps(%input: tensor<6x4xf32>, %weight: tensor<12x16xf32>) -> tensor<6x16xf32> attributes {target = "x86-64-v4@3928f7d3"} {
+  %out = tile.block(%input, %weight) {iters = [par 6, par 16, red 3, red 4], reads = [$0[d0 + d2 - 1, d3] pad 0.0, $1[d2 * 4 + d3, d1]], folds = [sum -> [d0, d1] held scratch<at = 0>], loops = [d2 by 1, d0 by 1, d1 by 1, d3 by 1], clip = [d0]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<6x4xf32>, tensor<12x16xf32>) -> tensor<6x16xf32>
+  func.return(%out) : (tensor<6x16xf32>) -> ()
+}
+func.func @main(%input: tensor<6x4xf32>, %weight: tensor<12x16xf32>) -> tensor<6x16xf32> {
+  %out = host.dispatch(%input, %weight) {callee = @taps} : (tensor<6x4xf32>, tensor<12x16xf32>) -> tensor<6x16xf32>
+  func.return(%out) : (tensor<6x16xf32>) -> ()
+}
+
+// -----
+
+// The rows here are the register tile's, in tiles of 4: rows 0-3, then rows 4-5. For each tap,
+// the loop over those tiles keeps them and cuts each to its rows in range. The register tile is
+// built once for each count of rows that a cut tile can keep, under a check of that count. The
+// first tile keeps 2 to 4 rows, since the taps leave at most a row out at each end of the 6. The
+// last keeps 1 to 2. So the register tile's shape stays known before the run, and no row needs a
+// mask.
+// ROUNDING: skip_pad: a skipped product of the pad is 0 only where the weight is finite.
+// CHECK: loop.func @taps([[INPUT:%[0-9]+]]: !loop.buf<6x4xf32, global>
+// CHECK: [[TWO:%[0-9]+]] = loop.predicate([[COUNT:%[0-9]+]]) {constraints = [d0 == 2]} : (index) -> i1
+// CHECK-NEXT: loop.if([[TWO]]) ({
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [2, 16], lanes = 16} ({
+// CHECK: [[THREE:%[0-9]+]] = loop.predicate([[COUNT]]) {constraints = [d0 == 3]} : (index) -> i1
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [3, 16], lanes = 16} ({
+// CHECK: [[FOUR:%[0-9]+]] = loop.predicate([[COUNT]]) {constraints = [d0 == 4]} : (index) -> i1
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [4, 16], lanes = 16} ({
+// CHECK: [[ONE:%[0-9]+]] = loop.predicate({{%[0-9]+}}) {constraints = [d0 == 1]} : (index) -> i1
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [1, 16], lanes = 16} ({
+// CHECK-NOT: pad
+// CHECK: loop.return() : () -> ()
+tile.dispatch @taps(%input: tensor<6x4xf32>, %weight: tensor<12x16xf32>) -> tensor<6x16xf32> attributes {target = "x86-64-v4@3928f7d3", numerics = <skip_pad = true>} {
+  %out = tile.block(%input, %weight) {iters = [par 6, par 16, red 3, red 4], reads = [$0[d0 + d2 - 1, d3] pad 0.0, $1[d2 * 4 + d3, d1]], folds = [sum -> [d0, d1] held scratch<at = 0>], loops = [d2 by 1, d0 by 4, d3 by 1, d0 by 4 : reg, d1 by 16 : lanes], clip = [d0]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<6x4xf32>, tensor<12x16xf32>) -> tensor<6x16xf32>
+  func.return(%out) : (tensor<6x16xf32>) -> ()
+}
+func.func @main(%input: tensor<6x4xf32>, %weight: tensor<12x16xf32>) -> tensor<6x16xf32> {
+  %out = host.dispatch(%input, %weight) {callee = @taps} : (tensor<6x4xf32>, tensor<12x16xf32>) -> tensor<6x16xf32>
+  func.return(%out) : (tensor<6x16xf32>) -> ()
+}
+
+// -----
+
+// A 3x3 convolution with padding 1 whose loops walk the taps and blocks of input channels outside
+// the tiles of columns, clipping the rows and cutting the tiles of columns. Its sums live in
+// private scratch: started at 0 before the taps, copied into registers before the points of each
+// register tile and back after them, and written out after the taps. The tile of columns that a
+// cut keeps is built once for each count of columns it can keep. The whole tile keeps 2 to 4,
+// since the taps leave at most a column out at each end of the 6, and the last keeps 1 to 2. So
+// the register tile's shape stays known. Inside, the rows and the columns stay in range, and the
+// input reads without its pad.
+// ROUNDING: skip_pad: a skipped product of the pad is 0 only where the weight is finite.
+// CHECK: loop.func @conv([[INPUT:%[0-9]+]]: !loop.buf<1x6x6x8xf32, global>, {{%[0-9]+}}: !loop.buf<3x3x8x16xf32, global>, [[OUTPUT:%[0-9]+]]: !loop.buf<1x6x6x16xf32, global>) attributes {access = [in, in, out], target = "x86-64-v4@3928f7d3"} {
+// CHECK-NEXT: [[SUMS:%[0-9]+]] = loop.alloc() {shape = [6, 6, 16], dtype = f32} : () -> !loop.buf<6x6x16xf32, private>
+// CHECK: [[ZERO:%[0-9]+]] = arith.constant() {value = 0.0 : f32} : () -> f32
+// CHECK-NEXT: loop.store([[ZERO]], [[SUMS]], {{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK: [[TWO_COLUMNS:%[0-9]+]] = loop.predicate([[KEPT:%[0-9]+]]) {constraints = [d0 == 2]} : (index) -> i1
+// CHECK-NEXT: loop.if([[TWO_COLUMNS]]) ({
+// CHECK: [[COPY:%[0-9]+]] = loop.alloc() {shape = [4, 16], dtype = f32, space = reg} : () -> !loop.buf<4x16xf32, reg>
+// CHECK: [[PARTIAL:%[0-9]+]] = loop.load([[SUMS]], {{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}) : (!loop.buf<6x6x16xf32, private>, index, index, index) -> f32
+// CHECK-NEXT: loop.store([[PARTIAL]], [[COPY]], {{%[0-9]+}}, {{%[0-9]+}}) : (f32, !loop.buf<4x16xf32, reg>, index, index) -> ()
+// CHECK: loop.load([[INPUT]], {{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}) : (!loop.buf<1x6x6x8xf32, global>, index, index, index, index) -> f32
+// CHECK: [[ACCUMULATED:%[0-9]+]] = loop.load([[COPY]], {{%[0-9]+}}, {{%[0-9]+}}) : (!loop.buf<4x16xf32, reg>, index, index) -> f32
+// CHECK-NEXT: [[ADDED:%[0-9]+]] = arith.add([[ACCUMULATED]], {{%[0-9]+}}) : (f32, f32) -> f32
+// CHECK-NEXT: loop.store([[ADDED]], [[COPY]], {{%[0-9]+}}, {{%[0-9]+}}) : (f32, !loop.buf<4x16xf32, reg>, index, index) -> ()
+// CHECK: [[FOLDED:%[0-9]+]] = loop.load([[COPY]], {{%[0-9]+}}, {{%[0-9]+}}) : (!loop.buf<4x16xf32, reg>, index, index) -> f32
+// CHECK-NEXT: loop.store([[FOLDED]], [[SUMS]], {{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}) : (f32, !loop.buf<6x6x16xf32, private>, index, index, index) -> ()
+// CHECK: loop.predicate([[KEPT]]) {constraints = [d0 == 3]} : (index) -> i1
+// CHECK: loop.predicate([[KEPT]]) {constraints = [d0 == 4]} : (index) -> i1
+// CHECK: loop.predicate({{%[0-9]+}}) {constraints = [d0 == 1]} : (index) -> i1
+// CHECK: loop.store({{%[0-9]+}}, [[OUTPUT]], {{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}) : (f32, !loop.buf<1x6x6x16xf32, global>, index, index, index, index) -> ()
+// CHECK: loop.return() : () -> ()
+tile.dispatch @conv(%input: tensor<1x6x6x8xf32>, %weight: tensor<3x3x8x16xf32>) -> tensor<1x6x6x16xf32> attributes {target = "x86-64-v4@3928f7d3", numerics = <skip_pad = true>} {
+  %out = tile.block(%input, %weight) {iters = [par 6, par 6, par 16, red 3, red 3, red 8], reads = [$0[0, d0 + d3 - 1, d1 + d4 - 1, d5] pad 0.0, $1[d3, d4, d5, d2]], folds = [sum -> [0, d0, d1, d2] held scratch<at = 0>], loops = [d3 by 1, d4 by 1, d5 by 4, d1 by 4, d0 by 1, d5 by 1, d1 by 4 : reg, d2 by 16 : lanes], clip = [d0, d1]} ({
+  ^body(%pixel: f32, %tap: f32):
+    %term = arith.mul(%pixel, %tap) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<1x6x6x8xf32>, tensor<3x3x8x16xf32>) -> tensor<1x6x6x16xf32>
+  func.return(%out) : (tensor<1x6x6x16xf32>) -> ()
+}
+func.func @main(%input: tensor<1x6x6x8xf32>, %weight: tensor<3x3x8x16xf32>) -> tensor<1x6x6x16xf32> {
+  %out = host.dispatch(%input, %weight) {callee = @conv} : (tensor<1x6x6x8xf32>, tensor<3x3x8x16xf32>) -> tensor<1x6x6x16xf32>
+  func.return(%out) : (tensor<1x6x6x16xf32>) -> ()
+}
+
+// -----
+
+// The 3x3 convolution with its sums in registers: its loops walk the taps inside the tiles of
+// columns, so the clip cuts the register tile at each tap rather than at the loop over its tiles.
+// At each point of the loop over `kw`, the tile of columns keeps the columns whose input stays in
+// range. It is built once for each count of columns dropped from its start and kept: 0 and 3 or
+// 4, or 1 and 2 or 3, for the whole tile, and 0 and 1 or 2, or 1 and 1, for the last. A cut tile
+// starts a known count of columns into the registers that hold the sums, so each sum keeps its
+// register. Inside, the input reads without its pad.
+// ROUNDING: skip_pad: a skipped product of the pad is 0 only where the weight is finite.
+// CHECK: [[SUMS:%[0-9]+]] = loop.alloc() {shape = [4, 16], dtype = f32, space = reg} : () -> !loop.buf<4x16xf32, reg>
+// CHECK: loop.predicate([[DROPPED:%[0-9]+]], [[KEPT:%[0-9]+]]) {constraints = [d0 == 0, d1 == 3]} : (index, index) -> i1
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [3, 16], lanes = 16} ({
+// CHECK: loop.predicate([[DROPPED]], [[KEPT]]) {constraints = [d0 == 0, d1 == 4]} : (index, index) -> i1
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [4, 16], lanes = 16} ({
+// CHECK: loop.predicate([[DROPPED]], [[KEPT]]) {constraints = [d0 == 1, d1 == 2]} : (index, index) -> i1
+// CHECK-NEXT: loop.if({{%[0-9]+}}) ({
+// CHECK-NEXT: [[CUT_START:%[0-9]+]] = loop.index([[TILE_START:%[0-9]+]]) {expr = d0 + 1} : (index) -> index
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [2, 16], lanes = 16} ({
+// CHECK-NEXT: ^body([[COLUMN_IN_CUT:%[0-9]+]]: index, {{%[0-9]+}}: index):
+// CHECK-NEXT: [[COLUMN:%[0-9]+]] = loop.index([[CUT_START]], [[COLUMN_IN_CUT]]) {expr = d0 + d1} : (index, index) -> index
+// CHECK: [[IN_SUMS:%[0-9]+]] = loop.index([[COLUMN]], [[TILE_START]]) {expr = d0 - d1} : (index, index) -> index
+// CHECK: loop.load([[SUMS]], [[IN_SUMS]], {{%[0-9]+}}) : (!loop.buf<4x16xf32, reg>, index, index) -> f32
+// CHECK: loop.predicate([[DROPPED]], [[KEPT]]) {constraints = [d0 == 1, d1 == 3]} : (index, index) -> i1
+// CHECK: loop.predicate({{%[0-9]+}}, {{%[0-9]+}}) {constraints = [d0 == 0, d1 == 1]} : (index, index) -> i1
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [1, 16], lanes = 16} ({
+// CHECK: loop.predicate({{%[0-9]+}}, {{%[0-9]+}}) {constraints = [d0 == 0, d1 == 2]} : (index, index) -> i1
+// CHECK: loop.predicate({{%[0-9]+}}, {{%[0-9]+}}) {constraints = [d0 == 1, d1 == 1]} : (index, index) -> i1
+// CHECK-NOT: pad
+// CHECK: loop.return() : () -> ()
+tile.dispatch @conv(%input: tensor<1x6x6x8xf32>, %weight: tensor<3x3x8x16xf32>) -> tensor<1x6x6x16xf32> attributes {numerics = <skip_pad = true>} {
+  %out = tile.block(%input, %weight) {iters = [par 6, par 6, par 16, red 3, red 3, red 8], reads = [$0[0, d0 + d3 - 1, d1 + d4 - 1, d5] pad 0.0, $1[d3, d4, d5, d2]], folds = [sum -> [0, d0, d1, d2]], loops = [d0 by 1, d1 by 4, d3 by 1, d4 by 1, d5 by 1, d1 by 4 : reg, d2 by 16 : lanes], clip = [d0, d1, d3, d4]} ({
+  ^body(%pixel: f32, %tap: f32):
+    %term = arith.mul(%pixel, %tap) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<1x6x6x8xf32>, tensor<3x3x8x16xf32>) -> tensor<1x6x6x16xf32>
+  func.return(%out) : (tensor<1x6x6x16xf32>) -> ()
+}
+func.func @main(%input: tensor<1x6x6x8xf32>, %weight: tensor<3x3x8x16xf32>) -> tensor<1x6x6x16xf32> {
+  %out = host.dispatch(%input, %weight) {callee = @conv} : (tensor<1x6x6x8xf32>, tensor<3x3x8x16xf32>) -> tensor<1x6x6x16xf32>
+  func.return(%out) : (tensor<1x6x6x16xf32>) -> ()
+}
+
+// -----
+
+// A block that clips the reduced iterator of a read whose coordinate does not move by a constant
+// step with it, `(d0 + d1) floordiv 2 - 1`: no loop can narrow to where it stays in range, so
+// the read keeps its pad.
+// CHECK: loop.func @pairs_max([[INPUT:%[0-9]+]]: !loop.buf<2xf32, global>, {{%[0-9]+}}: !loop.buf<4xf32, global>) attributes {access = [in, out]} {
+// CHECK: [[AT:%[0-9]+]] = loop.index({{%[0-9]+}}, {{%[0-9]+}}) {expr = (d0 + d1) floordiv 2 - 1} : (index, index) -> index
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load([[INPUT]], [[AT]]) {pad = -inf} : (!loop.buf<2xf32, global>, index) -> f32
+tile.dispatch @pairs_max(%input: tensor<2xf32>) -> tensor<4xf32> {
+  %largest = tile.block(%input) {iters = [par 4, red 2], reads = [$0[(d0 + d1) floordiv 2 - 1] pad -inf], folds = [max -> [d0]], clip = [d1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<2xf32>) -> tensor<4xf32>
+  func.return(%largest) : (tensor<4xf32>) -> ()
+}
+func.func @main(%input: tensor<2xf32>) -> tensor<4xf32> {
+  %largest = host.dispatch(%input) {callee = @pairs_max} : (tensor<2xf32>) -> tensor<4xf32>
+  func.return(%largest) : (tensor<4xf32>) -> ()
+}
+
+// -----
+
+// A max pool whose loop over tiles of 2 taps is clipped to the taps where the input stays in range:
+// one body serves every tile of the narrowed span, each cut to the points of the span it holds.
+// CHECK: loop.func @pool_taps([[INPUT:%[0-9]+]]: !loop.buf<8xf32, global>, {{%[0-9]+}}: !loop.buf<8xf32, global>)
+// CHECK: [[TILES:%[0-9]+]] = loop.index([[FIRST:%[0-9]+]], [[END:%[0-9]+]]) {expr = (d1 - d0 + 1) floordiv 2} : (index, index) -> index
+// CHECK: loop.for({{%[0-9]+}}, [[TILES]]) ({
+// CHECK-NEXT: ^body([[TILE:%[0-9]+]]: index):
+// CHECK-NEXT: [[TILE_START:%[0-9]+]] = loop.index([[FIRST]], [[TILE]]) {expr = d0 + d1 * 2} : (index, index) -> index
+// CHECK-NEXT: [[TILE_END:%[0-9]+]] = loop.index([[TILE_START]], [[END]]) {expr = min(d0 + 2, d1)} : (index, index) -> index
+// CHECK-NEXT: loop.for([[TILE_START]], [[TILE_END]]) ({
+// CHECK-NEXT: ^body([[TAP:%[0-9]+]]: index):
+// CHECK-NEXT: [[AT:%[0-9]+]] = loop.index({{%[0-9]+}}, [[TAP]]) {expr = d0 + d1 - 1} : (index, index) -> index
+// CHECK-NEXT: {{%[0-9]+}} = loop.load([[INPUT]], [[AT]]) : (!loop.buf<8xf32, global>, index) -> f32
+tile.dispatch @pool_taps(%input: tensor<8xf32>) -> tensor<8xf32> {
+  %out = tile.block(%input) {iters = [par 8, red 3], reads = [$0[d0 + d1 - 1] pad -inf], folds = [max -> [d0]], loops = [d0 by 1, d1 by 2, d1 by 1], clip = [d1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<8xf32>) -> tensor<8xf32>
+  func.return(%out) : (tensor<8xf32>) -> ()
+}
+func.func @main(%input: tensor<8xf32>) -> tensor<8xf32> {
+  %out = host.dispatch(%input) {callee = @pool_taps} : (tensor<8xf32>) -> tensor<8xf32>
+  func.return(%out) : (tensor<8xf32>) -> ()
+}
+
+// -----
+
+// A 1-D convolution of an input whose extent is known only when the code runs, with its sums in a
+// register tile of 4 rows that the clip cuts at each tap. How many rows a cut drops is not known
+// before the run, so the tile is built for each count of rows it can drop from its start and keep.
+// CHECK: loop.func @taps([[INPUT:%[0-9]+]]: !loop.buf<{W}xsi32, global>, {{%[0-9]+}}: !loop.buf<3x16xsi32, global>, {{%[0-9]+}}: !loop.buf<6x16xsi32, global>)
+// CHECK: loop.alloc() {shape = [4, 16], dtype = si32, space = reg} : () -> !loop.buf<4x16xsi32, reg>
+// CHECK: loop.predicate([[DROPPED:%[0-9]+]], [[KEPT:%[0-9]+]]) {constraints = [d0 == 0, d1 == 1]} : (index, index) -> i1
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [1, 16], lanes = 16} ({
+// CHECK: {{%[0-9]+}} = loop.load([[INPUT]], {{%[0-9]+}}) : (!loop.buf<{W}xsi32, global>, index) -> si32
+// CHECK: loop.predicate([[DROPPED]], [[KEPT]]) {constraints = [d0 == 0, d1 == 4]} : (index, index) -> i1
+// CHECK: loop.predicate([[DROPPED]], [[KEPT]]) {constraints = [d0 == 3, d1 == 1]} : (index, index) -> i1
+// CHECK-NOT: d0 == 4
+// CHECK: loop.alloc() {shape = [4, 16], dtype = si32, space = reg} : () -> !loop.buf<4x16xsi32, reg>
+// CHECK: loop.predicate({{%[0-9]+}}, {{%[0-9]+}}) {constraints = [d0 == 1, d1 == 1]} : (index, index) -> i1
+// CHECK-NOT: pad
+// CHECK: loop.return() : () -> ()
+tile.dispatch @taps(%input: tensor<{W}xsi32>, %weight: tensor<3x16xsi32>) -> tensor<6x16xsi32> {
+  %out = tile.block(%input, %weight) {iters = [par 6, par 16, red 3], reads = [$0[d0 + d2 - 1] pad 0.0, $1[d2, d1]], folds = [sum -> [d0, d1]], loops = [d0 by 4, d2 by 1, d0 by 4 : reg, d1 by 16 : lanes], clip = [d0]} ({
+  ^body(%element: si32, %scale: si32):
+    %term = arith.mul(%element, %scale) : (si32, si32) -> si32
+    tile.yield(%term) : (si32) -> ()
+  }) : (tensor<{W}xsi32>, tensor<3x16xsi32>) -> tensor<6x16xsi32>
+  func.return(%out) : (tensor<6x16xsi32>) -> ()
+}
+func.func @main(%input: tensor<{W}xsi32>, %weight: tensor<3x16xsi32>) -> tensor<6x16xsi32> {
+  %out = host.dispatch(%input, %weight) {callee = @taps} : (tensor<{W}xsi32>, tensor<3x16xsi32>) -> tensor<6x16xsi32>
+  func.return(%out) : (tensor<6x16xsi32>) -> ()
+}

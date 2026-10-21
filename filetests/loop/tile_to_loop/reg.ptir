@@ -1,0 +1,184 @@
+// RUN: pass tile-to-loop
+
+// A projection with a register tile of 3 rows by 16 columns, in vectors of 8 lanes. The 5 rows and
+// 20 columns make a full tile, whose atoms run every point of the tile, and last tiles of 2 rows
+// and of 4 columns, each built apart: their atoms have 2 rows, or one vector of 8 lanes that runs
+// the 4 points below its extent. The sums of the tile live in a `reg` buffer: an atom starts them,
+// an atom per contracted point adds a product to each, and an atom writes them out.
+// CHECK: [[FULL_ROW_TILES:%[0-9]+]] = loop.index({{%[0-9]+}}, {{%[0-9]+}}) {expr = min(d0, d1)} : (index, index) -> index
+// CHECK-NEXT: loop.for({{%[0-9]+}}, [[FULL_ROW_TILES]]) ({
+// CHECK-NEXT: ^body([[ROW_TILE:%[0-9]+]]: index):
+// CHECK-NEXT: [[FIRST_ROW:%[0-9]+]] = loop.index({{%[0-9]+}}, [[ROW_TILE]]) {expr = d0 + d1 * 3} : (index, index) -> index
+// CHECK-NEXT: loop.index([[FIRST_ROW]]) {expr = d0 + 3} : (index) -> index
+// CHECK: loop.for({{%[0-9]+}}, {{%[0-9]+}}) ({
+// CHECK-NEXT: ^body([[COLUMN_TILE:%[0-9]+]]: index):
+// CHECK-NEXT: [[FIRST_COLUMN:%[0-9]+]] = loop.index({{%[0-9]+}}, [[COLUMN_TILE]]) {expr = d0 + d1 * 16} : (index, index) -> index
+// CHECK-NEXT: loop.index([[FIRST_COLUMN]]) {expr = d0 + 16} : (index) -> index
+// CHECK-NEXT: [[SUMS:%[0-9]+]] = loop.alloc() {shape = [3, 16], dtype = f32, space = reg} : () -> !loop.buf<3x16xf32, reg>
+// CHECK-NEXT: [[ROWS_HERE:%[0-9]+]] = loop.index() {expr = 3} : () -> index
+// CHECK-NEXT: [[COLUMNS_HERE:%[0-9]+]] = loop.index() {expr = 16} : () -> index
+// CHECK-NEXT: loop.atom([[ROWS_HERE]], [[COLUMNS_HERE]]) {tile = [3, 16], lanes = 8} ({
+// CHECK-NEXT: ^body([[START_ROW:%[0-9]+]]: index, [[START_COLUMN:%[0-9]+]]: index):
+// CHECK: loop.store({{%[0-9]+}}, [[SUMS]], [[START_ROW]], [[START_COLUMN]])
+// CHECK: loop.for({{%[0-9]+}}, {{%[0-9]+}}) ({
+// CHECK-NEXT: ^body([[DEPTH:%[0-9]+]]: index):
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [3, 16], lanes = 8} ({
+// CHECK-NEXT: ^body([[ROW_IN_TILE:%[0-9]+]]: index, [[COLUMN_IN_TILE:%[0-9]+]]: index):
+// CHECK-NEXT: [[ROW:%[0-9]+]] = loop.index([[FIRST_ROW]], [[ROW_IN_TILE]]) {expr = d0 + d1} : (index, index) -> index
+// CHECK-NEXT: [[COLUMN:%[0-9]+]] = loop.index([[FIRST_COLUMN]], [[COLUMN_IN_TILE]]) {expr = d0 + d1} : (index, index) -> index
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load([[INPUT:%[0-9]+]], [[ROW]], [[DEPTH]])
+// CHECK-NEXT: [[SCALE:%[0-9]+]] = loop.load([[WEIGHT:%[0-9]+]], [[DEPTH]], [[COLUMN]])
+// CHECK-NEXT: [[TERM:%[0-9]+]] = arith.mul([[ELEMENT]], [[SCALE]])
+// CHECK: [[SO_FAR:%[0-9]+]] = loop.load([[SUMS]]
+// CHECK-NEXT: [[SUM:%[0-9]+]] = arith.add([[SO_FAR]], [[TERM]])
+// CHECK-NEXT: loop.store([[SUM]], [[SUMS]]
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [3, 16], lanes = 8} ({
+// CHECK-NEXT: ^body([[OUT_ROW:%[0-9]+]]: index, [[OUT_COLUMN:%[0-9]+]]: index):
+// CHECK: [[FINAL:%[0-9]+]] = loop.load([[SUMS]], [[OUT_ROW]], [[OUT_COLUMN]])
+// CHECK-NEXT: loop.store([[FINAL]], [[PRODUCT:%[0-9]+]]
+// CHECK: [[LAST_COLUMNS:%[0-9]+]] = loop.index() {expr = 4} : () -> index
+// CHECK-NEXT: loop.atom({{%[0-9]+}}, [[LAST_COLUMNS]]) {tile = [3, 8], lanes = 8} ({
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [2, 16], lanes = 8} ({
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [2, 8], lanes = 8} ({
+tile.dispatch @project(%input: tensor<5x7xf32>, %weight: tensor<7x20xf32>) -> tensor<5x20xf32> {
+  %product = tile.block(%input, %weight) {iters = [par 5, par 20, red 7], reads = [$0[d0, d2], $1[d2, d1]], folds = [sum -> [d0, d1]], loops = [d0 by 3, d1 by 16, d2 by 1, d0 by 3 : reg, d1 by 16 : reg, d1 by 8 : lanes]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<5x7xf32>, tensor<7x20xf32>) -> tensor<5x20xf32>
+  func.return(%product) : (tensor<5x20xf32>) -> ()
+}
+func.func @main(%input: tensor<5x7xf32>, %weight: tensor<7x20xf32>) -> tensor<5x20xf32> {
+  %product = host.dispatch(%input, %weight) {callee = @project} : (tensor<5x7xf32>, tensor<7x20xf32>) -> tensor<5x20xf32>
+  func.return(%product) : (tensor<5x20xf32>) -> ()
+}
+
+// -----
+
+// A map whose register tile is one row of 12 columns, the whole row, in vectors of 4: each row
+// is one atom, and each point of it adds its bias.
+// CHECK: loop.for({{%[0-9]+}}, {{%[0-9]+}}) ({
+// CHECK-NEXT: ^body([[ROW:%[0-9]+]]: index):
+// CHECK: loop.atom([[COLUMNS:%[0-9]+]]) {tile = [12], lanes = 4} ({
+// CHECK-NEXT: ^body([[COLUMN_IN_ROW:%[0-9]+]]: index):
+// CHECK-NEXT: [[COLUMN:%[0-9]+]] = loop.index({{%[0-9]+}}, [[COLUMN_IN_ROW]]) {expr = d0 + d1} : (index, index) -> index
+// CHECK-NEXT: [[ELEMENT:%[0-9]+]] = loop.load({{%[0-9]+}}, [[ROW]], [[COLUMN]])
+// CHECK-NEXT: [[SHIFT:%[0-9]+]] = loop.load({{%[0-9]+}}, [[COLUMN]])
+// CHECK-NEXT: [[SUM:%[0-9]+]] = arith.add([[ELEMENT]], [[SHIFT]])
+// CHECK-NEXT: loop.store([[SUM]], {{%[0-9]+}}, [[ROW]], [[COLUMN]])
+tile.dispatch @add_bias(%input: tensor<3x12xf32>, %bias: tensor<12xf32>) -> tensor<3x12xf32> {
+  %biased = tile.block(%input, %bias) {iters = [par 3, par 12], reads = [$0[d0, d1], $1[d1]], folds = [none -> [d0, d1]], loops = [d0 by 1, d1 by 12 : reg, d1 by 4 : lanes]} ({
+  ^body(%element: f32, %shift: f32):
+    %sum = arith.add(%element, %shift) : (f32, f32) -> f32
+    tile.yield(%sum) : (f32) -> ()
+  }) : (tensor<3x12xf32>, tensor<12xf32>) -> tensor<3x12xf32>
+  func.return(%biased) : (tensor<3x12xf32>) -> ()
+}
+func.func @main(%input: tensor<3x12xf32>, %bias: tensor<12xf32>) -> tensor<3x12xf32> {
+  %biased = host.dispatch(%input, %bias) {callee = @add_bias} : (tensor<3x12xf32>, tensor<12xf32>) -> tensor<3x12xf32>
+  func.return(%biased) : (tensor<3x12xf32>) -> ()
+}
+
+// -----
+
+// A copy out of a layout in blocks of 16 columns, `[column block, row, column in block]`, with
+// tiles of 32 columns inside tiles of 48: they start at 0, 32, 48 and 80, each a multiple of 16,
+// so each vector of 16 lanes reads within one block. A full tile of 32 columns is one atom of two
+// vectors, and the tile of 16 that ends each tile of 48 one of one vector.
+// CHECK: [[OUTER_START:%[0-9]+]] = loop.index({{%[0-9]+}}, {{%[0-9]+}}) {expr = d0 + d1 * 48} : (index, index) -> index
+// CHECK: [[START:%[0-9]+]] = loop.index([[OUTER_START]], {{%[0-9]+}}) {expr = d0 + d1 * 32} : (index, index) -> index
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [2, 32], lanes = 16} ({
+// CHECK-NEXT: ^body([[ROW_IN_TILE:%[0-9]+]]: index, [[COLUMN_IN_TILE:%[0-9]+]]: index):
+// CHECK-NEXT: [[ROW:%[0-9]+]] = loop.index({{%[0-9]+}}, [[ROW_IN_TILE]]) {expr = d0 + d1} : (index, index) -> index
+// CHECK-NEXT: [[COLUMN:%[0-9]+]] = loop.index([[START]], [[COLUMN_IN_TILE]]) {expr = d0 + d1} : (index, index) -> index
+// CHECK-NEXT: [[BLOCK:%[0-9]+]] = loop.index([[COLUMN]]) {expr = d0 floordiv 16} : (index) -> index
+// CHECK-NEXT: [[IN_BLOCK:%[0-9]+]] = loop.index([[COLUMN]]) {expr = d0 mod 16} : (index) -> index
+// CHECK-NEXT: loop.load({{%[0-9]+}}, [[BLOCK]], [[ROW]], [[IN_BLOCK]])
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [2, 16], lanes = 16} ({
+tile.dispatch @blocks_in_tiles(%input: tensor<6x2x16xf32>) -> tensor<2x96xf32> {
+  %output = tile.block(%input) {iters = [par 2, par 96], reads = [$0[d1 floordiv 16, d0, d1 mod 16]], folds = [none -> [d0, d1]], loops = [d1 by 48, d1 by 32, d0 by 2 : reg, d1 by 32 : reg, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<6x2x16xf32>) -> tensor<2x96xf32>
+  func.return(%output) : (tensor<2x96xf32>) -> ()
+}
+func.func @main(%input: tensor<6x2x16xf32>) -> tensor<2x96xf32> {
+  %output = host.dispatch(%input) {callee = @blocks_in_tiles} : (tensor<6x2x16xf32>) -> tensor<2x96xf32>
+  func.return(%output) : (tensor<2x96xf32>) -> ()
+}
+
+// -----
+
+// The same layout in blocks of 32 columns, with a register tile of 2 rows by 32 columns in one
+// vector of 32 lanes, as a warp of 32 threads runs it: each tile is one block.
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [2, 32], lanes = 32} ({
+// CHECK-NEXT: ^body([[ROW_IN_TILE:%[0-9]+]]: index, [[COLUMN_IN_TILE:%[0-9]+]]: index):
+// CHECK-NEXT: [[ROW:%[0-9]+]] = loop.index({{%[0-9]+}}, [[ROW_IN_TILE]]) {expr = d0 + d1} : (index, index) -> index
+// CHECK-NEXT: [[COLUMN:%[0-9]+]] = loop.index({{%[0-9]+}}, [[COLUMN_IN_TILE]]) {expr = d0 + d1} : (index, index) -> index
+// CHECK-NEXT: [[BLOCK:%[0-9]+]] = loop.index([[COLUMN]]) {expr = d0 floordiv 32} : (index) -> index
+// CHECK-NEXT: [[IN_BLOCK:%[0-9]+]] = loop.index([[COLUMN]]) {expr = d0 mod 32} : (index) -> index
+// CHECK-NEXT: loop.load({{%[0-9]+}}, [[BLOCK]], [[ROW]], [[IN_BLOCK]])
+tile.dispatch @warp_in_blocks(%input: tensor<2x2x32xf32>) -> tensor<2x64xf32> {
+  %output = tile.block(%input) {iters = [par 2, par 64], reads = [$0[d1 floordiv 32, d0, d1 mod 32]], folds = [none -> [d0, d1]], loops = [d1 by 32, d0 by 2 : reg, d1 by 32 : reg, d1 by 32 : lanes]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<2x2x32xf32>) -> tensor<2x64xf32>
+  func.return(%output) : (tensor<2x64xf32>) -> ()
+}
+func.func @main(%input: tensor<2x2x32xf32>) -> tensor<2x64xf32> {
+  %output = host.dispatch(%input) {callee = @warp_in_blocks} : (tensor<2x2x32xf32>) -> tensor<2x64xf32>
+  func.return(%output) : (tensor<2x64xf32>) -> ()
+}
+
+// -----
+
+// A projection to 24 columns with a register tile of 2 rows by 32 columns: no loop tiles the
+// columns, so their one piece holds 24 points, fewer than the register tile's 32, as a last piece
+// may. The sums keep the register tile's 32 columns, two whole vectors, and each atom runs on the
+// 24 columns in range: `loop-to-isa` masks the second vector's reads and writes.
+// CHECK: [[SUMS:%[0-9]+]] = loop.alloc() {shape = [2, 32], dtype = f32, space = reg} : () -> !loop.buf<2x32xf32, reg>
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [2, 32], lanes = 16} ({
+// CHECK: loop.for({{%[0-9]+}}, {{%[0-9]+}}) ({
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [2, 32], lanes = 16} ({
+// CHECK: loop.load([[SUMS]], {{%[0-9]+}}, {{%[0-9]+}}) : (!loop.buf<2x32xf32, reg>, index, index) -> f32
+// CHECK: loop.store({{%[0-9]+}}, [[SUMS]], {{%[0-9]+}}, {{%[0-9]+}}) : (f32, !loop.buf<2x32xf32, reg>, index, index) -> ()
+// CHECK: loop.store({{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}, {{%[0-9]+}}) : (f32, !loop.buf<4x24xf32, global>, index, index) -> ()
+tile.dispatch @project_24(%input: tensor<4x8xf32>, %weight: tensor<8x24xf32>) -> tensor<4x24xf32> {
+  %product = tile.block(%input, %weight) {iters = [par 4, par 24, red 8], reads = [$0[d0, d2], $1[d2, d1]], folds = [sum -> [d0, d1]], loops = [d0 by 2, d2 by 1, d0 by 2 : reg, d1 by 32 : reg, d1 by 16 : lanes]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<4x8xf32>, tensor<8x24xf32>) -> tensor<4x24xf32>
+  func.return(%product) : (tensor<4x24xf32>) -> ()
+}
+func.func @main(%input: tensor<4x8xf32>, %weight: tensor<8x24xf32>) -> tensor<4x24xf32> {
+  %product = host.dispatch(%input, %weight) {callee = @project_24} : (tensor<4x8xf32>, tensor<8x24xf32>) -> tensor<4x24xf32>
+  func.return(%product) : (tensor<4x24xf32>) -> ()
+}
+
+// -----
+
+// A map whose register tile of 2 rows walks rows whose count is known only when the code runs:
+// the whole tiles have atoms of 2 rows, and the last tile one whose rows the span clips.
+// CHECK: loop.func @doubled([[INPUT:%[0-9]+]]: !loop.buf<{N}x16xf32, global>, {{%[0-9]+}}: !loop.buf<{N}x16xf32, global>)
+// CHECK: [[ROW_COUNT:%[0-9]+]] = loop.index() {expr = {N}} : () -> index
+// CHECK: [[FULL_TILES:%[0-9]+]] = loop.index({{%[0-9]+}}, [[ROW_COUNT]]) {expr = (d1 - d0) floordiv 2} : (index, index) -> index
+// CHECK: loop.atom({{%[0-9]+}}, {{%[0-9]+}}) {tile = [2, 16], lanes = 16} ({
+// CHECK: [[REST_START:%[0-9]+]] = loop.index({{%[0-9]+}}, [[FULL_TILES]]) {expr = max(d0, d1)} : (index, index) -> index
+// CHECK-NEXT: loop.for([[REST_START]], {{%[0-9]+}}) ({
+// CHECK-NEXT: ^body([[LAST_TILE:%[0-9]+]]: index):
+// CHECK-NEXT: [[LAST_START:%[0-9]+]] = loop.index({{%[0-9]+}}, [[LAST_TILE]]) {expr = d0 + d1 * 2} : (index, index) -> index
+// CHECK: [[LAST_ROWS:%[0-9]+]] = loop.index([[LAST_START]], [[ROW_COUNT]]) {expr = min(2, d1 - d0)} : (index, index) -> index
+// CHECK: loop.atom([[LAST_ROWS]], {{%[0-9]+}}) {tile = [2, 16], lanes = 16} ({
+tile.dispatch @doubled(%input: tensor<{N}x16xf32>) -> tensor<{N}x16xf32> {
+  %doubled = tile.block(%input) {iters = [par {N}, par 16], reads = [$0[d0, d1]], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 2 : reg, d1 by 16 : lanes]} ({
+  ^body(%element: f32):
+    %twice = arith.add(%element, %element) : (f32, f32) -> f32
+    tile.yield(%twice) : (f32) -> ()
+  }) : (tensor<{N}x16xf32>) -> tensor<{N}x16xf32>
+  func.return(%doubled) : (tensor<{N}x16xf32>) -> ()
+}
+func.func @main(%input: tensor<{N}x16xf32>) -> tensor<{N}x16xf32> {
+  %doubled = host.dispatch(%input) {callee = @doubled} : (tensor<{N}x16xf32>) -> tensor<{N}x16xf32>
+  func.return(%doubled) : (tensor<{N}x16xf32>) -> ()
+}

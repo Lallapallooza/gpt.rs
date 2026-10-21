@@ -187,3 +187,72 @@ func.func @running_sums(%counts: tensor<6xsi32>) -> tensor<6xsi32> {
   }) : (tensor<6xsi32>) -> tensor<6xsi32>
   func.return(%sums) : (tensor<6xsi32>) -> ()
 }
+
+// -----
+
+// A prefix fold of each row whose state is held in scratch at the loop over the rows, inside the
+// loop over the prefix: at each point of the prefix, the 4 rows' sums start, the loop over the rows
+// folds each row's points up to the prefix's, and each row's sum is written.
+// CHECK: loop.func @running([[COUNTS:%[0-9]+]]: !loop.buf<4x6xsi32, global>, [[SUMS:%[0-9]+]]: !loop.buf<4x6xsi32, global>)
+// CHECK: ^body([[PREFIX_END:%[0-9]+]]: index):
+// CHECK-NEXT: [[ROW_SUMS:%[0-9]+]] = loop.alloc() {shape = [4], dtype = si32} : () -> !loop.buf<4xsi32, private>
+// CHECK: loop.store({{%[0-9]+}}, [[ROW_SUMS]], {{%[0-9]+}}) : (si32, !loop.buf<4xsi32, private>, index) -> ()
+// CHECK: ^body([[ROW:%[0-9]+]]: index):
+// CHECK-NEXT: [[START:%[0-9]+]] = loop.index() {expr = 0} : () -> index
+// CHECK-NEXT: [[THROUGH:%[0-9]+]] = loop.index([[PREFIX_END]]) {expr = d0 + 1} : (index) -> index
+// CHECK-NEXT: loop.for([[START]], [[THROUGH]]) ({
+// CHECK-NEXT: ^body([[POINT:%[0-9]+]]: index):
+// CHECK-NEXT: [[COUNT:%[0-9]+]] = loop.load([[COUNTS]], [[ROW]], [[POINT]]) : (!loop.buf<4x6xsi32, global>, index, index) -> si32
+// CHECK-NEXT: [[ROW_AT:%[0-9]+]] = loop.index([[ROW]], {{%[0-9]+}}) {expr = d0 - d1} : (index, index) -> index
+// CHECK-NEXT: [[SO_FAR:%[0-9]+]] = loop.load([[ROW_SUMS]], [[ROW_AT]]) : (!loop.buf<4xsi32, private>, index) -> si32
+// CHECK-NEXT: [[SUM:%[0-9]+]] = arith.add([[SO_FAR]], [[COUNT]]) : (si32, si32) -> si32
+// CHECK-NEXT: loop.store([[SUM]], [[ROW_SUMS]], [[ROW_AT]]) : (si32, !loop.buf<4xsi32, private>, index) -> ()
+// CHECK: loop.store({{%[0-9]+}}, [[SUMS]], {{%[0-9]+}}, [[PREFIX_END]]) : (si32, !loop.buf<4x6xsi32, global>, index, index) -> ()
+tile.dispatch @running(%counts: tensor<4x6xsi32>) -> tensor<4x6xsi32> attributes {target = "x86-64-v4@3928f7d3"} {
+  %sums = tile.block(%counts) {iters = [par 4, prefix 6], reads = [$0[d0, d1]], folds = [sum -> [d0, d1] held scratch<at = 1>], loops = [d1 by 1, d0 by 1]} ({
+  ^body(%count: si32):
+    tile.yield(%count) : (si32) -> ()
+  }) : (tensor<4x6xsi32>) -> tensor<4x6xsi32>
+  func.return(%sums) : (tensor<4x6xsi32>) -> ()
+}
+func.func @main(%counts: tensor<4x6xsi32>) -> tensor<4x6xsi32> {
+  %sums = host.dispatch(%counts) {callee = @running} : (tensor<4x6xsi32>) -> tensor<4x6xsi32>
+  func.return(%sums) : (tensor<4x6xsi32>) -> ()
+}
+
+// -----
+
+// A projection whose contracted axis runs in tiles of 8 outside the tiles of 2 rows. The sums of
+// the worker's 8 rows and 16 columns live in private scratch across the tiles of the contracted
+// axis: started at 0 before them, copied into registers before the points of each tile of rows
+// and back after them, and written into the product after the last tile.
+// CHECK: loop.func @project([[INPUT:%[0-9]+]]: !loop.buf<8x32xf32, global>, [[WEIGHT:%[0-9]+]]: !loop.buf<32x32xf32, global>, [[PRODUCT:%[0-9]+]]: !loop.buf<8x32xf32, global>)
+// CHECK: [[SUMS:%[0-9]+]] = loop.alloc() {shape = [8, 16], dtype = f32} : () -> !loop.buf<8x16xf32, private>
+// CHECK: [[ZERO:%[0-9]+]] = arith.constant() {value = 0.0 : f32} : () -> f32
+// CHECK-NEXT: loop.store([[ZERO]], [[SUMS]], {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK: [[TILE_SUMS:%[0-9]+]] = loop.alloc() {shape = [2, 16], dtype = f32, space = reg} : () -> !loop.buf<2x16xf32, reg>
+// CHECK: [[SO_FAR:%[0-9]+]] = loop.load([[SUMS]], {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK-NEXT: loop.store([[SO_FAR]], [[TILE_SUMS]], {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK: [[ELEMENT:%[0-9]+]] = loop.load([[INPUT]], {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK-NEXT: [[SCALE:%[0-9]+]] = loop.load([[WEIGHT]], {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK-NEXT: [[TERM:%[0-9]+]] = arith.mul([[ELEMENT]], [[SCALE]])
+// CHECK: [[PARTIAL:%[0-9]+]] = loop.load([[TILE_SUMS]], {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK-NEXT: [[SUM:%[0-9]+]] = arith.add([[PARTIAL]], [[TERM]])
+// CHECK-NEXT: loop.store([[SUM]], [[TILE_SUMS]], {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK: [[TILE_SUM:%[0-9]+]] = loop.load([[TILE_SUMS]], {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK-NEXT: loop.store([[TILE_SUM]], [[SUMS]], {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK: [[FINAL:%[0-9]+]] = loop.load([[SUMS]], {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK-NEXT: loop.store([[FINAL]], [[PRODUCT]], {{%[0-9]+}}, {{%[0-9]+}})
+// CHECK: loop.return() : () -> ()
+tile.dispatch @project(%input: tensor<8x32xf32>, %weight: tensor<32x32xf32>) -> tensor<8x32xf32> attributes {target = "x86-64-v4@3928f7d3"} {
+  %product = tile.block(%input, %weight) {iters = [par 8, par 32, red 32], reads = [$0[d0, d2], $1[d2, d1]], folds = [sum -> [d0, d1] held scratch<at = 2>], loops = [d0 by 8 : workers<level = core>, d1 by 16, d2 by 8, d0 by 2, d2 by 1, d0 by 2 : reg, d1 by 16 : lanes]} ({
+  ^body(%element: f32, %scale: f32):
+    %term = arith.mul(%element, %scale) : (f32, f32) -> f32
+    tile.yield(%term) : (f32) -> ()
+  }) : (tensor<8x32xf32>, tensor<32x32xf32>) -> tensor<8x32xf32>
+  func.return(%product) : (tensor<8x32xf32>) -> ()
+}
+func.func @main(%input: tensor<8x32xf32>, %weight: tensor<32x32xf32>) -> tensor<8x32xf32> {
+  %product = host.dispatch(%input, %weight) {callee = @project} : (tensor<8x32xf32>, tensor<32x32xf32>) -> tensor<8x32xf32>
+  func.return(%product) : (tensor<8x32xf32>) -> ()
+}

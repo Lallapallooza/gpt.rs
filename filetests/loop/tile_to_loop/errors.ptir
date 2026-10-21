@@ -8,20 +8,3 @@ func.func @unsealed(%input: tensor<4xf32>) -> tensor<4xf32> {
   }) : (tensor<4xf32>) -> tensor<4xf32>
   func.return(%output) : (tensor<4xf32>) -> ()
 }
-
-// -----
-
-// ERROR: tile-to-loop: tile.dispatch: failed to legalize: DispatchToLoop: tensor<{N}xf32> crosses blocks in private scratch, whose extents are static
-tile.dispatch @symbolic(%input: tensor<{N}xf32>) -> tensor<{N}xf32> {
-  %doubled = tile.block(%input) {iters = [par {N}], reads = [$0[d0]], folds = [none -> [d0]]} ({
-  ^body(%element: f32):
-    %sum = arith.add(%element, %element) : (f32, f32) -> f32
-    tile.yield(%sum) : (f32) -> ()
-  }) : (tensor<{N}xf32>) -> tensor<{N}xf32>
-  %squared = tile.block(%doubled) {iters = [par {N}], reads = [$0[d0]], folds = [none -> [d0]]} ({
-  ^body(%element: f32):
-    %product = arith.mul(%element, %element) : (f32, f32) -> f32
-    tile.yield(%product) : (f32) -> ()
-  }) : (tensor<{N}xf32>) -> tensor<{N}xf32>
-  func.return(%squared) : (tensor<{N}xf32>) -> ()
-}

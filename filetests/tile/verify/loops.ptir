@@ -100,7 +100,7 @@ tile.dispatch @lanes_in_memory(%input: tensor<4x16xf32>) -> tensor<4x16xf32> {
 // -----
 
 // ERROR: tile.block: read 0 is held at mode 3, of loops of 3 modes
-tile.dispatch @staged_outside(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+tile.dispatch @staged_outside(%input: tensor<4x6xf32>) -> tensor<4x6xf32> attributes {target = "x86-64-v4@3928f7d3"} {
   %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1] held copy<level = l1, at = 3>], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 1, d1 by 1]} ({
   ^body(%element: f32):
     tile.yield(%element) : (f32) -> ()
@@ -144,7 +144,7 @@ tile.dispatch @inside_registers(%input: tensor<4x32xf32>) -> tensor<4x32xf32> {
 // -----
 
 // ERROR: tile.block: read 0 is held at mode 2, a mode of the register tile, which runs its points at once
-tile.dispatch @held_in_registers(%input: tensor<4x32xf32>) -> tensor<4x32xf32> {
+tile.dispatch @held_in_registers(%input: tensor<4x32xf32>) -> tensor<4x32xf32> attributes {target = "x86-64-v4@3928f7d3"} {
   %output = tile.block(%input) {iters = [par 4, par 32], reads = [$0[d0, d1] held copy<level = l1, at = 2>], folds = [none -> [d0, d1]], loops = [d1 by 16, d0 by 1, d1 by 16 : lanes]} ({
   ^body(%element: f32):
     tile.yield(%element) : (f32) -> ()
@@ -288,7 +288,7 @@ tile.dispatch @reg_left_out(%cache: tensor<1x16xf32>, %row: tensor<1x16xf32>) ->
 // -----
 
 // ERROR: tile.block: read 1 holds $0, which another read holds
-tile.dispatch @read_twice(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+tile.dispatch @read_twice(%input: tensor<4x6xf32>) -> tensor<4x6xf32> attributes {target = "x86-64-v4@3928f7d3"} {
   %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1] held copy<level = l1, at = 0>, $0[d0, 5 - d1] held copy<level = l1, at = 0>], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 1, d1 by 1]} ({
   ^body(%element: f32, %mirrored: f32):
     %sum = arith.add(%element, %mirrored) : (f32, f32) -> f32
@@ -300,7 +300,7 @@ tile.dispatch @read_twice(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
 // -----
 
 // ERROR: tile.block: $0 is held in a copy, and the block uses it other than in one read of it alone
-tile.dispatch @copied_and_read(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+tile.dispatch @copied_and_read(%input: tensor<4x6xf32>) -> tensor<4x6xf32> attributes {target = "x86-64-v4@3928f7d3"} {
   %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1] held copy<level = l1, at = 0>, $0[d0, 5 - d1]], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 1, d1 by 1]} ({
   ^body(%element: f32, %mirrored: f32):
     %sum = arith.add(%element, %mirrored) : (f32, f32) -> f32
@@ -312,7 +312,7 @@ tile.dispatch @copied_and_read(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
 // -----
 
 // ERROR: tile.block: the copy of $0 has an axis of {N} elements, which is not static
-tile.dispatch @dynamic_copy(%input: tensor<4x{N}xf32>) -> tensor<4x{N}xf32> {
+tile.dispatch @dynamic_copy(%input: tensor<4x{N}xf32>) -> tensor<4x{N}xf32> attributes {target = "x86-64-v4@3928f7d3"} {
   %output = tile.block(%input) {iters = [par 4, par {N}], reads = [$0[d0, d1] held copy<level = l1, at = 0>], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 1, d1 by 1]} ({
   ^body(%element: f32):
     tile.yield(%element) : (f32) -> ()
@@ -484,7 +484,7 @@ tile.dispatch @reg_picks_list(%first: tensor<16xf32>, %second: tensor<16xf32>) -
 // -----
 
 // ERROR: tile.block: $0 is copied where d0, by which its read picks the operand, does not stand at one point
-tile.dispatch @stage_moving_pick(%first: tensor<16xf32>, %second: tensor<16xf32>) -> tensor<2x16xf32> {
+tile.dispatch @stage_moving_pick(%first: tensor<16xf32>, %second: tensor<16xf32>) -> tensor<2x16xf32> attributes {target = "x86-64-v4@3928f7d3"} {
   %output = tile.block(%first, %second) {iters = [par 2, par 16], reads = [$0..$1[d0][d1] held copy<level = l1, at = 0>], folds = [none -> [d0, d1]], loops = [d1 by 16, d0 by 1, d1 by 1]} ({
   ^body(%element: f32):
     tile.yield(%element) : (f32) -> ()
@@ -917,6 +917,17 @@ tile.dispatch @pieces_of_dram(%input: tensor<4x16xf32>) -> tensor<4x16xf32> attr
 // ERROR: tile.dispatch: block 0: the read of $0 is held for l2, for which %S/bare-l2.toml has no buffer space that holds a copy
 tile.dispatch @copy_without_space(%input: tensor<4x6xf32>) -> tensor<4x6xf32> attributes {target = "%S/bare-l2.toml@60326310"} {
   %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1] held copy<level = l2, at = 0>], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 1, d1 by 1]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x6xf32>) -> tensor<4x6xf32>
+  func.return(%output) : (tensor<4x6xf32>) -> ()
+}
+
+// -----
+
+// ERROR: tile.dispatch: block 0: the read of $0 is held in a copy for l1, which needs a memory of the target, and the dispatch names no target
+tile.dispatch @copy_without_target(%input: tensor<4x6xf32>) -> tensor<4x6xf32> {
+  %output = tile.block(%input) {iters = [par 4, par 6], reads = [$0[d0, d1] held copy<level = l1, at = 0>], folds = [none -> [d0, d1]], loops = [d0 by 2, d0 by 1, d1 by 1]} ({
   ^body(%element: f32):
     tile.yield(%element) : (f32) -> ()
   }) : (tensor<4x6xf32>) -> tensor<4x6xf32>

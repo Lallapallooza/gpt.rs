@@ -72,7 +72,7 @@ pub struct AtomPlan {
 }
 
 /// A copy of the elements of operand `operand` that the loops inside loop `at` of the nest read,
-/// or the whole nest without `at`, which a unit makes in its scratch for each tile of that loop
+/// or the whole nest without `at`, which a worker makes in its scratch for each tile of that loop
 /// and reads instead of the operand, sized for the memory `level`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyAt {
@@ -96,7 +96,8 @@ pub enum CopyAxis {
     /// The tiles of loop `index` of the nest within its tile of the loop around it: `count` of
     /// them.
     Tiles { index: usize, count: Dim },
-    /// The points of the innermost tile of the iterator at `position`, of `extent` points.
+    /// The `extent` points of the iterator at `position` in its innermost tile that has a `Tiles`
+    /// axis in the copy, or else in its tile around the copy.
     Points { position: usize, extent: Dim },
 }
 
@@ -765,6 +766,9 @@ impl Walk {
     /// whole nest, in the order that the loops inside walk its elements: one for each loop inside
     /// over an iterator the read takes, over its tiles, or its points for a loop of one point at a
     /// time, then one for the points of each iterator of the register tile that the read takes.
+    /// A loop over the tiles of an iterator that the block clips has no axis: a clip narrows the
+    /// loop, which numbers its tiles from where it starts, so the copy holds the points of such an
+    /// iterator by their offset from the start of its tile around the copy.
     pub fn copy_axes(&self, block: &Block, read: &Read, at: Option<usize>) -> Vec<CopyAxis> {
         let mut taken = BTreeSet::new();
         for coord in &read.coords {
@@ -787,6 +791,9 @@ impl Walk {
                     position,
                     extent: around[position].clone(),
                 });
+                continue;
+            }
+            if self.clip.contains(position) {
                 continue;
             }
             let count = match &around[position] {

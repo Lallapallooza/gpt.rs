@@ -517,6 +517,7 @@ Rejected, as the verify filetests pin it:
 - `tile.dispatch: block 0: the read of $0 is held for smem, a memory x86-64-v4 does not have`
 - `tile.dispatch: block 0: mode 0 walks the pieces of dram, which is not a cache or scratch of x86-64-v4`
 - `tile.dispatch: block 0: the read of $0 is held for l2, for which %S/bare-l2.toml has no buffer space that holds a copy`
+- `tile.dispatch: block 0: the read of $0 is held in a copy for l1, which needs a memory of the target, and the dispatch names no target`
 - `tile.dispatch: block 0: the read of $0 is held for l2, for which %S/bare-l2.toml has no prefetch that asks it for lines`
 - `tile.dispatch: block 0: 16 lanes of f64 take 1024 bits, and x86-64-v4 has registers of [128, 256, 512] bits`
 

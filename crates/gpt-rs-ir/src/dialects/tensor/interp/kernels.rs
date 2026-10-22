@@ -18,7 +18,7 @@ use anyhow::{anyhow, bail, Result};
 use half::{bf16, f16};
 
 use super::elementwise::Arith;
-use crate::host::TensorData;
+use crate::host::{HostTensor, TensorData};
 use crate::ir::{e8m0_decode, DType, Format, Overflow, F8E4M3};
 
 /// Row-major strides of `dims`.
@@ -45,8 +45,8 @@ pub fn unravel(mut index: usize, dims: &[usize]) -> Vec<usize> {
 pub fn offsets(extents: &[usize], steps: &[usize]) -> Vec<usize> {
     let count: usize = extents.iter().product();
     (0..count)
-        .map(|i| {
-            unravel(i, extents)
+        .map(|position| {
+            unravel(position, extents)
                 .iter()
                 .zip(steps)
                 .map(|(coord, step)| coord * step)
@@ -64,7 +64,7 @@ pub fn strided(
     steps: &[usize],
 ) -> Result<TensorData> {
     let at = offsets(extents, steps);
-    gather_elements(data, at.len(), |i| start + at[i])
+    gather_elements(data, at.len(), |element| start + at[element])
 }
 
 /// The elements of a tensor as equal-size chunks, for the ops that only move elements: the
@@ -79,7 +79,9 @@ pub struct Chunks<'a> {
 impl<'a> Chunks<'a> {
     pub fn of(data: &'a TensorData) -> Self {
         let bytes = match data {
-            TensorData::Packed(packed) => (0..packed.len()).map(|i| packed.get(i)).collect(),
+            TensorData::Packed(packed) => {
+                (0..packed.len()).map(|index| packed.get(index)).collect()
+            }
             data => Cow::Borrowed(data.bytes()),
         };
         Self {
@@ -142,8 +144,8 @@ pub fn gather_elements(
 ) -> Result<TensorData> {
     let input = Chunks::of(data);
     let mut out = Chunks::zeroed(data.dtype(), count);
-    for i in 0..count {
-        out.set(i, input.get(source(i)));
+    for element in 0..count {
+        out.set(element, input.get(source(element)));
     }
     out.into_data()
 }
@@ -160,61 +162,69 @@ pub enum Values<'a> {
 impl Values<'_> {
     pub fn len(&self) -> usize {
         match self {
-            Values::Int(v) => v.len(),
-            Values::F32(v) => v.len(),
-            Values::F64(v) => v.len(),
+            Values::Int(elements) => elements.len(),
+            Values::F32(elements) => elements.len(),
+            Values::F64(elements) => elements.len(),
         }
     }
 
     /// The values, owned.
     pub fn into_owned(self) -> Values<'static> {
         match self {
-            Values::Int(v) => Values::Int(v),
-            Values::F32(v) => Values::F32(Cow::Owned(v.into_owned())),
-            Values::F64(v) => Values::F64(Cow::Owned(v.into_owned())),
+            Values::Int(elements) => Values::Int(elements),
+            Values::F32(elements) => Values::F32(Cow::Owned(elements.into_owned())),
+            Values::F64(elements) => Values::F64(Cow::Owned(elements.into_owned())),
         }
     }
 }
 
 /// The elements of `data` in the type the interpreter computes with. Every dtype decodes exactly.
 pub fn values(data: &TensorData) -> Values<'_> {
-    let ints = |v: &mut dyn Iterator<Item = i128>| Values::Int(v.collect());
-    let codes = |format: Format, v: &[u8]| {
+    let ints = |elements: &mut dyn Iterator<Item = i128>| Values::Int(elements.collect());
+    let codes = |format: Format, stored: &[u8]| {
         Values::F32(
-            v.iter()
-                .map(|&c| format.decode(u32::from(c)) as f32)
+            stored
+                .iter()
+                .map(|&code| format.decode(u32::from(code)) as f32)
                 .collect(),
         )
     };
     match data {
-        TensorData::F64(v) => Values::F64(Cow::Borrowed(v)),
-        TensorData::F32(v) => Values::F32(Cow::Borrowed(v)),
-        TensorData::F16(v) => Values::F32(v.iter().map(|x| x.to_f32()).collect()),
-        TensorData::Bf16(v) => Values::F32(v.iter().map(|x| x.to_f32()).collect()),
-        TensorData::F8E4M3(v) => Values::F32(v.iter().map(|x| x.to_f32()).collect()),
-        TensorData::F8E5M2(v) => codes(Format::F8E5M2, v),
-        TensorData::F8E4M3Fnuz(v) => codes(Format::F8E4M3FNUZ, v),
-        TensorData::F8E5M2Fnuz(v) => codes(Format::F8E5M2FNUZ, v),
-        TensorData::E8M0(v) => Values::F32(v.iter().map(|&c| e8m0_decode(c) as f32).collect()),
-        TensorData::Si8(v) => ints(&mut v.iter().map(|&x| i128::from(x))),
-        TensorData::Ui8(v) | TensorData::I1(v) => ints(&mut v.iter().map(|&x| i128::from(x))),
-        TensorData::Si16(v) => ints(&mut v.iter().map(|&x| i128::from(x))),
-        TensorData::Ui16(v) => ints(&mut v.iter().map(|&x| i128::from(x))),
-        TensorData::Si32(v) => ints(&mut v.iter().map(|&x| i128::from(x))),
-        TensorData::Ui32(v) => ints(&mut v.iter().map(|&x| i128::from(x))),
-        TensorData::Si64(v) => ints(&mut v.iter().map(|&x| i128::from(x))),
-        TensorData::Ui64(v) => ints(&mut v.iter().map(|&x| i128::from(x))),
+        TensorData::F64(elements) => Values::F64(Cow::Borrowed(elements)),
+        TensorData::F32(elements) => Values::F32(Cow::Borrowed(elements)),
+        TensorData::F16(elements) => Values::F32(elements.iter().map(|x| x.to_f32()).collect()),
+        TensorData::Bf16(elements) => Values::F32(elements.iter().map(|x| x.to_f32()).collect()),
+        TensorData::F8E4M3(elements) => Values::F32(elements.iter().map(|x| x.to_f32()).collect()),
+        TensorData::F8E5M2(elements) => codes(Format::F8E5M2, elements),
+        TensorData::F8E4M3Fnuz(elements) => codes(Format::F8E4M3FNUZ, elements),
+        TensorData::F8E5M2Fnuz(elements) => codes(Format::F8E5M2FNUZ, elements),
+        TensorData::E8M0(elements) => Values::F32(
+            elements
+                .iter()
+                .map(|&code| e8m0_decode(code) as f32)
+                .collect(),
+        ),
+        TensorData::Si8(elements) => ints(&mut elements.iter().map(|&x| i128::from(x))),
+        TensorData::Ui8(elements) | TensorData::I1(elements) => {
+            ints(&mut elements.iter().map(|&x| i128::from(x)))
+        }
+        TensorData::Si16(elements) => ints(&mut elements.iter().map(|&x| i128::from(x))),
+        TensorData::Ui16(elements) => ints(&mut elements.iter().map(|&x| i128::from(x))),
+        TensorData::Si32(elements) => ints(&mut elements.iter().map(|&x| i128::from(x))),
+        TensorData::Ui32(elements) => ints(&mut elements.iter().map(|&x| i128::from(x))),
+        TensorData::Si64(elements) => ints(&mut elements.iter().map(|&x| i128::from(x))),
+        TensorData::Ui64(elements) => ints(&mut elements.iter().map(|&x| i128::from(x))),
         TensorData::Packed(packed) => {
             let dtype = packed.dtype();
-            let code = |i| u32::from(packed.get(i));
+            let code = |index| u32::from(packed.get(index));
             match (Format::of(dtype), dtype.int_format()) {
                 (Some(format), _) => Values::F32(
                     (0..packed.len())
-                        .map(|i| format.decode(code(i)) as f32)
+                        .map(|index| format.decode(code(index)) as f32)
                         .collect(),
                 ),
                 (None, Some(int)) => {
-                    ints(&mut (0..packed.len()).map(|i| int.wrap(i128::from(code(i)))))
+                    ints(&mut (0..packed.len()).map(|index| int.wrap(i128::from(code(index)))))
                 }
                 (None, None) => unreachable!("every packed dtype is a float or an integer"),
             }
@@ -305,11 +315,11 @@ fn narrow(
 
 /// `values`, computed in the type the interpreter computes `dtype` in, in a tensor of `dtype`.
 /// Integers must lie in the dtype's range.
-pub fn from_values(dtype: DType, values: Values<'_>) -> Result<TensorData> {
+pub fn from_values(dtype: DType, values: Values) -> Result<TensorData> {
     match values {
-        Values::Int(v) => from_ints(dtype, v.into_iter()),
-        Values::F32(v) => from_f32(dtype, v.iter().copied()),
-        Values::F64(v) => from_f64(dtype, v.iter().copied()),
+        Values::Int(elements) => from_ints(dtype, elements.into_iter()),
+        Values::F32(elements) => from_f32(dtype, elements.iter().copied()),
+        Values::F64(elements) => from_f64(dtype, elements.iter().copied()),
     }
 }
 
@@ -355,29 +365,36 @@ pub fn cast(data: &TensorData, to: DType) -> Result<TensorData> {
     }
     if to == DType::I1 {
         let nonzero: Vec<u8> = match values(data) {
-            Values::Int(v) => v.iter().map(|&x| u8::from(x != 0)).collect(),
-            Values::F32(v) => v.iter().map(|&x| u8::from(x != 0.0)).collect(),
-            Values::F64(v) => v.iter().map(|&x| u8::from(x != 0.0)).collect(),
+            Values::Int(elements) => elements.iter().map(|&x| u8::from(x != 0)).collect(),
+            Values::F32(elements) => elements.iter().map(|&x| u8::from(x != 0.0)).collect(),
+            Values::F64(elements) => elements.iter().map(|&x| u8::from(x != 0.0)).collect(),
         };
         return Ok(TensorData::I1(nonzero.into()));
     }
     if let Some(int) = to.int_format() {
         let saturate = |x: i128| int.saturate(x);
         return match values(data) {
-            Values::Int(v) => from_ints(to, v.into_iter().map(saturate)),
+            Values::Int(elements) => from_ints(to, elements.into_iter().map(saturate)),
             // `as` truncates toward zero, saturates and gives 0 for NaN.
-            Values::F32(v) => from_ints(to, v.iter().map(|&x| saturate(x as i128))),
-            Values::F64(v) => from_ints(to, v.iter().map(|&x| saturate(x as i128))),
+            Values::F32(elements) => from_ints(to, elements.iter().map(|&x| saturate(x as i128))),
+            Values::F64(elements) => from_ints(to, elements.iter().map(|&x| saturate(x as i128))),
         };
     }
     let Some(bits) = to.significand_bits() else {
         bail!("the interpreter casts nothing into {to}");
     };
     match values(data) {
-        Values::Int(v) => from_f64(to, v.into_iter().map(|x| round_integer(x, bits))),
-        Values::F32(v) => from_f32(to, v.iter().copied()),
-        Values::F64(v) => from_f64(to, v.iter().copied()),
+        Values::Int(elements) => from_f64(to, elements.into_iter().map(|x| round_integer(x, bits))),
+        Values::F32(elements) => from_f32(to, elements.iter().copied()),
+        Values::F64(elements) => from_f64(to, elements.iter().copied()),
     }
+}
+
+/// The bits of `input`'s elements read as `count` elements of `to`. The elements' bytes are their
+/// bit stream: packed from the least significant bit of each byte, little-endian across the bytes
+/// of an element.
+pub fn bitcast(input: &HostTensor, to: DType, count: usize) -> Result<TensorData> {
+    TensorData::read(to, count, Arc::new(input.to_le_bytes().to_vec()))
 }
 
 /// A tensor of the sub-byte dtype `dtype` whose elements have the codes `codes`.
@@ -386,8 +403,8 @@ pub fn packed(dtype: DType, codes: &[u8]) -> Result<TensorData> {
     let TensorData::Packed(packed) = &mut data else {
         bail!("{dtype} elements are not packed");
     };
-    for (i, &code) in codes.iter().enumerate() {
-        packed.set(i, code);
+    for (position, &code) in codes.iter().enumerate() {
+        packed.set(position, code);
     }
     Ok(data)
 }
@@ -427,7 +444,7 @@ pub(super) fn accumulate(
 
 fn run<T: Arith>(
     kernel: &impl Accumulation,
-    decoded: &[Values<'_>],
+    decoded: &[Values],
     accum: DType,
 ) -> Result<Values<'static>> {
     let inputs = decoded
@@ -441,12 +458,12 @@ fn run<T: Arith>(
     )?))
 }
 
-/// The positions of the `k` best of `count` candidates, best first: the largest by `order` with
+/// The positions of the `kept` best of `count` candidates, best first: the largest by `order` with
 /// `largest`, else the smallest. Of candidates that order equal, the one at the smaller position
 /// comes first.
 pub(crate) fn best_k(
     count: usize,
-    k: usize,
+    kept: usize,
     largest: bool,
     order: impl Fn(usize, usize) -> Ordering,
 ) -> Vec<usize> {
@@ -460,6 +477,6 @@ pub(crate) fn best_k(
             ordering
         }
     });
-    ranking.truncate(k);
+    ranking.truncate(kept);
     ranking
 }

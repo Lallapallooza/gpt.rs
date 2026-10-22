@@ -3,11 +3,11 @@
 use anyhow::Result;
 
 use crate::dialects::tensor::utils::shape::pick;
-use crate::dialects::tensor::{DotAxes, DotGeneral, Reshape, Side};
-use crate::ir::{Matched, Module, Ranked};
+use crate::dialects::tensor::{DotAxes, DotGeneral, DotGeneralOp, Reshape, Side};
+use crate::ir::Ranked;
 use crate::passes::{pass, run_patterns, Pass};
 use crate::require;
-use crate::rewrite::{pattern, Build, NoMatch, Pattern, PatternSet, Rewriter, Rewrites};
+use crate::rewrite::{pattern, Build, NoMatch, Pattern, PatternSet, Rewriter, Rewrites, Rewriting};
 
 /// `dot_general(reshape(x), w)` becomes `dot_general(x, w')` when the reshape only splits one
 /// axis `a` of `x` into the contracted axes of the lhs, which are adjacent and in order, and `w`
@@ -90,11 +90,7 @@ fn merged_dot(dot: &DotGeneral, axes: &DotAxes, merged_axis: usize) -> DotGenera
 impl Pattern for MergeDotAxes {
     type Root = DotGeneral;
 
-    fn rewrite(
-        &self,
-        dot: Matched<'_, DotGeneral>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, dot: DotGeneralOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let reshape = dot
             .lhs()
             .defining_op::<Reshape>()
@@ -141,7 +137,7 @@ impl Pass for MergeContractedAxes {
         Rewrites::patterns(populate_merge_contracted_axes_patterns)
     }
 
-    fn run(&self, module: &mut Module) -> Result<bool> {
+    fn run(&self, module: &mut Rewriting) -> Result<bool> {
         run_patterns(module, self.rewrites(), &Self::MERGED)
     }
 }

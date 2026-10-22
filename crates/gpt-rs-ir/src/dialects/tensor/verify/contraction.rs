@@ -16,8 +16,8 @@ use crate::ir::{ranked, DType, Dim, NoRegions, OpDef, OwnedTypes, TensorType, Ty
 impl OpDef for DotGeneral {
     fn result_types(
         &self,
-        ins: DotGeneralOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        ins: DotGeneralOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<DotGeneralResults<OwnedTypes>> {
         let (lhs, rhs) = (ins.lhs, ins.rhs);
         // Integers multiply integers, and floats, narrow ones included, multiply floats.
@@ -55,12 +55,13 @@ impl OpDef for DotGeneral {
             ("batch", &axes.batch_lhs, &axes.batch_rhs),
             ("contract", &axes.contract_lhs, &axes.contract_rhs),
         ] {
-            for (&l, &r) in lhs_axes.iter().zip(rhs_axes) {
+            for (&lhs_axis, &rhs_axis) in lhs_axes.iter().zip(rhs_axes) {
                 ensure!(
-                    lhs.dims[l] == rhs.dims[r],
-                    "{group}_lhs axis {l} has extent {}, but {group}_rhs axis {r} has extent {}",
-                    lhs.dims[l],
-                    rhs.dims[r]
+                    lhs.dims[lhs_axis] == rhs.dims[rhs_axis],
+                    "{group}_lhs axis {lhs_axis} has extent {}, but {group}_rhs axis {rhs_axis} has \
+                     extent {}",
+                    lhs.dims[lhs_axis],
+                    rhs.dims[rhs_axis]
                 );
             }
         }
@@ -84,8 +85,8 @@ impl OpDef for DotGeneral {
 impl OpDef for ArgMax {
     fn result_types(
         &self,
-        ins: ArgMaxOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        ins: ArgMaxOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<ArgMaxResults<OwnedTypes>> {
         let input = ins.input;
         ensure_class("the input", input, ARITHMETIC)?;
@@ -114,8 +115,8 @@ impl OpDef for ArgMax {
 /// The type rule of every [`Reduce`] op.
 pub(crate) fn reduce<T: Reduce>(
     op: &T,
-    ins: ReduceOperands<Types<'_>>,
-    _cx: &TypeCx<'_, NoRegions>,
+    ins: ReduceOperands<Types>,
+    _cx: &TypeCx<NoRegions>,
 ) -> Result<ReduceResults<OwnedTypes>> {
     let input = ins.input;
     ensure_reduction::<T::Combiner>(input, op.accum, op.out)?;
@@ -131,8 +132,8 @@ pub(crate) fn reduce<T: Reduce>(
 /// The type rule of every [`Segment`] op.
 pub(crate) fn segment<T: Segment>(
     op: &T,
-    ins: SegmentOperands<Types<'_>>,
-    _cx: &TypeCx<'_, NoRegions>,
+    ins: SegmentOperands<Types>,
+    _cx: &TypeCx<NoRegions>,
 ) -> Result<SegmentResults<OwnedTypes>> {
     let (data, ids) = (ins.data, ins.segment_ids);
     ensure_reduction::<T::Combiner>(data, None, None)?;
@@ -163,8 +164,8 @@ pub(super) fn ensure_reduction<C: Combiner>(
 ) -> Result<()> {
     ensure_class("the input", input, <C::Scalar as arith::Binary>::CLASSES)?;
     let class = [Class::of(input.dtype)];
-    for (what, dtype) in [("accum", accum), ("out", out)] {
-        if let Some(dtype) = dtype {
+    for (what, chosen) in [("accum", accum), ("out", out)] {
+        if let Some(dtype) = chosen {
             ensure_dtype_class(what, dtype, &class)?;
         }
     }
@@ -174,8 +175,8 @@ pub(super) fn ensure_reduction<C: Combiner>(
 /// The type rule of every [`SelectK`] op.
 pub(crate) fn select_k<T: SelectK>(
     op: &T,
-    ins: SelectKOperands<Types<'_>>,
-    _cx: &TypeCx<'_, NoRegions>,
+    ins: SelectKOperands<Types>,
+    _cx: &TypeCx<NoRegions>,
 ) -> Result<SelectKResults<OwnedTypes>> {
     let input = ins.input;
     ensure_class("the input", input, ARITHMETIC)?;

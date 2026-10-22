@@ -13,15 +13,15 @@ fn pattern_regex(
     let mut out = String::new();
     let mut captures = Vec::new();
     let mut last = 0;
-    for m in token.captures_iter(pattern) {
-        let whole = m.get(0).expect("match");
+    for token_match in token.captures_iter(pattern) {
+        let whole = token_match.get(0).expect("match");
         out.push_str(&regex::escape(&pattern[last..whole.start()]));
         last = whole.end();
-        if let Some(re) = m.get(3) {
+        if let Some(re) = token_match.get(3) {
             out.push_str(&format!("(?:{})", re.as_str()));
         } else {
-            let name = m[1].to_string();
-            match m.get(2) {
+            let name = token_match[1].to_string();
+            match token_match.get(2) {
                 Some(re) => {
                     out.push_str(&format!("(?P<{name}>{})", re.as_str()));
                     captures.push(name);
@@ -41,6 +41,14 @@ fn pattern_regex(
         .map_err(|err| format!("bad CHECK pattern `{pattern}`: {err}"))
 }
 
+/// Whether `pattern`, the message of an `// ERROR:` line, matches all of `message`.
+pub fn message_matches(pattern: &str, message: &str) -> Result<bool, String> {
+    let (regex, _) = pattern_regex(pattern, &HashMap::new())?;
+    let whole = Regex::new(&format!("^(?:{})$", regex.as_str()))
+        .map_err(|err| format!("bad ERROR pattern `{pattern}`: {err}"))?;
+    Ok(whole.is_match(message))
+}
+
 /// The case's CHECK lines as (directive, pattern).
 pub fn check_lines(case: &str) -> Result<Vec<(&str, &str)>, String> {
     let mut checks = Vec::new();
@@ -51,7 +59,9 @@ pub fn check_lines(case: &str) -> Result<Vec<(&str, &str)>, String> {
         if !comment.contains("CHECK") && !comment.trim_start().starts_with("check") {
             continue;
         }
-        let parsed = comment.strip_prefix(' ').and_then(|c| c.split_once(':'));
+        let parsed = comment
+            .strip_prefix(' ')
+            .and_then(|directive| directive.split_once(':'));
         let Some((kind @ ("CHECK" | "CHECK-NEXT" | "CHECK-NOT"), pattern)) = parsed else {
             return Err(format!("malformed CHECK line `{line}`"));
         };
@@ -60,22 +70,24 @@ pub fn check_lines(case: &str) -> Result<Vec<(&str, &str)>, String> {
     Ok(checks)
 }
 
+/// Checks that no line of `range` matches a pattern of `pending`, the CHECK-NOT lines before the
+/// next match.
+fn not_in(pending: &[&str], range: &[&str], vars: &HashMap<String, String>) -> Result<(), String> {
+    for pattern in pending {
+        let (re, _) = pattern_regex(pattern, vars)?;
+        if let Some(line) = range.iter().find(|candidate| re.is_match(candidate)) {
+            return Err(format!("CHECK-NOT: `{pattern}` matched `{line}`"));
+        }
+    }
+    Ok(())
+}
+
 /// Checks `output` against `checks`.
 pub fn file_check(checks: &[(&str, &str)], output: &str) -> Result<(), String> {
     let lines: Vec<&str> = output.lines().collect();
     let mut vars: HashMap<String, String> = HashMap::new();
     let mut cursor = 0usize; // the next line that may match
     let mut pending_not: Vec<&str> = Vec::new();
-    let not_in =
-        |pending: &[&str], range: &[&str], vars: &HashMap<String, String>| -> Result<(), String> {
-            for pattern in pending {
-                let (re, _) = pattern_regex(pattern, vars)?;
-                if let Some(line) = range.iter().find(|l| re.is_match(l)) {
-                    return Err(format!("CHECK-NOT: `{pattern}` matched `{line}`"));
-                }
-            }
-            Ok(())
-        };
     for &(kind, pattern) in checks {
         if kind == "CHECK-NOT" {
             pending_not.push(pattern);
@@ -86,8 +98,8 @@ pub fn file_check(checks: &[(&str, &str)], output: &str) -> Result<(), String> {
             let index = cursor;
             lines
                 .get(index)
-                .and_then(|l| re.captures(l))
-                .map(|c| (index, c))
+                .and_then(|line| re.captures(line))
+                .map(|captured| (index, captured))
                 .ok_or_else(|| {
                     format!(
                         "CHECK-NEXT: `{pattern}` does not match the next line `{}`",
@@ -96,7 +108,10 @@ pub fn file_check(checks: &[(&str, &str)], output: &str) -> Result<(), String> {
                 })?
         } else {
             (cursor..lines.len())
-                .find_map(|i| re.captures(lines[i]).map(|c| (i, c)))
+                .find_map(|line_index| {
+                    re.captures(lines[line_index])
+                        .map(|captured| (line_index, captured))
+                })
                 .ok_or_else(|| format!("CHECK: `{pattern}` not found"))?
         };
         let (index, caps) = found;

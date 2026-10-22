@@ -1,8 +1,7 @@
 use anyhow::Result;
 
 use super::{pass, Greedy, Pass, Rewrites};
-use crate::ir::Module;
-use crate::rewrite::canonical_patterns;
+use crate::rewrite::{canonical_patterns, Rewriting};
 
 /// Simplifies the module without changing what it computes: folds ops, erases dead ones and
 /// applies every canonicalization pattern until nothing changes.
@@ -31,10 +30,11 @@ impl Pass for Canonicalize {
         Rewrites {
             folds: true,
             patterns: canonical_patterns(),
+            ..Rewrites::default()
         }
     }
 
-    fn run(&self, module: &mut Module) -> Result<bool> {
+    fn run(&self, module: &mut Rewriting) -> Result<bool> {
         let report = Greedy::new(self.rewrites())
             .erase_dead()
             .fuel(self.fuel)

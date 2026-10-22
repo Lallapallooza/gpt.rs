@@ -84,13 +84,16 @@ pub fn ensure_index_dtype(what: &str, dtype: DType) -> Result<()> {
     Ok(())
 }
 
-/// Checks that `a` and `b` have equal types. `what` names them in the message.
+/// Checks that `first` and `second` have equal types. `what` names them in the message.
 pub fn ensure_equal_types<T: PartialEq + fmt::Display + ?Sized>(
     what: &str,
-    a: &T,
-    b: &T,
+    first: &T,
+    second: &T,
 ) -> Result<()> {
-    ensure!(a == b, "{what} must have equal types, got {a} and {b}");
+    ensure!(
+        first == second,
+        "{what} must have equal types, got {first} and {second}"
+    );
     Ok(())
 }
 

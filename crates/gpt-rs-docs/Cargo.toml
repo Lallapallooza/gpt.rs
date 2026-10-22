@@ -13,5 +13,9 @@ gpt-rs = { path = "../gpt-rs", version = "0.1.0" }
 gpt-rs-backend-c = { path = "../gpt-rs-backend-c", version = "0.1.0" }
 gpt-rs-backend-faer = { path = "../gpt-rs-backend-faer", version = "0.1.0" }
 gpt-rs-backend-ref-cpu = { path = "../gpt-rs-backend-ref-cpu", version = "0.1.0" }
+gpt-rs-backend-x86 = { path = "../gpt-rs-backend-x86", version = "0.1.0" }
 gpt-rs-filetests = { path = "../gpt-rs-filetests", version = "0.1.0" }
 gpt-rs-ir = { path = "../gpt-rs-ir", version = "0.1.0" }
+
+[lints]
+workspace = true

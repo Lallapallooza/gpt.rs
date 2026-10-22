@@ -2,8 +2,10 @@ use std::marker::PhantomData;
 
 use super::utils::elementwise;
 use crate::dialects::arith;
-use crate::dialects::tensor::{Binary, Cast, Compare, Select, StopGradient, Unary};
-use crate::ir::Matched;
+use crate::dialects::tensor::{
+    Binary, Cast, CastOp, Compare, Select, SelectOp, StopGradient, StopGradientOp, Unary,
+};
+use crate::ir::OpRef;
 use crate::rewrite::{pattern, NoMatch, Pattern, Rewriter};
 
 /// `tensor.stop_gradient` is its input: a forward computation has no gradients.
@@ -13,11 +15,7 @@ pub(super) struct StopGradientToTile;
 impl Pattern for StopGradientToTile {
     type Root = StopGradient;
 
-    fn rewrite(
-        &self,
-        stop: Matched<'_, StopGradient>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, stop: StopGradientOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         rewriter.replace_op(&stop, stop.input());
         Ok(())
     }
@@ -30,7 +28,7 @@ pub(super) struct UnaryToTile<T>(pub(super) PhantomData<T>);
 impl<T: Unary> Pattern for UnaryToTile<T> {
     type Root = T;
 
-    fn rewrite(&self, unary: Matched<'_, T>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, unary: OpRef<T>, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let inputs = [unary.input().id()];
         let result = elementwise(
             rewriter,
@@ -50,7 +48,7 @@ pub(super) struct BinaryToTile<T>(pub(super) PhantomData<T>);
 impl<T: Binary> Pattern for BinaryToTile<T> {
     type Root = T;
 
-    fn rewrite(&self, binary: Matched<'_, T>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, binary: OpRef<T>, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let inputs = [binary.lhs().id(), binary.rhs().id()];
         let result = elementwise(
             rewriter,
@@ -70,7 +68,7 @@ pub(super) struct CompareToTile<T>(pub(super) PhantomData<T>);
 impl<T: Compare> Pattern for CompareToTile<T> {
     type Root = T;
 
-    fn rewrite(&self, compare: Matched<'_, T>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, compare: OpRef<T>, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let inputs = [compare.lhs().id(), compare.rhs().id()];
         let result = elementwise(
             rewriter,
@@ -90,11 +88,7 @@ pub(super) struct SelectToTile;
 impl Pattern for SelectToTile {
     type Root = Select;
 
-    fn rewrite(
-        &self,
-        select: Matched<'_, Select>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, select: SelectOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let inputs = [
             select.pred().id(),
             select.on_true().id(),
@@ -118,7 +112,7 @@ pub(super) struct CastToTile;
 impl Pattern for CastToTile {
     type Root = Cast;
 
-    fn rewrite(&self, cast: Matched<'_, Cast>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, cast: CastOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let to = cast.to;
         let inputs = [cast.input().id()];
         let result = elementwise(

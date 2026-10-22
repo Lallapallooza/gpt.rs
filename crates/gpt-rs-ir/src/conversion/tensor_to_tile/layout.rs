@@ -1,11 +1,14 @@
 use super::utils::{copy, elementwise};
 use crate::dialects::arith;
 use crate::dialects::tensor::utils::shape::axis_index;
-use crate::dialects::tensor::{Bitcast, BroadcastTo, Concat, Reshape, Slice, Transpose};
+use crate::dialects::tensor::{
+    Bitcast, BitcastOp, BroadcastTo, BroadcastToOp, Concat, ConcatOp, Reshape, ReshapeOp, Slice,
+    SliceOp, Transpose, TransposeOp,
+};
 use crate::dialects::tile::{
     par_iters, push_iter, Block, CombineKind, Fold, IterKind, Read, Write,
 };
-use crate::ir::{Constraint, DType, Dim, IndexExpr, Matched, Relation};
+use crate::ir::{Constraint, DType, Dim, IndexExpr, Relation};
 use crate::require;
 use crate::rewrite::{pattern, NoMatch, Pattern, Rewriter};
 
@@ -17,11 +20,7 @@ pub(super) struct ReshapeToTile;
 impl Pattern for ReshapeToTile {
     type Root = Reshape;
 
-    fn rewrite(
-        &self,
-        reshape: Matched<'_, Reshape>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, reshape: ReshapeOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let input = reshape.input().tensor_type();
         let shape = &reshape.shape;
         let (iters, coords) = par_iters(shape);
@@ -40,11 +39,7 @@ pub(super) struct TransposeToTile;
 impl Pattern for TransposeToTile {
     type Root = Transpose;
 
-    fn rewrite(
-        &self,
-        transpose: Matched<'_, Transpose>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, transpose: TransposeOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let input = transpose.input().tensor_type();
         let output = transpose.output().tensor_type();
         let (iters, coords) = par_iters(&output.dims);
@@ -66,11 +61,7 @@ pub(super) struct BroadcastToTile;
 impl Pattern for BroadcastToTile {
     type Root = BroadcastTo;
 
-    fn rewrite(
-        &self,
-        broadcast: Matched<'_, BroadcastTo>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, broadcast: BroadcastToOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let input = broadcast.input().tensor_type();
         let shape = &broadcast.shape;
         let (iters, coords) = par_iters(shape);
@@ -98,11 +89,7 @@ pub(super) struct SliceToTile;
 impl Pattern for SliceToTile {
     type Root = Slice;
 
-    fn rewrite(
-        &self,
-        slice: Matched<'_, Slice>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, slice: SliceOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let output = slice.output().tensor_type();
         let (iters, coords) = par_iters(&output.dims);
         let mut source = Vec::new();
@@ -125,11 +112,7 @@ pub(super) struct ConcatToTile;
 impl Pattern for ConcatToTile {
     type Root = Concat;
 
-    fn rewrite(
-        &self,
-        concat: Matched<'_, Concat>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, concat: ConcatOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let output = concat.output().tensor_type();
         let axis = axis_index(concat.axis, output.rank()).expect("a verified axis");
         let (iters, coords) = par_iters(&output.dims);
@@ -162,9 +145,9 @@ impl Pattern for ConcatToTile {
                 return vec![value];
             }
             let at = body.index(position, DType::Si64);
-            for (operand, start) in starts.iter().enumerate().skip(1) {
-                let start = body.index(start.clone(), DType::Si64);
-                let inside = body.create(arith::GreaterEqual, (at, start));
+            for (operand, operand_start) in starts.iter().enumerate().skip(1) {
+                let start_index = body.index(operand_start.clone(), DType::Si64);
+                let inside = body.create(arith::GreaterEqual, (at, start_index));
                 value = body.create(arith::Select, (inside, args[operand], value));
             }
             vec![value]
@@ -183,11 +166,7 @@ pub(super) struct BitcastToTile;
 impl Pattern for BitcastToTile {
     type Root = Bitcast;
 
-    fn rewrite(
-        &self,
-        bitcast: Matched<'_, Bitcast>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, bitcast: BitcastOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let input = bitcast.input().tensor_type();
         let output = bitcast.output().tensor_type();
         let to = bitcast.to;
@@ -254,9 +233,9 @@ impl Pattern for BitcastToTile {
             let bits = body.bitcast(args[0], input_bits);
             let wide = body.cast(bits, DType::Ui64);
             let right = body.index(shift_right, DType::Ui64);
-            let wide = body.create(arith::ShiftRightLogical, (wide, right));
+            let shifted = body.create(arith::ShiftRightLogical, (wide, right));
             let left = body.index(shift_left, DType::Ui64);
-            vec![body.create(arith::ShiftLeft, (wide, left))]
+            vec![body.create(arith::ShiftLeft, (shifted, left))]
         });
         let result = elementwise(rewriter, &gathered, output, |body, args| {
             let mut bits = args[0];

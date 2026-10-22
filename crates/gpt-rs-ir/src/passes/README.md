@@ -17,16 +17,17 @@ crate.
 A pass is a struct with `#[pass]` and an `impl Pass`. Most passes apply patterns: local rewrites
 that the `Greedy` driver applies to each op until nothing changes. A pattern is a struct with
 `#[pattern]` and an `impl Pattern`, rooted at one op type, or at every op with a trait
-(`type Root = Has<Commutative>`). The example on this page compiles as a doc test. It is not a
-pass of the crate.
+(`type Root = Has<Commutative>`). A pass that rewrites each of its roots once, such as one that
+outlines every group of a function, returns its rewrites as once-rewrites, `Rewrites::once(..)`. The
+driver applies them to each op once, after the patterns. The example on this page compiles as a doc
+test. It is not a pass of the crate.
 
 ```rust,no_run
 use anyhow::Result;
-use gpt_rs_ir::dialects::tensor::{Div, Mul, Reciprocal};
-use gpt_rs_ir::ir::{Matched, Module};
+use gpt_rs_ir::dialects::tensor::{Div, DivOp, Mul, Reciprocal};
 use gpt_rs_ir::passes::{pass, run_patterns, Pass};
 use gpt_rs_ir::require;
-use gpt_rs_ir::rewrite::{pattern, NoMatch, Pattern, PatternSet, Rewriter, Rewrites};
+use gpt_rs_ir::rewrite::{pattern, NoMatch, Pattern, PatternSet, Rewriter, Rewrites, Rewriting};
 
 /// `x / s` is `x * reciprocal(s)` for a static float `s`: the backend computes the reciprocal
 /// once at load time, and a run multiplies, which costs less than dividing.
@@ -36,7 +37,7 @@ struct DivideByStatic;
 impl Pattern for DivideByStatic {
     type Root = Div;
 
-    fn rewrite(&self, div: Matched<'_, Div>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, div: DivOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         // Match: the op and its operands, read through the module.
         let (dividend, divisor) = (div.lhs(), div.rhs());
         require!(divisor.tensor_type().dtype.is_float(), "an integer division truncates");
@@ -71,7 +72,7 @@ impl Pass for MultiplyByReciprocal {
         Rewrites::patterns(populate_multiply_by_reciprocal_patterns)
     }
 
-    fn run(&self, module: &mut Module) -> Result<bool> {
+    fn run(&self, module: &mut Rewriting) -> Result<bool> {
         run_patterns(module, self.rewrites(), &Self::REWRITTEN)
     }
 }
@@ -81,6 +82,9 @@ impl Pass for MultiplyByReciprocal {
 The pass:
 
 - The doc comment is required. Its first paragraph is the pass's summary in the catalog.
+- `run` gets the module as a `Rewriting`, which it reads through `Deref` and changes only through
+  the drivers: `run_patterns`, `Greedy`, `apply_conversion` and `cse`. A pass never holds
+  `&mut Module`, and the raw edits of `Module` take an `EditKey` that only the drivers hold.
 - `run` returns whether the module changed; the filetest runner checks that against the text.
   The pipeline verifies the module after every pass.
 - `stats(name = "doc")` declares a counter, the constant `Self::NAME` of type `Stat`. The pass adds
@@ -97,14 +101,18 @@ The pattern:
 - It is rooted at an op type, such as `Div`; at each op of a family through a pattern generic over
   the family trait, `struct ReduceToTile<T>` with `impl<T: Reduce> Pattern for ReduceToTile<T>`;
   or at every op with a trait, `type Root = Has<Commutative>`.
-- It reads the IR through its root, a `Matched` op with its attributes and an accessor per
-  operand, result and region group, and through the `ValueRef`s those give: `defining_op::<T>()`,
-  `uses()`, `has_one_use()`, `tensor_type()`, `constant()`, `splat()`, `known_before_run()` and
+- It reads the IR through its root, a view `OpRef<'m, T>` that `#[op]` names `<Name>Op`
+  (`DivOp`): the op's attributes through `Deref` and an accessor per operand, result and region
+  group. It reads on through the `ValueRef`s those give: `defining_op::<T>()`, `uses()`,
+  `has_one_use()`, `tensor_type()`, `constant()`, `splat()`, `known_before_run()` and
   `depends_on_parameter()`.
-- It changes the IR only through the rewriter: `create`, `create_op`, `create_with_regions`,
-  `replace_op`, `replace_all_uses`, `set_op`, `set_operands`, `erase` and `remove_arg`. New ops go
-  before the root unless `set_insertion_point` moves them. The rewriter stages the changes, and
-  the driver applies them when the pattern returns `Ok`.
+- It changes an op's attributes through the op's view, `op.update(rewriter, |op| ...)` or a
+  generated `op.set_<field>(rewriter, value)`, and the rest of the IR through the rewriter:
+  `create`, `create_op`, `create_with_regions` (whose region builder can `move_here` an op of the
+  module), `replace_op`, `replace_all_uses`, `set_operand`, `set_operands`, `erase`, `remove_arg`,
+  `add_arg` and `add_symbol`. New ops go before the root unless `set_insertion_point` moves them,
+  and take the root's location unless `set_origin` names another op. The rewriter stages the
+  changes, and the driver applies them when the pattern returns `Ok`.
 - When it does not apply it returns `Err(NoMatch)` with the reason: `require!(cond, "reason")`,
   `require!(let Some(x) = .., "reason")` or `.ok_or("reason")?`. The driver drops what it staged,
   so a pattern that does not apply changes nothing. A failing conversion reports the reasons.
@@ -135,8 +143,8 @@ comment that says what the op folds to. The traits of an op fold it too, by the 
 impl Fold for Transpose {
     fn fold(
         &self,
-        ins: TransposeOperands<Folding<'_>>,
-        _cx: &FoldCx<'_>,
+        ins: TransposeOperands<Folding>,
+        _cx: &FoldCx,
     ) -> Option<TransposeResults<FoldOut>> {
         let identity = self.perm.iter().copied().eq(0..self.perm.len());
         identity.then_some(TransposeResults {
@@ -161,19 +169,29 @@ groups that the `populate_*_passes` functions add. The C backend's:
 ```rust,ignore
 let mut pm = Pipeline::new();
 passes::populate_simplification_passes(&mut pm);
-passes::populate_tensor_passes(&mut pm);
-pm.add(PackWeights);
+let numerics = Numerics {
+    scale_fold: true,
+    ..Numerics::default()
+};
+passes::populate_tensor_passes(&mut pm, &numerics);
+pm.add(MergeContractedAxes).add(PackWeights);
 passes::populate_load_time_passes(&mut pm);
 ```
+
+A pass that changes rounding runs only where the backend's numerics allow it. The backend's
+allowance and each dispatch's record of the changes it may hold are both `Numerics` values.
 
 Some passes of a backend put parameters in the layouts its kernels read, such as the reshape and
 transpose into the C GEMM's panels. They go before `populate_load_time_passes`, whose
 `outline-static` moves their work to load time. Such a pass writes plain ops, so the module keeps
-its meaning and the interpreter checks the pass. The catalog lists the pipeline of each backend.
+its meaning and the interpreter checks the pass. The catalog lists the pipeline of each backend,
+the x86 backend's for the `x86-64-v4` preset.
 
-Every module a backend compiles holds only `tensor` ops. The backend chooses its kernels when it
-compiles: it recognizes op sequences, such as a convolution or a projection over a stored bf16
-weight, and runs one kernel in their place.
+The modules that the ref-cpu, faer and C backends compile hold only `tensor` ops. Such a backend
+chooses its kernels when it compiles: it recognizes op sequences, such as a convolution or a
+projection over a stored bf16 weight, and runs one kernel in their place. The x86 backend's
+pipeline lowers the module through `tile`, `loop` and `isa` to the buffer form of `host`, and the
+backend writes C for every op of it.
 
 ## Where the pipeline runs
 

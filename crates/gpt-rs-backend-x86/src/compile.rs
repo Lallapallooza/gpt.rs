@@ -50,7 +50,7 @@ impl Compiler {
             .output()
             .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
             .unwrap_or_default();
-        // `-g` changes no code; it lets a profiler map samples to lines of the C. The C is
+        // `-g` changes no code. It lets a profiler map samples to lines of the C. The C is
         // vectorized as the schedules of its dispatches say, so the compiler vectorizes nothing
         // itself. It turns none of the C's loops into a library call (`memset`), across which it
         // would save registers.

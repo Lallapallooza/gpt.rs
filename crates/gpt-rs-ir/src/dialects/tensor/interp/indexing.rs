@@ -18,8 +18,8 @@ use crate::ir::{DType, Eval, EvalCx, Host, NoRegions, OwnedHost};
 impl Eval for Iota {
     fn eval(
         &self,
-        _ins: IotaOperands<Host<'_>>,
-        cx: &mut EvalCx<'_, NoRegions>,
+        _ins: IotaOperands<Host>,
+        cx: &mut EvalCx<NoRegions>,
     ) -> Result<IotaResults<OwnedHost>> {
         let dims = cx.result_dims(0)?;
         let axis = axis_index(self.axis, dims.len())?;
@@ -27,7 +27,7 @@ impl Eval for Iota {
         // The counts, converted to `dtype` as `tensor.cast` converts them.
         let counts = from_ints(
             DType::Si64,
-            (0..count).map(|i| unravel(i, &dims)[axis] as i128),
+            (0..count).map(|element| unravel(element, &dims)[axis] as i128),
         )?;
         Ok(IotaResults {
             output: HostTensor::new(dims, cast(&counts, self.dtype)?)?,
@@ -38,8 +38,8 @@ impl Eval for Iota {
 impl Eval for Take {
     fn eval(
         &self,
-        ins: TakeOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
+        ins: TakeOperands<Host>,
+        _cx: &mut EvalCx<NoRegions>,
     ) -> Result<TakeResults<OwnedHost>> {
         let indices = ins.indices.as_indices()?;
         let rows = ins.table.dims[0];
@@ -55,10 +55,10 @@ impl Eval for Take {
             .collect::<Result<Vec<usize>>>()?;
         let table = Chunks::of(&ins.table.data);
         let mut out = Chunks::zeroed(ins.table.dtype(), picked.len() * row_len);
-        for (i, &row) in picked.iter().enumerate() {
-            out.set_run(i * row_len, table.run(row * row_len, row_len));
+        for (position, &row) in picked.iter().enumerate() {
+            out.set_run(position * row_len, table.run(row * row_len, row_len));
         }
-        let out = out.into_data()?;
+        let data = out.into_data()?;
         let dims: Vec<usize> = ins
             .indices
             .dims
@@ -67,7 +67,7 @@ impl Eval for Take {
             .copied()
             .collect();
         Ok(TakeResults {
-            output: HostTensor::new(dims, out)?,
+            output: HostTensor::new(dims, data)?,
         })
     }
 }
@@ -75,13 +75,17 @@ impl Eval for Take {
 impl Eval for DynamicSlice {
     fn eval(
         &self,
-        ins: DynamicSliceOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
+        ins: DynamicSliceOperands<Host>,
+        _cx: &mut EvalCx<NoRegions>,
     ) -> Result<DynamicSliceResults<OwnedHost>> {
         let input = ins.input;
         let starts = clamped_starts(&input.dims, &self.sizes, &ins.starts.as_indices()?)?;
         let in_strides = strides(&input.dims);
-        let start = starts.iter().zip(&in_strides).map(|(s, n)| s * n).sum();
+        let start = starts
+            .iter()
+            .zip(&in_strides)
+            .map(|(axis_start, stride)| axis_start * stride)
+            .sum();
         let data = strided(&input.data, start, &self.sizes, &in_strides)?;
         Ok(DynamicSliceResults {
             output: HostTensor::new(self.sizes, data)?,
@@ -92,20 +96,24 @@ impl Eval for DynamicSlice {
 impl Eval for DynamicUpdateSlice {
     fn eval(
         &self,
-        ins: DynamicUpdateSliceOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
+        ins: DynamicUpdateSliceOperands<Host>,
+        _cx: &mut EvalCx<NoRegions>,
     ) -> Result<DynamicUpdateSliceResults<OwnedHost>> {
         let base = ins.base;
-        let starts = clamped_starts(&base.dims, &ins.update.dims, &ins.starts.as_indices()?)?;
+        let starts = clamped_starts(&base.dims, &ins.patch.dims, &ins.starts.as_indices()?)?;
         let base_strides = strides(&base.dims);
-        let start: usize = starts.iter().zip(&base_strides).map(|(s, n)| s * n).sum();
-        let update = Chunks::of(&ins.update.data);
+        let start: usize = starts
+            .iter()
+            .zip(&base_strides)
+            .map(|(axis_start, stride)| axis_start * stride)
+            .sum();
+        let patch = Chunks::of(&ins.patch.data);
         let mut out = Chunks::of(&base.data);
-        for (i, offset) in offsets(&ins.update.dims, &base_strides)
+        for (element, offset) in offsets(&ins.patch.dims, &base_strides)
             .into_iter()
             .enumerate()
         {
-            out.set(start + offset, update.get(i));
+            out.set(start + offset, patch.get(element));
         }
         Ok(DynamicUpdateSliceResults {
             output: HostTensor::new(base.dims, out.into_data()?)?,
@@ -126,16 +134,16 @@ fn clamped_starts(dims: &[usize], sizes: &[usize], starts: &[i64]) -> Result<Vec
         .collect()
 }
 
-/// The element of `input` (of shape `dims`) that element `i` of an index tensor of shape
+/// The element of `input` (of shape `dims`) that element `element` of an index tensor of shape
 /// `index_dims` addresses: its coordinates with the one on `axis` replaced by `index`.
 fn indexed_element(
-    i: usize,
+    element: usize,
     index: i64,
     axis: usize,
     index_dims: &[usize],
     dims: &[usize],
 ) -> Result<usize> {
-    let mut coord = unravel(i, index_dims);
+    let mut coord = unravel(element, index_dims);
     coord[axis] = usize::try_from(index)
         .ok()
         .filter(|&row| row < dims[axis])
@@ -143,15 +151,15 @@ fn indexed_element(
     Ok(coord
         .iter()
         .zip(strides(dims))
-        .map(|(coord, stride)| coord * stride)
+        .map(|(position, stride)| position * stride)
         .sum())
 }
 
 impl Eval for Gather {
     fn eval(
         &self,
-        ins: GatherOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
+        ins: GatherOperands<Host>,
+        _cx: &mut EvalCx<NoRegions>,
     ) -> Result<GatherResults<OwnedHost>> {
         let (input, indices) = (ins.input, ins.indices.as_indices()?);
         let index_dims = &ins.indices.dims;
@@ -159,12 +167,12 @@ impl Eval for Gather {
         let sources = indices
             .iter()
             .enumerate()
-            .map(|(i, &index)| indexed_element(i, index, axis, index_dims, &input.dims))
+            .map(|(element, &index)| indexed_element(element, index, axis, index_dims, &input.dims))
             .collect::<Result<Vec<_>>>()?;
         Ok(GatherResults {
             output: HostTensor::new(
                 index_dims,
-                gather_elements(&input.data, sources.len(), |i| sources[i])?,
+                gather_elements(&input.data, sources.len(), |element| sources[element])?,
             )?,
         })
     }
@@ -172,12 +180,14 @@ impl Eval for Gather {
 
 /// The element of `input` that each update goes to, along `axis` as `indices` say.
 fn scatter_targets(axis: i64, input: &HostTensor, indices: &HostTensor) -> Result<Vec<usize>> {
-    let axis = axis_index(axis, input.dims.len())?;
+    let axis_position = axis_index(axis, input.dims.len())?;
     indices
         .as_indices()?
         .iter()
         .enumerate()
-        .map(|(i, &index)| indexed_element(i, index, axis, &indices.dims, &input.dims))
+        .map(|(element, &index)| {
+            indexed_element(element, index, axis_position, &indices.dims, &input.dims)
+        })
         .collect()
 }
 
@@ -207,15 +217,15 @@ pub(crate) fn scatter_fold<C: Combiner>(
 impl Eval for ScatterReplace {
     fn eval(
         &self,
-        ins: ScatterReplaceOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
+        ins: ScatterReplaceOperands<Host>,
+        _cx: &mut EvalCx<NoRegions>,
     ) -> Result<ScatterReplaceResults<OwnedHost>> {
         let input = ins.input;
         let targets = scatter_targets(self.axis, input, ins.indices)?;
         let updates = Chunks::of(&ins.updates.data);
         let mut out = Chunks::of(&input.data);
-        for (i, &target) in targets.iter().enumerate() {
-            out.set(target, updates.get(i));
+        for (position, &target) in targets.iter().enumerate() {
+            out.set(target, updates.get(position));
         }
         Ok(ScatterReplaceResults {
             output: HostTensor::new(input.dims, out.into_data()?)?,
@@ -253,8 +263,8 @@ impl<C: Combiner> Accumulation for ScatterFold<C> {
 /// The semantics of every [`Scatter`] op.
 pub(crate) fn scatter<T: Scatter>(
     op: &T,
-    ins: ScatterOperands<Host<'_>>,
-    _cx: &mut EvalCx<'_, NoRegions>,
+    ins: ScatterOperands<Host>,
+    _cx: &mut EvalCx<NoRegions>,
 ) -> Result<ScatterResults<OwnedHost>> {
     Ok(ScatterResults {
         output: scatter_fold::<T::Combiner>(op, ins.input, ins.indices, ins.updates)?,

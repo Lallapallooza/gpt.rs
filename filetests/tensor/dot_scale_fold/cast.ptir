@@ -1,7 +1,8 @@
 // RUN: pass dot-scale-fold
 
-// A weight cast from a narrower dtype stays unscaled when ops that only move elements come
-// between the cast and the dot: scaling it would store a widened copy.
+// A weight cast from a narrower dtype stays unscaled, with ops that only move elements between
+// the cast and the dot: `outline-static` would not store the scaled weight, which takes more
+// bytes than the parameter it reads.
 // CHECK: func.func @transposed_cast
 // CHECK: [[PRODUCT:%[0-9]+]] = tensor.dot_general
 // CHECK: [[SCALES:%[0-9]+]] = tensor.broadcast_to

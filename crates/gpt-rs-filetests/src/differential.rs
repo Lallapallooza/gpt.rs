@@ -19,8 +19,8 @@ const DYNAMIC_EXTENT: usize = 3;
 /// The extents a run gives `dims`.
 pub fn run_dims(dims: &[Dim]) -> Vec<usize> {
     dims.iter()
-        .map(|d| match d {
-            Dim::Static(n) => *n,
+        .map(|dim| match dim {
+            Dim::Static(extent) => *extent,
             Dim::Dynamic(_) => DYNAMIC_EXTENT,
         })
         .collect()
@@ -87,6 +87,12 @@ fn special<T: Copy>(specials: &[T], index: usize, offset: usize) -> Option<T> {
     (index < specials.len()).then(|| specials[(index + offset) % specials.len()])
 }
 
+/// Element `index` of a float input whose specials are rotated by `offset`: its special value, or
+/// a random one.
+fn float_element(specials: &[f32], index: usize, offset: usize, rng: &mut StdRng) -> f32 {
+    special(specials, index, offset).unwrap_or_else(|| rng.gen_range(-4.0f32..4.0))
+}
+
 /// A random value of type `ty`. A tensor's first elements are the `specials`, rotated by `offset`.
 /// Random values fill the rest.
 pub fn random_value(
@@ -100,24 +106,36 @@ pub fn random_value(
     };
     let dims = run_dims(&tensor.dims);
     let count: usize = dims.iter().product();
-    let float = |i: usize, rng: &mut StdRng| -> f32 {
-        special(specials.floats(), i, offset).unwrap_or_else(|| rng.gen_range(-4.0f32..4.0))
-    };
+    let floats = specials.floats();
     let dtype = tensor.dtype;
     let data = match dtype {
-        DType::F64 => TensorData::F64((0..count).map(|i| f64::from(float(i, rng))).collect()),
-        DType::F32 => TensorData::F32((0..count).map(|i| float(i, rng)).collect()),
-        DType::F16 => TensorData::F16((0..count).map(|i| f16::from_f32(float(i, rng))).collect()),
-        DType::Bf16 => {
-            TensorData::Bf16((0..count).map(|i| bf16::from_f32(float(i, rng))).collect())
-        }
+        DType::F64 => TensorData::F64(
+            (0..count)
+                .map(|element| f64::from(float_element(floats, element, offset, rng)))
+                .collect(),
+        ),
+        DType::F32 => TensorData::F32(
+            (0..count)
+                .map(|element| float_element(floats, element, offset, rng))
+                .collect(),
+        ),
+        DType::F16 => TensorData::F16(
+            (0..count)
+                .map(|element| f16::from_f32(float_element(floats, element, offset, rng)))
+                .collect(),
+        ),
+        DType::Bf16 => TensorData::Bf16(
+            (0..count)
+                .map(|element| bf16::from_f32(float_element(floats, element, offset, rng)))
+                .collect(),
+        ),
         DType::I1 => TensorData::I1((0..count).map(|_| rng.gen_range(0..2)).collect()),
         _ => match dtype.int_format() {
             // Small integers index any axis of a run.
             Some(int) => {
-                let specials = specials.ints(int);
-                integers(dtype, count, |i| {
-                    special(&specials, i, offset)
+                let int_specials = specials.ints(int);
+                integers(dtype, count, |element| {
+                    special(&int_specials, element, offset)
                         .unwrap_or_else(|| rng.gen_range(0..DYNAMIC_EXTENT as i128))
                 })?
             }
@@ -147,69 +165,83 @@ fn integers(
     let mut data = TensorData::zeroed(dtype, count).map_err(|err| err.to_string())?;
     match &mut data {
         TensorData::Packed(packed) => {
-            for i in 0..count {
-                packed.set(i, value(i) as u8);
+            for element in 0..count {
+                packed.set(element, value(element) as u8);
             }
         }
         data => {
             let size = dtype.size_in_bytes().expect("a whole-byte dtype");
-            for (i, element) in data.bytes_mut().chunks_exact_mut(size).enumerate() {
-                element.copy_from_slice(&value(i).to_le_bytes()[..size]);
+            for (position, element) in data.bytes_mut().chunks_exact_mut(size).enumerate() {
+                element.copy_from_slice(&value(position).to_le_bytes()[..size]);
             }
         }
     }
     Ok(data)
 }
 
-/// Whether `a` and `b` have the same bits, except that any NaN equals any NaN: the IR leaves the
-/// sign and payload of a NaN unspecified. `-0.0` and `0.0` differ.
-fn same_float(a: f64, b: f64) -> bool {
-    a.to_bits() == b.to_bits() || a.is_nan() && b.is_nan()
+/// Whether `lhs` and `rhs` have the same bits, except that any NaN equals any NaN: the IR leaves
+/// the sign and payload of a NaN unspecified. `-0.0` and `0.0` differ.
+fn same_float(lhs: f64, rhs: f64) -> bool {
+    lhs.to_bits() == rhs.to_bits() || lhs.is_nan() && rhs.is_nan()
 }
 
-fn same_f32(a: f32, b: f32) -> bool {
-    same_float(a.into(), b.into())
+fn same_f32(lhs: f32, rhs: f32) -> bool {
+    same_float(lhs.into(), rhs.into())
 }
 
 /// The value of every element of a float or `e8m0` tensor, exactly.
 fn float_values(data: &TensorData) -> Option<Vec<f64>> {
-    let codes = |format: Format, v: &[u8]| v.iter().map(|&c| format.decode(c.into())).collect();
+    let decode = |format: Format, codes: &[u8]| {
+        codes
+            .iter()
+            .map(|&code| format.decode(code.into()))
+            .collect()
+    };
     Some(match data {
-        TensorData::F64(v) => v.to_vec(),
-        TensorData::F32(v) => v.iter().map(|&x| f64::from(x)).collect(),
-        TensorData::F16(v) => v.iter().map(|x| x.to_f64()).collect(),
-        TensorData::Bf16(v) => v.iter().map(|x| x.to_f64()).collect(),
-        TensorData::F8E4M3(v) => v.iter().map(|x| f64::from(x.to_f32())).collect(),
-        TensorData::F8E5M2(v) => codes(Format::F8E5M2, v),
-        TensorData::F8E4M3Fnuz(v) => codes(Format::F8E4M3FNUZ, v),
-        TensorData::F8E5M2Fnuz(v) => codes(Format::F8E5M2FNUZ, v),
-        TensorData::E8M0(v) => v.iter().map(|&c| e8m0_decode(c)).collect(),
+        TensorData::F64(values) => values.to_vec(),
+        TensorData::F32(values) => values.iter().map(|&value| f64::from(value)).collect(),
+        TensorData::F16(values) => values.iter().map(|value| value.to_f64()).collect(),
+        TensorData::Bf16(values) => values.iter().map(|value| value.to_f64()).collect(),
+        TensorData::F8E4M3(values) => values
+            .iter()
+            .map(|value| f64::from(value.to_f32()))
+            .collect(),
+        TensorData::F8E5M2(codes) => decode(Format::F8E5M2, codes),
+        TensorData::F8E4M3Fnuz(codes) => decode(Format::F8E4M3FNUZ, codes),
+        TensorData::F8E5M2Fnuz(codes) => decode(Format::F8E5M2FNUZ, codes),
+        TensorData::E8M0(codes) => codes.iter().map(|&code| e8m0_decode(code)).collect(),
         TensorData::Packed(packed) => {
             let format = Format::of(packed.dtype())?;
             (0..packed.len())
-                .map(|i| format.decode(packed.get(i).into()))
+                .map(|element| format.decode(packed.get(element).into()))
                 .collect()
         }
         _ => return None,
     })
 }
 
-/// Whether `a` and `b` are tensors of one shape and dtype whose elements compare equal as
+/// Whether `lhs` and `rhs` are tensors of one shape and dtype whose elements compare equal as
 /// `same_float` compares floats, and bit for bit otherwise.
-pub fn bits_eq(a: &HostValue, b: &HostValue) -> bool {
-    let (Some(a), Some(b)) = (a.as_tensor(), b.as_tensor()) else {
+pub fn bits_eq(lhs: &HostValue, rhs: &HostValue) -> bool {
+    let (Some(lhs_tensor), Some(rhs_tensor)) = (lhs.as_tensor(), rhs.as_tensor()) else {
         return false;
     };
-    if a.dims != b.dims || a.dtype() != b.dtype() {
+    if lhs_tensor.dims != rhs_tensor.dims || lhs_tensor.dtype() != rhs_tensor.dtype() {
         return false;
     }
-    match (float_values(&a.data), float_values(&b.data)) {
-        (Some(x), Some(y)) => x.iter().zip(&y).all(|(&p, &q)| same_float(p, q)),
-        _ => match (&a.data, &b.data) {
-            (TensorData::Packed(x), TensorData::Packed(y)) => {
-                (0..x.len()).all(|i| x.get(i) == y.get(i))
-            }
-            (x, y) => x.bytes() == y.bytes(),
+    match (
+        float_values(&lhs_tensor.data),
+        float_values(&rhs_tensor.data),
+    ) {
+        (Some(lhs_values), Some(rhs_values)) => lhs_values
+            .iter()
+            .zip(&rhs_values)
+            .all(|(&lhs_value, &rhs_value)| same_float(lhs_value, rhs_value)),
+        _ => match (&lhs_tensor.data, &rhs_tensor.data) {
+            (TensorData::Packed(lhs_packed), TensorData::Packed(rhs_packed)) => (0..lhs_packed
+                .len())
+                .all(|element| lhs_packed.get(element) == rhs_packed.get(element)),
+            (lhs_data, rhs_data) => lhs_data.bytes() == rhs_data.bytes(),
         },
     }
 }
@@ -222,11 +254,11 @@ struct Inputs {
 }
 
 fn funcs(module: &Module) -> Vec<Func> {
-    module
-        .funcs()
-        .into_iter()
-        .map(|f| module.op(f).get::<Func>().expect("a function").clone())
-        .collect()
+    let mut funcs = Vec::new();
+    for func in module.funcs() {
+        funcs.push(func.attrs().clone());
+    }
+    funcs
 }
 
 /// Random inputs for `func`, starting with `specials`, and a value for every other parameter
@@ -262,34 +294,47 @@ fn random_inputs(
     Ok(inputs)
 }
 
+/// The arguments of `func`: the value in `params` of each parameter it reads, and the `run_time`
+/// inputs in order.
+fn args_of(
+    func: &Func,
+    params: &HashMap<ParamId, HostValue>,
+    run_time: &[HostValue],
+) -> anyhow::Result<Vec<HostValue>> {
+    let mut run_time_inputs = run_time.iter();
+    let mut args = Vec::with_capacity(func.args.len());
+    for index in 0..func.args.len() {
+        let arg = match func.param(index) {
+            Some(id) => params.get(&id).cloned().ok_or_else(|| {
+                anyhow::anyhow!("@{}: no value for parameter {}", func.name, id.0)
+            })?,
+            None => run_time_inputs
+                .next()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("@{}: too few run-time inputs", func.name))?,
+        };
+        args.push(arg);
+    }
+    Ok(args)
+}
+
 /// Runs the function `name` of `module` on `inputs`, after the module's load-time functions.
 fn run_bound(module: &Module, name: &str, inputs: &Inputs) -> anyhow::Result<Vec<HostValue>> {
     let mut params = inputs.params.clone();
     let funcs = funcs(module);
-    let args_of =
-        |func: &Func, params: &HashMap<ParamId, HostValue>| -> anyhow::Result<Vec<HostValue>> {
-            let mut run_time = inputs.run_time.iter();
-            (0..func.args.len())
-                .map(|index| match func.param(index) {
-                    Some(id) => params.get(&id).cloned().ok_or_else(|| {
-                        anyhow::anyhow!("@{}: no value for parameter {}", func.name, id.0)
-                    }),
-                    None => run_time
-                        .next()
-                        .cloned()
-                        .ok_or_else(|| anyhow::anyhow!("@{}: too few run-time inputs", func.name)),
-                })
-                .collect()
-        };
-    for func in funcs.iter().filter(|f| f.is_load_time()) {
-        let results = interp::run(module, &func.name, args_of(func, &params)?)?;
+    for func in funcs.iter().filter(|func| func.is_load_time()) {
+        let results = interp::run(
+            module,
+            &func.name,
+            args_of(func, &params, &inputs.run_time)?,
+        )?;
         params.extend(func.result_params.iter().copied().zip(results));
     }
     let func = funcs
         .iter()
-        .find(|f| f.name == name)
+        .find(|func| func.name == name)
         .ok_or_else(|| anyhow::anyhow!("no function @{name}"))?;
-    interp::run(module, name, args_of(func, &params)?)
+    interp::run(module, name, args_of(func, &params, &inputs.run_time)?)
 }
 
 /// One round's inputs for `func` and its results in `module`: inputs starting with `specials`, or
@@ -302,8 +347,8 @@ fn run_inputs(
     specials: Specials,
 ) -> Result<(Inputs, Vec<HostValue>), String> {
     let mut last = String::new();
-    for specials in [specials, Specials::None] {
-        let inputs = random_inputs(module, func, seed, round, specials)?;
+    for tried_specials in [specials, Specials::None] {
+        let inputs = random_inputs(module, func, seed, round, tried_specials)?;
         match run_bound(module, &func.name, &inputs) {
             Ok(results) => return Ok((inputs, results)),
             Err(err) => last = format!("{err:#}"),
@@ -312,45 +357,146 @@ fn run_inputs(
     Err(format!("@{}: the input does not run: {last}", func.name))
 }
 
-/// Whether `got` equals `want` up to rounding: f32 elements within `1e-5 * max(|got|, |want|) +
-/// 1e-6` of each other, NaNs and infinities in the same places, and everything else as
-/// [`bits_eq`] compares it.
-fn close(want: &HostValue, got: &HostValue) -> bool {
-    let (HostValue::Tensor(a), HostValue::Tensor(b)) = (want, got) else {
-        return bits_eq(want, got);
-    };
-    let (TensorData::F32(x), TensorData::F32(y)) = (&a.data, &b.data) else {
-        return bits_eq(want, got);
-    };
-    let near = |&(x, y): &(&f32, &f32)| {
-        if !x.is_finite() || !y.is_finite() {
-            return same_f32(*x, *y);
+/// How a rewrite may change the bits of a result, as the classes of a case's
+/// `// ROUNDING: <classes>: <reason>` line name it. Every class holds in real arithmetic, so the
+/// case's inputs are finite. With several classes, the loosest holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Rounding {
+    /// Bit for bit on finite inputs: `skip_pad`, a skipped product of the pad, which is 0 only
+    /// where the weight is finite.
+    Exact,
+    /// Element by element, within this many units in the last place: `poly`, a polynomial in
+    /// place of a math function, within 1, as `expand-math` measures its expansions against the
+    /// interpreter's math functions.
+    Ulps(u32),
+    /// A sum whose terms round differently: in another order (`reassoc`), with each product rounded
+    /// once with the sum (`contract`), through Winograd's transforms (`winograd`), or with a
+    /// scale rounded into each term (`fold_scale`). Its error scales with its terms, not with its
+    /// value, which cancels near 0, so each f32 element is within 1e-5 times the largest
+    /// magnitude of its tensor, plus 1e-6.
+    Sums,
+}
+
+/// The rounding of each class that a `ROUNDING:` line can name.
+const ROUNDING_CLASSES: [(&str, Rounding); 6] = [
+    ("skip_pad", Rounding::Exact),
+    ("poly", Rounding::Ulps(1)),
+    ("reassoc", Rounding::Sums),
+    ("contract", Rounding::Sums),
+    ("winograd", Rounding::Sums),
+    ("fold_scale", Rounding::Sums),
+];
+
+impl Rounding {
+    /// The rounding that the directive `line`, `<classes>: <reason>`, names.
+    pub fn of_directive(line: &str) -> Result<Rounding, String> {
+        let Some((classes, reason)) = line.split_once(':') else {
+            return Err(format!(
+                "`ROUNDING: {line}` names no class: write `<classes>: <reason>`"
+            ));
+        };
+        if reason.trim().is_empty() {
+            return Err(format!("`ROUNDING: {line}` gives no reason"));
         }
-        (x - y).abs() <= 1e-5 * x.abs().max(y.abs()) + 1e-6
+        let mut loosest = Rounding::Exact;
+        for class in classes.split(',') {
+            let name = class.trim();
+            let Some(&(_, rounding)) = ROUNDING_CLASSES.iter().find(|(known, _)| *known == name)
+            else {
+                let mut known = Vec::new();
+                for (class_name, _) in ROUNDING_CLASSES {
+                    known.push(class_name);
+                }
+                return Err(format!(
+                    "no rounding class `{name}`: the classes are {}",
+                    known.join(", ")
+                ));
+            };
+            loosest = loosest.max(rounding);
+        }
+        Ok(loosest)
+    }
+
+    /// Whether `got` equals `want` up to this rounding. Floats other than f32 compare as
+    /// [`bits_eq`] does, and NaNs and infinities stay in their places.
+    fn holds(self, want: &HostValue, got: &HostValue) -> bool {
+        let (HostValue::Tensor(want_tensor), HostValue::Tensor(got_tensor)) = (want, got) else {
+            return bits_eq(want, got);
+        };
+        let (TensorData::F32(want_values), TensorData::F32(got_values)) =
+            (&want_tensor.data, &got_tensor.data)
+        else {
+            return bits_eq(want, got);
+        };
+        if want_tensor.dims != got_tensor.dims || want_values.len() != got_values.len() {
+            return false;
+        }
+        let mut largest = 0f32;
+        for value in want_values.iter().filter(|value| value.is_finite()) {
+            largest = largest.max(value.abs());
+        }
+        for (&expected, &computed) in want_values.iter().zip(got_values.iter()) {
+            if !expected.is_finite() || !computed.is_finite() {
+                if !same_f32(expected, computed) {
+                    return false;
+                }
+                continue;
+            }
+            let near = match self {
+                Rounding::Exact => same_f32(expected, computed),
+                Rounding::Ulps(ulps) => ulp_distance(expected, computed) <= u64::from(ulps),
+                Rounding::Sums => (expected - computed).abs() <= 1e-5 * largest + 1e-6,
+            };
+            if !near {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// How many f32 values lie from `lhs` up to `rhs`, or down: 0 for `0.0` and `-0.0`.
+fn ulp_distance(lhs: f32, rhs: f32) -> u64 {
+    // The bits of a float, read as a sign and a magnitude, order the floats once the negative
+    // ones count down from zero.
+    let ordered = |value: f32| {
+        let bits = i64::from(value.to_bits() as i32);
+        if bits < 0 {
+            i64::from(i32::MIN) - bits
+        } else {
+            bits
+        }
     };
-    a.dims == b.dims && x.len() == y.len() && x.iter().zip(y.iter()).all(|p| near(&p))
+    ordered(lhs).abs_diff(ordered(rhs))
 }
 
 /// Runs every run-time function of `before` and `after` on the same random inputs and compares
-/// their results: as [`bits_eq`] does, or up to rounding with `rounding`.
+/// their results: as [`bits_eq`] does, or up to `rounding` on finite inputs.
 pub fn interp_differential(
     before: &Module,
     after: &Module,
     seed: u64,
-    rounding: bool,
+    rounding: Option<Rounding>,
 ) -> Result<(), String> {
-    let equal = |a: &HostValue, b: &HostValue| if rounding { close(a, b) } else { bits_eq(a, b) };
-    let specials = if rounding {
-        Specials::Finite
-    } else {
-        Specials::All
+    let equal = |expected: &HostValue, computed: &HostValue| match rounding {
+        Some(allowed) => allowed.holds(expected, computed),
+        None => bits_eq(expected, computed),
     };
-    for func in funcs(before).iter().filter(|f| !f.is_load_time()) {
+    let specials = match rounding {
+        Some(_) => Specials::Finite,
+        None => Specials::All,
+    };
+    for func in funcs(before).iter().filter(|func| !func.is_load_time()) {
         for round in 0..ROUNDS {
             let (inputs, want) = run_inputs(before, func, seed, round, specials)?;
             let got = run_bound(after, &func.name, &inputs)
                 .map_err(|err| format!("@{}: the output does not run: {err:#}", func.name))?;
-            if want.len() != got.len() || want.iter().zip(&got).any(|(a, b)| !equal(a, b)) {
+            if want.len() != got.len()
+                || want
+                    .iter()
+                    .zip(&got)
+                    .any(|(want_value, got_value)| !equal(want_value, got_value))
+            {
                 return Err(format!(
                     "@{}: results differ after the passes (round {round})\nbefore: {want:?}\nafter: {got:?}",
                     func.name

@@ -12,8 +12,8 @@ use crate::ir::{ranked, DType, Dim, NoRegions, OpDef, OwnedTypes, TensorType, Ty
 impl OpDef for Iota {
     fn result_types(
         &self,
-        _ins: IotaOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        _ins: IotaOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<IotaResults<OwnedTypes>> {
         axis_index(self.axis, self.shape.len())?;
         ensure_dtype_class("dtype", self.dtype, ARITHMETIC)?;
@@ -29,8 +29,8 @@ impl OpDef for Iota {
 impl OpDef for Take {
     fn result_types(
         &self,
-        ins: TakeOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        ins: TakeOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<TakeResults<OwnedTypes>> {
         ensure!(
             ins.table.rank() >= 1,
@@ -48,8 +48,8 @@ impl OpDef for Take {
 impl OpDef for DynamicSlice {
     fn result_types(
         &self,
-        ins: DynamicSliceOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        ins: DynamicSliceOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<DynamicSliceResults<OwnedTypes>> {
         check_window_type(ins.input, ins.starts, &self.sizes)?;
         Ok(DynamicSliceResults {
@@ -61,23 +61,23 @@ impl OpDef for DynamicSlice {
 impl OpDef for DynamicUpdateSlice {
     fn result_types(
         &self,
-        ins: DynamicUpdateSliceOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        ins: DynamicUpdateSliceOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<DynamicUpdateSliceResults<OwnedTypes>> {
-        let (base, update) = (ins.base, ins.update);
+        let (base, patch) = (ins.base, ins.patch);
         ensure!(
-            update.dtype == base.dtype,
-            "update must have dtype {}, got {update}",
+            patch.dtype == base.dtype,
+            "patch must have dtype {}, got {patch}",
             base.dtype
         );
         ensure!(
-            update.rank() == base.rank(),
-            "update must have rank {}, got {update}",
+            patch.rank() == base.rank(),
+            "patch must have rank {}, got {patch}",
             base.rank()
         );
-        let sizes = update
+        let sizes = patch
             .static_dims()
-            .ok_or_else(|| anyhow!("update must have static extents, got {update}"))?;
+            .ok_or_else(|| anyhow!("patch must have static extents, got {patch}"))?;
         check_window_type(base, ins.starts, &sizes)?;
         Ok(DynamicUpdateSliceResults {
             output: base.clone(),
@@ -88,8 +88,8 @@ impl OpDef for DynamicUpdateSlice {
 impl OpDef for Gather {
     fn result_types(
         &self,
-        ins: GatherOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        ins: GatherOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<GatherResults<OwnedTypes>> {
         let (input, indices) = (ins.input, ins.indices);
         ensure_index_shape(self.axis, input, indices)?;
@@ -102,8 +102,8 @@ impl OpDef for Gather {
 impl OpDef for ScatterReplace {
     fn result_types(
         &self,
-        ins: ScatterReplaceOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        ins: ScatterReplaceOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<ScatterReplaceResults<OwnedTypes>> {
         Ok(ScatterReplaceResults {
             output: scatter_types(self.axis, ins.input, ins.indices, ins.updates)?,
@@ -114,8 +114,8 @@ impl OpDef for ScatterReplace {
 /// The type rule of every [`Scatter`] op.
 pub(crate) fn scatter<T: Scatter>(
     op: &T,
-    ins: ScatterOperands<Types<'_>>,
-    _cx: &TypeCx<'_, NoRegions>,
+    ins: ScatterOperands<Types>,
+    _cx: &TypeCx<NoRegions>,
 ) -> Result<ScatterResults<OwnedTypes>> {
     ensure_class("the input", ins.input, ARITHMETIC)?;
     Ok(ScatterResults {
@@ -162,11 +162,13 @@ fn scatter_types(
 /// every axis but `axis`.
 fn ensure_index_shape(axis: i64, input: &TensorType, indices: &TensorType) -> Result<()> {
     let rank = input.rank();
-    let axis = axis_index(axis, rank)?;
+    let axis_position = axis_index(axis, rank)?;
     ensure_index_dtype("indices", indices.dtype)?;
     ensure!(
-        indices.rank() == rank && (0..rank).all(|d| d == axis || indices.dims[d] == input.dims[d]),
-        "indices {indices} must match {input} on every axis but {axis}"
+        indices.rank() == rank
+            && (0..rank)
+                .all(|other| other == axis_position || indices.dims[other] == input.dims[other]),
+        "indices {indices} must match {input} on every axis but {axis_position}"
     );
     Ok(())
 }

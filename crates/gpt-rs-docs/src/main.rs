@@ -1,7 +1,8 @@
 //! Writes the reference pages of the IR from the code: `docs/ptir/<dialect>.md` for each dialect
-//! with a specification (`tensor`, `arith`, `tile`, `host`, `loop`), and `docs/ptir/passes.md`, the
-//! passes, what they rewrite and the pipelines of the backends. With `--check`, it writes nothing
-//! and fails when the pages in the repository differ from what the code gives.
+//! with a specification (`tensor`, `arith`, `tile`, `host`, `loop`, `isa`), and
+//! `docs/ptir/passes.md`, the passes, what they rewrite and the pipelines of the backends. With
+//! `--check`, it writes nothing and fails when the pages in the repository differ from what the
+//! code gives.
 //!
 //! An op's entry comes from its struct: the doc comment, and what `#[op]` records of its groups,
 //! attributes, traits and effects. Its example is a roundtrip filetest that uses it, and
@@ -21,12 +22,13 @@ use std::path::Path;
 
 use anyhow::{bail, ensure, Context, Result};
 use gpt_rs::backend::PortableBackend;
-use gpt_rs_ir::dialects::arith::ArithOp;
-use gpt_rs_ir::dialects::func::FuncOp;
-use gpt_rs_ir::dialects::host::HostOp;
-use gpt_rs_ir::dialects::r#loop::LoopOp;
-use gpt_rs_ir::dialects::tensor::TensorOp;
-use gpt_rs_ir::dialects::tile::TileOp;
+use gpt_rs_ir::dialects::arith::ArithOps;
+use gpt_rs_ir::dialects::func::FuncOps;
+use gpt_rs_ir::dialects::host::HostOps;
+use gpt_rs_ir::dialects::isa::IsaOps;
+use gpt_rs_ir::dialects::loops::LoopOps;
+use gpt_rs_ir::dialects::tensor::TensorOps;
+use gpt_rs_ir::dialects::tile::TileOps;
 use gpt_rs_ir::ir::OpInfo;
 use gpt_rs_ir::passes::{self, PassEntry, Pipeline};
 use gpt_rs_ir::rewrite::{Rewrites, RootInfo};
@@ -39,19 +41,20 @@ fn main() -> Result<()> {
     let check = std::env::args().skip(1).any(|arg| arg == "--check");
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let filetests = filetests::read()?;
-    let backends = backends();
+    let backends = backends()?;
     let fires = filetests::Fires::record(&filetests, &backends)?;
     let catalog = Catalog::new()?;
     let dialects = [
-        ("tensor", TensorOp::infos()),
-        ("arith", ArithOp::infos()),
-        ("tile", TileOp::infos()),
-        ("host", HostOp::infos()),
-        ("loop", LoopOp::infos()),
+        ("tensor", TensorOps::infos()),
+        ("arith", ArithOps::infos()),
+        ("tile", TileOps::infos()),
+        ("host", HostOps::infos()),
+        ("loop", LoopOps::infos()),
+        ("isa", IsaOps::infos()),
     ];
     let mut pages = Vec::new();
     for (name, infos) in &dialects {
-        let text = dialect_page::write(&root, name, infos, &filetests, &catalog)?;
+        let text = dialect_page::write(&root, infos, &filetests, &catalog)?;
         pages.push((format!("docs/ptir/{name}.md"), text));
     }
     pages.push((
@@ -85,11 +88,11 @@ fn main() -> Result<()> {
 /// `c-pack-weights`, which its file and struct leave out.
 fn check_pass_layout(entry: &PassEntry) -> Result<()> {
     let path = Path::new(entry.file);
-    let stem = match path.file_stem().and_then(|s| s.to_str()) {
+    let stem = match path.file_stem().and_then(|file_stem| file_stem.to_str()) {
         Some("mod") => path
             .parent()
             .and_then(Path::file_name)
-            .and_then(|s| s.to_str()),
+            .and_then(|directory| directory.to_str()),
         stem => stem,
     };
     let backend = entry
@@ -97,7 +100,7 @@ fn check_pass_layout(entry: &PassEntry) -> Result<()> {
         .strip_prefix("crates/gpt-rs-backend-")
         .and_then(|rest| rest.split('/').next());
     let name = backend
-        .and_then(|backend| entry.name.strip_prefix(&format!("{backend}-")))
+        .and_then(|backend_name| entry.name.strip_prefix(&format!("{backend_name}-")))
         .unwrap_or(entry.name);
     let file = name.replace('-', "_");
     ensure!(
@@ -124,9 +127,14 @@ fn check_pass_layout(entry: &PassEntry) -> Result<()> {
     Ok(())
 }
 
-/// The backends of the repository, by name, with their pipelines.
-fn backends() -> Vec<(&'static str, Pipeline)> {
-    vec![
+/// The backends of the repository, by name, with their pipelines: the x86 backend's for the
+/// `x86-64-v4` preset, with its default options.
+fn backends() -> Result<Vec<(&'static str, Pipeline)>> {
+    let x86 = gpt_rs_backend_x86::X86Backend::new(
+        gpt_rs_ir::targets::Target::resolve("x86-64-v4")?,
+        gpt_rs_backend_x86::X86Options::default(),
+    )?;
+    Ok(vec![
         (
             "ref-cpu",
             gpt_rs_backend_ref_cpu::CpuPortableBackend::new().pipeline(),
@@ -136,7 +144,8 @@ fn backends() -> Vec<(&'static str, Pipeline)> {
             gpt_rs_backend_faer::FaerPortableBackend::new().pipeline(),
         ),
         ("c", gpt_rs_backend_c::CBackend::new().pipeline()),
-    ]
+        ("x86", x86.pipeline()),
+    ])
 }
 
 /// What the pages know of the IR: the ops, every registered pass with the rewrites it applies,
@@ -149,15 +158,17 @@ pub struct Catalog {
 
 impl Catalog {
     fn new() -> Result<Self> {
-        let mut ops = TensorOp::infos();
-        ops.extend(FuncOp::infos());
-        ops.extend(ArithOp::infos());
-        ops.extend(TileOp::infos());
-        ops.extend(HostOp::infos());
+        let mut ops = TensorOps::infos();
+        ops.extend(FuncOps::infos());
+        ops.extend(ArithOps::infos());
+        ops.extend(TileOps::infos());
+        ops.extend(HostOps::infos());
+        ops.extend(LoopOps::infos());
+        ops.extend(IsaOps::infos());
         let mut traits = BTreeMap::new();
         for info in &ops {
-            for &t in info.traits {
-                traits.entry(t.name()).or_insert(t);
+            for &op_trait in info.traits {
+                traits.entry(op_trait.name()).or_insert(op_trait);
             }
         }
         let mut entries = Vec::new();
@@ -191,10 +202,12 @@ impl Catalog {
     ) -> Vec<(&'static str, &'static str, RootInfo)> {
         let mut found = Vec::new();
         for (entry, rewrites) in &self.passes {
-            for pattern in rewrites.patterns.iter() {
-                let item = (pattern.name(), entry.name, pattern.root());
-                if at(item.2) && !found.contains(&item) {
-                    found.push(item);
+            for set in [&rewrites.patterns, &rewrites.once] {
+                for pattern in set.iter() {
+                    let item = (pattern.name(), entry.name, pattern.root());
+                    if at(item.2) && !found.contains(&item) {
+                        found.push(item);
+                    }
                 }
             }
         }

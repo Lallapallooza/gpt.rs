@@ -2,14 +2,14 @@
 
 // Two values computed from one weight take twice its bytes, so only the first moves. The second
 // stays at run time and reads the first from its load-time parameter.
-// CHECK: func.func @shared_weight([[INPUT:%[0-9]+]]: tensor<4xf32>, [[WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1}, [[EXP:%[0-9]+]]: tensor<4xf32> {param = {{[0-9]+}}}) -> tensor<4xf32>
-// CHECK-NEXT: [[NEGATED:%[0-9]+]] = tensor.neg([[EXP]])
-// CHECK-NEXT: [[SUM:%[0-9]+]] = tensor.add([[INPUT]], [[EXP]])
-// CHECK-NEXT: tensor.mul([[SUM]], [[NEGATED]])
 // CHECK: func.func @static.{{[0-9a-f]+}}([[STATIC_WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1})
 // CHECK-NEXT: tensor.exp([[STATIC_WEIGHT]])
 // CHECK-NEXT: func.return
 // CHECK-NOT: func.func @static.
+// CHECK: func.func @shared_weight([[INPUT:%[0-9]+]]: tensor<4xf32>, [[WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1}, [[EXP:%[0-9]+]]: tensor<4xf32> {param = {{[0-9]+}}}) -> tensor<4xf32>
+// CHECK-NEXT: [[NEGATED:%[0-9]+]] = tensor.neg([[EXP]])
+// CHECK-NEXT: [[SUM:%[0-9]+]] = tensor.add([[INPUT]], [[EXP]])
+// CHECK-NEXT: tensor.mul([[SUM]], [[NEGATED]])
 func.func @shared_weight(%input: tensor<4xf32>, %weight: tensor<4xf32> {param = 1}) -> tensor<4xf32> {
   %exp = tensor.exp(%weight) : (tensor<4xf32>) -> tensor<4xf32>
   %negated = tensor.neg(%exp) : (tensor<4xf32>) -> tensor<4xf32>
@@ -21,12 +21,100 @@ func.func @shared_weight(%input: tensor<4xf32>, %weight: tensor<4xf32> {param = 
 // -----
 
 // A weight of unknown size never fits, so its cast to a wider dtype stays at run time.
+// CHECK-NOT: func.func @static.
 // CHECK: func.func @dynamic_weight([[INPUT:%[0-9]+]]: tensor<2x8xf32>, [[WEIGHT:%[0-9]+]]: tensor<{N}x8xbf16> {param = 1}) -> tensor<2x{N}xf32>
 // CHECK-NEXT: [[WIDENED:%[0-9]+]] = tensor.cast([[WEIGHT]])
 // CHECK-NEXT: tensor.dot_general([[INPUT]], [[WIDENED]])
-// CHECK-NOT: func.func @static.
 func.func @dynamic_weight(%input: tensor<2x8xf32>, %weight: tensor<{N}x8xbf16> {param = 1}) -> tensor<2x{N}xf32> {
   %widened = tensor.cast(%weight) {to = f32} : (tensor<{N}x8xbf16>) -> tensor<{N}x8xf32>
   %product = tensor.dot_general(%input, %widened) {contract_lhs = [1], contract_rhs = [1]} : (tensor<2x8xf32>, tensor<{N}x8xf32>) -> tensor<2x{N}xf32>
   func.return(%product) : (tensor<2x{N}xf32>) -> ()
+}
+
+// -----
+
+// A weight of 5 columns laid out in panels of 4, the last padded with zeros: 32 elements from 20,
+// 12 more, which is less than one panel of 16 elements. A layout of the weight's dtype may take that, so the
+// panels move to load time.
+// CHECK: func.func @static.{{[0-9a-f]+}}([[STATIC_WEIGHT:%[0-9]+]]: tensor<4x5xf32> {param = 1}) -> (tensor<2x4x4xf32> {param = [[ID:[0-9]+]]})
+// CHECK-NEXT: host.dispatch([[STATIC_WEIGHT]]) {callee = @pack}
+// CHECK: func.func @main([[INPUT:%[0-9]+]]: tensor<2x4x4xf32>, {{%[0-9]+}}: tensor<4x5xf32> {param = 1}, [[PANELS:%[0-9]+]]: tensor<2x4x4xf32> {param = [[ID]]})
+// CHECK-NEXT: host.dispatch([[INPUT]], [[PANELS]]) {callee = @add}
+tile.dispatch @pack(%weight: tensor<4x5xf32>) -> tensor<2x4x4xf32> {
+  %laid = tile.block(%weight) {iters = [par 2, par 4, par 4], reads = [$0[d1, d0 * 4 + d2] pad 0.0], folds = [none -> [d0, d1, d2]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x5xf32>) -> tensor<2x4x4xf32>
+  func.return(%laid) : (tensor<2x4x4xf32>) -> ()
+}
+tile.dispatch @add(%input: tensor<2x4x4xf32>, %laid: tensor<2x4x4xf32>) -> tensor<2x4x4xf32> {
+  %sum = tile.block(%input, %laid) {iters = [par 2, par 4, par 4], reads = [$0[d0, d1, d2], $1[d0, d1, d2]], folds = [none -> [d0, d1, d2]]} ({
+  ^body(%element: f32, %weight_element: f32):
+    %added = arith.add(%element, %weight_element) : (f32, f32) -> f32
+    tile.yield(%added) : (f32) -> ()
+  }) : (tensor<2x4x4xf32>, tensor<2x4x4xf32>) -> tensor<2x4x4xf32>
+  func.return(%sum) : (tensor<2x4x4xf32>) -> ()
+}
+func.func @main(%input: tensor<2x4x4xf32>, %weight: tensor<4x5xf32> {param = 1}) -> tensor<2x4x4xf32> {
+  %laid = host.dispatch(%weight) {callee = @pack} : (tensor<4x5xf32>) -> tensor<2x4x4xf32>
+  %sum = host.dispatch(%input, %laid) {callee = @add} : (tensor<2x4x4xf32>, tensor<2x4x4xf32>) -> tensor<2x4x4xf32>
+  func.return(%sum) : (tensor<2x4x4xf32>) -> ()
+}
+
+// -----
+
+// The same weight twice, 40 elements from 20: one whole slice of the outermost axis more, which no
+// layout in panels takes, so it stays at run time.
+// CHECK-NOT: func.func @static.
+// CHECK: func.func @main([[INPUT:%[0-9]+]]: tensor<2x4x5xf32>, [[WEIGHT:%[0-9]+]]: tensor<4x5xf32> {param = 1}) -> tensor<2x4x5xf32>
+// CHECK-NEXT: [[SPREAD:%[0-9]+]] = host.dispatch([[WEIGHT]]) {callee = @spread}
+// CHECK-NEXT: host.dispatch([[INPUT]], [[SPREAD]]) {callee = @add}
+tile.dispatch @spread(%weight: tensor<4x5xf32>) -> tensor<2x4x5xf32> {
+  %laid = tile.block(%weight) {iters = [par 2, par 4, par 5], reads = [$0[d1, d2]], folds = [none -> [d0, d1, d2]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x5xf32>) -> tensor<2x4x5xf32>
+  func.return(%laid) : (tensor<2x4x5xf32>) -> ()
+}
+tile.dispatch @add(%input: tensor<2x4x5xf32>, %laid: tensor<2x4x5xf32>) -> tensor<2x4x5xf32> {
+  %sum = tile.block(%input, %laid) {iters = [par 2, par 4, par 5], reads = [$0[d0, d1, d2], $1[d0, d1, d2]], folds = [none -> [d0, d1, d2]]} ({
+  ^body(%element: f32, %weight_element: f32):
+    %added = arith.add(%element, %weight_element) : (f32, f32) -> f32
+    tile.yield(%added) : (f32) -> ()
+  }) : (tensor<2x4x5xf32>, tensor<2x4x5xf32>) -> tensor<2x4x5xf32>
+  func.return(%sum) : (tensor<2x4x5xf32>) -> ()
+}
+func.func @main(%input: tensor<2x4x5xf32>, %weight: tensor<4x5xf32> {param = 1}) -> tensor<2x4x5xf32> {
+  %laid = host.dispatch(%weight) {callee = @spread} : (tensor<4x5xf32>) -> tensor<2x4x5xf32>
+  %sum = host.dispatch(%input, %laid) {callee = @add} : (tensor<2x4x5xf32>, tensor<2x4x5xf32>) -> tensor<2x4x5xf32>
+  func.return(%sum) : (tensor<2x4x5xf32>) -> ()
+}
+
+// -----
+
+// The weight in one panel padded to 8 columns, 32 elements from 20: a slice that holds more than
+// the weight, so no layout in panels pads it and it stays at run time.
+// CHECK-NOT: func.func @static.
+// CHECK: func.func @main([[INPUT:%[0-9]+]]: tensor<1x4x8xf32>, [[WEIGHT:%[0-9]+]]: tensor<4x5xf32> {param = 1}) -> tensor<1x4x8xf32>
+// CHECK-NEXT: [[PANEL:%[0-9]+]] = host.dispatch([[WEIGHT]]) {callee = @pack}
+// CHECK-NEXT: host.dispatch([[INPUT]], [[PANEL]]) {callee = @add}
+tile.dispatch @pack(%weight: tensor<4x5xf32>) -> tensor<1x4x8xf32> {
+  %laid = tile.block(%weight) {iters = [par 1, par 4, par 8], reads = [$0[d1, d2] pad 0.0], folds = [none -> [d0, d1, d2]]} ({
+  ^body(%element: f32):
+    tile.yield(%element) : (f32) -> ()
+  }) : (tensor<4x5xf32>) -> tensor<1x4x8xf32>
+  func.return(%laid) : (tensor<1x4x8xf32>) -> ()
+}
+tile.dispatch @add(%input: tensor<1x4x8xf32>, %laid: tensor<1x4x8xf32>) -> tensor<1x4x8xf32> {
+  %sum = tile.block(%input, %laid) {iters = [par 1, par 4, par 8], reads = [$0[d0, d1, d2], $1[d0, d1, d2]], folds = [none -> [d0, d1, d2]]} ({
+  ^body(%element: f32, %weight_element: f32):
+    %added = arith.add(%element, %weight_element) : (f32, f32) -> f32
+    tile.yield(%added) : (f32) -> ()
+  }) : (tensor<1x4x8xf32>, tensor<1x4x8xf32>) -> tensor<1x4x8xf32>
+  func.return(%sum) : (tensor<1x4x8xf32>) -> ()
+}
+func.func @main(%input: tensor<1x4x8xf32>, %weight: tensor<4x5xf32> {param = 1}) -> tensor<1x4x8xf32> {
+  %laid = host.dispatch(%weight) {callee = @pack} : (tensor<4x5xf32>) -> tensor<1x4x8xf32>
+  %sum = host.dispatch(%input, %laid) {callee = @add} : (tensor<1x4x8xf32>, tensor<1x4x8xf32>) -> tensor<1x4x8xf32>
+  func.return(%sum) : (tensor<1x4x8xf32>) -> ()
 }

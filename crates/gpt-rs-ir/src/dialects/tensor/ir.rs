@@ -8,7 +8,7 @@ use crate::dialects::arith::math::Combiner;
 use crate::ir::{DType, Dense, Dim, Perm, Ranked, TensorType, F64};
 use crate::traits::{
     Absorbing, Associative, Commutative, DistributesOver, Elementwise, Idempotent, IntValue,
-    Involution, Movement, RightIdentity, Terminator, NEG_ZERO,
+    Involution, Movement, NarrowInF32, RightIdentity, Terminator, NEG_ZERO,
 };
 
 // ------------------------------------------------------------------------------------------------
@@ -36,7 +36,7 @@ pub struct Constant {
 #[crate::family(
     operands(input(Tensor)),
     results(output(Tensor)),
-    traits(Elementwise),
+    traits(Elementwise, NarrowInF32::ROUNDED),
     rule(crate::dialects::tensor::verify::elementwise::unary),
     eval(crate::dialects::tensor::interp::elementwise::unary)
 )]
@@ -102,7 +102,7 @@ pub struct Not;
 #[crate::family(
     operands(lhs(Tensor), rhs(Tensor)),
     results(output(Tensor)),
-    traits(Elementwise),
+    traits(Elementwise, NarrowInF32::ROUNDED),
     rule(crate::dialects::tensor::verify::elementwise::binary),
     eval(crate::dialects::tensor::interp::elementwise::binary)
 )]
@@ -263,7 +263,7 @@ pub struct ShiftRightArithmetic;
 #[crate::family(
     operands(lhs(Tensor), rhs(Tensor)),
     results(output(Tensor)),
-    traits(Elementwise),
+    traits(Elementwise, NarrowInF32::COMPARED),
     rule(crate::dialects::tensor::verify::elementwise::compare),
     eval(crate::dialects::tensor::interp::elementwise::compare)
 )]
@@ -504,6 +504,10 @@ pub struct SegmentOr(pub SegmentAttrs);
 
 /// The attributes of `tensor.top_k` and `tensor.bottom_k`.
 #[derive(crate::AttrGroup, Debug, Clone, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::min_ident_chars,
+    reason = "the text form prints the field `k` by name, as in `tensor.top_k(..) {k = 3, ..}`"
+)]
 pub struct SelectKAttrs {
     pub k: usize,
     pub axis: i64,
@@ -690,15 +694,15 @@ pub struct DynamicSlice {
 }
 
 /// `tensor.dynamic_update_slice`: `base` with the block at the run-time `starts` replaced by
-/// `update`.
+/// `patch`.
 ///
-/// - The block's extents are the static extents of `update`, which has the dtype and rank of
+/// - The block's extents are the static extents of `patch`, which has the dtype and rank of
 ///   `base`.
 /// - `starts` holds one `si32` or `si64` start per axis, of shape `[rank]`, clamped as in
 ///   `tensor.dynamic_slice`: into `[0, extent - size]`.
 #[crate::op(
     "tensor.dynamic_update_slice",
-    operands(base(Tensor), update(Tensor), starts(Tensor)),
+    operands(base(Tensor), patch(Tensor), starts(Tensor)),
     results(output(Tensor)),
     traits(Movement::leading(2))
 )]
@@ -915,24 +919,24 @@ pub struct RngNormal(pub RngAttrs);
 // Quantization: elements of a narrow dtype with scales, and offsets, that map them back to real
 // values. "Quantization" in the dialect documentation gives the scale layout the ops share.
 
-/// `tensor.dequantize`: `out[i] = to(q[i] * scale[i / block] + offset[i / block])`, computed in
-/// f32, then rounded to nearest-even in `to`.
+/// `tensor.dequantize`: `out[i] = to(quantized[i] * scale[i / block] + offset[i / block])`,
+/// computed in f32, then rounded to nearest-even in `to`.
 ///
 /// - `to` is `f32`, `bf16` or `f16`. The scale and the offset follow the scale layout of
 ///   "Quantization" in the dialect documentation. Without an offset, the sum adds nothing.
-/// - `q` holds quantized elements, integers or narrow floats, or the values of a code table that
-///   `tensor.take` read at the codes: NF4 weights dequantize as `take(table, codes)` and then this
-///   op.
+/// - `quantized` holds quantized elements, integers or narrow floats, or the values of a code table
+///   that `tensor.take` read at the codes: NF4 weights dequantize as `take(table, codes)` and then
+///   this op.
 /// - The offset carries asymmetric quantization: the zero points of GPTQ and AWQ as
 ///   `offset = -zero_point * scale`, computed once at load time, and the block minimums of GGUF.
-/// - A backend SHOULD read `q` and `scale` in place inside the op that consumes the result, such
-///   as a `dot_general` with a quantized weight.
+/// - A backend SHOULD read `quantized` and `scale` in place inside the op that consumes the result,
+///   such as a `dot_general` with a quantized weight.
 /// - Autodiff MUST differentiate it as multiplication by the scale, so that
 ///   `dequantize(quantize(x))` passes gradients through unchanged.
 /// - An extension op: a backend MAY reject it as unimplemented.
 #[crate::op(
     "tensor.dequantize",
-    operands(q(Tensor), scale(Tensor), offset(Optional(Tensor))),
+    operands(quantized(Tensor), scale(Tensor), offset(Optional(Tensor))),
     results(output(Tensor))
 )]
 pub struct Dequantize {
@@ -1209,7 +1213,7 @@ pub struct CustomCall {
 
 #[derive(crate::Dialect, Debug, Clone, PartialEq, Eq, Hash)]
 #[dialect(name = "tensor", op = Tensor)]
-pub enum TensorOp {
+pub enum TensorOps {
     Constant(Constant),
     Neg(Neg),
     Abs(Abs),

@@ -25,7 +25,7 @@ impl ExtractPatches {
         ensure_per_axis("dilation", &self.dilation, spatial, &axes)?;
         ensure_per_axis("padding", &self.padding, spatial, &axes)?;
         ensure!(
-            dims[1..].iter().all(|&n| n > 0),
+            dims[1..].iter().all(|&extent| extent > 0),
             "input {input} has an empty spatial or channel axis"
         );
         ensure_positive("window", &self.window)?;
@@ -33,24 +33,24 @@ impl ExtractPatches {
         ensure_positive("dilation", &self.dilation)?;
 
         let windowed: Vec<WindowAxis> = (0..spatial)
-            .map(|i| WindowAxis {
-                input: dims[1 + i],
-                window: self.window[i],
-                stride: self.strides[i],
-                padding: self.padding[i],
+            .map(|position| WindowAxis {
+                input: dims[1 + position],
+                window: self.window[position],
+                stride: self.strides[position],
+                padding: self.padding[position],
                 base_dilation: 1,
-                window_dilation: self.dilation[i],
+                window_dilation: self.dilation[position],
             })
             .collect();
         let mut out = Vec::with_capacity(dims.len());
         out.push(dims[0]);
-        for (i, axis) in windowed.iter().enumerate() {
-            out.push(axis.output(&format!("spatial axis {i}"))?);
+        for (position, axis) in windowed.iter().enumerate() {
+            out.push(axis.output(&format!("spatial axis {position}"))?);
         }
         let patch = self
             .window
             .iter()
-            .try_fold(dims[dims.len() - 1], |acc, &n| acc.checked_mul(n))
+            .try_fold(dims[dims.len() - 1], |acc, &extent| acc.checked_mul(extent))
             .ok_or_else(|| anyhow!("patch size overflows"))?;
         out.push(patch);
         Ok((windowed, out))
@@ -76,19 +76,19 @@ impl ReduceWindowAttrs {
         ensure_positive("window_dilation", &self.window_dilation)?;
 
         let windowed: Vec<WindowAxis> = (0..rank)
-            .map(|i| WindowAxis {
-                input: dims[i],
-                window: self.window_dims[i],
-                stride: self.strides[i],
-                padding: self.padding[i],
-                base_dilation: self.base_dilation[i],
-                window_dilation: self.window_dilation[i],
+            .map(|position| WindowAxis {
+                input: dims[position],
+                window: self.window_dims[position],
+                stride: self.strides[position],
+                padding: self.padding[position],
+                base_dilation: self.base_dilation[position],
+                window_dilation: self.window_dilation[position],
             })
             .collect();
         let out = windowed
             .iter()
             .enumerate()
-            .map(|(i, axis)| axis.output(&format!("axis {i}")))
+            .map(|(position, axis)| axis.output(&format!("axis {position}")))
             .collect::<Result<Vec<_>>>()?;
         Ok((windowed, out))
     }
@@ -112,17 +112,17 @@ impl WindowAxis {
         let dilated = self
             .input
             .checked_sub(1)
-            .map_or(Some(0), |n| {
-                n.checked_mul(self.base_dilation)?.checked_add(1)
+            .map_or(Some(0), |extent| {
+                extent.checked_mul(self.base_dilation)?.checked_add(1)
             })
             .ok_or_else(|| anyhow!("the dilated input overflows on {at}"))?;
         let padded = dilated
             .checked_add(self.padding.0)
-            .and_then(|n| n.checked_add(self.padding.1))
+            .and_then(|extent| extent.checked_add(self.padding.1))
             .ok_or_else(|| anyhow!("the padded input overflows on {at}"))?;
         let span = (self.window - 1)
             .checked_mul(self.window_dilation)
-            .and_then(|n| n.checked_add(1))
+            .and_then(|extent| extent.checked_add(1))
             .ok_or_else(|| anyhow!("the dilated window overflows on {at}"))?;
         if self.input == 0 && span > padded {
             return Ok(0);
@@ -157,7 +157,7 @@ fn ensure_per_axis<T: fmt::Debug>(name: &str, value: &[T], len: usize, axes: &st
 
 fn ensure_positive(name: &str, value: &[usize]) -> Result<()> {
     ensure!(
-        value.iter().all(|&n| n > 0),
+        value.iter().all(|&extent| extent > 0),
         "{name} {value:?} must all be positive"
     );
     Ok(())

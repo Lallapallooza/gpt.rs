@@ -2,9 +2,9 @@ use std::marker::PhantomData;
 
 use super::utils::{cast_to, copy};
 use crate::dialects::arith::math::Combiner;
-use crate::dialects::tensor::{Accumulates, ExtractPatches, ReduceWindow};
+use crate::dialects::tensor::{Accumulates, ExtractPatches, ExtractPatchesOp, ReduceWindow};
 use crate::dialects::tile::{par_iters, push_iter, Block, Fold, IterKind, Read, Write};
-use crate::ir::{Constraint, Dim, IndexExpr, Matched, Relation};
+use crate::ir::{Constraint, Dim, IndexExpr, OpRef, Relation};
 use crate::require;
 use crate::rewrite::{pattern, NoMatch, Pattern, Rewriter};
 
@@ -16,11 +16,7 @@ pub(super) struct ExtractPatchesToTile;
 impl Pattern for ExtractPatchesToTile {
     type Root = ExtractPatches;
 
-    fn rewrite(
-        &self,
-        patches: Matched<'_, ExtractPatches>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, patches: ExtractPatchesOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let input = patches.input().tensor_type();
         let output = patches.output().tensor_type();
         let rank = input.rank();
@@ -55,15 +51,17 @@ impl Pattern for ExtractPatchesToTile {
 }
 
 /// A `tensor.reduce_window_*` op is a block with the window offsets as reduction iterators after
-/// the positions, folding with the combine of its `arith` op. A window element in the padding or
-/// between dilated input elements fails one of the block's constraints.
+/// the positions, folding with the combine of its `arith` op. A window element in the padding, or
+/// between dilated input elements, fails one of the block's constraints, which hold for every
+/// dtype. `pad-with-identity` turns the constraints that keep the read inside the input into a pad
+/// of the fold's identity, where the dtype holds that identity.
 #[pattern]
 pub(super) struct ReduceWindowToTile<T>(pub(super) PhantomData<T>);
 
 impl<T: ReduceWindow> Pattern for ReduceWindowToTile<T> {
     type Root = T;
 
-    fn rewrite(&self, window: Matched<'_, T>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, window: OpRef<T>, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let input = window.input().tensor_type();
         let output = window.output().tensor_type();
         let accum = window.accum_dtype(input.dtype);
@@ -82,26 +80,30 @@ impl<T: ReduceWindow> Pattern for ReduceWindowToTile<T> {
             let low_padding = IndexExpr::constant(window.padding[axis].0 as i64);
             let dilated = ((start + offset) - low_padding).simplify();
             let dilation = window.base_dilation[axis] as i64;
+            let coord = match dilation > 1 {
+                true => {
+                    let remainder =
+                        IndexExpr::modulo(dilated.clone(), IndexExpr::constant(dilation));
+                    let zero = IndexExpr::constant(0);
+                    constraints.push(Constraint::cmp(remainder, Relation::Equal, zero));
+                    IndexExpr::floordiv(dilated, IndexExpr::constant(dilation))
+                }
+                false => dilated,
+            };
             let (low, high) = window.padding[axis];
             if low > 0 {
                 let zero = IndexExpr::constant(0);
-                constraints.push(Constraint::cmp(zero, Relation::LessEqual, dilated.clone()));
+                constraints.push(Constraint::cmp(zero, Relation::LessEqual, coord.clone()));
             }
             if high > 0 {
-                let last = IndexExpr::constant((extents[axis] as i64 - 1).max(0) * dilation);
-                constraints.push(Constraint::cmp(dilated.clone(), Relation::LessEqual, last));
+                let last = IndexExpr::constant(extents[axis] as i64 - 1);
+                constraints.push(Constraint::cmp(coord.clone(), Relation::LessEqual, last));
             }
-            if dilation > 1 {
-                let remainder = IndexExpr::modulo(dilated.clone(), IndexExpr::constant(dilation));
-                let zero = IndexExpr::constant(0);
-                constraints.push(Constraint::cmp(remainder, Relation::Equal, zero));
-                source.push(IndexExpr::floordiv(dilated, IndexExpr::constant(dilation)));
-            } else {
-                source.push(dilated);
-            }
+            source.push(coord);
         }
         let fold = Fold::new(T::Combiner::COMBINE, vec![Write::new(positions)]);
-        let block = Block::new(iters, vec![Read::new(0, source)], vec![fold]).restrict(constraints);
+        let read = Read::new(0, source);
+        let block = Block::new(iters, vec![read], vec![fold]).restrict(constraints);
         let inputs = vec![window.input().id()];
         let folded = block.build(rewriter, inputs, |body, args| {
             vec![body.cast(args[0], accum)]

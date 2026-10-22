@@ -1,24 +1,22 @@
 //! Semantics of the layout ops.
 
-use std::sync::Arc;
-
 use anyhow::Result;
 
-use super::kernels::{strided, strides, Chunks};
+use super::kernels::{bitcast, strided, strides, Chunks};
 use crate::dialects::tensor::ir::{
     Bitcast, BitcastOperands, BitcastResults, BroadcastTo, BroadcastToOperands, BroadcastToResults,
     Concat, ConcatOperands, ConcatResults, Reshape, ReshapeOperands, ReshapeResults, Slice,
     SliceOperands, SliceResults, Transpose, TransposeOperands, TransposeResults,
 };
 use crate::dialects::tensor::utils::shape::{axis_index, check_window, pick};
-use crate::host::{HostTensor, TensorData};
+use crate::host::HostTensor;
 use crate::ir::{Eval, EvalCx, Host, NoRegions, OwnedHost};
 
 impl Eval for Reshape {
     fn eval(
         &self,
-        ins: ReshapeOperands<Host<'_>>,
-        cx: &mut EvalCx<'_, NoRegions>,
+        ins: ReshapeOperands<Host>,
+        cx: &mut EvalCx<NoRegions>,
     ) -> Result<ReshapeResults<OwnedHost>> {
         Ok(ReshapeResults {
             output: HostTensor::new(cx.result_dims(0)?, ins.input.data.clone())?,
@@ -29,8 +27,8 @@ impl Eval for Reshape {
 impl Eval for Transpose {
     fn eval(
         &self,
-        ins: TransposeOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
+        ins: TransposeOperands<Host>,
+        _cx: &mut EvalCx<NoRegions>,
     ) -> Result<TransposeResults<OwnedHost>> {
         let in_dims = &ins.input.dims;
         let out_dims: Vec<usize> = self.perm.iter().map(|&axis| in_dims[axis]).collect();
@@ -45,8 +43,8 @@ impl Eval for Transpose {
 impl Eval for BroadcastTo {
     fn eval(
         &self,
-        ins: BroadcastToOperands<Host<'_>>,
-        cx: &mut EvalCx<'_, NoRegions>,
+        ins: BroadcastToOperands<Host>,
+        cx: &mut EvalCx<NoRegions>,
     ) -> Result<BroadcastToResults<OwnedHost>> {
         let input = ins.input;
         let in_dims = &input.dims;
@@ -55,7 +53,7 @@ impl Eval for BroadcastTo {
         // A broadcast axis, new or of extent 1, steps by 0.
         let steps: Vec<usize> = (0..out_dims.len())
             .map(|axis| match self.source_axis(axis, in_dims.len()) {
-                Some(axis) if in_dims[axis] != 1 => in_strides[axis],
+                Some(source) if in_dims[source] != 1 => in_strides[source],
                 _ => 0,
             })
             .collect();
@@ -69,8 +67,8 @@ impl Eval for BroadcastTo {
 impl Eval for Slice {
     fn eval(
         &self,
-        ins: SliceOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
+        ins: SliceOperands<Host>,
+        _cx: &mut EvalCx<NoRegions>,
     ) -> Result<SliceResults<OwnedHost>> {
         let input = ins.input;
         for (axis, &extent) in input.dims.iter().enumerate() {
@@ -95,8 +93,8 @@ impl Eval for Slice {
 impl Eval for Concat {
     fn eval(
         &self,
-        ins: ConcatOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
+        ins: ConcatOperands<Host>,
+        _cx: &mut EvalCx<NoRegions>,
     ) -> Result<ConcatResults<OwnedHost>> {
         let first = ins.inputs[0];
         let axis = axis_index(self.axis, first.dims.len())?;
@@ -129,15 +127,11 @@ impl Eval for Concat {
 impl Eval for Bitcast {
     fn eval(
         &self,
-        ins: BitcastOperands<Host<'_>>,
-        cx: &mut EvalCx<'_, NoRegions>,
+        ins: BitcastOperands<Host>,
+        cx: &mut EvalCx<NoRegions>,
     ) -> Result<BitcastResults<OwnedHost>> {
-        // The elements' bytes are their bit stream: packed from the least significant bit of each
-        // byte, little-endian across the bytes of an element.
         let dims = cx.result_dims(0)?;
-        let count = dims.iter().product();
-        let bytes = ins.input.to_le_bytes().to_vec();
-        let data = TensorData::read(self.to, count, Arc::new(bytes))?;
+        let data = bitcast(ins.input, self.to, dims.iter().product())?;
         Ok(BitcastResults {
             output: HostTensor::new(dims, data)?,
         })

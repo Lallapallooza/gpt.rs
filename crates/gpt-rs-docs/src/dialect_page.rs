@@ -15,16 +15,20 @@ use gpt_rs_ir::traits::OpTrait;
 use crate::filetests::Case;
 use crate::{cell, defined_by, inline_list, readme, Catalog, HEADER};
 
-/// The page of the dialect `name`, whose ops are `infos`.
+/// The page of a dialect whose ops are `infos`, with the `README.md` beside their definitions.
 pub fn write(
     root: &Path,
-    name: &str,
     infos: &[OpInfo],
     filetests: &[Case],
     catalog: &Catalog,
 ) -> Result<String> {
-    let spec =
-        fs::read_to_string(root.join(format!("crates/gpt-rs-ir/src/dialects/{name}/README.md")))?;
+    let Some(first) = infos.first() else {
+        bail!("a dialect page needs an op");
+    };
+    let definitions = Path::new(first.file)
+        .parent()
+        .expect("an op is defined in a file of a directory");
+    let spec = fs::read_to_string(root.join(definitions).join("README.md"))?;
     let mut out = String::from(HEADER);
     out.push_str(readme(&spec).trim_end());
     out.push_str("\n\n## Ops\n\n");
@@ -83,7 +87,11 @@ fn shared_rows(out: &mut String, info: &OpInfo) -> Result<()> {
     writeln!(out, "| Operands | {} |", groups(info.operands))?;
     writeln!(out, "| Results | {} |", groups(info.results))?;
     if !info.regions.is_empty() {
-        let regions: Vec<String> = info.regions.iter().map(|r| r.to_string()).collect();
+        let regions: Vec<String> = info
+            .regions
+            .iter()
+            .map(|region| region.to_string())
+            .collect();
         writeln!(out, "| Regions | {} |", inline_list(&regions))?;
     }
     if !info.attrs.is_empty() {
@@ -229,7 +237,7 @@ fn family_section(
         .traits
         .iter()
         .copied()
-        .filter(|t| ops.iter().all(|op| has_same_trait(op, *t)))
+        .filter(|op_trait| ops.iter().all(|op| has_same_trait(op, *op_trait)))
         .collect();
     if !shared.is_empty() {
         writeln!(out, "| Traits | {} |", traits(&shared))?;
@@ -258,7 +266,11 @@ fn family_section(
         op.traits
             .iter()
             .copied()
-            .filter(|t| !shared.iter().any(|s| s.to_string() == t.to_string()))
+            .filter(|op_trait| {
+                !shared
+                    .iter()
+                    .any(|shared_trait| shared_trait.to_string() == op_trait.to_string())
+            })
             .collect()
     };
     let with_traits = ops.iter().any(|op| !own(op).is_empty());
@@ -280,14 +292,14 @@ fn family_section(
 
 /// Whether `op` has the trait named `name`.
 fn has_trait(op: &OpInfo, name: &str) -> bool {
-    op.traits.iter().any(|t| t.name() == name)
+    op.traits.iter().any(|op_trait| op_trait.name() == name)
 }
 
 /// Whether `op` has `wanted`, with its parameters.
 fn has_same_trait(op: &OpInfo, wanted: &dyn OpTrait) -> bool {
     op.traits
         .iter()
-        .any(|t| t.to_string() == wanted.to_string())
+        .any(|op_trait| op_trait.to_string() == wanted.to_string())
 }
 
 /// The patterns rooted at the ops of a family, each with its pass, and with the ops it is rooted
@@ -296,10 +308,9 @@ fn family_patterns(catalog: &Catalog, ops: &[&OpInfo]) -> Vec<String> {
     let mut found: Vec<(&str, &str, Vec<&str>)> = Vec::new();
     for op in ops {
         for (pattern, pass, _) in catalog.patterns_at(|root| root == RootInfo::Op(op.name)) {
-            match found
-                .iter_mut()
-                .find(|(p, s, _)| (*p, *s) == (pattern, pass))
-            {
+            match found.iter_mut().find(|(found_pattern, found_pass, _)| {
+                (*found_pattern, *found_pass) == (pattern, pass)
+            }) {
                 Some((_, _, roots)) => roots.push(op.name),
                 None => found.push((pattern, pass, vec![op.name])),
             }
@@ -366,7 +377,7 @@ fn traits_section(out: &mut String, infos: &[OpInfo], catalog: &Catalog) -> Resu
          it implies apply to every one of them; [passes.md](passes.md) says which pass runs \
          each.\n",
     );
-    for (name, t) in &catalog.traits {
+    for (name, op_trait) in &catalog.traits {
         let ops: Vec<String> = infos
             .iter()
             .filter(|info| has_trait(info, name))
@@ -376,8 +387,8 @@ fn traits_section(out: &mut String, infos: &[OpInfo], catalog: &Catalog) -> Resu
             continue;
         }
         writeln!(out, "\n### `{name}`\n")?;
-        writeln!(out, "{}\n", t.doc())?;
-        writeln!(out, "{}\n", defined_by(name, t.file()))?;
+        writeln!(out, "{}\n", op_trait.doc())?;
+        writeln!(out, "{}\n", defined_by(name, op_trait.file()))?;
         writeln!(out, "Ops: {}.", inline_list(&ops))?;
         let patterns = catalog.patterns_at(|root| root == RootInfo::Trait(name));
         if !patterns.is_empty() {
@@ -390,10 +401,10 @@ fn traits_section(out: &mut String, infos: &[OpInfo], catalog: &Catalog) -> Resu
 /// The doc comment without the name it starts with (`` `tensor.transpose`: ``), which the
 /// heading shows.
 fn body(doc: &str) -> String {
-    let doc = doc.trim();
-    let rest = match doc.split_once(": ") {
+    let trimmed = doc.trim();
+    let rest = match trimmed.split_once(": ") {
         Some((name, rest)) if name.starts_with('`') && !name.contains('\n') => rest,
-        _ => doc,
+        _ => trimmed,
     };
     let mut chars = rest.chars();
     match chars.next() {
@@ -413,6 +424,7 @@ fn groups(groups: &[Group]) -> String {
                 Kind::Any => ("value", "values"),
                 Kind::Tensor => ("tensor", "tensors"),
                 Kind::Buffer => ("buffer", "buffers"),
+                Kind::Vector => ("vector", "vectors"),
                 Kind::Index => ("index", "indices"),
                 Kind::Scalar => ("scalar", "scalars"),
             };
@@ -430,7 +442,7 @@ fn groups(groups: &[Group]) -> String {
 fn traits(traits: &[&dyn OpTrait]) -> String {
     traits
         .iter()
-        .map(|t| t.to_string())
+        .map(|op_trait| op_trait.to_string())
         .collect::<Vec<_>>()
         .join("; ")
 }

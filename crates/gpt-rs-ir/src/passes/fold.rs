@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use super::{pass, Greedy, Pass, Rewrites};
-use crate::ir::Module;
+use crate::rewrite::Rewriting;
 
 /// Replaces each op that folds by an existing value or a constant, until nothing changes. The
 /// folds are those of `canonicalize`, without its patterns.
@@ -19,7 +19,7 @@ impl Pass for Fold {
         }
     }
 
-    fn run(&self, module: &mut Module) -> Result<bool> {
+    fn run(&self, module: &mut Rewriting) -> Result<bool> {
         let report = Greedy::new(self.rewrites()).run(module)?;
         Fold::FOLDED.add(report.folded);
         Ok(report.changed())

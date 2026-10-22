@@ -10,8 +10,8 @@ use crate::ir::{NoRegions, OpDef, OwnedTypes, TensorType, TypeCx, Types};
 impl OpDef for ExtractPatches {
     fn result_types(
         &self,
-        ins: ExtractPatchesOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        ins: ExtractPatchesOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<ExtractPatchesResults<OwnedTypes>> {
         let (_, dims) = self.geometry(ins.input)?;
         ensure!(
@@ -29,8 +29,8 @@ impl OpDef for ExtractPatches {
 /// The type rule of every [`ReduceWindow`] op.
 pub(crate) fn reduce_window<T: ReduceWindow>(
     op: &T,
-    ins: ReduceWindowOperands<Types<'_>>,
-    _cx: &TypeCx<'_, NoRegions>,
+    ins: ReduceWindowOperands<Types>,
+    _cx: &TypeCx<NoRegions>,
 ) -> Result<ReduceWindowResults<OwnedTypes>> {
     let (_, dims) = op.geometry(ins.input)?;
     ensure_reduction::<T::Combiner>(ins.input, op.accum, op.out)?;

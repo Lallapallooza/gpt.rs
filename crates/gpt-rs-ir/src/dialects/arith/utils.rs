@@ -136,8 +136,8 @@ pub(crate) fn ensure_bitcast(from: DType, to: DType) -> Result<()> {
 }
 
 /// Scalar code while it is built, through a `Builder`, such as the body of a `tile.block`, or
-/// through a pattern's `Rewriter`: `create` creates one op, and the other methods build a constant
-/// or a value from one or more arith ops. An op its type rule rejects is a bug in the caller, and
+/// through a pattern's `Rewriter`. `create` creates one op, and most other methods build a
+/// constant or a value from arith ops. An op its type rule rejects is a bug in the caller, and
 /// panics.
 pub struct ScalarBuilder<'b, B> {
     pub builder: &'b mut B,

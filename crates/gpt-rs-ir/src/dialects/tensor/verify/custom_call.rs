@@ -8,8 +8,8 @@ use crate::ir::{NoRegions, OpDef, OwnedTypes, TypeCx, Types};
 impl OpDef for CustomCall {
     fn result_types(
         &self,
-        _ins: CustomCallOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        _ins: CustomCallOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<CustomCallResults<OwnedTypes>> {
         ensure!(!self.target.is_empty(), "the target is empty");
         Ok(CustomCallResults {

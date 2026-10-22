@@ -35,3 +35,17 @@ func.func @two_products(%lhs: tensor<3x2xf32>, %rhs: tensor<2x5xf32>) -> tensor<
   %product = tensor.dot_general(%lhs, %rhs) {contract_lhs = [1], contract_rhs = [0]} : (tensor<3x2xf32>, tensor<2x5xf32>) -> tensor<3x5xf32>
   func.return(%product) : (tensor<3x5xf32>) -> ()
 }
+
+// -----
+
+// A 1x1 convolution's dot contracts its kernel axes of one point on both sides, which add nothing
+// to its sums: it contracts the operands without them, summing the same products in the same
+// order.
+// CHECK: func.func @pointwise_conv([[PATCHES:%[0-9]+]]: tensor<2x5x1x1x8xf32>, [[WEIGHT:%[0-9]+]]: tensor<6x8x1x1xf32>) -> tensor<2x5x6xf32> {
+// CHECK-NEXT: [[ROWS:%[0-9]+]] = tensor.reshape([[PATCHES]]) {shape = [2, 5, 8]} : (tensor<2x5x1x1x8xf32>) -> tensor<2x5x8xf32>
+// CHECK-NEXT: [[MATRIX:%[0-9]+]] = tensor.reshape([[WEIGHT]]) {shape = [6, 8]} : (tensor<6x8x1x1xf32>) -> tensor<6x8xf32>
+// CHECK-NEXT: tensor.dot_general([[ROWS]], [[MATRIX]]) {contract_lhs = [2], contract_rhs = [1]} : (tensor<2x5x8xf32>, tensor<6x8xf32>) -> tensor<2x5x6xf32>
+func.func @pointwise_conv(%patches: tensor<2x5x1x1x8xf32>, %weight: tensor<6x8x1x1xf32>) -> tensor<2x5x6xf32> {
+  %product = tensor.dot_general(%patches, %weight) {contract_lhs = [2, 3, 4], contract_rhs = [2, 3, 1]} : (tensor<2x5x1x1x8xf32>, tensor<6x8x1x1xf32>) -> tensor<2x5x6xf32>
+  func.return(%product) : (tensor<2x5x6xf32>) -> ()
+}

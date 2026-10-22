@@ -6,8 +6,8 @@ use crate::dialects::tile;
 use crate::ir::Module;
 
 /// What a call of `callee` costs: the cost of the ops of a `tile.dispatch`'s body, with the ops
-/// of each block counted once per point, or `None` for a `loop.func`: the count of a
-/// `loop.func`'s ops leaves out its loops.
+/// of each block counted once per point, or `None` for a `loop.func`, since the count of its ops
+/// leaves out its loops.
 fn callee_cost(module: &Module, callee: &str) -> Option<Cost> {
     let symbol = module.symbol(callee)?;
     module.op(symbol).get::<tile::Dispatch>()?;

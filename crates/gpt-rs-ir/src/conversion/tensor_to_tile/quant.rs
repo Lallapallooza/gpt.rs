@@ -1,17 +1,21 @@
 use std::marker::PhantomData;
 
 use super::utils::elementwise;
-use crate::dialects::arith;
+use crate::dialects::arith::{self, ScalarBuilder};
+use crate::dialects::tensor::utils::quant::scale_dims;
 use crate::dialects::tensor::{
     BlockScale, BlockScaleAmax, BlockScalePow2Ceil, BlockScalePow2Floor, BlockScaleRange,
-    Dequantize, Quantize, QuantizeStochastic, QuantizeTable,
+    BlockScaleRangeOp, Dequantize, DequantizeOp, Quantize, QuantizeOp, QuantizeStochastic,
+    QuantizeStochasticOp, QuantizeTable, QuantizeTableOp,
 };
 use crate::dialects::tile::{
-    par_iters, push_iter, Block, Body, CombineKind, Fold, Inputs, IterKind, Read, Write,
+    par_iters, push_iter, Block, CombineKind, Fold, Inputs, IterKind, Read, Write,
 };
-use crate::ir::{floor_log2, DType, Dim, Elements, IndexExpr, Matched, Value, ValueRef};
+use crate::ir::{
+    floor_log2, DType, Dim, Elements, IndexExpr, OpRef, Ranked, Value, ValueRef, E8M0_BIAS,
+};
 use crate::require;
-use crate::rewrite::{pattern, NoMatch, Pattern, Rewriter};
+use crate::rewrite::{pattern, Builder, NoMatch, Pattern, Rewriter};
 
 /// `tensor.dequantize` is a parallel block that multiplies each value by its block's scale and
 /// adds the offset, in f32.
@@ -21,30 +25,26 @@ pub(super) struct DequantizeToTile;
 impl Pattern for DequantizeToTile {
     type Root = Dequantize;
 
-    fn rewrite(
-        &self,
-        dequantize: Matched<'_, Dequantize>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
-        let codes = dequantize.q();
-        let block = &dequantize.block;
+    fn rewrite(&self, dequantize: DequantizeOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
+        let codes = dequantize.quantized();
+        let quant_block = &dequantize.block;
         let (iters, coords) = par_iters(&codes.tensor_type().dims);
         let mut inputs = Inputs::new(Vec::new());
         let code = inputs.read(codes.id(), coords.clone());
-        let scale = read_block(&mut inputs, dequantize.scale().id(), &coords, block);
+        let scale = read_block(&mut inputs, dequantize.scale().id(), &coords, quant_block);
         let offset = dequantize
             .offset()
-            .map(|offset| read_block(&mut inputs, offset.id(), &coords, block));
+            .map(|offset| read_block(&mut inputs, offset.id(), &coords, quant_block));
         let to = dequantize.to;
         let block = Block::new(iters, inputs.reads, vec![Fold::plain(Write::new(coords))]);
         let result = block.build(rewriter, inputs.values, |body, args| {
             let value = body.cast(args[code], DType::F32);
-            let scale = body.cast(args[scale], DType::F32);
-            let product = body.create(arith::Mul, (value, scale));
+            let scale_value = body.cast(args[scale], DType::F32);
+            let product = body.create(arith::Mul, (value, scale_value));
             let real = match offset {
-                Some(offset) => {
-                    let offset = body.cast(args[offset], DType::F32);
-                    body.create(arith::Add, (product, offset))
+                Some(offset_arg) => {
+                    let offset_value = body.cast(args[offset_arg], DType::F32);
+                    body.create(arith::Add, (product, offset_value))
                 }
                 None => product,
             };
@@ -63,11 +63,7 @@ pub(super) struct QuantizeToTile;
 impl Pattern for QuantizeToTile {
     type Root = Quantize;
 
-    fn rewrite(
-        &self,
-        quantize: Matched<'_, Quantize>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, quantize: QuantizeOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let to = quantize.to;
         require!(let Ok(elements) = to.elements(), "{to} is not a quantized dtype");
         let operands = QuantizeOperands {
@@ -75,9 +71,13 @@ impl Pattern for QuantizeToTile {
             scale: quantize.scale().id(),
             offset: quantize.offset().map(ValueRef::id),
         };
-        let result = quantize_elements(rewriter, &operands, &quantize.block, None, |body, y, _| {
-            round_nearest(body, y, to, elements)
-        });
+        let result = quantize_elements(
+            rewriter,
+            &operands,
+            &quantize.block,
+            None,
+            |body, quotient, _| round_nearest(body, quotient, to, elements),
+        );
         rewriter.replace_op(&quantize, result);
         Ok(())
     }
@@ -93,8 +93,8 @@ impl Pattern for QuantizeStochasticToTile {
 
     fn rewrite(
         &self,
-        quantize: Matched<'_, QuantizeStochastic>,
-        rewriter: &mut Rewriter<'_>,
+        quantize: QuantizeStochasticOp,
+        rewriter: &mut Rewriter,
     ) -> Result<(), NoMatch> {
         let to = quantize.to;
         require!(let Ok(elements) = to.elements(), "{to} is not a quantized dtype");
@@ -109,9 +109,10 @@ impl Pattern for QuantizeStochasticToTile {
             &operands,
             &quantize.block,
             random,
-            |body, y, draw| {
-                let draw = draw.expect("a stochastic quantization reads a draw for each element");
-                round_stochastic(body, y, to, elements, draw)
+            |body, quotient, element_draw| {
+                let draw =
+                    element_draw.expect("a stochastic quantization reads a draw for each element");
+                round_stochastic(body, quotient, to, elements, draw)
             },
         );
         rewriter.replace_op(&quantize, result);
@@ -127,11 +128,7 @@ pub(super) struct QuantizeTableToTile;
 impl Pattern for QuantizeTableToTile {
     type Root = QuantizeTable;
 
-    fn rewrite(
-        &self,
-        quantize: Matched<'_, QuantizeTable>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, quantize: QuantizeTableOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let operands = QuantizeOperands {
             input: quantize.x(),
             scale: quantize.scale().id(),
@@ -157,9 +154,9 @@ impl Pattern for QuantizeTableToTile {
         let block = Block::new(iters, inputs.reads, vec![nearest_entry]);
         let nearest = block.build(rewriter, inputs.values, |body, args| {
             let quotient = divide_by_scale(body, args, element, scale, offset);
-            let mut distance = |entry: Value| {
-                let entry = body.cast(entry, DType::F32);
-                let difference = body.create(arith::Sub, (entry, quotient));
+            let mut distance = |table_value: Value| {
+                let widened = body.cast(table_value, DType::F32);
+                let difference = body.create(arith::Sub, (widened, quotient));
                 body.create(arith::Abs, difference)
             };
             let entry_distance = distance(args[entry]);
@@ -189,19 +186,19 @@ impl Pattern for QuantizeTableToTile {
 pub(super) trait ScaleToTile {
     /// The scale, an f64, of a block whose largest magnitude is `amax`, an f64, for a quantized
     /// dtype whose largest finite value is `largest`.
-    fn scale(body: &mut Body<'_, '_>, amax: Value, largest: f64) -> Value;
+    fn scale(body: &mut ScalarBuilder<Builder>, amax: Value, largest: f64) -> Value;
 }
 
 impl ScaleToTile for BlockScaleAmax {
-    fn scale(body: &mut Body<'_, '_>, amax: Value, largest: f64) -> Value {
+    fn scale(body: &mut ScalarBuilder<Builder>, amax: Value, largest: f64) -> Value {
         let divisor = body.float(DType::F64, largest);
         body.create(arith::Div, (amax, divisor))
     }
 }
 
 impl ScaleToTile for BlockScalePow2Floor {
-    fn scale(body: &mut Body<'_, '_>, amax: Value, largest: f64) -> Value {
-        let amax_exponent = body.exponent_f64(amax);
+    fn scale(body: &mut ScalarBuilder<Builder>, amax: Value, largest: f64) -> Value {
+        let amax_exponent = body.exponent(amax);
         let largest_exponent = body.int(DType::Si64, i128::from(floor_log2(largest)));
         let exponent = body.create(arith::Sub, (amax_exponent, largest_exponent));
         power_of_two(body, amax, exponent)
@@ -209,11 +206,11 @@ impl ScaleToTile for BlockScalePow2Floor {
 }
 
 impl ScaleToTile for BlockScalePow2Ceil {
-    fn scale(body: &mut Body<'_, '_>, amax: Value, largest: f64) -> Value {
+    fn scale(body: &mut ScalarBuilder<Builder>, amax: Value, largest: f64) -> Value {
         let divisor = body.float(DType::F64, largest);
         let ratio = body.create(arith::Div, (amax, divisor));
-        let floor = body.exponent_f64(ratio);
-        let power = body.pow2_f64(floor);
+        let floor = body.exponent(ratio);
+        let power = body.pow2(DType::F64, floor);
         let exact = body.create(arith::Equal, (ratio, power));
         let one = body.int(DType::Si64, 1);
         let ceil = body.create(arith::Add, (floor, one));
@@ -222,17 +219,17 @@ impl ScaleToTile for BlockScalePow2Ceil {
     }
 }
 
-/// `2^exponent` as an f64, the si64 `exponent` clamped to `[-127, 127]`, or `2^-127` where `amax`
-/// is 0.
-fn power_of_two(body: &mut Body<'_, '_>, amax: Value, exponent: Value) -> Value {
-    let lowest = body.int(DType::Si64, -127);
-    let highest = body.int(DType::Si64, 127);
+/// `2^exponent` as an f64, the si64 `exponent` clamped to the finite scales of `e8m0`,
+/// `[-127, 127]`, or `2^-127` where `amax` is 0.
+fn power_of_two(body: &mut ScalarBuilder<Builder>, amax: Value, exponent: Value) -> Value {
+    let lowest = body.int(DType::Si64, i128::from(-E8M0_BIAS));
+    let highest = body.int(DType::Si64, i128::from(E8M0_BIAS));
     let raised = body.create(arith::Maximum, (exponent, lowest));
     let clamped = body.create(arith::Minimum, (raised, highest));
     let zero = body.float(DType::F64, 0.0);
     let empty = body.create(arith::Equal, (amax, zero));
     let chosen = body.create(arith::Select, (empty, lowest, clamped));
-    body.pow2_f64(chosen)
+    body.pow2(DType::F64, chosen)
 }
 
 /// A `tensor.block_scale_*` op is a block that folds each block's range, then a block that computes
@@ -243,7 +240,7 @@ pub(super) struct BlockScaleToTile<T>(pub(super) PhantomData<T>);
 impl<T: BlockScale + ScaleToTile> Pattern for BlockScaleToTile<T> {
     type Root = T;
 
-    fn rewrite(&self, scaling: Matched<'_, T>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, scaling: OpRef<T>, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let to = scaling.to;
         require!(let Ok(elements) = to.elements(), "{to} is not a quantized dtype");
         let scale_dtype = scaling.scale_dtype;
@@ -274,11 +271,7 @@ pub(super) struct BlockScaleRangeToTile;
 impl Pattern for BlockScaleRangeToTile {
     type Root = BlockScaleRange;
 
-    fn rewrite(
-        &self,
-        scaling: Matched<'_, BlockScaleRange>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, scaling: BlockScaleRangeOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let to = scaling.to;
         require!(let Ok(elements) = to.elements(), "{to} is not a quantized dtype");
         let scale_dtype = scaling.scale_dtype;
@@ -302,20 +295,12 @@ impl Pattern for BlockScaleRangeToTile {
 /// with `block`, and the extents of the scales. A tail block reads 0 past the end, which the range
 /// holds anyway.
 fn block_range(
-    rewriter: &mut Rewriter<'_>,
-    input: ValueRef<'_>,
+    rewriter: &mut Rewriter,
+    input: ValueRef,
     block: &[usize],
-) -> Result<(Vec<Dim>, Vec<Value>), NoMatch> {
-    let mut scale_dims = Vec::new();
-    for (extent, &size) in input.tensor_type().dims.iter().zip(block) {
-        match extent {
-            Dim::Static(extent) => scale_dims.push(Dim::Static(extent.div_ceil(size))),
-            Dim::Dynamic(_) => {
-                require!(size == 1, "a block of {size} needs a static extent");
-                scale_dims.push(extent.clone());
-            }
-        }
-    }
+) -> Result<(Ranked<Dim>, Vec<Value>), NoMatch> {
+    let scale_dims = scale_dims(&input.tensor_type().dims, block)
+        .map_err(|err| NoMatch::because(format_args!("{err:#}")))?;
     let (mut iters, block_coords) = par_iters(&scale_dims);
     let mut source = Vec::new();
     for (axis, &size) in block.iter().enumerate() {
@@ -343,7 +328,11 @@ fn block_range(
 }
 
 /// The bounds of a block's range, `[range_min, range_max]` widened to hold 0.
-fn widened(body: &mut Body<'_, '_>, range_min: Value, range_max: Value) -> (Value, Value) {
+fn widened(
+    body: &mut ScalarBuilder<Builder>,
+    range_min: Value,
+    range_max: Value,
+) -> (Value, Value) {
     let zero = body.float(DType::F32, 0.0);
     let low = body.create(arith::Minimum, (zero, range_min));
     let high = body.create(arith::Maximum, (zero, range_max));
@@ -351,7 +340,7 @@ fn widened(body: &mut Body<'_, '_>, range_min: Value, range_max: Value) -> (Valu
 }
 
 /// The largest magnitude of a block whose elements range over `[range_min, range_max]`, an f64.
-fn block_amax(body: &mut Body<'_, '_>, range_min: Value, range_max: Value) -> Value {
+fn block_amax(body: &mut ScalarBuilder<Builder>, range_min: Value, range_max: Value) -> Value {
     let (low, high) = widened(body, range_min, range_max);
     let negated_low = body.create(arith::Neg, low);
     let amax = body.create(arith::Maximum, (high, negated_low));
@@ -360,10 +349,10 @@ fn block_amax(body: &mut Body<'_, '_>, range_min: Value, range_max: Value) -> Va
 
 /// The f64 scale `real` stored as `scale_dtype`: an `e8m0` scale, a power of two, as the code of
 /// its exponent.
-fn store_scale(body: &mut Body<'_, '_>, real: Value, scale_dtype: DType) -> Value {
+fn store_scale(body: &mut ScalarBuilder<Builder>, real: Value, scale_dtype: DType) -> Value {
     if scale_dtype == DType::E8M0 {
-        let exponent = body.exponent_f64(real);
-        let bias = body.int(DType::Si64, 127);
+        let exponent = body.exponent(real);
+        let bias = body.int(DType::Si64, i128::from(E8M0_BIAS));
         let biased = body.create(arith::Add, (exponent, bias));
         let code = body.cast(biased, DType::Ui8);
         return body.bitcast(code, DType::E8M0);
@@ -375,7 +364,7 @@ fn store_scale(body: &mut Body<'_, '_>, real: Value, scale_dtype: DType) -> Valu
 /// The asymmetric scale and offset of a block whose elements range over
 /// `[range_min, range_max]`.
 fn asymmetric_scale(
-    body: &mut Body<'_, '_>,
+    body: &mut ScalarBuilder<Builder>,
     range_min: Value,
     range_max: Value,
     scale_dtype: DType,
@@ -404,7 +393,7 @@ fn asymmetric_scale(
     vec![scale, body.cast(offset, scale_dtype)]
 }
 
-/// Reads `value` at the block of `coords`, coordinate `c` divided by its block extent, and returns
+/// Reads `value` at the block of `coords`, each coordinate divided by its block extent, and returns
 /// the index of the read.
 fn read_block(inputs: &mut Inputs, value: Value, coords: &[IndexExpr], block: &[usize]) -> usize {
     let mut at = Vec::with_capacity(coords.len());
@@ -423,7 +412,7 @@ struct QuantizeOperands<'m> {
 
 /// `(element - offset) / scale` in f32, or 0 where the scale is 0, from the reads of a block.
 fn divide_by_scale(
-    body: &mut Body<'_, '_>,
+    body: &mut ScalarBuilder<Builder>,
     args: &[Value],
     element: usize,
     scale: usize,
@@ -431,9 +420,9 @@ fn divide_by_scale(
 ) -> Value {
     let value = body.cast(args[element], DType::F32);
     let numerator = match offset {
-        Some(offset) => {
-            let offset = body.cast(args[offset], DType::F32);
-            body.create(arith::Sub, (value, offset))
+        Some(offset_arg) => {
+            let offset_value = body.cast(args[offset_arg], DType::F32);
+            body.create(arith::Sub, (value, offset_value))
         }
         None => value,
     };
@@ -447,30 +436,35 @@ fn divide_by_scale(
 /// A parallel block over the input of `operands` that rounds each `(x - offset) / scale` as
 /// `round` does, given the element's draw from `random` when there is one.
 fn quantize_elements(
-    rewriter: &mut Rewriter<'_>,
-    operands: &QuantizeOperands<'_>,
-    block: &[usize],
+    rewriter: &mut Rewriter,
+    operands: &QuantizeOperands,
+    quant_block: &[usize],
     random: Option<Value>,
-    round: impl FnOnce(&mut Body<'_, '_>, Value, Option<Value>) -> Value,
+    round: impl FnOnce(&mut ScalarBuilder<Builder>, Value, Option<Value>) -> Value,
 ) -> Value {
     let input_type = operands.input.tensor_type();
     let (iters, coords) = par_iters(&input_type.dims);
     let mut inputs = Inputs::new(Vec::new());
     let element = inputs.read(operands.input.id(), coords.clone());
-    let scale = read_block(&mut inputs, operands.scale, &coords, block);
+    let scale = read_block(&mut inputs, operands.scale, &coords, quant_block);
     let offset = operands
         .offset
-        .map(|offset| read_block(&mut inputs, offset, &coords, block));
-    let draw = random.map(|random| inputs.read(random, coords.clone()));
+        .map(|offset| read_block(&mut inputs, offset, &coords, quant_block));
+    let draw = random.map(|draws| inputs.read(draws, coords.clone()));
     let block = Block::new(iters, inputs.reads, vec![Fold::plain(Write::new(coords))]);
     block.build(rewriter, inputs.values, |body, args| {
         let quotient = divide_by_scale(body, args, element, scale, offset);
-        vec![round(body, quotient, draw.map(|draw| args[draw]))]
+        vec![round(body, quotient, draw.map(|index| args[index]))]
     })[0]
 }
 
 /// `quotient`, an f32, rounded to the nearest value of `to`, the even one on a tie.
-fn round_nearest(body: &mut Body<'_, '_>, quotient: Value, to: DType, elements: Elements) -> Value {
+fn round_nearest(
+    body: &mut ScalarBuilder<Builder>,
+    quotient: Value,
+    to: DType,
+    elements: Elements,
+) -> Value {
     match elements {
         Elements::Float(_) => body.cast(quotient, to),
         Elements::Int(_) => {
@@ -483,7 +477,7 @@ fn round_nearest(body: &mut Body<'_, '_>, quotient: Value, to: DType, elements: 
 /// `quotient`, an f32, rounded up from `lower` to `lower + spacing` when the ui32 `draw` is below
 /// the fraction of the way, in f64, then stored as `to`.
 fn round_stochastic(
-    body: &mut Body<'_, '_>,
+    body: &mut ScalarBuilder<Builder>,
     quotient: Value,
     to: DType,
     elements: Elements,
@@ -495,14 +489,14 @@ fn round_stochastic(
         Elements::Int(_) => body.float(DType::F64, 1.0),
         Elements::Float(format) => {
             let min_normal = body.int(DType::Si64, i128::from(1 - format.bias));
-            let exponent = body.exponent_f64(magnitude);
+            let exponent = body.exponent(magnitude);
             let normal_exponent = body.create(arith::Maximum, (exponent, min_normal));
             let zero = body.float(DType::F64, 0.0);
             let positive = body.create(arith::Greater, (magnitude, zero));
             let binade = body.create(arith::Select, (positive, normal_exponent, min_normal));
             let mantissa_bits = body.int(DType::Si64, i128::from(format.man_bits));
             let spacing_exponent = body.create(arith::Sub, (binade, mantissa_bits));
-            body.pow2_f64(spacing_exponent)
+            body.pow2(DType::F64, spacing_exponent)
         }
     };
     let ratio = body.create(arith::Div, (magnitude, spacing));
@@ -542,7 +536,7 @@ fn round_stochastic(
 }
 
 /// The si64 `index` as `to`, an integer dtype: its low bits, as a stored code.
-fn wrap_int(body: &mut Body<'_, '_>, index: Value, to: DType) -> Value {
+fn wrap_int(body: &mut ScalarBuilder<Builder>, index: Value, to: DType) -> Value {
     let width = to.bits();
     if width == 64 {
         return body.bitcast(index, to);

@@ -2,13 +2,13 @@
 
 // Computation over parameters moves into a load-time function, whose result binds the new
 // parameter argument the run-time function reads.
-// CHECK: func.func @simple([[INPUT:%[0-9]+]]: tensor<4xf32>, [[WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1}, [[DOUBLED:%[0-9]+]]: tensor<4xf32> {param = [[ID:[0-9]+]]}) -> tensor<4xf32>
-// CHECK-NEXT: [[SUM:%[0-9]+]] = tensor.add([[INPUT]], [[DOUBLED]])
-// CHECK-NEXT: func.return([[SUM]])
-// CHECK: func.func @static.{{[0-9a-f]+}}([[STATIC_WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1}) -> (tensor<4xf32> {param = [[ID]]})
+// CHECK: func.func @static.{{[0-9a-f]+}}([[STATIC_WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1}) -> (tensor<4xf32> {param = [[ID:[0-9]+]]})
 // CHECK-NEXT: [[TWO:%[0-9]+]] = tensor.constant
 // CHECK-NEXT: [[STATIC_DOUBLED:%[0-9]+]] = tensor.mul([[STATIC_WEIGHT]], [[TWO]])
 // CHECK-NEXT: func.return([[STATIC_DOUBLED]])
+// CHECK: func.func @simple([[INPUT:%[0-9]+]]: tensor<4xf32>, [[WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1}, [[DOUBLED:%[0-9]+]]: tensor<4xf32> {param = [[ID]]}) -> tensor<4xf32>
+// CHECK-NEXT: [[SUM:%[0-9]+]] = tensor.add([[INPUT]], [[DOUBLED]])
+// CHECK-NEXT: func.return([[SUM]])
 func.func @simple(%input: tensor<4xf32>, %weight: tensor<4xf32> {param = 1}) -> tensor<4xf32> {
   %two = tensor.constant() {value = dense<4xf32: 2.0>} : () -> tensor<4xf32>
   %doubled = tensor.mul(%weight, %two) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
@@ -19,10 +19,10 @@ func.func @simple(%input: tensor<4xf32>, %weight: tensor<4xf32> {param = 1}) -> 
 // -----
 
 // What moves is the value before its broadcast, so the runtime keeps 3 elements, not 12.
+// CHECK: func.func @static.{{[0-9a-f]+}}([[STATIC_BIAS:%[0-9]+]]: tensor<3xf32> {param = 1}) -> (tensor<3xf32>
 // CHECK: func.func @broadcast([[INPUT:%[0-9]+]]: tensor<4x3xf32>, [[BIAS:%[0-9]+]]: tensor<3xf32> {param = 1}, [[EXP:%[0-9]+]]: tensor<3xf32> {param = {{[0-9]+}}}) -> tensor<4x3xf32>
 // CHECK-NEXT: [[BROADCAST:%[0-9]+]] = tensor.broadcast_to([[EXP]]) {shape = [4, 3]}
 // CHECK-NEXT: tensor.add([[INPUT]], [[BROADCAST]])
-// CHECK: func.func @static.{{[0-9a-f]+}}([[STATIC_BIAS:%[0-9]+]]: tensor<3xf32> {param = 1}) -> (tensor<3xf32>
 func.func @broadcast(%input: tensor<4x3xf32>, %bias: tensor<3xf32> {param = 1}) -> tensor<4x3xf32> {
   %exp = tensor.exp(%bias) : (tensor<3xf32>) -> tensor<3xf32>
   %broadcast = tensor.broadcast_to(%exp) {shape = [4, 3]} : (tensor<3xf32>) -> tensor<4x3xf32>
@@ -34,11 +34,13 @@ func.func @broadcast(%input: tensor<4x3xf32>, %bias: tensor<3xf32> {param = 1}) 
 
 // Equal computations in two functions share one load-time function and one parameter. A static
 // value computed from constants alone stays where it is.
-// CHECK: func.func @first([[FIRST_INPUT:%[0-9]+]]: tensor<4xf32>, [[FIRST_WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1}, [[FIRST_EXP:%[0-9]+]]: tensor<4xf32> {param = [[ID:[0-9]+]]})
+// CHECK: func.func @static.{{[0-9a-f]+}}({{%[0-9]+}}: tensor<4xf32> {param = 1}) -> (tensor<4xf32> {param = [[ID:[0-9]+]]})
+// CHECK-NOT: func.func @static.
+// CHECK: func.func @first([[FIRST_INPUT:%[0-9]+]]: tensor<4xf32>, [[FIRST_WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1}, [[FIRST_EXP:%[0-9]+]]: tensor<4xf32> {param = [[ID]]})
 // CHECK: tensor.mul({{%[0-9]+}}, {{%[0-9]+}})
 // CHECK: tensor.add
+// CHECK-NOT: func.func @static.
 // CHECK: func.func @second([[SECOND_INPUT:%[0-9]+]]: tensor<4xf32>, [[SECOND_WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1}, [[SECOND_EXP:%[0-9]+]]: tensor<4xf32> {param = [[ID]]})
-// CHECK: func.func @static.
 // CHECK-NOT: func.func @static.
 func.func @first(%input: tensor<4xf32>, %weight: tensor<4xf32> {param = 1}) -> tensor<4xf32> {
   %exp = tensor.exp(%weight) : (tensor<4xf32>) -> tensor<4xf32>
@@ -57,17 +59,16 @@ func.func @second(%input: tensor<4xf32>, %weight: tensor<4xf32> {param = 1}) -> 
 
 // -----
 
-// A static value read both at run time and by more static work moves on its own, and the work
-// after it moves with a copy of it.
-// CHECK: func.func @chained([[INPUT:%[0-9]+]]: tensor<2xf32>, [[WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1}, [[HEAD:%[0-9]+]]: tensor<2xf32> {param = {{[0-9]+}}}, [[NEGATED:%[0-9]+]]: tensor<2xf32> {param = {{[0-9]+}}})
+// A static value read both at run time and by more static work moves with that work into the one
+// load-time function of the function, which computes it once and gives both.
+// CHECK: func.func @static.{{[0-9a-f]+}}([[STORED:%[0-9]+]]: tensor<4xf32> {param = 1}) -> (tensor<2xf32> {param = [[HEAD_ID:[0-9]+]]}, tensor<2xf32> {param = [[NEGATED_ID:[0-9]+]]})
+// CHECK-NEXT: [[SLICED:%[0-9]+]] = tensor.slice([[STORED]])
+// CHECK-NEXT: [[NEGATED_HEAD:%[0-9]+]] = tensor.neg([[SLICED]])
+// CHECK-NEXT: func.return([[SLICED]], [[NEGATED_HEAD]])
+// CHECK-NOT: func.func @static.
+// CHECK: func.func @chained([[INPUT:%[0-9]+]]: tensor<2xf32>, [[WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1}, [[HEAD:%[0-9]+]]: tensor<2xf32> {param = [[HEAD_ID]]}, [[NEGATED:%[0-9]+]]: tensor<2xf32> {param = [[NEGATED_ID]]})
 // CHECK-NEXT: [[SUM:%[0-9]+]] = tensor.add([[INPUT]], [[HEAD]])
 // CHECK-NEXT: [[PRODUCT:%[0-9]+]] = tensor.mul([[SUM]], [[NEGATED]])
-// CHECK: func.func @static.{{[0-9a-f]+}}([[HEAD_WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1})
-// CHECK-NEXT: tensor.slice([[HEAD_WEIGHT]])
-// CHECK-NEXT: func.return
-// CHECK: func.func @static.{{[0-9a-f]+}}([[NEGATED_WEIGHT:%[0-9]+]]: tensor<4xf32> {param = 1})
-// CHECK-NEXT: tensor.slice([[NEGATED_WEIGHT]])
-// CHECK-NEXT: tensor.neg
 func.func @chained(%input: tensor<2xf32>, %weight: tensor<4xf32> {param = 1}) -> tensor<2xf32> {
   %head = tensor.slice(%weight) {starts = [0], sizes = [2]} : (tensor<4xf32>) -> tensor<2xf32>
   %negated = tensor.neg(%head) : (tensor<2xf32>) -> tensor<2xf32>
@@ -79,10 +80,10 @@ func.func @chained(%input: tensor<2xf32>, %weight: tensor<4xf32> {param = 1}) ->
 // -----
 
 // A weight cast to a wider dtype would take twice its bytes, so the cast stays at run time.
+// CHECK-NOT: func.func @static.
 // CHECK: func.func @widening([[INPUT:%[0-9]+]]: tensor<2x8xf32>, [[WEIGHT:%[0-9]+]]: tensor<4x8xbf16> {param = 1}) -> tensor<2x4xf32>
 // CHECK-NEXT: [[WIDENED:%[0-9]+]] = tensor.cast([[WEIGHT]])
 // CHECK-NEXT: tensor.dot_general([[INPUT]], [[WIDENED]])
-// CHECK-NOT: func.func @static.
 func.func @widening(%input: tensor<2x8xf32>, %weight: tensor<4x8xbf16> {param = 1}) -> tensor<2x4xf32> {
   %widened = tensor.cast(%weight) {to = f32} : (tensor<4x8xbf16>) -> tensor<4x8xf32>
   %product = tensor.dot_general(%input, %widened) {contract_lhs = [1], contract_rhs = [1]} : (tensor<2x8xf32>, tensor<4x8xf32>) -> tensor<2x4xf32>
@@ -94,13 +95,13 @@ func.func @widening(%input: tensor<2x8xf32>, %weight: tensor<4x8xbf16> {param = 
 // A value that stays at run time still gets its static inputs from load-time results. Here the
 // scaled weight stays: its 128 bytes exceed the 68 bytes of the weight and the scale. The scale
 // moves.
+// CHECK: func.func @static.{{[0-9a-f]+}}([[STATIC_SCALE:%[0-9]+]]: tensor<f32> {param = 2}) -> (tensor<f32>
+// CHECK-NEXT: tensor.exp([[STATIC_SCALE]])
 // CHECK: func.func @widening_inputs([[INPUT:%[0-9]+]]: tensor<2x8xf32>, [[WEIGHT:%[0-9]+]]: tensor<4x8xbf16> {param = 1}, [[SCALE:%[0-9]+]]: tensor<f32> {param = 2}, [[EXP_SCALE:%[0-9]+]]: tensor<f32> {param = {{[0-9]+}}}) -> tensor<2x4xf32>
 // CHECK-NEXT: [[WIDENED:%[0-9]+]] = tensor.cast([[WEIGHT]])
 // CHECK-NEXT: [[SCALES:%[0-9]+]] = tensor.broadcast_to([[EXP_SCALE]]) {shape = [4, 8]}
 // CHECK-NEXT: [[SCALED_WEIGHT:%[0-9]+]] = tensor.mul([[WIDENED]], [[SCALES]])
 // CHECK-NEXT: tensor.dot_general([[INPUT]], [[SCALED_WEIGHT]])
-// CHECK: func.func @static.{{[0-9a-f]+}}([[STATIC_SCALE:%[0-9]+]]: tensor<f32> {param = 2}) -> (tensor<f32>
-// CHECK-NEXT: tensor.exp([[STATIC_SCALE]])
 func.func @widening_inputs(%input: tensor<2x8xf32>, %weight: tensor<4x8xbf16> {param = 1}, %scale: tensor<f32> {param = 2}) -> tensor<2x4xf32> {
   %widened = tensor.cast(%weight) {to = f32} : (tensor<4x8xbf16>) -> tensor<4x8xf32>
   %exp_scale = tensor.exp(%scale) : (tensor<f32>) -> tensor<f32>
@@ -108,4 +109,20 @@ func.func @widening_inputs(%input: tensor<2x8xf32>, %weight: tensor<4x8xbf16> {p
   %scaled_weight = tensor.mul(%widened, %scales) : (tensor<4x8xf32>, tensor<4x8xf32>) -> tensor<4x8xf32>
   %product = tensor.dot_general(%input, %scaled_weight) {contract_lhs = [1], contract_rhs = [1]} : (tensor<2x8xf32>, tensor<4x8xf32>) -> tensor<2x4xf32>
   func.return(%product) : (tensor<2x4xf32>) -> ()
+}
+
+// -----
+
+// The same computation on the parameters of two layers is one load-time function of two results,
+// not one function for each layer: each result a parameter of its own.
+// CHECK: func.func @static.{{[0-9a-f]+}}([[FIRST_SCALE:%[0-9]+]]: tensor<4xf32> {param = 1}, [[SECOND_SCALE:%[0-9]+]]: tensor<4xf32> {param = 2}) -> (tensor<4xf32> {param = [[FIRST_ID:[0-9]+]]}, tensor<4xf32> {param = [[SECOND_ID:[0-9]+]]})
+// CHECK-NOT: func.func @static.
+// CHECK: func.func @layers({{.*}}{param = [[FIRST_ID]]}{{.*}}{param = [[SECOND_ID]]}
+func.func @layers(%input: tensor<4xf32>, %first: tensor<4xf32> {param = 1}, %second: tensor<4xf32> {param = 2}) -> tensor<4xf32> {
+  %one = tensor.constant() {value = dense<4xf32: 1.0>} : () -> tensor<4xf32>
+  %first_scale = tensor.add(%first, %one) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %second_scale = tensor.add(%second, %one) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %scaled = tensor.mul(%input, %first_scale) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  %rescaled = tensor.mul(%scaled, %second_scale) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+  func.return(%rescaled) : (tensor<4xf32>) -> ()
 }

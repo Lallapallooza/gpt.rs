@@ -1,7 +1,7 @@
 // RUN: pass dot-scale-fold
 
 // A static scale of a dot's result moves into the weight, laid out along the weight's free axis.
-// ROUNDING: the scale rounds into every weight before the sum, instead of into the sum once
+// ROUNDING: fold_scale: the scale rounds into every weight before the sum, instead of into the sum once
 // CHECK: func.func @scale([[INPUT:%[0-9]+]]: tensor<2x3xf32>, [[WEIGHT:%[0-9]+]]: tensor<3x4xf32> {param = 1}, [[SCALE:%[0-9]+]]: tensor<4xf32> {param = 2})
 // CHECK-NEXT: [[RESHAPED_SCALE:%[0-9]+]] = tensor.reshape([[SCALE]]) {shape = [1, 4]}
 // CHECK-NEXT: [[SCALES:%[0-9]+]] = tensor.broadcast_to([[RESHAPED_SCALE]]) {shape = [3, 4]}
@@ -18,7 +18,7 @@ func.func @scale(%input: tensor<2x3xf32>, %weight: tensor<3x4xf32> {param = 1}, 
 // -----
 
 // With batch axes, the free axes of the weight still end the result.
-// ROUNDING: the scale rounds into every weight before the sum, instead of into the sum once
+// ROUNDING: fold_scale: the scale rounds into every weight before the sum, instead of into the sum once
 // CHECK: func.func @batched([[INPUT:%[0-9]+]]: tensor<2x3x5xf32>, [[WEIGHT:%[0-9]+]]: tensor<2x5x4xf32> {param = 1}, [[SCALE:%[0-9]+]]: tensor<4xf32> {param = 2})
 // CHECK-NEXT: [[RESHAPED_SCALE:%[0-9]+]] = tensor.reshape([[SCALE]]) {shape = [1, 1, 4]}
 // CHECK-NEXT: [[SCALES:%[0-9]+]] = tensor.broadcast_to([[RESHAPED_SCALE]]) {shape = [2, 5, 4]}
@@ -136,7 +136,7 @@ func.func @widening_dot(%input: tensor<2x3xbf16>, %weight: tensor<3x4xbf16> {par
 // -----
 
 // A scale along the last of two free axes of the weight.
-// ROUNDING: the scale rounds into every weight before the sum, instead of into the sum once
+// ROUNDING: fold_scale: the scale rounds into every weight before the sum, instead of into the sum once
 // CHECK: func.func @two_free([[INPUT:%[0-9]+]]: tensor<2x3xf32>, [[WEIGHT:%[0-9]+]]: tensor<3x4x5xf32> {param = 1}, [[SCALE:%[0-9]+]]: tensor<5xf32> {param = 2})
 // CHECK-NEXT: tensor.reshape([[SCALE]]) {shape = [1, 1, 5]}
 func.func @two_free(%input: tensor<2x3xf32>, %weight: tensor<3x4x5xf32> {param = 1}, %scale: tensor<5xf32> {param = 2}) -> tensor<2x4x5xf32> {
@@ -144,4 +144,42 @@ func.func @two_free(%input: tensor<2x3xf32>, %weight: tensor<3x4x5xf32> {param =
   %scales = tensor.broadcast_to(%scale) {shape = [2, 4, 5]} : (tensor<5xf32>) -> tensor<2x4x5xf32>
   %scaled = tensor.mul(%product, %scales) : (tensor<2x4x5xf32>, tensor<2x4x5xf32>) -> tensor<2x4x5xf32>
   func.return(%scaled) : (tensor<2x4x5xf32>) -> ()
+}
+
+// -----
+
+// A product that a transpose and a reshape move, which only adds or removes axes of extent 1:
+// the scale along a batch axis of the result moves into the weight's batch axis, and the moves
+// follow the scaled product, as with a depthwise filter's channels and the BatchNorm after it.
+// ROUNDING: fold_scale: the scale rounds into every weight before the sum, instead of into the sum once
+// CHECK: func.func @moved([[INPUT:%[0-9]+]]: tensor<2x3x5xf32>, [[WEIGHT:%[0-9]+]]: tensor<2x5x1xf32> {param = 1}, [[SCALE:%[0-9]+]]: tensor<2xf32> {param = 2})
+// CHECK-NEXT: [[RESHAPED_SCALE:%[0-9]+]] = tensor.reshape([[SCALE]]) {shape = [2, 1, 1]}
+// CHECK-NEXT: [[SCALES:%[0-9]+]] = tensor.broadcast_to([[RESHAPED_SCALE]]) {shape = [2, 5, 1]}
+// CHECK-NEXT: [[SCALED_WEIGHT:%[0-9]+]] = tensor.mul([[WEIGHT]], [[SCALES]])
+// CHECK-NEXT: [[PRODUCT:%[0-9]+]] = tensor.dot_general([[INPUT]], [[SCALED_WEIGHT]]) {batch_lhs = [0], batch_rhs = [0], contract_lhs = [2], contract_rhs = [1]}
+// CHECK-NEXT: [[SWAPPED:%[0-9]+]] = tensor.transpose([[PRODUCT]]) {perm = [1, 0, 2]}
+// CHECK-NEXT: [[CHANNELS:%[0-9]+]] = tensor.reshape([[SWAPPED]]) {shape = [3, 2]}
+// CHECK-NEXT: func.return([[CHANNELS]])
+func.func @moved(%input: tensor<2x3x5xf32>, %weight: tensor<2x5x1xf32> {param = 1}, %scale: tensor<2xf32> {param = 2}) -> tensor<3x2xf32> {
+  %product = tensor.dot_general(%input, %weight) {batch_lhs = [0], batch_rhs = [0], contract_lhs = [2], contract_rhs = [1]} : (tensor<2x3x5xf32>, tensor<2x5x1xf32>) -> tensor<2x3x1xf32>
+  %swapped = tensor.transpose(%product) {perm = [1, 0, 2]} : (tensor<2x3x1xf32>) -> tensor<3x2x1xf32>
+  %channels = tensor.reshape(%swapped) {shape = [3, 2]} : (tensor<3x2x1xf32>) -> tensor<3x2xf32>
+  %scales = tensor.broadcast_to(%scale) {shape = [3, 2]} : (tensor<2xf32>) -> tensor<3x2xf32>
+  %scaled = tensor.mul(%channels, %scales) : (tensor<3x2xf32>, tensor<3x2xf32>) -> tensor<3x2xf32>
+  func.return(%scaled) : (tensor<3x2xf32>) -> ()
+}
+
+// -----
+
+// A reshape that merges axes the scale varies along keeps the scale outside the dot.
+// CHECK: func.func @merged
+// CHECK: [[FLAT:%[0-9]+]] = tensor.reshape
+// CHECK: [[SCALES:%[0-9]+]] = tensor.broadcast_to
+// CHECK: tensor.mul([[FLAT]], [[SCALES]])
+func.func @merged(%input: tensor<2x3x5xf32>, %weight: tensor<2x5x1xf32> {param = 1}, %scale: tensor<6xf32> {param = 2}) -> tensor<6xf32> {
+  %product = tensor.dot_general(%input, %weight) {batch_lhs = [0], batch_rhs = [0], contract_lhs = [2], contract_rhs = [1]} : (tensor<2x3x5xf32>, tensor<2x5x1xf32>) -> tensor<2x3x1xf32>
+  %flat = tensor.reshape(%product) {shape = [6]} : (tensor<2x3x1xf32>) -> tensor<6xf32>
+  %scales = tensor.broadcast_to(%scale) {shape = [6]} : (tensor<6xf32>) -> tensor<6xf32>
+  %scaled = tensor.mul(%flat, %scales) : (tensor<6xf32>, tensor<6xf32>) -> tensor<6xf32>
+  func.return(%scaled) : (tensor<6xf32>) -> ()
 }

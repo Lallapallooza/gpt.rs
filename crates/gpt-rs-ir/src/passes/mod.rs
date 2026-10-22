@@ -8,6 +8,7 @@ mod outline_static;
 mod prune_params;
 mod registry;
 mod stats;
+mod widen_narrow_floats;
 
 use anyhow::{anyhow, Context, Result};
 pub use gpt_rs_ir_macros::pass;
@@ -20,13 +21,18 @@ pub use self::outline_static::OutlineStatic;
 pub use self::prune_params::PruneParams;
 pub use self::registry::{parse, registered, OptionInfo, PassEntry, StatInfo, PASSES};
 pub use self::stats::{take_stats, Stat};
-use crate::dialects::tensor::{DotScaleFold, MergeContractedAxes};
+pub use self::widen_narrow_floats::WidenNarrowFloats;
+use crate::conversion::{LoopToIsa, TileToLoop};
+use crate::dialects::loops::Contract;
+use crate::dialects::tensor::DotScaleFold;
+use crate::dialects::tile::Numerics;
 use crate::ir::{verify, Module};
-use crate::rewrite::{Greedy, Rewrites};
+use crate::rewrite::{Greedy, Rewrites, Rewriting};
+use crate::targets::Target;
 
 /// Runs `rewrites` to a fixpoint with the greedy driver, erasing dead ops, adds the rewrites to
 /// `stat`, and returns whether the module changed: the `run` of a pass that applies patterns.
-pub fn run_patterns(module: &mut Module, rewrites: Rewrites, stat: &Stat) -> Result<bool> {
+pub fn run_patterns(module: &mut Rewriting, rewrites: Rewrites, stat: &Stat) -> Result<bool> {
     let report = Greedy::new(rewrites).erase_dead().run(module)?;
     stat.add(report.rewritten);
     Ok(report.changed())
@@ -34,11 +40,12 @@ pub fn run_patterns(module: &mut Module, rewrites: Rewrites, stat: &Stat) -> Res
 
 /// A transformation of a module. `#[pass]` on the struct implements `Registered`.
 pub trait Pass: Registered {
-    /// Runs the pass and returns whether the module changed.
-    fn run(&self, module: &mut Module) -> Result<bool>;
+    /// Runs the pass on `module`, which it reads through `Deref` and changes only through the
+    /// drivers, and returns whether the module changed.
+    fn run(&self, module: &mut Rewriting) -> Result<bool>;
 
-    /// The folds and patterns the pass applies. A pass that runs the greedy driver runs these,
-    /// and the reference pages list them under the pass.
+    /// The folds, patterns and once-rewrites the pass applies. A pass that runs the greedy driver
+    /// runs these, and the reference pages list them under the pass.
     fn rewrites(&self) -> Rewrites {
         Rewrites::default()
     }
@@ -97,7 +104,9 @@ impl Pipeline {
 /// on belong to `pass`, until `take_stats` reads them.
 pub fn run_pass(pass: &dyn Pass, module: &mut Module) -> Result<bool> {
     take_stats();
-    let changed = pass.run(module).with_context(|| pass.label())?;
+    let changed = pass
+        .run(&mut Rewriting::new(module, pass.name()))
+        .with_context(|| pass.label())?;
     verify(module).map_err(|err| anyhow!("after {}: {err}", pass.label()))?;
     Ok(changed)
 }
@@ -108,13 +117,33 @@ pub fn populate_simplification_passes(pm: &mut Pipeline) {
     pm.add(Canonicalize::default()).add(Cse);
 }
 
-/// Adds the `tensor` rewrites that change where work happens: `dot-scale-fold` moves the scales of
-/// dot results into the weights, `canonicalize` simplifies what that exposes, and
-/// `merge-contracted-axes` puts static dot operands in the layout the dot reads.
-pub fn populate_tensor_passes(pm: &mut Pipeline) {
-    pm.add(DotScaleFold)
+/// Adds the `tensor` rewrites that change where work happens, as `numerics` allows them:
+/// `dot-scale-fold` moves the scales of dot results into the weights (`scale_fold`), and
+/// `canonicalize` simplifies what that exposes. A backend whose pipeline plans no layout of static
+/// operands at the `tile` level adds `merge-contracted-axes` after them, which puts static dot
+/// operands in the layout the dot reads.
+pub fn populate_tensor_passes(pm: &mut Pipeline, numerics: &Numerics) {
+    if numerics.scale_fold {
+        pm.add(DotScaleFold);
+    }
+    pm.add(Canonicalize::default());
+}
+
+/// Adds the lowering of each dispatch through `loop` to `isa` for `target`, in this order:
+///
+/// 1. `tile-to-loop`;
+/// 2. `canonicalize`, which simplifies the index arithmetic and the loops that `tile-to-loop`
+///    writes, so that `loop-to-isa` can compute each atom in vectors;
+/// 3. `contract`, which writes a product and the sum it enters as one `arith.fma` where the
+///    dispatch contracts;
+/// 4. `loop-to-isa`.
+///
+/// A backend that runs `isa` code lowers with it.
+pub fn populate_isa_lowering_passes(pm: &mut Pipeline, target: Option<Target>) {
+    pm.add(TileToLoop)
         .add(Canonicalize::default())
-        .add(MergeContractedAxes);
+        .add(Contract)
+        .add(LoopToIsa { target });
 }
 
 /// Adds `outline-static`, which moves the computation over parameters into load-time functions,

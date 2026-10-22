@@ -6,17 +6,19 @@ use super::kernels::{from_f32, from_ints, strides, unravel, values, Values};
 use crate::dialects::arith;
 use crate::dialects::arith::math::BinaryMath;
 use crate::dialects::tensor::ir::*;
+use crate::dialects::tensor::utils::quant::scale_extent;
 use crate::host::{HostTensor, TensorData};
 use crate::ir::{
     e8m0_encode, floor_log2, DType, Elements, Eval, EvalCx, Host, NoRegions, Overflow, OwnedHost,
+    E8M0_BIAS,
 };
 
 /// The value of every element of `data` as an f32.
 fn reals(data: &TensorData) -> Vec<f32> {
     match values(data) {
-        Values::F32(v) => v.into_owned(),
-        Values::F64(v) => v.iter().map(|&x| x as f32).collect(),
-        Values::Int(v) => v.iter().map(|&x| x as f32).collect(),
+        Values::F32(elements) => elements.into_owned(),
+        Values::F64(elements) => elements.iter().map(|&x| x as f32).collect(),
+        Values::Int(elements) => elements.iter().map(|&x| x as f32).collect(),
     }
 }
 
@@ -67,9 +69,9 @@ impl Elements {
         }
     }
 
-    /// `y` rounded to the nearest value, the even one on a tie, then saturated.
-    fn round_nearest(self, y: f32) -> f64 {
-        let value = f64::from(y);
+    /// `quotient` rounded to the nearest value, the even one on a tie, then saturated.
+    fn round_nearest(self, quotient: f32) -> f64 {
+        let value = f64::from(quotient);
         if !value.is_finite() {
             return self.non_finite(value);
         }
@@ -80,13 +82,13 @@ impl Elements {
         self.saturate(rounded)
     }
 
-    /// `y` rounded up or down as the draw `draw` decides, then saturated.
-    fn round_stochastic(self, y: f32, draw: u32) -> f64 {
-        let value = f64::from(y);
+    /// `quotient` rounded up or down as the draw `draw` decides, then saturated.
+    fn round_stochastic(self, quotient: f32, draw: u32) -> f64 {
+        let value = f64::from(quotient);
         if !value.is_finite() {
             return self.non_finite(value);
         }
-        // Up with probability `(|y| - lo) / spacing`, decided by the draw's 32 bits.
+        // Up with probability `(|quotient| - lo) / spacing`, decided by the draw's 32 bits.
         let (lo, spacing) = self.bracket(value.abs());
         let threshold = ((value.abs() - lo) / spacing * 2f64.powi(32)).floor();
         let up = f64::from(draw) < threshold;
@@ -106,7 +108,7 @@ impl Elements {
 fn scale_extents(dims: &[usize], block: &[usize]) -> Vec<usize> {
     let mut extents = Vec::with_capacity(dims.len());
     for (&extent, &size) in dims.iter().zip(block) {
-        extents.push(extent.div_ceil(size));
+        extents.push(scale_extent(extent, size));
     }
     extents
 }
@@ -135,12 +137,14 @@ fn quotients(
     block: &[usize],
 ) -> Vec<f32> {
     let scales = reals(&scale.data);
-    let offsets = offset.map(|offset| reals(&offset.data));
+    let offsets = offset.map(|offset_tensor| reals(&offset_tensor.data));
     let elements = reals(&x.data);
     let indices = scale_indices(&x.dims, block);
     let mut quotients = Vec::with_capacity(elements.len());
     for (&element, &at) in elements.iter().zip(&indices) {
-        let shift = offsets.as_ref().map_or(0.0, |offsets| offsets[at]);
+        let shift = offsets
+            .as_ref()
+            .map_or(0.0, |block_offsets| block_offsets[at]);
         quotients.push(match scales[at] {
             0.0 => 0.0,
             divisor => (element - shift) / divisor,
@@ -149,13 +153,14 @@ fn quotients(
     quotients
 }
 
-/// The index of the value of `table` nearest to `y`, the lowest index on a tie, or 0 for NaN.
-fn nearest(table: &[f32], y: f32) -> usize {
-    let distance = |k: usize| (table[k] - y).abs();
+/// The index of the value of `table` nearest to `quotient`, the lowest index on a tie, or 0 for
+/// NaN.
+fn nearest(table: &[f32], quotient: f32) -> usize {
+    let distance = |candidate: usize| (table[candidate] - quotient).abs();
     (0..table.len())
-        .reduce(|best, k| {
-            if distance(k) < distance(best) {
-                k
+        .reduce(|best, candidate| {
+            if distance(candidate) < distance(best) {
+                candidate
             } else {
                 best
             }
@@ -166,23 +171,23 @@ fn nearest(table: &[f32], y: f32) -> usize {
 impl Eval for Dequantize {
     fn eval(
         &self,
-        ins: DequantizeOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
+        ins: DequantizeOperands<Host>,
+        _cx: &mut EvalCx<NoRegions>,
     ) -> Result<DequantizeResults<OwnedHost>> {
         let scales = reals(&ins.scale.data);
         let offsets = ins.offset.map(|offset| reals(&offset.data));
-        let codes = reals(&ins.q.data);
-        let indices = scale_indices(&ins.q.dims, &self.block);
+        let codes = reals(&ins.quantized.data);
+        let indices = scale_indices(&ins.quantized.dims, &self.block);
         let mut real = Vec::with_capacity(codes.len());
         for (&code, &at) in codes.iter().zip(&indices) {
             // Without an offset the sum adds nothing: `-0.0 + 0.0` would be `0.0`.
             real.push(match &offsets {
-                Some(offsets) => code * scales[at] + offsets[at],
+                Some(block_offsets) => code * scales[at] + block_offsets[at],
                 None => code * scales[at],
             });
         }
         Ok(DequantizeResults {
-            output: HostTensor::new(ins.q.dims, from_f32(self.to, real.into_iter())?)?,
+            output: HostTensor::new(ins.quantized.dims, from_f32(self.to, real.into_iter())?)?,
         })
     }
 }
@@ -190,13 +195,13 @@ impl Eval for Dequantize {
 impl Eval for Quantize {
     fn eval(
         &self,
-        ins: QuantizeOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
+        ins: QuantizeOperands<Host>,
+        _cx: &mut EvalCx<NoRegions>,
     ) -> Result<QuantizeResults<OwnedHost>> {
         let elements = self.to.elements()?;
         let mut rounded = Vec::new();
-        for y in quotients(ins.x, ins.scale, ins.offset, &self.block) {
-            rounded.push(elements.round_nearest(y));
+        for quotient in quotients(ins.x, ins.scale, ins.offset, &self.block) {
+            rounded.push(elements.round_nearest(quotient));
         }
         Ok(QuantizeResults {
             output: HostTensor::new(ins.x.dims, elements.encode(self.to, rounded)?)?,
@@ -207,8 +212,8 @@ impl Eval for Quantize {
 impl Eval for QuantizeStochastic {
     fn eval(
         &self,
-        ins: QuantizeStochasticOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
+        ins: QuantizeStochasticOperands<Host>,
+        _cx: &mut EvalCx<NoRegions>,
     ) -> Result<QuantizeStochasticResults<OwnedHost>> {
         let TensorData::Ui32(draws) = &ins.random.data else {
             bail!("random bits must be ui32, got {}", ins.random.dtype());
@@ -216,8 +221,8 @@ impl Eval for QuantizeStochastic {
         let elements = self.to.elements()?;
         let mut rounded = Vec::new();
         let quotients = quotients(ins.x, ins.scale, ins.offset, &self.block);
-        for (y, &draw) in quotients.into_iter().zip(draws.iter()) {
-            rounded.push(elements.round_stochastic(y, draw));
+        for (quotient, &draw) in quotients.into_iter().zip(draws.iter()) {
+            rounded.push(elements.round_stochastic(quotient, draw));
         }
         Ok(QuantizeStochasticResults {
             output: HostTensor::new(ins.x.dims, elements.encode(self.to, rounded)?)?,
@@ -228,13 +233,13 @@ impl Eval for QuantizeStochastic {
 impl Eval for QuantizeTable {
     fn eval(
         &self,
-        ins: QuantizeTableOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
+        ins: QuantizeTableOperands<Host>,
+        _cx: &mut EvalCx<NoRegions>,
     ) -> Result<QuantizeTableResults<OwnedHost>> {
         let table = reals(&ins.table.data);
         let mut codes = Vec::new();
-        for y in quotients(ins.x, ins.scale, ins.offset, &self.block) {
-            codes.push(nearest(&table, y) as i128);
+        for quotient in quotients(ins.x, ins.scale, ins.offset, &self.block) {
+            codes.push(nearest(&table, quotient) as i128);
         }
         Ok(QuantizeTableResults {
             output: HostTensor::new(ins.x.dims, from_ints(self.to, codes.into_iter())?)?,
@@ -269,12 +274,13 @@ impl BlockRanges {
     }
 }
 
-/// `2^exponent(amax)`, the exponent clamped to `[-127, 127]`, or `2^-127` for a block of zeros.
+/// `2^exponent(amax)`, the exponent clamped to the finite scales of `e8m0`, `[-127, 127]`, or
+/// `2^-127` for a block of zeros.
 fn power_of_two(amax: f64, exponent: impl Fn(f64) -> i32) -> f64 {
     let clamped = if amax == 0.0 {
-        -127
+        -E8M0_BIAS
     } else {
-        exponent(amax).clamp(-127, 127)
+        exponent(amax).clamp(-E8M0_BIAS, E8M0_BIAS)
     };
     2f64.powi(clamped)
 }
@@ -287,21 +293,23 @@ impl ScaleFormula for BlockScaleAmax {
 
 impl ScaleFormula for BlockScalePow2Floor {
     fn scale(amax: f64, largest: f64) -> f64 {
-        power_of_two(amax, |amax| floor_log2(amax) - floor_log2(largest))
+        power_of_two(amax, |block_max| {
+            floor_log2(block_max) - floor_log2(largest)
+        })
     }
 }
 
 impl ScaleFormula for BlockScalePow2Ceil {
     fn scale(amax: f64, largest: f64) -> f64 {
-        power_of_two(amax, |amax| ceil_log2(amax / largest))
+        power_of_two(amax, |block_max| ceil_log2(block_max / largest))
     }
 }
 
 /// The semantics of every [`BlockScale`] op.
 pub(crate) fn block_scale<T: BlockScale>(
     op: &T,
-    ins: BlockScaleOperands<Host<'_>>,
-    _cx: &mut EvalCx<'_, NoRegions>,
+    ins: BlockScaleOperands<Host>,
+    _cx: &mut EvalCx<NoRegions>,
 ) -> Result<BlockScaleResults<OwnedHost>> {
     let ranges = BlockRanges::of(ins.x, &op.block);
     let largest = f64::from(op.to.elements()?.largest());
@@ -329,8 +337,8 @@ pub(crate) fn block_scale<T: BlockScale>(
 impl Eval for BlockScaleRange {
     fn eval(
         &self,
-        ins: BlockScaleRangeOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
+        ins: BlockScaleRangeOperands<Host>,
+        _cx: &mut EvalCx<NoRegions>,
     ) -> Result<BlockScaleRangeResults<OwnedHost>> {
         let ranges = BlockRanges::of(ins.x, &self.block);
         let elements = self.to.elements()?;

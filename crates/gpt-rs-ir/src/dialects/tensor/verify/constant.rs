@@ -8,8 +8,8 @@ use crate::ir::{NoRegions, OpDef, OwnedTypes, TypeCx, Types};
 impl OpDef for Constant {
     fn result_types(
         &self,
-        _ins: ConstantOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        _ins: ConstantOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<ConstantResults<OwnedTypes>> {
         let value = &self.value;
         let (count, len) = (value.element_count(), value.bytes.len());

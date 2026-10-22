@@ -20,10 +20,10 @@ pub(crate) trait Arith: Copy {
     fn binary<T: BinaryMath>(dtype: DType) -> Result<impl Fn(Self, Self) -> Option<Self>>;
     /// The value a fold with `C` of no elements of `dtype` gives, which every fold starts from.
     fn fold_init<C: Combiner>(dtype: DType) -> Result<Self>;
-    /// `a` against `b`, with NaN above every number and equal to NaN.
-    fn order(a: Self, b: Self) -> Ordering;
+    /// `lhs` against `rhs`, with NaN above every number and equal to NaN.
+    fn order(lhs: Self, rhs: Self) -> Ordering;
     /// The elements of `values` when the type computes them.
-    fn of<'a>(values: &'a Values<'_>) -> Option<&'a [Self]>;
+    fn of<'a>(values: &'a Values) -> Option<&'a [Self]>;
     /// `values` as the elements of a tensor.
     fn into_values(values: Vec<Self>) -> Values<'static>;
     /// What a value of `dtype` keeps of a result: the result wrapped into an integer dtype's
@@ -45,25 +45,25 @@ macro_rules! float_arith {
 
             fn binary<T: BinaryMath>(dtype: DType) -> Result<impl Fn($t, $t) -> Option<$t>> {
                 let op = T::float::<$t>().ok_or_else(|| missing(T::INFO.name, dtype))?;
-                Ok(move |x, y| Some(op(x, y)))
+                Ok(move |lhs, rhs| Some(op(lhs, rhs)))
             }
 
             fn fold_init<C: Combiner>(dtype: DType) -> Result<$t> {
                 C::float_init::<$t>().ok_or_else(|| missing(C::INFO.name, dtype))
             }
 
-            fn order(a: $t, b: $t) -> Ordering {
-                match (a.is_nan(), b.is_nan()) {
+            fn order(lhs: $t, rhs: $t) -> Ordering {
+                match (lhs.is_nan(), rhs.is_nan()) {
                     (true, true) => Ordering::Equal,
                     (true, false) => Ordering::Greater,
                     (false, true) => Ordering::Less,
-                    (false, false) => a.partial_cmp(&b).expect("neither is NaN"),
+                    (false, false) => lhs.partial_cmp(&rhs).expect("neither is NaN"),
                 }
             }
 
-            fn of<'a>(values: &'a Values<'_>) -> Option<&'a [$t]> {
+            fn of<'a>(values: &'a Values) -> Option<&'a [$t]> {
                 match values {
-                    Values::$variant(v) => Some(v),
+                    Values::$variant(elements) => Some(elements),
                     _ => None,
                 }
             }
@@ -91,20 +91,20 @@ impl Arith for i128 {
     fn binary<T: BinaryMath>(dtype: DType) -> Result<impl Fn(i128, i128) -> Option<i128>> {
         let op = T::int().ok_or_else(|| missing(T::INFO.name, dtype))?;
         let format = int_format(dtype)?;
-        Ok(move |x, y| op(x, y, format))
+        Ok(move |lhs, rhs| op(lhs, rhs, format))
     }
 
     fn fold_init<C: Combiner>(dtype: DType) -> Result<i128> {
         Ok(C::int_init(int_format(dtype)?))
     }
 
-    fn order(a: i128, b: i128) -> Ordering {
-        a.cmp(&b)
+    fn order(lhs: i128, rhs: i128) -> Ordering {
+        lhs.cmp(&rhs)
     }
 
-    fn of<'a>(values: &'a Values<'_>) -> Option<&'a [i128]> {
+    fn of<'a>(values: &'a Values) -> Option<&'a [i128]> {
         match values {
-            Values::Int(v) => Some(v),
+            Values::Int(elements) => Some(elements),
             _ => None,
         }
     }
@@ -119,21 +119,21 @@ impl Arith for i128 {
     }
 }
 
-/// The op `T` on each element of `x`, rounded to its dtype.
-pub(crate) fn unary_data<T: UnaryMath>(x: &TensorData) -> Result<TensorData> {
-    let dtype = x.dtype();
-    match values(x) {
-        Values::Int(x) => {
+/// The op `T` on each element of `input`, rounded to its dtype.
+pub(crate) fn unary_data<T: UnaryMath>(input: &TensorData) -> Result<TensorData> {
+    let dtype = input.dtype();
+    match values(input) {
+        Values::Int(elements) => {
             let (op, int) = (i128::unary::<T>(dtype)?, int_format(dtype)?);
-            from_ints(dtype, x.into_iter().map(|x| int.wrap(op(x))))
+            from_ints(dtype, elements.into_iter().map(|x| int.wrap(op(x))))
         }
-        Values::F32(x) => {
+        Values::F32(elements) => {
             let op = f32::unary::<T>(dtype)?;
-            from_f32(dtype, x.iter().map(|&x| op(x)))
+            from_f32(dtype, elements.iter().map(|&x| op(x)))
         }
-        Values::F64(x) => {
+        Values::F64(elements) => {
             let op = f64::unary::<T>(dtype)?;
-            from_f64(dtype, x.iter().map(|&x| op(x)))
+            from_f64(dtype, elements.iter().map(|&x| op(x)))
         }
     }
 }
@@ -145,31 +145,39 @@ pub(crate) fn int_format(dtype: DType) -> Result<IntFormat> {
         .ok_or_else(|| anyhow!("{dtype} is not an integer dtype"))
 }
 
-/// The op `T` on each pair of elements of `a` and `b`, of one dtype, rounded to it.
-pub(crate) fn binary_data<T: BinaryMath>(a: &TensorData, b: &TensorData) -> Result<TensorData> {
-    let dtype = a.dtype();
+/// The op `T` on each pair of elements of `lhs` and `rhs`, of one dtype, rounded to it.
+pub(crate) fn binary_data<T: BinaryMath>(lhs: &TensorData, rhs: &TensorData) -> Result<TensorData> {
+    let dtype = lhs.dtype();
     let name = T::INFO.name;
-    match (values(a), values(b)) {
-        (Values::Int(a), Values::Int(b)) => {
+    match (values(lhs), values(rhs)) {
+        (Values::Int(lhs_elements), Values::Int(rhs_elements)) => {
             let (op, int) = (i128::binary::<T>(dtype)?, int_format(dtype)?);
-            let results = a
+            let results = lhs_elements
                 .into_iter()
-                .zip(b)
-                .map(|(x, y)| op(x, y).ok_or_else(|| anyhow!("{name}: integer division by zero")))
+                .zip(rhs_elements)
+                .map(|(left, right)| {
+                    op(left, right).ok_or_else(|| anyhow!("{name}: integer division by zero"))
+                })
                 .collect::<Result<Vec<i128>>>()?;
             from_ints(dtype, results.into_iter().map(|x| int.wrap(x)))
         }
-        (Values::F32(a), Values::F32(b)) => {
+        (Values::F32(lhs_elements), Values::F32(rhs_elements)) => {
             let op = f32::binary::<T>(dtype)?;
-            let results = a.iter().zip(b.iter()).map(|(&x, &y)| op(x, y));
+            let results = lhs_elements
+                .iter()
+                .zip(rhs_elements.iter())
+                .map(|(&left, &right)| op(left, right));
             from_f32(
                 dtype,
                 results.map(|x| x.expect("float ops are defined everywhere")),
             )
         }
-        (Values::F64(a), Values::F64(b)) => {
+        (Values::F64(lhs_elements), Values::F64(rhs_elements)) => {
             let op = f64::binary::<T>(dtype)?;
-            let results = a.iter().zip(b.iter()).map(|(&x, &y)| op(x, y));
+            let results = lhs_elements
+                .iter()
+                .zip(rhs_elements.iter())
+                .map(|(&left, &right)| op(left, right));
             from_f64(
                 dtype,
                 results.map(|x| x.expect("float ops are defined everywhere")),
@@ -182,18 +190,18 @@ pub(crate) fn binary_data<T: BinaryMath>(a: &TensorData, b: &TensorData) -> Resu
 impl Eval for Select {
     fn eval(
         &self,
-        ins: SelectOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
+        ins: SelectOperands<Host>,
+        _cx: &mut EvalCx<NoRegions>,
     ) -> Result<SelectResults<OwnedHost>> {
         let (on_true, on_false) = (
             Chunks::of(&ins.on_true.data),
             Chunks::of(&ins.on_false.data),
         );
-        let pred = ins.pred.as_i1()?;
-        let mut out = Chunks::zeroed(ins.on_true.dtype(), pred.len());
-        for (i, &pred) in pred.iter().enumerate() {
-            let branch = if pred != 0 { &on_true } else { &on_false };
-            out.set(i, branch.get(i));
+        let predicates = ins.pred.as_i1()?;
+        let mut out = Chunks::zeroed(ins.on_true.dtype(), predicates.len());
+        for (position, &predicate) in predicates.iter().enumerate() {
+            let branch = if predicate != 0 { &on_true } else { &on_false };
+            out.set(position, branch.get(position));
         }
         Ok(SelectResults {
             output: HostTensor::new(ins.on_true.dims, out.into_data()?)?,
@@ -204,8 +212,8 @@ impl Eval for Select {
 impl Eval for Cast {
     fn eval(
         &self,
-        ins: CastOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
+        ins: CastOperands<Host>,
+        _cx: &mut EvalCx<NoRegions>,
     ) -> Result<CastResults<OwnedHost>> {
         Ok(CastResults {
             output: HostTensor::new(ins.input.dims, cast(&ins.input.data, self.to)?)?,
@@ -216,8 +224,8 @@ impl Eval for Cast {
 impl Eval for StopGradient {
     fn eval(
         &self,
-        ins: StopGradientOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
+        ins: StopGradientOperands<Host>,
+        _cx: &mut EvalCx<NoRegions>,
     ) -> Result<StopGradientResults<OwnedHost>> {
         Ok(StopGradientResults {
             output: ins.input.clone(),
@@ -228,8 +236,8 @@ impl Eval for StopGradient {
 /// The semantics of every [`Unary`] op.
 pub(crate) fn unary<T: Unary>(
     _op: &T,
-    ins: UnaryOperands<Host<'_>>,
-    _cx: &mut EvalCx<'_, NoRegions>,
+    ins: UnaryOperands<Host>,
+    _cx: &mut EvalCx<NoRegions>,
 ) -> Result<UnaryResults<OwnedHost>> {
     let data = unary_data::<T::Scalar>(&ins.input.data)?;
     Ok(UnaryResults {
@@ -240,8 +248,8 @@ pub(crate) fn unary<T: Unary>(
 /// The semantics of every [`Binary`] op.
 pub(crate) fn binary<T: Binary>(
     _op: &T,
-    ins: BinaryOperands<Host<'_>>,
-    _cx: &mut EvalCx<'_, NoRegions>,
+    ins: BinaryOperands<Host>,
+    _cx: &mut EvalCx<NoRegions>,
 ) -> Result<BinaryResults<OwnedHost>> {
     let data = binary_data::<T::Scalar>(&ins.lhs.data, &ins.rhs.data)?;
     Ok(BinaryResults {
@@ -249,18 +257,28 @@ pub(crate) fn binary<T: Binary>(
     })
 }
 
-/// 1 where the relation of `T` holds between the elements of `a` and `b` at a position, else 0.
-pub(crate) fn compare_data<T: CompareMath>(a: &TensorData, b: &TensorData) -> Result<TensorData> {
-    fn flags<T: CompareMath, V: PartialOrd + Copy>(a: &[V], b: &[V]) -> Buffer<u8> {
-        a.iter()
-            .zip(b)
-            .map(|(&lhs, &rhs)| u8::from(T::holds(lhs, rhs)))
+/// 1 where the relation of `T` holds between the elements of `lhs` and `rhs` at a position, else
+/// 0.
+pub(crate) fn compare_data<T: CompareMath>(
+    lhs: &TensorData,
+    rhs: &TensorData,
+) -> Result<TensorData> {
+    fn flags<T: CompareMath, V: PartialOrd + Copy>(lhs: &[V], rhs: &[V]) -> Buffer<u8> {
+        lhs.iter()
+            .zip(rhs)
+            .map(|(&left, &right)| u8::from(T::holds(left, right)))
             .collect()
     }
-    let flags = match (values(a), values(b)) {
-        (Values::Int(a), Values::Int(b)) => flags::<T, _>(&a, &b),
-        (Values::F32(a), Values::F32(b)) => flags::<T, _>(&a, &b),
-        (Values::F64(a), Values::F64(b)) => flags::<T, _>(&a, &b),
+    let flags = match (values(lhs), values(rhs)) {
+        (Values::Int(lhs_elements), Values::Int(rhs_elements)) => {
+            flags::<T, _>(&lhs_elements, &rhs_elements)
+        }
+        (Values::F32(lhs_elements), Values::F32(rhs_elements)) => {
+            flags::<T, _>(&lhs_elements, &rhs_elements)
+        }
+        (Values::F64(lhs_elements), Values::F64(rhs_elements)) => {
+            flags::<T, _>(&lhs_elements, &rhs_elements)
+        }
         _ => bail!("compared operands differ in dtype"),
     };
     Ok(TensorData::I1(flags))
@@ -269,8 +287,8 @@ pub(crate) fn compare_data<T: CompareMath>(a: &TensorData, b: &TensorData) -> Re
 /// The semantics of every [`Compare`] op.
 pub(crate) fn compare<T: Compare>(
     _op: &T,
-    ins: CompareOperands<Host<'_>>,
-    _cx: &mut EvalCx<'_, NoRegions>,
+    ins: CompareOperands<Host>,
+    _cx: &mut EvalCx<NoRegions>,
 ) -> Result<CompareResults<OwnedHost>> {
     let flags = compare_data::<T::Scalar>(&ins.lhs.data, &ins.rhs.data)?;
     Ok(CompareResults {

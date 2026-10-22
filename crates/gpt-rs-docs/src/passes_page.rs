@@ -8,7 +8,7 @@ use std::path::Path;
 use anyhow::{bail, Result};
 use gpt_rs_ir::ir::FOLDS;
 use gpt_rs_ir::passes::{self, PassEntry, Pipeline};
-use gpt_rs_ir::rewrite::{Fired, Rewrites};
+use gpt_rs_ir::rewrite::{Fired, PatternSet, Rewrites};
 
 use crate::filetests::{Case, Fires};
 use crate::{cell, defined_by, file_links, readme, Catalog, HEADER};
@@ -35,8 +35,8 @@ pub fn write(
         }
     }
     for (names, labels) in &groups {
-        let names: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
-        writeln!(out, "\n{}:\n", names.join(" and "))?;
+        let quoted: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
+        writeln!(out, "\n{}:\n", quoted.join(" and "))?;
         for (index, label) in labels.iter().enumerate() {
             writeln!(out, "{}. `{label}`", index + 1)?;
         }
@@ -48,13 +48,15 @@ pub fn write(
     for (entry, rewrites) in &catalog.passes {
         out.push('\n');
         pass_section(&mut out, entry, rewrites, filetests, fires, catalog)?;
-        for pattern in rewrites.patterns.iter() {
-            let fired = !fires
-                .files(Some(entry.name), Fired::Pattern(pattern.name()))
-                .is_empty();
-            let missing = format!("`{}` under `{}`", pattern.name(), entry.name);
-            if !fired && !unfired.contains(&missing) {
-                unfired.push(missing);
+        for set in [&rewrites.patterns, &rewrites.once] {
+            for pattern in set.iter() {
+                let fired = !fires
+                    .files(Some(entry.name), Fired::Pattern(pattern.name()))
+                    .is_empty();
+                let missing = format!("`{}` under `{}`", pattern.name(), entry.name);
+                if !fired && !unfired.contains(&missing) {
+                    unfired.push(missing);
+                }
             }
         }
     }
@@ -65,6 +67,41 @@ pub fn write(
         );
     }
     Ok(out)
+}
+
+/// The table of the patterns of `set` under `title`, one row per pattern with its roots, when it
+/// has any.
+fn patterns_table(
+    out: &mut String,
+    title: &str,
+    set: &PatternSet,
+    catalog: &Catalog,
+    fired_in: &dyn Fn(Fired) -> String,
+) -> Result<()> {
+    let mut patterns: Vec<(&str, Vec<String>, &str)> = Vec::new();
+    for pattern in set.iter() {
+        let root = catalog.root_label(pattern.root());
+        match patterns
+            .iter_mut()
+            .find(|(name, ..)| *name == pattern.name())
+        {
+            Some((_, roots, _)) => roots.push(root),
+            None => patterns.push((pattern.name(), vec![root], pattern.doc())),
+        }
+    }
+    if patterns.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "\n{title}:\n\n| Pattern | Root | Rewrite | Fires in |\n|---|---|---|---|"
+    )?;
+    for (name, roots, doc) in patterns {
+        let fired = fired_in(Fired::Pattern(name));
+        let root_list = roots.join(", ");
+        writeln!(out, "| `{name}` | {root_list} | {} | {fired} |", cell(doc))?;
+    }
+    Ok(())
 }
 
 /// The folds that `canonicalize` and `fold` apply: each op's own folder, then the folds of its
@@ -89,7 +126,7 @@ fn folds_section(
         .iter()
         .map(|fold| (format!("`{}`", fold.name), fold))
         .collect();
-    folds.sort_by(|a, b| a.0.cmp(&b.0));
+    folds.sort_by(|(left, _), (right, _)| left.cmp(right));
     for (op, fold) in folds {
         let fired = fired_in(Fired::Fold(fold.name));
         if fired == "none" {
@@ -103,7 +140,10 @@ fn folds_section(
          every trait.\n\n| Trait | | Fires in |\n|---|---|---|"
     )?;
     for name in fires.trait_folds() {
-        let doc = catalog.traits.get(name).map_or("", |t| t.doc());
+        let doc = catalog
+            .traits
+            .get(name)
+            .map_or("", |op_trait| op_trait.doc());
         let fired = fired_in(Fired::TraitFold(name));
         writeln!(out, "| `{name}` | {} | {fired} |", cell(doc))?;
     }
@@ -151,28 +191,14 @@ fn pass_section(
     if rewrites.folds {
         writeln!(out, "\nIt applies every [fold](#folds).")?;
     }
-    let mut patterns: Vec<(&str, Vec<String>, &str)> = Vec::new();
-    for pattern in rewrites.patterns.iter() {
-        let root = catalog.root_label(pattern.root());
-        match patterns
-            .iter_mut()
-            .find(|(name, ..)| *name == pattern.name())
-        {
-            Some((_, roots, _)) => roots.push(root),
-            None => patterns.push((pattern.name(), vec![root], pattern.doc())),
-        }
-    }
-    if !patterns.is_empty() {
-        writeln!(
-            out,
-            "\nPatterns:\n\n| Pattern | Root | Rewrite | Fires in |\n|---|---|---|---|"
-        )?;
-        for (name, roots, doc) in patterns {
-            let fired = fired_in(Fired::Pattern(name));
-            let roots = roots.join(", ");
-            writeln!(out, "| `{name}` | {roots} | {} | {fired} |", cell(doc))?;
-        }
-    }
+    patterns_table(out, "Patterns", &rewrites.patterns, catalog, &fired_in)?;
+    patterns_table(
+        out,
+        "Once-rewrites, which rewrite each root once, after the patterns",
+        &rewrites.once,
+        catalog,
+        &fired_in,
+    )?;
     let mut files: Vec<&str> = filetests
         .iter()
         .filter(|case| runs(&case.mode, entry.name))
@@ -192,6 +218,6 @@ fn runs(mode: &str, pass: &str) -> bool {
         return false;
     };
     passes::parse(list)
-        .map(|pipeline| pipeline.passes().iter().any(|p| p.name() == pass))
+        .map(|pipeline| pipeline.passes().iter().any(|listed| listed.name() == pass))
         .unwrap_or(false)
 }

@@ -4,10 +4,11 @@ use super::utils::{access, cast_to, copy};
 use crate::dialects::arith::math::Combiner;
 use crate::dialects::tensor::utils::shape::axis_index;
 use crate::dialects::tensor::{
-    DynamicSlice, DynamicUpdateSlice, Gather, Iota, Scatter, ScatterReplace, Take,
+    DynamicSlice, DynamicSliceOp, DynamicUpdateSlice, DynamicUpdateSliceOp, Gather, GatherOp, Iota,
+    IotaOp, Scatter, ScatterReplace, ScatterReplaceOp, Take, TakeOp,
 };
 use crate::dialects::tile::{par_iters, Block, CombineKind, Fold, Read, Write};
-use crate::ir::{AccessExpr, Dim, Matched, TensorType};
+use crate::ir::{AccessExpr, Dim, OpRef, TensorType};
 use crate::require;
 use crate::rewrite::{pattern, NoMatch, Pattern, Rewriter};
 
@@ -18,7 +19,7 @@ pub(super) struct IotaToTile;
 impl Pattern for IotaToTile {
     type Root = Iota;
 
-    fn rewrite(&self, iota: Matched<'_, Iota>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, iota: IotaOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let axis = axis_index(iota.axis, iota.shape.len()).expect("a verified axis");
         let (iters, coords) = par_iters(&iota.shape);
         let position = coords[axis].clone();
@@ -39,7 +40,7 @@ pub(super) struct TakeToTile;
 impl Pattern for TakeToTile {
     type Root = Take;
 
-    fn rewrite(&self, take: Matched<'_, Take>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, take: TakeOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let output = take.output().tensor_type();
         let index_rank = take.indices().tensor_type().rank();
         let (iters, coords) = par_iters(&output.dims);
@@ -59,11 +60,7 @@ pub(super) struct GatherToTile;
 impl Pattern for GatherToTile {
     type Root = Gather;
 
-    fn rewrite(
-        &self,
-        gather: Matched<'_, Gather>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, gather: GatherOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let input = gather.input().tensor_type();
         let output = gather.output().tensor_type();
         let axis = axis_index(gather.axis, input.rank()).expect("a verified axis");
@@ -96,11 +93,7 @@ pub(super) struct DynamicSliceToTile;
 impl Pattern for DynamicSliceToTile {
     type Root = DynamicSlice;
 
-    fn rewrite(
-        &self,
-        slice: Matched<'_, DynamicSlice>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, slice: DynamicSliceOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let input = slice.input().tensor_type();
         let dims: Vec<Dim> = slice.sizes.iter().map(|&size| Dim::Static(size)).collect();
         let (iters, coords) = par_iters(&dims);
@@ -115,7 +108,7 @@ impl Pattern for DynamicSliceToTile {
     }
 }
 
-/// `tensor.dynamic_update_slice` is a block that writes the update into the base at the clamped
+/// `tensor.dynamic_update_slice` is a block that writes the patch into the base at the clamped
 /// start.
 #[pattern]
 pub(super) struct DynamicUpdateSliceToTile;
@@ -125,13 +118,13 @@ impl Pattern for DynamicUpdateSliceToTile {
 
     fn rewrite(
         &self,
-        update_slice: Matched<'_, DynamicUpdateSlice>,
-        rewriter: &mut Rewriter<'_>,
+        update_slice: DynamicUpdateSliceOp,
+        rewriter: &mut Rewriter,
     ) -> Result<(), NoMatch> {
         let base = update_slice.base().tensor_type();
-        let update = update_slice.update().tensor_type();
-        require!(let Some(sizes) = update.static_dims(), "the update has a dynamic extent");
-        let (iters, coords) = par_iters(&update.dims);
+        let patch = update_slice.patch().tensor_type();
+        require!(let Some(sizes) = patch.static_dims(), "the patch has a dynamic extent");
+        let (iters, coords) = par_iters(&patch.dims);
         let mut target = Vec::new();
         for (axis, coord) in coords.iter().enumerate() {
             target.push(clamped_start(base, 2, axis, sizes[axis]) + coord.clone().into());
@@ -140,7 +133,7 @@ impl Pattern for DynamicUpdateSliceToTile {
         let block = Block::new(iters, vec![Read::new(1, coords)], vec![Fold::plain(write)]);
         let inputs = vec![
             update_slice.base().id(),
-            update_slice.update().id(),
+            update_slice.patch().id(),
             update_slice.starts().id(),
         ];
         let result = block.build(rewriter, inputs, |_, args| vec![args[0]])[0];
@@ -158,7 +151,7 @@ pub(super) struct ScatterToTile<T>(pub(super) PhantomData<T>);
 impl<T: Scatter> Pattern for ScatterToTile<T> {
     type Root = T;
 
-    fn rewrite(&self, scatter: Matched<'_, T>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, scatter: OpRef<T>, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let input = scatter.input().tensor_type();
         let accum = input.dtype.default_accumulator();
         let base = cast_to(rewriter, scatter.input().id(), input, accum);
@@ -182,11 +175,7 @@ pub(super) struct ScatterReplaceToTile;
 impl Pattern for ScatterReplaceToTile {
     type Root = ScatterReplace;
 
-    fn rewrite(
-        &self,
-        scatter: Matched<'_, ScatterReplace>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, scatter: ScatterReplaceOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let input = scatter.input().tensor_type();
         let updates = scatter.updates().tensor_type();
         let block = scatter_block(scatter.axis, input, updates, CombineKind::None);
@@ -201,15 +190,15 @@ impl Pattern for ScatterReplaceToTile {
     }
 }
 
-/// The block of a scatter along `axis` of `input`: it reads update `i` of operand 2 and writes it
-/// into operand 0 at the coordinate that operand 1, the indices, names.
+/// The block of a scatter along `scatter_axis` of `input`: it reads update `i` of operand 2 and
+/// writes it into operand 0 at the coordinate that operand 1, the indices, names.
 fn scatter_block(
-    axis: i64,
+    scatter_axis: i64,
     input: &TensorType,
     updates: &TensorType,
     combine: CombineKind,
 ) -> Block {
-    let axis = axis_index(axis, input.rank()).expect("a verified axis");
+    let axis = axis_index(scatter_axis, input.rank()).expect("a verified axis");
     let (iters, coords) = par_iters(&updates.dims);
     let mut target = access(&coords);
     target[axis] = AccessExpr::read(1, coords.clone());

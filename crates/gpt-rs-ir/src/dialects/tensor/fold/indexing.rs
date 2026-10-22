@@ -8,8 +8,8 @@ use crate::ir::{fold, Fold, FoldCx, FoldOut, Folded, Folding};
 impl Fold for DynamicSlice {
     fn fold(
         &self,
-        ins: DynamicSliceOperands<Folding<'_>>,
-        cx: &FoldCx<'_>,
+        ins: DynamicSliceOperands<Folding>,
+        cx: &FoldCx,
     ) -> Option<DynamicSliceResults<FoldOut>> {
         (ins.input.ty == cx.result_type(0)).then_some(DynamicSliceResults {
             output: Folded::Value(ins.input.value),
@@ -17,16 +17,16 @@ impl Fold for DynamicSlice {
     }
 }
 
-/// An update as large as the base replaces all of it, so the result is the update.
+/// A patch as large as the base replaces all of it, so the result is the patch.
 #[fold]
 impl Fold for DynamicUpdateSlice {
     fn fold(
         &self,
-        ins: DynamicUpdateSliceOperands<Folding<'_>>,
-        _cx: &FoldCx<'_>,
+        ins: DynamicUpdateSliceOperands<Folding>,
+        _cx: &FoldCx,
     ) -> Option<DynamicUpdateSliceResults<FoldOut>> {
-        (ins.update.ty == ins.base.ty).then_some(DynamicUpdateSliceResults {
-            output: Folded::Value(ins.update.value),
+        (ins.patch.ty == ins.base.ty).then_some(DynamicUpdateSliceResults {
+            output: Folded::Value(ins.patch.value),
         })
     }
 }

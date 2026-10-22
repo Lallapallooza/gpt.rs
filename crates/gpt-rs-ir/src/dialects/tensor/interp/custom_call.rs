@@ -8,8 +8,8 @@ use crate::ir::{Eval, EvalCx, Host, NoRegions, OwnedHost};
 impl Eval for CustomCall {
     fn eval(
         &self,
-        _ins: CustomCallOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
+        _ins: CustomCallOperands<Host>,
+        _cx: &mut EvalCx<NoRegions>,
     ) -> Result<CustomCallResults<OwnedHost>> {
         bail!(
             "`{}` is a backend kernel with no reference semantics",

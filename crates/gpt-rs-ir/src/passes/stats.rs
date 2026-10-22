@@ -17,15 +17,15 @@ impl Stat {
         Self { name }
     }
 
-    /// Adds `n` to this counter of the pass running on this thread.
-    pub fn add(&self, n: usize) {
-        if n == 0 {
+    /// Adds `amount` to this counter of the pass running on this thread.
+    pub fn add(&self, amount: usize) {
+        if amount == 0 {
             return;
         }
         COUNTS.with_borrow_mut(|counts| {
             match counts.iter_mut().find(|(name, _)| *name == self.name) {
-                Some((_, count)) => *count += n as u64,
-                None => counts.push((self.name, n as u64)),
+                Some((_, count)) => *count += amount as u64,
+                None => counts.push((self.name, amount as u64)),
             }
         });
     }

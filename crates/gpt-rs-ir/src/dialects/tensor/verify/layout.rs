@@ -11,8 +11,8 @@ use crate::ir::{Attr, DType, Dim, NoRegions, OpDef, OwnedTypes, Sym, TensorType,
 impl OpDef for Reshape {
     fn result_types(
         &self,
-        ins: ReshapeOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        ins: ReshapeOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<ReshapeResults<OwnedTypes>> {
         let input = ins.input;
         let have = Count::of(&input.dims)
@@ -37,8 +37,8 @@ impl OpDef for Reshape {
 impl OpDef for Transpose {
     fn result_types(
         &self,
-        ins: TransposeOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        ins: TransposeOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<TransposeResults<OwnedTypes>> {
         ensure!(
             self.perm.is_permutation_of(ins.input.rank()),
@@ -55,8 +55,8 @@ impl OpDef for Transpose {
 impl OpDef for BroadcastTo {
     fn result_types(
         &self,
-        ins: BroadcastToOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        ins: BroadcastToOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<BroadcastToResults<OwnedTypes>> {
         let input = ins.input;
         ensure!(
@@ -83,8 +83,8 @@ impl OpDef for BroadcastTo {
 impl OpDef for Slice {
     fn result_types(
         &self,
-        ins: SliceOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        ins: SliceOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<SliceResults<OwnedTypes>> {
         let input = ins.input;
         let rank = input.rank();
@@ -118,8 +118,8 @@ impl OpDef for Slice {
 impl OpDef for Concat {
     fn result_types(
         &self,
-        ins: ConcatOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        ins: ConcatOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<ConcatResults<OwnedTypes>> {
         let Some(&first) = ins.inputs.first() else {
             bail!("needs at least one input");
@@ -135,8 +135,8 @@ impl OpDef for Concat {
                 "inputs must have equal ranks, got {first} and {input}"
             );
             let off_axis_equal = (0..first.rank())
-                .filter(|&a| a != axis)
-                .all(|a| input.dims[a] == first.dims[a]);
+                .filter(|&other| other != axis)
+                .all(|other| input.dims[other] == first.dims[other]);
             ensure!(
                 off_axis_equal,
                 "inputs must have equal extents off axis {axis}, got {first} and {input}"
@@ -146,9 +146,9 @@ impl OpDef for Concat {
         let mut dynamic: Vec<&Sym> = Vec::new();
         for input in &ins.inputs {
             match &input.dims[axis] {
-                Dim::Static(n) => {
+                Dim::Static(extent) => {
                     fixed = fixed
-                        .checked_add(*n)
+                        .checked_add(*extent)
                         .ok_or_else(|| anyhow!("the joined extent on axis {axis} overflows"))?;
                 }
                 Dim::Dynamic(sym) => dynamic.push(sym),
@@ -161,7 +161,7 @@ impl OpDef for Concat {
                 let terms: Vec<String> = ins
                     .inputs
                     .iter()
-                    .map(|t| t.dims[axis].to_string())
+                    .map(|input| input.dims[axis].to_string())
                     .collect();
                 bail!(
                     "axis {axis} joins to {}, which is not one dimension",
@@ -180,8 +180,8 @@ impl OpDef for Concat {
 impl OpDef for Bitcast {
     fn result_types(
         &self,
-        ins: BitcastOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        ins: BitcastOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<BitcastResults<OwnedTypes>> {
         let input = ins.input;
         // An i1 element is one byte, 0 or 1, not a bit of a stream.
@@ -240,7 +240,7 @@ impl Count {
         let mut dynamic = Vec::new();
         for dim in dims {
             match dim {
-                Dim::Static(n) => factor = factor.checked_mul(*n)?,
+                Dim::Static(extent) => factor = factor.checked_mul(*extent)?,
                 Dim::Dynamic(sym) => dynamic.push(sym.clone()),
             }
         }
@@ -253,7 +253,7 @@ impl Count {
 }
 
 impl fmt::Display for Count {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut terms: Vec<String> = Vec::new();
         if self.factor != 1 || self.dynamic.is_empty() {
             terms.push(self.factor.to_string());

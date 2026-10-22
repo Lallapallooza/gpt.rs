@@ -12,3 +12,15 @@ func.func @located(%input: tensor<4xf32>) -> tensor<4xf32> {
   %magnitude = tensor.abs(%negated) : (tensor<4xf32>) -> tensor<4xf32> loc("crates/gpt-rs/src/nn/layers/mlp.rs":43:9)
   func.return(%magnitude) : (tensor<4xf32>) -> ()
 }
+
+// -----
+
+// A trail names each pass that made the op, with the name and the number of the op it made it
+// from. A location may have a trail alone.
+// CHECK: tensor.exp({{%[0-9]+}}) : (tensor<4xf32>) -> tensor<4xf32> loc("model.mlp"("mlp.rs":42:9) via ["canonicalize"("tensor.exp":3), "cse"("tensor.exp":2)])
+// CHECK-NEXT: tensor.neg({{%[0-9]+}}) : (tensor<4xf32>) -> tensor<4xf32> loc("" via ["canonicalize"("tensor.neg":4)])
+func.func @trailed(%input: tensor<4xf32>) -> tensor<4xf32> {
+  %exp = tensor.exp(%input) : (tensor<4xf32>) -> tensor<4xf32> loc("model.mlp"("mlp.rs":42:9) via ["canonicalize"("tensor.exp":3), "cse"("tensor.exp":2)])
+  %negated = tensor.neg(%exp) : (tensor<4xf32>) -> tensor<4xf32> loc("" via ["canonicalize"("tensor.neg":4)])
+  func.return(%negated) : (tensor<4xf32>) -> ()
+}

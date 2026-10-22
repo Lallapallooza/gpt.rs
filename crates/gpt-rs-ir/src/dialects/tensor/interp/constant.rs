@@ -11,8 +11,8 @@ use crate::ir::{Eval, EvalCx, Host, NoRegions, OwnedHost};
 impl Eval for Constant {
     fn eval(
         &self,
-        _ins: ConstantOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
+        _ins: ConstantOperands<Host>,
+        _cx: &mut EvalCx<NoRegions>,
     ) -> Result<ConstantResults<OwnedHost>> {
         // The result views the constant's bytes, which outlive it through the `Arc`.
         let value = &self.value;

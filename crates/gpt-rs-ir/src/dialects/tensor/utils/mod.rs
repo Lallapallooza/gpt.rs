@@ -5,6 +5,7 @@ pub(crate) mod class;
 mod constant;
 pub(crate) mod contraction;
 mod layout;
+pub(crate) mod quant;
 pub(crate) mod random;
 pub(crate) mod shape;
 pub(crate) mod window;

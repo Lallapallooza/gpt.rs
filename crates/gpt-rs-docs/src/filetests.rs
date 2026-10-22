@@ -13,8 +13,11 @@ use gpt_rs_ir::rewrite::{record_fired, Fired};
 /// module it holds names, when it parses.
 pub struct Case {
     pub file: String,
+    /// The mode of its `// RUN:` line, `%S` replaced by the file's directory.
     pub mode: String,
     pub text: String,
+    /// Its text as it runs, `%S` replaced by the file's directory.
+    pub run_text: String,
     /// The names of the ops it holds, at any depth.
     pub ops: BTreeSet<String>,
     /// The symbols it defines: the names of its functions and dispatches.
@@ -51,9 +54,11 @@ pub fn read() -> Result<Vec<Case>> {
         let text = fs::read_to_string(&path)?;
         let relative = path.strip_prefix(&root).unwrap_or(&path);
         let file = Path::new("filetests").join(relative).display().to_string();
-        let (mode, file_cases) = gpt_rs_filetests::split_cases(&text);
+        let (written, file_cases) = gpt_rs_filetests::split_cases(&text);
+        let mode = gpt_rs_filetests::substitute(&written, &path);
         for case in file_cases {
-            let (ops, symbols) = names(&case.text);
+            let run_text = gpt_rs_filetests::substitute(&case.text, &path);
+            let (ops, symbols) = names(&run_text);
             let mut errors = Vec::new();
             for message in gpt_rs_filetests::directive(&case.text, "ERROR") {
                 errors.push(message.to_string());
@@ -62,6 +67,7 @@ pub fn read() -> Result<Vec<Case>> {
                 file: file.clone(),
                 mode: mode.clone(),
                 text: case.text,
+                run_text,
                 ops,
                 symbols,
                 errors,
@@ -98,7 +104,8 @@ impl Fires {
                 parsed = passes::parse(list).with_context(|| case.file.clone())?;
                 &parsed
             };
-            let mut module = Module::from_text(&case.text).with_context(|| case.file.clone())?;
+            let mut module =
+                Module::from_text(&case.run_text).with_context(|| case.file.clone())?;
             for pass in pipeline.passes() {
                 let (result, fired) = record_fired(|| passes::run_pass(pass.as_ref(), &mut module));
                 result.with_context(|| format!("{}: {}", case.file, pass.label()))?;
@@ -118,7 +125,9 @@ impl Fires {
         let files: BTreeSet<&str> = self
             .0
             .iter()
-            .filter(|((p, r), _)| pass.is_none_or(|pass| *p == pass) && *r == rewrite)
+            .filter(|((fired_pass, fired_rewrite), _)| {
+                pass.is_none_or(|wanted| *fired_pass == wanted) && *fired_rewrite == rewrite
+            })
             .flat_map(|(_, files)| files.iter().map(String::as_str))
             .collect();
         files.into_iter().collect()

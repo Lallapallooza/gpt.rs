@@ -14,8 +14,8 @@ use crate::ir::{Eval, EvalCx, Host, NoRegions, OwnedHost, Region, TensorType};
 impl Eval for Yield {
     fn eval(
         &self,
-        _ins: YieldOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
+        _ins: YieldOperands<Host>,
+        _cx: &mut EvalCx<NoRegions>,
     ) -> Result<YieldResults<OwnedHost>> {
         Ok(YieldResults::default())
     }
@@ -24,8 +24,8 @@ impl Eval for Yield {
 impl Eval for Cond {
     fn eval(
         &self,
-        ins: CondOperands<Host<'_>>,
-        cx: &mut EvalCx<'_, CondRegions<Region>>,
+        ins: CondOperands<Host>,
+        cx: &mut EvalCx<CondRegions<Region>>,
     ) -> Result<CondResults<OwnedHost>> {
         let branch = match ins.pred.as_i1()?[0] {
             0 => cx.regions.else_branch,
@@ -40,8 +40,8 @@ impl Eval for Cond {
 impl Eval for While {
     fn eval(
         &self,
-        ins: WhileOperands<Host<'_>>,
-        cx: &mut EvalCx<'_, WhileRegions<Region>>,
+        ins: WhileOperands<Host>,
+        cx: &mut EvalCx<WhileRegions<Region>>,
     ) -> Result<WhileResults<OwnedHost>> {
         let (cond, body) = (cx.regions.cond, cx.regions.body);
         let mut carried = HostValue::of_tensors(&ins.init);
@@ -65,19 +65,19 @@ impl Eval for While {
 impl Eval for Scan {
     fn eval(
         &self,
-        ins: ScanOperands<Host<'_>>,
-        cx: &mut EvalCx<'_, ScanRegions<Region>>,
+        ins: ScanOperands<Host>,
+        cx: &mut EvalCx<ScanRegions<Region>>,
     ) -> Result<ScanResults<OwnedHost>> {
-        let (carried, scanned) = ins.inputs.split_at(self.carry_count);
+        let (initial, scanned) = ins.inputs.split_at(self.carry_count);
         let steps = scanned[0].dims[0];
-        let mut carried = HostValue::of_tensors(carried);
+        let mut carried = HostValue::of_tensors(initial);
         let mut outputs: Vec<Vec<HostTensor>> = vec![Vec::with_capacity(steps); self.outputs.len()];
         for step in 0..steps {
             let slices = scanned
                 .iter()
                 .map(|input| {
                     let row: usize = input.dims[1..].iter().product();
-                    let data = gather_elements(&input.data, row, |i| step * row + i)?;
+                    let data = gather_elements(&input.data, row, |element| step * row + element)?;
                     Ok(HostValue::Tensor(HostTensor::new(&input.dims[1..], data)?))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -112,8 +112,8 @@ fn stack_steps(stack: Vec<HostTensor>, ty: &TensorType, steps: usize) -> Result<
     let mut out = Chunks::zeroed(ty.dtype, steps * count);
     for (step, tensor) in stack.iter().enumerate() {
         let elements = Chunks::of(&tensor.data);
-        for i in 0..count {
-            out.set(step * count + i, elements.get(i));
+        for element in 0..count {
+            out.set(step * count + element, elements.get(element));
         }
     }
     HostTensor::new(

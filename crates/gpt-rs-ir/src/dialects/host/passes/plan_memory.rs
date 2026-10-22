@@ -20,11 +20,11 @@ use crate::targets::{required, Target};
 /// Gives every value that a function's dispatches compute a buffer, and calls each `loop.func`
 /// with `host.launch` on buffers: the buffer form of the `host` dialect.
 ///
-/// - Values live in one arena, `host.arena`. A greedy best fit places them, the largest first, each
-///   at the lowest offset of the smallest gap between the values already placed that are live at
-///   the same time, so values that are never live at once share bytes. The arena, each value in it
-///   and the memory of each allocation start at a multiple of the alignment that the target states
-///   for its buffers.
+/// - Values live in one arena, `host.arena`. A greedy best fit places them, the largest first. Each
+///   goes at the lowest offset of the smallest gap between the placed values live at the same time,
+///   or after all of them when no gap fits. So values that are never live at once share bytes. The
+///   arena, each value in it and the memory of each allocation start at a multiple of the alignment
+///   that the target states for its buffers.
 /// - An `inout` parameter updates the buffer of its argument when that argument is the result of
 ///   an earlier launch, or an argument of the function that only launches use, and dies at this
 ///   launch: the launch takes it once and nothing uses it later. It updates a copy otherwise.

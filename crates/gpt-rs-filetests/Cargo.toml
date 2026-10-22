@@ -19,3 +19,6 @@ gpt-rs-ir = { path = "../gpt-rs-ir", version = "0.1.0" }
 half = "2.6"
 rand = { workspace = true }
 regex = "1"
+
+[lints]
+workspace = true

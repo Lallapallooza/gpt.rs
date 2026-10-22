@@ -3,9 +3,7 @@
 use anyhow::Result;
 
 use super::{pass, Pass};
-use crate::ir::{Inst, Module, OpKey, Region, ScopedMap};
-use crate::rewrite::Editor;
-use crate::traits::IsolatedFromAbove;
+use crate::rewrite::{cse, Rewriting};
 
 /// Replaces each op by an earlier op that computes the same values: the same op with the same
 /// attributes and operands. Ops with effects or regions, and terminators, are never replaced. An
@@ -15,37 +13,9 @@ use crate::traits::IsolatedFromAbove;
 pub struct Cse;
 
 impl Pass for Cse {
-    fn run(&self, module: &mut Module) -> Result<bool> {
-        let body = module.body();
-        let replaced = cse(module, body, &mut ScopedMap::new())?;
+    fn run(&self, module: &mut Rewriting) -> Result<bool> {
+        let replaced = cse(module)?;
         Cse::REPLACED.add(replaced);
         Ok(replaced > 0)
     }
-}
-
-/// The number of ops of `region` and the regions inside it that it replaces.
-fn cse(module: &mut Module, region: Region, seen: &mut ScopedMap<OpKey, Inst>) -> Result<usize> {
-    let mut replaced = 0;
-    for inst in module.insts(region).collect::<Vec<_>>() {
-        let isolated = module.op(inst).has_trait::<IsolatedFromAbove>();
-        for inner in module.regions(inst).to_vec() {
-            seen.push(isolated);
-            replaced += cse(module, inner, seen)?;
-            seen.pop();
-        }
-        let Some(key) = module.cse_key(inst) else {
-            continue;
-        };
-        match seen.get(&key) {
-            Some(earlier) => {
-                let values = module.results(earlier).to_vec();
-                Editor::new(module).replace(inst, &values)?;
-                replaced += 1;
-            }
-            None => {
-                seen.insert(key, inst);
-            }
-        }
-    }
-    Ok(replaced)
 }

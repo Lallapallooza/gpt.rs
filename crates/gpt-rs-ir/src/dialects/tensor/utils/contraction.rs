@@ -9,7 +9,7 @@ use crate::dialects::arith::math::{Combiner, Float};
 use crate::dialects::tensor::ir::*;
 use crate::dialects::tensor::utils::shape::axis_index;
 use crate::dialects::tile::CombineKind;
-use crate::ir::{DType, IntFormat, Matched, Perm, Ranked, MAX_RANK};
+use crate::ir::{DType, IntFormat, OpRef, Perm, Ranked, MAX_RANK};
 
 impl DotGeneral {
     /// The contraction of the `lhs` axes with the `rhs` axes, in pairs, without batch axes.
@@ -53,7 +53,7 @@ impl DotGeneral {
 
     /// This dot with the batch and contracting axes of `axes`.
     pub fn with_axes(self, axes: &DotAxes) -> Self {
-        let listed = |axes: &[usize]| axes.iter().map(|&axis| axis as i64).collect();
+        let listed = |positions: &[usize]| positions.iter().map(|&axis| axis as i64).collect();
         Self {
             batch_lhs: listed(&axes.batch_lhs),
             batch_rhs: listed(&axes.batch_rhs),
@@ -229,7 +229,7 @@ fn operand_axes(
     Ok(out)
 }
 
-impl Matched<'_, DotGeneral> {
+impl DotGeneralOp<'_> {
     /// The dot's axes, non-negative, for the ranks of its operands.
     pub fn axes(&self) -> DotAxes {
         let (lhs_rank, rhs_rank) = (
@@ -242,7 +242,7 @@ impl Matched<'_, DotGeneral> {
     }
 }
 
-impl<T: Reduce> Matched<'_, T> {
+impl<T: Reduce> OpRef<'_, T> {
     /// The reduced axes, non-negative and sorted, for the rank of the input.
     pub fn reduced_axes(&self) -> Ranked<usize> {
         let rank = self.input().tensor_type().rank();

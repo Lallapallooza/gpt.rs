@@ -5,11 +5,13 @@ use crate::dialects::arith;
 use crate::dialects::arith::math;
 use crate::dialects::arith::math::Combiner;
 use crate::dialects::tensor::utils::shape::axis_index;
-use crate::dialects::tensor::{Accumulates, ArgMax, DotGeneral, Reduce, Segment, SelectK, Side};
-use crate::dialects::tile::{
-    par_iters, push_iter, Block, CombineKind, Fold, IterKind, KBest, Read, Write,
+use crate::dialects::tensor::{
+    Accumulates, ArgMax, ArgMaxOp, DotGeneral, DotGeneralOp, Reduce, Segment, SelectK, Side,
 };
-use crate::ir::{AccessExpr, Dim, IndexExpr, Matched};
+use crate::dialects::tile::{
+    par_iters, push_iter, Block, CombineKind, Fold, IterKind, Iters, KBest, Read, Write,
+};
+use crate::ir::{AccessExpr, Dim, IndexExpr, OpRef};
 use crate::rewrite::{pattern, NoMatch, Pattern, Rewriter};
 
 /// `tensor.dot_general` is a block with one reduction iterator per contracted pair, in
@@ -21,17 +23,13 @@ pub(super) struct DotToTile;
 impl Pattern for DotToTile {
     type Root = DotGeneral;
 
-    fn rewrite(
-        &self,
-        dot: Matched<'_, DotGeneral>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, dot: DotGeneralOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let (lhs, rhs) = (dot.lhs().tensor_type(), dot.rhs().tensor_type());
         let axes = dot.axes();
         let accum = dot.accum_dtype(lhs.dtype);
         let lhs_free = axes.free(Side::Lhs);
         let rhs_free = axes.free(Side::Rhs);
-        let mut iters = Vec::new();
+        let mut iters = Iters::new();
         let mut lhs_coords = vec![IndexExpr::constant(0); lhs.rank()];
         let mut rhs_coords = vec![IndexExpr::constant(0); rhs.rank()];
         let mut result_coords = Vec::new();
@@ -81,7 +79,7 @@ pub(super) struct ReduceToTile<T>(pub(super) PhantomData<T>);
 impl<T: Reduce> Pattern for ReduceToTile<T> {
     type Root = T;
 
-    fn rewrite(&self, reduce: Matched<'_, T>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, reduce: OpRef<T>, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let input = reduce.input().tensor_type();
         let axes = reduce.reduced_axes();
         let accum = reduce.accum_dtype(input.dtype);
@@ -107,11 +105,7 @@ pub(super) struct ArgMaxToTile;
 impl Pattern for ArgMaxToTile {
     type Root = ArgMax;
 
-    fn rewrite(
-        &self,
-        argmax: Matched<'_, ArgMax>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, argmax: ArgMaxOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let input = argmax.input().tensor_type();
         let axis = axis_index(argmax.axis, input.rank()).expect("a verified axis");
         let (iters, coords, write) = along(input, &[axis], argmax.keepdims);
@@ -136,7 +130,7 @@ pub(super) struct SelectKToTile<T>(pub(super) PhantomData<T>);
 impl<T: SelectK> Pattern for SelectKToTile<T> {
     type Root = T;
 
-    fn rewrite(&self, top_k: Matched<'_, T>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, top_k: OpRef<T>, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let input = top_k.input().tensor_type();
         let axis = axis_index(top_k.axis, input.rank()).expect("a verified axis");
         let (iters, coords, write) = along(input, &[axis], false);
@@ -162,15 +156,15 @@ impl<T: SelectK> Pattern for SelectKToTile<T> {
         dims[axis] = Dim::Static(top_k.k);
         let mut moved = Vec::new();
         for result in found {
-            let (iters, coords) = par_iters(&dims);
-            let mut source = coords.clone();
+            let (copy_iters, copy_coords) = par_iters(&dims);
+            let mut source = copy_coords.clone();
             let top_k_coord = source.remove(axis);
             source.push(top_k_coord);
             moved.push(copy(
                 rewriter,
                 vec![result],
-                iters,
-                coords,
+                copy_iters,
+                copy_coords,
                 Read::new(0, source),
             ));
         }
@@ -187,7 +181,7 @@ pub(super) struct SegmentToTile<T>(pub(super) PhantomData<T>);
 impl<T: Segment> Pattern for SegmentToTile<T> {
     type Root = T;
 
-    fn rewrite(&self, segment: Matched<'_, T>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, segment: OpRef<T>, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let data = segment.data().tensor_type();
         let accum = data.dtype.default_accumulator();
         let mut dims = data.dims.clone();

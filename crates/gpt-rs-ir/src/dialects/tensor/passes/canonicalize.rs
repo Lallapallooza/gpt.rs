@@ -6,14 +6,15 @@ use std::marker::PhantomData;
 use crate::dialects::arith::math::{Combiner, CompareMath};
 use crate::dialects::tensor::utils::shape::axis_index;
 use crate::dialects::tensor::{
-    Accumulates, ArgMax, BottomK, BroadcastTo, Compare, Concat, DotAxes, DotGeneral, Equal, Gather,
-    Greater, GreaterEqual, Iota, Less, LessEqual, NotEqual, Reduce, ReduceAnd, ReduceAttrs,
-    ReduceMax, ReduceMin, ReduceOr, ReduceSum, ReduceWindowAnd, ReduceWindowMax, ReduceWindowMin,
-    ReduceWindowOr, ReduceWindowSum, Reshape, ScatterAdd, ScatterMax, ScatterMin, ScatterReplace,
-    Side, Slice, TopK, Transpose,
+    Accumulates, ArgMax, BottomK, BroadcastTo, BroadcastToOp, Compare, Concat, ConcatOp, DotAxes,
+    DotGeneral, DotGeneralOp, Equal, Gather, Greater, GreaterEqual, Iota, IotaOp, Less, LessEqual,
+    NotEqual, Reduce, ReduceAnd, ReduceAttrs, ReduceMax, ReduceMin, ReduceOr, ReduceSum,
+    ReduceWindowAnd, ReduceWindowMax, ReduceWindowMin, ReduceWindowOr, ReduceWindowSum, Reshape,
+    ScatterAdd, ScatterMax, ScatterMin, ScatterReplace, Side, Slice, SliceOp, TopK, Transpose,
+    TransposeOp,
 };
 use crate::host::HostScalar;
-use crate::ir::{DType, Dim, InOp, Matched, OpKind, Ranked, TensorType, Value, ValueRef};
+use crate::ir::{DType, Dim, InOp, OpKind, OpRef, Ranked, TensorType, Value, ValueRef};
 use crate::require;
 use crate::rewrite::{pattern, Build, Has, NoMatch, Pattern, Rewriter, WithTrait};
 use crate::traits::{Associative, Commutative, Elementwise, Idempotent, Traits};
@@ -78,7 +79,7 @@ struct CollapseChain<T>(PhantomData<T>);
 impl<T: Compose> Pattern for CollapseChain<T> {
     type Root = T;
 
-    fn rewrite(&self, second: Matched<'_, T>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, second: OpRef<T>, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let first = second
             .operand(0)
             .defining_op::<T>()
@@ -97,17 +98,14 @@ struct UnitStrides;
 impl Pattern for UnitStrides {
     type Root = Slice;
 
-    fn rewrite(
-        &self,
-        slice: Matched<'_, Slice>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, slice: SliceOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         require!(!slice.strides.is_empty(), "the slice has no strides");
         require!(
             slice.strides.iter().all(|&stride| stride == 1),
             "a stride is not 1"
         );
-        rewriter.set_op(&slice, Slice::new(slice.starts, slice.sizes));
+        let unstrided = Slice::new(slice.starts, slice.sizes);
+        slice.update(rewriter, |op| *op = unstrided);
         Ok(())
     }
 }
@@ -136,9 +134,9 @@ struct NonNegativeAxis<T>(PhantomData<T>);
 impl<T: OneAxis> Pattern for NonNegativeAxis<T> {
     type Root = T;
 
-    fn rewrite(&self, root: Matched<'_, T>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
-        let mut op = root.attrs().clone();
-        let axis = *op.axis_mut();
+    fn rewrite(&self, root: OpRef<T>, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
+        let mut attrs = root.attrs().clone();
+        let axis = *attrs.axis_mut();
         require!(axis < 0, "the axis is not negative");
         let has_operands = !root.module().operands(root.inst()).is_empty();
         let counted = if has_operands {
@@ -146,9 +144,9 @@ impl<T: OneAxis> Pattern for NonNegativeAxis<T> {
         } else {
             root.result(0)
         };
-        *op.axis_mut() =
+        *attrs.axis_mut() =
             axis_index(axis, counted.tensor_type().rank()).expect("a verified axis") as i64;
-        rewriter.set_op(&root, op);
+        root.update(rewriter, |op| *op = attrs);
         Ok(())
     }
 }
@@ -183,11 +181,7 @@ struct NonNegativeDotAxes;
 impl Pattern for NonNegativeDotAxes {
     type Root = DotGeneral;
 
-    fn rewrite(
-        &self,
-        dot: Matched<'_, DotGeneral>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, dot: DotGeneralOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let lists = [
             &dot.batch_lhs,
             &dot.batch_rhs,
@@ -197,15 +191,14 @@ impl Pattern for NonNegativeDotAxes {
         let negative = lists.iter().any(|axes| axes.iter().any(|&axis| axis < 0));
         require!(negative, "no axis is negative");
         let axes = dot.axes();
-        let signed = |axes: Ranked<usize>| axes.into_iter().map(|axis| axis as i64).collect();
-        let normalized = DotGeneral {
-            batch_lhs: signed(axes.batch_lhs),
-            batch_rhs: signed(axes.batch_rhs),
-            contract_lhs: signed(axes.contract_lhs),
-            contract_rhs: signed(axes.contract_rhs),
-            ..dot.attrs().clone()
-        };
-        rewriter.set_op(&dot, normalized);
+        let signed =
+            |positions: Ranked<usize>| positions.into_iter().map(|axis| axis as i64).collect();
+        dot.update(rewriter, |op| {
+            op.batch_lhs = signed(axes.batch_lhs);
+            op.batch_rhs = signed(axes.batch_rhs);
+            op.contract_lhs = signed(axes.contract_lhs);
+            op.contract_rhs = signed(axes.contract_rhs);
+        });
         Ok(())
     }
 }
@@ -229,10 +222,10 @@ struct DropDefaultDtypes<T>(PhantomData<T>);
 impl<T: InOp + Accumulates> Pattern for DropDefaultDtypes<T> {
     type Root = T;
 
-    fn rewrite(&self, root: Matched<'_, T>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, root: OpRef<T>, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let input_dtype = root.operand(0).tensor_type().dtype;
-        let mut op = root.attrs().clone();
-        let (accum, out) = op.dtypes_mut();
+        let mut attrs = root.attrs().clone();
+        let (accum, out) = attrs.dtypes_mut();
         let default_out = *out == Some(input_dtype);
         let default_accum = *accum == Some(input_dtype.default_accumulator());
         require!(default_out || default_accum, "no dtype is the default");
@@ -242,7 +235,7 @@ impl<T: InOp + Accumulates> Pattern for DropDefaultDtypes<T> {
         if default_accum {
             *accum = None;
         }
-        rewriter.set_op(&root, op);
+        root.update(rewriter, |op| *op = attrs);
         Ok(())
     }
 }
@@ -254,7 +247,7 @@ struct SortedReduceAxes<T>(PhantomData<T>);
 impl<T: Reduce> Pattern for SortedReduceAxes<T> {
     type Root = T;
 
-    fn rewrite(&self, reduce: Matched<'_, T>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, reduce: OpRef<T>, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let sorted = reduce.reduced_axes();
         let axes: Ranked<i64> = sorted.into_iter().map(|axis| axis as i64).collect();
         require!(axes != reduce.axes, "the axes are sorted already");
@@ -262,7 +255,7 @@ impl<T: Reduce> Pattern for SortedReduceAxes<T> {
             axes,
             ..ReduceAttrs::clone(reduce.attrs())
         };
-        rewriter.set_op(&reduce, T::from(attrs));
+        reduce.update(rewriter, |op| *op = T::from(attrs));
         Ok(())
     }
 }
@@ -303,15 +296,15 @@ impl Pattern for HoistBroadcast {
 
     fn rewrite(
         &self,
-        root: WithTrait<'_, Elementwise>,
-        rewriter: &mut Rewriter<'_>,
+        root: WithTrait<Elementwise>,
+        rewriter: &mut Rewriter,
     ) -> Result<(), NoMatch> {
-        let narrow: Option<Vec<_>> = root
+        let all_narrowed: Option<Vec<_>> = root
             .operands
             .iter()
             .map(|&operand| narrowed(operand))
             .collect();
-        require!(let Some(narrow) = narrow, "an operand is neither a broadcast nor a splat");
+        require!(let Some(narrow) = all_narrowed, "an operand is neither a broadcast nor a splat");
         require!(let Some(dims) = input_dims(&narrow), "the broadcast inputs differ in shape");
         let wide = root.results[0].tensor_type();
         require!(wide.dims != *dims, "the broadcasts add nothing");
@@ -343,7 +336,7 @@ fn combines_in_any_order<C: Combiner>(dtype: DType) -> bool {
 }
 
 /// The input type of a reduction that accumulates and returns in its input dtype.
-fn plain_input<'m, T: Reduce>(reduce: &Matched<'m, T>) -> Option<&'m TensorType> {
+fn plain_input<'m, T: Reduce>(reduce: &OpRef<'m, T>) -> Option<&'m TensorType> {
     let input = reduce.input().tensor_type();
     (reduce.accum_dtype(input.dtype) == input.dtype && reduce.out.is_none()).then_some(input)
 }
@@ -356,7 +349,7 @@ struct MergeReductions<T>(PhantomData<T>);
 impl<T: Reduce> Pattern for MergeReductions<T> {
     type Root = T;
 
-    fn rewrite(&self, outer: Matched<'_, T>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, outer: OpRef<T>, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let inner = outer
             .input()
             .defining_op::<T>()
@@ -380,13 +373,13 @@ impl<T: Reduce> Pattern for MergeReductions<T> {
         }
         axes.sort_unstable();
         axes.dedup();
-        let merged = T::from(ReduceAttrs {
+        let merged_op = T::from(ReduceAttrs {
             axes: axes.into_iter().map(|axis| axis as i64).collect(),
             keepdims: inner.keepdims && outer.keepdims,
             accum: None,
             out: None,
         });
-        let merged = rewriter.create(merged, inner.input());
+        let merged = rewriter.create(merged_op, inner.input());
         let shape = outer.output().tensor_type().dims.clone();
         let result = rewriter.on(merged).reshape(shape).value();
         rewriter.replace_op(&outer, result);
@@ -404,7 +397,7 @@ struct ReduceOfBroadcast<T>(PhantomData<T>);
 impl<T: Reduce> Pattern for ReduceOfBroadcast<T> {
     type Root = T;
 
-    fn rewrite(&self, reduce: Matched<'_, T>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, reduce: OpRef<T>, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let broadcast = reduce
             .input()
             .defining_op::<BroadcastTo>()
@@ -422,9 +415,9 @@ impl<T: Reduce> Pattern for ReduceOfBroadcast<T> {
         let reduced = reduce.reduced_axes();
         for (axis, extent) in shape.iter().enumerate() {
             let source_axis = broadcast.source_axis(axis, source.rank());
-            let repeated = source_axis.is_none_or(|source_axis| source.dims[source_axis].is_one())
+            let repeated = source_axis.is_none_or(|position| source.dims[position].is_one())
                 && !extent.is_one();
-            let nonempty = matches!(extent, Dim::Static(extent) if *extent > 0);
+            let nonempty = matches!(extent, Dim::Static(size) if *size > 0);
             match (repeated, reduced.contains(&axis)) {
                 (true, true) => require!(nonempty, "a repeated axis may be empty"),
                 (true, false) => return Err("the reduction keeps a repeated axis".into()),
@@ -447,7 +440,7 @@ struct ReduceOfConcat<T>(PhantomData<T>);
 impl<T: Reduce> Pattern for ReduceOfConcat<T> {
     type Root = T;
 
-    fn rewrite(&self, reduce: Matched<'_, T>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, reduce: OpRef<T>, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let concat = reduce
             .input()
             .defining_op::<Concat>()
@@ -484,11 +477,7 @@ struct TransposeOfUnitAxes;
 impl Pattern for TransposeOfUnitAxes {
     type Root = Transpose;
 
-    fn rewrite(
-        &self,
-        transpose: Matched<'_, Transpose>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, transpose: TransposeOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let output = transpose.output().tensor_type();
         let mut moved = Vec::new();
         for (axis, extent) in output.dims.iter().enumerate() {
@@ -516,11 +505,7 @@ struct SliceOfConcat;
 impl Pattern for SliceOfConcat {
     type Root = Slice;
 
-    fn rewrite(
-        &self,
-        slice: Matched<'_, Slice>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, slice: SliceOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let concat = slice
             .input()
             .defining_op::<Concat>()
@@ -559,20 +544,16 @@ struct ConcatOfConcat;
 impl Pattern for ConcatOfConcat {
     type Root = Concat;
 
-    fn rewrite(
-        &self,
-        concat: Matched<'_, Concat>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, concat: ConcatOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let rank = concat.output().tensor_type().rank();
         let axis = axis_index(concat.axis, rank).expect("a verified axis");
         let mut inputs = Vec::new();
         let mut flattened = false;
         for input in concat.inputs() {
-            let inner = input
+            let inner_concat = input
                 .defining_op::<Concat>()
                 .filter(|inner| axis_index(inner.axis, rank).ok() == Some(axis));
-            match inner {
+            match inner_concat {
                 Some(inner) => {
                     inputs.extend(inner.inputs().iter().map(|part| part.id()));
                     flattened = true;
@@ -595,11 +576,7 @@ struct BroadcastOfLeadingUnitAxes;
 impl Pattern for BroadcastOfLeadingUnitAxes {
     type Root = BroadcastTo;
 
-    fn rewrite(
-        &self,
-        broadcast: Matched<'_, BroadcastTo>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, broadcast: BroadcastToOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let reshape = broadcast
             .input()
             .defining_op::<Reshape>()
@@ -628,7 +605,7 @@ struct IotaOfUnitAxis;
 impl Pattern for IotaOfUnitAxis {
     type Root = Iota;
 
-    fn rewrite(&self, iota: Matched<'_, Iota>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, iota: IotaOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let axis = axis_index(iota.axis, iota.shape.len()).expect("a verified axis");
         require!(
             iota.shape[axis].is_one(),
@@ -650,7 +627,7 @@ struct CompareWithItself<T>(PhantomData<T>);
 impl<T: Compare> Pattern for CompareWithItself<T> {
     type Root = T;
 
-    fn rewrite(&self, compare: Matched<'_, T>, rewriter: &mut Rewriter<'_>) -> Result<(), NoMatch> {
+    fn rewrite(&self, compare: OpRef<T>, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         require!(compare.lhs() == compare.rhs(), "the operands may differ");
         let dtype = compare.lhs().tensor_type().dtype;
         require!(
@@ -676,8 +653,8 @@ struct DotOfOneProduct;
 /// where the result holds them and extent 1 at the other side's free axes, broadcast to `result`
 /// and cast to `accum`.
 fn along_result(
-    rewriter: &mut Rewriter<'_>,
-    operand: ValueRef<'_>,
+    rewriter: &mut Rewriter,
+    operand: ValueRef,
     (axes, side): (&DotAxes, Side),
     result: &TensorType,
     accum: DType,
@@ -689,8 +666,8 @@ fn along_result(
     let mut order: Vec<usize> = (0..dims.len()).collect();
     order.sort_by_key(|&axis| landing[axis].unwrap_or(usize::MAX));
     let mut shape = vec![Dim::Static(1); result.rank()];
-    for (axis, result_axis) in landing.iter().enumerate() {
-        if let Some(result_axis) = result_axis {
+    for (axis, landed) in landing.iter().enumerate() {
+        if let Some(result_axis) = landed {
             shape[*result_axis] = dims[axis].clone();
         }
     }
@@ -706,11 +683,7 @@ fn along_result(
 impl Pattern for DotOfOneProduct {
     type Root = DotGeneral;
 
-    fn rewrite(
-        &self,
-        dot: Matched<'_, DotGeneral>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, dot: DotGeneralOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let axes = dot.axes();
         let lhs_type = dot.lhs().tensor_type();
         let one_product = axes
@@ -730,6 +703,82 @@ impl Pattern for DotOfOneProduct {
     }
 }
 
+/// A pair of contracted axes of one element each adds nothing to the sums: the dot contracts the
+/// operands reshaped without such pairs, summing the same products in the same order. A dot that
+/// sums one product is [`DotOfOneProduct`]'s.
+#[pattern(canonical)]
+struct DropUnitContractions;
+
+/// The position of `axis` among the axes of an operand that keep their place once the axes
+/// `dropped` are gone.
+fn kept_position(axis: usize, dropped: &[usize]) -> i64 {
+    let mut before = 0;
+    for &gone in dropped {
+        before += usize::from(gone < axis);
+    }
+    (axis - before) as i64
+}
+
+/// The extents of an operand of extents `dims` without its axes `dropped`.
+fn without_axes(dims: &[Dim], dropped: &[usize]) -> Ranked<Dim> {
+    let mut kept = Ranked::new();
+    for (axis, extent) in dims.iter().enumerate() {
+        if !dropped.contains(&axis) {
+            kept.push(extent.clone());
+        }
+    }
+    kept
+}
+
+impl Pattern for DropUnitContractions {
+    type Root = DotGeneral;
+
+    fn rewrite(&self, dot: DotGeneralOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
+        let axes = dot.axes();
+        let lhs_type = dot.lhs().tensor_type();
+        let rhs_type = dot.rhs().tensor_type();
+        let (mut lhs_dropped, mut rhs_dropped) = (Ranked::new(), Ranked::new());
+        let (mut contract_lhs, mut contract_rhs) = (Ranked::new(), Ranked::new());
+        for (&lhs_axis, &rhs_axis) in axes.contract_lhs.iter().zip(&axes.contract_rhs) {
+            if lhs_type.dims[lhs_axis].is_one() && rhs_type.dims[rhs_axis].is_one() {
+                lhs_dropped.push(lhs_axis);
+                rhs_dropped.push(rhs_axis);
+            } else {
+                contract_lhs.push(lhs_axis);
+                contract_rhs.push(rhs_axis);
+            }
+        }
+        require!(
+            !lhs_dropped.is_empty(),
+            "no contracted pair holds one element"
+        );
+        require!(!contract_lhs.is_empty(), "the dot sums one product");
+        let lhs = rewriter
+            .on(dot.lhs().id())
+            .reshape(without_axes(&lhs_type.dims, &lhs_dropped))
+            .value();
+        let rhs = rewriter
+            .on(dot.rhs().id())
+            .reshape(without_axes(&rhs_type.dims, &rhs_dropped))
+            .value();
+        let renumbered = |kept: &[usize], dropped: &[usize]| -> Ranked<i64> {
+            kept.iter()
+                .map(|&axis| kept_position(axis, dropped))
+                .collect()
+        };
+        let narrowed = DotGeneral {
+            batch_lhs: renumbered(&axes.batch_lhs, &lhs_dropped),
+            batch_rhs: renumbered(&axes.batch_rhs, &rhs_dropped),
+            contract_lhs: renumbered(&contract_lhs, &lhs_dropped),
+            contract_rhs: renumbered(&contract_rhs, &rhs_dropped),
+            ..dot.attrs().clone()
+        };
+        let product = rewriter.create(narrowed, (lhs, rhs));
+        rewriter.replace_op(&dot, product);
+        Ok(())
+    }
+}
+
 /// A transpose that feeds a dot folds into the dot's axes when it keeps the order of the
 /// operand's free axes: the dot reads the transpose's input and names its batch and contracted
 /// axes there. Each sum keeps its order, which follows the listed contracted axes.
@@ -739,11 +788,7 @@ struct TransposeIntoDot;
 impl Pattern for TransposeIntoDot {
     type Root = DotGeneral;
 
-    fn rewrite(
-        &self,
-        dot: Matched<'_, DotGeneral>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, dot: DotGeneralOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let mut axes = dot.axes();
         let mut operands = [dot.lhs(), dot.rhs()];
         let mut folded = false;

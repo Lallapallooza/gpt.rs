@@ -8,7 +8,7 @@ func.func @dequantize_scale_extents(%codes: tensor<4x64xf4e2m1>, %scale: tensor<
 
 // -----
 
-// ERROR: tensor.dequantize: q must be an integer, narrow float or float tensor, got tensor<4x64xe8m0>
+// ERROR: tensor.dequantize: quantized must be an integer, narrow float or float tensor, got tensor<4x64xe8m0>
 func.func @dequantize_scales(%codes: tensor<4x64xe8m0>, %scale: tensor<4x2xe8m0>) -> tensor<4x64xf32> {
   %dequantized = tensor.dequantize(%codes, %scale) {block = [1, 32], to = f32} : (tensor<4x64xe8m0>, tensor<4x2xe8m0>) -> tensor<4x64xf32>
   func.return(%dequantized) : (tensor<4x64xf32>) -> ()

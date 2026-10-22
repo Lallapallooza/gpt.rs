@@ -365,7 +365,7 @@ Defined by `Unary` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates/
 |---|---|
 | Operands | `input`: tensor |
 | Results | `output`: tensor |
-| Traits | elementwise |
+| Traits | elementwise; narrow in f32, rounded once |
 | Effects | none |
 | Patterns | `UnaryToTile` (`tensor-to-tile`) |
 
@@ -429,7 +429,7 @@ Defined by `Binary` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crates
 |---|---|
 | Operands | `lhs`: tensor; `rhs`: tensor |
 | Results | `output`: tensor |
-| Traits | elementwise |
+| Traits | elementwise; narrow in f32, rounded once |
 | Effects | none |
 | Patterns | `BinaryToTile` (`tensor-to-tile`); `ScaleIntoDot` (`dot-scale-fold`, at `tensor.mul`) |
 
@@ -493,7 +493,7 @@ Defined by `Compare` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../crate
 |---|---|
 | Operands | `lhs`: tensor; `rhs`: tensor |
 | Results | `output`: tensor |
-| Traits | elementwise |
+| Traits | elementwise; narrow in f32, compared |
 | Effects | none |
 | Patterns | `CompareWithItself` (`canonicalize`); `CompareToTile` (`tensor-to-tile`) |
 
@@ -620,7 +620,7 @@ Defined by `DotGeneral` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../cr
 | Results | `output`: tensor |
 | Attributes | `batch_lhs`: `[i64]`, optional; `batch_rhs`: `[i64]`, optional; `contract_lhs`: `[i64]`; `contract_rhs`: `[i64]`; `accum`: `DType`, optional; `out`: `DType`, optional |
 | Effects | none |
-| Patterns | `PackGemmWeight` (`c-pack-weights`); `GroupedConvWeight` (`c-pack-weights`); `DotOfOneProduct` (`canonicalize`); `DropDefaultDtypes` (`canonicalize`); `NonNegativeDotAxes` (`canonicalize`); `TransposeIntoDot` (`canonicalize`); `MergeDotAxes` (`merge-contracted-axes`); `DotToTile` (`tensor-to-tile`) |
+| Patterns | `PackGemmWeight` (`c-pack-weights`); `GroupedConvWeight` (`c-pack-weights`); `DotOfOneProduct` (`canonicalize`); `DropDefaultDtypes` (`canonicalize`); `DropUnitContractions` (`canonicalize`); `NonNegativeDotAxes` (`canonicalize`); `TransposeIntoDot` (`canonicalize`); `MergeDotAxes` (`merge-contracted-axes`); `DotToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/contraction.ptir`:
 
@@ -1045,9 +1045,9 @@ Rejected, as the verify filetests pin it:
 ### `tensor.dynamic_update_slice`
 
 `base` with the block at the run-time `starts` replaced by
-`update`.
+`patch`.
 
-- The block's extents are the static extents of `update`, which has the dtype and rank of
+- The block's extents are the static extents of `patch`, which has the dtype and rank of
   `base`.
 - `starts` holds one `si32` or `si64` start per axis, of shape `[rank]`, clamped as in
   `tensor.dynamic_slice`: into `[0, extent - size]`.
@@ -1056,11 +1056,11 @@ Defined by `DynamicUpdateSlice` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](
 
 | | |
 |---|---|
-| Operands | `base`: tensor; `update`: tensor; `starts`: tensor |
+| Operands | `base`: tensor; `patch`: tensor; `starts`: tensor |
 | Results | `output`: tensor |
 | Traits | movement of operands 0 to 1 |
 | Effects | none |
-| Folds | An update as large as the base replaces all of it, so the result is the update. |
+| Folds | A patch as large as the base replaces all of it, so the result is the patch. |
 | Patterns | `DynamicUpdateSliceToTile` (`tensor-to-tile`) |
 
 Example, from `filetests/tensor/roundtrip/indexing.ptir`:
@@ -1075,10 +1075,10 @@ func.func @dynamic_update_slice(%cache: tensor<2x16x4xf32>, %update: tensor<2x1x
 
 Rejected, as the verify filetests pin it:
 
-- `tensor.dynamic_update_slice: update must have rank 2, got tensor<1xf32>`
+- `tensor.dynamic_update_slice: patch must have rank 2, got tensor<1xf32>`
 - `tensor.dynamic_update_slice: size 5 exceeds extent 4 on axis 0`
-- `tensor.dynamic_update_slice: update must have dtype f32, got tensor<1x8xsi32>`
-- `tensor.dynamic_update_slice: update must have static extents, got tensor<1x{N}xf32>`
+- `tensor.dynamic_update_slice: patch must have dtype f32, got tensor<1x8xsi32>`
+- `tensor.dynamic_update_slice: patch must have static extents, got tensor<1x{N}xf32>`
 
 ### `tensor.extract_patches`
 
@@ -1713,18 +1713,18 @@ Rejected, as the verify filetests pin it:
 
 ### `tensor.dequantize`
 
-`out[i] = to(q[i] * scale[i / block] + offset[i / block])`, computed in
-f32, then rounded to nearest-even in `to`.
+`out[i] = to(quantized[i] * scale[i / block] + offset[i / block])`,
+computed in f32, then rounded to nearest-even in `to`.
 
 - `to` is `f32`, `bf16` or `f16`. The scale and the offset follow the scale layout of
   "Quantization" in the dialect documentation. Without an offset, the sum adds nothing.
-- `q` holds quantized elements, integers or narrow floats, or the values of a code table that
-  `tensor.take` read at the codes: NF4 weights dequantize as `take(table, codes)` and then this
-  op.
+- `quantized` holds quantized elements, integers or narrow floats, or the values of a code table
+  that `tensor.take` read at the codes: NF4 weights dequantize as `take(table, codes)` and then
+  this op.
 - The offset carries asymmetric quantization: the zero points of GPTQ and AWQ as
   `offset = -zero_point * scale`, computed once at load time, and the block minimums of GGUF.
-- A backend SHOULD read `q` and `scale` in place inside the op that consumes the result, such
-  as a `dot_general` with a quantized weight.
+- A backend SHOULD read `quantized` and `scale` in place inside the op that consumes the result,
+  such as a `dot_general` with a quantized weight.
 - Autodiff MUST differentiate it as multiplication by the scale, so that
   `dequantize(quantize(x))` passes gradients through unchanged.
 - An extension op: a backend MAY reject it as unimplemented.
@@ -1733,7 +1733,7 @@ Defined by `Dequantize` in [crates/gpt-rs-ir/src/dialects/tensor/ir.rs](../../cr
 
 | | |
 |---|---|
-| Operands | `q`: tensor; `scale`: tensor; `offset`: optional tensor |
+| Operands | `quantized`: tensor; `scale`: tensor; `offset`: optional tensor |
 | Results | `output`: tensor |
 | Attributes | `block`: `[usize]`; `to`: `DType` |
 | Effects | none |
@@ -1751,7 +1751,7 @@ func.func @mxfp4(%quantized: tensor<4x64xf4e2m1>, %scales: tensor<4x2xe8m0>) -> 
 Rejected, as the verify filetests pin it:
 
 - `tensor.dequantize: the scale must have the extents [4, 2] for block [1, 32], got tensor<4x3xe8m0>`
-- `tensor.dequantize: q must be an integer, narrow float or float tensor, got tensor<4x64xe8m0>`
+- `tensor.dequantize: quantized must be an integer, narrow float or float tensor, got tensor<4x64xe8m0>`
 - `tensor.dequantize: the offset must have the scale's extents, got tensor<4x1xf16> and tensor<4x2xf16>`
 - `tensor.dequantize: the offset must be a float tensor, got tensor<4x2xe8m0>`
 
@@ -2039,6 +2039,18 @@ operands: a constant stores every element, so a broadcast splat stays a broadcas
 Defined by `Movement` in [crates/gpt-rs-ir/src/traits/structure.rs](../../crates/gpt-rs-ir/src/traits/structure.rs).
 
 Ops: `tensor.reshape`, `tensor.transpose`, `tensor.broadcast_to`, `tensor.slice`, `tensor.concat`, `tensor.take`, `tensor.dynamic_slice`, `tensor.dynamic_update_slice`.
+
+### `NarrowInF32`
+
+On floats that the IR computes on in f32 ([`DType::computes_in_f32`], bf16 and f16), the op is
+the op on their f32 values, with its float result rounded once to the operands' dtype, or, for
+a comparison, kept as it is. A backend without arithmetic on such floats computes the op in f32.
+
+Defined by `NarrowInF32` in [crates/gpt-rs-ir/src/traits/structure.rs](../../crates/gpt-rs-ir/src/traits/structure.rs).
+
+Ops: `tensor.neg`, `tensor.abs`, `tensor.exp`, `tensor.log`, `tensor.tanh`, `tensor.erf`, `tensor.rsqrt`, `tensor.reciprocal`, `tensor.sin`, `tensor.cos`, `tensor.not`, `tensor.add`, `tensor.sub`, `tensor.mul`, `tensor.div`, `tensor.maximum`, `tensor.minimum`, `tensor.and`, `tensor.or`, `tensor.xor`, `tensor.shift_left`, `tensor.shift_right_logical`, `tensor.shift_right_arithmetic`, `tensor.less`, `tensor.less_equal`, `tensor.equal`, `tensor.greater_equal`, `tensor.greater`, `tensor.not_equal`.
+
+Patterns rooted at it: `ComputeInF32` (`widen-narrow-floats`).
 
 ### `RightIdentity`
 

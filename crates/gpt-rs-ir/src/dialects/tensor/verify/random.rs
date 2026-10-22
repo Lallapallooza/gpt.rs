@@ -11,8 +11,8 @@ use crate::ir::{NoRegions, OwnedTypes, TensorType, TypeCx, Types};
 /// The type rule of every [`Rng`] op.
 pub(crate) fn rng<T: Rng>(
     op: &T,
-    ins: RngOperands<Types<'_>>,
-    _cx: &TypeCx<'_, NoRegions>,
+    ins: RngOperands<Types>,
+    _cx: &TypeCx<NoRegions>,
 ) -> Result<RngResults<OwnedTypes>> {
     let state = state_type();
     ensure!(

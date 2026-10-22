@@ -22,11 +22,10 @@ use self::quant::*;
 use self::random::*;
 use self::window::*;
 use super::{apply_conversion, ConversionTarget, ConvertOp, Mode, OpForm};
-use crate::dialects::tensor::{self, TensorOp};
+use crate::dialects::tensor::{self, TensorOps};
 use crate::dialects::Dialect;
-use crate::ir::Module;
 use crate::passes::{pass, Pass};
-use crate::rewrite::{PatternSet, Rewrites};
+use crate::rewrite::{PatternSet, Rewrites, Rewriting};
 
 /// Converts the `tensor` ops that compute on elements to `tile.block`s that compute the same
 /// values, bit for bit.
@@ -53,7 +52,7 @@ impl TensorToTile {
         let mut target =
             ConversionTarget::of_dialects(&[Dialect::Func, Dialect::Arith, Dialect::Tile]);
         let mut patterns = PatternSet::new();
-        TensorOp::convert::<TensorToTile>(&mut target, &mut patterns);
+        TensorOps::convert::<TensorToTile>(&mut target, &mut patterns);
         (target, patterns)
     }
 }
@@ -61,12 +60,12 @@ impl TensorToTile {
 impl Pass for TensorToTile {
     fn rewrites(&self) -> Rewrites {
         Rewrites {
-            folds: false,
             patterns: Self::conversion().1,
+            ..Rewrites::default()
         }
     }
 
-    fn run(&self, module: &mut Module) -> Result<bool> {
+    fn run(&self, module: &mut Rewriting) -> Result<bool> {
         let (target, patterns) = Self::conversion();
         let converted = apply_conversion(module, &target, &patterns, Mode::Full)?;
         TensorToTile::CONVERTED.add(converted);

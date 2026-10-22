@@ -11,15 +11,15 @@ use crate::ir::{
 impl OpDef for Yield {
     fn result_types(
         &self,
-        _ins: YieldOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        _ins: YieldOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<YieldResults<OwnedTypes>> {
         Ok(YieldResults::default())
     }
 }
 
 impl RegionOpDef for Cond {
-    fn region_signatures(&self, ins: CondOperands<Types<'_>>) -> Result<CondRegions<RegionSig>> {
+    fn region_signatures(&self, ins: CondOperands<Types>) -> Result<CondRegions<RegionSig>> {
         let branch = || {
             RegionSig::new(
                 tensors(&ins.args),
@@ -36,8 +36,8 @@ impl RegionOpDef for Cond {
 impl OpDef for Cond {
     fn result_types(
         &self,
-        ins: CondOperands<Types<'_>>,
-        _cx: &TypeCx<'_, CondRegions<Region>>,
+        ins: CondOperands<Types>,
+        _cx: &TypeCx<CondRegions<Region>>,
     ) -> Result<CondResults<OwnedTypes>> {
         ensure_predicate(ins.pred)?;
         Ok(CondResults {
@@ -47,7 +47,7 @@ impl OpDef for Cond {
 }
 
 impl RegionOpDef for While {
-    fn region_signatures(&self, ins: WhileOperands<Types<'_>>) -> Result<WhileRegions<RegionSig>> {
+    fn region_signatures(&self, ins: WhileOperands<Types>) -> Result<WhileRegions<RegionSig>> {
         let carried = tensors(&ins.init);
         let predicate = Type::Tensor(TensorType::new(DType::I1, [] as [usize; 0]));
         let cond_yields = [vec![predicate], carried.clone()].concat();
@@ -61,8 +61,8 @@ impl RegionOpDef for While {
 impl OpDef for While {
     fn result_types(
         &self,
-        ins: WhileOperands<Types<'_>>,
-        _cx: &TypeCx<'_, WhileRegions<Region>>,
+        ins: WhileOperands<Types>,
+        _cx: &TypeCx<WhileRegions<Region>>,
     ) -> Result<WhileResults<OwnedTypes>> {
         Ok(WhileResults {
             outputs: ins.init.iter().map(|&ty| ty.clone()).collect(),
@@ -71,7 +71,7 @@ impl OpDef for While {
 }
 
 impl RegionOpDef for Scan {
-    fn region_signatures(&self, ins: ScanOperands<Types<'_>>) -> Result<ScanRegions<RegionSig>> {
+    fn region_signatures(&self, ins: ScanOperands<Types>) -> Result<ScanRegions<RegionSig>> {
         steps(self, &ins.inputs)?;
         let (carried, scanned) = ins.inputs.split_at(self.carry_count);
         let mut args = tensors(carried);
@@ -92,8 +92,8 @@ impl RegionOpDef for Scan {
 impl OpDef for Scan {
     fn result_types(
         &self,
-        ins: ScanOperands<Types<'_>>,
-        _cx: &TypeCx<'_, ScanRegions<Region>>,
+        ins: ScanOperands<Types>,
+        _cx: &TypeCx<ScanRegions<Region>>,
     ) -> Result<ScanResults<OwnedTypes>> {
         let steps = steps(self, &ins.inputs)?;
         let mut outputs: Vec<TensorType> = ins.inputs[..self.carry_count]

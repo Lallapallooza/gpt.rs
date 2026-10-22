@@ -56,30 +56,30 @@ func.func @dynamic_slice_size(%input: tensor<4x8xf32>, %starts: tensor<2xsi32>) 
 }
 
 // -----
-// ERROR: tensor.dynamic_update_slice: update must have rank 2, got tensor<1xf32>
-func.func @dynamic_update_slice_rank(%input: tensor<4x8xf32>, %update: tensor<1xf32>, %starts: tensor<2xsi32>) -> tensor<4x8xf32> {
-  %updated = tensor.dynamic_update_slice(%input, %update, %starts) : (tensor<4x8xf32>, tensor<1xf32>, tensor<2xsi32>) -> tensor<4x8xf32>
+// ERROR: tensor.dynamic_update_slice: patch must have rank 2, got tensor<1xf32>
+func.func @dynamic_update_slice_rank(%input: tensor<4x8xf32>, %patch: tensor<1xf32>, %starts: tensor<2xsi32>) -> tensor<4x8xf32> {
+  %updated = tensor.dynamic_update_slice(%input, %patch, %starts) : (tensor<4x8xf32>, tensor<1xf32>, tensor<2xsi32>) -> tensor<4x8xf32>
   func.return(%updated) : (tensor<4x8xf32>) -> ()
 }
 
 // -----
 // ERROR: tensor.dynamic_update_slice: size 5 exceeds extent 4 on axis 0
-func.func @dynamic_update_slice_size(%input: tensor<4x8xf32>, %update: tensor<5x8xf32>, %starts: tensor<2xsi32>) -> tensor<4x8xf32> {
-  %updated = tensor.dynamic_update_slice(%input, %update, %starts) : (tensor<4x8xf32>, tensor<5x8xf32>, tensor<2xsi32>) -> tensor<4x8xf32>
+func.func @dynamic_update_slice_size(%input: tensor<4x8xf32>, %patch: tensor<5x8xf32>, %starts: tensor<2xsi32>) -> tensor<4x8xf32> {
+  %updated = tensor.dynamic_update_slice(%input, %patch, %starts) : (tensor<4x8xf32>, tensor<5x8xf32>, tensor<2xsi32>) -> tensor<4x8xf32>
   func.return(%updated) : (tensor<4x8xf32>) -> ()
 }
 
 // -----
-// ERROR: tensor.dynamic_update_slice: update must have dtype f32, got tensor<1x8xsi32>
-func.func @dynamic_update_slice_update_dtype(%input: tensor<4x8xf32>, %update: tensor<1x8xsi32>, %starts: tensor<2xsi32>) -> tensor<4x8xf32> {
-  %updated = tensor.dynamic_update_slice(%input, %update, %starts) : (tensor<4x8xf32>, tensor<1x8xsi32>, tensor<2xsi32>) -> tensor<4x8xf32>
+// ERROR: tensor.dynamic_update_slice: patch must have dtype f32, got tensor<1x8xsi32>
+func.func @dynamic_update_slice_patch_dtype(%input: tensor<4x8xf32>, %patch: tensor<1x8xsi32>, %starts: tensor<2xsi32>) -> tensor<4x8xf32> {
+  %updated = tensor.dynamic_update_slice(%input, %patch, %starts) : (tensor<4x8xf32>, tensor<1x8xsi32>, tensor<2xsi32>) -> tensor<4x8xf32>
   func.return(%updated) : (tensor<4x8xf32>) -> ()
 }
 
 // -----
-// ERROR: tensor.dynamic_update_slice: update must have static extents, got tensor<1x{N}xf32>
-func.func @dynamic_update_slice_dynamic_update(%input: tensor<4x8xf32>, %update: tensor<1x{N}xf32>, %starts: tensor<2xsi32>) -> tensor<4x8xf32> {
-  %updated = tensor.dynamic_update_slice(%input, %update, %starts) : (tensor<4x8xf32>, tensor<1x{N}xf32>, tensor<2xsi32>) -> tensor<4x8xf32>
+// ERROR: tensor.dynamic_update_slice: patch must have static extents, got tensor<1x{N}xf32>
+func.func @dynamic_update_slice_dynamic_patch(%input: tensor<4x8xf32>, %patch: tensor<1x{N}xf32>, %starts: tensor<2xsi32>) -> tensor<4x8xf32> {
+  %updated = tensor.dynamic_update_slice(%input, %patch, %starts) : (tensor<4x8xf32>, tensor<1x{N}xf32>, tensor<2xsi32>) -> tensor<4x8xf32>
   func.return(%updated) : (tensor<4x8xf32>) -> ()
 }
 

@@ -12,8 +12,8 @@ use crate::ir::{DType, NoRegions, OpDef, OwnedTypes, TypeCx, Types};
 impl OpDef for Select {
     fn result_types(
         &self,
-        ins: SelectOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        ins: SelectOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<SelectResults<OwnedTypes>> {
         ensure!(
             ins.pred.dtype == DType::I1,
@@ -36,8 +36,8 @@ impl OpDef for Select {
 impl OpDef for Cast {
     fn result_types(
         &self,
-        ins: CastOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        ins: CastOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<CastResults<OwnedTypes>> {
         // e8m0 scales come from the `block_scale_*` ops, which state how they round them.
         ensure_dtype_class("to", self.to, CASTABLE)?;
@@ -50,8 +50,8 @@ impl OpDef for Cast {
 impl OpDef for StopGradient {
     fn result_types(
         &self,
-        ins: StopGradientOperands<Types<'_>>,
-        _cx: &TypeCx<'_, NoRegions>,
+        ins: StopGradientOperands<Types>,
+        _cx: &TypeCx<NoRegions>,
     ) -> Result<StopGradientResults<OwnedTypes>> {
         Ok(StopGradientResults {
             output: ins.input.clone(),
@@ -62,8 +62,8 @@ impl OpDef for StopGradient {
 /// The type rule of every [`Unary`] op.
 pub(crate) fn unary<T: Unary>(
     _op: &T,
-    ins: UnaryOperands<Types<'_>>,
-    _cx: &TypeCx<'_, NoRegions>,
+    ins: UnaryOperands<Types>,
+    _cx: &TypeCx<NoRegions>,
 ) -> Result<UnaryResults<OwnedTypes>> {
     ensure_class("the input", ins.input, <T::Scalar as arith::Unary>::CLASSES)?;
     Ok(UnaryResults {
@@ -74,8 +74,8 @@ pub(crate) fn unary<T: Unary>(
 /// The type rule of every [`Binary`] op.
 pub(crate) fn binary<T: Binary>(
     _op: &T,
-    ins: BinaryOperands<Types<'_>>,
-    _cx: &TypeCx<'_, NoRegions>,
+    ins: BinaryOperands<Types>,
+    _cx: &TypeCx<NoRegions>,
 ) -> Result<BinaryResults<OwnedTypes>> {
     ensure_equal_types("operands", &ins.lhs, &ins.rhs)?;
     ensure_class(
@@ -91,8 +91,8 @@ pub(crate) fn binary<T: Binary>(
 /// The type rule of every [`Compare`] op.
 pub(crate) fn compare<T: Compare>(
     _op: &T,
-    ins: CompareOperands<Types<'_>>,
-    _cx: &TypeCx<'_, NoRegions>,
+    ins: CompareOperands<Types>,
+    _cx: &TypeCx<NoRegions>,
 ) -> Result<CompareResults<OwnedTypes>> {
     ensure_equal_types("operands", &ins.lhs, &ins.rhs)?;
     ensure_class("each operand", ins.lhs, ORDERED)?;

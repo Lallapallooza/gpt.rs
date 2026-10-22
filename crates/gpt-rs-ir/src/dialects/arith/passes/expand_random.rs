@@ -19,8 +19,8 @@ use crate::rewrite::{pattern, NoMatch, Pattern, PatternSet, Rewriter, Rewrites, 
 /// `arith.rng_uniform` becomes its draw in `arith`: the Philox4x32-10 block that holds the
 /// element's words of the stream, by integer ops on ui64 values of 32 bits each, the words picked
 /// from it, and the element they give: the low bits of the words for an integer, wrapped to its
-/// dtype, and for a float the top bits of its significand, scaled into `[0, 1)`. The words of one
-/// element lie in one block, since their count divides the block's.
+/// dtype, and for a float as many top bits of the words as its significand has, scaled into
+/// `[0, 1)`. The words of one element lie in one block, since their count divides the block's.
 #[pattern]
 struct ExpandRngUniform;
 
@@ -137,9 +137,9 @@ fn philox(
 
 /// The element of `dtype` that the low `width` bits of the ui64 `bits` give, with the stream's
 /// first word least significant. An integer takes the low bits, as two's complement when it is
-/// signed. A float takes the top bits of its significand as an integer and scales them into
-/// `[0, 1)` by a power of two. It scales in f32 when the integer fits there, as it does for every
-/// narrower float, and in f64 otherwise.
+/// signed. A float takes as many top bits as its significand has, as an integer, and scales them
+/// into `[0, 1)` by a power of two. It scales in f32 when the integer fits there, as it does for
+/// every narrower float, and in f64 otherwise.
 fn uniform(
     body: &mut ScalarBuilder<Rewriter>,
     dtype: DType,

@@ -25,8 +25,8 @@ use crate::ir::{DType, Eval, EvalCx, Host, NoRegions, OwnedHost};
 impl Eval for DotGeneral {
     fn eval(
         &self,
-        ins: DotGeneralOperands<Host<'_>>,
-        _cx: &mut EvalCx<'_, NoRegions>,
+        ins: DotGeneralOperands<Host>,
+        _cx: &mut EvalCx<NoRegions>,
     ) -> Result<DotGeneralResults<OwnedHost>> {
         let (lhs, rhs) = (ins.lhs, ins.rhs);
         let (accum, out) = (self.accum_dtype(lhs.dtype()), self.out_dtype(lhs.dtype()));
@@ -100,8 +100,10 @@ impl Accumulation for Dot {
             .rows
             .iter()
             .map(|&(lhs_row, rhs_row)| {
-                self.terms.iter().fold(zero, |sum, &(l, r)| {
-                    let product = round(mul(lhs[lhs_row + l], rhs[rhs_row + r]).expect(defined));
+                self.terms.iter().fold(zero, |sum, &(lhs_term, rhs_term)| {
+                    let product = round(
+                        mul(lhs[lhs_row + lhs_term], rhs[rhs_row + rhs_term]).expect(defined),
+                    );
                     round(add(sum, product).expect(defined))
                 })
             })
@@ -171,20 +173,26 @@ impl<C: Combiner> Accumulation for Fold<'_, C> {
             .groups
             .iter()
             .map(|group| {
-                group
-                    .iter()
-                    .fold(init, |acc, &i| round(combine(acc, x[i]).expect(defined)))
+                group.iter().fold(init, |acc, &index| {
+                    round(combine(acc, x[index]).expect(defined))
+                })
             })
             .collect())
     }
 }
 
-/// How element `a` of `data` orders against element `b`, with NaN above every number.
+/// How element `first` of `data` orders against element `second`, with NaN above every number.
 fn order<'a>(data: &'a TensorData) -> Box<dyn Fn(usize, usize) -> Ordering + 'a> {
     match values(data) {
-        Values::Int(v) => Box::new(move |a, b| i128::order(v[a], v[b])),
-        Values::F32(v) => Box::new(move |a, b| f32::order(v[a], v[b])),
-        Values::F64(v) => Box::new(move |a, b| f64::order(v[a], v[b])),
+        Values::Int(elements) => {
+            Box::new(move |first, second| i128::order(elements[first], elements[second]))
+        }
+        Values::F32(elements) => {
+            Box::new(move |first, second| f32::order(elements[first], elements[second]))
+        }
+        Values::F64(elements) => {
+            Box::new(move |first, second| f64::order(elements[first], elements[second]))
+        }
     }
 }
 
@@ -195,20 +203,24 @@ fn split_axis(dims: &[usize], axis: usize) -> (usize, usize, usize) {
     (outer, dims[axis], inner)
 }
 
-/// The indices of every line along `axis`: element `j` of line `(o, i)` is at
-/// `(o * n + j) * inner + i`.
+/// The indices of every line along `axis`: element `line_index` of the line
+/// `(outer_index, inner_index)` is at `(outer_index * extent + line_index) * inner + inner_index`.
 fn lines(dims: &[usize], axis: usize) -> impl Iterator<Item = Vec<usize>> {
-    let (outer, n, inner) = split_axis(dims, axis);
-    (0..outer).flat_map(move |o| {
-        (0..inner).map(move |i| (0..n).map(|j| (o * n + j) * inner + i).collect())
+    let (outer, extent, inner) = split_axis(dims, axis);
+    (0..outer).flat_map(move |outer_index| {
+        (0..inner).map(move |inner_index| {
+            (0..extent)
+                .map(|line_index| (outer_index * extent + line_index) * inner + inner_index)
+                .collect()
+        })
     })
 }
 
 impl Eval for ArgMax {
     fn eval(
         &self,
-        ins: ArgMaxOperands<Host<'_>>,
-        cx: &mut EvalCx<'_, NoRegions>,
+        ins: ArgMaxOperands<Host>,
+        cx: &mut EvalCx<NoRegions>,
     ) -> Result<ArgMaxResults<OwnedHost>> {
         let compare = order(&ins.input.data);
         let axis = axis_index(self.axis, ins.input.dims.len())?;
@@ -231,24 +243,24 @@ pub(crate) fn reduce_segments<C: Combiner>(
     data: &HostTensor,
     ids: &HostTensor,
 ) -> Result<HostTensor> {
-    let ids = ids.as_indices()?;
+    let segment_ids = ids.as_indices()?;
     if attrs.indices_are_sorted {
         ensure!(
-            ids.windows(2).all(|pair| pair[0] <= pair[1]),
+            segment_ids.windows(2).all(|pair| pair[0] <= pair[1]),
             "the segment ids are not sorted"
         );
     }
     if attrs.unique {
         let mut seen = std::collections::HashSet::new();
         ensure!(
-            ids.iter().all(|id| seen.insert(id)),
+            segment_ids.iter().all(|id| seen.insert(id)),
             "the segment ids repeat"
         );
     }
     let row: usize = data.dims[1..].iter().product();
     // Element `e` of segment `s` folds element `e` of every row that `s` holds, in order.
     let mut groups = vec![Vec::new(); attrs.num_segments * row];
-    for (row_index, &id) in ids.iter().enumerate() {
+    for (row_index, &id) in segment_ids.iter().enumerate() {
         let segment = usize::try_from(id)
             .ok()
             .filter(|&segment| segment < attrs.num_segments)
@@ -270,15 +282,15 @@ pub(crate) fn reduce_segments<C: Combiner>(
 
 /// A tensor of `indices` in the index dtype `dtype`, si32 or si64.
 fn index_tensor(dims: Vec<usize>, indices: &[usize], dtype: DType) -> Result<HostTensor> {
-    let data = from_ints(dtype, indices.iter().map(|&i| i as i128))?;
+    let data = from_ints(dtype, indices.iter().map(|&index| index as i128))?;
     HostTensor::new(dims, data)
 }
 
 /// The semantics of every [`Reduce`] op.
 pub(crate) fn reduce<T: Reduce>(
     op: &T,
-    ins: ReduceOperands<Host<'_>>,
-    _cx: &mut EvalCx<'_, NoRegions>,
+    ins: ReduceOperands<Host>,
+    _cx: &mut EvalCx<NoRegions>,
 ) -> Result<ReduceResults<OwnedHost>> {
     Ok(ReduceResults {
         output: reduce_axes::<T::Combiner>(op, ins.input)?,
@@ -288,8 +300,8 @@ pub(crate) fn reduce<T: Reduce>(
 /// The semantics of every [`Segment`] op.
 pub(crate) fn segment<T: Segment>(
     op: &T,
-    ins: SegmentOperands<Host<'_>>,
-    _cx: &mut EvalCx<'_, NoRegions>,
+    ins: SegmentOperands<Host>,
+    _cx: &mut EvalCx<NoRegions>,
 ) -> Result<SegmentResults<OwnedHost>> {
     Ok(SegmentResults {
         output: reduce_segments::<T::Combiner>(op, ins.data, ins.segment_ids)?,
@@ -299,8 +311,8 @@ pub(crate) fn segment<T: Segment>(
 /// The semantics of every [`SelectK`] op.
 pub(crate) fn select_k<T: SelectK>(
     op: &T,
-    ins: SelectKOperands<Host<'_>>,
-    cx: &mut EvalCx<'_, NoRegions>,
+    ins: SelectKOperands<Host>,
+    cx: &mut EvalCx<NoRegions>,
 ) -> Result<SelectKResults<OwnedHost>> {
     let input = ins.input;
     let compare = order(&input.data);

@@ -6,11 +6,7 @@ use crate::ir::{fold, Fold, FoldCx, FoldOut, Folded, Folding};
 /// A bitcast to the input's own type is the input.
 #[fold]
 impl Fold for Bitcast {
-    fn fold(
-        &self,
-        ins: BitcastOperands<Folding<'_>>,
-        cx: &FoldCx<'_>,
-    ) -> Option<BitcastResults<FoldOut>> {
+    fn fold(&self, ins: BitcastOperands<Folding>, cx: &FoldCx) -> Option<BitcastResults<FoldOut>> {
         Some(BitcastResults {
             output: cx.identity(ins.input)?,
         })
@@ -21,11 +17,7 @@ impl Fold for Bitcast {
 /// with the new extents, its elements in the same row-major order.
 #[fold]
 impl Fold for Reshape {
-    fn fold(
-        &self,
-        ins: ReshapeOperands<Folding<'_>>,
-        cx: &FoldCx<'_>,
-    ) -> Option<ReshapeResults<FoldOut>> {
+    fn fold(&self, ins: ReshapeOperands<Folding>, cx: &FoldCx) -> Option<ReshapeResults<FoldOut>> {
         let input = ins.input;
         let output = match cx.identity(input) {
             Some(output) => output,
@@ -40,8 +32,8 @@ impl Fold for Reshape {
 impl Fold for Transpose {
     fn fold(
         &self,
-        ins: TransposeOperands<Folding<'_>>,
-        _cx: &FoldCx<'_>,
+        ins: TransposeOperands<Folding>,
+        _cx: &FoldCx,
     ) -> Option<TransposeResults<FoldOut>> {
         self.perm.is_identity().then_some(TransposeResults {
             output: Folded::Value(ins.input.value),
@@ -54,8 +46,8 @@ impl Fold for Transpose {
 impl Fold for BroadcastTo {
     fn fold(
         &self,
-        ins: BroadcastToOperands<Folding<'_>>,
-        cx: &FoldCx<'_>,
+        ins: BroadcastToOperands<Folding>,
+        cx: &FoldCx,
     ) -> Option<BroadcastToResults<FoldOut>> {
         Some(BroadcastToResults {
             output: cx.identity(ins.input)?,
@@ -66,11 +58,7 @@ impl Fold for BroadcastTo {
 /// A slice with the input's extents covers the whole input, so it is the input.
 #[fold]
 impl Fold for Slice {
-    fn fold(
-        &self,
-        ins: SliceOperands<Folding<'_>>,
-        cx: &FoldCx<'_>,
-    ) -> Option<SliceResults<FoldOut>> {
+    fn fold(&self, ins: SliceOperands<Folding>, cx: &FoldCx) -> Option<SliceResults<FoldOut>> {
         Some(SliceResults {
             output: cx.identity(ins.input)?,
         })
@@ -80,11 +68,7 @@ impl Fold for Slice {
 /// A concat of one input is that input.
 #[fold]
 impl Fold for Concat {
-    fn fold(
-        &self,
-        ins: ConcatOperands<Folding<'_>>,
-        _cx: &FoldCx<'_>,
-    ) -> Option<ConcatResults<FoldOut>> {
+    fn fold(&self, ins: ConcatOperands<Folding>, _cx: &FoldCx) -> Option<ConcatResults<FoldOut>> {
         let [input] = ins.inputs.as_slice() else {
             return None;
         };

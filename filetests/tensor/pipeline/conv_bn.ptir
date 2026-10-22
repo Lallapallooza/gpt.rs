@@ -3,13 +3,13 @@
 // A convolution as a dot, followed by a BatchNorm whose scale and shift are parameters: the scale
 // moves into the weight, the scaled weight becomes a load-time result, and the run computes one
 // dot and one add.
-// ROUNDING: the scale rounds into every weight before the sum, instead of into the sum once
-// CHECK: func.func @conv_bn([[INPUT:%[0-9]+]]: tensor<2x3xf32>, [[WEIGHT:%[0-9]+]]: tensor<3x4xf32> {param = 1}, [[SCALE:%[0-9]+]]: tensor<4xf32> {param = 2}, [[SHIFT:%[0-9]+]]: tensor<4xf32> {param = 3}, [[SCALED_WEIGHT:%[0-9]+]]: tensor<3x4xf32> {param = [[SCALED_WEIGHT_ID:[0-9]+]]}) -> tensor<2x4xf32>
+// ROUNDING: fold_scale: the scale rounds into every weight before the sum, instead of into the sum once
+// CHECK: func.func @static.{{[0-9a-f]+}}([[STATIC_WEIGHT:%[0-9]+]]: tensor<3x4xf32> {param = 1}, [[STATIC_SCALE:%[0-9]+]]: tensor<4xf32> {param = 2}) -> (tensor<3x4xf32> {param = [[SCALED_WEIGHT_ID:[0-9]+]]})
+// CHECK: func.func @conv_bn([[INPUT:%[0-9]+]]: tensor<2x3xf32>, [[WEIGHT:%[0-9]+]]: tensor<3x4xf32> {param = 1}, [[SCALE:%[0-9]+]]: tensor<4xf32> {param = 2}, [[SHIFT:%[0-9]+]]: tensor<4xf32> {param = 3}, [[SCALED_WEIGHT:%[0-9]+]]: tensor<3x4xf32> {param = [[SCALED_WEIGHT_ID]]}) -> tensor<2x4xf32>
 // CHECK-NEXT: [[PRODUCT:%[0-9]+]] = tensor.dot_general([[INPUT]], [[SCALED_WEIGHT]])
 // CHECK-NEXT: [[SHIFTS:%[0-9]+]] = tensor.broadcast_to([[SHIFT]]) {shape = [2, 4]}
 // CHECK-NEXT: [[NORMALIZED:%[0-9]+]] = tensor.add([[PRODUCT]], [[SHIFTS]])
 // CHECK-NEXT: func.return([[NORMALIZED]])
-// CHECK: func.func @static.{{[0-9a-f]+}}([[STATIC_WEIGHT:%[0-9]+]]: tensor<3x4xf32> {param = 1}, [[STATIC_SCALE:%[0-9]+]]: tensor<4xf32> {param = 2}) -> (tensor<3x4xf32> {param = [[SCALED_WEIGHT_ID]]})
 func.func @conv_bn(%input: tensor<2x3xf32>, %weight: tensor<3x4xf32> {param = 1}, %scale: tensor<4xf32> {param = 2}, %shift: tensor<4xf32> {param = 3}) -> tensor<2x4xf32> {
   %product = tensor.dot_general(%input, %weight) {contract_lhs = [1], contract_rhs = [0]} : (tensor<2x3xf32>, tensor<3x4xf32>) -> tensor<2x4xf32>
   %scales = tensor.broadcast_to(%scale) {shape = [2, 4]} : (tensor<4xf32>) -> tensor<2x4xf32>

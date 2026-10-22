@@ -46,15 +46,25 @@ impl AddAssign for Cost {
     }
 }
 
-/// An op whose cost the default model gets wrong. `#[cost]` on the impl registers it.
+/// An op whose cost the default model gets wrong, such as one whose cost comes from its regions,
+/// which it runs as often as its semantics say, or from the function it calls. `#[cost]` on the
+/// impl registers it, and the ops of the regions of a registered op count in its cost alone.
 pub trait OpCost: OpKind {
-    /// The op's cost on operands and results of these types, or `None` when a dynamic extent
-    /// leaves it unknown.
-    fn cost(&self, ins: Operands<Self, Types<'_>>, outs: Results<Self, Types<'_>>) -> Option<Cost>;
+    /// The op's cost at `at`, or `None` when a dynamic extent leaves it unknown.
+    fn cost(&self, at: CostAt<Self>) -> Option<Cost>;
+}
+
+/// Where an op's cost is asked: the module, the op's instruction, and the types of its operands
+/// and results in its groups.
+pub struct CostAt<'m, T: OpKind> {
+    pub module: &'m Module,
+    pub inst: Inst,
+    pub ins: Operands<T, Types<'m>>,
+    pub outs: Results<T, Types<'m>>,
 }
 
 /// An op's registered cost, erased to run on any op value.
-pub type CostFn = fn(&dyn Any, &[&Type], Option<&[usize]>, &[&Type]) -> Option<Cost>;
+pub type CostFn = fn(&dyn Any, &Module, Inst) -> Option<Cost>;
 
 /// One op's registered cost.
 pub struct CostEntry {
@@ -72,25 +82,32 @@ pub static COSTS: [CostEntry];
 
 /// `T`'s cost as a [`CostFn`], which `#[cost]` registers.
 pub fn cost_erased<T: OpCost + 'static>(
-    op: &dyn Any,
-    ins: &[&Type],
-    segments: Option<&[usize]>,
-    outs: &[&Type],
+    erased_op: &dyn Any,
+    module: &Module,
+    inst: Inst,
 ) -> Option<Cost> {
-    let op = op.downcast_ref::<T>()?;
-    let ins = T::Groups::split_operands::<Types<'_>>(ins.iter().copied(), segments).ok()?;
-    let outs = T::Groups::split_results::<Types<'_>>(outs.iter().copied(), None).ok()?;
-    op.cost(ins, outs)
+    let op = erased_op.downcast_ref::<T>()?;
+    let operand_types = module.operand_types(inst);
+    let result_types = module.result_types(inst);
+    let segments = module.operand_segments(inst);
+    let ins =
+        T::Groups::split_operands::<Types<'_>>(operand_types.iter().copied(), segments).ok()?;
+    let outs = T::Groups::split_results::<Types<'_>>(result_types.iter().copied(), None).ok()?;
+    op.cost(CostAt {
+        module,
+        inst,
+        ins,
+        outs,
+    })
 }
 
-/// The cost of `op` on operands of types `ins`, in the groups `segments`, giving results of types
-/// `outs`: its registered cost, or else [`default_cost`].
-pub fn op_cost(op: &Op, ins: &[&Type], segments: Option<&[usize]>, outs: &[&Type]) -> Option<Cost> {
+/// The registered cost of `op`, when it has one.
+fn registered_cost(op: &Op) -> Option<CostFn> {
     let op_type = op.dyn_any().type_id();
-    match COSTS.iter().find(|entry| (entry.op)() == op_type) {
-        Some(entry) => (entry.cost)(op.dyn_any(), ins, segments, outs),
-        None => default_cost(op, ins, outs),
-    }
+    COSTS
+        .iter()
+        .find(|entry| (entry.op)() == op_type)
+        .map(|entry| entry.cost)
 }
 
 /// The cost of an op that computes each result element once, from the operand elements:
@@ -123,10 +140,11 @@ pub fn default_cost(op: &Op, ins: &[&Type], outs: &[&Type]) -> Option<Cost> {
 }
 
 /// The elements of a value of type `ty`: one for a scalar, an index or a buffer, whose value is
-/// where its elements are.
+/// where its elements are, and every lane of a vector.
 pub fn elements(ty: &Type) -> Option<u64> {
     match ty {
         Type::Tensor(tensor) => tensor_elements(tensor),
+        Type::Vector(vector) => tensor_elements(&vector.tensor_type()),
         Type::Scalar(_) | Type::Index | Type::Buffer(_) => Some(1),
     }
 }
@@ -135,8 +153,9 @@ pub fn elements(ty: &Type) -> Option<u64> {
 pub fn bytes(ty: &Type) -> Option<u64> {
     match ty {
         Type::Tensor(tensor) => tensor_bytes(tensor),
+        Type::Vector(vector) => tensor_bytes(&vector.tensor_type()),
         Type::Scalar(dtype) => Some((dtype.bits() as u64).div_ceil(8)),
-        Type::Index | Type::Buffer(_) => Some(8),
+        Type::Index | Type::Buffer(_) => Some(Type::INDEX_BYTES),
     }
 }
 
@@ -173,19 +192,28 @@ pub struct CostSummary {
 impl Module {
     /// The cost of the op of `inst`, or `None` when a dynamic extent leaves it unknown.
     pub fn cost(&self, inst: Inst) -> Option<Cost> {
-        op_cost(
-            self.op(inst),
-            &self.operand_types(inst),
-            self.operand_segments(inst),
-            &self.result_types(inst),
-        )
+        let op = self.op(inst);
+        match registered_cost(op) {
+            Some(cost) => cost(op.dyn_any(), self, inst),
+            None => default_cost(op, &self.operand_types(inst), &self.result_types(inst)),
+        }
     }
 
     /// The cost of the ops under `region`, those of nested regions once each, in the groups that
-    /// `group` names, such as op names. Terminators move no data, so they are left out.
+    /// `group` names, such as op names. Terminators move no data, so they are left out, and the
+    /// ops in the regions of an op with a registered [`OpCost`] count in its cost alone.
     pub fn cost_summary(&self, region: Region, group: impl Fn(Inst) -> String) -> CostSummary {
         let mut summary = CostSummary::default();
-        for inst in self.walk(region) {
+        let mut pending: Vec<Inst> = self.insts(region).collect();
+        pending.reverse();
+        while let Some(inst) = pending.pop() {
+            if registered_cost(self.op(inst)).is_none() {
+                for &inner in self.regions(inst).iter().rev() {
+                    let mut nested: Vec<Inst> = self.insts(inner).collect();
+                    nested.reverse();
+                    pending.extend(nested);
+                }
+            }
             let op = self.op(inst);
             if op.has_trait::<Terminator>() {
                 continue;

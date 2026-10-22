@@ -58,7 +58,7 @@ impl Conv2d {
         let kernel = [kh, kw];
         let padding = match self.padding {
             ConvPadding::Centered => {
-                let [pad_h, pad_w] = kernel.map(|k| (k - 1) / 2 * self.dilation);
+                let [pad_h, pad_w] = kernel.map(|extent| (extent - 1) / 2 * self.dilation);
                 Padding2d {
                     top: pad_h,
                     bottom: pad_h,
@@ -107,9 +107,9 @@ impl ConvNormActivation {
     }
 
     fn forward(&self, x: &Tensor) -> Tensor {
-        let x = self.convolution(x);
-        let x = self.normalization(&x);
-        self.activation(&x).unwrap_or(x)
+        let convolved = self.convolution(x);
+        let normalized = self.normalization(&convolved);
+        self.activation(&normalized).unwrap_or(normalized)
     }
 }
 
@@ -122,13 +122,13 @@ fn tf_same_padding(
     dilation: usize,
 ) -> Padding2d {
     let [(top, bottom), (left, right)] = [0, 1].map(|axis| {
-        let (size, kernel) = (input[axis], kernel[axis]);
+        let (size, extent) = (input[axis], kernel[axis]);
         let remainder = match size % stride {
             0 => stride,
             remainder => remainder,
         };
-        let total = kernel.saturating_sub(remainder) * dilation;
-        let before = kernel.saturating_sub(remainder) / 2 * dilation;
+        let total = extent.saturating_sub(remainder) * dilation;
+        let before = extent.saturating_sub(remainder) / 2 * dilation;
         (before, total - before)
     });
     Padding2d {

@@ -3,10 +3,63 @@
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, ensure, Result};
+use gpt_rs_ir::ir::{Ranked, TensorType};
 
 use crate::backend::PortableBackend;
 use crate::tensor::{DType, DeviceTensor};
+
+/// How a constructor reads a tensor of the checkpoint: as stored, or as a view of its bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TensorView {
+    /// As stored.
+    Stored,
+    /// Without its axes of one element: the `[out, in, 1, 1]` weight of a 1x1 convolution reads as
+    /// `[out, in]` where neither extent is 1.
+    WithoutUnitAxes,
+    /// Its bits read as elements of this dtype, as `tensor.bitcast` reads them, its last axis
+    /// scaled by the ratio of the widths: the int32 words of a 4-bit checkpoint read as its codes.
+    Bitcast(DType),
+}
+
+impl TensorView {
+    /// The type of a tensor stored as `stored`, read as this view says. It fails on dynamic
+    /// extents. A bitcast also fails on a tensor with no axes, and on rows that hold no whole
+    /// number of the elements it reads.
+    pub fn type_of(self, stored: &TensorType) -> Result<TensorType> {
+        let dims = stored
+            .static_dims()
+            .ok_or_else(|| anyhow!("a checkpoint tensor of type {stored} has dynamic extents"))?;
+        match self {
+            TensorView::Stored => Ok(stored.clone()),
+            TensorView::WithoutUnitAxes => {
+                let mut kept = Ranked::<usize>::new();
+                for &extent in &dims {
+                    if extent != 1 {
+                        kept.push(extent);
+                    }
+                }
+                Ok(TensorType::new(stored.dtype, kept))
+            }
+            TensorView::Bitcast(to) => {
+                let (&last, outer) = dims.split_last().ok_or_else(|| {
+                    anyhow!("a tensor of type {stored} has no axis to read as {to}")
+                })?;
+                let bits = last * stored.dtype.bits();
+                ensure!(
+                    bits.is_multiple_of(to.bits()),
+                    "rows of {bits} bits hold no whole number of {to} elements"
+                );
+                let extents = [outer, &[bits / to.bits()]].concat();
+                Ok(TensorType::new(to, extents))
+            }
+        }
+    }
+}
+
+/// Reads the checkpoint tensor of a name as a [`TensorView`] says: a parameter
+/// ([`DeviceTensor::as_param`]), or `None` for a name the checkpoint does not have.
+pub type TensorGetter<'a, B> = dyn FnMut(&str, TensorView) -> Result<Option<DeviceTensor<B>>> + 'a;
 
 /// The checkpoint tensors that a model's constructors read, by module path.
 ///
@@ -16,7 +69,7 @@ use crate::tensor::{DType, DeviceTensor};
 /// checkpoint.
 pub struct Params<'a, B: PortableBackend + 'static> {
     backend: Arc<B>,
-    get: &'a mut dyn FnMut(&str) -> Result<Option<DeviceTensor<B>>>,
+    get: &'a mut TensorGetter<'a, B>,
     path: Vec<String>,
     /// Tensors read so far, which tells [`Params::optional`] whether a build read any.
     reads: usize,
@@ -25,12 +78,8 @@ pub struct Params<'a, B: PortableBackend + 'static> {
 }
 
 impl<'a, B: PortableBackend + 'static> Params<'a, B> {
-    /// Reads tensors by name from `get`, which returns parameters ([`DeviceTensor::as_param`]), or
-    /// `None` for a name the checkpoint does not have.
-    pub fn new(
-        backend: Arc<B>,
-        get: &'a mut dyn FnMut(&str) -> Result<Option<DeviceTensor<B>>>,
-    ) -> Self {
+    /// Reads tensors by name from `get`.
+    pub fn new(backend: Arc<B>, get: &'a mut TensorGetter<'a, B>) -> Self {
         Self {
             backend,
             get,
@@ -63,6 +112,12 @@ impl<'a, B: PortableBackend + 'static> Params<'a, B> {
         self.linear_input_dtype
     }
 
+    /// The current path, which names the module that the constructor builds. A constructor can
+    /// start its error messages with it.
+    pub fn path(&self) -> String {
+        self.path.join(".")
+    }
+
     /// The tensor at the current path.
     pub fn param(&mut self) -> Result<DeviceTensor<B>> {
         match self.optional_param()? {
@@ -73,14 +128,35 @@ impl<'a, B: PortableBackend + 'static> Params<'a, B> {
 
     /// The tensor at the current path, or `None` when the checkpoint has none.
     pub fn optional_param(&mut self) -> Result<Option<DeviceTensor<B>>> {
+        self.optional_view(TensorView::Stored)
+    }
+
+    /// The tensor at the current path without its axes of one element
+    /// ([`TensorView::WithoutUnitAxes`]).
+    pub fn param_without_unit_axes(&mut self) -> Result<DeviceTensor<B>> {
+        match self.optional_view(TensorView::WithoutUnitAxes)? {
+            Some(tensor) => Ok(tensor),
+            None => Err(MissingTensor(self.path.join(".")).into()),
+        }
+    }
+
+    /// The tensor at the current path, its bits read as elements of `dtype`
+    /// ([`TensorView::Bitcast`]), or `None` when the checkpoint has none.
+    pub fn optional_param_as(&mut self, dtype: DType) -> Result<Option<DeviceTensor<B>>> {
+        self.optional_view(TensorView::Bitcast(dtype))
+    }
+
+    /// The tensor at the current path, read as `view` says, or `None` when the checkpoint has
+    /// none.
+    fn optional_view(&mut self, view: TensorView) -> Result<Option<DeviceTensor<B>>> {
         let name = self.path.join(".");
-        let tensor = match (self.get)(&name)? {
+        let tensor = match (self.get)(&name, view)? {
             Some(tensor) => Some(tensor),
             None => match self
                 .base_model_prefix
                 .and_then(|prefix| name.strip_prefix(prefix)?.strip_prefix('.'))
             {
-                Some(unprefixed) => (self.get)(unprefixed)?,
+                Some(unprefixed) => (self.get)(unprefixed, view)?,
                 None => None,
             },
         };
@@ -130,8 +206,8 @@ impl<'a, B: PortableBackend + 'static> Params<'a, B> {
     /// variant that adds no segment.
     #[doc(hidden)]
     pub fn __enter(&mut self, segment: Option<&'static str>) -> Scope<'_, 'a, B> {
-        if let Some(segment) = segment {
-            self.path.push(segment.to_string());
+        if let Some(name) = segment {
+            self.path.push(name.to_string());
         }
         Scope {
             pushed: segment.is_some(),

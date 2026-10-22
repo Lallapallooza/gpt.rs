@@ -21,11 +21,11 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream
         return Err(Error::new(attr.span(), "#[nn::module] takes no arguments"));
     }
     match syn::parse2::<Item>(item)? {
-        Item::Struct(item) => expand_struct(item),
-        Item::Enum(item) => expand_enum(item),
-        Item::Impl(item) => expand_impl(item),
-        item => Err(Error::new(
-            item.span(),
+        Item::Struct(struct_item) => expand_struct(struct_item),
+        Item::Enum(enum_item) => expand_enum(enum_item),
+        Item::Impl(impl_item) => expand_impl(impl_item),
+        other => Err(Error::new(
+            other.span(),
             "#[nn::module] applies to a struct, an enum, or the impl that holds its `forward`",
         )),
     }
@@ -198,57 +198,7 @@ fn expand_struct(mut item: ItemStruct) -> Result<TokenStream> {
     };
     let mut visited = Vec::new();
     for field in fields.named.iter_mut() {
-        let options = Options::take(&mut field.attrs)?;
-        let ident = field.ident.clone().expect("named field");
-        if options.config {
-            if options.flatten || options.rename.is_some() {
-                return Err(Error::new(
-                    ident.span(),
-                    "`config` fields are not visited, so they take no `flatten` or `rename`",
-                ));
-            }
-            TensorSugar.visit_type_mut(&mut field.ty);
-            continue;
-        }
-        let (wrap, inner) = if let Some(inner) = wrapped(&mut field.ty, "Option") {
-            (Wrap::Option, inner)
-        } else if let Some(inner) = wrapped(&mut field.ty, "Vec") {
-            (Wrap::Vec, inner)
-        } else {
-            (Wrap::Plain, &mut field.ty)
-        };
-        let kind = backend_type(inner)?;
-        let inner = inner.clone();
-        if kind == Kind::Layer && RESERVED.iter().any(|name| ident == name) {
-            return Err(Error::new(
-                ident.span(),
-                format!("sublayer field `{ident}` would shadow the module method `{ident}`"),
-            ));
-        }
-        if options.flatten && (kind != Kind::Layer || wrap != Wrap::Plain) {
-            return Err(Error::new(
-                ident.span(),
-                "only a plain sublayer field can be `flatten`ed",
-            ));
-        }
-        if options.flatten && options.rename.is_some() {
-            return Err(Error::new(
-                ident.span(),
-                "a `flatten`ed field adds no path segment to rename",
-            ));
-        }
-        let name = options.rename.unwrap_or_else(|| {
-            let name = LitStr::new(&ident.to_string(), ident.span());
-            parse_quote!(#name)
-        });
-        visited.push(Visited {
-            ident,
-            name,
-            kind,
-            wrap,
-            flatten: options.flatten,
-            inner,
-        });
+        visited.extend(visited_field(field)?);
     }
     add_backend_param(&mut item.generics, "#[nn::module]")?;
 
@@ -288,6 +238,61 @@ fn expand_struct(mut item: ItemStruct) -> Result<TokenStream> {
     })
 }
 
+/// Reads the `#[module(...)]` options of a struct field and gives its type the backend argument.
+/// Returns the field as visited, or `None` for a `config` field.
+fn visited_field(field: &mut syn::Field) -> Result<Option<Visited>> {
+    let options = Options::take(&mut field.attrs)?;
+    let ident = field.ident.clone().expect("named field");
+    if options.config {
+        if options.flatten || options.rename.is_some() {
+            return Err(Error::new(
+                ident.span(),
+                "`config` fields are not visited, so they take no `flatten` or `rename`",
+            ));
+        }
+        TensorSugar.visit_type_mut(&mut field.ty);
+        return Ok(None);
+    }
+    let (wrap, inner) = if let Some(inner) = wrapped(&mut field.ty, "Option") {
+        (Wrap::Option, inner)
+    } else if let Some(inner) = wrapped(&mut field.ty, "Vec") {
+        (Wrap::Vec, inner)
+    } else {
+        (Wrap::Plain, &mut field.ty)
+    };
+    let kind = backend_type(inner)?;
+    if kind == Kind::Layer && RESERVED.iter().any(|name| ident == name) {
+        return Err(Error::new(
+            ident.span(),
+            format!("sublayer field `{ident}` would shadow the module method `{ident}`"),
+        ));
+    }
+    if options.flatten && (kind != Kind::Layer || wrap == Wrap::Option) {
+        return Err(Error::new(
+            ident.span(),
+            "only a sublayer field or a list of them can be `flatten`ed",
+        ));
+    }
+    if options.flatten && options.rename.is_some() {
+        return Err(Error::new(
+            ident.span(),
+            "a `flatten`ed field adds no path segment to rename",
+        ));
+    }
+    let name = options.rename.unwrap_or_else(|| {
+        let name = LitStr::new(&ident.to_string(), ident.span());
+        parse_quote!(#name)
+    });
+    Ok(Some(Visited {
+        ident,
+        name,
+        kind,
+        wrap,
+        flatten: options.flatten,
+        inner: inner.clone(),
+    }))
+}
+
 fn expand_enum(mut item: ItemEnum) -> Result<TokenStream> {
     let mut visit = Vec::new();
     let mut visit_mut = Vec::new();
@@ -323,7 +328,7 @@ fn expand_enum(mut item: ItemEnum) -> Result<TokenStream> {
                 "enum variants must hold sublayers",
             ));
         }
-        let variant = &variant.ident;
+        let variant_ident = &variant.ident;
         for (arms, visit_fn) in [
             (&mut visit, quote!(visit_params)),
             (&mut visit_mut, quote!(visit_params_mut)),
@@ -334,7 +339,7 @@ fn expand_enum(mut item: ItemEnum) -> Result<TokenStream> {
                 }
                 None => quote!(::gpt_rs::module::Module::<B>::#visit_fn(layer, v)),
             };
-            arms.push(quote!(Self::#variant(layer) => #body,));
+            arms.push(quote!(Self::#variant_ident(layer) => #body,));
         }
     }
     add_backend_param(&mut item.generics, "#[nn::module]")?;
@@ -381,7 +386,7 @@ fn module_impl(
 
             fn visit_params(
                 &self,
-                v: &mut ::gpt_rs::module::ParamVisitor<'_, B>,
+                v: &mut ::gpt_rs::module::ParamVisitor<B>,
             ) -> anyhow::Result<()> {
                 #unused
                 #visit
@@ -390,7 +395,7 @@ fn module_impl(
 
             fn visit_params_mut(
                 &mut self,
-                v: &mut ::gpt_rs::module::ParamVisitorMut<'_, B>,
+                v: &mut ::gpt_rs::module::ParamVisitorMut<B>,
             ) -> anyhow::Result<()> {
                 #unused
                 #visit_mut
@@ -416,9 +421,9 @@ fn visit_field(field: &Visited, mutable: bool) -> TokenStream {
     };
     let role = quote!(::gpt_rs::module::TensorRole::Parameter);
     let module = quote!(::gpt_rs::module::Module::<B>);
-    let leaf = |value: TokenStream, name: TokenStream| match kind {
-        Kind::Tensor => quote!(v.param(#name, #role, #value)),
-        Kind::Layer => quote!(v.scoped(#name, |v| #module::#visit_fn(#value, v))),
+    let leaf = |value: TokenStream, segment: TokenStream| match kind {
+        Kind::Tensor => quote!(v.param(#segment, #role, #value)),
+        Kind::Layer => quote!(v.scoped(#segment, |v| #module::#visit_fn(#value, v))),
     };
     match field.wrap {
         Wrap::Plain if field.flatten => quote!(#module::#visit_fn(#access, v)?;),
@@ -430,6 +435,14 @@ fn visit_field(field: &Visited, mutable: bool) -> TokenStream {
             let visit = leaf(quote!(item), name.to_token_stream());
             quote! {
                 if let Some(item) = #access {
+                    #visit?;
+                }
+            }
+        }
+        Wrap::Vec if field.flatten => {
+            let visit = leaf(quote!(item), quote!(&index.to_string()));
+            quote! {
+                for (index, item) in (#access).#iter().enumerate() {
                     #visit?;
                 }
             }
@@ -565,13 +578,12 @@ fn expand_impl(mut item: ItemImpl) -> Result<TokenStream> {
         }
     }
 
-    let position = item
-        .items
-        .iter()
-        .position(|item| matches!(item, ImplItem::Fn(f) if f.sig.ident == "forward"));
-    let layer = match position {
-        Some(position) => {
-            let ImplItem::Fn(forward) = item.items.remove(position) else {
+    let forward_index = item.items.iter().position(
+        |impl_item| matches!(impl_item, ImplItem::Fn(function) if function.sig.ident == "forward"),
+    );
+    let layer = match forward_index {
+        Some(index) => {
+            let ImplItem::Fn(forward) = item.items.remove(index) else {
                 unreachable!("position found a fn");
             };
             Some(layer_impl(&item, forward)?)
@@ -587,11 +599,13 @@ fn expand_impl(mut item: ItemImpl) -> Result<TokenStream> {
 
 /// The identifier of a `name: &mut Params<..>` argument of `sig`.
 fn params_argument(sig: &syn::Signature) -> Option<syn::Ident> {
-    sig.inputs.iter().find_map(|input| {
-        let FnArg::Typed(input) = input else {
+    sig.inputs.iter().find_map(|argument| {
+        let FnArg::Typed(typed_argument) = argument else {
             return None;
         };
-        let (Pat::Ident(pat), Type::Reference(reference)) = (&*input.pat, &*input.ty) else {
+        let (Pat::Ident(pat), Type::Reference(reference)) =
+            (&*typed_argument.pat, &*typed_argument.ty)
+        else {
             return None;
         };
         let Type::Path(path) = &*reference.elem else {
@@ -629,9 +643,15 @@ impl ScopeFields {
 
     fn scoped(&self, expr: &Expr, segment: TokenStream) -> Expr {
         let params = &self.params;
+        // The rebinding has the span of generated code, so lints on the user's code skip it. It
+        // still resolves at the call site, where the initializer reads it.
+        let scoped_params = syn::Ident::new(
+            &params.to_string(),
+            Span::call_site().located_at(params.span()),
+        );
         parse_quote!({
             let mut __nn_scope = ::gpt_rs::nn::Params::__enter(#params, #segment);
-            let #params = ::core::ops::DerefMut::deref_mut(&mut __nn_scope);
+            let #scoped_params = ::core::ops::DerefMut::deref_mut(&mut __nn_scope);
             #expr
         })
     }
@@ -707,13 +727,13 @@ fn layer_impl(item: &ItemImpl, forward: syn::ImplItemFn) -> Result<TokenStream> 
     }
     let mut pats: Punctuated<Pat, Token![,]> = Punctuated::new();
     let mut types: Punctuated<Type, Token![,]> = Punctuated::new();
-    for input in inputs {
-        let FnArg::Typed(input) = input else {
+    for argument in inputs {
+        let FnArg::Typed(typed_argument) = argument else {
             unreachable!("only the first input is a receiver");
         };
-        let mut ty = (*input.ty).clone();
+        let mut ty = (*typed_argument.ty).clone();
         ArgsLifetime.visit_type_mut(&mut ty);
-        pats.push((*input.pat).clone());
+        pats.push((*typed_argument.pat).clone());
         types.push(ty);
     }
     let (args_pat, args_ty) = if pats.len() == 1 {

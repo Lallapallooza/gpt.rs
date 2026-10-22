@@ -98,7 +98,7 @@ impl RotaryEmbedding {
             "rope theta must be finite and positive (got {theta})"
         );
         let half = rotary_dim / 2;
-        let base_inv_freq = |i: usize| theta.powf(-(2.0 * i as f32) / rotary_dim as f32);
+        let base_inv_freq = |dim: usize| theta.powf(-(2.0 * dim as f32) / rotary_dim as f32);
 
         let (inv_freq, attention_scaling) = match scaling {
             RopeScaling::None => ((0..half).map(base_inv_freq).collect(), 1.0),
@@ -107,7 +107,10 @@ impl RotaryEmbedding {
                     factor.is_finite() && factor > 0.0,
                     "rope scaling factor must be finite and positive (got {factor})"
                 );
-                ((0..half).map(|i| base_inv_freq(i) / factor).collect(), 1.0)
+                (
+                    (0..half).map(|dim| base_inv_freq(dim) / factor).collect(),
+                    1.0,
+                )
             }
             RopeScaling::Yarn {
                 factor,
@@ -115,59 +118,31 @@ impl RotaryEmbedding {
                 mscale_all_dim,
                 beta_fast,
                 beta_slow,
-                original_max_position_embeddings,
+                original_max_position_embeddings: original_context,
                 truncate,
             } => {
                 ensure!(
                     factor.is_finite() && factor > 0.0,
                     "rope yarn factor must be finite and positive (got {factor})"
                 );
-                let beta_fast = beta_fast.unwrap_or(32.0);
-                let beta_slow = beta_slow.unwrap_or(1.0);
+                let fast_beta = beta_fast.unwrap_or(32.0);
+                let slow_beta = beta_slow.unwrap_or(1.0);
                 ensure!(
-                    beta_fast.is_finite() && beta_slow.is_finite() && beta_fast >= beta_slow,
-                    "rope yarn beta range is invalid: beta_fast={beta_fast} beta_slow={beta_slow}"
+                    fast_beta.is_finite() && slow_beta.is_finite() && fast_beta >= slow_beta,
+                    "rope yarn beta range is invalid: beta_fast={fast_beta} beta_slow={slow_beta}"
                 );
-
-                let get_mscale = |scale: f32, mscale: f32| {
-                    if scale <= 1.0 {
-                        1.0
-                    } else {
-                        0.1 * mscale * scale.ln() + 1.0
-                    }
-                };
-                let attention_scaling = match (mscale, mscale_all_dim) {
-                    (Some(ms), Some(ms_all)) if ms != 0.0 && ms_all != 0.0 => {
-                        get_mscale(factor, ms) / get_mscale(factor, ms_all)
-                    }
-                    _ => get_mscale(factor, 1.0),
-                };
-
-                let find_correction_dim = |num_rotations: f32| {
-                    (rotary_dim as f32
-                        * (original_max_position_embeddings as f32
-                            / (num_rotations * 2.0 * std::f32::consts::PI))
-                            .ln())
-                        / (2.0 * theta.ln())
-                };
-                let mut low = find_correction_dim(beta_fast);
-                let mut high = find_correction_dim(beta_slow);
-                if truncate {
-                    low = low.floor();
-                    high = high.ceil();
-                }
-                low = low.max(0.0);
-                high = high.min((rotary_dim - 1) as f32);
-                if (low - high).abs() < f32::EPSILON {
-                    high += 0.001;
-                }
+                let attention_scaling = yarn_attention_scaling(factor, mscale, mscale_all_dim);
+                let low = yarn_correction_dim(rotary_dim, theta, original_context, fast_beta);
+                let high = yarn_correction_dim(rotary_dim, theta, original_context, slow_beta);
+                let (ramp_start, ramp_end) = yarn_ramp(rotary_dim, low, high, truncate);
 
                 // Extrapolated (unscaled) below the ramp, interpolated (`/ factor`) above it.
                 let inv_freq = (0..half)
-                    .map(|i| {
-                        let extrapolation = base_inv_freq(i);
+                    .map(|dim| {
+                        let extrapolation = base_inv_freq(dim);
                         let interpolation = extrapolation / factor;
-                        let ramp = ((i as f32 - low) / (high - low)).clamp(0.0, 1.0);
+                        let ramp =
+                            ((dim as f32 - ramp_start) / (ramp_end - ramp_start)).clamp(0.0, 1.0);
                         interpolation * ramp + extrapolation * (1.0 - ramp)
                     })
                     .collect();
@@ -193,8 +168,8 @@ impl RotaryEmbedding {
         positions: &DeviceTensor<B>,
     ) -> (DeviceTensor<B>, DeviceTensor<B>) {
         let half = self.inv_freq.len();
-        let inv_freq = HostTensor::f32([1, half], self.inv_freq.clone()).expect("one row");
-        let inv_freq = DeviceTensor::constant(positions, &inv_freq);
+        let inv_freq_host = HostTensor::f32([1, half], self.inv_freq.clone()).expect("one row");
+        let inv_freq = DeviceTensor::constant(positions, &inv_freq_host);
         let angles = positions.cast(DType::F32).reshape([positions.size(0), 1]) * inv_freq;
         let (cos, sin) = (angles.cos(), angles.sin());
         if self.attention_scaling == 1.0 {
@@ -202,4 +177,53 @@ impl RotaryEmbedding {
         }
         (cos * self.attention_scaling, sin * self.attention_scaling)
     }
+}
+
+/// Hugging Face `get_mscale`: `0.1 * mscale * ln(scale) + 1` for a `scale` above 1, else 1.
+fn yarn_mscale(scale: f32, mscale: f32) -> f32 {
+    if scale <= 1.0 {
+        1.0
+    } else {
+        0.1 * mscale * scale.ln() + 1.0
+    }
+}
+
+/// The YaRN attention factor of `factor`: the ratio of its scales under `mscale` and
+/// `mscale_all_dim` when both are set and nonzero, else its scale under 1.
+fn yarn_attention_scaling(factor: f32, mscale: Option<f32>, mscale_all_dim: Option<f32>) -> f32 {
+    match (mscale, mscale_all_dim) {
+        (Some(scale), Some(scale_all)) if scale != 0.0 && scale_all != 0.0 => {
+            yarn_mscale(factor, scale) / yarn_mscale(factor, scale_all)
+        }
+        _ => yarn_mscale(factor, 1.0),
+    }
+}
+
+/// Hugging Face `find_correction_dim`: the channel pair that turns `num_rotations` times over the
+/// `original_context` positions.
+fn yarn_correction_dim(
+    rotary_dim: usize,
+    theta: f32,
+    original_context: usize,
+    num_rotations: f32,
+) -> f32 {
+    (rotary_dim as f32
+        * (original_context as f32 / (num_rotations * 2.0 * std::f32::consts::PI)).ln())
+        / (2.0 * theta.ln())
+}
+
+/// The YaRN ramp from the correction dimension `low` to `high`: rounded outward when `truncate`,
+/// clamped to the channels of `rotary_dim`, and never empty.
+fn yarn_ramp(rotary_dim: usize, low: f32, high: f32, truncate: bool) -> (f32, f32) {
+    let (mut start, mut end) = if truncate {
+        (low.floor(), high.ceil())
+    } else {
+        (low, high)
+    };
+    start = start.max(0.0);
+    end = end.min((rotary_dim - 1) as f32);
+    if (start - end).abs() < f32::EPSILON {
+        end += 0.001;
+    }
+    (start, end)
 }

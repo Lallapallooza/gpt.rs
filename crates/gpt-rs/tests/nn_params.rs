@@ -4,7 +4,7 @@ use anyhow::Result;
 use gpt_rs::nn::LayerNorm;
 use gpt_rs::tensor::HostTensor;
 use gpt_rs_backend_ref_cpu::CpuPortableBackend;
-use gpt_rs_backend_tests::load_layer;
+use gpt_rs_backend_tests::layers::load_layer;
 
 #[test]
 fn optional_sublayer_needs_all_or_none_of_its_tensors() -> Result<()> {
@@ -17,7 +17,9 @@ fn optional_sublayer_needs_all_or_none_of_its_tensors() -> Result<()> {
             )
         });
         load_layer(&backend, tensors, |p| {
-            p.optional(|p| p.scoped("norm", |p| LayerNorm::new(p, 1e-5)))
+            p.optional(|sublayer_params| {
+                sublayer_params.scoped("norm", |norm_params| LayerNorm::new(norm_params, 1e-5))
+            })
         })
     };
     assert!(norm(&[])?.is_none());

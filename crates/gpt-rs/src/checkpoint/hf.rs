@@ -44,10 +44,10 @@ pub struct HfCheckpoint {
 impl HfCheckpoint {
     pub fn open(dir: &Path) -> Result<Self> {
         let raw = read_json(&dir.join("config.json"))?;
-        let generation = dir.join("generation_config.json");
-        let generation = generation
+        let generation_path = dir.join("generation_config.json");
+        let generation = generation_path
             .is_file()
-            .then(|| read_json(&generation))
+            .then(|| read_json(&generation_path))
             .transpose()?;
         let text = raw.get("text_config").and_then(Value::as_object);
         let config = model_config(&raw, text, generation.as_ref())?;
@@ -59,8 +59,8 @@ impl HfCheckpoint {
 
         let mut entries = Vec::new();
         let mut sources = Vec::new();
-        for (file, f) in files.iter().enumerate() {
-            for tensor in f.tensors() {
+        for (file, shard) in files.iter().enumerate() {
+            for tensor in shard.tensors() {
                 let Some(name) = loaded_name(&tensor.name, text.is_some()) else {
                     continue;
                 };
@@ -147,9 +147,9 @@ fn read_json(path: &Path) -> Result<Value> {
 /// The weight files of `dir`: the shards of `model.safetensors.index.json`, or
 /// `model.safetensors`.
 fn weight_files(dir: &Path) -> Result<Vec<String>> {
-    let index = dir.join("model.safetensors.index.json");
-    if index.is_file() {
-        let index = read_json(&index)?;
+    let index_path = dir.join("model.safetensors.index.json");
+    if index_path.is_file() {
+        let index = read_json(&index_path)?;
         let weight_map = index
             .get("weight_map")
             .and_then(Value::as_object)
@@ -192,19 +192,22 @@ fn model_config(
     generation: Option<&Value>,
 ) -> Result<ModelConfig> {
     let mut config = match text {
-        Some(text) => {
-            let mut text = text.clone();
+        Some(text_config) => {
+            let mut fields = text_config.clone();
             if let Some(tied) = raw.get("tie_word_embeddings") {
-                text.entry("tie_word_embeddings").or_insert(tied.clone());
+                fields.entry("tie_word_embeddings").or_insert(tied.clone());
             }
-            Value::Object(text)
+            Value::Object(fields)
         }
         None => raw.clone(),
     };
+    // A timm checkpoint names its `architecture` where a `transformers` one names its
+    // `model_type`.
     let kind = config
         .get("model_type")
+        .or_else(|| config.get("architecture"))
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("config has no model_type"))?
+        .ok_or_else(|| anyhow!("config has no model_type or architecture"))?
         .to_string();
     // The stop tokens are every `eos_token_id` of the generation config, the text config, and the
     // top-level config.
@@ -215,8 +218,8 @@ fn model_config(
             Some(id) => vec![id.clone()],
             None => Vec::new(),
         };
-        for id in ids.iter().filter_map(Value::as_u64) {
-            let id = id as usize;
+        for raw_id in ids.iter().filter_map(Value::as_u64) {
+            let id = raw_id as usize;
             if !eos_token_ids.contains(&id) {
                 eos_token_ids.push(id);
             }

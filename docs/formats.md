@@ -12,9 +12,10 @@ Source of truth is the code:
 
 `runtime::load_model(backend, model_dir)` loads a directory with:
 
-- `config.json`. Its `model_type` (the `text_config` one for a multimodal checkpoint) is the model
-  kind that picks the Rust model in `crates/gpt-rs/src/model/registry.rs`. The loader passes the
-  config to that model, which reads only the keys that its config struct declares.
+- `config.json`. Its `model_type` (the `text_config` one for a multimodal checkpoint), or the
+  `architecture` of a timm checkpoint, is the model kind that picks the Rust model in
+  `crates/gpt-rs/src/model/registry.rs`. The loader passes the config to that model, which reads
+  only the keys that its config struct declares.
 - `model.safetensors`, or the shards that `model.safetensors.index.json` lists. The loader ignores
   other weight files, such as Mistral's `consolidated.safetensors`.
 - `generation_config.json` (optional). Its `eos_token_id` values end generation, as do those of
@@ -104,9 +105,12 @@ GPT-2 (`gpt2`) has the `GPT2LMHeadModel` modules `transformer.wte`, `transformer
 Each has a `.weight` and a `.bias`, except `wte` and `wpe`, which have only a `.weight`.
 `attn.c_attn` projects to the fused `[query, key, value]`.
 
-The vision models (`resnet`, `mobilenet_v2`) have the names of `ResNetForImageClassification` and
-`MobileNetV2ForImageClassification`. Convolutions keep the PyTorch `[out, in / groups, kh, kw]`
-layout. BatchNorm loads its `weight`, `bias`, `running_mean`, and `running_var`.
+ResNet (`resnet`) and MobileNetV2 (`mobilenet_v2`) have the names of
+`ResNetForImageClassification` and `MobileNetV2ForImageClassification`. MobileNetV3
+(`mobilenetv3_large_100`) has the names of timm's `MobileNetV3`: `conv_stem`, `bn1`,
+`blocks.{stage}.{block}`, `conv_head`, and `classifier`.
+Convolutions keep the PyTorch `[out, in / groups, kh, kw]` layout. BatchNorm loads its `weight`,
+`bias`, `running_mean`, and `running_var`.
 
 ## Tensor files
 

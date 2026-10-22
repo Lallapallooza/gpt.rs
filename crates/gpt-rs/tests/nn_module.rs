@@ -28,8 +28,8 @@ struct ScaleAdd {
 
 #[nn::module]
 impl ScaleAdd {
-    fn forward(&self, a: &Tensor, b: &Tensor) -> Tensor {
-        a * &self.weight + b
+    fn forward(&self, x: &Tensor, addend: &Tensor) -> Tensor {
+        x * &self.weight + addend
     }
 }
 
@@ -71,17 +71,17 @@ struct Net {
 #[nn::module]
 impl Net {
     fn forward(&self, x: &Tensor) -> Tensor {
-        let y = self.scale(x);
-        let y = self.maybe(&y).unwrap_or(y);
-        let mut y = self.missing(&y).unwrap_or(y);
+        let scaled = self.scale(x);
+        let maybe_scaled = self.maybe(&scaled).unwrap_or(scaled);
+        let mut hidden = self.missing(&maybe_scaled).unwrap_or(maybe_scaled);
         for scale in &self.stack {
-            y = scale.call(&y);
+            hidden = scale.call(&hidden);
         }
-        let y = self.branch(&y);
-        let y = self.pair((&y, x));
+        let branched = self.branch(&hidden);
+        let paired = self.pair((&branched, x));
         match &self.bias {
-            Some(bias) => y + bias,
-            None => y,
+            Some(bias) => paired + bias,
+            None => paired,
         }
     }
 }
@@ -169,8 +169,8 @@ fn mutable_visit_matches_and_updates_parameters() {
 
     // Every scale is 1 and the bias 1: `x * 1 + x + 1`.
     let x = filled(&backend, 4.0);
-    let y = net.call(&x).to_host().unwrap();
-    assert_eq!(y.as_f32().unwrap(), [9.0, 9.0]);
+    let output = net.call(&x).to_host().unwrap();
+    assert_eq!(output.as_f32().unwrap(), [9.0, 9.0]);
 }
 
 #[test]
@@ -192,8 +192,8 @@ fn forward_runs_sublayers_through_generated_calls() {
     let pair = ScaleAdd {
         weight: filled(&backend, 3.0),
     };
-    let y = pair.call((&x, &filled(&backend, 1.0)));
-    assert_eq!(y.to_host().unwrap().as_f32().unwrap(), [2.5, 2.5]);
+    let output = pair.call((&x, &filled(&backend, 1.0)));
+    assert_eq!(output.to_host().unwrap().as_f32().unwrap(), [2.5, 2.5]);
 }
 
 #[test]

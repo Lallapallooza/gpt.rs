@@ -55,7 +55,9 @@ mod nn_module;
 /// - A `Tensor` is the parameter `name`. The parameters of a sublayer are under `name.`.
 /// - The visitors skip an `Option<_>` that is `None`.
 /// - Element `i` of a `Vec<_>` is under `name.i`.
-/// - A `#[module(flatten)]` sublayer adds no `name.` segment.
+/// - A `#[module(flatten)]` sublayer adds no `name.` segment, and element `i` of a flattened
+///   `Vec<_>` is under `i`: a list of lists, such as `blocks.0.1`, is a `Vec<_>` of modules that
+///   each flatten their list.
 /// - `#[module(config)]` fields (dimensions, epsilons, flags) are not visited.
 ///
 /// An enum holds one sublayer per variant, `Variant(Layer)`. The visitors visit the active
@@ -66,11 +68,11 @@ mod nn_module;
 ///
 /// In an impl function that takes a `&mut Params<..>` argument (`gpt_rs::nn::Params`, `p` below),
 /// each field initializer of a `Self { .. }` literal that uses `p` runs with `p` inside that
-/// field's parameter path. So does the payload of a `Self::Variant(..)`. This is the same path
-/// that the visitors use. A tensor field reads its tensor with `p.param()`, whose shape comes from
-/// the checkpoint. `p.each(items, |p, item| ..)` builds a `Vec<_>`. A sublayer built outside such
-/// an initializer reads from the enclosing path, so build each one inside its field, or enter a
-/// path explicitly with `p.scoped(..)`.
+/// field's parameter path. So does the payload of a `Self::Variant(..)`. This is the same path that
+/// the visitors use. A tensor field reads its tensor with `p.param()`, whose shape comes from the
+/// checkpoint. `p.each(items, |item_params, item| ..)` builds a `Vec<_>`. A sublayer built outside
+/// such an initializer reads from the enclosing path, so build each one inside its field, or enter
+/// a path explicitly with `p.scoped(..)`.
 ///
 /// # Forward and sublayer calls
 ///

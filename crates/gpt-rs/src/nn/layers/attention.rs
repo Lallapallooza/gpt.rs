@@ -9,7 +9,6 @@ use super::rms_norm::{RmsNorm, RmsNormConfig};
 use crate::backend::PortableBackend;
 use crate::nn::{self, Params};
 use crate::ops::functional::{self, AttentionPositions, DecodeKvCache, WeightLayout};
-use crate::s;
 
 /// Configuration of a [`CausalSelfAttention`] layer.
 ///
@@ -173,8 +172,10 @@ impl<N: DecoderNames> CausalSelfAttention<N> {
         );
         let (separate, fused) = (!config.fused_qkv, config.fused_qkv);
         let layout = config.weight_layout;
-        let projection = |p: &mut Params<B>, present: bool| {
-            present.then(|| Linear::with_layout(p, layout)).transpose()
+        let projection = |params: &mut Params<B>, present: bool| {
+            present
+                .then(|| Linear::with_layout(params, layout))
+                .transpose()
         };
         Ok(Self {
             q_proj: projection(p, separate)?,
@@ -205,14 +206,14 @@ impl<N: DecoderNames> CausalSelfAttention<N> {
         positions: &AttentionPositions<B>,
     ) -> (Tensor, DecodeKvCache<B>) {
         let cfg = &self.config;
-        let (t, d) = (x.size(0), cfg.head_dim);
-        let (q_proj, k, v) = match self.qkv_proj(x) {
+        let (seq_len, head_dim) = (x.size(0), cfg.head_dim);
+        let (query_proj, key_proj, value_proj) = match self.qkv_proj(x) {
             Some(qkv) => {
                 let (q_dim, kv_dim) = (cfg.query_dim(), cfg.key_value_projection_dim());
                 (
-                    qkv.slice(s![.., ..q_dim]),
-                    qkv.slice(s![.., q_dim..q_dim + kv_dim]),
-                    qkv.slice(s![.., q_dim + kv_dim..]),
+                    qkv.slice(crate::s![.., ..q_dim]),
+                    qkv.slice(crate::s![.., q_dim..q_dim + kv_dim]),
+                    qkv.slice(crate::s![.., q_dim + kv_dim..]),
                 )
             }
             None => {
@@ -224,26 +225,30 @@ impl<N: DecoderNames> CausalSelfAttention<N> {
                 )
             }
         };
-        let (q, gate) = if cfg.output_gate {
-            let q_and_gate = q_proj.reshape([t, cfg.num_query_heads, 2 * d]);
-            let gate = q_and_gate.slice(s![.., .., d..]);
+        let (query_heads, gate) = if cfg.output_gate {
+            let q_and_gate = query_proj.reshape([seq_len, cfg.num_query_heads, 2 * head_dim]);
+            let gate = q_and_gate.slice(crate::s![.., .., head_dim..]);
             (
-                q_and_gate.slice(s![.., .., ..d]),
-                Some(gate.reshape([t, cfg.query_dim()])),
+                q_and_gate.slice(crate::s![.., .., ..head_dim]),
+                Some(gate.reshape([seq_len, cfg.query_dim()])),
             )
         } else {
-            (q_proj.reshape([t, cfg.num_query_heads, d]), None)
+            (
+                query_proj.reshape([seq_len, cfg.num_query_heads, head_dim]),
+                None,
+            )
         };
-        let k = k.reshape([t, cfg.num_key_value_heads, d]);
-        let v = v.reshape([t, cfg.num_key_value_heads, d]);
-        let q = self.q_norm(&q).unwrap_or(q);
-        let k = self.k_norm(&k).unwrap_or(k);
+        let key_heads = key_proj.reshape([seq_len, cfg.num_key_value_heads, head_dim]);
+        let values = value_proj.reshape([seq_len, cfg.num_key_value_heads, head_dim]);
+        let queries = self.q_norm(&query_heads).unwrap_or(query_heads);
+        let keys = self.k_norm(&key_heads).unwrap_or(key_heads);
 
-        let (output, cache) = functional::attention_kv_cache(&q, &k, &v, cache, positions);
+        let (attended, next_cache) =
+            functional::attention_kv_cache(&queries, &keys, &values, cache, positions);
         let output = match gate {
-            Some(gate) => output * functional::sigmoid(&gate),
-            None => output,
+            Some(gate_logits) => attended * functional::sigmoid(&gate_logits),
+            None => attended,
         };
-        (self.o_proj(&output), cache)
+        (self.o_proj(&output), next_cache)
     }
 }

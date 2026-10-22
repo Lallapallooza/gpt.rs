@@ -29,10 +29,10 @@ fn write_raw_safetensors(path: &Path, tensors: &[(&str, &str, Vec<usize>, Vec<u8
             json!({"dtype": dtype, "shape": dims, "data_offsets": [start, data.len()]}),
         );
     }
-    let mut header = serde_json::to_vec(&header)?;
-    header.resize(header.len().next_multiple_of(8), b' ');
-    let mut file = (header.len() as u64).to_le_bytes().to_vec();
-    file.extend_from_slice(&header);
+    let mut header_bytes = serde_json::to_vec(&header)?;
+    header_bytes.resize(header_bytes.len().next_multiple_of(8), b' ');
+    let mut file = (header_bytes.len() as u64).to_le_bytes().to_vec();
+    file.extend_from_slice(&header_bytes);
     file.extend_from_slice(&data);
     Ok(fs::write(path, file)?)
 }
@@ -52,15 +52,17 @@ fn sharded_directory_reads_the_tensors_of_every_shard() -> Result<()> {
     let mut weight_map = serde_json::Map::new();
     let names: Vec<&String> = tensors.keys().collect();
     let (first, second) = names.split_at(names.len() / 2);
-    for (shard, names) in [
+    for (shard, shard_names) in [
         ("model-00001-of-00002.safetensors", first),
         ("model-00002-of-00002.safetensors", second),
     ] {
         safetensors::save(
             sharded.path.join(shard),
-            names.iter().map(|name| (name.as_str(), &tensors[*name])),
+            shard_names
+                .iter()
+                .map(|name| (name.as_str(), &tensors[*name])),
         )?;
-        for name in names {
+        for name in shard_names {
             weight_map.insert(name.to_string(), shard.into());
         }
     }
@@ -105,11 +107,19 @@ fn config_overrides_replace_checkpoint_config_fields() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn multimodal_fp8_checkpoint_opens_as_its_text_model() -> Result<()> {
-    let dir = TempDir::new("gpt_rs_hf_multimodal");
+/// The little-endian bf16 bytes of `values`.
+fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|&value| half::bf16::from_f32(value).to_le_bytes())
+        .collect()
+}
+
+/// Writes to `dir` a Mistral 3 checkpoint, a vision tower and a `ministral3` text model whose
+/// `up_proj` is FP8 with its scales.
+fn write_multimodal_fp8_checkpoint(dir: &Path) -> Result<()> {
     fs::write(
-        dir.path.join("config.json"),
+        dir.join("config.json"),
         serde_json::to_vec(&json!({
             "model_type": "mistral3",
             "tie_word_embeddings": true,
@@ -117,23 +127,17 @@ fn multimodal_fp8_checkpoint_opens_as_its_text_model() -> Result<()> {
         }))?,
     )?;
     fs::write(
-        dir.path.join("generation_config.json"),
+        dir.join("generation_config.json"),
         serde_json::to_vec(&json!({"eos_token_id": [2, 3]}))?,
     )?;
-    let bf16 = |values: &[f32]| -> Vec<u8> {
-        values
-            .iter()
-            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
-            .collect()
-    };
     write_raw_safetensors(
-        &dir.path.join("model.safetensors"),
+        &dir.join("model.safetensors"),
         &[
             (
                 "model.language_model.embed_tokens.weight",
                 "BF16",
                 vec![2, 2],
-                bf16(&[1.0, 2.0, 3.0, 4.0]),
+                bf16_bytes(&[1.0, 2.0, 3.0, 4.0]),
             ),
             (
                 "model.language_model.layers.0.mlp.up_proj.weight",
@@ -145,34 +149,40 @@ fn multimodal_fp8_checkpoint_opens_as_its_text_model() -> Result<()> {
                 "model.language_model.layers.0.mlp.up_proj.weight_scale_inv",
                 "BF16",
                 vec![],
-                bf16(&[0.5]),
+                bf16_bytes(&[0.5]),
             ),
             (
                 "model.language_model.layers.0.mlp.up_proj.activation_scale",
                 "BF16",
                 vec![],
-                bf16(&[1.0]),
+                bf16_bytes(&[1.0]),
             ),
             (
                 "model.language_model.norm.weight",
                 "BF16",
                 vec![2],
-                bf16(&[1.5, 2.5]),
+                bf16_bytes(&[1.5, 2.5]),
             ),
             (
                 "model.vision_tower.patch_conv.weight",
                 "BF16",
                 vec![2],
-                bf16(&[0.0, 0.0]),
+                bf16_bytes(&[0.0, 0.0]),
             ),
             (
                 "lm_head.weight",
                 "BF16",
                 vec![2, 2],
-                bf16(&[1.0, 2.0, 3.0, 4.0]),
+                bf16_bytes(&[1.0, 2.0, 3.0, 4.0]),
             ),
         ],
-    )?;
+    )
+}
+
+#[test]
+fn multimodal_fp8_checkpoint_opens_as_its_text_model() -> Result<()> {
+    let dir = TempDir::new("gpt_rs_hf_multimodal");
+    write_multimodal_fp8_checkpoint(&dir.path)?;
 
     let checkpoint = checkpoint::open(&dir.path)?;
     let config = checkpoint.config();
@@ -195,7 +205,7 @@ fn multimodal_fp8_checkpoint_opens_as_its_text_model() -> Result<()> {
     let mut names: Vec<&str> = checkpoint
         .tensors()
         .iter()
-        .map(|e| e.name.as_str())
+        .map(|entry| entry.name.as_str())
         .collect();
     names.sort();
     assert_eq!(
@@ -214,7 +224,7 @@ fn multimodal_fp8_checkpoint_opens_as_its_text_model() -> Result<()> {
     assert_eq!(up_proj.to_le_bytes(), [0x38, 0x40, 0x38, 0x40]);
     let scale = read("model.layers.0.mlp.up_proj.weight_scale_inv")?;
     assert_eq!(scale.dtype(), DType::Bf16);
-    assert_eq!(scale.to_le_bytes(), bf16(&[0.5]).as_slice());
+    assert_eq!(scale.to_le_bytes(), bf16_bytes(&[0.5]).as_slice());
     let norm = read("model.norm.weight")?;
     assert_eq!(norm.dtype(), DType::F32);
     assert_eq!(norm.as_f32().unwrap(), [1.5, 2.5]);
@@ -257,7 +267,11 @@ fn stored_dtypes_load_as_stored() -> Result<()> {
             "{name}"
         );
     }
-    let dtypes: Vec<DType> = checkpoint.tensors().iter().map(|e| e.dtype).collect();
+    let dtypes: Vec<DType> = checkpoint
+        .tensors()
+        .iter()
+        .map(|entry| entry.dtype)
+        .collect();
     assert_eq!(
         dtypes,
         [
@@ -309,23 +323,106 @@ fn fp8_tensors_that_would_load_unscaled_are_rejected() -> Result<()> {
 }
 
 #[test]
+fn a_timm_checkpoint_is_of_the_kind_of_its_architecture() -> Result<()> {
+    let dir = TempDir::new("gpt_rs_timm_kind");
+    fs::write(
+        dir.path.join("config.json"),
+        serde_json::to_vec(&json!({"architecture": "mobilenetv3_large_100", "num_classes": 2}))?,
+    )?;
+    write_raw_safetensors(
+        &dir.path.join("model.safetensors"),
+        &[("classifier.bias", "F32", vec![2], vec![0; 8])],
+    )?;
+    assert_eq!(
+        checkpoint::open(&dir.path)?.config().kind,
+        "mobilenetv3_large_100"
+    );
+
+    fs::write(
+        dir.path.join("config.json"),
+        serde_json::to_vec(&json!({"num_classes": 2}))?,
+    )?;
+    let err = checkpoint::open(&dir.path)
+        .err()
+        .expect("a config without a kind fails");
+    assert!(
+        format!("{err:#}").ends_with("config has no model_type or architecture"),
+        "{err:#}"
+    );
+    Ok(())
+}
+
+#[test]
 fn truncated_or_missing_weights_are_rejected() -> Result<()> {
     let checkpoint = checkpoint_support::gpt2()?;
     let weights = checkpoint.path.join("model.safetensors");
     let bytes = fs::read(&weights)?;
     fs::write(&weights, &bytes[..bytes.len() - 1])?;
-    let err = checkpoint::open(&checkpoint.path)
+    let truncated_err = checkpoint::open(&checkpoint.path)
         .err()
         .expect("a truncated payload must be rejected");
     assert!(
-        format!("{err:#}").contains("invalid safetensors file"),
-        "{err:#}"
+        format!("{truncated_err:#}").contains("invalid safetensors file"),
+        "{truncated_err:#}"
     );
 
     fs::remove_file(&weights)?;
-    let err = checkpoint::open(&checkpoint.path)
+    let missing_err = checkpoint::open(&checkpoint.path)
         .err()
         .expect("a directory without weights must be rejected");
-    assert!(format!("{err:#}").contains("model.safetensors"), "{err:#}");
+    assert!(
+        format!("{missing_err:#}").contains("model.safetensors"),
+        "{missing_err:#}"
+    );
+    Ok(())
+}
+
+#[test]
+fn quantized_projections_of_unsupported_formats_are_rejected() -> Result<()> {
+    let projection = "model.layers.0.mlp.gate_proj";
+    let load_error = |extra: Vec<(&str, HostTensor)>, packed: bool| -> Result<String> {
+        let checkpoint = checkpoint_support::qwen3_5()?;
+        let weights = checkpoint.path.join("model.safetensors");
+        let mut tensors: BTreeMap<String, HostTensor> =
+            safetensors::load(&weights)?.into_iter().collect();
+        if packed {
+            tensors.remove(&format!("{projection}.weight"));
+            tensors.insert(
+                format!("{projection}.weight_packed"),
+                HostTensor::si32(vec![32, 2], vec![0; 64])?,
+            );
+        }
+        for (name, tensor) in extra {
+            tensors.insert(format!("{projection}.{name}"), tensor);
+        }
+        safetensors::save(
+            &weights,
+            tensors.iter().map(|(name, tensor)| (name.as_str(), tensor)),
+        )?;
+        let backend = Arc::new(CpuPortableBackend::new());
+        let err = load_model_with_options(backend, &checkpoint.path, LoadOptions::default())
+            .err()
+            .expect("the checkpoint must be rejected");
+        Ok(format!("{err:#}"))
+    };
+    let scale = || HostTensor::f32(vec![32, 1], vec![1.0; 32]);
+    let unpaired_scale = format!(
+        "{projection}: a `weight_scale` comes with packed 4-bit codes (`weight_packed`) and only \
+         with them"
+    );
+    assert_eq!(
+        load_error(
+            vec![("weight_scale", scale()?), ("weight_zero_point", scale()?)],
+            true
+        )?,
+        format!(
+            "{projection}: 4-bit codes with zero points (`weight_zero_point`) are not supported"
+        )
+    );
+    assert_eq!(load_error(vec![], true)?, unpaired_scale);
+    assert_eq!(
+        load_error(vec![("weight_scale", scale()?)], false)?,
+        unpaired_scale
+    );
     Ok(())
 }

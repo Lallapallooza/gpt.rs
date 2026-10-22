@@ -38,11 +38,11 @@ pub enum Mixer<N: DecoderNames> {
 impl<N: DecoderNames> Mixer<N> {
     pub fn new(p: &mut Params<B>, config: &MixerConfig) -> Result<Self> {
         Ok(match config {
-            MixerConfig::Attention(config) => {
-                Self::Attention(CausalSelfAttention::new(p, config.clone())?)
+            MixerConfig::Attention(attention) => {
+                Self::Attention(CausalSelfAttention::new(p, attention.clone())?)
             }
-            MixerConfig::LinearAttention(config) => {
-                Self::LinearAttention(GatedDeltaNet::new(p, config.clone())?)
+            MixerConfig::LinearAttention(linear_attention) => {
+                Self::LinearAttention(GatedDeltaNet::new(p, linear_attention.clone())?)
             }
         })
     }
@@ -66,12 +66,12 @@ impl<N: DecoderNames> Mixer<N> {
         let _path = capture::scope(format_args!("{}", self.name()));
         match (self, cache) {
             (Mixer::Attention(attn), LayerCache::Attention(kv)) => {
-                let (out, kv) = attn.call((x, kv, positions));
-                (out, LayerCache::Attention(kv))
+                let (out, next_kv) = attn.call((x, kv, positions));
+                (out, LayerCache::Attention(next_kv))
             }
             (Mixer::LinearAttention(lin), LayerCache::LinearAttention(state)) => {
-                let (out, state) = lin.call((x, state));
-                (out, LayerCache::LinearAttention(state))
+                let (out, next_state) = lin.call((x, state));
+                (out, LayerCache::LinearAttention(next_state))
             }
             _ => panic!("layer cache kind does not match the {} layer", self.name()),
         }
@@ -128,15 +128,15 @@ impl<N: DecoderNames> DecoderBlock<N> {
         cache: &LayerCache<B>,
         positions: &AttentionPositions<B>,
     ) -> (Tensor, LayerCache<B>) {
-        let normed = self.input_layernorm(x);
-        capture::record(N::INPUT_LAYERNORM, &normed);
-        let (mixed, cache) = self.mixer((&normed, cache, positions));
+        let mixer_input = self.input_layernorm(x);
+        capture::record(N::INPUT_LAYERNORM, &mixer_input);
+        let (mixed, next_cache) = self.mixer((&mixer_input, cache, positions));
         capture::record(self.mixer.name(), &mixed);
         let residual = mixed + x;
-        let normed = self.post_attention_layernorm(&residual);
-        capture::record(N::POST_ATTENTION_LAYERNORM, &normed);
-        let mlp = self.mlp(&normed);
+        let mlp_input = self.post_attention_layernorm(&residual);
+        capture::record(N::POST_ATTENTION_LAYERNORM, &mlp_input);
+        let mlp = self.mlp(&mlp_input);
         capture::record("mlp", &mlp);
-        (mlp + residual, cache)
+        (mlp + residual, next_cache)
     }
 }

@@ -47,27 +47,27 @@ impl Drop for TempDir {
 /// A two-layer `GPT2LMHeadModel` whose `lm_head` is tied to `wte`, so the checkpoint has no
 /// `lm_head.weight`.
 pub fn gpt2() -> Result<TempDir> {
-    let d = 16;
+    let hidden = 16;
     let mut tensors = vec![
-        ("transformer.wte.weight".to_string(), vec![VOCAB, d]),
-        ("transformer.wpe.weight".to_string(), vec![CONTEXT, d]),
-        ("transformer.ln_f.weight".to_string(), vec![d]),
-        ("transformer.ln_f.bias".to_string(), vec![d]),
+        ("transformer.wte.weight".to_string(), vec![VOCAB, hidden]),
+        ("transformer.wpe.weight".to_string(), vec![CONTEXT, hidden]),
+        ("transformer.ln_f.weight".to_string(), vec![hidden]),
+        ("transformer.ln_f.bias".to_string(), vec![hidden]),
     ];
     for layer in 0..2 {
         for (name, dims) in [
-            ("ln_1.weight", vec![d]),
-            ("ln_1.bias", vec![d]),
-            ("attn.c_attn.weight", vec![d, 3 * d]),
-            ("attn.c_attn.bias", vec![3 * d]),
-            ("attn.c_proj.weight", vec![d, d]),
-            ("attn.c_proj.bias", vec![d]),
-            ("ln_2.weight", vec![d]),
-            ("ln_2.bias", vec![d]),
-            ("mlp.c_fc.weight", vec![d, 4 * d]),
-            ("mlp.c_fc.bias", vec![4 * d]),
-            ("mlp.c_proj.weight", vec![4 * d, d]),
-            ("mlp.c_proj.bias", vec![d]),
+            ("ln_1.weight", vec![hidden]),
+            ("ln_1.bias", vec![hidden]),
+            ("attn.c_attn.weight", vec![hidden, 3 * hidden]),
+            ("attn.c_attn.bias", vec![3 * hidden]),
+            ("attn.c_proj.weight", vec![hidden, hidden]),
+            ("attn.c_proj.bias", vec![hidden]),
+            ("ln_2.weight", vec![hidden]),
+            ("ln_2.bias", vec![hidden]),
+            ("mlp.c_fc.weight", vec![hidden, 4 * hidden]),
+            ("mlp.c_fc.bias", vec![4 * hidden]),
+            ("mlp.c_proj.weight", vec![4 * hidden, hidden]),
+            ("mlp.c_proj.bias", vec![hidden]),
         ] {
             tensors.push((format!("transformer.h.{layer}.{name}"), dims));
         }
@@ -75,7 +75,7 @@ pub fn gpt2() -> Result<TempDir> {
     let config = json!({
         "model_type": "gpt2",
         "n_positions": CONTEXT,
-        "n_embd": d,
+        "n_embd": hidden,
         "n_layer": 2,
         "n_head": 2,
         "layer_norm_epsilon": 1e-5,
@@ -86,46 +86,46 @@ pub fn gpt2() -> Result<TempDir> {
 
 /// A `Qwen3_5ForCausalLM` whose first layer is linear attention and second is full attention.
 pub fn qwen3_5() -> Result<TempDir> {
-    let (h, m, head_dim) = (16, 32, 8);
+    let (hidden, intermediate, head_dim) = (16, 32, 8);
     // Full attention: 2 query heads and 1 key-value head. Linear attention: 1 key head and 2
     // value heads.
     let (key_dim, value_heads) = (head_dim, 2);
     let value_dim = value_heads * head_dim;
     let conv_dim = 2 * key_dim + value_dim;
     let mut tensors = vec![
-        ("model.embed_tokens.weight".to_string(), vec![VOCAB, h]),
-        ("model.norm.weight".to_string(), vec![h]),
-        ("lm_head.weight".to_string(), vec![VOCAB, h]),
+        ("model.embed_tokens.weight".to_string(), vec![VOCAB, hidden]),
+        ("model.norm.weight".to_string(), vec![hidden]),
+        ("lm_head.weight".to_string(), vec![VOCAB, hidden]),
     ];
     let mixers = [
         vec![
-            ("linear_attn.in_proj_qkv.weight", vec![conv_dim, h]),
-            ("linear_attn.in_proj_z.weight", vec![value_dim, h]),
-            ("linear_attn.in_proj_b.weight", vec![value_heads, h]),
-            ("linear_attn.in_proj_a.weight", vec![value_heads, h]),
+            ("linear_attn.in_proj_qkv.weight", vec![conv_dim, hidden]),
+            ("linear_attn.in_proj_z.weight", vec![value_dim, hidden]),
+            ("linear_attn.in_proj_b.weight", vec![value_heads, hidden]),
+            ("linear_attn.in_proj_a.weight", vec![value_heads, hidden]),
             ("linear_attn.conv1d.weight", vec![conv_dim, 1, 4]),
             ("linear_attn.dt_bias", vec![value_heads]),
             ("linear_attn.A_log", vec![value_heads]),
             ("linear_attn.norm.weight", vec![head_dim]),
-            ("linear_attn.out_proj.weight", vec![h, value_dim]),
+            ("linear_attn.out_proj.weight", vec![hidden, value_dim]),
         ],
         vec![
             // The query projection also produces the output gate.
-            ("self_attn.q_proj.weight", vec![2 * 2 * head_dim, h]),
-            ("self_attn.k_proj.weight", vec![head_dim, h]),
-            ("self_attn.v_proj.weight", vec![head_dim, h]),
-            ("self_attn.o_proj.weight", vec![h, 2 * head_dim]),
+            ("self_attn.q_proj.weight", vec![2 * 2 * head_dim, hidden]),
+            ("self_attn.k_proj.weight", vec![head_dim, hidden]),
+            ("self_attn.v_proj.weight", vec![head_dim, hidden]),
+            ("self_attn.o_proj.weight", vec![hidden, 2 * head_dim]),
             ("self_attn.q_norm.weight", vec![head_dim]),
             ("self_attn.k_norm.weight", vec![head_dim]),
         ],
     ];
     for (layer, mixer) in mixers.into_iter().enumerate() {
         let common = [
-            ("input_layernorm.weight", vec![h]),
-            ("post_attention_layernorm.weight", vec![h]),
-            ("mlp.gate_proj.weight", vec![m, h]),
-            ("mlp.up_proj.weight", vec![m, h]),
-            ("mlp.down_proj.weight", vec![h, m]),
+            ("input_layernorm.weight", vec![hidden]),
+            ("post_attention_layernorm.weight", vec![hidden]),
+            ("mlp.gate_proj.weight", vec![intermediate, hidden]),
+            ("mlp.up_proj.weight", vec![intermediate, hidden]),
+            ("mlp.down_proj.weight", vec![hidden, intermediate]),
         ];
         for (name, dims) in common.into_iter().chain(mixer) {
             tensors.push((format!("model.layers.{layer}.{name}"), dims));
@@ -134,7 +134,7 @@ pub fn qwen3_5() -> Result<TempDir> {
     let config = json!({
         "model_type": "qwen3_5_text",
         "max_position_embeddings": CONTEXT,
-        "hidden_size": h,
+        "hidden_size": hidden,
         "num_hidden_layers": 2,
         "layer_types": ["linear_attention", "full_attention"],
         "rms_norm_eps": 1e-6,
@@ -161,7 +161,7 @@ fn write(prefix: &str, config: Value, tensors: &[(String, Vec<usize>)]) -> Resul
     let dir = TempDir::new(prefix);
     fs::write(dir.path.join("config.json"), serde_json::to_vec(&config)?)?;
     let mut rng = StdRng::seed_from_u64(0);
-    let tensors = tensors
+    let random_tensors = tensors
         .iter()
         .map(|(name, dims)| {
             let len = dims.iter().product();
@@ -171,7 +171,7 @@ fn write(prefix: &str, config: Value, tensors: &[(String, Vec<usize>)]) -> Resul
         .collect::<Result<Vec<_>>>()?;
     safetensors::save(
         dir.path.join("model.safetensors"),
-        tensors.iter().map(|(name, tensor)| (*name, tensor)),
+        random_tensors.iter().map(|(name, tensor)| (*name, tensor)),
     )?;
     Ok(dir)
 }

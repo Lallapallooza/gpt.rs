@@ -37,13 +37,13 @@ pub trait Checkpoint: Send + Sync {
 /// Opens the checkpoint at `path`: a Hugging Face model directory (`config.json` plus
 /// safetensors).
 pub fn open(path: impl AsRef<Path>) -> Result<Box<dyn Checkpoint>> {
-    let path = path.as_ref();
+    let dir = path.as_ref();
     ensure!(
-        path.join("config.json").is_file(),
+        dir.join("config.json").is_file(),
         "{} is not a Hugging Face model directory (no config.json)",
-        path.display()
+        dir.display()
     );
-    Ok(Box::new(HfCheckpoint::open(path)?))
+    Ok(Box::new(HfCheckpoint::open(dir)?))
 }
 
 /// Suffix of the per-tensor scale of an FP8 weight.
@@ -67,14 +67,14 @@ fn load_dtype(name: &str, dims: &[usize], stored: DType) -> DType {
 /// Widens little-endian f16 or bf16 `bytes` to little-endian f32.
 fn widen_to_f32(bytes: &[u8], dtype: StoredDtype) -> Result<Vec<u8>> {
     let widen: fn([u8; 2]) -> f32 = match dtype {
-        StoredDtype::F16 => |b| f16::from_le_bytes(b).to_f32(),
-        StoredDtype::BF16 => |b| bf16::from_le_bytes(b).to_f32(),
+        StoredDtype::F16 => |element| f16::from_le_bytes(element).to_f32(),
+        StoredDtype::BF16 => |element| bf16::from_le_bytes(element).to_f32(),
         other => bail!("cannot widen {other} tensors to f32"),
     };
     Ok(bytes
         .as_chunks::<2>()
         .0
         .iter()
-        .flat_map(|&b| widen(b).to_le_bytes())
+        .flat_map(|&element| widen(element).to_le_bytes())
         .collect())
 }

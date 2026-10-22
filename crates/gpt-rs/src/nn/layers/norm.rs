@@ -28,7 +28,7 @@ impl Norm {
     pub fn new(p: &mut Params<B>, config: NormConfig) -> Result<Self> {
         Ok(match config {
             NormConfig::Layer { eps } => Self::Layer(LayerNorm::new(p, eps)?),
-            NormConfig::Rms(config) => Self::Rms(RmsNorm::new(p, config)?),
+            NormConfig::Rms(rms) => Self::Rms(RmsNorm::new(p, rms)?),
         })
     }
 

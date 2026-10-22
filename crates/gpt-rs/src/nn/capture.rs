@@ -30,7 +30,8 @@ struct Capture {
     error: Option<anyhow::Error>,
 }
 
-fn capturing() -> bool {
+/// Whether a capture runs. A capture reads module outputs back while the forward records.
+pub(crate) fn capturing() -> bool {
     CAPTURE.with_borrow(Option::is_some)
 }
 
@@ -48,11 +49,13 @@ pub fn path() -> Option<Arc<str>> {
     PATH.with_borrow(|path| (!path.is_empty()).then(|| Arc::from(path.as_str())))
 }
 
-/// Runs `f` with capture enabled and returns its result with the recorded module outputs, each
+/// Runs `run` with capture enabled and returns its result with the recorded module outputs, each
 /// `[rows, width]`, in first-recorded order.
-pub fn module_outputs<T>(f: impl FnOnce() -> Result<T>) -> Result<(T, Vec<(String, HostTensor)>)> {
+pub fn module_outputs<T>(
+    run: impl FnOnce() -> Result<T>,
+) -> Result<(T, Vec<(String, HostTensor)>)> {
     ensure!(!capturing(), "module output capture is already running");
-    /// Ends the capture, also when `f` fails or panics.
+    /// Ends the capture, also when `run` fails or panics.
     struct Stop;
     impl Drop for Stop {
         fn drop(&mut self) {
@@ -61,7 +64,7 @@ pub fn module_outputs<T>(f: impl FnOnce() -> Result<T>) -> Result<(T, Vec<(Strin
     }
     CAPTURE.set(Some(Capture::default()));
     let _stop = Stop;
-    let value = f()?;
+    let value = run()?;
     let capture = CAPTURE.take().unwrap_or_default();
     if let Some(error) = capture.error {
         return Err(error.context("reading back a module output"));
@@ -91,11 +94,11 @@ pub fn record<B: PortableBackend + 'static>(name: &str, output: &DeviceTensor<B>
     if !capturing() {
         return;
     }
-    let read = read(output);
-    CAPTURE.with_borrow_mut(|capture| {
-        let Some(capture) = capture else { return };
-        let (width, values) = match read {
-            Ok(read) => read,
+    let readback = read(output);
+    CAPTURE.with_borrow_mut(|active| {
+        let Some(capture) = active else { return };
+        let (width, values) = match readback {
+            Ok(read_back) => read_back,
             Err(error) => {
                 capture.error.get_or_insert(error);
                 return;
@@ -114,7 +117,7 @@ pub fn record<B: PortableBackend + 'static>(name: &str, output: &DeviceTensor<B>
 }
 
 /// Prefixes module `name` to the names recorded until the returned guard drops.
-pub fn scope(name: fmt::Arguments<'_>) -> Scope {
+pub fn scope(name: fmt::Arguments) -> Scope {
     if !naming() {
         return Scope { parent_len: None };
     }

@@ -23,6 +23,9 @@ pub enum ActivationFunction {
     /// `x * sigmoid(x)`.
     #[serde(rename = "silu", alias = "swish")]
     Silu,
+    /// `x * relu6(x + 3) / 6`.
+    #[serde(rename = "hard_swish", alias = "hardswish")]
+    HardSwish,
 }
 
 impl ActivationFunction {
@@ -34,6 +37,7 @@ impl ActivationFunction {
             ActivationFunction::Relu => functional::relu,
             ActivationFunction::Relu6 => functional::relu6,
             ActivationFunction::Silu => functional::silu,
+            ActivationFunction::HardSwish => functional::hard_swish,
         };
         Activation { function }
     }

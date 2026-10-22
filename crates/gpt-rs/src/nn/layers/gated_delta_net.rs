@@ -13,7 +13,6 @@ use super::linear::Linear;
 use super::rms_norm::{RmsNorm, RmsNormConfig};
 use crate::nn::{self, Params};
 use crate::ops::functional::{self, LinearAttentionCache};
-use crate::s;
 
 /// Head layout and convolution size of a [`GatedDeltaNet`].
 #[derive(Debug, Clone)]
@@ -102,29 +101,38 @@ impl GatedDeltaNet {
         cache: &LinearAttentionCache<B>,
     ) -> (Tensor, LinearAttentionCache<B>) {
         let cfg = &self.config;
-        let t = x.size(0);
+        let seq_len = x.size(0);
         let (hk, hv) = (cfg.num_key_heads, cfg.num_value_heads);
         let (dk, dv) = (cfg.key_head_dim, cfg.value_head_dim);
         let (key_dim, value_dim) = (cfg.key_dim(), cfg.value_dim());
 
         let conv = self.conv1d((&self.in_proj_qkv(x), cache.conv_state()));
         let mixed = functional::silu(&conv.output);
-        let q = mixed.slice(s![.., ..key_dim]).reshape([t, hk, dk]);
-        let k = mixed
-            .slice(s![.., key_dim..2 * key_dim])
-            .reshape([t, hk, dk]);
-        let v = mixed
-            .slice(s![.., 2 * key_dim..2 * key_dim + value_dim])
-            .reshape([t, hv, dv]);
+        let queries = mixed
+            .slice(crate::s![.., ..key_dim])
+            .reshape([seq_len, hk, dk]);
+        let keys = mixed
+            .slice(crate::s![.., key_dim..2 * key_dim])
+            .reshape([seq_len, hk, dk]);
+        let values = mixed
+            .slice(crate::s![.., 2 * key_dim..2 * key_dim + value_dim])
+            .reshape([seq_len, hv, dv]);
 
         let beta = functional::sigmoid(&self.in_proj_b(x));
-        let a = self.in_proj_a(x) + &self.dt_bias;
-        let g = functional::softplus(&a) * -self.a_log.exp();
+        let step_logits = self.in_proj_a(x) + &self.dt_bias;
+        let log_decay = functional::softplus(&step_logits) * -self.a_log.exp();
 
-        let delta = functional::gated_delta_rule(&q, &k, &v, &g, &beta, cache.recurrent_state());
-        let z = self.in_proj_z(x).reshape([t, hv, dv]);
-        let gated = self.norm(&delta.output) * functional::silu(&z);
-        let out = self.out_proj(&gated.reshape([t, value_dim]));
+        let delta = functional::gated_delta_rule(
+            &queries,
+            &keys,
+            &values,
+            &log_decay,
+            &beta,
+            cache.recurrent_state(),
+        );
+        let gate = self.in_proj_z(x).reshape([seq_len, hv, dv]);
+        let gated = self.norm(&delta.output) * functional::silu(&gate);
+        let out = self.out_proj(&gated.reshape([seq_len, value_dim]));
         (out, LinearAttentionCache::new(conv.state, delta.state))
     }
 

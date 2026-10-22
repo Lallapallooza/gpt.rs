@@ -10,8 +10,8 @@ use gpt_rs_backend_ref_cpu::CpuPortableBackend;
 #[test]
 fn each_activation_function_applies_its_own_functional() {
     let backend = Arc::new(CpuPortableBackend::new());
-    let x = HostTensor::f32([3], vec![-1.0, 1.0, 7.0]).unwrap();
-    let x = DeviceTensor::from_host(Arc::clone(&backend), x).unwrap();
+    let host = HostTensor::f32([3], vec![-1.0, 1.0, 7.0]).unwrap();
+    let x = DeviceTensor::from_host(Arc::clone(&backend), host).unwrap();
     for (activation, expected) in [
         (ActivationFunction::Gelu, [-0.158_655_25, 0.841_344_8, 7.0]),
         (
@@ -21,17 +21,17 @@ fn each_activation_function_applies_its_own_functional() {
         (ActivationFunction::Relu, [0.0, 1.0, 7.0]),
         (ActivationFunction::Relu6, [0.0, 1.0, 6.0]),
     ] {
-        let y = activation.layer().call(&x).to_host().unwrap();
-        let close = y
+        let output = activation.layer().call(&x).to_host().unwrap();
+        let close = output
             .as_f32()
             .unwrap()
             .iter()
             .zip(expected)
-            .all(|(a, e)| (a - e).abs() <= 1e-5);
+            .all(|(actual, wanted)| (actual - wanted).abs() <= 1e-5);
         assert!(
             close,
             "{activation:?}: {:?}, expected {expected:?}",
-            y.as_f32().unwrap()
+            output.as_f32().unwrap()
         );
     }
 }

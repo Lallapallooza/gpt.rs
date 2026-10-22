@@ -131,9 +131,9 @@ impl MobileNetV2InvertedResidual {
     }
 
     fn forward(&self, x: &Tensor) -> Tensor {
-        let features = self.expand_1x1(x);
-        let features = self.conv_3x3(&features);
-        let features = self.reduce_1x1(&features);
+        let expanded = self.expand_1x1(x);
+        let depthwise = self.conv_3x3(&expanded);
+        let features = self.reduce_1x1(&depthwise);
         // `transformers` adds the input when the stride is 1 and the channel count stays, so the
         // shape is unchanged.
         if features.shape() == x.shape() {
@@ -159,17 +159,17 @@ impl MobileNetV2Stem {
     fn new(p: &mut Params<B>, config: &MobileNetV2Config) -> Result<Self> {
         Ok(Self {
             first_conv: conv_layer(p, config, 2, 1)?,
-            expand_1x1: p.optional(|p| conv_layer(p, config, 1, 1))?,
+            expand_1x1: p.optional(|expand_params| conv_layer(expand_params, config, 1, 1))?,
             conv_3x3: conv_layer(p, config, 1, 1)?,
             reduce_1x1: linear_conv_layer(p, config)?,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Tensor {
-        let features = self.first_conv(x);
-        let features = self.expand_1x1(&features).unwrap_or(features);
-        let features = self.conv_3x3(&features);
-        self.reduce_1x1(&features)
+        let first = self.first_conv(x);
+        let expanded = self.expand_1x1(&first).unwrap_or(first);
+        let depthwise = self.conv_3x3(&expanded);
+        self.reduce_1x1(&depthwise)
     }
 }
 
@@ -186,22 +186,25 @@ impl MobileNetV2Model {
     fn new(p: &mut Params<B>, config: &MobileNetV2Config) -> Result<Self> {
         Ok(Self {
             conv_stem: MobileNetV2Stem::new(p, config)?,
-            layer: p.each(config.layer_strides(), |p, (stride, dilation)| {
-                MobileNetV2InvertedResidual::new(p, config, stride, dilation)
-            })?,
+            layer: p.each(
+                config.layer_strides(),
+                |layer_params, (stride, dilation)| {
+                    MobileNetV2InvertedResidual::new(layer_params, config, stride, dilation)
+                },
+            )?,
             conv_1x1: conv_layer(p, config, 1, 1)?,
         })
     }
 
     /// Pooled features `[N, channels]` of NCHW images.
     fn forward(&self, pixel_values: &Tensor) -> Tensor {
-        let x = pixel_values.transpose([0, 2, 3, 1]);
-        let mut x = self.conv_stem(&x);
+        let nhwc = pixel_values.transpose([0, 2, 3, 1]);
+        let mut hidden = self.conv_stem(&nhwc);
         for layer in &self.layer {
-            x = layer.call(&x);
+            hidden = layer.call(&hidden);
         }
-        let x = self.conv_1x1(&x);
-        global_avg_pool2d(&x)
+        let features = self.conv_1x1(&hidden);
+        global_avg_pool2d(&features)
     }
 }
 

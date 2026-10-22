@@ -2,6 +2,7 @@ pub mod config;
 pub mod gpt;
 pub mod ministral;
 pub mod mobilenet_v2;
+pub mod mobilenet_v3;
 pub mod qwen3_5;
 pub mod registry;
 pub mod resnet;
@@ -10,6 +11,7 @@ pub use self::config::ModelConfig;
 pub use self::gpt::{Gpt, GptConfig};
 pub use self::ministral::{Ministral, MinistralConfig};
 pub use self::mobilenet_v2::{MobileNetV2, MobileNetV2Config};
+pub use self::mobilenet_v3::{MobileNetV3, MobileNetV3Config};
 pub use self::qwen3_5::{Qwen35, Qwen35Config};
 pub use self::resnet::{ResNet, ResNetConfig};
 

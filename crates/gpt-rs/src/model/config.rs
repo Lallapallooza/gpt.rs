@@ -10,7 +10,8 @@ pub struct ModelRuntimeConfig {
     pub matmul_input_dtype: Option<DType>,
 }
 
-/// What a model is built from. `kind` is the Hugging Face `model_type`.
+/// What a model is built from. `kind` is the Hugging Face `model_type`, or the `architecture` of a
+/// timm checkpoint.
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub kind: String,

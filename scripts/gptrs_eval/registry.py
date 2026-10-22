@@ -41,13 +41,29 @@ _CASES: dict[str, CaseSpec] = {
         "Qwen35Case",
         {"hf_model": "Qwen/Qwen3.8-27B", "prompt": "The capital of France is"},
     ),
+    "qwen3_8_27b_int4": CaseSpec(
+        "gptrs_eval.models.qwen3_5",
+        "Qwen35Case",
+        {"hf_model": "RedHatAI/Qwen3.8-27B-INT4", "prompt": "The capital of France is"},
+    ),
+    "resnet18": CaseSpec(
+        "gptrs_eval.models.resnet", "ResNetCase", {"hf_model": "microsoft/resnet-18"}
+    ),
     "resnet34": CaseSpec(
-        "gptrs_eval.models.resnet34", "ResNet34Case", {"hf_model": "microsoft/resnet-34"}
+        "gptrs_eval.models.resnet", "ResNetCase", {"hf_model": "microsoft/resnet-34"}
+    ),
+    "resnet152": CaseSpec(
+        "gptrs_eval.models.resnet", "ResNetCase", {"hf_model": "microsoft/resnet-152"}
     ),
     "mobilenet_v2": CaseSpec(
         "gptrs_eval.models.mobilenet_v2",
         "MobileNetV2Case",
         {"hf_model": "google/mobilenet_v2_1.0_224"},
+    ),
+    "mobilenetv3_large_100": CaseSpec(
+        "gptrs_eval.models.mobilenet_v3",
+        "MobileNetV3Case",
+        {"hf_model": "timm/mobilenetv3_large_100.ra_in1k"},
     ),
 }
 
@@ -70,4 +86,6 @@ def get_case(name: str) -> ModelCase:
     spec = _CASES[name]
     mod = importlib.import_module(spec.module)
     case_cls: type[ModelCase] = getattr(mod, spec.cls)
-    return case_cls()
+    case = case_cls()
+    case.name = name
+    return case

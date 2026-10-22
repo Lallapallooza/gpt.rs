@@ -102,9 +102,9 @@ impl ResNetLayer {
             ResNetLayerType::Bottleneck => vec![(1, relu), (stride, relu), (1, None)],
         };
         Ok(Self {
-            shortcut: p.optional(|p| conv_layer(p, stride, None))?,
-            layer: p.each(convs, |p, (stride, activation)| {
-                conv_layer(p, stride, activation)
+            shortcut: p.optional(|shortcut_params| conv_layer(shortcut_params, stride, None))?,
+            layer: p.each(convs, |conv_params, (conv_stride, activation)| {
+                conv_layer(conv_params, conv_stride, activation)
             })?,
             activation: config.hidden_act.layer(),
         })
@@ -133,16 +133,18 @@ impl ResNetStage {
             .chain(std::iter::repeat(1))
             .take(depth);
         Ok(Self {
-            layers: p.each(strides, |p, stride| ResNetLayer::new(p, config, stride))?,
+            layers: p.each(strides, |layer_params, layer_stride| {
+                ResNetLayer::new(layer_params, config, layer_stride)
+            })?,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Tensor {
-        let mut x = x.clone();
+        let mut hidden = x.clone();
         for layer in &self.layers {
-            x = layer.call(&x);
+            hidden = layer.call(&hidden);
         }
-        x
+        hidden
     }
 }
 
@@ -164,18 +166,21 @@ impl ResNetEncoder {
         };
         let strides = std::iter::once(first_stride).chain(std::iter::repeat(2));
         Ok(Self {
-            stages: p.each(strides.zip(&config.depths), |p, (stride, &depth)| {
-                ResNetStage::new(p, config, stride, depth)
-            })?,
+            stages: p.each(
+                strides.zip(&config.depths),
+                |stage_params, (stride, &depth)| {
+                    ResNetStage::new(stage_params, config, stride, depth)
+                },
+            )?,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Tensor {
-        let mut x = x.clone();
+        let mut hidden = x.clone();
         for stage in &self.stages {
-            x = stage.call(&x);
+            hidden = stage.call(&hidden);
         }
-        x
+        hidden
     }
 }
 
@@ -194,8 +199,8 @@ impl ResNetEmbeddings {
     }
 
     fn forward(&self, x: &Tensor) -> Tensor {
-        let x = self.embedder(x);
-        max_pool2d(&x, [3, 3], [2, 2], Padding2d::uniform(1))
+        let embedded = self.embedder(x);
+        max_pool2d(&embedded, [3, 3], [2, 2], Padding2d::uniform(1))
     }
 }
 
@@ -217,10 +222,10 @@ impl ResNetModel {
 
     /// Pooled features `[N, channels]` of NCHW images.
     fn forward(&self, pixel_values: &Tensor) -> Tensor {
-        let x = pixel_values.transpose([0, 2, 3, 1]);
-        let x = self.embedder(&x);
-        let x = self.encoder(&x);
-        global_avg_pool2d(&x)
+        let nhwc = pixel_values.transpose([0, 2, 3, 1]);
+        let embedded = self.embedder(&nhwc);
+        let features = self.encoder(&embedded);
+        global_avg_pool2d(&features)
     }
 }
 

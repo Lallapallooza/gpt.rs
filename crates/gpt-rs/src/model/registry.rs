@@ -6,15 +6,12 @@ use anyhow::Result;
 use super::ModelConfig;
 use crate::backend::PortableBackend;
 use crate::inference::{decoder, vision};
+use crate::nn::TensorGetter;
 use crate::runtime::LoadedModel;
-use crate::tensor::DeviceTensor;
 
 /// Signature for model builders used by the runtime checkpoint loader.
-pub type BuildFn<B> = fn(
-    Arc<B>,
-    &ModelConfig,
-    &mut dyn FnMut(&str) -> Result<Option<DeviceTensor<B>>>,
-) -> Result<Box<dyn LoadedModel>>;
+pub type BuildFn<B> =
+    fn(Arc<B>, &ModelConfig, &mut TensorGetter<B>) -> Result<Box<dyn LoadedModel>>;
 
 #[derive(Clone, Copy)]
 pub struct ModelFactory<B: PortableBackend + 'static> {
@@ -48,6 +45,10 @@ pub fn model_factories<B: PortableBackend + 'static>() -> &'static [ModelFactory
         ModelFactory {
             kind: super::mobilenet_v2::KIND,
             build: vision::build_from_model_config::<B, super::mobilenet_v2::MobileNetV2Config>,
+        },
+        ModelFactory {
+            kind: super::mobilenet_v3::KIND,
+            build: vision::build_from_model_config::<B, super::mobilenet_v3::MobileNetV3Config>,
         },
     ]
 }

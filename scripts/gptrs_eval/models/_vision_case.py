@@ -50,6 +50,9 @@ class VisionCaseBase:
         )
         return model.eval()
 
+    def _torch_logits(self, model: Any, pixel_values: Any) -> Any:
+        return model(pixel_values=pixel_values).logits
+
     def _build_models(self, cfg: RunConfig) -> tuple[Any, Any]:
         return self._build_torch_model(cfg), load_gpt_rs(cfg)
 
@@ -64,14 +67,23 @@ class VisionCaseBase:
         batch = int(cfg.params.get("batch", 1))
         image_size = int(cfg.params.get("image_size", 224))
 
-        x = np.random.randn(batch, 3, image_size, image_size).astype(np.float32)
-        x_torch = torch.from_numpy(x)
+        # Two inputs: the first call records the forward, the second runs its program again.
+        inputs = [
+            np.random.randn(batch, 3, image_size, image_size).astype(np.float32) for _ in range(2)
+        ]
 
         with torch.no_grad():
-            torch_logits = torch_to_numpy(torch_model(pixel_values=x_torch).logits)
+            torch_logits = np.concatenate(
+                [
+                    torch_to_numpy(self._torch_logits(torch_model, torch.from_numpy(x)))
+                    for x in inputs
+                ]
+            )
 
         with debug_context(cfg.params):
-            gpt_logits = model_gpt.forward_vision(x).astype(np.float32, copy=False)
+            gpt_logits = np.concatenate(
+                [model_gpt.forward_vision(x).astype(np.float32, copy=False) for x in inputs]
+            )
 
         extra = {
             "batch": batch,
@@ -113,7 +125,7 @@ class VisionCaseBase:
 
         def run_torch_once() -> None:
             with torch.no_grad():
-                out = torch_model(pixel_values=x_torch).logits
+                out = self._torch_logits(torch_model, x_torch)
             _ = float(out.reshape(-1)[0].item())
 
         def run_gptrs_once() -> None:

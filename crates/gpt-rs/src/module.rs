@@ -44,15 +44,15 @@ impl ParamPath {
 pub struct ParamVisitor<'a, B: PortableBackend + 'static> {
     path: ParamPath,
     scratch: String,
-    f: &'a mut VisitParamsFn<'a, B>,
+    visit: &'a mut VisitParamsFn<'a, B>,
 }
 
 impl<'a, B: PortableBackend + 'static> ParamVisitor<'a, B> {
-    pub fn new(f: &'a mut VisitParamsFn<'a, B>) -> Self {
+    pub fn new(visit: &'a mut VisitParamsFn<'a, B>) -> Self {
         Self {
             path: ParamPath::default(),
             scratch: String::new(),
-            f,
+            visit,
         }
     }
 
@@ -79,8 +79,8 @@ impl<'a, B: PortableBackend + 'static> ParamVisitor<'a, B> {
         );
 
         self.scratch.clear();
-        for (i, seg) in self.path.segments.iter().enumerate() {
-            if i > 0 {
+        for (index, seg) in self.path.segments.iter().enumerate() {
+            if index > 0 {
                 self.scratch.push('.');
             }
             self.scratch.push_str(seg);
@@ -90,22 +90,22 @@ impl<'a, B: PortableBackend + 'static> ParamVisitor<'a, B> {
         }
         self.scratch.push_str(leaf);
 
-        (self.f)(self.scratch.as_str(), role, tensor)
+        (self.visit)(self.scratch.as_str(), role, tensor)
     }
 }
 
 pub struct ParamVisitorMut<'a, B: PortableBackend + 'static> {
     path: ParamPath,
     scratch: String,
-    f: &'a mut VisitParamsMutFn<'a, B>,
+    visit: &'a mut VisitParamsMutFn<'a, B>,
 }
 
 impl<'a, B: PortableBackend + 'static> ParamVisitorMut<'a, B> {
-    pub fn new(f: &'a mut VisitParamsMutFn<'a, B>) -> Self {
+    pub fn new(visit: &'a mut VisitParamsMutFn<'a, B>) -> Self {
         Self {
             path: ParamPath::default(),
             scratch: String::new(),
-            f,
+            visit,
         }
     }
 
@@ -137,8 +137,8 @@ impl<'a, B: PortableBackend + 'static> ParamVisitorMut<'a, B> {
         );
 
         self.scratch.clear();
-        for (i, seg) in self.path.segments.iter().enumerate() {
-            if i > 0 {
+        for (index, seg) in self.path.segments.iter().enumerate() {
+            if index > 0 {
                 self.scratch.push('.');
             }
             self.scratch.push_str(seg);
@@ -148,7 +148,7 @@ impl<'a, B: PortableBackend + 'static> ParamVisitorMut<'a, B> {
         }
         self.scratch.push_str(leaf);
 
-        (self.f)(self.scratch.as_str(), role, tensor)
+        (self.visit)(self.scratch.as_str(), role, tensor)
     }
 }
 
@@ -157,8 +157,8 @@ pub trait Module<B: PortableBackend + 'static> {
     /// Name of the module type. The profiler uses it as the layer scope of the forward pass.
     const NAME: &'static str;
 
-    fn visit_params(&self, v: &mut ParamVisitor<'_, B>) -> Result<()>;
-    fn visit_params_mut(&mut self, v: &mut ParamVisitorMut<'_, B>) -> Result<()>;
+    fn visit_params(&self, visitor: &mut ParamVisitor<B>) -> Result<()>;
+    fn visit_params_mut(&mut self, visitor: &mut ParamVisitorMut<B>) -> Result<()>;
 }
 
 /// Forward pass of a module, like PyTorch `forward`. A [`crate::nn::module`] impl implements it.

@@ -15,10 +15,10 @@ fn fixture() -> Value {
     };
     // GPT-2 byte-to-unicode alphabet.
     let mut shifted = 0u32;
-    for b in 0u32..=255 {
-        let printable = matches!(b, 33..=126 | 161..=172 | 174..=255);
+    for byte in 0u32..=255 {
+        let printable = matches!(byte, 33..=126 | 161..=172 | 174..=255);
         let cp = if printable {
-            b
+            byte
         } else {
             shifted += 1;
             255 + shifted
@@ -139,14 +139,20 @@ fn stream_decoder_replaces_invalid_bytes_and_flushes_partial_ones() {
 fn unsupported_options_are_rejected() {
     type Mutation = fn(&mut Value);
     let cases: [(Mutation, &str); 4] = [
-        (|j| j["model"]["type"] = json!("WordPiece"), "WordPiece"),
         (
-            |j| j["model"]["ignore_merges"] = json!(true),
+            |document| document["model"]["type"] = json!("WordPiece"),
+            "WordPiece",
+        ),
+        (
+            |document| document["model"]["ignore_merges"] = json!(true),
             "ignore_merges",
         ),
-        (|j| j["added_tokens"][0]["lstrip"] = json!(true), "lstrip"),
         (
-            |j| j["pre_tokenizer"]["pretokenizers"][0]["invert"] = json!(true),
+            |document| document["added_tokens"][0]["lstrip"] = json!(true),
+            "lstrip",
+        ),
+        (
+            |document| document["pre_tokenizer"]["pretokenizers"][0]["invert"] = json!(true),
             "pre-tokenizer",
         ),
     ];

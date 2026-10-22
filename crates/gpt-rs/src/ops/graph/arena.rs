@@ -42,19 +42,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
-use gpt_rs_ir::dialects::func::{Func, ParamId};
+use gpt_rs_ir::dialects::func::ParamId;
 use gpt_rs_ir::ir::{Module, Type, Value};
-use gpt_rs_ir::passes::{self, Pass, Pipeline, PruneParams};
+use gpt_rs_ir::passes::{run_pass, PruneParams};
 
 use super::builder::GraphBuilder;
 use super::plan::{
     get_cached_program, insert_cached_program, CachedProgram, InputBinding, Plan, PlanGraph,
     PlanInput, PlanKey, PlanNode, PlanNodeView, ValueRef,
 };
-use super::state::{GraphInner, NodeState, ValueDef};
+use super::state::{GraphInner, NodeState, ValueDef, ValueSet};
 use crate::backend::PortableBackend;
 use crate::ops::graph::ValueId;
-use crate::ops::trace::{self, PassRun, ProgramContext, ProgramKind, ProgramStats, ProgramStatus};
+use crate::ops::trace::{
+    self, ExecutionTraceSink, ProgramContext, ProgramKind, ProgramStats, ProgramStatus,
+};
 use crate::tensor::{InputRole, Materialized};
 
 /// Central storage for lazy tensor graphs built on top of a single backend instance.
@@ -62,6 +64,32 @@ pub struct GraphArena<B: PortableBackend + 'static> {
     backend: Arc<B>,
     inner: Mutex<GraphInner<B>>,
     id: usize,
+    /// The programs it ran, when it records them for a trace.
+    runs: Option<Mutex<Vec<ProgramRun>>>,
+}
+
+/// A program run of an arena that records its runs: what a traced function replays.
+pub(super) struct ProgramRun {
+    pub(super) key: PlanKey,
+    pub(super) exe: Arc<dyn Any + Send + Sync>,
+    pub(super) module: Arc<Module>,
+    /// What each argument of the program was, in order.
+    pub(super) inputs: Vec<RunInput>,
+    /// The value of each result of the program, in order.
+    pub(super) outputs: Vec<ValueId>,
+    /// The values marked for export that the program also computed.
+    pub(super) exports: Vec<ValueId>,
+}
+
+/// An argument of a program that an arena ran.
+pub(super) enum RunInput {
+    /// The parameter of this id.
+    Param(u128),
+    /// The tensor of this id that the graph captured, which the record does not hold, so that the
+    /// run may take it.
+    Captured(u128),
+    /// A value that an earlier program of the arena computed.
+    Computed,
 }
 
 static ARENA_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -69,12 +97,36 @@ static ARENA_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 impl<B: PortableBackend + 'static> GraphArena<B> {
     /// Creates a new arena wrapping the provided backend.
     pub fn new(backend: Arc<B>) -> Arc<Self> {
+        Self::with_runs(backend, None)
+    }
+
+    /// A new arena that records the programs it runs, which [`Self::take_runs`] gives.
+    pub(super) fn recording_runs(backend: Arc<B>) -> Arc<Self> {
+        Self::with_runs(backend, Some(Mutex::default()))
+    }
+
+    fn with_runs(backend: Arc<B>, runs: Option<Mutex<Vec<ProgramRun>>>) -> Arc<Self> {
         let id = ARENA_ID_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
         Arc::new(GraphArena {
             backend,
             inner: Mutex::new(GraphInner::new()),
             id,
+            runs,
         })
+    }
+
+    /// The programs that this arena ran since it was made, or since the last call, when it
+    /// records them.
+    pub(super) fn take_runs(&self) -> Vec<ProgramRun> {
+        match &self.runs {
+            Some(runs) => std::mem::take(&mut *runs.lock().expect("graph arena poisoned")),
+            None => Vec::new(),
+        }
+    }
+
+    /// The id of the arena, which trace sinks see as the graph of its programs.
+    pub(super) fn id(&self) -> usize {
+        self.id
     }
 
     /// Returns the underlying backend handle.
@@ -120,6 +172,9 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
                 ..
             } => Ok(None),
             ValueDef::Input(input) => self.input_handle(input).map(Some),
+            ValueDef::Given => Err(anyhow!(
+                "{value:?} went to a program that may have updated it in place"
+            )),
         }
     }
 
@@ -157,12 +212,12 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
 
     /// Records graph edits through a [`GraphBuilder`], holding the arena for their duration.
     /// The edits remain isolated to this arena and can be replayed later when materialization is requested.
-    pub(crate) fn capture<R, F>(self: &Arc<Self>, f: F) -> Result<R>
+    pub(crate) fn capture<R, F>(self: &Arc<Self>, edit: F) -> Result<R>
     where
         F: FnOnce(&mut GraphBuilder<B>) -> Result<R>,
     {
         let mut inner = self.inner.lock().expect("graph arena poisoned");
-        f(&mut GraphBuilder {
+        edit(&mut GraphBuilder {
             arena: self,
             inner: &mut inner,
             location: None,
@@ -195,9 +250,25 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
                         let _scope = crate::profiling::compile_scope("graph::plan");
                         self.plan(*context)?
                     };
+                    let run_inputs = match &self.runs {
+                        Some(_) => Some(self.run_inputs(&plan)?),
+                        None => None,
+                    };
                     let entry_inputs = self.collect_entry_inputs(&plan)?;
                     match self.try_execute_plan(&plan, values, entry_inputs) {
-                        Ok(handles) => return Ok(handles),
+                        Ok(handles) => {
+                            if let (Some(runs), Some(inputs)) = (&self.runs, run_inputs) {
+                                runs.lock().expect("graph arena poisoned").push(ProgramRun {
+                                    key: plan.key,
+                                    exe: Arc::clone(&plan.exe),
+                                    module: Arc::clone(&plan.module),
+                                    inputs,
+                                    outputs: plan.program_outputs.clone(),
+                                    exports: plan.exports.clone(),
+                                });
+                            }
+                            return Ok(handles);
+                        }
                         Err(err) => {
                             if err.downcast_ref::<StalePlanError>().is_some() {
                                 crate::profiling::cache_event("stale_plan_retry");
@@ -246,32 +317,8 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
         requested.sort_by_key(|value| value.0);
         requested.dedup();
 
-        let (refs, nodes, inputs) = plan_refs(&inner, &requested)?;
-        let mut ordered = Vec::with_capacity(nodes);
-        let mut inputs = Vec::with_capacity(inputs);
-        for (index, value_ref) in refs.iter().enumerate() {
-            let value = ValueId(index as u32);
-            match value_ref {
-                ValueRef::Node(_) => ordered.push(value),
-                ValueRef::Input(_) => {
-                    let record = &inner.values[index];
-                    let (role, stable_id) = match &record.def {
-                        ValueDef::Input(input) => (
-                            input.role,
-                            (input.role == InputRole::Param).then_some(input.id),
-                        ),
-                        ValueDef::Node { .. } => (InputRole::Arg, None),
-                    };
-                    inputs.push(PlanInput {
-                        value,
-                        role,
-                        stable_id,
-                        ty: record.tensor_type().clone(),
-                    });
-                }
-                ValueRef::External => {}
-            }
-        }
+        let (refs, node_count, input_count) = plan_refs(&inner, &requested)?;
+        let (ordered, inputs) = plan_values(&inner, &refs, node_count, input_count)?;
 
         let mut exports: Vec<_> = inner.exports.iter().copied().collect();
         exports.sort_by_key(|value| value.0);
@@ -285,13 +332,16 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
                 Some(PlanNodeView {
                     op: &op.op,
                     operands: inner.operands(op),
-                    ty: inner.values[value.0 as usize].tensor_type(),
                     first: op.first,
                     result,
                 })
             },
         };
-        let key = PlanKey::new(self.backend.backend_name(), &graph)?;
+        let key = PlanKey::new(
+            self.backend.backend_name(),
+            self.backend.compile_identity(),
+            &graph,
+        )?;
 
         Ok(PrepareResult::NeedsPlan(Box::new(PlanContext {
             key,
@@ -315,9 +365,8 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
             arena_version,
         } = context;
 
-        let cached = get_cached_program(&key);
         let mut compile_outputs = outputs.clone();
-        if let Some(cached) = cached {
+        if let Some(cached) = get_cached_program(&key) {
             let program_outputs =
                 values_at_ranks(&ordered_values, &plan_inputs, &cached.output_ranks)?;
             if outputs.iter().all(|value| program_outputs.contains(value)) {
@@ -347,19 +396,19 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
             .iter()
             .map(|input| input.stable_id.map(ParamId))
             .collect();
-        let mut module = build_module(&plan_inputs, &params, &nodes, &compile_outputs)?;
+        let mut built = build_module(&plan_inputs, &params, &nodes, &compile_outputs)?;
         {
-            let _scope = crate::profiling::compile_scope("optimizer::pass_pipeline");
-            run_traced(&mut module, &self.backend.pipeline())?;
+            let _pipeline_scope = crate::profiling::compile_scope("optimizer::pass_pipeline");
+            trace::run_pipeline(&mut built, &self.backend.pipeline())?;
         }
-        let inputs = prune_params(&mut module)?;
-        let module = Arc::new(module);
+        let inputs = prune_params(&mut built)?;
+        let module = Arc::new(built);
         self.load_static_params(&module)?;
-        let exe = {
-            let _scope = crate::profiling::compile_scope("backend::compile");
+        let compiled = {
+            let _backend_scope = crate::profiling::compile_scope("backend::compile");
             self.backend.compile(&module, "captured")?
         };
-        let exe: Arc<dyn Any + Send + Sync> = Arc::new(exe);
+        let exe: Arc<dyn Any + Send + Sync> = Arc::new(compiled);
         let output_ranks = ranks_of(&ordered_values, &plan_inputs, &compile_outputs)?;
         insert_cached_program(
             key,
@@ -387,7 +436,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
     /// does not hold yet, and stores the results there.
     fn load_static_params(&self, module: &Arc<Module>) -> Result<()> {
         for func in module.funcs() {
-            let attrs = module.op(func).get::<Func>().expect("a function");
+            let attrs = func.attrs();
             if !attrs.is_load_time() {
                 continue;
             }
@@ -397,9 +446,9 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
                 continue;
             }
             let leaves = (0..attrs.args.len())
-                .map(|i| {
+                .map(|position| {
                     let id = attrs
-                        .param(i)
+                        .param(position)
                         .expect("a load-time function reads parameters");
                     self.param_handle(id.0)
                 })
@@ -408,7 +457,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
             let handles = self
                 .backend
                 .compile(module, &attrs.name)
-                .and_then(|exe| self.backend.run(&exe, &leaves))
+                .and_then(|exe| self.backend.run(&exe, leaves))
                 .map_err(|err| anyhow!("load-time function @{}: {err:#}", attrs.name))?;
             for (id, handle) in computed.into_iter().zip(handles) {
                 params.set(id, handle);
@@ -452,23 +501,7 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
         entry_inputs: Vec<B::TensorHandle>,
     ) -> Result<Vec<B::TensorHandle>> {
         // Build the program context only when a trace sink will read it.
-        let traced = trace::current_sink().map(|sink| {
-            let context = ProgramContext {
-                trace_id: trace::next_trace_id(),
-                graph_id: self.id,
-                backend: self.backend.backend_name().to_string(),
-                plan_hash: plan.key.0,
-                program_cache_hit: plan.program_cache_hit,
-                targets: targets.to_vec(),
-                outputs: plan.requested_outputs.clone(),
-                exports: plan.exports.clone(),
-                timestamp: std::time::SystemTime::now(),
-                kind: ProgramKind::Materialize {
-                    values: targets.to_vec(),
-                },
-            };
-            (sink, context)
-        });
+        let traced = trace::current_sink().map(|sink| (sink, self.program_context(plan, targets)));
 
         if let Some((sink, context)) = &traced {
             sink.before_program(context, &plan.module);
@@ -479,78 +512,75 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
             .exe
             .downcast_ref::<B::Executable>()
             .ok_or_else(|| anyhow!("the plan was compiled by another backend type"))?;
-        let exec = self.backend.run(exe, &entry_inputs);
+        let exec = self.backend.run(exe, entry_inputs);
 
         match exec {
-            Ok(mut produced) => {
+            Ok(produced) => {
                 if produced.len() != plan.program_outputs.len() {
-                    if let Some((sink, context)) = &traced {
-                        sink.after_program(
-                            context,
-                            &ProgramStats {
-                                duration: start.elapsed(),
-                                output_count: produced.len(),
-                                status: ProgramStatus::Failure {
-                                    message: format!(
-                                        "backend returned {} outputs, expected {}",
-                                        produced.len(),
-                                        plan.program_outputs.len()
-                                    ),
-                                },
-                            },
-                        );
-                    }
-                    return Err(anyhow!(
+                    let message = format!(
                         "backend returned {} outputs, expected {}",
                         produced.len(),
                         plan.program_outputs.len()
-                    ));
-                }
-
-                let final_handles = {
-                    let mut inner = self.inner.lock().expect("graph arena poisoned");
-                    for (value, handle) in plan.program_outputs.iter().zip(produced.drain(..)) {
-                        if let Some(ValueDef::Node { state, .. }) = inner
-                            .values
-                            .get_mut(value.0 as usize)
-                            .map(|record| &mut record.def)
-                        {
-                            *state = NodeState::Ready(handle);
-                        }
-                    }
-
-                    self.collect_target_handles(&inner, targets)?
-                };
-
-                if let Some((sink, context)) = &traced {
-                    sink.after_program(
-                        context,
-                        &ProgramStats {
-                            duration: start.elapsed(),
-                            output_count: plan.program_outputs.len(),
-                            status: ProgramStatus::Success,
-                        },
                     );
+                    let status = ProgramStatus::Failure {
+                        message: message.clone(),
+                    };
+                    report_program(traced.as_ref(), start, produced.len(), status);
+                    return Err(anyhow!(message));
                 }
 
+                let final_handles = self.store_outputs(plan, targets, produced)?;
+                let output_count = plan.program_outputs.len();
+                report_program(traced.as_ref(), start, output_count, ProgramStatus::Success);
                 Ok(final_handles)
             }
             Err(err) => {
-                if let Some((sink, context)) = &traced {
-                    sink.after_program(
-                        context,
-                        &ProgramStats {
-                            duration: start.elapsed(),
-                            output_count: 0,
-                            status: ProgramStatus::Failure {
-                                message: err.to_string(),
-                            },
-                        },
-                    );
-                }
+                let status = ProgramStatus::Failure {
+                    message: err.to_string(),
+                };
+                report_program(traced.as_ref(), start, 0, status);
                 Err(err)
             }
         }
+    }
+
+    /// What a trace sink learns about the run of `plan` that materializes `targets`.
+    fn program_context(&self, plan: &Plan, targets: &[ValueId]) -> ProgramContext {
+        ProgramContext {
+            trace_id: trace::next_trace_id(),
+            graph_id: self.id,
+            backend: self.backend.backend_name().to_string(),
+            plan_hash: plan.key.0,
+            program_cache_hit: plan.program_cache_hit,
+            targets: targets.to_vec(),
+            outputs: plan.requested_outputs.clone(),
+            exports: plan.exports.clone(),
+            timestamp: std::time::SystemTime::now(),
+            kind: ProgramKind::Materialize {
+                values: targets.to_vec(),
+            },
+        }
+    }
+
+    /// Stores each handle that the run of `plan` `produced` as the value of its output, and returns
+    /// the handles of `targets`.
+    fn store_outputs(
+        &self,
+        plan: &Plan,
+        targets: &[ValueId],
+        produced: Vec<B::TensorHandle>,
+    ) -> Result<Vec<B::TensorHandle>> {
+        let mut inner = self.inner.lock().expect("graph arena poisoned");
+        for (value, handle) in plan.program_outputs.iter().zip(produced) {
+            if let Some(ValueDef::Node { state, .. }) = inner
+                .values
+                .get_mut(value.0 as usize)
+                .map(|record| &mut record.def)
+            {
+                *state = NodeState::Ready(handle);
+            }
+        }
+        self.collect_target_handles(&inner, targets)
     }
 
     /// The handles of the inputs of `plan`, in the order of its program's parameters. The
@@ -566,7 +596,8 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
             .get_all(param_ids)
             .ok_or_else(|| anyhow!("a parameter of the program is not in the parameter store"))?
             .into_iter();
-        let inner = self.inner.lock().expect("graph arena poisoned");
+        let mut inner = self.inner.lock().expect("graph arena poisoned");
+        let given = given_inputs(&inner, plan);
         let mut args = plan.args.iter();
         let mut handles = Vec::with_capacity(plan.inputs.len());
         for binding in &plan.inputs {
@@ -576,12 +607,40 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
                     let value = *args
                         .next()
                         .ok_or_else(|| anyhow!("plan binds more arguments than it records"))?;
-                    self.arg_handle(&inner, value)?
+                    match given.contains(&value) {
+                        true => give(&mut inner, value),
+                        false => self.arg_handle(&inner, value)?,
+                    }
                 }
             };
             handles.push(handle);
         }
         Ok(handles)
+    }
+
+    /// What each argument of `plan` is, in the order of its program's parameters.
+    fn run_inputs(&self, plan: &Plan) -> Result<Vec<RunInput>> {
+        let inner = self.inner.lock().expect("graph arena poisoned");
+        let mut args = plan.args.iter();
+        let mut inputs = Vec::with_capacity(plan.inputs.len());
+        for binding in &plan.inputs {
+            let input = match binding {
+                InputBinding::Param(id) => RunInput::Param(*id),
+                InputBinding::Arg(_) => {
+                    let value = *args
+                        .next()
+                        .ok_or_else(|| anyhow!("plan binds more arguments than it records"))?;
+                    match &inner.value(value)?.def {
+                        ValueDef::Input(input) if input.role == InputRole::Arg => {
+                            RunInput::Captured(input.id)
+                        }
+                        _ => RunInput::Computed,
+                    }
+                }
+            };
+            inputs.push(input);
+        }
+        Ok(inputs)
     }
 
     fn arg_handle(&self, inner: &GraphInner<B>, value: ValueId) -> Result<B::TensorHandle> {
@@ -590,11 +649,103 @@ impl<B: PortableBackend + 'static> GraphArena<B> {
     }
 }
 
+/// The run-time arguments of `plan` whose handles its run may take, so the backend may update
+/// their memory in place. Each is a captured tensor that:
+/// - no tensor holds any more;
+/// - the plan binds once;
+/// - is read by no pending value that a caller may still ask for, directly or through other
+///   pending values.
+///
+/// A caller may ask for a value while a tensor of it is alive, unless the run computes it.
+fn given_inputs<B: PortableBackend + 'static>(inner: &GraphInner<B>, plan: &Plan) -> ValueSet {
+    let mut given = ValueSet::default();
+    for &value in &plan.args {
+        let ValueDef::Input(input) = &inner.values[value.0 as usize].def else {
+            continue;
+        };
+        let bound_once = plan.args.iter().filter(|&&arg| arg == value).count() == 1;
+        if input.role == InputRole::Arg && Arc::strong_count(input) == 1 && bound_once {
+            given.insert(value);
+        }
+    }
+    if given.is_empty() {
+        return given;
+    }
+    let computed: ValueSet = plan.requested_outputs.iter().copied().collect();
+    let mut stack = Vec::new();
+    for (index, record) in inner.values.iter().enumerate() {
+        let value = ValueId(index as u32);
+        let pending = matches!(
+            record.def,
+            ValueDef::Node {
+                state: NodeState::Pending,
+                ..
+            }
+        );
+        if pending && record.tensors.strong_count() > 0 && !computed.contains(&value) {
+            stack.push(value);
+        }
+    }
+    let mut seen = ValueSet::default();
+    while let Some(value) = stack.pop() {
+        if !seen.insert(value) {
+            continue;
+        }
+        let record = &inner.values[value.0 as usize];
+        match &record.def {
+            ValueDef::Node {
+                op,
+                state: NodeState::Pending,
+                ..
+            } => stack.extend_from_slice(inner.operands(&inner.ops[*op as usize])),
+            ValueDef::Input(_) => {
+                given.remove(&value);
+            }
+            _ => {}
+        }
+    }
+    given
+}
+
+/// Takes the handle of the captured tensor `value` for a run, which nothing else holds.
+fn give<B: PortableBackend + 'static>(
+    inner: &mut GraphInner<B>,
+    value: ValueId,
+) -> B::TensorHandle {
+    let def = std::mem::replace(&mut inner.values[value.0 as usize].def, ValueDef::Given);
+    let ValueDef::Input(input) = def else {
+        unreachable!("only captured tensors are given");
+    };
+    match Arc::try_unwrap(input) {
+        Ok(owned) => owned.tensor,
+        Err(_) => unreachable!("the graph holds the only handle of a given tensor"),
+    }
+}
+
+/// Tells the trace sink of `traced`, when there is one, how the run that began at `start` ended.
+pub(super) fn report_program(
+    traced: Option<&(Arc<dyn ExecutionTraceSink>, ProgramContext)>,
+    start: Instant,
+    output_count: usize,
+    status: ProgramStatus,
+) {
+    if let Some((sink, context)) = traced {
+        sink.after_program(
+            context,
+            &ProgramStats {
+                duration: start.elapsed(),
+                output_count,
+                status,
+            },
+        );
+    }
+}
+
 #[derive(Debug)]
 struct StalePlanError;
 
 impl fmt::Display for StalePlanError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "cached plan is stale after graph mutation")
     }
 }
@@ -614,7 +765,7 @@ fn ranks_of(
         .iter()
         .map(|value| {
             context_nodes
-                .binary_search_by_key(&value.0, |v| v.0)
+                .binary_search_by_key(&value.0, |node| node.0)
                 .or_else(|_| {
                     params
                         .binary_search_by_key(&value.0, |param| param.value.0)
@@ -675,27 +826,6 @@ struct PlanContext {
     arena_version: u64,
 }
 
-/// Runs the passes of `pipeline` on `module`, verifying after each. A trace sink receives the
-/// module after each pass.
-fn run_traced(module: &mut Module, pipeline: &Pipeline) -> Result<()> {
-    let sink = trace::current_sink();
-    for pass in pipeline.passes() {
-        let _scope = crate::profiling::compile_pass_scope(pass.name());
-        let changed = passes::run_pass(pass.as_ref(), module)?;
-        let stats = passes::take_stats();
-        if let Some(sink) = &sink {
-            let run = PassRun {
-                name: pass.name(),
-                options: &pass.options(),
-                changed,
-                stats: &stats,
-            };
-            sink.on_pass(&run, module);
-        }
-    }
-    Ok(())
-}
-
 /// The module whose function `@captured` computes `outputs` from the plan inputs `inputs`, bound
 /// to `params`, with the ops `nodes`.
 fn build_module(
@@ -709,46 +839,52 @@ fn build_module(
         .iter()
         .map(|input| Type::Tensor(input.ty.clone()))
         .collect();
-    module.build_func("captured", types, params.to_vec(), |b, args| {
-        let mut values: HashMap<ValueId, Value> = inputs
-            .iter()
-            .map(|input| input.value)
-            .zip(args.iter().copied())
-            .collect();
-        // The op of each `first` value, built once for all of its results.
-        let mut insts = HashMap::new();
-        for node in nodes {
-            let inst = match insts.get(&node.first) {
-                Some(&inst) => inst,
-                None => {
-                    let operands = node
-                        .operands
-                        .iter()
-                        .map(|v| {
-                            values
-                                .get(v)
-                                .copied()
-                                .ok_or_else(|| anyhow!("{v:?} is not computed"))
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    b.set_location(node.location.clone());
-                    let inst = b.create_op(node.op.clone(), operands, None, Vec::new());
-                    insts.insert(node.first, inst);
-                    inst
-                }
-            };
-            values.insert(node.value, b.module.results(inst)[node.result]);
-        }
-        outputs
-            .iter()
-            .map(|v| {
-                values
-                    .get(v)
-                    .copied()
-                    .ok_or_else(|| anyhow!("output {v:?} is not computed"))
-            })
-            .collect()
-    })?;
+    module.build_func(
+        "captured",
+        types,
+        params.to_vec(),
+        Vec::new(),
+        |builder, args| {
+            let mut values: HashMap<ValueId, Value> = inputs
+                .iter()
+                .map(|input| input.value)
+                .zip(args.iter().copied())
+                .collect();
+            // The op of each `first` value, built once for all of its results.
+            let mut insts = HashMap::new();
+            for node in nodes {
+                let inst = match insts.get(&node.first) {
+                    Some(&inst) => inst,
+                    None => {
+                        let operands = node
+                            .operands
+                            .iter()
+                            .map(|operand| {
+                                values
+                                    .get(operand)
+                                    .copied()
+                                    .ok_or_else(|| anyhow!("{operand:?} is not computed"))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        builder.set_location(node.location.clone());
+                        let inst = builder.create_op(node.op.clone(), operands, None, Vec::new());
+                        insts.insert(node.first, inst);
+                        inst
+                    }
+                };
+                values.insert(node.value, builder.module.results(inst)[node.result]);
+            }
+            outputs
+                .iter()
+                .map(|output| {
+                    values
+                        .get(output)
+                        .copied()
+                        .ok_or_else(|| anyhow!("output {output:?} is not computed"))
+                })
+                .collect()
+        },
+    )?;
     Ok(module)
 }
 
@@ -757,8 +893,8 @@ fn build_module(
 /// position among the plan inputs.
 fn prune_params(module: &mut Module) -> Result<Vec<InputBinding>> {
     let func = module.func("captured").expect("the captured function");
-    let attrs = module.op(func).get::<Func>().expect("a function");
-    let args = module.args(module.regions(func)[0]);
+    let attrs = func.attrs();
+    let args = module.args(func.body().id());
     let bindings = args
         .iter()
         .enumerate()
@@ -767,8 +903,55 @@ fn prune_params(module: &mut Module) -> Result<Vec<InputBinding>> {
             None => Some(InputBinding::Arg(index)),
         })
         .collect();
-    PruneParams.run(module)?;
+    run_pass(&PruneParams, module)?;
     Ok(bindings)
+}
+
+/// The pending nodes of `refs` in value order, and the plan inputs it binds: ready nodes and
+/// captured tensors.
+fn plan_values<B: PortableBackend + 'static>(
+    inner: &GraphInner<B>,
+    refs: &[ValueRef],
+    node_count: usize,
+    input_count: usize,
+) -> Result<(Vec<ValueId>, Vec<PlanInput>)> {
+    let mut ordered = Vec::with_capacity(node_count);
+    let mut inputs = Vec::with_capacity(input_count);
+    for (index, value_ref) in refs.iter().enumerate() {
+        let value = ValueId(index as u32);
+        match value_ref {
+            ValueRef::Node(_) => ordered.push(value),
+            ValueRef::Input(_) => inputs.push(plan_input(inner, value)?),
+            ValueRef::External => {}
+        }
+    }
+    Ok((ordered, inputs))
+}
+
+/// The plan input that binds `value`: a parameter by its stable id, or a run-time argument.
+fn plan_input<B: PortableBackend + 'static>(
+    inner: &GraphInner<B>,
+    value: ValueId,
+) -> Result<PlanInput> {
+    let record = &inner.values[value.0 as usize];
+    let (role, stable_id) = match &record.def {
+        ValueDef::Input(input) => (
+            input.role,
+            (input.role == InputRole::Param).then_some(input.id),
+        ),
+        ValueDef::Node { .. } => (InputRole::Arg, None),
+        ValueDef::Given => {
+            return Err(anyhow!(
+                "{value:?} went to a program that may have updated it in place"
+            ))
+        }
+    };
+    Ok(PlanInput {
+        value,
+        role,
+        stable_id,
+        ty: record.tensor_type().clone(),
+    })
 }
 
 /// What each value of `inner` is in the plan that computes `requested`, by value id: a pending

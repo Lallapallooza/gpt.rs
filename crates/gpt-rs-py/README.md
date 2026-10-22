@@ -15,7 +15,7 @@ uv sync
 uv pip install maturin
 
 # Build the extension with the backends you want at runtime (`maturin develop --release`):
-uv run python scripts/rebuild_py.py --features faer,conversion-c
+uv run python scripts/rebuild_py.py --features faer,conversion-c,x86
 
 # Or one backend, to build faster:
 uv run python scripts/rebuild_py.py --features faer
@@ -26,8 +26,11 @@ Then pick a backend at runtime:
 ```python
 import gpt_rs
 
-gpt_rs.set_backend("faer")  # or: "c", "ref-cpu"; gpt_rs.list_backends() lists them
+gpt_rs.set_backend("faer")  # or: "c", "x86", "ref-cpu"; gpt_rs.list_backends() lists them
 ```
+
+In `load_model(model_dir, backend="x86", target="host")`, `target=` names the target that x86
+compiles for: a preset, `host` or a target file (`$GPTRS_TARGET`, else `host`).
 
 ## Quick smoke test
 

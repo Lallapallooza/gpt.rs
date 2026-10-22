@@ -1,7 +1,7 @@
 //! Mutable builder that records operations in a [`GraphArena`](super::arena::GraphArena).
 
 use std::ops::Range;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use anyhow::{anyhow, bail, Result};
 use gpt_rs_ir::dialects::tensor::{BroadcastTo, Constant};
@@ -9,7 +9,7 @@ use gpt_rs_ir::ir::{DType, Dense, Dim, InOp, Location, Module, OpDyn, Ranked, Te
 use smallvec::SmallVec;
 
 use super::arena::GraphArena;
-use super::state::{GraphInner, NodeState, OpRecord, ScalarKey, ValueDef, ValueRecord};
+use super::state::{GraphInner, NodeState, NodeToken, OpRecord, ScalarKey, ValueDef, ValueRecord};
 use crate::backend::PortableBackend;
 use crate::ops::graph::ValueId;
 use crate::tensor::{DeviceTensor, LazyHandle, Materialized};
@@ -34,6 +34,17 @@ impl<'a, B: PortableBackend + 'static> GraphBuilder<'a, B> {
         self.location = location;
     }
 
+    /// The token that the tensors of the recorded value `value` hold while they are alive.
+    pub(crate) fn node_token(&mut self, value: ValueId) -> Arc<NodeToken> {
+        let record = &mut self.inner.values[value.0 as usize];
+        if let Some(token) = record.tensors.upgrade() {
+            return token;
+        }
+        let token = Arc::new(NodeToken);
+        record.tensors = Arc::downgrade(&token);
+        token
+    }
+
     /// Imports a tensor into the graph, returning the associated value identifier.
     /// Existing handles are reused so repeated captures share parameters.
     pub fn import(&mut self, tensor: &DeviceTensor<B>) -> Result<ValueId> {
@@ -50,7 +61,7 @@ impl<'a, B: PortableBackend + 'static> GraphBuilder<'a, B> {
                 self.inner.bump_version();
                 Ok(value)
             }
-            LazyHandle::Node { graph, value } if Arc::ptr_eq(graph, self.arena) => Ok(*value),
+            LazyHandle::Node { graph, value, .. } if Arc::ptr_eq(graph, self.arena) => Ok(*value),
             LazyHandle::Node { .. } => {
                 let input = Materialized::arg(tensor.materialize()?);
                 let value = self
@@ -66,9 +77,9 @@ impl<'a, B: PortableBackend + 'static> GraphBuilder<'a, B> {
     /// `dtype`: a rank-0 constant, broadcast to `dims`. A graph records each scalar, and each
     /// broadcast of it, once and reuses them while they are pending.
     pub fn scalar(&mut self, dtype: DType, element: &[u8], dims: &[usize]) -> Result<ValueId> {
-        let mut bits = [0u8; 8];
-        bits[..element.len()].copy_from_slice(element);
-        let bits = u64::from_le_bytes(bits);
+        let mut bytes = [0u8; 8];
+        bytes[..element.len()].copy_from_slice(element);
+        let bits = u64::from_le_bytes(bytes);
         let constant = match self.pending_scalar(&(dtype, bits, Ranked::new())) {
             Some(constant) => constant,
             None => {
@@ -122,7 +133,7 @@ impl<'a, B: PortableBackend + 'static> GraphBuilder<'a, B> {
                 types.push(&self.inner.value(operand)?.ty);
             }
             let (results, _) = op
-                .dyn_result_types(&types, None, &[], empty_module())
+                .dyn_result_types(&types, None, &[], empty_module(), None)
                 .map_err(|err| anyhow!("{}: {err:#}", op.name()))?;
             results
         };
@@ -139,7 +150,11 @@ impl<'a, B: PortableBackend + 'static> GraphBuilder<'a, B> {
                 result: result as u32,
                 state: NodeState::Pending,
             };
-            self.inner.values.push(ValueRecord { ty, def });
+            self.inner.values.push(ValueRecord {
+                ty,
+                def,
+                tensors: Weak::new(),
+            });
         }
         self.inner.ops.push(OpRecord {
             op: op.into(),

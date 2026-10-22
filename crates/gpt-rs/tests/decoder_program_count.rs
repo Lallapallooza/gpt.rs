@@ -30,10 +30,10 @@ impl ExecutionTraceSink for ProgramRuns {
 }
 
 impl ProgramRuns {
-    /// What `f` returns, and whether each program that it runs reused a compiled program.
-    fn record<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<(T, Vec<bool>)> {
+    /// What `run` returns, and whether each program that it runs reused a compiled program.
+    fn record<T>(&self, run: impl FnOnce() -> Result<T>) -> Result<(T, Vec<bool>)> {
         let before = self.cache_hits.lock().unwrap().len();
-        let value = f()?;
+        let value = run()?;
         Ok((value, self.cache_hits.lock().unwrap()[before..].to_vec()))
     }
 }
@@ -51,7 +51,7 @@ fn decoder_runs_one_program_per_prefill_chunk_and_decode_step() -> Result<()> {
         let loaded = load_model(Arc::clone(&backend), &checkpoint.path)?;
         let model = loaded.causal_lm()?;
 
-        let prompt: Vec<usize> = (0..PREFILL_CHUNK + 8).map(|i| i % 64).collect();
+        let prompt: Vec<usize> = (0..PREFILL_CHUNK + 8).map(|index| index % 64).collect();
         let (_, forward) = runs.record(|| model.forward(&prompt))?;
         assert_eq!(
             forward.len(),

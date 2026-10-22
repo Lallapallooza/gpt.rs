@@ -25,16 +25,16 @@ static PROGRAM_CACHE: Lazy<Mutex<LruCache<PlanKey, CachedProgram>>> = Lazy::new(
     ))
 });
 
-/// A hash of everything a compiled program depends on: the backend, the graph structure (input
-/// roles, ops with their attributes and literals, operand topology), and the types and parameter
-/// ids it is specialized to. The values that a call requests are not part of it, because
-/// programs bind outputs by node rank.
+/// A hash of everything a compiled program depends on: the backend's name and compile identity
+/// (such as its target), the graph structure (input roles, ops with their attributes and literals,
+/// operand topology), and the types and parameter ids it is specialized to. The values that a call
+/// requests are not part of it, because programs bind outputs by node rank.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(super) struct PlanKey(pub(super) u64);
 
 impl PlanKey {
     /// Computes the key of `graph` in one pass, without allocating.
-    pub(super) fn new<'n, F>(backend: &str, graph: &PlanGraph<'_, F>) -> Result<Self>
+    pub(super) fn new<'n, F>(backend: &str, identity: &str, graph: &PlanGraph<F>) -> Result<Self>
     where
         F: Fn(ValueId) -> Option<PlanNodeView<'n>>,
     {
@@ -46,6 +46,7 @@ impl PlanKey {
 
         let mut hasher = key_hasher();
         backend.hash(&mut hasher);
+        identity.hash(&mut hasher);
         hasher.write_usize(graph.inputs.len());
         for input in graph.inputs {
             input.role.hash(&mut hasher);
@@ -56,8 +57,8 @@ impl PlanKey {
         for &node_value in graph.nodes {
             let node = (graph.node_view)(node_value)
                 .ok_or_else(|| anyhow::anyhow!("missing node for value {node_value:?}"))?;
+            // The node's type is left out: its op gives it from its operands' types.
             node.op.hash(&mut hasher);
-            node.ty.hash(&mut hasher);
             hasher.write_usize(node.result);
             if node.result > 0 {
                 write_ref(&mut hasher, graph.value_ref(node.first));
@@ -102,12 +103,11 @@ pub(super) struct PlanNode {
     pub(super) location: Option<Location>,
 }
 
-/// Borrowed view of a pending node: its op, operands, type and result index.
+/// Borrowed view of a pending node: its op, operands and result index.
 #[derive(Clone, Copy)]
 pub(super) struct PlanNodeView<'a> {
     pub(super) op: &'a Op,
     pub(super) operands: &'a [ValueId],
-    pub(super) ty: &'a TensorType,
     pub(super) first: ValueId,
     pub(super) result: usize,
 }

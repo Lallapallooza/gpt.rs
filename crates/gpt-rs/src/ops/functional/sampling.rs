@@ -25,25 +25,25 @@ pub fn sample(
     );
     let (rows, vocab) = (logits.size(0), logits.size(1));
     let scaled = logits / temperature;
-    let (candidates, indices) = match top_k {
-        Some(k) if k < vocab => {
-            assert!(k > 0, "{FUNCTIONAL}: top_k must be positive");
-            let (values, indices) = scaled.top_k(k, -1);
+    let (candidates, top_indices) = match top_k {
+        Some(count) if count < vocab => {
+            assert!(count > 0, "{FUNCTIONAL}: top_k must be positive");
+            let (values, indices) = scaled.top_k(count, -1);
             (values, Some(indices))
         }
         _ => (scaled, None),
     };
-    let (uniform, state) = state.rng_uniform(candidates.shape().dims(), DType::F32);
+    let (uniform, next_state) = state.rng_uniform(candidates.shape().dims(), DType::F32);
     let gumbel = -(-uniform.log()).log();
     let choice = (candidates + gumbel).argmax(-1);
-    let Some(indices) = indices else {
-        return (choice, state);
+    let Some(indices) = top_indices else {
+        return (choice, next_state);
     };
-    // The chosen column of each row of `indices`, at `row * k + choice` of its flat elements.
-    let k = indices.size(1);
-    let offsets: Vec<i32> = (0..rows).map(|row| (row * k) as i32).collect();
-    let offsets = HostTensor::si32([rows], offsets).expect("one offset per row");
+    // The chosen column of each row of `indices`, at `row * kept + choice` of its flat elements.
+    let kept = indices.size(1);
+    let row_offsets: Vec<i32> = (0..rows).map(|row| (row * kept) as i32).collect();
+    let offsets = HostTensor::si32([rows], row_offsets).expect("one offset per row");
     let flat = DeviceTensor::constant(&choice, &offsets);
-    let token = indices.reshape([rows * k]).take(&(choice + flat));
-    (token, state)
+    let token = indices.reshape([rows * kept]).take(&(choice + flat));
+    (token, next_state)
 }

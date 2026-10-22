@@ -11,15 +11,17 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 use gpt_rs_ir::ir::Module;
+use gpt_rs_ir::passes::{self, Pipeline};
 use gpt_rs_ir::text::TextOptions;
 use serde::Serialize;
 
 use crate::ops::graph::ValueId;
 
-/// Dumped programs are stored programs, with the location of each op.
+/// Dumped programs are stored programs, with the location and the number of each op.
 const DUMPED_TEXT: TextOptions = TextOptions {
     versioned: true,
     locations: true,
+    numbers: true,
 };
 
 /// Describes the kind of PTIR program being executed.
@@ -32,6 +34,8 @@ pub enum ProgramKind {
     FlushAll,
     /// Custom tag supplied by higher-level callers.
     Custom { label: String },
+    /// The program of a traced function, run again on new inputs without recording.
+    Replay,
 }
 
 impl ProgramKind {
@@ -40,12 +44,13 @@ impl ProgramKind {
             ProgramKind::Materialize { .. } => "materialize",
             ProgramKind::FlushAll => "flush_all",
             ProgramKind::Custom { label } => label.as_str(),
+            ProgramKind::Replay => "replay",
         }
     }
 }
 
 impl fmt::Display for ProgramKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ProgramKind::Materialize { values } => {
                 if let Some(first) = values.first() {
@@ -56,6 +61,7 @@ impl fmt::Display for ProgramKind {
             }
             ProgramKind::FlushAll => write!(f, "flush_all"),
             ProgramKind::Custom { label } => write!(f, "{label}"),
+            ProgramKind::Replay => write!(f, "replay"),
         }
     }
 }
@@ -101,7 +107,39 @@ pub trait ExecutionTraceSink: Send + Sync {
     fn after_program(&self, context: &ProgramContext, stats: &ProgramStats);
 
     /// Called after each pass of the pipeline, with the module after it.
-    fn on_pass(&self, _pass: &PassRun<'_>, _module: &Module) {}
+    fn on_pass(&self, _pass: &PassRun, _module: &Module) {}
+
+    /// Called with a file a backend made from a module, such as the source it generated, named
+    /// `name`, after the passes that made the module.
+    fn on_artifact(&self, _name: &str, _contents: &str) {}
+}
+
+/// Runs the passes of `pipeline` on `module`, verifying after each, in a profiler scope each. A
+/// trace sink receives the module after each pass.
+pub fn run_pipeline(module: &mut Module, pipeline: &Pipeline) -> anyhow::Result<()> {
+    let installed = current_sink();
+    for pass in pipeline.passes() {
+        let _scope = crate::profiling::compile_pass_scope(pass.name());
+        let changed = passes::run_pass(pass.as_ref(), module)?;
+        let stats = passes::take_stats();
+        if let Some(sink) = &installed {
+            let run = PassRun {
+                name: pass.name(),
+                options: &pass.options(),
+                changed,
+                stats: &stats,
+            };
+            sink.on_pass(&run, module);
+        }
+    }
+    Ok(())
+}
+
+/// Hands the trace sink, if one is installed, the file `contents` named `name`.
+pub fn artifact(name: &str, contents: &str) {
+    if let Some(sink) = current_sink() {
+        sink.on_artifact(name, contents);
+    }
 }
 
 /// What one pass of the pipeline did.
@@ -254,7 +292,7 @@ impl FileTraceSink {
         }
     }
 
-    fn append_execution_record(&self, record: &ExecutionRecord<'_>) {
+    fn append_execution_record(&self, record: &ExecutionRecord) {
         if !self.options.emit_execution_log {
             return;
         }
@@ -324,15 +362,15 @@ impl ExecutionTraceSink for FileTraceSink {
     }
 
     fn after_program(&self, context: &ProgramContext, stats: &ProgramStats) {
-        let record = if let Ok(mut runs) = self.runs.lock() {
+        let removed = if let Ok(mut runs) = self.runs.lock() {
             runs.remove(&context.trace_id)
         } else {
             None
         };
 
-        let dumped = record.as_ref().is_some_and(|r| r.dumped);
+        let dumped = removed.as_ref().is_some_and(|record| record.dumped);
 
-        if let Some(record) = record {
+        if let Some(record) = removed {
             if let Some(dir) = record.dir {
                 if let Ok(json) = serde_json::to_string_pretty(stats) {
                     let _ = std::fs::write(dir.join("stats.json"), json);
@@ -363,7 +401,7 @@ impl ExecutionTraceSink for FileTraceSink {
     /// Writes the module after each pass to `passes/`. With `GPTRS_PASS_STATS`, it also logs
     /// the pass, its options, whether it changed the module, how many ops the module has and the
     /// pass's statistics to `passes.jsonl`.
-    fn on_pass(&self, run: &PassRun<'_>, module: &Module) {
+    fn on_pass(&self, run: &PassRun, module: &Module) {
         if !self.options.emit_pass_events {
             return;
         }
@@ -383,6 +421,23 @@ impl ExecutionTraceSink for FileTraceSink {
         let file_name = format!("{idx:05}_{}.ptir", sanitize_file_fragment(pass));
         let _ = std::fs::write(pass_dir.join(file_name), module.print(DUMPED_TEXT));
     }
+
+    /// Writes the file to `passes/`, after the dumps of the passes that made its module.
+    fn on_artifact(&self, name: &str, contents: &str) {
+        if !self.options.emit_pass_events {
+            return;
+        }
+        let pass_dir = self.root.join("passes");
+        let _ = std::fs::create_dir_all(&pass_dir);
+        let idx = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let (stem, extension) = name.rsplit_once('.').unwrap_or((name, "txt"));
+        let file_name = format!(
+            "{idx:05}_{}.{}",
+            sanitize_file_fragment(stem),
+            sanitize_file_fragment(extension)
+        );
+        let _ = std::fs::write(pass_dir.join(file_name), contents);
+    }
 }
 
 /// What one pipeline pass did: its options, whether it changed the module, how many ops the
@@ -399,7 +454,7 @@ struct PassStats<'a> {
 }
 
 impl FileTraceSink {
-    fn append_pass_stats(&self, stats: &PassStats<'_>) {
+    fn append_pass_stats(&self, stats: &PassStats) {
         let Ok(mut file_guard) = self.pass_log.lock() else {
             return;
         };

@@ -8,7 +8,7 @@ mod runtime;
 mod tokenizer;
 
 #[pymodule]
-fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _native(m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<tokenizer::PyTokenizer>()?;
     m.add_class::<runtime::PyLoadedModel>()?;
 

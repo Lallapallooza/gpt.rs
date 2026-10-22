@@ -16,7 +16,7 @@ use gpt_rs_ir::dialects::tensor::DotGeneral;
 use crate::backend::PortableBackend;
 use crate::ops::functional::matmul;
 use crate::tensor::{DType, DeviceTensor, Shape};
-use crate::{ensure_dtype, ensure_rank, ensure_same_shape, functional, s};
+use crate::{ensure_dtype, ensure_rank, ensure_same_shape, functional};
 
 /// Additive bias of the masked entries of a decay matrix: `exp` maps it to exactly 0.
 const MASKED_BIAS: f32 = -1e9;
@@ -135,12 +135,15 @@ pub fn causal_conv1d(x: &Tensor, state: &Tensor, weight: &Tensor) -> CausalConv1
     let window = DeviceTensor::concat(0, &[state, x]);
     let taps = weight.transpose([1, 0]);
     let output = (0..kernel)
-        .map(|j| window.slice(s![j..j + seq_len]) * taps.slice(s![j..=j]))
+        .map(|tap| window.slice(crate::s![tap..tap + seq_len]) * taps.slice(crate::s![tap..=tap]))
         .reduce(|sum, term| sum + term)
         .expect("kernel >= 2");
-    let state = window.slice(s![seq_len..]);
-    state.export();
-    CausalConv1dResult { output, state }
+    let next_state = window.slice(crate::s![seq_len..]);
+    next_state.export();
+    CausalConv1dResult {
+        output,
+        state: next_state,
+    }
 }
 
 /// Output of [`gated_delta_rule`].
@@ -161,10 +164,11 @@ struct DeltaRulePlan {
 
 /// Gated delta-rule recurrence (Gated DeltaNet) over `T` tokens with carried state.
 ///
-/// The functional L2-normalizes `q` and `k` over the key dimension and scales `q` by `Dk^-1/2`.
-/// Value head `h` reads key head `h / (Hv / Hk)`. Each head has the state `S` (`[Dk, Dv]`), with
-/// `S_0 = state`. Token `t` computes the following, like Hugging Face
-/// `torch_recurrent_gated_delta_rule` with `use_qk_l2norm_in_kernel`:
+/// The functional L2-normalizes `query` and `key` over the key dimension and scales `query` by
+/// `Dk^-1/2`. Value head `h` reads key head `h / (Hv / Hk)`. Each head has the state `S`
+/// (`[Dk, Dv]`), with `S_0 = state`. Token `t`, with query `q_t`, key `k_t`, value `v_t` and
+/// log-decay `g_t`, computes the following, like Hugging Face `torch_recurrent_gated_delta_rule`
+/// with `use_qk_l2norm_in_kernel`:
 ///
 /// ```text
 /// S_t = exp(g_t) S_{t-1} + k_t (beta_t (v_t - exp(g_t) S_{t-1}^T k_t))^T
@@ -177,39 +181,39 @@ struct DeltaRulePlan {
 /// has no intra-chunk system, so it records the recurrence above for its token.
 #[functional]
 pub fn gated_delta_rule(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    g: &Tensor,
+    query: &Tensor,
+    key: &Tensor,
+    value: &Tensor,
+    log_decay: &Tensor,
     beta: &Tensor,
     state: &Tensor,
 ) -> GatedDeltaRuleResult<B> {
-    ensure_dtype!(q, F32);
-    ensure_dtype!(k, F32);
-    ensure_dtype!(v, F32);
-    ensure_dtype!(g, F32);
+    ensure_dtype!(query, F32);
+    ensure_dtype!(key, F32);
+    ensure_dtype!(value, F32);
+    ensure_dtype!(log_decay, F32);
     ensure_dtype!(beta, F32);
     ensure_dtype!(state, F32);
-    ensure_rank!(q, 3);
-    ensure_rank!(v, 3);
-    ensure_same_shape!(q, k);
-    let (q_dims, v_dims) = (q.shape().dims(), v.shape().dims());
-    let (seq_len, key_heads, key_dim) = (q_dims[0], q_dims[1], q_dims[2]);
-    let (value_heads, value_dim) = (v_dims[1], v_dims[2]);
+    ensure_rank!(query, 3);
+    ensure_rank!(value, 3);
+    ensure_same_shape!(query, key);
+    let (query_shape, value_shape) = (query.shape().dims(), value.shape().dims());
+    let (seq_len, key_heads, key_dim) = (query_shape[0], query_shape[1], query_shape[2]);
+    let (value_heads, value_dim) = (value_shape[1], value_shape[2]);
     assert!(
-        v_dims[0] == seq_len,
-        "{FUNCTIONAL}: v must have the {seq_len} tokens of q, got {}",
-        v_dims[0]
+        value_shape[0] == seq_len,
+        "{FUNCTIONAL}: value must have the {seq_len} tokens of query, got {}",
+        value_shape[0]
     );
     assert!(
         value_heads.is_multiple_of(key_heads),
         "{FUNCTIONAL}: value heads ({value_heads}) must be a multiple of key heads ({key_heads})"
     );
-    for (name, t) in [("g", g), ("beta", beta)] {
+    for (name, per_head) in [("log_decay", log_decay), ("beta", beta)] {
         assert!(
-            t.shape().dims() == [seq_len, value_heads],
+            per_head.shape().dims() == [seq_len, value_heads],
             "{FUNCTIONAL}: {name} must be [{seq_len}, {value_heads}], got {:?}",
-            t.shape().dims()
+            per_head.shape().dims()
         );
     }
     assert!(
@@ -224,33 +228,37 @@ pub fn gated_delta_rule(
         key_dim,
     };
 
-    let (heads_first, state) = gated_delta_rule_chunked(plan, [q, k, v, g, beta, state]);
-    state.export();
+    let (heads_first, final_state) =
+        gated_delta_rule_chunked(plan, [query, key, value, log_decay, beta, state]);
+    final_state.export();
     GatedDeltaRuleResult {
         output: heads_first.transpose([1, 0, 2]),
-        state,
+        state: final_state,
     }
 }
 
-/// An `[n, n]` lower-triangular selection in the graph of `like`: `inside` where
+/// A `[size, size]` lower-triangular selection in the graph of `like`: `inside` where
 /// `col <= row + diagonal`, and `outside` elsewhere. With `inside = 1` and `outside = 0`, this is
-/// `torch.tril(torch.ones(n, n), diagonal)`.
+/// `torch.tril(torch.ones(size, size), diagonal)`.
 fn tril_mask<B: PortableBackend + 'static>(
     like: &DeviceTensor<B>,
-    n: usize,
+    size: usize,
     diagonal: i64,
     inside: f32,
     outside: f32,
 ) -> DeviceTensor<B> {
-    // Row `i` and column `j` of the result read position `(i + r, j + c)` of a larger plane. So
-    // `row >= col` in that plane means `i + diagonal >= j`.
-    let (r, c) = (diagonal.max(0) as usize, (-diagonal).max(0) as usize);
-    let plane = [n + r, n + c];
+    // Row `i` and column `j` of the result read position `(i + row_offset, j + col_offset)` of a
+    // larger plane. So `row >= col` in that plane means `i + diagonal >= j`.
+    let (row_offset, col_offset) = (diagonal.max(0) as usize, (-diagonal).max(0) as usize);
+    let plane = [size + row_offset, size + col_offset];
     let rows = DeviceTensor::iota(like, plane, 0, DType::Si32);
     let cols = DeviceTensor::iota(like, plane, 1, DType::Si32);
     rows.greater_equal(&cols)
         .select(inside, outside)
-        .slice(s![r..r + n, c..c + n])
+        .slice(crate::s![
+            row_offset..row_offset + size,
+            col_offset..col_offset + size
+        ])
 }
 
 /// `x` divided by its L2 norm over the last axis.
@@ -272,26 +280,28 @@ fn batched_dot<B: PortableBackend + 'static>(
     )
 }
 
-/// `[l, l]` mask of the lower-left `b x b` block inside each `2b x 2b` diagonal block.
+/// `[len, len]` mask of the lower-left `b x b` block inside each `2b x 2b` diagonal block, with
+/// `b = block`.
 ///
-/// Built at a size that `2b` divides, as `eye(m) (x) [[0, 0], [1, 0]] (x) ones(b, b)`, then cut to
-/// `l`. The leading block of a product of lower-triangular matrices is the product of their leading
-/// blocks, so the doubling with the cut mask is also exact when `l` is not a power of two.
+/// Built at a size that `2b` divides, as `eye(pairs) (x) [[0, 0], [1, 0]] (x) ones(b, b)`, then cut
+/// to `len`. The leading block of a product of lower-triangular matrices is the product of their
+/// leading blocks, so the doubling with the cut mask is also exact when `len` is not a power of
+/// two.
 fn off_diagonal_block_mask<B: PortableBackend + 'static>(
     like: &DeviceTensor<B>,
-    l: usize,
-    b: usize,
+    len: usize,
+    block: usize,
 ) -> DeviceTensor<B> {
-    let m = l.div_ceil(2 * b);
-    let n = 2 * b * m;
-    let lower = tril_mask(like, m, 0, 1.0, 0.0);
+    let pairs = len.div_ceil(2 * block);
+    let padded_len = 2 * block * pairs;
+    let lower = tril_mask(like, pairs, 0, 1.0, 0.0);
     let eye = &lower * lower.transpose([1, 0]);
-    let blocks = eye.reshape([m, 1, 1, m, 1, 1]);
+    let blocks = eye.reshape([pairs, 1, 1, pairs, 1, 1]);
     let lower_left = tril_mask(like, 2, -1, 1.0, 0.0).reshape([1, 2, 1, 1, 2, 1]);
     (blocks * lower_left)
-        .broadcast_to([m, 2, b, m, 2, b])
-        .reshape([n, n])
-        .slice(s![..l, ..l])
+        .broadcast_to([pairs, 2, block, pairs, 2, block])
+        .reshape([padded_len, padded_len])
+        .slice(crate::s![..len, ..len])
 }
 
 /// Chunked (WY-form) gated delta rule built from core ops.
@@ -307,77 +317,78 @@ fn off_diagonal_block_mask<B: PortableBackend + 'static>(
 /// Returns the outputs as `[Hv, T, Dv]` and the final state.
 fn gated_delta_rule_chunked<B: PortableBackend + 'static>(
     plan: DeltaRulePlan,
-    [q, k, v, g, beta, state]: [&DeviceTensor<B>; 6],
+    [query, key, value, log_decay, beta, state]: [&DeviceTensor<B>; 6],
 ) -> (DeviceTensor<B>, DeviceTensor<B>) {
     let DeltaRulePlan {
-        seq_len: t,
-        key_heads: hk,
-        value_heads: hv,
-        key_dim: dk,
+        seq_len,
+        key_heads,
+        value_heads,
+        key_dim,
     } = plan;
-    let group = hv / hk;
-    let scale = 1.0f32 / (dk as f32).sqrt();
+    let group = value_heads / key_heads;
+    let scale = 1.0f32 / (key_dim as f32).sqrt();
 
     let expand = |x: DeviceTensor<B>| {
-        x.reshape([t, hk, 1, dk])
-            .broadcast_to([t, hk, group, dk])
-            .reshape([t, hv, dk])
+        x.reshape([seq_len, key_heads, 1, key_dim])
+            .broadcast_to([seq_len, key_heads, group, key_dim])
+            .reshape([seq_len, value_heads, key_dim])
             .transpose([1, 0, 2])
     };
-    let q_all = expand(l2_normalize_last(q) * scale);
-    let k_all = expand(l2_normalize_last(k));
-    let v_all = v.transpose([1, 0, 2]);
-    let g_all = g.transpose([1, 0]);
+    let q_all = expand(l2_normalize_last(query) * scale);
+    let k_all = expand(l2_normalize_last(key));
+    let v_all = value.transpose([1, 0, 2]);
+    let g_all = log_decay.transpose([1, 0]);
     let beta_all = beta.transpose([1, 0]);
 
-    let mut s = state.clone();
+    let mut carried = state.clone();
     let mut outputs = Vec::new();
     let mut start = 0;
-    while start < t {
-        let l = CHUNK.min(t - start);
-        let qc = q_all.slice(s![.., start..start + l]);
-        let kc = k_all.slice(s![.., start..start + l]);
-        let vc = v_all.slice(s![.., start..start + l]);
-        let gc = g_all.slice(s![.., start..start + l]);
-        let bc = beta_all.slice(s![.., start..start + l]);
+    while start < seq_len {
+        let chunk_len = CHUNK.min(seq_len - start);
+        let qc = q_all.slice(crate::s![.., start..start + chunk_len]);
+        let kc = k_all.slice(crate::s![.., start..start + chunk_len]);
+        let vc = v_all.slice(crate::s![.., start..start + chunk_len]);
+        let gc = g_all.slice(crate::s![.., start..start + chunk_len]);
+        let bc = beta_all.slice(crate::s![.., start..start + chunk_len]);
 
-        let beta_col = bc.reshape([hv, l, 1]);
+        let beta_col = bc.reshape([value_heads, chunk_len, 1]);
         let ChunkTerms {
             exp_cum,
-            u,
-            w,
+            wy_values,
+            wy_keys,
             scores,
             k_tail,
-        } = if l == 1 {
+        } = if chunk_len == 1 {
             one_token_terms(&qc, &kc, &vc, &gc, &beta_col)
         } else {
-            wy_terms(&qc, &kc, &vc, &gc, &beta_col, l)
+            wy_terms(&qc, &kc, &vc, &gc, &beta_col, chunk_len)
         };
-        let v_new = u - matmul(&w, &s);
-        let o_inter = matmul(&(&qc * &exp_cum), &s);
+        let v_new = wy_values - matmul(&wy_keys, &carried);
+        let o_inter = matmul(&(&qc * &exp_cum), &carried);
         outputs.push(o_inter + matmul(&scores, &v_new));
 
-        let carry = exp_cum.slice(s![.., l - 1..l, ..]);
-        s = s * carry + batched_dot(&k_tail, &v_new, 1, 1);
-        start += l;
+        let carry = exp_cum.slice(crate::s![.., chunk_len - 1..chunk_len, ..]);
+        carried = carried * carry + batched_dot(&k_tail, &v_new, 1, 1);
+        start += chunk_len;
     }
 
-    let outputs: Vec<_> = outputs.iter().collect();
-    (DeviceTensor::concat(1, &outputs), s)
+    let output_refs: Vec<_> = outputs.iter().collect();
+    (DeviceTensor::concat(1, &output_refs), carried)
 }
 
 /// What a chunk contributes besides the carried state: the cumulative decays `exp(G)` (`[Hv, L, 1]`),
-/// `U` and `W` with `V_new = U - W S`, the decayed scores `(Q K^T) * exp(G_i - G_j)` that weigh
-/// `V_new`, and the keys decayed to the chunk's end, which update the state.
+/// `U` (`wy_values`) and `W` (`wy_keys`) with `V_new = U - W S`, the decayed scores
+/// `(Q K^T) * exp(G_i - G_j)` that weigh `V_new`, and the keys decayed to the chunk's end, which
+/// update the state.
 struct ChunkTerms<B: PortableBackend + 'static> {
     exp_cum: DeviceTensor<B>,
-    u: DeviceTensor<B>,
-    w: DeviceTensor<B>,
+    wy_values: DeviceTensor<B>,
+    wy_keys: DeviceTensor<B>,
     scores: DeviceTensor<B>,
     k_tail: DeviceTensor<B>,
 }
 
-/// The terms of a chunk of `l` tokens: the intra-chunk system `(I + A) X = B` of
+/// The terms of a chunk of `chunk_len` tokens: the intra-chunk system `(I + A) X = B` of
 /// [`gated_delta_rule_chunked`], solved by doubling.
 fn wy_terms<B: PortableBackend + 'static>(
     qc: &DeviceTensor<B>,
@@ -385,40 +396,41 @@ fn wy_terms<B: PortableBackend + 'static>(
     vc: &DeviceTensor<B>,
     gc: &DeviceTensor<B>,
     beta_col: &DeviceTensor<B>,
-    l: usize,
+    chunk_len: usize,
 ) -> ChunkTerms<B> {
     let hv = gc.shape().dims()[0];
     // Inclusive cumulative sum over the chunk: G = g @ U with U[j, i] = [i >= j].
-    let lower = tril_mask(gc, l, 0, 1.0, 0.0);
+    let lower = tril_mask(gc, chunk_len, 0, 1.0, 0.0);
     let upper = lower.transpose([1, 0]);
     let cum = gc.dot_general(&upper, DotGeneral::contract([1], [0]));
 
     // The bias is 0 on and below the diagonal and a large negative value above it. `exp` maps
     // the masked entries to exactly 0, and their positive differences never overflow.
-    let causal_bias = tril_mask(gc, l, 0, 0.0, MASKED_BIAS);
-    let strict = tril_mask(gc, l, -1, 1.0, 0.0);
-    let diff = cum.reshape([hv, l, 1]) - cum.reshape([hv, 1, l]);
+    let causal_bias = tril_mask(gc, chunk_len, 0, 0.0, MASKED_BIAS);
+    let strict = tril_mask(gc, chunk_len, -1, 1.0, 0.0);
+    let diff = cum.reshape([hv, chunk_len, 1]) - cum.reshape([hv, 1, chunk_len]);
     // exp(G_i - G_j) on and below the diagonal, 0 above.
     let decay = (diff + causal_bias).exp();
 
-    let a = batched_dot(kc, kc, 2, 2) * &decay * beta_col * strict;
+    // The strictly lower-triangular `A` of the system.
+    let system = batched_dot(kc, kc, 2, 2) * &decay * beta_col * strict;
     let eye = &lower * &upper;
-    let mut inv = eye - &a * off_diagonal_block_mask(gc, l, 1);
+    let mut inv = eye - &system * off_diagonal_block_mask(gc, chunk_len, 1);
     let mut block = 2usize;
-    while block < l {
-        let coupling = &a * off_diagonal_block_mask(gc, l, block);
+    while block < chunk_len {
+        let coupling = &system * off_diagonal_block_mask(gc, chunk_len, block);
         inv = &inv - matmul(&matmul(&inv, &coupling), &inv);
         block *= 2;
     }
 
-    let exp_cum = cum.exp().reshape([hv, l, 1]);
+    let exp_cum = cum.exp().reshape([hv, chunk_len, 1]);
     let v_beta = vc * beta_col;
     let k_beta_decay = kc * (beta_col * &exp_cum);
-    let last = cum.slice(s![.., l - 1..l]);
-    let tail_decay = (&last - &cum).exp().reshape([hv, l, 1]);
+    let last = cum.slice(crate::s![.., chunk_len - 1..chunk_len]);
+    let tail_decay = (&last - &cum).exp().reshape([hv, chunk_len, 1]);
     ChunkTerms {
-        u: matmul(&inv, &v_beta),
-        w: matmul(&inv, &k_beta_decay),
+        wy_values: matmul(&inv, &v_beta),
+        wy_keys: matmul(&inv, &k_beta_decay),
         scores: batched_dot(qc, kc, 2, 2) * decay,
         k_tail: kc * tail_decay,
         exp_cum,
@@ -439,8 +451,8 @@ fn one_token_terms<B: PortableBackend + 'static>(
     let hv = gc.shape().dims()[0];
     let exp_g = gc.exp().reshape([hv, 1, 1]);
     ChunkTerms {
-        u: vc * beta_col,
-        w: kc * (beta_col * &exp_g),
+        wy_values: vc * beta_col,
+        wy_keys: kc * (beta_col * &exp_g),
         scores: batched_dot(qc, kc, 2, 2),
         k_tail: kc.clone(),
         exp_cum: exp_g,

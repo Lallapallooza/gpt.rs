@@ -266,11 +266,12 @@ pub struct Tokenizer {
 impl Tokenizer {
     /// Loads a tokenizer from a Hugging Face `tokenizer.json`.
     pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let data = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read tokenizer from {}", path.display()))?;
+        let tokenizer_path = path.as_ref();
+        let data = std::fs::read_to_string(tokenizer_path).with_context(|| {
+            format!("failed to read tokenizer from {}", tokenizer_path.display())
+        })?;
         let config = TokenizerConfig::from_json_str(&data)
-            .with_context(|| format!("invalid tokenizer.json in {}", path.display()))?;
+            .with_context(|| format!("invalid tokenizer.json in {}", tokenizer_path.display()))?;
         Self::from_config(config)
     }
 
@@ -293,7 +294,7 @@ impl Tokenizer {
             .ok_or_else(|| anyhow!("tokenizer vocabulary is empty"))?;
         let byte_encoder = bytes_to_unicode();
         let byte_decoder: HashMap<char, u8> = (0..=255u8)
-            .map(|b| (byte_encoder[usize::from(b)], b))
+            .map(|byte| (byte_encoder[usize::from(byte)], byte))
             .collect();
         let mut token_bytes = vec![Vec::new(); max_id + 1];
         for (token, &idx) in &vocab {
@@ -302,24 +303,24 @@ impl Tokenizer {
             let mut bytes = Vec::with_capacity(token.len());
             for ch in token.chars() {
                 match byte_decoder.get(&ch) {
-                    Some(&b) => bytes.push(b),
+                    Some(&byte) => bytes.push(byte),
                     None => bytes.extend_from_slice(ch.encode_utf8(&mut [0u8; 4]).as_bytes()),
                 }
             }
             token_bytes[idx] = bytes;
         }
-        let added_tokens: Vec<AddedToken> = added_tokens
+        let added_with_content: Vec<AddedToken> = added_tokens
             .into_iter()
             .filter(|token| !token.content.is_empty())
             .collect();
-        for token in &added_tokens {
+        for token in &added_with_content {
             token_bytes[token.id] = token.content.as_bytes().to_vec();
         }
         let added = AhoCorasick::builder()
             .match_kind(MatchKind::LeftmostLongest)
-            .build(added_tokens.iter().map(|token| &token.content))
+            .build(added_with_content.iter().map(|token| &token.content))
             .context("failed to build the added-token matcher")?;
-        let added_ids = added_tokens.iter().map(|token| token.id).collect();
+        let added_ids = added_with_content.iter().map(|token| token.id).collect();
 
         let unk_id = vocab
             .get(&unk_token)
@@ -329,11 +330,11 @@ impl Tokenizer {
         let ranks = merges
             .into_iter()
             .enumerate()
-            .map(|(rank, (a, b))| ((a, b), rank))
+            .map(|(rank, (left, right))| ((left, right), rank))
             .collect();
 
         let pattern_src = pattern.as_deref().unwrap_or(GPT2_PATTERN);
-        let pattern = Regex::new(pattern_src)
+        let pattern_regex = Regex::new(pattern_src)
             .with_context(|| format!("invalid pre-tokenization pattern {pattern_src:?}"))?;
 
         Ok(Tokenizer {
@@ -343,7 +344,7 @@ impl Tokenizer {
             unk_id,
             byte_encoder,
             cache: Mutex::new(HashMap::new()),
-            pattern,
+            pattern: pattern_regex,
             normalize_nfc,
             added,
             added_ids,
@@ -378,11 +379,11 @@ impl Tokenizer {
             };
         // As in Hugging Face's `Isolated` split, text between matches is a piece of its own.
         let mut last = 0;
-        for mat in self.pattern.find_iter(&normalized) {
-            let mat = mat.context("pre-tokenization regex failed")?;
-            self.encode_piece(&normalized[last..mat.start()], ids)?;
-            self.encode_piece(mat.as_str(), ids)?;
-            last = mat.end();
+        for found in self.pattern.find_iter(&normalized) {
+            let matched = found.context("pre-tokenization regex failed")?;
+            self.encode_piece(&normalized[last..matched.start()], ids)?;
+            self.encode_piece(matched.as_str(), ids)?;
+            last = matched.end();
         }
         self.encode_piece(&normalized[last..], ids)
     }
@@ -413,7 +414,7 @@ impl Tokenizer {
     pub fn decode(&self, tokens: &[usize]) -> String {
         let bytes: Vec<u8> = tokens
             .iter()
-            .flat_map(|&t| self.token_bytes(t))
+            .flat_map(|&token| self.token_bytes(token))
             .copied()
             .collect();
         String::from_utf8_lossy(&bytes).into_owned()
@@ -457,18 +458,18 @@ impl Tokenizer {
         let mut pairs = get_pairs(&word);
         while !pairs.is_empty() {
             let mut min_rank = usize::MAX;
-            let mut best_pair: Option<(String, String)> = None;
+            let mut best: Option<(String, String)> = None;
 
             for pair in &pairs {
                 if let Some(rank) = self.merges.rank(pair) {
                     if rank < min_rank {
                         min_rank = rank;
-                        best_pair = Some(pair.clone());
+                        best = Some(pair.clone());
                     }
                 }
             }
 
-            let Some(best_pair) = best_pair else {
+            let Some(best_pair) = best else {
                 break;
             };
 
@@ -478,18 +479,18 @@ impl Tokenizer {
             let second_ref = second.as_str();
 
             let mut new_word = Vec::with_capacity(word.len());
-            let mut i = 0;
-            while i < word.len() {
-                if i + 1 < word.len()
-                    && word[i].as_str() == first_ref
-                    && word[i + 1].as_str() == second_ref
+            let mut cursor = 0;
+            while cursor < word.len() {
+                if cursor + 1 < word.len()
+                    && word[cursor].as_str() == first_ref
+                    && word[cursor + 1].as_str() == second_ref
                 {
-                    let merged = format!("{}{}", word[i], word[i + 1]);
+                    let merged = format!("{}{}", word[cursor], word[cursor + 1]);
                     new_word.push(merged);
-                    i += 2;
+                    cursor += 2;
                 } else {
-                    new_word.push(word[i].clone());
-                    i += 1;
+                    new_word.push(word[cursor].clone());
+                    cursor += 1;
                 }
             }
 
@@ -511,7 +512,7 @@ impl Tokenizer {
     /// Converts a chunk of text into the intermediate Unicode alphabet used by byte-level BPE.
     fn byte_encode(&self, text: &str) -> String {
         text.bytes()
-            .map(|b| self.byte_encoder[usize::from(b)])
+            .map(|byte| self.byte_encoder[usize::from(byte)])
             .collect()
     }
 }
@@ -575,12 +576,12 @@ impl StreamDecoder {
 /// Maps every byte to the printable Unicode alphabet of byte-level BPE. Printable Latin-1 bytes map
 /// to themselves. The other bytes map to consecutive code points from U+0100.
 fn bytes_to_unicode() -> [char; 256] {
-    let printable = |b: u8| matches!(b, 33..=126 | 161..=172 | 174..=255);
+    let printable = |byte: u8| matches!(byte, 33..=126 | 161..=172 | 174..=255);
     let mut table = ['\0'; 256];
     let mut shifted = 0u32;
-    for b in 0..=255u8 {
-        table[usize::from(b)] = if printable(b) {
-            char::from(b)
+    for byte in 0..=255u8 {
+        table[usize::from(byte)] = if printable(byte) {
+            char::from(byte)
         } else {
             shifted += 1;
             char::from_u32(255 + shifted).expect("code points below U+0200 are valid")

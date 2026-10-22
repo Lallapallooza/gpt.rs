@@ -3,7 +3,7 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use anyhow::{anyhow, Result};
 use foldhash::fast::FixedState;
@@ -97,7 +97,7 @@ impl<B: PortableBackend + 'static> GraphInner<B> {
             inputs,
             scalars,
             exports,
-        } = spare.map(|spare| *spare).unwrap_or_default();
+        } = spare.map(|boxed| *boxed).unwrap_or_default();
         GraphInner {
             values,
             ops,
@@ -124,7 +124,7 @@ impl<B: PortableBackend + 'static> GraphInner<B> {
     pub(super) fn node(&self, value: ValueId) -> Option<(&OpRecord, usize)> {
         match self.values.get(value.0 as usize)?.def {
             ValueDef::Node { op, result, .. } => Some((&self.ops[op as usize], result as usize)),
-            ValueDef::Input(_) => None,
+            ValueDef::Input(_) | ValueDef::Given => None,
         }
     }
 
@@ -137,6 +137,7 @@ impl<B: PortableBackend + 'static> GraphInner<B> {
         self.values.push(ValueRecord {
             ty: Type::Tensor(ty),
             def,
+            tensors: Weak::new(),
         });
         value
     }
@@ -157,12 +158,18 @@ impl<B: PortableBackend + 'static> Drop for GraphInner<B> {
     }
 }
 
-/// A value of the graph: its type, and what defines it.
+/// A value of the graph: its type, what defines it, and whether a tensor of it is alive.
 pub(super) struct ValueRecord<B: PortableBackend + 'static> {
     /// Always a tensor type. The type rules read operand types as [`Type`]s.
     pub(super) ty: Type,
     pub(super) def: ValueDef<B>,
+    /// The token that every `DeviceTensor` of a recorded value holds.
+    pub(super) tensors: Weak<NodeToken>,
 }
+
+/// What every `DeviceTensor` of a recorded value holds, so its graph knows while one is alive and
+/// may ask for the value.
+pub(crate) struct NodeToken;
 
 impl<B: PortableBackend + 'static> ValueRecord<B> {
     pub(super) fn tensor_type(&self) -> &TensorType {
@@ -179,6 +186,9 @@ pub(super) enum ValueDef<B: PortableBackend + 'static> {
     },
     /// A tensor the backend holds, captured as an input of the graph.
     Input(Arc<Materialized<B>>),
+    /// A captured tensor whose handle a program took, which may have updated it in place. Nothing
+    /// reads it any more.
+    Given,
 }
 
 /// A recorded op: the op, the range of its operands in [`GraphInner::operands`], and the value

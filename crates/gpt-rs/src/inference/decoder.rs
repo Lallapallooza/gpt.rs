@@ -14,18 +14,17 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::generate::Sampling;
-use super::{index_tensor, CausalLanguageModel, Decode, LayerCache};
+use super::{index_tensor, CacheKind, CausalLanguageModel, Decode, LayerCache};
 use crate::backend::PortableBackend;
 use crate::model::ModelConfig;
 use crate::nn::{
     self, capture, DecoderBlock, DecoderNames, Embedding, Linear, MixerConfig, MlpConfig, Norm,
-    NormConfig, Params, RopeConfig, RotaryEmbedding,
+    NormConfig, Params, RopeConfig, RotaryEmbedding, TensorGetter,
 };
 use crate::ops::functional::{self, AttentionPositions};
 use crate::ops::graph::context::{current_arena, push_default_arena, ArenaGuard};
-use crate::ops::graph::GraphArena;
+use crate::ops::graph::{GraphArena, Traces};
 use crate::runtime::LoadedModel;
-use crate::s;
 use crate::tensor::{DeviceTensor, HostTensor};
 
 /// Largest number of prompt tokens processed by one compiled forward program.
@@ -123,7 +122,9 @@ impl<N: DecoderNames> DecoderModel<N> {
         Ok(Self {
             embed_tokens: Embedding::new(p)?,
             embed_positions: absolute_positions.then(|| Embedding::new(p)).transpose()?,
-            layers: p.each(&mixers, |p, mixer| DecoderBlock::new(p, norm, mixer, mlp))?,
+            layers: p.each(&mixers, |layer_params, mixer| {
+                DecoderBlock::new(layer_params, norm, mixer, mlp)
+            })?,
             norm: Norm::new(p, norm)?,
             rotary_emb: rope.map(RotaryEmbedding::new).transpose()?,
         })
@@ -140,10 +141,10 @@ impl<N: DecoderNames> DecoderModel<N> {
             hidden = hidden + position_embeds;
         }
         let rotary = self.rotary_emb.as_ref().map(|rope| rope.tables(positions));
-        let positions = AttentionPositions::new(positions.clone(), rotary);
+        let attention_positions = AttentionPositions::new(positions.clone(), rotary);
         for (layer, (block, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate() {
             let scope = capture::scope(format_args!("{}.{layer}", N::LAYERS));
-            let (output, updated) = block.call((&hidden, cache, &positions));
+            let (output, updated) = block.call((&hidden, cache, &attention_positions));
             scope.record(&output);
             cache.replace(updated);
             hidden = output;
@@ -167,7 +168,7 @@ impl<N: DecoderNames> DecoderModel<N> {
 pub(crate) fn build_from_model_config<B: PortableBackend + 'static, C: DecoderConfig>(
     backend: Arc<B>,
     cfg: &ModelConfig,
-    get: &mut dyn FnMut(&str) -> Result<Option<DeviceTensor<B>>>,
+    get: &mut TensorGetter<B>,
 ) -> Result<Box<dyn LoadedModel>> {
     let config: C = serde_json::from_value(cfg.config.clone())
         .map_err(|err| anyhow!("invalid {} config: {err}", C::KIND))?;
@@ -182,7 +183,9 @@ impl<C: DecoderConfig> CausalDecoder<C> {
     pub fn new(p: &mut Params<B>, config: C) -> Result<Self> {
         // A tied `lm_head` shares the token embedding, so the base model comes first.
         let layout = config.layout()?;
-        let base_model = p.scoped(C::BASE_MODEL_PREFIX, |p| DecoderModel::new(p, layout))?;
+        let base_model = p.scoped(C::BASE_MODEL_PREFIX, |base_params| {
+            DecoderModel::new(base_params, layout)
+        })?;
         let embeddings = &base_model.embed_tokens.weight;
         let &[vocab_size, _] = embeddings.shape().dims() else {
             bail!(
@@ -214,7 +217,7 @@ fn chunk_arena<B: PortableBackend + 'static>(backend: &Arc<B>) -> Option<ArenaGu
 
 impl<B: PortableBackend + 'static, C: DecoderConfig> CausalDecoder<B, C> {
     fn backend(&self) -> Arc<B> {
-        self.lm_head.weight.backend()
+        self.base_model.embed_tokens.weight.backend()
     }
 
     /// The KV cache capacity of sequences of up to `len` tokens. Rounding up to a power of two
@@ -256,13 +259,13 @@ impl<B: PortableBackend + 'static, C: DecoderConfig> CausalDecoder<B, C> {
             tokens.len(),
             self.context_length
         );
-        if let Some((i, token)) = tokens
+        if let Some((position, token)) = tokens
             .iter()
             .enumerate()
-            .find(|(_, &t)| t >= self.vocab_size)
+            .find(|(_, &token_id)| token_id >= self.vocab_size)
         {
             bail!(
-                "token id {token} at position {i} exceeds vocabulary size {}",
+                "token id {token} at position {position} exceeds vocabulary size {}",
                 self.vocab_size
             );
         }
@@ -276,7 +279,7 @@ impl<B: PortableBackend + 'static, C: DecoderConfig> CausalDecoder<B, C> {
                 let rows = if every_position {
                     hidden
                 } else {
-                    hidden.slice(s![-1..])
+                    hidden.slice(crate::s![-1..])
                 };
                 return on_logits(self.logits(&rows));
             }
@@ -287,6 +290,37 @@ impl<B: PortableBackend + 'static, C: DecoderConfig> CausalDecoder<B, C> {
             DeviceTensor::materialize_many(&states)?;
         }
         unreachable!("a non-empty sequence has a last chunk")
+    }
+
+    /// One decode step on `inputs`: the token (`si32 [1]`), its position (`si32 [1]`), the
+    /// generator state where `sampling` is random, and the state tensors of each layer's cache, in
+    /// the order of `kinds`, which gives the kind of each cache, with `len` positions filled. It
+    /// gives the next token, the generator state after it, and the state tensors of each layer's
+    /// cache after the step, in the same order: what the step's program computes, which a trace
+    /// replays.
+    fn step(
+        &self,
+        inputs: &[DeviceTensor<B>],
+        (kinds, len): (&[CacheKind], usize),
+        sampling: &Sampling,
+    ) -> Vec<DeviceTensor<B>> {
+        let (token, positions) = (&inputs[0], &inputs[1]);
+        let state = sampling.is_random().then(|| &inputs[2]);
+        let first_cache = 2 + usize::from(state.is_some());
+        let mut layer_caches = Vec::with_capacity(kinds.len());
+        for (layer, kind) in kinds.iter().enumerate() {
+            let at = first_cache + 2 * layer;
+            let tensors = [inputs[at].clone(), inputs[at + 1].clone()];
+            layer_caches.push(kind.with_tensors(tensors, len));
+        }
+        let hidden = self.base_model((token, positions, &mut layer_caches));
+        let (next, next_state) = pick(&self.logits(&hidden), sampling, state);
+        let mut results = vec![next];
+        results.extend(next_state);
+        for cache in &layer_caches {
+            results.extend(cache.tensors().map(DeviceTensor::clone));
+        }
+        results
     }
 
     /// Logits for final hidden states `[N, embed_dim]`.
@@ -339,6 +373,7 @@ impl<B: PortableBackend + 'static, C: DecoderConfig> CausalLanguageModel for Cau
             next,
             returned: false,
             picker,
+            step: Traces::new(backend),
         }))
     }
 }
@@ -381,17 +416,30 @@ impl<B: PortableBackend + 'static> Picker<B> {
 
     /// The token (`si32 [1]`) that the logits `[1, vocab]` give.
     fn pick(&mut self, logits: &DeviceTensor<B>) -> DeviceTensor<B> {
-        let Some(state) = &self.state else {
-            return logits.argmax(-1);
-        };
-        let Sampling {
-            temperature, top_k, ..
-        } = self.sampling;
-        let (token, state) = functional::sample(logits, temperature, top_k, state);
-        state.export();
-        self.state = Some(state);
+        let (token, next_state) = pick(logits, &self.sampling, self.state.as_ref());
+        if let Some(state) = &next_state {
+            state.export();
+        }
+        self.state = next_state;
         token
     }
+}
+
+/// The token (`si32 [1]`) that the logits `[1, vocab]` give as `sampling` says, and the generator
+/// state after it, drawn with `state` where the sampling is random.
+fn pick<B: PortableBackend + 'static>(
+    logits: &DeviceTensor<B>,
+    sampling: &Sampling,
+    state: Option<&DeviceTensor<B>>,
+) -> (DeviceTensor<B>, Option<DeviceTensor<B>>) {
+    let Some(generator) = state else {
+        return (logits.argmax(-1), None);
+    };
+    let Sampling {
+        temperature, top_k, ..
+    } = *sampling;
+    let (token, next_state) = functional::sample(logits, temperature, top_k, generator);
+    (token, Some(next_state))
 }
 
 /// The decoding state of a [`CausalDecoder`] after a prompt.
@@ -410,6 +458,8 @@ struct Decoding<'a, B: PortableBackend + 'static, C: DecoderConfig> {
     returned: bool,
     /// Picks the token after each step.
     picker: Picker<B>,
+    /// The traces of a step, which runs as one program replayed for each token.
+    step: Traces<B>,
 }
 
 impl<B: PortableBackend + 'static, C: DecoderConfig> Decode for Decoding<'_, B, C> {
@@ -422,12 +472,34 @@ impl<B: PortableBackend + 'static, C: DecoderConfig> Decode for Decoding<'_, B, 
                 "the KV caches hold {} positions, all used",
                 self.capacity
             );
-            let _arena = chunk_arena(&self.model.backend());
-            let hidden = self
-                .model
-                .chunk(&self.next, self.position, &mut self.caches)?;
+            // The step takes the generator state and the caches, which nothing else then holds, so
+            // that its program may update them in place.
+            let positions = index_tensor(&self.model.backend(), [self.position])?;
+            let mut inputs = vec![self.next.clone(), positions];
+            let random = self.picker.state.is_some();
+            inputs.extend(self.picker.state.take());
+            let mut kinds = Vec::with_capacity(self.caches.len());
+            for cache in std::mem::take(&mut self.caches) {
+                kinds.push(cache.kind());
+                inputs.extend(cache.into_tensors());
+            }
+            let (model, len) = (self.model, self.position);
+            let sampling = self.picker.sampling;
+            let stepped = self.step.call(inputs, &|step_inputs: &[DeviceTensor<B>]| {
+                model.step(step_inputs, (&kinds, len), &sampling)
+            })?;
             self.position += 1;
-            self.next = self.picker.pick(&self.model.logits(&hidden));
+            let mut results = stepped.into_iter();
+            self.next = results.next().expect("a step gives its token");
+            if random {
+                self.picker.state = results.next();
+            }
+            for kind in kinds {
+                let first = results.next().expect("a step gives each cache");
+                let second = results.next().expect("a step gives each cache");
+                self.caches
+                    .push(kind.with_tensors([first, second], self.position));
+            }
         }
         self.returned = true;
         let token = self.next.to_host()?;

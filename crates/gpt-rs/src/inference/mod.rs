@@ -31,12 +31,50 @@ impl<B: PortableBackend + 'static> LayerCache<B> {
         }
     }
 
+    /// The kind of this cache.
+    pub(crate) fn kind(&self) -> CacheKind {
+        match self {
+            LayerCache::Attention(_) => CacheKind::Attention,
+            LayerCache::LinearAttention(_) => CacheKind::LinearAttention,
+        }
+    }
+
+    /// The state tensors, which this cache no longer holds.
+    pub(crate) fn into_tensors(self) -> [DeviceTensor<B>; 2] {
+        self.tensors().map(DeviceTensor::clone)
+    }
+
     /// Replaces this cache with `next` and stops exporting the replaced state.
     pub(crate) fn replace(&mut self, next: LayerCache<B>) {
         for tensor in self.tensors() {
             tensor.release_export();
         }
         *self = next;
+    }
+}
+
+/// The kind of a [`LayerCache`], which a decode step needs to rebuild the cache from its state
+/// tensors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CacheKind {
+    Attention,
+    LinearAttention,
+}
+
+impl CacheKind {
+    /// The cache of this kind that holds `first` and `second`, the state tensors in
+    /// [`LayerCache::tensors`]'s order, with `len` positions filled.
+    pub(crate) fn with_tensors<B: PortableBackend + 'static>(
+        self,
+        [first, second]: [DeviceTensor<B>; 2],
+        len: usize,
+    ) -> LayerCache<B> {
+        match self {
+            CacheKind::Attention => LayerCache::Attention(DecodeKvCache::new(first, second, len)),
+            CacheKind::LinearAttention => {
+                LayerCache::LinearAttention(LinearAttentionCache::new(first, second))
+            }
+        }
     }
 }
 
@@ -47,7 +85,7 @@ pub(crate) fn index_tensor<B: PortableBackend + 'static>(
 ) -> Result<DeviceTensor<B>> {
     let ids = indices
         .into_iter()
-        .map(|i| i32::try_from(i).map_err(|_| anyhow!("index {i} exceeds i32::MAX")))
+        .map(|index| i32::try_from(index).map_err(|_| anyhow!("index {index} exceeds i32::MAX")))
         .collect::<Result<Vec<i32>>>()?;
     let host = HostTensor::si32(vec![ids.len()], ids)?;
     DeviceTensor::from_host(Arc::clone(backend), host)

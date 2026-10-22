@@ -3,7 +3,7 @@
 
 use gpt_rs_ir::dialects::tensor::DotGeneral;
 
-use crate::{ensure_last_dim, ensure_rank, ensure_same_dtype, functional};
+use crate::{ensure_rank, ensure_same_dtype, functional};
 
 /// 2D convolution of NHWC activations `x` (`[N, H, W, C_in]`) with an OIHW `weight`
 /// (`[C_out, C_in / groups, KH, KW]`) and an optional `bias` (`[C_out]`). It computes what Torch's
@@ -26,9 +26,12 @@ pub fn conv2d(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>, params: Conv2d
         "{FUNCTIONAL}: {groups} groups do not fit {c_in} input channels and the weight {:?}",
         weight.shape().dims()
     );
-    if let Some(bias) = bias {
-        ensure_rank!(bias, 1);
-        ensure_last_dim!(bias, c_out);
+    if let Some(bias_tensor) = bias {
+        let bias_dims = bias_tensor.shape().dims();
+        assert!(
+            bias_dims == [c_out],
+            "{FUNCTIONAL}: bias must be [{c_out}], got {bias_dims:?}"
+        );
     }
     let patches = x.extract_patches(
         [kernel_h, kernel_w],
@@ -37,30 +40,38 @@ pub fn conv2d(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>, params: Conv2d
         padding.as_hw_pairs(),
         0.0,
     );
-    let [n, out_h, out_w] = [0, 1, 2].map(|axis| patches.size(axis));
+    let [batch, out_h, out_w] = [0, 1, 2].map(|axis| patches.size(axis));
     let out = if groups == 1 {
         // Patches are [N, OH, OW, KH, KW, C_in]. The weight [C_out, C_in, KH, KW] contracts with
         // them.
         patches
-            .reshape([n, out_h, out_w, kernel_h, kernel_w, c_in])
+            .reshape([batch, out_h, out_w, kernel_h, kernel_w, c_in])
             .dot_general(weight, DotGeneral::contract([3, 4, 5], [2, 3, 1]))
     } else {
         // The patches [N, OH, OW, KH, KW, G, C_in/G] contract with the weight viewed as
         // [G, C_out/G, C_in/G, KH, KW], batched over the groups. The result is
         // [G, N, OH, OW, C_out/G], as batch axes come first.
-        let patches =
-            patches.reshape([n, out_h, out_w, kernel_h, kernel_w, groups, c_in_per_group]);
-        let weight = weight.reshape([groups, c_out / groups, c_in_per_group, kernel_h, kernel_w]);
-        patches
+        let grouped_patches = patches.reshape([
+            batch,
+            out_h,
+            out_w,
+            kernel_h,
+            kernel_w,
+            groups,
+            c_in_per_group,
+        ]);
+        let grouped_weight =
+            weight.reshape([groups, c_out / groups, c_in_per_group, kernel_h, kernel_w]);
+        grouped_patches
             .dot_general(
-                &weight,
+                &grouped_weight,
                 DotGeneral::contract([3, 4, 6], [3, 4, 2]).batch([5], [0]),
             )
             .transpose([1, 2, 3, 0, 4])
-            .reshape([n, out_h, out_w, c_out])
+            .reshape([batch, out_h, out_w, c_out])
     };
     match bias {
-        Some(bias) => out + bias,
+        Some(bias_tensor) => out + bias_tensor,
         None => out,
     }
 }

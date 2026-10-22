@@ -13,9 +13,10 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::sync::Arc;
 
 use gpt_rs_ir::dialects::tensor::{
-    self, ArgMax, Binary, BroadcastTo, Cast, Concat, Constant, DotGeneral, DynamicSlice,
-    DynamicUpdateSlice, ExtractPatches, Iota, Reduce, ReduceAttrs, ReduceWindow, ReduceWindowAttrs,
-    Reshape, RngAttrs, RngUniform, Select, SelectKAttrs, Take, TopK, Transpose, Unary,
+    self, ArgMax, Binary, BroadcastTo, Cast, Concat, Constant, Dequantize, DotGeneral,
+    DynamicSlice, DynamicUpdateSlice, ExtractPatches, Iota, Reduce, ReduceAttrs, ReduceWindow,
+    ReduceWindowAttrs, Reshape, RngAttrs, RngUniform, Select, SelectKAttrs, Take, TopK, Transpose,
+    Unary,
 };
 use gpt_rs_ir::host::HostTensor;
 use gpt_rs_ir::ir::{ranked, DType, Dense, Dim, InOp, Location, OpDyn, Ranked, F64};
@@ -26,7 +27,7 @@ use super::slicing::{self, AxisIndex};
 use super::{DeviceTensor, Shape};
 use crate::backend::PortableBackend;
 use crate::nn::capture;
-use crate::ops::graph::{context, GraphArena, GraphBuilder, ValueId};
+use crate::ops::graph::{context, GraphArena, GraphBuilder, NodeToken, ValueId};
 use crate::ops::trace;
 
 /// What a binary op or `select` takes besides a tensor: another tensor, or an `f32` scalar, which
@@ -134,17 +135,18 @@ fn axis_list<T: Copy + Default>(items: impl AsRef<[T]>) -> Ranked<T> {
 
 #[track_caller]
 fn static_dims(dims: impl AsRef<[usize]>) -> Ranked<Dim> {
-    let dims = axis_list(dims);
+    let extents = axis_list(dims);
     let mut shape = Ranked::new();
-    for &extent in &dims {
+    for &extent in &extents {
         shape.push(Dim::Static(extent));
     }
     shape
 }
 
-/// The value `value` of `builder`'s graph with the static shape of its type.
+/// The value `value` of `builder`'s graph with the static shape of its type, and the token that
+/// its tensors hold.
 fn recorded<B: PortableBackend + 'static>(
-    builder: &GraphBuilder<'_, B>,
+    builder: &mut GraphBuilder<B>,
     value: ValueId,
 ) -> anyhow::Result<Recorded> {
     let ty = builder.type_of(value)?;
@@ -155,7 +157,8 @@ fn recorded<B: PortableBackend + 'static>(
         };
         dims.push(extent);
     }
-    Ok((value, Shape::new(dims), ty.dtype))
+    let dtype = ty.dtype;
+    Ok((value, Shape::new(dims), dtype, builder.node_token(value)))
 }
 
 /// Where the op being recorded comes from, while a trace sink keeps locations: the code that
@@ -182,18 +185,19 @@ fn broadcast_dims(lhs: &[usize], rhs: &[usize]) -> Shape {
     };
     (0..rank)
         .map(|axis| {
-            let (a, b) = (extent(lhs, axis), extent(rhs, axis));
+            let (lhs_extent, rhs_extent) = (extent(lhs, axis), extent(rhs, axis));
             assert!(
-                a == b || a == 1 || b == 1,
+                lhs_extent == rhs_extent || lhs_extent == 1 || rhs_extent == 1,
                 "shapes {lhs:?} and {rhs:?} do not broadcast"
             );
-            a.max(b)
+            lhs_extent.max(rhs_extent)
         })
         .collect()
 }
 
-/// A recorded value with the static shape and dtype of its type.
-type Recorded = (ValueId, Shape, DType);
+/// A recorded value with the static shape and dtype of its type, and the token that its tensors
+/// hold.
+type Recorded = (ValueId, Shape, DType, Arc<NodeToken>);
 
 impl<B: PortableBackend + 'static> DeviceTensor<B> {
     /// Records `op` on `operands` in the graph of `operands` and returns its result.
@@ -206,9 +210,9 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     #[track_caller]
     fn record_in<T: InOp + OpDyn>(graph: &Arc<GraphArena<B>>, op: T, operands: &[&Self]) -> Self {
         let location = recording_location();
-        let recorded = Self::capture(graph, operands, |builder, operands| {
+        let recorded = Self::capture(graph, operands, |builder, operand_values| {
             builder.set_location(location);
-            let results = builder.emit(op, operands)?;
+            let results = builder.emit(op, operand_values)?;
             anyhow::ensure!(results.len() == 1, "the op gives {} results", results.len());
             recorded(builder, ValueId(results.start))
         });
@@ -224,16 +228,16 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     ) -> SmallVec<[Self; 2]> {
         let location = recording_location();
         let recorded: SmallVec<[Recorded; 2]> =
-            Self::capture(graph, operands, |builder, operands| {
+            Self::capture(graph, operands, |builder, operand_values| {
                 builder.set_location(location);
                 builder
-                    .emit(op, operands)?
+                    .emit(op, operand_values)?
                     .map(|value| recorded(builder, ValueId(value)))
                     .collect()
             });
         recorded
             .into_iter()
-            .map(|recorded| Self::lazy(graph, recorded))
+            .map(|result| Self::lazy(graph, result))
             .collect()
     }
 
@@ -243,7 +247,7 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     fn capture<R>(
         graph: &Arc<GraphArena<B>>,
         operands: &[&Self],
-        record: impl FnOnce(&mut GraphBuilder<'_, B>, &[ValueId]) -> anyhow::Result<R>,
+        record: impl FnOnce(&mut GraphBuilder<B>, &[ValueId]) -> anyhow::Result<R>,
     ) -> R {
         if let Some(other) = operands
             .iter()
@@ -262,15 +266,15 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
             record(builder, &values)
         });
         match captured {
-            Ok(captured) => captured,
+            Ok(result) => result,
             Err(err) => panic!("{err:#}"),
         }
     }
 
     /// The lazy tensor of a recorded value.
     #[track_caller]
-    fn lazy(graph: &Arc<GraphArena<B>>, (value, shape, dtype): Recorded) -> Self {
-        match Self::from_lazy(Arc::clone(graph), shape, dtype, value) {
+    fn lazy(graph: &Arc<GraphArena<B>>, (value, shape, dtype, token): Recorded) -> Self {
+        match Self::from_lazy(Arc::clone(graph), shape, dtype, value, token) {
             Ok(tensor) => tensor,
             Err(err) => panic!("{err:#}"),
         }
@@ -304,12 +308,12 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
             Some(dims) => broadcast_dims(self.shape().dims(), dims),
             None => self.shape().clone(),
         };
-        let rhs = rhs.tensor(self, self.dtype(), dims.dims());
+        let rhs_tensor = rhs.tensor(self, self.dtype(), dims.dims());
         Self::record(
             op,
             &[
                 &*self.broadcast_if(dims.dims()),
-                &*rhs.broadcast_if(dims.dims()),
+                &*rhs_tensor.broadcast_if(dims.dims()),
             ],
         )
     }
@@ -334,12 +338,13 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     /// they suit small tables that every run reads, not run-time inputs.
     #[track_caller]
     pub fn constant(like: &Self, value: &HostTensor) -> Self {
-        let value = Dense {
+        let dense = Dense {
             dtype: value.dtype(),
             dims: value.dims.to_vec(),
             bytes: value.to_le_bytes().into(),
         };
-        Self::record_in(&graph_of(&like.backend, &[like]), Constant { value }, &[])
+        let op = Constant { value: dense };
+        Self::record_in(&graph_of(&like.backend, &[like]), op, &[])
     }
 
     /// Keeps this tensor as a result of the graph although nothing reads it, as for an updated
@@ -444,16 +449,36 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
         for branch in [when_true.dims(), when_false.dims()].into_iter().flatten() {
             dims = broadcast_dims(dims.dims(), branch);
         }
-        let when_true = when_true.tensor(self, DType::F32, dims.dims());
-        let when_false = when_false.tensor(self, DType::F32, dims.dims());
+        let true_branch = when_true.tensor(self, DType::F32, dims.dims());
+        let false_branch = when_false.tensor(self, DType::F32, dims.dims());
         Self::record(
             Select,
             &[
                 &*self.broadcast_if(dims.dims()),
-                &*when_true.broadcast_if(dims.dims()),
-                &*when_false.broadcast_if(dims.dims()),
+                &*true_branch.broadcast_if(dims.dims()),
+                &*false_branch.broadcast_if(dims.dims()),
             ],
         )
+    }
+
+    /// These codes dequantized to `to` (`tensor.dequantize`): each code times the scale of its
+    /// block of `block` elements, plus the block's `offset` where there is one.
+    #[track_caller]
+    pub fn dequantize(
+        &self,
+        scale: &Self,
+        offset: Option<&Self>,
+        block: impl AsRef<[usize]>,
+        to: DType,
+    ) -> Self {
+        let attrs = Dequantize {
+            block: block.as_ref().iter().copied().collect(),
+            to,
+        };
+        match offset {
+            Some(block_offsets) => Self::record(attrs, &[self, scale, block_offsets]),
+            None => Self::record(attrs, &[self, scale]),
+        }
     }
 
     /// This tensor converted to `dtype`, or itself when it has `dtype`. Float-to-float casts round
@@ -490,8 +515,9 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     pub fn slice(&self, index: impl AsRef<[AxisIndex]>) -> Self {
         let dims = self.shape().dims();
         let (op, out) = slicing::resolve(dims, index.as_ref());
-        let whole =
-            op.strides.is_empty() && op.starts.iter().all(|&s| s == 0) && op.sizes[..] == *dims;
+        let whole = op.strides.is_empty()
+            && op.starts.iter().all(|&start| start == 0)
+            && op.sizes[..] == *dims;
         let taken = if whole {
             self.clone()
         } else {
@@ -513,10 +539,10 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
         Self::record(op, &[self, starts])
     }
 
-    /// This tensor with the block at the offsets `starts` (`si32 [rank]`) replaced by `update`.
+    /// This tensor with the block at the offsets `starts` (`si32 [rank]`) replaced by `patch`.
     #[track_caller]
-    pub fn dynamic_update_slice(&self, update: &Self, starts: &Self) -> Self {
-        Self::record(DynamicUpdateSlice, &[self, update, starts])
+    pub fn dynamic_update_slice(&self, patch: &Self, starts: &Self) -> Self {
+        Self::record(DynamicUpdateSlice, &[self, patch, starts])
     }
 
     /// The tensors joined along `axis`.
@@ -617,11 +643,11 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
         Self::record(op, &[self])
     }
 
-    /// The `k` largest elements along `axis`, largest first, and their `si32` indices.
+    /// The `count` largest elements along `axis`, largest first, and their `si32` indices.
     #[track_caller]
-    pub fn top_k(&self, k: usize, axis: i64) -> (Self, Self) {
+    pub fn top_k(&self, count: usize, axis: i64) -> (Self, Self) {
         let op = TopK(SelectKAttrs {
-            k,
+            k: count,
             axis,
             indices: DType::Si32,
         });

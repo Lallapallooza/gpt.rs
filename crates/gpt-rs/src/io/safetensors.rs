@@ -32,13 +32,13 @@ pub struct SafetensorsFile {
 
 impl SafetensorsFile {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let file =
-            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let file_path = path.as_ref();
+        let file = File::open(file_path)
+            .with_context(|| format!("failed to open {}", file_path.display()))?;
         // SAFETY: the file must not change while it is mapped.
         let map = Arc::new(unsafe { memmap2::Mmap::map(&file)? });
         let (header_len, metadata) = SafeTensors::read_metadata(&map)
-            .map_err(|err| anyhow!("invalid safetensors file {}: {err}", path.display()))?;
+            .map_err(|err| anyhow!("invalid safetensors file {}: {err}", file_path.display()))?;
         let data_start = 8 + header_len;
         let mut tensors: Vec<StoredTensor> = metadata
             .tensors()
@@ -159,7 +159,7 @@ pub fn save<'a>(
     path: impl AsRef<Path>,
     tensors: impl IntoIterator<Item = (&'a str, &'a HostTensor)>,
 ) -> Result<()> {
-    let path = path.as_ref();
+    let file_path = path.as_ref();
     let views = tensors
         .into_iter()
         .map(|(name, tensor)| {
@@ -169,6 +169,6 @@ pub fn save<'a>(
             Ok((name, TensorData { tensor, dtype }))
         })
         .collect::<Result<Vec<_>>>()?;
-    safetensors::serialize_to_file(views, None, path)
-        .map_err(|err| anyhow!("failed to write {}: {err}", path.display()))
+    safetensors::serialize_to_file(views, None, file_path)
+        .map_err(|err| anyhow!("failed to write {}: {err}", file_path.display()))
 }

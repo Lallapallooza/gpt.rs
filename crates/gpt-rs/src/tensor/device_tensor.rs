@@ -11,7 +11,7 @@ use super::lazy_tensor::{InputRole, LazyHandle, Materialized};
 use super::shape::Shape;
 use super::{DType, HostTensor};
 use crate::backend::PortableBackend;
-use crate::ops::graph::{GraphArena, ValueId};
+use crate::ops::graph::{GraphArena, NodeToken, ValueId};
 
 type ArenaGroup<B> = (Arc<GraphArena<B>>, Vec<(usize, ValueId)>);
 
@@ -69,12 +69,14 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
         }
     }
 
-    /// Builds a device tensor from a lazy graph node, optionally flushing when eager mode is set.
-    pub fn from_lazy(
+    /// Builds a device tensor from a lazy graph node whose tensors hold `token`, flushing it when
+    /// eager mode is set.
+    pub(crate) fn from_lazy(
         graph: Arc<GraphArena<B>>,
         shape: Shape,
         dtype: DType,
         value: ValueId,
+        token: Arc<NodeToken>,
     ) -> Result<Self> {
         let backend = graph.backend();
 
@@ -91,7 +93,11 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                 backend,
                 shape,
                 dtype,
-                handle: LazyHandle::Node { graph, value },
+                handle: LazyHandle::Node {
+                    graph,
+                    value,
+                    token,
+                },
             })
         }
     }
@@ -171,15 +177,31 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     pub(crate) fn graph_value(&self) -> Option<(Arc<GraphArena<B>>, ValueId)> {
         match &self.handle {
             LazyHandle::Input(_) => None,
-            LazyHandle::Node { graph, value } => Some((Arc::clone(graph), *value)),
+            LazyHandle::Node { graph, value, .. } => Some((Arc::clone(graph), *value)),
+        }
+    }
+
+    /// The handle of this tensor, materialized: the tensor's own when it is an argument that no
+    /// other tensor holds, so that a run that takes it may update its memory in place.
+    pub fn into_handle(self) -> Result<B::TensorHandle> {
+        match self.handle {
+            LazyHandle::Input(input) if input.role == InputRole::Arg => {
+                crate::ops::graph::note_materialized();
+                Ok(match Arc::try_unwrap(input) {
+                    Ok(owned) => owned.tensor,
+                    Err(shared) => shared.tensor.clone(),
+                })
+            }
+            _ => self.materialize(),
         }
     }
 
     /// Ensures the tensor is materialized on the backend and returns the handle.
     pub fn materialize(&self) -> Result<B::TensorHandle> {
+        crate::ops::graph::note_materialized();
         match &self.handle {
             LazyHandle::Input(input) => Ok(input.tensor.clone()),
-            LazyHandle::Node { graph, value } => {
+            LazyHandle::Node { graph, value, .. } => {
                 if let Some(handle) = graph.try_ready_handle(*value) {
                     return Ok(handle);
                 }
@@ -238,6 +260,7 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     /// Materializes a collection of tensors, grouping them by their backing graph arenas so
     /// common subgraphs execute only once.
     pub fn materialize_many(tensors: &[&DeviceTensor<B>]) -> Result<Vec<B::TensorHandle>> {
+        crate::ops::graph::note_materialized();
         if tensors.is_empty() {
             return Ok(Vec::new());
         }
@@ -250,7 +273,7 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
                 LazyHandle::Input(input) => {
                     results[idx] = Some(input.tensor.clone());
                 }
-                LazyHandle::Node { graph, value } => {
+                LazyHandle::Node { graph, value, .. } => {
                     let key = Arc::as_ptr(graph) as usize;
                     let entry = groups
                         .entry(key)
@@ -278,10 +301,29 @@ impl<B: PortableBackend + 'static> DeviceTensor<B> {
     pub(crate) fn tensor_type(&self) -> TensorType {
         TensorType::new(self.dtype, self.shape.dims().iter().copied())
     }
+
+    /// Whether this tensor and `other` are one tensor, which a graph reads as one value: the same
+    /// input, or the same value of one graph.
+    pub(crate) fn same_tensor(&self, other: &DeviceTensor<B>) -> bool {
+        match (&self.handle, &other.handle) {
+            (LazyHandle::Input(input), LazyHandle::Input(other_input)) => {
+                input.role == other_input.role && input.id == other_input.id
+            }
+            (
+                LazyHandle::Node { graph, value, .. },
+                LazyHandle::Node {
+                    graph: other_graph,
+                    value: other_value,
+                    ..
+                },
+            ) => Arc::ptr_eq(graph, other_graph) && value == other_value,
+            _ => false,
+        }
+    }
 }
 
 impl<B: PortableBackend> fmt::Debug for DeviceTensor<B> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("DeviceTensor")
             .field("backend", &self.backend.backend_name())
             .field("shape", &self.shape.dims())

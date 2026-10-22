@@ -83,32 +83,35 @@ impl From<RangeFull> for AxisIndex {
 }
 
 impl<T: Position> From<Range<T>> for AxisIndex {
-    fn from(r: Range<T>) -> Self {
-        range(Some(r.start.position()), Some(r.end.position()))
+    fn from(bounds: Range<T>) -> Self {
+        range(Some(bounds.start.position()), Some(bounds.end.position()))
     }
 }
 
 impl<T: Position> From<RangeFrom<T>> for AxisIndex {
-    fn from(r: RangeFrom<T>) -> Self {
-        range(Some(r.start.position()), None)
+    fn from(bounds: RangeFrom<T>) -> Self {
+        range(Some(bounds.start.position()), None)
     }
 }
 
 impl<T: Position> From<RangeTo<T>> for AxisIndex {
-    fn from(r: RangeTo<T>) -> Self {
-        range(None, Some(r.end.position()))
+    fn from(bounds: RangeTo<T>) -> Self {
+        range(None, Some(bounds.end.position()))
     }
 }
 
 impl<T: Position> From<RangeInclusive<T>> for AxisIndex {
-    fn from(r: RangeInclusive<T>) -> Self {
-        range(Some(r.start().position()), after(r.end().position()))
+    fn from(bounds: RangeInclusive<T>) -> Self {
+        range(
+            Some(bounds.start().position()),
+            after(bounds.end().position()),
+        )
     }
 }
 
 impl<T: Position> From<RangeToInclusive<T>> for AxisIndex {
-    fn from(r: RangeToInclusive<T>) -> Self {
-        range(None, after(r.end.position()))
+    fn from(bounds: RangeToInclusive<T>) -> Self {
+        range(None, after(bounds.end.position()))
     }
 }
 
@@ -130,6 +133,10 @@ impl<T: Position> From<T> for AxisIndex {
 /// Negative positions count from the end, range bounds clamp to the axis, and the axes that the
 /// index leaves out at the end are taken whole, all as in Python.
 #[macro_export]
+#[expect(
+    clippy::min_ident_chars,
+    reason = "`s!` is the public slicing macro, which other crates call by this name"
+)]
 macro_rules! s {
     (@index [$($done:expr,)*]) => { [$($done),*] };
     (@index [$($done:expr,)*] ... $(, $($rest:tt)*)?) => {
@@ -214,11 +221,11 @@ pub(super) fn resolve(dims: &[usize], index: &[AxisIndex]) -> (Slice, Vec<usize>
                         bound.min(extent)
                     }
                 };
-                let start = start.map_or(0, clamp);
-                let end = end.map_or(extent, clamp);
-                let size = ((end - start).max(0) as usize).div_ceil(step);
+                let clamped_start = start.map_or(0, clamp);
+                let clamped_end = end.map_or(extent, clamp);
+                let size = ((clamped_end - clamped_start).max(0) as usize).div_ceil(step);
                 // An empty range starts at 0, which fits any axis.
-                starts.push(if size == 0 { 0 } else { start as usize });
+                starts.push(if size == 0 { 0 } else { clamped_start as usize });
                 sizes.push(size);
                 strides.push(step);
                 out.push(size);

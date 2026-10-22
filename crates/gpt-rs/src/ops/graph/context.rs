@@ -60,22 +60,22 @@ pub fn push_default_arena<B: PortableBackend + 'static>(arena: Arc<GraphArena<B>
     ArenaGuard { active: true }
 }
 
-/// Runs `f` with the provided arena installed as the current default.
-pub fn with_default_arena<B, F, R>(arena: Arc<GraphArena<B>>, f: F) -> R
+/// Runs `body` with the provided arena installed as the current default.
+pub fn with_default_arena<B, F, R>(arena: Arc<GraphArena<B>>, body: F) -> R
 where
     B: PortableBackend + 'static,
     F: FnOnce() -> R,
 {
     let guard = push_default_arena(arena);
-    let result = f();
+    let result = body();
     drop(guard);
     result
 }
 
 /// Retrieves the currently installed default arena, if its backend matches `B`.
 pub fn current_arena<B: PortableBackend + 'static>() -> Option<Arc<GraphArena<B>>> {
-    ARENA_STACK.with(|stack| {
-        let stack = stack.borrow();
+    ARENA_STACK.with(|arenas| {
+        let stack = arenas.borrow();
         for entry in stack.iter().rev() {
             if let Ok(arena) = entry.clone().downcast::<GraphArena<B>>() {
                 return Some(arena);

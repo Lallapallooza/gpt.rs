@@ -15,15 +15,15 @@ use self::support::filled;
 #[test]
 fn gated_delta_rule_rejects_value_heads_not_divisible_by_key_heads() {
     let backend = Arc::new(CpuPortableBackend::new());
-    let d = |shape: &[usize]| filled(&backend, shape, 0.1);
+    let tenths = |shape: &[usize]| filled(&backend, shape, 0.1);
     let message = panic_message(|| {
         functional::gated_delta_rule(
-            &d(&[2, 3, 4]),
-            &d(&[2, 3, 4]),
-            &d(&[2, 4, 5]),
-            &d(&[2, 4]),
-            &d(&[2, 4]),
-            &d(&[4, 4, 5]),
+            &tenths(&[2, 3, 4]),
+            &tenths(&[2, 3, 4]),
+            &tenths(&[2, 4, 5]),
+            &tenths(&[2, 4]),
+            &tenths(&[2, 4]),
+            &tenths(&[4, 4, 5]),
         )
     });
     assert_eq!(
@@ -37,12 +37,12 @@ fn attention_kv_cache_rejects_writes_past_capacity() {
     let backend = Arc::new(CpuPortableBackend::new());
     let zeros = |shape: &[usize]| filled(&backend, shape, 0.0);
     let cache = DecodeKvCache::new(zeros(&[2, 4, 8]), zeros(&[2, 4, 8]), 3);
-    let positions = DeviceTensor::from_host(
+    let position_ids = DeviceTensor::from_host(
         Arc::clone(&backend),
         HostTensor::si32([2], vec![3, 4]).unwrap(),
     )
     .unwrap();
-    let positions = AttentionPositions::new(positions, None);
+    let positions = AttentionPositions::new(position_ids, None);
     let message = panic_message(|| {
         functional::attention_kv_cache(
             &zeros(&[2, 2, 8]),
@@ -65,16 +65,19 @@ fn linear_in_out_contracts_the_first_weight_axis() {
         let host = HostTensor::f32(dims, data).unwrap();
         DeviceTensor::from_host(Arc::clone(&backend), host).unwrap()
     };
-    let x = tensor([2, 4], (1..=8).map(|v| v as f32).collect());
-    let w = tensor([4, 3], (1..=12).map(|v| v as f32).collect());
-    let y = functional::linear(&x, &w, WeightLayout::InOut)
+    let x = tensor([2, 4], (1..=8).map(|value| value as f32).collect());
+    let weight = tensor([4, 3], (1..=12).map(|value| value as f32).collect());
+    let output = functional::linear(&x, &weight, WeightLayout::InOut)
         .to_host()
         .unwrap();
-    assert_eq!(y.dims[..], [2, 3]);
+    assert_eq!(output.dims[..], [2, 3]);
     // x @ w with w row-major [in, out], computed by hand.
-    assert_eq!(y.as_f32().unwrap(), [70.0, 80.0, 90.0, 158.0, 184.0, 210.0]);
     assert_eq!(
-        panic_message(|| functional::linear(&x, &w, WeightLayout::OutIn)),
+        output.as_f32().unwrap(),
+        [70.0, 80.0, 90.0, 158.0, 184.0, 210.0]
+    );
+    assert_eq!(
+        panic_message(|| functional::linear(&x, &weight, WeightLayout::OutIn)),
         "linear: weight in_features 3 must match x in_features 4"
     );
 }
@@ -83,8 +86,8 @@ fn linear_in_out_contracts_the_first_weight_axis() {
 fn validation_messages_name_the_functional_and_the_argument() {
     let backend = Arc::new(CpuPortableBackend::new());
     let f32 = |shape: &[usize]| filled(&backend, shape, 0.5);
-    let indices = HostTensor::si32([2, 4], vec![0; 8]).unwrap();
-    let indices = DeviceTensor::from_host(Arc::clone(&backend), indices).unwrap();
+    let indices_host = HostTensor::si32([2, 4], vec![0; 8]).unwrap();
+    let indices = DeviceTensor::from_host(Arc::clone(&backend), indices_host).unwrap();
 
     assert_eq!(
         panic_message(|| functional::linear(&f32(&[4]), &f32(&[3, 4]), WeightLayout::OutIn)),
@@ -115,8 +118,8 @@ fn validation_messages_name_the_functional_and_the_argument() {
 fn shape_checks_name_the_extents_that_do_not_match() {
     let backend = Arc::new(CpuPortableBackend::new());
     let f32 = |shape: &[usize]| filled(&backend, shape, 0.5);
-    let indices = HostTensor::si32([3, 2], vec![0; 6]).unwrap();
-    let indices = DeviceTensor::from_host(Arc::clone(&backend), indices).unwrap();
+    let indices_host = HostTensor::si32([3, 2], vec![0; 6]).unwrap();
+    let indices = DeviceTensor::from_host(Arc::clone(&backend), indices_host).unwrap();
 
     assert_eq!(
         panic_message(|| functional::rms_norm(&f32(&[2, 3, 4]), &f32(&[3]), 1e-5)),
@@ -132,11 +135,11 @@ fn shape_checks_name_the_extents_that_do_not_match() {
     );
     assert_eq!(
         panic_message(|| functional::matmul(&f32(&[4, 5]), &f32(&[4, 3]))),
-        "matmul: the last dimension 5 of a must match dimension 4 of b"
+        "matmul: the last dimension 5 of lhs must match dimension 4 of rhs"
     );
     assert_eq!(
         panic_message(|| functional::matmul(&f32(&[2, 4, 5]), &f32(&[3, 5, 2]))),
-        "matmul: batch 2 of a must match batch 3 of b"
+        "matmul: batch 2 of lhs must match batch 3 of rhs"
     );
     assert_eq!(
         panic_message(|| functional::apply_rope(&f32(&[2, 8, 16]), &f32(&[7, 8]), &f32(&[7, 8]))),
@@ -179,8 +182,8 @@ fn binary_ops_broadcast_as_torch_and_reject_other_shapes() {
         panic_message(|| &x + &bias),
         "shapes [2, 3] and [4] do not broadcast"
     );
-    let bf16 = tensor_as(&[3], &[0.0; 3], DType::Bf16);
-    let bf16 = DeviceTensor::from_host(Arc::clone(&backend), bf16).unwrap();
+    let bf16_host = tensor_as(&[3], &[0.0; 3], DType::Bf16);
+    let bf16 = DeviceTensor::from_host(Arc::clone(&backend), bf16_host).unwrap();
     assert_eq!(
         panic_message(|| &x * &bf16),
         "tensor.mul: operands must have equal types, got tensor<2x3xf32> and tensor<2x3xbf16>"
@@ -193,9 +196,9 @@ fn ops_reject_tensors_of_two_backend_instances() {
         Arc::new(CpuPortableBackend::new()),
         Arc::new(CpuPortableBackend::new()),
     );
-    let (a, b) = (filled(&one, &[2], 1.0), filled(&two, &[2], 1.0));
+    let (on_one, on_two) = (filled(&one, &[2], 1.0), filled(&two, &[2], 1.0));
     assert_eq!(
-        panic_message(|| &a + &b),
+        panic_message(|| &on_one + &on_two),
         "a ref-cpu tensor of another backend instance cannot join this graph"
     );
 }

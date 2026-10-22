@@ -11,29 +11,30 @@ use crate::backend::PortableBackend;
 use crate::checkpoint::{self, Checkpoint};
 use crate::model::config::ModelRuntimeConfig;
 use crate::model::registry as model_registry;
+use crate::nn::TensorView;
 use crate::params::{base_param_id, param_key, ModelNamespaceId};
 use crate::tensor::{DeviceTensor, HostTensor, Shape};
 
-/// Hands a checkpoint tensor to the backend as a view into the memory-mapped file, so a backend
-/// on host memory leaves the weights in the OS page cache. An entry that the file does not align
-/// for its dtype is copied, and its size is added to `copied`.
+/// Hands a checkpoint tensor of type `ty` to the backend as a view into the memory-mapped file,
+/// whose bytes hold its elements row-major over `ty`'s extents. So a backend on host memory
+/// leaves the weights in the OS page cache. It copies an entry that the file does not align for
+/// its dtype, and adds its size to `copied`.
 fn upload_entry<B: PortableBackend + 'static>(
     backend: &B,
     checkpoint: &dyn Checkpoint,
-    index: usize,
+    (index, ty): (usize, &TensorType),
     copied: &mut usize,
 ) -> Result<B::TensorHandle> {
     let entry = &checkpoint.tensors()[index];
     let bytes = checkpoint
         .bytes(index)
         .with_context(|| format!("failed to read tensor '{}'", entry.name))?;
-    let ty = TensorType::new(entry.dtype, entry.dims.iter().copied());
-    let align = entry.dtype.size_in_bytes().unwrap_or(1);
+    let align = ty.dtype.size_in_bytes().unwrap_or(1);
     let host = if (bytes.as_slice().as_ptr() as usize).is_multiple_of(align) {
-        HostTensor::view(&ty, bytes)
+        HostTensor::view(ty, bytes)
     } else {
         *copied += bytes.len();
-        HostTensor::from_le_bytes(&ty, bytes.as_slice())
+        HostTensor::from_le_bytes(ty, bytes.as_slice())
     }
     .with_context(|| format!("checkpoint tensor '{}'", entry.name))?;
     backend.upload(host)
@@ -89,21 +90,24 @@ pub fn load_model_with_options<B: PortableBackend + 'static>(
         .map(|(index, entry)| (entry.name.as_str(), index))
         .collect();
     let mut copied = 0usize;
-    let mut get = |name: &str| -> Result<Option<DeviceTensor<B>>> {
+    let mut get = |name: &str, view: TensorView| -> Result<Option<DeviceTensor<B>>> {
         let Some(&index) = indices.get(name) else {
             return Ok(None);
         };
         let entry = &checkpoint.tensors()[index];
         let key = param_key(namespace, base_param_id(name)?);
-        let handle = upload_entry(backend.as_ref(), checkpoint.as_ref(), index, &mut copied)?;
-        DeviceTensor::from_handle(
-            Arc::clone(&backend),
-            Shape::new(entry.dims.clone()),
-            entry.dtype,
-            handle,
-        )
-        .as_param(key.0)
-        .map(Some)
+        let stored = TensorType::new(entry.dtype, entry.dims.iter().copied());
+        let ty = view
+            .type_of(&stored)
+            .with_context(|| format!("checkpoint tensor '{name}'"))?;
+        let read = (index, &ty);
+        let handle = upload_entry(backend.as_ref(), checkpoint.as_ref(), read, &mut copied)?;
+        let dims = ty
+            .static_dims()
+            .expect("a checkpoint tensor has static extents");
+        DeviceTensor::from_handle(Arc::clone(&backend), Shape::new(dims), ty.dtype, handle)
+            .as_param(key.0)
+            .map(Some)
     };
 
     let kind = config.kind.as_str();

@@ -9,7 +9,7 @@ use gpt_rs_ir::dialects::tensor::DotGeneral;
 use crate::backend::PortableBackend;
 use crate::ops::functional::{apply_rope, softmax};
 use crate::tensor::{DType, DeviceTensor, HostTensor, Shape};
-use crate::{ensure_dtype, ensure_rank, ensure_same_dtype, ensure_same_shape, functional, s};
+use crate::{ensure_dtype, ensure_rank, ensure_same_dtype, ensure_same_shape, functional};
 
 /// Fixed-capacity KV cache that [`attention_kv_cache`] reads and writes.
 ///
@@ -125,9 +125,10 @@ impl<B: PortableBackend + 'static> AttentionPositions<B> {
             positions.dtype(),
             positions.shape().dims()
         );
-        let zero = HostTensor::si32([1], vec![0]).expect("one element");
-        let zero = DeviceTensor::constant(&positions, &zero);
-        let cache_starts = DeviceTensor::concat(0, &[&zero, &positions.slice(s![..1]), &zero]);
+        let zero_host = HostTensor::si32([1], vec![0]).expect("one element");
+        let zero = DeviceTensor::constant(&positions, &zero_host);
+        let cache_starts =
+            DeviceTensor::concat(0, &[&zero, &positions.slice(crate::s![..1]), &zero]);
         Self {
             positions,
             rotary,
@@ -138,8 +139,8 @@ impl<B: PortableBackend + 'static> AttentionPositions<B> {
 
 /// Grouped-query causal attention for `T` new tokens appended to a fixed-capacity KV cache.
 ///
-/// `q` is `[T, Hq, D]`, and `k` and `v` are `[T, Hkv, D]`. When `positions` holds rotary tables,
-/// they rotate `q` and `k`. The first position must equal `cache.len()`.
+/// `query` is `[T, Hq, D]`, and `key` and `value` are `[T, Hkv, D]`. When `positions` holds rotary
+/// tables, they rotate `query` and `key`. The first position must equal `cache.len()`.
 ///
 /// The functional writes the new keys and values at the first position with
 /// `dynamic_update_slice`. Query `t` then attends to the cache rows up to its own position, with
@@ -150,81 +151,80 @@ impl<B: PortableBackend + 'static> AttentionPositions<B> {
 /// Shapes depend only on `(T, capacity)`, so all positions reuse the same compiled programs.
 #[functional]
 pub fn attention_kv_cache(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
+    query: &Tensor,
+    key: &Tensor,
+    value: &Tensor,
     cache: &DecodeKvCache<B>,
     positions: &AttentionPositions<B>,
 ) -> (Tensor, DecodeKvCache<B>) {
     let cache_keys = cache.keys();
     let token_positions = &positions.positions;
-    ensure_rank!(q, 3);
-    ensure_rank!(k, 3);
-    ensure_dtype!(q, F32);
-    ensure_same_dtype!(q, k, v, cache_keys);
-    ensure_same_shape!(k, v);
+    ensure_rank!(query, 3);
+    ensure_rank!(key, 3);
+    ensure_dtype!(query, F32);
+    ensure_same_dtype!(query, key, value, cache_keys);
+    ensure_same_shape!(key, value);
     ensure_rank!(token_positions, 1);
     ensure_dtype!(token_positions, Si32);
-    let [t, hq, d] = [0, 1, 2].map(|axis| q.size(axis));
-    let hkv = k.size(1);
+    let [seq_len, query_heads, head_dim] = [0, 1, 2].map(|axis| query.size(axis));
+    let kv_heads = key.size(1);
     assert!(
-        k.shape().dims() == [t, hkv, d] && token_positions.size(0) == t,
-        "{FUNCTIONAL}: k must be [{t}, {hkv}, {d}] and positions [{t}], got {:?} and {:?}",
-        k.shape().dims(),
+        key.shape().dims() == [seq_len, kv_heads, head_dim] && token_positions.size(0) == seq_len,
+        "{FUNCTIONAL}: key must be [{seq_len}, {kv_heads}, {head_dim}] and positions [{seq_len}], \
+         got {:?} and {:?}",
+        key.shape().dims(),
         token_positions.shape().dims()
     );
     assert!(
-        hkv > 0 && hq.is_multiple_of(hkv),
-        "{FUNCTIONAL}: query heads ({hq}) must be a multiple of kv heads ({hkv})"
+        kv_heads > 0 && query_heads.is_multiple_of(kv_heads),
+        "{FUNCTIONAL}: query heads ({query_heads}) must be a multiple of kv heads ({kv_heads})"
     );
     let cache_dims = cache_keys.shape().dims();
     assert!(
-        cache_dims[0] == hkv && cache_dims[2] == d,
-        "{FUNCTIONAL}: cache must be [{hkv}, capacity, {d}], got {cache_dims:?}"
+        cache_dims[0] == kv_heads && cache_dims[2] == head_dim,
+        "{FUNCTIONAL}: cache must be [{kv_heads}, capacity, {head_dim}], got {cache_dims:?}"
     );
-    let c = cache_dims[1];
+    let capacity = cache_dims[1];
     assert!(
-        cache.len() + t <= c,
-        "{FUNCTIONAL}: update would exceed capacity (len {} + seq_len {t} > {c})",
+        cache.len() + seq_len <= capacity,
+        "{FUNCTIONAL}: update would exceed capacity (len {} + seq_len {seq_len} > {capacity})",
         cache.len()
     );
-    let group = hq / hkv;
-    let scale = 1.0f32 / (d as f32).sqrt();
+    let group = query_heads / kv_heads;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
 
-    let (mut q, mut k, v) = (
-        q.transpose([1, 0, 2]),
-        k.transpose([1, 0, 2]),
-        v.transpose([1, 0, 2]),
-    );
+    let mut queries = query.transpose([1, 0, 2]);
+    let mut new_keys = key.transpose([1, 0, 2]);
+    let new_values = value.transpose([1, 0, 2]);
     if let Some((cos, sin)) = &positions.rotary {
-        q = apply_rope(&q, cos, sin);
-        k = apply_rope(&k, cos, sin);
+        queries = apply_rope(&queries, cos, sin);
+        new_keys = apply_rope(&new_keys, cos, sin);
     }
 
     let starts = &positions.cache_starts;
-    let keys = cache_keys.dynamic_update_slice(&k, starts);
-    let values = cache.values().dynamic_update_slice(&v, starts);
+    let keys = cache_keys.dynamic_update_slice(&new_keys, starts);
+    let values = cache.values().dynamic_update_slice(&new_values, starts);
     keys.export();
     values.export();
 
-    let scores = q
-        .reshape([hkv, group * t, d])
+    let scores = queries
+        .reshape([kv_heads, group * seq_len, head_dim])
         .dot_general(&keys, DotGeneral::contract([2], [2]).batch([0], [0]))
         * scale;
-    let start = token_positions.slice(s![..1]);
-    let query_pos = DeviceTensor::iota(&q, [t, c], 0, DType::Si32).add(&start);
-    let key_pos = DeviceTensor::iota(&q, [t, c], 1, DType::Si32);
+    let start = token_positions.slice(crate::s![..1]);
+    let query_pos = DeviceTensor::iota(&queries, [seq_len, capacity], 0, DType::Si32).add(&start);
+    let key_pos = DeviceTensor::iota(&queries, [seq_len, capacity], 1, DType::Si32);
     let visible = query_pos
         .greater_equal(&key_pos)
-        .reshape([1, 1, t, c])
-        .broadcast_to([hkv, group, t, c])
-        .reshape([hkv, group * t, c]);
+        .reshape([1, 1, seq_len, capacity])
+        .broadcast_to([kv_heads, group, seq_len, capacity])
+        .reshape([kv_heads, group * seq_len, capacity]);
     let probs = softmax(&visible.select(&scores, f32::NEG_INFINITY), -1);
     let output = probs
         .dot_general(&values, DotGeneral::contract([2], [1]).batch([0], [0]))
-        .reshape([hkv, group, t, d])
+        .reshape([kv_heads, group, seq_len, head_dim])
         .transpose([2, 0, 1, 3])
-        .reshape([t, hq * d]);
-    let cache = DecodeKvCache::new(keys, values, cache.len() + t);
-    (output, cache)
+        .reshape([seq_len, query_heads * head_dim]);
+    let next_cache = DecodeKvCache::new(keys, values, cache.len() + seq_len);
+    (output, next_cache)
 }

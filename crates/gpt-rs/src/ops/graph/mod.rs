@@ -9,9 +9,13 @@ mod builder;
 pub mod context;
 mod plan;
 mod state;
+mod traced;
 
 pub use self::arena::GraphArena;
 pub(crate) use self::builder::GraphBuilder;
+pub(crate) use self::state::NodeToken;
+pub(crate) use self::traced::note_materialized;
+pub use self::traced::{Traced, TracedFn, Traces, TracesFn};
 
 /// The identifier of a value in a graph arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

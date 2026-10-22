@@ -7,35 +7,39 @@ use gpt_rs_ir::ir::{Inst, Module, Value, ValueRef};
 use crate::tensor::DType;
 use crate::{ensure_dtype, ensure_rank, ensure_same_dtype, functional};
 
-/// Performs matrix multiplication (or batched matmul) between `a` and `b`.
+/// Performs matrix multiplication (or batched matmul) between `lhs` and `rhs`.
 ///
 /// Rank-2 operands multiply as `[m, k] x [k, n]`. Rank-3 operands multiply per batch, as
 /// `[b, m, k] x [b, k, n]`.
 #[functional]
-pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
-    ensure_same_dtype!(a, b);
-    let (a_dims, b_dims) = (a.shape().dims(), b.shape().dims());
-    let dims = match (a_dims.len(), b_dims.len()) {
+pub fn matmul(lhs: &Tensor, rhs: &Tensor) -> Tensor {
+    ensure_same_dtype!(lhs, rhs);
+    let (lhs_dims, rhs_dims) = (lhs.shape().dims(), rhs.shape().dims());
+    let dims = match (lhs_dims.len(), rhs_dims.len()) {
         (2, 2) => DotGeneral::contract([1], [0]),
         (3, 3) => {
             assert!(
-                a_dims[0] == b_dims[0],
-                "{FUNCTIONAL}: batch {} of a must match batch {} of b",
-                a_dims[0],
-                b_dims[0]
+                lhs_dims[0] == rhs_dims[0],
+                "{FUNCTIONAL}: batch {} of lhs must match batch {} of rhs",
+                lhs_dims[0],
+                rhs_dims[0]
             );
             DotGeneral::contract([2], [1]).batch([0], [0])
         }
-        (a_rank, b_rank) => {
-            panic!("{FUNCTIONAL}: a and b must both have rank 2 or 3, got {a_rank} and {b_rank}")
+        (lhs_rank, rhs_rank) => {
+            panic!(
+                "{FUNCTIONAL}: lhs and rhs must both have rank 2 or 3, got {lhs_rank} and \
+                 {rhs_rank}"
+            )
         }
     };
-    let (k_a, k_b) = (a_dims[a_dims.len() - 1], b_dims[b_dims.len() - 2]);
+    let (lhs_inner, rhs_inner) = (lhs_dims[lhs_dims.len() - 1], rhs_dims[rhs_dims.len() - 2]);
     assert!(
-        k_a == k_b,
-        "{FUNCTIONAL}: the last dimension {k_a} of a must match dimension {k_b} of b"
+        lhs_inner == rhs_inner,
+        "{FUNCTIONAL}: the last dimension {lhs_inner} of lhs must match dimension {rhs_inner} \
+         of rhs"
     );
-    a.dot_general(b, dims)
+    lhs.dot_general(rhs, dims)
 }
 
 /// Layout of the weight of a [`linear`] projection.
@@ -131,7 +135,7 @@ pub fn linear_weight(module: &Module, inst: Inst) -> Option<LinearWeight> {
     let x = dot.lhs();
     let static_rank2 = |value: ValueRef<'_>| {
         let dims = value.tensor_type().static_dims();
-        dims.is_some_and(|dims| dims.len() == 2)
+        dims.is_some_and(|extents| extents.len() == 2)
     };
     (static_rank2(x) && static_rank2(weight)).then_some(LinearWeight {
         layout,
@@ -149,11 +153,11 @@ fn dequantized<'m>(
     chain: &mut Vec<Inst>,
 ) -> Option<(ValueRef<'m>, ValueRef<'m>)> {
     let mul = value.defining_op::<Mul>()?;
-    let (cast, broadcast) = match mul.lhs().defining_op::<Cast>() {
+    let (cast, scale_operand) = match mul.lhs().defining_op::<Cast>() {
         Some(cast) => (cast, mul.rhs()),
         None => (mul.rhs().defining_op::<Cast>()?, mul.lhs()),
     };
-    let broadcast = broadcast.defining_op::<BroadcastTo>()?;
+    let broadcast = scale_operand.defining_op::<BroadcastTo>()?;
     let scale = broadcast.input();
     if scale.tensor_type().element_count()? != 1 {
         return None;

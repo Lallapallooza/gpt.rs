@@ -14,6 +14,18 @@ pub fn relu6(x: &Tensor) -> Tensor {
     x.maximum(0.0).minimum(6.0)
 }
 
+/// Applies the hard sigmoid `relu6(x + 3) / 6`, as Torch's `hardsigmoid`.
+#[functional]
+pub fn hard_sigmoid(x: &Tensor) -> Tensor {
+    relu6(&(x + 3.0)) / 6.0
+}
+
+/// Applies the hard swish `x * relu6(x + 3) / 6`, as Torch's `hardswish`.
+#[functional]
+pub fn hard_swish(x: &Tensor) -> Tensor {
+    x * hard_sigmoid(x)
+}
+
 /// Computes a numerically stable softmax of `x` along `axis`, which counts from the end when it
 /// is negative, as in Torch: `exp(x - max(x)) / sum(exp(x - max(x)))`. Subtracting the maximum
 /// keeps the exponentials in range.

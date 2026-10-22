@@ -34,3 +34,6 @@ safetensors = "0.8"
 [dev-dependencies]
 gpt-rs-backend-ref-cpu = { path = "../gpt-rs-backend-ref-cpu", version = "0.1.0" }
 gpt-rs-backend-tests = { path = "../gpt-rs-backend-tests", version = "0.1.0" }
+
+[lints]
+workspace = true

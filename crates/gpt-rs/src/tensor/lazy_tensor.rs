@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::backend::PortableBackend;
-use crate::ops::graph::{GraphArena, ValueId};
+use crate::ops::graph::{GraphArena, NodeToken, ValueId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum InputRole {
@@ -38,10 +38,12 @@ impl<B: PortableBackend + 'static> Materialized<B> {
 /// allocating.
 pub(crate) enum LazyHandle<B: PortableBackend + 'static> {
     Input(Arc<Materialized<B>>),
-    /// Lazily-evaluated graph node that will be flushed into a concrete handle on demand.
+    /// Lazily-evaluated graph node that will be flushed into a concrete handle on demand. The token
+    /// tells the graph that a tensor of the node is alive.
     Node {
         graph: Arc<GraphArena<B>>,
         value: ValueId,
+        token: Arc<NodeToken>,
     },
 }
 
@@ -49,9 +51,14 @@ impl<B: PortableBackend + 'static> Clone for LazyHandle<B> {
     fn clone(&self) -> Self {
         match self {
             LazyHandle::Input(input) => LazyHandle::Input(Arc::clone(input)),
-            LazyHandle::Node { graph, value } => LazyHandle::Node {
+            LazyHandle::Node {
+                graph,
+                value,
+                token,
+            } => LazyHandle::Node {
                 graph: Arc::clone(graph),
                 value: *value,
+                token: Arc::clone(token),
             },
         }
     }

@@ -35,9 +35,9 @@ impl Sampling {
         }
     }
 
-    /// Draws only among the `k` most likely tokens.
-    pub fn with_top_k(mut self, k: usize) -> Self {
-        self.top_k = Some(k.max(1));
+    /// Draws only among the `count` most likely tokens.
+    pub fn with_top_k(mut self, count: usize) -> Self {
+        self.top_k = Some(count.max(1));
         self
     }
 

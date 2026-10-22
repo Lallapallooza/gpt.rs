@@ -44,8 +44,9 @@ fn last_logits_row(logits: &HostTensor) -> PyResult<&[f32]> {
     Ok(&data[start..start + vocab])
 }
 
-/// The f32 NCHW pixels of `array`, which must have rank 4.
-fn pixels(array: PyReadonlyArrayDyn<'_, f32>) -> PyResult<HostTensor> {
+/// The f32 NCHW pixels of `array`, which must have rank 4, copied: the model runs without the GIL,
+/// while Python code may write the array.
+fn pixels(array: PyReadonlyArrayDyn<f32>) -> PyResult<HostTensor> {
     let shape: Vec<usize> = array.shape().to_vec();
     if shape.len() != 4 {
         return Err(PyValueError::new_err(format!(
@@ -138,7 +139,7 @@ impl PyLoadedModel {
     #[allow(clippy::too_many_arguments)]
     fn generate_tokens(
         &self,
-        py: Python<'_>,
+        py: Python,
         prompt_tokens: Vec<usize>,
         max_new_tokens: usize,
         temperature: f32,
@@ -178,7 +179,7 @@ impl PyLoadedModel {
     fn forward_vision<'py>(
         &self,
         py: Python<'py>,
-        input_nchw: PyReadonlyArrayDyn<'_, f32>,
+        input_nchw: PyReadonlyArrayDyn<f32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pixels = pixels(input_nchw)?;
         let model = &self.model;
@@ -204,14 +205,27 @@ impl PyLoadedModel {
 }
 
 /// Loads the Hugging Face model directory `checkpoint`. `config_overrides` replaces keys of the
-/// model config (the text config of a multimodal checkpoint).
-#[pyfunction(signature = (checkpoint, *, backend=None, matmul_input_dtype=None, config_overrides=None))]
+/// model config (the text config of a multimodal checkpoint). `target` is the target of a backend
+/// that compiles for one: a preset, `host` or a target file (`$GPTRS_TARGET`, else `host`).
+/// `winograd` runs 3x3 convolutions with stride 1 as Winograd's F(2x2, 3x3), which rounds
+/// differently from the convolution. It is off by default (`$GPTRS_WINOGRAD=1`).
+#[pyfunction(signature = (
+    checkpoint,
+    *,
+    backend=None,
+    matmul_input_dtype=None,
+    config_overrides=None,
+    target=None,
+    winograd=None
+))]
 pub fn load_model(
-    py: Python<'_>,
+    py: Python,
     checkpoint: String,
     backend: Option<String>,
     matmul_input_dtype: Option<String>,
-    config_overrides: Option<Bound<'_, PyDict>>,
+    config_overrides: Option<Bound<PyDict>>,
+    target: Option<String>,
+    winograd: Option<bool>,
 ) -> PyResult<PyLoadedModel> {
     let config_overrides = match config_overrides {
         Some(overrides) => {
@@ -235,9 +249,18 @@ pub fn load_model(
         config_overrides,
     };
 
+    let mut backend_options = gpt_rs_backends::BackendOptions::from_env();
+    if let Some(target) = target {
+        backend_options.target = target;
+    }
+    if let Some(winograd) = winograd {
+        backend_options.winograd = winograd;
+    }
     let backend_name = backend.unwrap_or_else(crate::backend::get_backend);
     let model = py
-        .allow_threads(|| gpt_rs_backends::load_model(&backend_name, &checkpoint, options))
+        .allow_threads(|| {
+            gpt_rs_backends::load_model(&backend_name, &backend_options, &checkpoint, options)
+        })
         .with_context(|| format!("failed to load checkpoint {checkpoint}"))
         .map_err(runtime_error)?;
     Ok(PyLoadedModel {

@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use gpt_rs_ir::dialects::tensor::{DotAxes, DotGeneral, TensorOp};
+use gpt_rs_ir::dialects::tensor::{DotAxes, DotGeneral, TensorOps};
 use gpt_rs_ir::ir::{DType, TensorType, Value};
 
 use super::super::profile::{matmul_work_stats, register_op_profile_binary, signature_binary};
@@ -15,11 +15,8 @@ use super::EmitContext;
 use crate::kernels::{LINEAR_PACK_MIN_ROWS, PANEL_N};
 use crate::targets::linear_kernel;
 
-pub(super) fn emit_instruction(
-    inst: &Instruction<'_>,
-    ctx: &mut EmitContext<'_>,
-) -> Result<Option<usize>> {
-    let &Kind::Op(TensorOp::DotGeneral(spec)) = &inst.kind else {
+pub(super) fn emit_instruction(inst: &Instruction, ctx: &mut EmitContext) -> Result<Option<usize>> {
+    let &Kind::Op(TensorOps::DotGeneral(spec)) = &inst.kind else {
         return Ok(None);
     };
     let &[lhs, rhs] = inst.operands.as_slice() else {
@@ -44,7 +41,7 @@ pub(super) fn emit_instruction(
 
 /// Emits a [`Kind::Linear`] instruction, `x [M, K] . w [N, K]` with `w` as stored, scaled by the
 /// third operand when there is one.
-pub(super) fn emit_linear(inst: &Instruction<'_>, ctx: &mut EmitContext<'_>) -> Result<usize> {
+pub(super) fn emit_linear(inst: &Instruction, ctx: &mut EmitContext) -> Result<usize> {
     let scale = match inst.operands.as_slice() {
         [_, _] => None,
         [_, _, scale] => Some(scale),
@@ -70,10 +67,10 @@ fn reads_panels(spec: &DotGeneral, x: &TensorType, w: &TensorType) -> bool {
 
 /// Emits `lhs . rhs`. A `scale` operand is the one-element scale of a dequantized `rhs`.
 fn emit_dot(
-    inst: &Instruction<'_>,
+    inst: &Instruction,
     spec: &DotGeneral,
     scale: Option<&Value>,
-    ctx: &mut EmitContext<'_>,
+    ctx: &mut EmitContext,
 ) -> Result<usize> {
     let EmitContext {
         module,
@@ -186,7 +183,7 @@ fn emit_dot(
 
 /// Emits the GEMM of `x [.., K]` and `w` packed as `[N / PANEL_N, K, PANEL_N]`, whose result
 /// `[.., N / PANEL_N, PANEL_N]` holds `x . w` as `[.., N]`.
-fn emit_matmul_packed(inst: &Instruction<'_>, ctx: &mut EmitContext<'_>) -> Result<usize> {
+fn emit_matmul_packed(inst: &Instruction, ctx: &mut EmitContext) -> Result<usize> {
     let EmitContext {
         module,
         value_infos,

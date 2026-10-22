@@ -14,7 +14,7 @@ fn run_linear_case<B: PortableBackend + 'static>(
     in_features: usize,
     out_features: usize,
     seed: u64,
-    bias: bool,
+    with_bias: bool,
 ) {
     let mut rng = seeded_rng(seed);
     let input_host = tensor_from_vec(
@@ -26,7 +26,7 @@ fn run_linear_case<B: PortableBackend + 'static>(
         random_vec(&mut rng, out_features * in_features),
     );
     let bias_host =
-        bias.then(|| tensor_from_vec(&[out_features], random_vec(&mut rng, out_features)));
+        with_bias.then(|| tensor_from_vec(&[out_features], random_vec(&mut rng, out_features)));
 
     let expected = timed_torch(|| {
         let input_tch = tch_tensor_from_vec(&[batch, in_features], input_host.as_f32().unwrap());
@@ -34,7 +34,7 @@ fn run_linear_case<B: PortableBackend + 'static>(
             tch_tensor_from_vec(&[out_features, in_features], weight_host.as_f32().unwrap());
         let bias_tch = bias_host
             .as_ref()
-            .map(|b| tch_tensor_from_vec(&[out_features], b.as_f32().unwrap()));
+            .map(|bias| tch_tensor_from_vec(&[out_features], bias.as_f32().unwrap()));
         tensor_to_vec(&input_tch.linear(&weight_tch, bias_tch.as_ref()))
     });
 

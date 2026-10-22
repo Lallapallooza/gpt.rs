@@ -1,7 +1,7 @@
 //! `rng_uniform` of f32 values: the Philox4x32-10 stream of the state, as the spec defines it.
 
 use anyhow::{bail, ensure, Result};
-use gpt_rs_ir::dialects::tensor::TensorOp;
+use gpt_rs_ir::dialects::tensor::TensorOps;
 use gpt_rs_ir::ir::DType;
 
 use super::super::profile::register_op_profile_generic;
@@ -10,10 +10,7 @@ use super::super::utils::push_block;
 use super::super::value_info::{operand_expr, operand_types, output_info};
 use super::EmitContext;
 
-pub(super) fn emit_instruction(
-    inst: &Instruction<'_>,
-    ctx: &mut EmitContext<'_>,
-) -> Result<Option<usize>> {
+pub(super) fn emit_instruction(inst: &Instruction, ctx: &mut EmitContext) -> Result<Option<usize>> {
     let EmitContext {
         module,
         value_infos,
@@ -24,8 +21,8 @@ pub(super) fn emit_instruction(
         return Ok(None);
     };
     let spec = match op {
-        TensorOp::RngUniform(spec) => spec,
-        TensorOp::RngNormal(_) => bail!("the C backend draws only uniform values, not normal"),
+        TensorOps::RngUniform(spec) => spec,
+        TensorOps::RngNormal(_) => bail!("the C backend draws only uniform values, not normal"),
         _ => return Ok(None),
     };
     ensure!(

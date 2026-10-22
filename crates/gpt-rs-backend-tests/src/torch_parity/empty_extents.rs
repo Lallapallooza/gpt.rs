@@ -38,14 +38,14 @@ pub fn batched_matmul_inner0_matches_torch<B: PortableBackend + 'static>(backend
 pub fn linear_in0_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
     let expected = timed_torch(|| {
         let x = tch_tensor_from_vec(&[2, 0], &[]);
-        let w = tch_tensor_from_vec(&[3, 0], &[]);
-        tensor_to_vec(&x.matmul(&w.transpose(0, 1)))
+        let weight = tch_tensor_from_vec(&[3, 0], &[]);
+        tensor_to_vec(&x.matmul(&weight.transpose(0, 1)))
     });
 
     let actual = timed_gpt(|| {
         let x = device_tensor_from_data(backend, &[2, 0], &[]);
-        let w = device_tensor_from_data(backend, &[3, 0], &[]);
-        to_host_vec(&functional::linear(&x, &w, WeightLayout::OutIn))
+        let weight = device_tensor_from_data(backend, &[3, 0], &[]);
+        to_host_vec(&functional::linear(&x, &weight, WeightLayout::OutIn))
     });
 
     assert_close(&expected, &actual);

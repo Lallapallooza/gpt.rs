@@ -87,22 +87,23 @@ struct DeltaRuleInputs {
     value_heads: usize,
     key_dim: usize,
     value_dim: usize,
-    q: Vec<f32>,
-    k: Vec<f32>,
-    v: Vec<f32>,
-    g: Vec<f32>,
+    query: Vec<f32>,
+    key: Vec<f32>,
+    value: Vec<f32>,
+    log_decay: Vec<f32>,
     beta: Vec<f32>,
     state: Vec<f32>,
 }
 
 impl DeltaRuleInputs {
-    /// Slow decays with `g` near 0 and `beta` near 1, so tokens far apart in a chunk still interact
-    /// and the higher powers of the intra-chunk system contribute above the parity tolerance.
+    /// Slow decays with the log-decay near 0 and `beta` near 1, so tokens far apart in a chunk
+    /// still interact and the higher powers of the intra-chunk system contribute above the parity
+    /// tolerance.
     fn with_slow_decay(mut self, seed: u64) -> Self {
         let mut rng = seeded_rng(seed);
-        let n = self.seq * self.value_heads;
-        self.g = random_vec_range(&mut rng, n, -0.05, -0.001);
-        self.beta = random_vec_range(&mut rng, n, 0.8, 1.0);
+        let len = self.seq * self.value_heads;
+        self.log_decay = random_vec_range(&mut rng, len, -0.05, -0.001);
+        self.beta = random_vec_range(&mut rng, len, 0.8, 1.0);
         self
     }
 
@@ -111,9 +112,11 @@ impl DeltaRuleInputs {
     /// inverse of `I + A`.
     fn with_repeated_keys(mut self, period: usize) -> Self {
         let row = self.key_heads * self.key_dim;
-        for t in period..self.seq {
-            self.k
-                .copy_within((t - period) * row..(t - period + 1) * row, t * row);
+        for token in period..self.seq {
+            self.key.copy_within(
+                (token - period) * row..(token - period + 1) * row,
+                token * row,
+            );
         }
         self
     }
@@ -128,11 +131,11 @@ impl DeltaRuleInputs {
         seed: u64,
     ) -> Self {
         let mut rng = seeded_rng(seed);
-        let q = random_vec(&mut rng, seq * key_heads * key_dim);
-        let k = random_vec(&mut rng, seq * key_heads * key_dim);
-        let v = random_vec(&mut rng, seq * value_heads * value_dim);
+        let query = random_vec(&mut rng, seq * key_heads * key_dim);
+        let key = random_vec(&mut rng, seq * key_heads * key_dim);
+        let value = random_vec(&mut rng, seq * value_heads * value_dim);
         // Log-decays as produced by `-exp(A_log) * softplus(a + dt_bias)`: strictly negative.
-        let g = random_vec_range(&mut rng, seq * value_heads, -2.5, -0.01);
+        let log_decay = random_vec_range(&mut rng, seq * value_heads, -2.5, -0.01);
         let beta = random_vec_range(&mut rng, seq * value_heads, 0.05, 0.95);
         let state = if zero_state {
             vec![0.0; value_heads * key_dim * value_dim]
@@ -145,10 +148,10 @@ impl DeltaRuleInputs {
             value_heads,
             key_dim,
             value_dim,
-            q,
-            k,
-            v,
-            g,
+            query,
+            key,
+            value,
+            log_decay,
             beta,
             state,
         }
@@ -156,7 +159,7 @@ impl DeltaRuleInputs {
 
     /// Token-by-token recurrence, as in `torch_recurrent_gated_delta_rule`.
     fn reference(&self) -> (Vec<f32>, Vec<f32>) {
-        let (t, hk, hv, dk, dv) = (
+        let (seq_len, hk, hv, dk, dv) = (
             self.seq as i64,
             self.key_heads as i64,
             self.value_heads as i64,
@@ -168,44 +171,46 @@ impl DeltaRuleInputs {
             x * (sum_sq + 1e-6).rsqrt()
         };
         let group = hv / hk;
-        let q = l2(&tch_tensor_from_vec(
+        let query = l2(&tch_tensor_from_vec(
             &[self.seq, self.key_heads, self.key_dim],
-            &self.q,
+            &self.query,
         ))
         .repeat_interleave_self_int(group, 1, None::<i64>)
             * (1.0 / (dk as f64).sqrt());
-        let k = l2(&tch_tensor_from_vec(
+        let key = l2(&tch_tensor_from_vec(
             &[self.seq, self.key_heads, self.key_dim],
-            &self.k,
+            &self.key,
         ))
         .repeat_interleave_self_int(group, 1, None::<i64>);
-        let v = tch_tensor_from_vec(&[self.seq, self.value_heads, self.value_dim], &self.v);
-        let g = tch_tensor_from_vec(&[self.seq, self.value_heads], &self.g);
+        let value = tch_tensor_from_vec(&[self.seq, self.value_heads, self.value_dim], &self.value);
+        let log_decay = tch_tensor_from_vec(&[self.seq, self.value_heads], &self.log_decay);
         let beta = tch_tensor_from_vec(&[self.seq, self.value_heads], &self.beta);
-        let mut s = tch_tensor_from_vec(
+        let mut state = tch_tensor_from_vec(
             &[self.value_heads, self.key_dim, self.value_dim],
             &self.state,
         );
         let mut outs = Vec::with_capacity(self.seq);
-        for step in 0..t {
-            let q_t = q.get(step); // [Hv, Dk]
-            let k_t = k.get(step);
-            let v_t = v.get(step); // [Hv, Dv]
-            let decay = g.get(step).exp().view([hv, 1, 1]);
+        for step in 0..seq_len {
+            let q_t = query.get(step); // [Hv, Dk]
+            let k_t = key.get(step);
+            let v_t = value.get(step); // [Hv, Dv]
+            let decay = log_decay.get(step).exp().view([hv, 1, 1]);
             let b_t = beta.get(step).view([hv, 1]);
-            s *= decay;
+            state *= decay;
             let kv_mem =
-                (&s * k_t.unsqueeze(-1)).sum_dim_intlist([1i64].as_slice(), false, Kind::Float);
+                (&state * k_t.unsqueeze(-1)).sum_dim_intlist([1i64].as_slice(), false, Kind::Float);
             let delta = (v_t - kv_mem) * b_t;
-            s = &s + k_t.unsqueeze(-1) * delta.unsqueeze(1);
-            outs.push((&s * q_t.unsqueeze(-1)).sum_dim_intlist(
+            state = &state + k_t.unsqueeze(-1) * delta.unsqueeze(1);
+            outs.push((&state * q_t.unsqueeze(-1)).sum_dim_intlist(
                 [1i64].as_slice(),
                 false,
                 Kind::Float,
             ));
         }
-        let out = TchTensor::stack(&outs, 0).view([t, hv, dv]).contiguous();
-        (tensor_to_vec(&out), tensor_to_vec(&s.contiguous()))
+        let out = TchTensor::stack(&outs, 0)
+            .view([seq_len, hv, dv])
+            .contiguous();
+        (tensor_to_vec(&out), tensor_to_vec(&state.contiguous()))
     }
 }
 
@@ -221,10 +226,10 @@ fn run_delta_rule_case<B: PortableBackend + 'static>(backend: &Arc<B>, inputs: D
             ..
         } = inputs;
         let res = functional::gated_delta_rule(
-            &device_tensor_from_data(backend, &[seq, key_heads, key_dim], &inputs.q),
-            &device_tensor_from_data(backend, &[seq, key_heads, key_dim], &inputs.k),
-            &device_tensor_from_data(backend, &[seq, value_heads, value_dim], &inputs.v),
-            &device_tensor_from_data(backend, &[seq, value_heads], &inputs.g),
+            &device_tensor_from_data(backend, &[seq, key_heads, key_dim], &inputs.query),
+            &device_tensor_from_data(backend, &[seq, key_heads, key_dim], &inputs.key),
+            &device_tensor_from_data(backend, &[seq, value_heads, value_dim], &inputs.value),
+            &device_tensor_from_data(backend, &[seq, value_heads], &inputs.log_decay),
             &device_tensor_from_data(backend, &[seq, value_heads], &inputs.beta),
             &device_tensor_from_data(backend, &[value_heads, key_dim, value_dim], &inputs.state),
         );

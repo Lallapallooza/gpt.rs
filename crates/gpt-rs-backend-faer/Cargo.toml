@@ -21,3 +21,6 @@ half = "2.6"
 
 [dev-dependencies]
 gpt-rs-backend-tests = { path = "../gpt-rs-backend-tests", version = "0.1.0" }
+
+[lints]
+workspace = true

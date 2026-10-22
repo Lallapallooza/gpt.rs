@@ -102,13 +102,63 @@ extern "C" fn dump_table() {
     });
 }
 
-fn print_table(rows: &[TableRow]) {
-    struct PivotRow {
-        torch_ms: f64,
-        status: String,
-        cells: HashMap<String, (f64, String)>,
-    }
+/// The results of one test in the table: its Torch time, its status over every backend, and the
+/// gpt.rs time and status of each backend that ran it.
+struct PivotRow {
+    torch_ms: f64,
+    status: String,
+    cells: HashMap<String, (f64, String)>,
+}
 
+impl PivotRow {
+    /// The gpt.rs time of `backend`, NaN when it did not run the test.
+    fn gpt_ms(&self, backend: &str) -> f64 {
+        self.cells
+            .get(backend)
+            .map(|(gpt_ms, _)| *gpt_ms)
+            .unwrap_or(f64::NAN)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Align {
+    Left,
+    Right,
+    Center,
+}
+
+/// A column of the table: its header, the width of its cells and how they align.
+struct Column {
+    header: String,
+    width: usize,
+    align: Align,
+}
+
+fn format_cell(value: &str, width: usize, align: Align) -> String {
+    match align {
+        Align::Left => format!("{value:<width$}"),
+        Align::Right => format!("{value:>width$}"),
+        Align::Center => {
+            let pad = width.saturating_sub(value.len());
+            let left = pad / 2;
+            let right = pad - left;
+            format!("{}{}{}", " ".repeat(left), value, " ".repeat(right))
+        }
+    }
+}
+
+fn border(widths: &[usize]) -> String {
+    let mut line = String::new();
+    line.push('+');
+    for width in widths {
+        line.push_str(&"-".repeat(width + 2));
+        line.push('+');
+    }
+    line
+}
+
+/// The backends of `rows` and the backends the run expects, sorted.
+fn table_backends(rows: &[TableRow]) -> Vec<String> {
     let mut backends_set: HashSet<String> = HashSet::new();
     for row in rows {
         backends_set.insert(row.backend.clone());
@@ -118,7 +168,12 @@ fn print_table(rows: &[TableRow]) {
     }
     let mut backends: Vec<String> = backends_set.into_iter().collect();
     backends.sort();
+    backends
+}
 
+/// One row per test. A test fails unless each of `backends` ran it in a finite time with status
+/// `ok`.
+fn pivot_rows(rows: &[TableRow], backends: &[String]) -> BTreeMap<String, PivotRow> {
     let mut by_test: BTreeMap<String, PivotRow> = BTreeMap::new();
     for row in rows {
         let entry = by_test
@@ -138,7 +193,7 @@ fn print_table(rows: &[TableRow]) {
 
     for entry in by_test.values_mut() {
         let mut failed = false;
-        for backend in &backends {
+        for backend in backends {
             match entry.cells.get(backend) {
                 Some((gpt_ms, status)) => {
                     if !gpt_ms.is_finite() || status != "ok" {
@@ -156,43 +211,16 @@ fn print_table(rows: &[TableRow]) {
             "ok".to_string()
         };
     }
+    by_test
+}
 
-    #[derive(Clone, Copy)]
-    enum Align {
-        Left,
-        Right,
-        Center,
-    }
-
-    struct Col {
-        header: String,
-        width: usize,
-        align: Align,
-    }
-
-    fn format_cell(value: &str, width: usize, align: Align) -> String {
-        match align {
-            Align::Left => format!("{value:<width$}"),
-            Align::Right => format!("{value:>width$}"),
-            Align::Center => {
-                let pad = width.saturating_sub(value.len());
-                let left = pad / 2;
-                let right = pad - left;
-                format!("{}{}{}", " ".repeat(left), value, " ".repeat(right))
-            }
-        }
-    }
-
-    fn border(widths: &[usize]) -> String {
-        let mut line = String::new();
-        line.push('+');
-        for width in widths {
-            line.push_str(&"-".repeat(width + 2));
-            line.push('+');
-        }
-        line
-    }
-
+/// The columns of the table: the test, its Torch time, its status and the gpt.rs time of each of
+/// `backends`, each as wide as its widest cell.
+fn table_columns(
+    rows: &[TableRow],
+    by_test: &BTreeMap<String, PivotRow>,
+    backends: &[String],
+) -> Vec<Column> {
     let test_width = by_test
         .keys()
         .map(|name| name.len())
@@ -212,74 +240,68 @@ fn print_table(rows: &[TableRow]) {
         .unwrap_or(2)
         .max("status".len());
 
-    let mut cols = Vec::new();
-    cols.push(Col {
-        header: "test".to_string(),
-        width: test_width,
-        align: Align::Left,
-    });
-    cols.push(Col {
-        header: "torch".to_string(),
-        width: torch_width,
-        align: Align::Right,
-    });
-    cols.push(Col {
-        header: "status".to_string(),
-        width: status_width,
-        align: Align::Center,
-    });
-
-    let mut backend_cols: Vec<(String, usize)> = Vec::new();
-    for backend in &backends {
+    let mut columns = vec![
+        Column {
+            header: "test".to_string(),
+            width: test_width,
+            align: Align::Left,
+        },
+        Column {
+            header: "torch".to_string(),
+            width: torch_width,
+            align: Align::Right,
+        },
+        Column {
+            header: "status".to_string(),
+            width: status_width,
+            align: Align::Center,
+        },
+    ];
+    for backend in backends {
         let mut width = backend.len().max(3);
         for entry in by_test.values() {
-            let gpt_ms = entry
-                .cells
-                .get(backend)
-                .map(|(ms, _)| *ms)
-                .unwrap_or(f64::NAN);
-            width = width.max(format_ms(gpt_ms).len());
+            width = width.max(format_ms(entry.gpt_ms(backend)).len());
         }
-        backend_cols.push((backend.clone(), width));
-    }
-
-    for (backend, width) in &backend_cols {
-        cols.push(Col {
+        columns.push(Column {
             header: backend.clone(),
-            width: *width,
+            width,
             align: Align::Right,
         });
     }
+    columns
+}
 
-    let widths: Vec<usize> = cols.iter().map(|col| col.width).collect();
-    let header = cols
-        .iter()
-        .map(|col| format_cell(&col.header, col.width, col.align))
-        .collect::<Vec<_>>()
-        .join(" | ");
+/// A line of the table: `values`, one per column of `columns`, each in its column's cell.
+fn table_line(columns: &[Column], values: &[String]) -> String {
+    let mut cells = Vec::with_capacity(columns.len());
+    for (column, value) in columns.iter().zip(values) {
+        cells.push(format_cell(value, column.width, column.align));
+    }
+    format!("| {} |", cells.join(" | "))
+}
+
+fn print_table(rows: &[TableRow]) {
+    let backends = table_backends(rows);
+    let by_test = pivot_rows(rows, &backends);
+    let columns = table_columns(rows, &by_test, &backends);
+
+    let mut widths = Vec::with_capacity(columns.len());
+    let mut headers = Vec::with_capacity(columns.len());
+    for column in &columns {
+        widths.push(column.width);
+        headers.push(column.header.clone());
+    }
 
     println!("{}", border(&widths));
-    println!("| {} |", header);
+    println!("{}", table_line(&columns, &headers));
     println!("{}", border(&widths));
 
     for (test_name, entry) in by_test {
-        let mut cells = Vec::new();
-        cells.push(format_cell(&test_name, test_width, Align::Left));
-        cells.push(format_cell(
-            &format_ms(entry.torch_ms),
-            torch_width,
-            Align::Right,
-        ));
-        cells.push(format_cell(&entry.status, status_width, Align::Center));
-        for (backend, width) in &backend_cols {
-            let gpt_ms = entry
-                .cells
-                .get(backend)
-                .map(|(ms, _)| *ms)
-                .unwrap_or(f64::NAN);
-            cells.push(format_cell(&format_ms(gpt_ms), *width, Align::Right));
+        let mut values = vec![test_name, format_ms(entry.torch_ms), entry.status.clone()];
+        for backend in &backends {
+            values.push(format_ms(entry.gpt_ms(backend)));
         }
-        println!("| {} |", cells.join(" | "));
+        println!("{}", table_line(&columns, &values));
     }
     println!("{}", border(&widths));
 }
@@ -463,9 +485,9 @@ fn take_durations() -> RunDurations {
     RUN_CONTEXT.with(|ctx| *ctx.borrow())
 }
 
-pub fn timed_torch<T, F: FnOnce() -> T>(f: F) -> T {
+pub fn timed_torch<T, F: FnOnce() -> T>(compute: F) -> T {
     let start = Instant::now();
-    let output = f();
+    let output = compute();
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
     RUN_CONTEXT.with(|ctx| {
         ctx.borrow_mut().torch_ms += elapsed;
@@ -489,13 +511,13 @@ impl ExecutionTraceSink for ProgramTimer {
     }
 }
 
-/// Runs `f`, the gpt.rs side of a parity test, and adds the time its programs ran to the test's
-/// gpt.rs time. Recording and compiling are left out.
-pub fn timed_gpt<T, F: FnOnce() -> T>(f: F) -> T {
+/// Runs `compute`, the gpt.rs side of a parity test, and adds the time its programs ran to the
+/// test's gpt.rs time. Recording and compiling are left out.
+pub fn timed_gpt<T, F: FnOnce() -> T>(compute: F) -> T {
     static TIMER: OnceLock<TraceGuard> = OnceLock::new();
     TIMER.get_or_init(|| trace::install_global_sink(Arc::new(ProgramTimer)));
     let before = PROGRAM_TIME.with(Cell::get);
-    let output = f();
+    let output = compute();
     let ran = PROGRAM_TIME.with(Cell::get) - before;
     RUN_CONTEXT.with(|ctx| {
         ctx.borrow_mut().gpt_ms += ran.as_secs_f64() * 1000.0;
@@ -506,7 +528,7 @@ pub fn timed_gpt<T, F: FnOnce() -> T>(f: F) -> T {
 pub fn run_parity_test<B: PortableBackend + 'static, F: Fn(&Arc<B>)>(
     backend: Arc<B>,
     test_name: &str,
-    f: F,
+    body: F,
 ) {
     let backend_name = backend.backend_name().to_string();
     if let Some(reason) = xfail_reason(&backend_name, test_name) {
@@ -520,7 +542,7 @@ pub fn run_parity_test<B: PortableBackend + 'static, F: Fn(&Arc<B>)>(
     reset_durations();
     let start = Instant::now();
     let result = catch_unwind(AssertUnwindSafe(|| {
-        with_default_arena(arena, || f(&backend))
+        with_default_arena(arena, || body(&backend))
     }));
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     let durations = take_durations();

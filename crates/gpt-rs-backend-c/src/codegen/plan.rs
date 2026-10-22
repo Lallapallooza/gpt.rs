@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
-use gpt_rs_ir::dialects::tensor::TensorOp;
+use gpt_rs_ir::dialects::tensor::TensorOps;
 use gpt_rs_ir::ir::{DType, Value};
 
 use super::types::{Instruction, Kind};
@@ -26,7 +26,7 @@ pub(super) enum Planned {
 /// The storage of each value of `insts`, which compute `results` from the function's arguments.
 /// `size` gives the dtype and the byte length of a value.
 pub(super) fn plan(
-    insts: &[Instruction<'_>],
+    insts: &[Instruction],
     results: &[Value],
     size: impl Fn(Value) -> Result<(DType, usize)>,
 ) -> Result<HashMap<Value, Planned>> {
@@ -56,11 +56,11 @@ pub(super) fn plan(
         for &value in &inst.results {
             // A constant is a static array, which the function copies when it returns the
             // constant.
-            if matches!(inst.kind, Kind::Op(TensorOp::Constant(_))) {
+            if matches!(inst.kind, Kind::Op(TensorOps::Constant(_))) {
                 planned.insert(value, Planned::Const);
             } else if let Some(&index) = outputs.get(&value) {
                 planned.insert(value, Planned::Output { index });
-            } else if let (Kind::Op(TensorOp::Reshape(_)), [operand]) =
+            } else if let (Kind::Op(TensorOps::Reshape(_)), [operand]) =
                 (&inst.kind, inst.operands.as_slice())
             {
                 planned.insert(value, Planned::Alias { of: *operand });

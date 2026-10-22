@@ -1,7 +1,7 @@
 //! `argmax` and `top_k` of f32 tensors: a scan of each line along the axis.
 
 use anyhow::{ensure, Result};
-use gpt_rs_ir::dialects::tensor::TensorOp;
+use gpt_rs_ir::dialects::tensor::TensorOps;
 use gpt_rs_ir::ir::{DType, TensorType};
 
 use super::super::profile::register_op_profile_generic;
@@ -16,10 +16,7 @@ use crate::kernels::PARALLEL_MIN_WORK;
 /// The most shares that one long line splits into.
 const MAX_SHARES: usize = 64;
 
-pub(super) fn emit_instruction(
-    inst: &Instruction<'_>,
-    ctx: &mut EmitContext<'_>,
-) -> Result<Option<usize>> {
+pub(super) fn emit_instruction(inst: &Instruction, ctx: &mut EmitContext) -> Result<Option<usize>> {
     let EmitContext {
         module,
         value_infos,
@@ -30,9 +27,9 @@ pub(super) fn emit_instruction(
         return Ok(None);
     };
     let (axis, k, largest) = match op {
-        TensorOp::ArgMax(spec) => (spec.axis, None, true),
-        TensorOp::TopK(spec) => (spec.axis, Some(spec.k), true),
-        TensorOp::BottomK(spec) => (spec.axis, Some(spec.k), false),
+        TensorOps::ArgMax(spec) => (spec.axis, None, true),
+        TensorOps::TopK(spec) => (spec.axis, Some(spec.k), true),
+        TensorOps::BottomK(spec) => (spec.axis, Some(spec.k), false),
         _ => return Ok(None),
     };
     let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;

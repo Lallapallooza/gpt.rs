@@ -10,7 +10,7 @@ mod shape;
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
-use gpt_rs_ir::dialects::tensor::TensorOp;
+use gpt_rs_ir::dialects::tensor::TensorOps;
 use gpt_rs_ir::ir::Value;
 
 use super::outline::Outliner;
@@ -29,13 +29,13 @@ pub(super) struct EmitContext<'a> {
 /// renamed buffers.
 pub(super) fn emit_instructions(
     module: &mut String,
-    instructions: &[Instruction<'_>],
+    instructions: &[Instruction],
     value_infos: &HashMap<Value, ValueInfo>,
     matmul_profile: &mut OpProfile,
     outliner: &mut Outliner,
 ) -> Result<()> {
     for inst in instructions {
-        if matches!(inst.kind, Kind::Op(TensorOp::Constant(_))) {
+        if matches!(inst.kind, Kind::Op(TensorOps::Constant(_))) {
             continue;
         }
         let renamed = outliner.rename(inst, value_infos)?;
@@ -55,7 +55,7 @@ pub(super) fn emit_instructions(
 }
 
 /// Emits one instruction and returns the id of the profile op it registered.
-fn emit_instruction(inst: &Instruction<'_>, ctx: &mut EmitContext<'_>) -> Result<usize> {
+fn emit_instruction(inst: &Instruction, ctx: &mut EmitContext) -> Result<usize> {
     match &inst.kind {
         Kind::Op(_) => emit_op(inst, ctx),
         Kind::Linear => dot::emit_linear(inst, ctx),
@@ -99,7 +99,7 @@ fn emit_instruction(inst: &Instruction<'_>, ctx: &mut EmitContext<'_>) -> Result
     }
 }
 
-fn emit_op(inst: &Instruction<'_>, ctx: &mut EmitContext<'_>) -> Result<usize> {
+fn emit_op(inst: &Instruction, ctx: &mut EmitContext) -> Result<usize> {
     type Emit = fn(&Instruction<'_>, &mut EmitContext<'_>) -> Result<Option<usize>>;
     let emitters: [Emit; 8] = [
         elementwise::emit_instruction,
@@ -120,7 +120,7 @@ fn emit_op(inst: &Instruction<'_>, ctx: &mut EmitContext<'_>) -> Result<usize> {
 }
 
 /// Registers the profile op of a kernel that reads `inst.operands`.
-fn register_kernel(inst: &Instruction<'_>, ctx: &mut EmitContext<'_>) -> Result<usize> {
+fn register_kernel(inst: &Instruction, ctx: &mut EmitContext) -> Result<usize> {
     let out_info = output_info(ctx.value_infos, inst.result())?;
     let input_types = operand_types(&inst.operands, ctx.value_infos)?;
     register_op_profile_generic(ctx.matmul_profile, inst.label, &out_info.ty, &input_types)

@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use gpt_rs_ir::dialects::tensor::{ReduceAttrs, ReduceWindowAttrs, TensorOp};
+use gpt_rs_ir::dialects::tensor::{ReduceAttrs, ReduceWindowAttrs, TensorOps};
 use gpt_rs_ir::dialects::tile::CombineKind;
 use gpt_rs_ir::ir::{DType, TensorType};
 
@@ -14,10 +14,7 @@ use super::super::value_info::{
 };
 use super::EmitContext;
 
-pub(super) fn emit_instruction(
-    inst: &Instruction<'_>,
-    ctx: &mut EmitContext<'_>,
-) -> Result<Option<usize>> {
+pub(super) fn emit_instruction(inst: &Instruction, ctx: &mut EmitContext) -> Result<Option<usize>> {
     let EmitContext {
         module,
         value_infos,
@@ -86,21 +83,21 @@ pub(super) fn emit_instruction(
 
 /// The attributes and the fold of a reduction that the C backend emits: an f32 sum, maximum or
 /// minimum.
-fn reduction(op: &TensorOp) -> Option<(&ReduceAttrs, CombineKind)> {
+fn reduction(op: &TensorOps) -> Option<(&ReduceAttrs, CombineKind)> {
     Some(match op {
-        TensorOp::ReduceSum(spec) => (&spec.0, CombineKind::Sum),
-        TensorOp::ReduceMax(spec) => (&spec.0, CombineKind::Max),
-        TensorOp::ReduceMin(spec) => (&spec.0, CombineKind::Min),
+        TensorOps::ReduceSum(spec) => (&spec.0, CombineKind::Sum),
+        TensorOps::ReduceMax(spec) => (&spec.0, CombineKind::Max),
+        TensorOps::ReduceMin(spec) => (&spec.0, CombineKind::Min),
         _ => return None,
     })
 }
 
 /// As [`reduction`], for a reduction of windows.
-fn window_reduction(op: &TensorOp) -> Option<(&ReduceWindowAttrs, CombineKind)> {
+fn window_reduction(op: &TensorOps) -> Option<(&ReduceWindowAttrs, CombineKind)> {
     Some(match op {
-        TensorOp::ReduceWindowSum(spec) => (&spec.0, CombineKind::Sum),
-        TensorOp::ReduceWindowMax(spec) => (&spec.0, CombineKind::Max),
-        TensorOp::ReduceWindowMin(spec) => (&spec.0, CombineKind::Min),
+        TensorOps::ReduceWindowSum(spec) => (&spec.0, CombineKind::Sum),
+        TensorOps::ReduceWindowMax(spec) => (&spec.0, CombineKind::Max),
+        TensorOps::ReduceWindowMin(spec) => (&spec.0, CombineKind::Min),
         _ => return None,
     })
 }

@@ -21,7 +21,7 @@ fn rng_uniform_draws_the_philox_known_answer() -> Result<()> {
     let backend = CBackend::new();
     let exe = backend.compile(&Arc::new(module), "main")?;
     let state = HostTensor::new(vec![2], TensorData::Ui64(vec![0, 0].into()))?;
-    let out = backend.run(&exe, &[backend.upload(state)?])?;
+    let out = backend.run(&exe, vec![backend.upload(state)?])?;
     // Random123's known answer for Philox4x32-10 with counter and key 0.
     let words = [0x6627_e8d5u32, 0xe169_c58d, 0xbc57_ac4c, 0x9b00_dbd8];
     // A uniform f32 is the top 24 bits of its word over 2^24, and one block moves the counter on

@@ -142,17 +142,17 @@ fn run_batched_dot_case<B: PortableBackend + 'static>(
         // Move each contraction axis next to the other operand's free axis, then bmm.
         let lhs_t = tch_tensor_from_vec(lhs_shape, &lhs_data);
         let rhs_t = tch_tensor_from_vec(rhs_shape, &rhs_data);
-        let lhs_t = if contract.0 == 1 {
+        let lhs_for_bmm = if contract.0 == 1 {
             lhs_t.transpose(1, 2)
         } else {
             lhs_t
         };
-        let rhs_t = if contract.1 == 2 {
+        let rhs_for_bmm = if contract.1 == 2 {
             rhs_t.transpose(1, 2)
         } else {
             rhs_t
         };
-        tensor_to_vec(&lhs_t.bmm(&rhs_t).contiguous())
+        tensor_to_vec(&lhs_for_bmm.bmm(&rhs_for_bmm).contiguous())
     });
 
     let actual = timed_gpt(|| {

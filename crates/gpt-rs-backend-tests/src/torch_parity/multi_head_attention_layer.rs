@@ -16,20 +16,20 @@ const ROPE_THETA: f32 = 10_000.0;
 
 /// Host weights of a [`CausalSelfAttention`] layer.
 struct HostAttention {
-    q: HostLinear,
-    k: HostLinear,
-    v: HostLinear,
-    o: HostLinear,
+    q_proj: HostLinear,
+    k_proj: HostLinear,
+    v_proj: HostLinear,
+    o_proj: HostLinear,
     /// `(q_norm weight, k_norm weight)`, each `[head_dim]`.
     qk_norm: Option<(Vec<f32>, Vec<f32>)>,
 }
 
 fn rms_norm_reference(x: &TchTensor, weight: &[f32], norm: RmsNormConfig) -> TchTensor {
-    let weight = tch_tensor_from_vec(&[weight.len()], weight);
+    let weight_tensor = tch_tensor_from_vec(&[weight.len()], weight);
     let scale = if norm.unit_offset {
-        weight + 1.0
+        weight_tensor + 1.0
     } else {
-        weight
+        weight_tensor
     };
     let mean_square = (x * x).mean_dim(Some([-1i64].as_slice()), true, Kind::Float);
     x * (mean_square + norm.eps as f64).rsqrt() * scale
@@ -79,39 +79,43 @@ fn attention_reference(
         head_dim
     };
     let q_and_gate = weights
-        .q
+        .q_proj
         .torch(input)
         .reshape([seq_len, num_heads, q_width]);
-    let mut q = q_and_gate.narrow(2, 0, head_dim);
-    let mut k = weights
-        .k
+    let mut query = q_and_gate.narrow(2, 0, head_dim);
+    let mut key = weights
+        .k_proj
         .torch(input)
         .reshape([seq_len, kv_heads, head_dim]);
-    let v = weights
-        .v
+    let value = weights
+        .v_proj
         .torch(input)
         .reshape([seq_len, kv_heads, head_dim]);
     if let (Some(norm), Some((q_weight, k_weight))) = (config.qk_norm, &weights.qk_norm) {
-        q = rms_norm_reference(&q, q_weight, norm);
-        k = rms_norm_reference(&k, k_weight, norm);
+        query = rms_norm_reference(&query, q_weight, norm);
+        key = rms_norm_reference(&key, k_weight, norm);
     }
-    let (mut q, mut k, v) = (q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1));
-    if let Some(rope) = rope {
-        q = rope_reference(&q, rope.rotary_dim);
-        k = rope_reference(&k, rope.rotary_dim);
+    let (mut query_heads, mut key_heads, value_heads) = (
+        query.transpose(0, 1),
+        key.transpose(0, 1),
+        value.transpose(0, 1),
+    );
+    if let Some(rope_config) = rope {
+        query_heads = rope_reference(&query_heads, rope_config.rotary_dim);
+        key_heads = rope_reference(&key_heads, rope_config.rotary_dim);
     }
-    let k = k.repeat_interleave_self_int(group_size, 0, None::<i64>);
-    let v = v.repeat_interleave_self_int(group_size, 0, None::<i64>);
+    let grouped_keys = key_heads.repeat_interleave_self_int(group_size, 0, None::<i64>);
+    let grouped_values = value_heads.repeat_interleave_self_int(group_size, 0, None::<i64>);
 
     let scale = (head_dim as f64).sqrt();
-    let scores = q.matmul(&k.transpose(-2, -1)) / scale;
+    let scores = query_heads.matmul(&grouped_keys.transpose(-2, -1)) / scale;
     let causal_mask = TchTensor::ones(scores.size().as_slice(), (Kind::Bool, scores.device()))
         .tril(0)
         .logical_not();
     let masked = scores.masked_fill(&causal_mask, f64::NEG_INFINITY);
     let attn = masked.softmax(-1, Kind::Float);
     let mut context = attn
-        .matmul(&v)
+        .matmul(&grouped_values)
         .transpose(0, 1)
         .reshape([seq_len, num_heads * head_dim]);
     if config.output_gate {
@@ -120,7 +124,7 @@ fn attention_reference(
             .reshape([seq_len, num_heads * head_dim]);
         context *= gate.sigmoid();
     }
-    weights.o.torch(&context)
+    weights.o_proj.torch(&context)
 }
 
 /// The `[in_features, out_features]` weight and the bias of `linears` fused along their outputs,
@@ -174,13 +178,13 @@ fn run_attention_case<B: PortableBackend + 'static>(
 
     let input = random_vec(&mut rng, total_seq * embed_dim);
     let weights = HostAttention {
-        q: HostLinear::random(&mut rng, embed_dim, config.query_projection_dim(), bias),
-        k: HostLinear::random(&mut rng, embed_dim, kv_dim, bias),
-        v: HostLinear::random(&mut rng, embed_dim, kv_dim, bias),
-        o: HostLinear::random(&mut rng, config.query_dim(), embed_dim, bias),
+        q_proj: HostLinear::random(&mut rng, embed_dim, config.query_projection_dim(), bias),
+        k_proj: HostLinear::random(&mut rng, embed_dim, kv_dim, bias),
+        v_proj: HostLinear::random(&mut rng, embed_dim, kv_dim, bias),
+        o_proj: HostLinear::random(&mut rng, config.query_dim(), embed_dim, bias),
         qk_norm: config.qk_norm.map(|_| {
-            let d = config.head_dim;
-            let mut weight = || random_vec_range(&mut rng, d, 0.5, 1.5);
+            let head_dim = config.head_dim;
+            let mut weight = || random_vec_range(&mut rng, head_dim, 0.5, 1.5);
             (weight(), weight())
         }),
     };
@@ -196,18 +200,18 @@ fn run_attention_case<B: PortableBackend + 'static>(
 
     timed_gpt(|| {
         let mut tensors = if config.fused_qkv {
-            let qkv = [&weights.q, &weights.k, &weights.v];
+            let qkv = [&weights.q_proj, &weights.k_proj, &weights.v_proj];
             [
                 fused_in_out("attn.qkv_proj", &qkv),
-                fused_in_out("attn.o_proj", &[&weights.o]),
+                fused_in_out("attn.o_proj", &[&weights.o_proj]),
             ]
             .concat()
         } else {
             [
-                weights.q.tensors("attn.q_proj"),
-                weights.k.tensors("attn.k_proj"),
-                weights.v.tensors("attn.v_proj"),
-                weights.o.tensors("attn.o_proj"),
+                weights.q_proj.tensors("attn.q_proj"),
+                weights.k_proj.tensors("attn.k_proj"),
+                weights.v_proj.tensors("attn.v_proj"),
+                weights.o_proj.tensors("attn.o_proj"),
             ]
             .concat()
         };
@@ -222,20 +226,20 @@ fn run_attention_case<B: PortableBackend + 'static>(
                 ));
             }
         }
-        let layer = load_layer(backend, tensors, |p| {
-            p.scoped("attn", |p| {
+        let layer = load_layer(backend, tensors, |params| {
+            params.scoped("attn", |p| {
                 CausalSelfAttention::<_, LlamaNames>::new(p, config.clone())
             })
         })
         .unwrap();
-        let rotary = rope.map(|rope| RotaryEmbedding::new(rope).unwrap());
+        let rotary = rope.map(|rope_config| RotaryEmbedding::new(rope_config).unwrap());
         let mut cache = layer.config.empty_cache(backend, total_seq).unwrap();
         let mut position = 0;
         for len in std::iter::once(prefill_len).chain(std::iter::repeat_n(1, decode_steps)) {
             let rows = position * embed_dim..(position + len) * embed_dim;
             let x = device_tensor_from_data(backend, &[len, embed_dim], &input[rows.clone()]);
             let ids = positions_tensor(backend, position..position + len);
-            let tables = rotary.as_ref().map(|rope| rope.tables(&ids));
+            let tables = rotary.as_ref().map(|embedding| embedding.tables(&ids));
             let positions = AttentionPositions::new(ids, tables);
             let (output, next_cache) = layer.call((&x, &cache, &positions));
             assert_close(&expected[rows], &to_host_vec(&output));

@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{anyhow, Result};
 use gpt_rs::ops::functional::{linear_weight, WeightLayout};
 use gpt_rs_ir::dialects::tensor::{
-    Add, BroadcastTo, Cast, DotGeneral, ExtractPatches, Reshape, Slice, TensorOp, Transpose,
+    Add, BroadcastTo, Cast, DotGeneral, ExtractPatches, Reshape, Slice, TensorOps, Transpose,
 };
 use gpt_rs_ir::ir::{DType, Inst, Module, Value};
 use gpt_rs_ir::rewrite::matched;
@@ -230,7 +230,7 @@ fn linear(module: &Module, inst: Inst) -> Option<Fused<'_>> {
 fn bias_add(
     module: &Module,
     add: Inst,
-    fused: &HashMap<Inst, Fused<'_>>,
+    fused: &HashMap<Inst, Fused>,
 ) -> Option<(Inst, Value, Vec<Inst>)> {
     let add = module.op_as::<Add>(add)?;
     let is_conv = |inst: Inst| {
@@ -319,7 +319,7 @@ fn elementwise<'m>(module: &'m Module, inst: Inst, claimed: &HashSet<Inst>) -> O
 
 /// The op of an elementwise node and its operands, when `inst` is an elementwise op of one or
 /// two operands that has a C expression.
-fn node_op(module: &Module, inst: Inst) -> Option<(TensorOp, Value, Option<Value>)> {
+fn node_op(module: &Module, inst: Inst) -> Option<(TensorOps, Value, Option<Value>)> {
     let Op::Tensor(op) = module.op(inst) else {
         return None;
     };

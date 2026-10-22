@@ -66,7 +66,7 @@ fn each_run_reads_the_values_its_inputs_hold() {
             buffers[0].write(&a);
             buffers[1].write(&b);
         }
-        let out = backend.run(&main, &inputs).expect("the run");
+        let out = backend.run(&main, inputs.to_vec()).expect("the run");
         let out = backend.download(&out[0]).expect("the result");
         let got = out.as_f32().expect("f32 results");
         let want: Vec<f32> = (0..N * N)

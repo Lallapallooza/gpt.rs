@@ -21,8 +21,8 @@ fn run_gated_feed_forward_case<B: PortableBackend + 'static>(
     let down = HostLinear::random(&mut rng, hidden_dim, embed_dim, bias);
 
     let expected = timed_torch(|| {
-        let input = tch_tensor_from_vec(&[batch, embed_dim], &input);
-        let hidden = gate.torch(&input).silu() * up.torch(&input);
+        let input_tch = tch_tensor_from_vec(&[batch, embed_dim], &input);
+        let hidden = gate.torch(&input_tch).silu() * up.torch(&input_tch);
         tensor_to_vec(&down.torch(&hidden))
     });
 
@@ -37,12 +37,12 @@ fn run_gated_feed_forward_case<B: PortableBackend + 'static>(
             act: ActivationFunction::Silu,
             weight_layout: WeightLayout::OutIn,
         };
-        let layer = load_layer(backend, tensors.concat(), |p| {
-            p.scoped("mlp", |p| FeedForward::<_, LlamaNames>::new(p, config))
+        let layer = load_layer(backend, tensors.concat(), |params| {
+            params.scoped("mlp", |p| FeedForward::<_, LlamaNames>::new(p, config))
         })
         .unwrap();
-        let input = device_tensor_from_data(backend, &[batch, embed_dim], &input);
-        to_host_vec(&layer.call(&input))
+        let input_device = device_tensor_from_data(backend, &[batch, embed_dim], &input);
+        to_host_vec(&layer.call(&input_device))
     });
 
     assert_close(&expected, &actual);

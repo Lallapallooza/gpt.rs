@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use gpt_rs::backend::PortableBackend;
-use gpt_rs::nn::layers::{Embedding, LayerNorm, Linear, RmsNorm, RmsNormConfig};
+use gpt_rs::nn::layers::{Embedding, LayerNorm, RmsNorm, RmsNormConfig};
 use gpt_rs::tensor::{DeviceTensor, HostTensor};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -12,7 +12,11 @@ use serde::Deserialize;
 use tch::Tensor as TchTensor;
 
 use super::harness;
-pub use crate::{load_layer, panic_message};
+pub use crate::layers::{
+    load_layer, random_vec, random_vec_range, tensor_from_vec, HostBatchNorm, HostConv1D,
+    HostLinear,
+};
+pub use crate::panic_message;
 
 pub const ATOL: f64 = 5e-4;
 pub const RTOL: f64 = 1e-4;
@@ -67,8 +71,8 @@ pub struct ParityContextGuard {
 }
 
 pub fn set_parity_context(backend: &str, test_name: &str) -> ParityContextGuard {
-    PARITY_CONTEXT.with(|slot| {
-        let mut slot = slot.borrow_mut();
+    PARITY_CONTEXT.with(|cell| {
+        let mut slot = cell.borrow_mut();
         let prev = slot.take();
         *slot = Some(ParityContext {
             backend: backend.to_string(),
@@ -229,27 +233,18 @@ pub fn seeded_rng(seed: u64) -> StdRng {
     StdRng::seed_from_u64(seed)
 }
 
-pub fn random_vec(rng: &mut StdRng, len: usize) -> Vec<f32> {
-    (0..len).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect()
-}
-
-pub fn random_vec_range(rng: &mut StdRng, len: usize, lo: f32, hi: f32) -> Vec<f32> {
-    let span = hi - lo;
-    (0..len).map(|_| lo + rng.gen::<f32>() * span).collect()
-}
-
 pub fn random_vec_nonzero(rng: &mut StdRng, len: usize, min_abs: f32) -> Vec<f32> {
     (0..len)
         .map(|_| {
-            let mut v = rng.gen::<f32>() * 2.0 - 1.0;
-            if v.abs() < min_abs {
-                v = if v.is_sign_negative() {
+            let mut value = rng.gen::<f32>() * 2.0 - 1.0;
+            if value.abs() < min_abs {
+                value = if value.is_sign_negative() {
                     -min_abs
                 } else {
                     min_abs
                 };
             }
-            v
+            value
         })
         .collect()
 }
@@ -279,10 +274,6 @@ pub fn const_vec(len: usize, value: f32) -> Vec<f32> {
     vec![value; len]
 }
 
-pub fn tensor_from_vec(shape: &[usize], data: Vec<f32>) -> HostTensor {
-    HostTensor::f32(shape, data).unwrap()
-}
-
 pub fn device_tensor_from_data<B: PortableBackend + 'static>(
     backend: &Arc<B>,
     shape: &[usize],
@@ -296,13 +287,13 @@ pub fn positions_tensor<B: PortableBackend + 'static>(
     backend: &Arc<B>,
     positions: std::ops::Range<usize>,
 ) -> DeviceTensor<B> {
-    let positions: Vec<i32> = positions.map(|p| p as i32).collect();
-    let host = HostTensor::si32([positions.len()], positions).unwrap();
+    let position_ids: Vec<i32> = positions.map(|position| position as i32).collect();
+    let host = HostTensor::si32([position_ids.len()], position_ids).unwrap();
     DeviceTensor::from_host(Arc::clone(backend), host).unwrap()
 }
 
 pub fn tch_tensor_from_vec(shape: &[usize], data: &[f32]) -> TchTensor {
-    let dims: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
+    let dims: Vec<i64> = shape.iter().map(|&extent| extent as i64).collect();
     TchTensor::from_slice(data).reshape(dims.as_slice())
 }
 
@@ -326,119 +317,47 @@ pub fn assert_close(expected: &[f32], actual: &[f32]) {
 /// exactly where `expected` has one.
 pub fn assert_close_tol(expected: &[f32], actual: &[f32], atol: f64, rtol: f64) {
     assert_eq!(expected.len(), actual.len());
-    for (idx, (&e, &a)) in expected.iter().zip(actual.iter()).enumerate() {
-        if !e.is_finite() || !a.is_finite() {
+    for (idx, (&want, &got)) in expected.iter().zip(actual.iter()).enumerate() {
+        if !want.is_finite() || !got.is_finite() {
             assert!(
-                e == a || (e.is_nan() && a.is_nan()),
-                "value mismatch at index {idx}: expected {e}, actual {a}"
+                want == got || (want.is_nan() && got.is_nan()),
+                "value mismatch at index {idx}: expected {want}, actual {got}"
             );
             continue;
         }
-        let diff = (e as f64 - a as f64).abs();
-        let thresh = atol + rtol * e.abs().max(a.abs()) as f64;
+        let diff = (want as f64 - got as f64).abs();
+        let thresh = atol + rtol * want.abs().max(got.abs()) as f64;
         assert!(
             diff <= thresh,
-            "value mismatch at index {idx}: expected {e}, actual {a}, diff {diff}, thresh {thresh}"
+            "value mismatch at index {idx}: expected {want}, actual {got}, diff {diff}, thresh \
+             {thresh}"
         );
     }
 }
 
-pub fn timed_torch<T, F: FnOnce() -> T>(f: F) -> T {
-    harness::timed_torch(f)
+pub fn timed_torch<T, F: FnOnce() -> T>(compute: F) -> T {
+    harness::timed_torch(compute)
 }
 
-pub fn timed_gpt<T, F: FnOnce() -> T>(f: F) -> T {
-    harness::timed_gpt(f)
-}
-
-/// Host weights of a `Linear`: an `[out, in]` weight and an optional bias.
-pub struct HostLinear {
-    in_features: usize,
-    out_features: usize,
-    weight: HostTensor,
-    bias: Option<HostTensor>,
+pub fn timed_gpt<T, F: FnOnce() -> T>(compute: F) -> T {
+    harness::timed_gpt(compute)
 }
 
 impl HostLinear {
-    pub fn random(rng: &mut StdRng, in_features: usize, out_features: usize, bias: bool) -> Self {
-        let weight = tensor_from_vec(
-            &[out_features, in_features],
-            random_vec(rng, out_features * in_features),
-        );
-        let bias = bias.then(|| tensor_from_vec(&[out_features], random_vec(rng, out_features)));
-        Self {
-            in_features,
-            out_features,
-            weight,
-            bias,
-        }
-    }
-
-    pub fn tensors(&self, prefix: &str) -> Vec<(String, HostTensor)> {
-        let weight = (format!("{prefix}.weight"), self.weight.clone());
-        let bias = self
-            .bias
-            .as_ref()
-            .map(|bias| (format!("{prefix}.bias"), bias.clone()));
-        std::iter::once(weight).chain(bias).collect()
-    }
-
-    pub fn layer<B: PortableBackend + 'static>(&self, backend: &Arc<B>) -> Linear<B> {
-        load_layer(backend, self.tensors("proj"), |p| {
-            p.scoped("proj", Linear::new)
-        })
-        .unwrap()
-    }
-
     pub fn torch(&self, input: &TchTensor) -> TchTensor {
-        let weight = tch_tensor_from_vec(
-            &[self.out_features, self.in_features],
-            self.weight.as_f32().unwrap(),
-        );
+        let weight = tch_tensor_from_vec(&self.weight.dims, self.weight.as_f32().unwrap());
         let bias = self
             .bias
             .as_ref()
-            .map(|b| tch_tensor_from_vec(&[self.out_features], b.as_f32().unwrap()));
+            .map(|bias| tch_tensor_from_vec(&bias.dims, bias.as_f32().unwrap()));
         input.linear(&weight, bias.as_ref())
     }
 }
 
-/// Host weights of a `Conv1D`: an `[in, out]` weight and a bias.
-pub struct HostConv1D {
-    in_features: usize,
-    out_features: usize,
-    weight: HostTensor,
-    bias: HostTensor,
-}
-
 impl HostConv1D {
-    pub fn random(rng: &mut StdRng, in_features: usize, out_features: usize) -> Self {
-        let weight = tensor_from_vec(
-            &[in_features, out_features],
-            random_vec(rng, in_features * out_features),
-        );
-        let bias = tensor_from_vec(&[out_features], random_vec(rng, out_features));
-        Self {
-            in_features,
-            out_features,
-            weight,
-            bias,
-        }
-    }
-
-    pub fn tensors(&self, prefix: &str) -> Vec<(String, HostTensor)> {
-        vec![
-            (format!("{prefix}.weight"), self.weight.clone()),
-            (format!("{prefix}.bias"), self.bias.clone()),
-        ]
-    }
-
     pub fn torch(&self, input: &TchTensor) -> TchTensor {
-        let weight = tch_tensor_from_vec(
-            &[self.in_features, self.out_features],
-            self.weight.as_f32().unwrap(),
-        );
-        let bias = tch_tensor_from_vec(&[self.out_features], self.bias.as_f32().unwrap());
+        let weight = tch_tensor_from_vec(&self.weight.dims, self.weight.as_f32().unwrap());
+        let bias = tch_tensor_from_vec(&self.bias.dims, self.bias.as_f32().unwrap());
         bias.addmm(input, &weight)
     }
 }
@@ -463,8 +382,8 @@ pub fn layer_norm_layer<B: PortableBackend + 'static>(
         ("norm.weight".to_string(), weight),
         ("norm.bias".to_string(), bias),
     ];
-    load_layer(backend, tensors, |p| {
-        p.scoped("norm", |p| LayerNorm::new(p, eps))
+    load_layer(backend, tensors, |params| {
+        params.scoped("norm", |p| LayerNorm::new(p, eps))
     })
     .unwrap()
 }
@@ -474,8 +393,8 @@ pub fn rms_norm_layer<B: PortableBackend + 'static>(
     weight: HostTensor,
     config: RmsNormConfig,
 ) -> RmsNorm<B> {
-    load_layer(backend, [("norm.weight".to_string(), weight)], |p| {
-        p.scoped("norm", |p| RmsNorm::new(p, config))
+    load_layer(backend, [("norm.weight".to_string(), weight)], |params| {
+        params.scoped("norm", |p| RmsNorm::new(p, config))
     })
     .unwrap()
 }

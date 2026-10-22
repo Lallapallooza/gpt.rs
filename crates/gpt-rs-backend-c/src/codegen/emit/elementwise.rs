@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, ensure, Result};
-use gpt_rs_ir::dialects::tensor::TensorOp;
+use gpt_rs_ir::dialects::tensor::TensorOps;
 use gpt_rs_ir::ir::{DType, Value};
 
 use super::super::profile::{
@@ -18,10 +18,7 @@ use super::super::value_info::{
 use super::EmitContext;
 use crate::targets::{binary_expr, fused_input_fits, unary_expr};
 
-pub(super) fn emit_instruction(
-    inst: &Instruction<'_>,
-    ctx: &mut EmitContext<'_>,
-) -> Result<Option<usize>> {
+pub(super) fn emit_instruction(inst: &Instruction, ctx: &mut EmitContext) -> Result<Option<usize>> {
     let EmitContext {
         module,
         value_infos,
@@ -85,7 +82,7 @@ pub(super) fn emit_instruction(
             )?;
             op_id
         }
-        TensorOp::Cast(cast) => {
+        TensorOps::Cast(cast) => {
             let out_info = output_info(value_infos, inst.result())?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             let label = inst.label;
@@ -106,12 +103,12 @@ pub(super) fn emit_instruction(
             )?;
             op_id
         }
-        TensorOp::Less(_)
-        | TensorOp::LessEqual(_)
-        | TensorOp::Equal(_)
-        | TensorOp::GreaterEqual(_)
-        | TensorOp::Greater(_)
-        | TensorOp::NotEqual(_) => {
+        TensorOps::Less(_)
+        | TensorOps::LessEqual(_)
+        | TensorOps::Equal(_)
+        | TensorOps::GreaterEqual(_)
+        | TensorOps::Greater(_)
+        | TensorOps::NotEqual(_) => {
             let out_info = output_info(value_infos, inst.result())?;
             let lhs_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             let rhs_dtype = operand_dtype(&inst.operands[1], value_infos)?;
@@ -146,7 +143,7 @@ pub(super) fn emit_instruction(
             )?;
             op_id
         }
-        TensorOp::Select(_) => {
+        TensorOps::Select(_) => {
             let out_info = output_info(value_infos, inst.result())?;
             let pred_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             let t_dtype = operand_dtype(&inst.operands[1], value_infos)?;
@@ -179,7 +176,7 @@ pub(super) fn emit_instruction(
 
 fn emit_unary(
     module: &mut String,
-    op: &TensorOp,
+    op: &TensorOps,
     out: &str,
     input: &str,
     elem_count: usize,
@@ -196,7 +193,7 @@ fn emit_unary(
 }
 fn emit_binary(
     module: &mut String,
-    op: &TensorOp,
+    op: &TensorOps,
     dtype: DType,
     out: &str,
     (lhs, rhs): (&str, &str),
@@ -221,14 +218,14 @@ fn emit_binary(
 
 /// `lhs op rhs` of `int32_t` operands. Sums, differences and products wrap, as the spec says, so
 /// they compute on `uint32_t`.
-fn int_binary_expr(op: &TensorOp, lhs: &str, rhs: &str) -> Result<String> {
+fn int_binary_expr(op: &TensorOps, lhs: &str, rhs: &str) -> Result<String> {
     let wrapping = |symbol: &str| format!("(int32_t)((uint32_t){lhs} {symbol} (uint32_t){rhs})");
     Ok(match op {
-        TensorOp::Add(_) => wrapping("+"),
-        TensorOp::Sub(_) => wrapping("-"),
-        TensorOp::Mul(_) => wrapping("*"),
-        TensorOp::Maximum(_) => format!("({lhs} > {rhs} ? {lhs} : {rhs})"),
-        TensorOp::Minimum(_) => format!("({lhs} < {rhs} ? {lhs} : {rhs})"),
+        TensorOps::Add(_) => wrapping("+"),
+        TensorOps::Sub(_) => wrapping("-"),
+        TensorOps::Mul(_) => wrapping("*"),
+        TensorOps::Maximum(_) => format!("({lhs} > {rhs} ? {lhs} : {rhs})"),
+        TensorOps::Minimum(_) => format!("({lhs} < {rhs} ? {lhs} : {rhs})"),
         other => bail!("the C backend has no si32 {}", other.name()),
     })
 }
@@ -316,7 +313,7 @@ fn emit_cast(
 }
 fn emit_compare(
     module: &mut String,
-    op: &TensorOp,
+    op: &TensorOps,
     out: &str,
     lhs: &str,
     rhs: &str,
@@ -324,12 +321,12 @@ fn emit_compare(
     dtype: DType,
 ) -> Result<()> {
     let expr = match op {
-        TensorOp::Less(_) => "lhs[i] < rhs[i]",
-        TensorOp::LessEqual(_) => "lhs[i] <= rhs[i]",
-        TensorOp::Equal(_) => "lhs[i] == rhs[i]",
-        TensorOp::GreaterEqual(_) => "lhs[i] >= rhs[i]",
-        TensorOp::Greater(_) => "lhs[i] > rhs[i]",
-        TensorOp::NotEqual(_) => "lhs[i] != rhs[i]",
+        TensorOps::Less(_) => "lhs[i] < rhs[i]",
+        TensorOps::LessEqual(_) => "lhs[i] <= rhs[i]",
+        TensorOps::Equal(_) => "lhs[i] == rhs[i]",
+        TensorOps::GreaterEqual(_) => "lhs[i] >= rhs[i]",
+        TensorOps::Greater(_) => "lhs[i] > rhs[i]",
+        TensorOps::NotEqual(_) => "lhs[i] != rhs[i]",
         other => bail!("{} is not a comparison", other.name()),
     };
     let ctype = match dtype {

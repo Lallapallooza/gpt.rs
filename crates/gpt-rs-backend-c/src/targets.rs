@@ -1,7 +1,7 @@
 //! The C backend's kernel tables: which kernel reads which dtypes, and the C expressions of the
 //! elementwise ops.
 
-use gpt_rs_ir::dialects::tensor::TensorOp;
+use gpt_rs_ir::dialects::tensor::TensorOps;
 use gpt_rs_ir::ir::DType;
 
 /// The C function that computes `x [.., M, K] . w [.., N, K]` with f32 sums, for an `x` of dtype
@@ -47,32 +47,32 @@ pub fn fused_input_fits(out: &[usize], input: &[usize], starts: Option<&[usize]>
 }
 
 /// The C expression of the elementwise `op` on the f32 expression `arg`, when `op` has one.
-pub fn unary_expr(op: &TensorOp, arg: &str) -> Option<String> {
+pub fn unary_expr(op: &TensorOps, arg: &str) -> Option<String> {
     Some(match op {
-        TensorOp::Neg(_) => format!("-({arg})"),
-        TensorOp::Abs(_) => format!("fabsf({arg})"),
-        TensorOp::Exp(_) => format!("expf({arg})"),
-        TensorOp::Log(_) => format!("logf({arg})"),
-        TensorOp::Tanh(_) => format!("tanhf({arg})"),
-        TensorOp::Erf(_) => format!("erff({arg})"),
-        TensorOp::Rsqrt(_) => format!("1.0f / sqrtf({arg})"),
-        TensorOp::Reciprocal(_) => format!("1.0f / ({arg})"),
-        TensorOp::Sin(_) => format!("sinf({arg})"),
-        TensorOp::Cos(_) => format!("cosf({arg})"),
+        TensorOps::Neg(_) => format!("-({arg})"),
+        TensorOps::Abs(_) => format!("fabsf({arg})"),
+        TensorOps::Exp(_) => format!("expf({arg})"),
+        TensorOps::Log(_) => format!("logf({arg})"),
+        TensorOps::Tanh(_) => format!("tanhf({arg})"),
+        TensorOps::Erf(_) => format!("erff({arg})"),
+        TensorOps::Rsqrt(_) => format!("1.0f / sqrtf({arg})"),
+        TensorOps::Reciprocal(_) => format!("1.0f / ({arg})"),
+        TensorOps::Sin(_) => format!("sinf({arg})"),
+        TensorOps::Cos(_) => format!("cosf({arg})"),
         _ => return None,
     })
 }
 
 /// The C expression of the elementwise `op` on the f32 expressions `lhs` and `rhs`, when `op`
 /// has one.
-pub fn binary_expr(op: &TensorOp, lhs: &str, rhs: &str) -> Option<String> {
+pub fn binary_expr(op: &TensorOps, lhs: &str, rhs: &str) -> Option<String> {
     Some(match op {
-        TensorOp::Add(_) => format!("({lhs}) + ({rhs})"),
-        TensorOp::Sub(_) => format!("({lhs}) - ({rhs})"),
-        TensorOp::Mul(_) => format!("({lhs}) * ({rhs})"),
-        TensorOp::Div(_) => format!("({lhs}) / ({rhs})"),
-        TensorOp::Maximum(_) => format!("gpt_rs_maximum_f32({lhs}, {rhs})"),
-        TensorOp::Minimum(_) => format!("gpt_rs_minimum_f32({lhs}, {rhs})"),
+        TensorOps::Add(_) => format!("({lhs}) + ({rhs})"),
+        TensorOps::Sub(_) => format!("({lhs}) - ({rhs})"),
+        TensorOps::Mul(_) => format!("({lhs}) * ({rhs})"),
+        TensorOps::Div(_) => format!("({lhs}) / ({rhs})"),
+        TensorOps::Maximum(_) => format!("gpt_rs_maximum_f32({lhs}, {rhs})"),
+        TensorOps::Minimum(_) => format!("gpt_rs_minimum_f32({lhs}, {rhs})"),
         _ => return None,
     })
 }

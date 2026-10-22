@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use gpt_rs::backend::PortableBackend;
-use gpt_rs::s;
 use gpt_rs::tensor::DType;
 use tch::Kind;
 
@@ -23,8 +22,8 @@ pub fn two_offset_slices_feed_one_chain_matches_torch<B: PortableBackend + 'stat
     });
     let actual = timed_gpt(|| {
         let x_d = device_tensor_from_data(backend, &[6, 20], &values);
-        let gate = x_d.slice(s![1..5, 2..10]);
-        let up = x_d.slice(s![2..6, 11..19]);
+        let gate = x_d.slice(gpt_rs::s![1..5, 2..10]);
+        let up = x_d.slice(gpt_rs::s![2..6, 11..19]);
         to_host_vec(&(&gate * gate.exp() * up))
     });
     assert_close(&expected, &actual);
@@ -68,23 +67,24 @@ pub fn chain_with_bf16_store_matches_torch<B: PortableBackend + 'static>(backend
         384.0 + 1.0,
         384.0 + 3.0,
     ];
-    let n = 64;
-    let mut x = random_vec_range(&mut rng, n, -8.0, 8.0);
-    let mut y = random_vec_range(&mut rng, n, -8.0, 8.0);
-    let mut z = random_vec_range(&mut rng, n, -8.0, 8.0);
+    let len = 64;
+    let mut lhs = random_vec_range(&mut rng, len, -8.0, 8.0);
+    let mut rhs = random_vec_range(&mut rng, len, -8.0, 8.0);
+    let mut addend = random_vec_range(&mut rng, len, -8.0, 8.0);
     for (index, tie) in ties.iter().enumerate() {
-        (x[index], y[index], z[index]) = (*tie, 1.0, 0.0);
+        (lhs[index], rhs[index], addend[index]) = (*tie, 1.0, 0.0);
     }
     let expected = timed_torch(|| {
-        let t = |v: &[f32]| tch_tensor_from_vec(&[4, n / 4], v);
-        let result = (t(&x) * t(&y) + t(&z))
+        let torch_tensor = |data: &[f32]| tch_tensor_from_vec(&[4, len / 4], data);
+        let result = (torch_tensor(&lhs) * torch_tensor(&rhs) + torch_tensor(&addend))
             .to_kind(Kind::BFloat16)
             .to_kind(Kind::Float);
         tensor_to_vec(&result)
     });
     let actual = timed_gpt(|| {
-        let d = |v: &[f32]| device_tensor_from_data(backend, &[4, n / 4], v);
-        let narrowed = (d(&x) * d(&y) + d(&z)).cast(DType::Bf16);
+        let device_tensor = |data: &[f32]| device_tensor_from_data(backend, &[4, len / 4], data);
+        let narrowed =
+            (device_tensor(&lhs) * device_tensor(&rhs) + device_tensor(&addend)).cast(DType::Bf16);
         assert_eq!(narrowed.dtype(), DType::Bf16);
         to_host_vec(&narrowed.cast(DType::F32))
     });

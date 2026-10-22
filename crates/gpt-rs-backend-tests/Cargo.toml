@@ -20,3 +20,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tch = { version = "0.13", optional = true, features = ["download-libtorch"] }
 libc = "0.2"
+
+[lints]
+workspace = true

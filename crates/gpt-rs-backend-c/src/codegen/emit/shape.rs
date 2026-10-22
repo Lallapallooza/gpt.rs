@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
-use gpt_rs_ir::dialects::tensor::{axis_index, Concat, Iota, Slice, TensorOp, Transpose};
+use gpt_rs_ir::dialects::tensor::{axis_index, Concat, Iota, Slice, TensorOps, Transpose};
 use gpt_rs_ir::ir::{DType, TensorType, Value};
 
 use super::super::profile::{register_op_profile_generic, register_op_profile_unary};
@@ -16,10 +16,7 @@ use super::super::value_info::{
 };
 use super::EmitContext;
 
-pub(super) fn emit_instruction(
-    inst: &Instruction<'_>,
-    ctx: &mut EmitContext<'_>,
-) -> Result<Option<usize>> {
+pub(super) fn emit_instruction(inst: &Instruction, ctx: &mut EmitContext) -> Result<Option<usize>> {
     let EmitContext {
         module,
         value_infos,
@@ -31,7 +28,7 @@ pub(super) fn emit_instruction(
         return Ok(None);
     };
     let op_id = match op {
-        TensorOp::Reshape(_) => {
+        TensorOps::Reshape(_) => {
             let out_info = output_info(value_infos, inst.result())?;
             let label = inst.label;
             let input_spec = operand_type(&inst.operands[0], value_infos)?;
@@ -45,7 +42,7 @@ pub(super) fn emit_instruction(
             emit_memcpy(module, &out_info.var, &input, out_info.byte_len);
             op_id
         }
-        TensorOp::BroadcastTo(_) => {
+        TensorOps::BroadcastTo(_) => {
             let out_info = output_info(value_infos, inst.result())?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             ensure_copy_dtypes("broadcast", &[input_dtype], out_info.ty.dtype)?;
@@ -57,7 +54,7 @@ pub(super) fn emit_instruction(
             emit_broadcast(module, &out_info.var, &input, &out_info.ty, &input_spec)?;
             op_id
         }
-        TensorOp::Transpose(spec) => {
+        TensorOps::Transpose(spec) => {
             let out_info = output_info(value_infos, inst.result())?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             ensure_copy_dtypes("transpose", &[input_dtype], out_info.ty.dtype)?;
@@ -68,7 +65,7 @@ pub(super) fn emit_instruction(
             emit_transpose(module, &out_info.var, &input, &out_info.ty, &in_spec, spec)?;
             op_id
         }
-        TensorOp::Slice(spec) => {
+        TensorOps::Slice(spec) => {
             let out_info = output_info(value_infos, inst.result())?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             ensure_copy_dtypes("slice", &[input_dtype], out_info.ty.dtype)?;
@@ -79,7 +76,7 @@ pub(super) fn emit_instruction(
             emit_slice(module, &out_info.var, &input, &out_info.ty, &in_spec, spec)?;
             op_id
         }
-        TensorOp::Concat(spec) => {
+        TensorOps::Concat(spec) => {
             let out_info = output_info(value_infos, inst.result())?;
             let dtypes = inst
                 .operands
@@ -101,7 +98,7 @@ pub(super) fn emit_instruction(
             )?;
             op_id
         }
-        TensorOp::Iota(spec) => {
+        TensorOps::Iota(spec) => {
             let out_info = output_info(value_infos, inst.result())?;
             ensure_dtype(out_info.ty.dtype, DType::Si32, "iota output must be si32")?;
             let label = inst.label;

@@ -9,11 +9,11 @@ use tch::{Kind, Tensor as TchTensor};
 use super::common::*;
 
 fn embedding_reference(weight: &TchTensor, indices: &[usize]) -> TchTensor {
-    let idx: Vec<i64> = indices.iter().map(|&i| i as i64).collect();
-    let idx = TchTensor::from_slice(&idx)
+    let ids: Vec<i64> = indices.iter().map(|&index| index as i64).collect();
+    let ids_tensor = TchTensor::from_slice(&ids)
         .to_kind(Kind::Int64)
         .reshape([indices.len() as i64]);
-    weight.index_select(0, &idx)
+    weight.index_select(0, &ids_tensor)
 }
 
 pub fn embedding_matches_torch_basic<B: PortableBackend + 'static>(backend: &Arc<B>) {
@@ -78,7 +78,7 @@ pub fn embedding_bf16_table_returns_f32_rows<B: PortableBackend + 'static>(backe
     let (vocab, embed_dim) = (32, 24);
     let weights: Vec<f32> = random_vec(&mut rng, vocab * embed_dim)
         .into_iter()
-        .map(|v| half::bf16::from_f32(v).to_f32())
+        .map(|value| half::bf16::from_f32(value).to_f32())
         .collect();
     let indices = [3usize, 0, 31, 3, 17];
 
@@ -89,9 +89,9 @@ pub fn embedding_bf16_table_returns_f32_rows<B: PortableBackend + 'static>(backe
 
     let actual = timed_gpt(|| {
         let table = crate::tensor_as(&[vocab, embed_dim], &weights, DType::Bf16);
-        let ids = indices.iter().map(|&idx| idx as i32).collect();
-        let ids = HostTensor::si32([indices.len()], ids).unwrap();
-        let ids = DeviceTensor::from_host(Arc::clone(backend), ids).unwrap();
+        let id_values = indices.iter().map(|&idx| idx as i32).collect();
+        let ids_host = HostTensor::si32([indices.len()], id_values).unwrap();
+        let ids = DeviceTensor::from_host(Arc::clone(backend), ids_host).unwrap();
         let layer = embedding_layer(backend, table);
         let rows = layer.call(&ids);
         assert_eq!(rows.dtype(), DType::F32);

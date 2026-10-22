@@ -22,12 +22,12 @@ fn run_conv1d_case<B: PortableBackend + 'static>(
     });
 
     let actual = timed_gpt(|| {
-        let layer = load_layer(backend, conv.tensors("proj"), |p| {
-            p.scoped("proj", |p| Linear::with_layout(p, WeightLayout::InOut))
+        let layer = load_layer(backend, conv.tensors("proj"), |params| {
+            params.scoped("proj", |p| Linear::with_layout(p, WeightLayout::InOut))
         })
         .unwrap();
-        let input = device_tensor_from_data(backend, &[batch, in_features], &input);
-        to_host_vec(&layer.call(&input))
+        let input_device = device_tensor_from_data(backend, &[batch, in_features], &input);
+        to_host_vec(&layer.call(&input_device))
     });
 
     assert_close(&expected, &actual);

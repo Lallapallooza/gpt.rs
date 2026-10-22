@@ -26,65 +26,62 @@ struct Side<'a> {
 /// Copies the elements of an index space of extents `dims` from `src` to `dst`, both slices of
 /// elements of `elem` bytes. Adjacent axes that both sides lay out contiguously merge, so the
 /// innermost loop copies whole runs.
-fn copy_strided(
-    dst: &mut [u8],
-    to: Side<'_>,
-    src: &[u8],
-    from: Side<'_>,
-    dims: &[usize],
-    elem: usize,
-) {
+fn copy_strided(dst: &mut [u8], to: Side, src: &[u8], from: Side, dims: &[usize], elem: usize) {
     if dims.contains(&0) {
         return;
     }
     // The axes of extent above 1, merged where both sides are contiguous across them.
     let mut axes: Vec<(usize, usize, usize)> = Vec::new();
     for (axis, &dim) in dims.iter().enumerate().filter(|&(_, &dim)| dim > 1) {
-        let (ds, ss) = (to.strides[axis], from.strides[axis]);
+        let (dst_stride, src_stride) = (to.strides[axis], from.strides[axis]);
         match axes.last_mut() {
-            Some(last) if last.1 == ds * dim && last.2 == ss * dim => {
-                *last = (last.0 * dim, ds, ss)
+            Some(last) if last.1 == dst_stride * dim && last.2 == src_stride * dim => {
+                *last = (last.0 * dim, dst_stride, src_stride)
             }
-            _ => axes.push((dim, ds, ss)),
+            _ => axes.push((dim, dst_stride, src_stride)),
         }
     }
-    let (inner, ds, ss) = axes.pop().unwrap_or((1, 1, 1));
-    let run = |dst: &mut [u8], d: usize, s: usize| {
-        let (d, s) = (d * elem, s * elem);
-        if ds == 1 && ss == 1 {
-            dst[d..][..inner * elem].copy_from_slice(&src[s..][..inner * elem]);
-        } else if ds == 1 && ss == 0 {
-            let value = &src[s..][..elem];
-            for chunk in dst[d..][..inner * elem].chunks_exact_mut(elem) {
+    let (inner, inner_dst_stride, inner_src_stride) = axes.pop().unwrap_or((1, 1, 1));
+    let copy_run = |dst_bytes: &mut [u8], dst_element: usize, src_element: usize| {
+        let (dst_start, src_start) = (dst_element * elem, src_element * elem);
+        if inner_dst_stride == 1 && inner_src_stride == 1 {
+            dst_bytes[dst_start..][..inner * elem]
+                .copy_from_slice(&src[src_start..][..inner * elem]);
+        } else if inner_dst_stride == 1 && inner_src_stride == 0 {
+            let value = &src[src_start..][..elem];
+            for chunk in dst_bytes[dst_start..][..inner * elem].chunks_exact_mut(elem) {
                 chunk.copy_from_slice(value);
             }
         } else {
-            for i in 0..inner {
-                dst[d + i * ds * elem..][..elem].copy_from_slice(&src[s + i * ss * elem..][..elem]);
+            for position in 0..inner {
+                dst_bytes[dst_start + position * inner_dst_stride * elem..][..elem]
+                    .copy_from_slice(
+                        &src[src_start + position * inner_src_stride * elem..][..elem],
+                    );
             }
         }
     };
     // An odometer over the outer axes, which moves both offsets as it counts.
     let mut index = vec![0usize; axes.len()];
-    let (mut d, mut s) = (to.offset, from.offset);
+    let (mut dst_offset, mut src_offset) = (to.offset, from.offset);
     loop {
-        run(dst, d, s);
+        copy_run(dst, dst_offset, src_offset);
         let mut axis = axes.len();
         loop {
             let Some(next) = axis.checked_sub(1) else {
                 return;
             };
             axis = next;
-            let (dim, ds, ss) = axes[axis];
+            let (dim, dst_stride, src_stride) = axes[axis];
             index[axis] += 1;
-            d += ds;
-            s += ss;
+            dst_offset += dst_stride;
+            src_offset += src_stride;
             if index[axis] < dim {
                 break;
             }
             index[axis] = 0;
-            d -= ds * dim;
-            s -= ss * dim;
+            dst_offset -= dst_stride * dim;
+            src_offset -= src_stride * dim;
         }
     }
 }
@@ -134,7 +131,7 @@ pub(crate) fn broadcast_to(
     let in_strides = strides(&input.dims);
     let src_strides: Vec<usize> = (0..out_dims.len())
         .map(|axis| match axis.checked_sub(rank_diff) {
-            Some(a) if input.dims[a] != 1 => in_strides[a],
+            Some(input_axis) if input.dims[input_axis] != 1 => in_strides[input_axis],
             _ => 0,
         })
         .collect();
@@ -173,8 +170,8 @@ pub(crate) fn dynamic_slice(
     starts: &HostTensor,
     out: &TensorType,
 ) -> Result<HostTensor> {
-    let starts = clamped_starts(&input.dims, &op.sizes, starts)?;
-    window(input, &starts, out)
+    let window_starts = clamped_starts(&input.dims, &op.sizes, starts)?;
+    window(input, &window_starts, out)
 }
 
 /// The window of `input` at `starts` whose extents are those of `out`.
@@ -194,10 +191,10 @@ pub(crate) fn dynamic_update_slice(
     update: &HostTensor,
     starts: &HostTensor,
 ) -> Result<HostTensor> {
-    let starts = clamped_starts(&base.dims, &update.dims, starts)?;
+    let window_starts = clamped_starts(&base.dims, &update.dims, starts)?;
     let elem = elem_bytes(base)?;
     let base_strides = strides(&base.dims);
-    let offset = starts
+    let offset = window_starts
         .iter()
         .zip(&base_strides)
         .map(|(start, stride)| start * stride)
@@ -249,17 +246,17 @@ pub(crate) fn concat(op: &Concat, inputs: &[HostTensor], out: &TensorType) -> Re
 /// Each start clamped into `[0, extent - size]`, as `dynamic_slice` and `dynamic_update_slice`
 /// define, so the window always lies inside the tensor.
 fn clamped_starts(dims: &[usize], sizes: &[usize], starts: &HostTensor) -> Result<Vec<usize>> {
-    let starts = starts.as_si32()?;
+    let start_values = starts.as_si32()?;
     ensure!(
-        starts.len() == dims.len() && sizes.len() == dims.len(),
+        start_values.len() == dims.len() && sizes.len() == dims.len(),
         "{} starts and {} sizes for a rank-{} tensor",
-        starts.len(),
+        start_values.len(),
         sizes.len(),
         dims.len()
     );
     dims.iter()
         .zip(sizes)
-        .zip(starts)
+        .zip(start_values)
         .map(|((&extent, &size), &start)| {
             ensure!(
                 size <= extent,

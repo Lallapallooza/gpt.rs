@@ -1,4 +1,4 @@
-use gpt_rs_ir::dialects::tensor::{ExtractPatches, TensorOp};
+use gpt_rs_ir::dialects::tensor::{ExtractPatches, TensorOps};
 use gpt_rs_ir::ir::{TensorType, Value};
 
 /// Where the generated function keeps a value.
@@ -46,7 +46,7 @@ impl Instruction<'_> {
 }
 
 pub(super) enum Kind<'m> {
-    Op(&'m TensorOp),
+    Op(&'m TensorOps),
     /// An NHWC f32 convolution with these patches. Operands `[x, w]` or `[x, w, bias]`, where `w`
     /// is `[KH * KW * C_in, C_out]` or in the GEMM's panels `[C_out / PANEL_N, K, PANEL_N]`.
     Conv2d(ExtractPatches),
@@ -80,7 +80,7 @@ pub(super) struct ElementwiseInput {
 
 pub(super) struct Node {
     /// An elementwise op that has a C expression: of one operand, or of two with `rhs`.
-    pub(super) op: TensorOp,
+    pub(super) op: TensorOps,
     pub(super) lhs: NodeRef,
     pub(super) rhs: Option<NodeRef>,
 }

@@ -1,45 +1,19 @@
+pub mod layers;
 pub mod recording_backend;
 #[cfg(feature = "torch")]
 pub mod torch_parity;
 
-use std::sync::Arc;
-
-use anyhow::Result;
-use gpt_rs::backend::PortableBackend;
 use gpt_rs::gpt_rs_ir::ir::TensorType;
-use gpt_rs::nn::Params;
-use gpt_rs::params::{base_param_id, param_key};
-use gpt_rs::runtime::next_namespace;
-use gpt_rs::tensor::{DType, DeviceTensor, HostTensor};
+use gpt_rs::tensor::{DType, HostTensor};
 
-/// Builds a layer with `build`, passing it [`Params`] over the host `tensors`, which are keyed by
-/// parameter path. Like a loaded model, the layer reads them as parameters of a fresh namespace.
-pub fn load_layer<B: PortableBackend + 'static, L>(
-    backend: &Arc<B>,
-    tensors: impl IntoIterator<Item = (String, HostTensor)>,
-    build: impl FnOnce(&mut Params<'_, B>) -> Result<L>,
-) -> Result<L> {
-    let tensors: Vec<(String, HostTensor)> = tensors.into_iter().collect();
-    let namespace = next_namespace();
-    let mut get = |name: &str| -> Result<Option<DeviceTensor<B>>> {
-        let Some((_, tensor)) = tensors.iter().find(|(candidate, _)| candidate == name) else {
-            return Ok(None);
-        };
-        let key = param_key(namespace, base_param_id(name)?);
-        let tensor = DeviceTensor::from_host(Arc::clone(backend), tensor.clone())?;
-        tensor.as_param(key.0).map(Some)
-    };
-    build(&mut Params::new(Arc::clone(backend), &mut get))
-}
-
-/// The message of the panic that `f` raises.
-pub fn panic_message<T>(f: impl FnOnce() -> T) -> String {
-    let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) else {
+/// The message of the panic that `action` raises.
+pub fn panic_message<T>(action: impl FnOnce() -> T) -> String {
+    let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)) else {
         panic!("expected a panic");
     };
     match payload.downcast::<String>() {
         Ok(message) => *message,
-        Err(payload) => payload
+        Err(other_payload) => other_payload
             .downcast::<&str>()
             .map(|message| message.to_string())
             .unwrap_or_default(),
@@ -49,14 +23,14 @@ pub fn panic_message<T>(f: impl FnOnce() -> T) -> String {
 /// Host tensor holding `data` rounded to nearest-even in the floating `dtype`.
 pub fn tensor_as(shape: &[usize], data: &[f32], dtype: DType) -> HostTensor {
     let bytes: Vec<u8> = match dtype {
-        DType::F32 => data.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        DType::F32 => data.iter().flat_map(|value| value.to_le_bytes()).collect(),
         DType::Bf16 => data
             .iter()
-            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .flat_map(|&value| half::bf16::from_f32(value).to_le_bytes())
             .collect(),
         DType::F16 => data
             .iter()
-            .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+            .flat_map(|&value| half::f16::from_f32(value).to_le_bytes())
             .collect(),
         other => panic!("tensor_as rounds only to f32, bf16 and f16, not {other}"),
     };
@@ -183,6 +157,8 @@ macro_rules! define_backend_tests {
             parity_test!(torch_vision_depthwise_conv2d_nhwc_stride2_matches_torch, vision_ops::depthwise_conv2d_nhwc_stride2_matches_torch);
             parity_test!(torch_vision_max_pool2d_nhwc_matches_torch, vision_ops::max_pool2d_nhwc_matches_torch);
             parity_test!(torch_vision_relu6_matches_torch, vision_ops::relu6_matches_torch);
+            parity_test!(torch_vision_hard_sigmoid_matches_torch, vision_ops::hard_sigmoid_matches_torch);
+            parity_test!(torch_vision_hard_swish_matches_torch, vision_ops::hard_swish_matches_torch);
             parity_test!(torch_vision_global_avg_pool2d_matches_torch, vision_ops::global_avg_pool2d_matches_torch);
             parity_test!(torch_vision_conv2d_nhwc_k3_s1_p1_bias_n1_h11_w13_c3_cout8, vision_ops::conv2d_nhwc_k3_s1_p1_bias_n1_h11_w13_c3_cout8);
             parity_test!(torch_vision_conv2d_nhwc_k3_s2_p1_nobias_n2_h9_w10_c5_cout7, vision_ops::conv2d_nhwc_k3_s2_p1_nobias_n2_h9_w10_c5_cout7);
@@ -209,6 +185,8 @@ macro_rules! define_backend_tests {
             parity_test!(torch_linear_matches_torch_batch4_in1_out1_bias, linear::linear_matches_torch_batch4_in1_out1_bias);
             parity_test!(torch_linear_matches_torch_batch4_in33_out65_no_bias, linear::linear_matches_torch_batch4_in33_out65_no_bias);
             parity_test!(torch_linear_fp8_weight_rows3_matches_torch, narrow_weights::linear_fp8_weight_rows3_matches_torch);
+            parity_test!(torch_linear_packed4_weight_rows1_matches_torch, narrow_weights::linear_packed4_weight_rows1_matches_torch);
+            parity_test!(torch_linear_bf16_input_packed4_weight_rows64_matches_torch, narrow_weights::linear_bf16_input_packed4_weight_rows64_matches_torch);
             parity_test!(torch_linear_fp8_scaled_weight_rows1_out9000_matches_torch, narrow_weights::linear_fp8_scaled_weight_rows1_out9000_matches_torch);
             parity_test!(torch_linear_fp8_scaled_weight_rows64_matches_torch, narrow_weights::linear_fp8_scaled_weight_rows64_matches_torch);
             parity_test!(torch_linear_fp8_f32_scaled_weight_rows64_matches_torch, narrow_weights::linear_fp8_f32_scaled_weight_rows64_matches_torch);

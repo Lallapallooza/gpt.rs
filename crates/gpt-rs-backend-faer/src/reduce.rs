@@ -55,10 +55,10 @@ fn reduce_f32(
     let values = rows
         .iter()
         .map(|&row| {
-            runs.iter().fold(init, |acc, &start| {
+            runs.iter().fold(init, |folded, &start| {
                 x[row + start..][..run]
                     .iter()
-                    .fold(acc, |acc, &v| combine(acc, v))
+                    .fold(folded, |acc, &value| combine(acc, value))
             })
         })
         .collect();
@@ -70,7 +70,7 @@ fn offsets(axes: impl Iterator<Item = (usize, usize)>) -> Vec<usize> {
     axes.fold(vec![0], |offsets, (dim, stride)| {
         offsets
             .iter()
-            .flat_map(|&offset| (0..dim).map(move |i| offset + i * stride))
+            .flat_map(|&offset| (0..dim).map(move |step| offset + step * stride))
             .collect()
     })
 }

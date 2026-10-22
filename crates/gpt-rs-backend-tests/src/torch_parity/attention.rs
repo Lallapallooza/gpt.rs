@@ -18,46 +18,46 @@ fn run_kv_cache_attention_case<B: PortableBackend + 'static>(
     seed: u64,
 ) {
     let mut rng = seeded_rng(seed);
-    let q = random_vec(&mut rng, query_heads * seq * head_dim);
-    let k = random_vec(&mut rng, kv_heads * seq * head_dim);
-    let v = random_vec(&mut rng, kv_heads * seq * head_dim);
+    let query_data = random_vec(&mut rng, query_heads * seq * head_dim);
+    let key_data = random_vec(&mut rng, kv_heads * seq * head_dim);
+    let value_data = random_vec(&mut rng, kv_heads * seq * head_dim);
     // Cache rows past `prefix` hold garbage that attention must never read.
     let cache_k = random_vec(&mut rng, kv_heads * capacity * head_dim);
     let cache_v = random_vec(&mut rng, kv_heads * capacity * head_dim);
 
     let (expected_ctx, expected_k, expected_v) = timed_torch(|| {
-        let (hq, hkv, d, p, t) = (
+        let (hq, hkv, dim, past, steps) = (
             query_heads as i64,
             kv_heads as i64,
             head_dim as i64,
             prefix as i64,
             seq as i64,
         );
-        let q_t = tch_tensor_from_vec(&[query_heads, seq, head_dim], &q);
-        let k_t = tch_tensor_from_vec(&[kv_heads, seq, head_dim], &k);
-        let v_t = tch_tensor_from_vec(&[kv_heads, seq, head_dim], &v);
+        let q_t = tch_tensor_from_vec(&[query_heads, seq, head_dim], &query_data);
+        let k_t = tch_tensor_from_vec(&[kv_heads, seq, head_dim], &key_data);
+        let v_t = tch_tensor_from_vec(&[kv_heads, seq, head_dim], &value_data);
         let ck = tch_tensor_from_vec(&[kv_heads, capacity, head_dim], &cache_k);
         let cv = tch_tensor_from_vec(&[kv_heads, capacity, head_dim], &cache_v);
-        let keys = TchTensor::cat(&[ck.narrow(1, 0, p), k_t.shallow_clone()], 1);
-        let values = TchTensor::cat(&[cv.narrow(1, 0, p), v_t.shallow_clone()], 1);
+        let keys = TchTensor::cat(&[ck.narrow(1, 0, past), k_t.shallow_clone()], 1);
+        let values = TchTensor::cat(&[cv.narrow(1, 0, past), v_t.shallow_clone()], 1);
         let group = hq / hkv;
         let keys_q = keys.repeat_interleave_self_int(group, 0, None::<i64>);
         let values_q = values.repeat_interleave_self_int(group, 0, None::<i64>);
-        let scores = q_t.matmul(&keys_q.transpose(1, 2)) * (1.0 / (d as f64).sqrt());
-        let mask = TchTensor::ones([t, p + t], (Kind::Float, tch::Device::Cpu))
-            .tril(p)
-            .view([1, t, p + t]);
+        let scores = q_t.matmul(&keys_q.transpose(1, 2)) * (1.0 / (dim as f64).sqrt());
+        let mask = TchTensor::ones([steps, past + steps], (Kind::Float, tch::Device::Cpu))
+            .tril(past)
+            .view([1, steps, past + steps]);
         let masked = scores.masked_fill(&mask.eq(0.0), f64::NEG_INFINITY);
         let ctx = masked
             .softmax(-1, Kind::Float)
             .matmul(&values_q)
             .transpose(0, 1)
-            .reshape([t, hq * d])
+            .reshape([steps, hq * dim])
             .contiguous();
         let new_k = ck.copy();
         let new_v = cv.copy();
-        new_k.narrow(1, p, t).copy_(&k_t);
-        new_v.narrow(1, p, t).copy_(&v_t);
+        new_k.narrow(1, past, steps).copy_(&k_t);
+        new_v.narrow(1, past, steps).copy_(&v_t);
         (
             tensor_to_vec(&ctx),
             tensor_to_vec(&new_k.contiguous()),
@@ -77,18 +77,18 @@ fn run_kv_cache_attention_case<B: PortableBackend + 'static>(
         };
         let positions =
             AttentionPositions::new(positions_tensor(backend, prefix..prefix + seq), None);
-        let (output, cache) = functional::attention_kv_cache(
-            &heads(query_heads, &q),
-            &heads(kv_heads, &k),
-            &heads(kv_heads, &v),
+        let (output, updated_cache) = functional::attention_kv_cache(
+            &heads(query_heads, &query_data),
+            &heads(kv_heads, &key_data),
+            &heads(kv_heads, &value_data),
             &cache,
             &positions,
         );
         (
             to_host_vec(&output),
-            to_host_vec(cache.keys()),
-            to_host_vec(cache.values()),
-            cache.len(),
+            to_host_vec(updated_cache.keys()),
+            to_host_vec(updated_cache.values()),
+            updated_cache.len(),
         )
     });
 

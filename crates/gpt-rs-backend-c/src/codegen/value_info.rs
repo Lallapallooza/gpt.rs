@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, ensure, Result};
-use gpt_rs_ir::dialects::tensor::TensorOp;
+use gpt_rs_ir::dialects::tensor::TensorOps;
 use gpt_rs_ir::ir::{DType, Dense, Module, TensorType, Value};
 
 use super::plan::{plan, Planned};
@@ -20,7 +20,7 @@ pub(super) fn tensor_type(module: &Module, value: Value) -> Result<TensorType> {
 pub(super) fn build_value_infos(
     module: &Module,
     args: &[Value],
-    insts: &[Instruction<'_>],
+    insts: &[Instruction],
     results: &[Value],
 ) -> Result<(HashMap<Value, ValueInfo>, HashMap<Value, Dense>)> {
     let mut infos: HashMap<Value, ValueInfo> = HashMap::new();
@@ -50,7 +50,7 @@ pub(super) fn build_value_infos(
                 Planned::Alias { of } => (ValueStorage::Alias, infos[&of].var.clone()),
             };
             let mut info = value_info(module, value, storage, var)?;
-            if let (Kind::Op(TensorOp::Constant(constant)), 0) = (&inst.kind, result) {
+            if let (Kind::Op(TensorOps::Constant(constant)), 0) = (&inst.kind, result) {
                 info.const_name = Some(format!("kConst_{number}"));
                 constants.insert(value, constant.value.clone());
             }

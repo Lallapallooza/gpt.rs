@@ -56,7 +56,9 @@ fn softmax_axis_case<B: PortableBackend + 'static>(
     });
 
     match (atol, rtol) {
-        (Some(atol), Some(rtol)) => assert_close_tol(&expected, &actual, atol, rtol),
+        (Some(abs_tolerance), Some(rel_tolerance)) => {
+            assert_close_tol(&expected, &actual, abs_tolerance, rel_tolerance);
+        }
         _ => assert_close(&expected, &actual),
     }
 }
@@ -116,7 +118,7 @@ fn add_bias_case<B: PortableBackend + 'static>(
         let x_t = tch_tensor_from_vec(shape, x_data);
         let mut bias_shape = vec![1i64; shape.len()];
         bias_shape[shape.len() - 1] = bias_len as i64;
-        let dims: Vec<i64> = shape.iter().map(|d| *d as i64).collect();
+        let dims: Vec<i64> = shape.iter().map(|&extent| extent as i64).collect();
         let bias_t = tch_tensor_from_vec(&[bias_len], bias).reshape(bias_shape);
         let bias_broadcast = bias_t.expand(dims, true);
         let expected_tensor = x_t + bias_broadcast;
@@ -256,7 +258,7 @@ pub fn add_bias_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
         let x_t = tch_tensor_from_vec(&shape, &data);
         let mut bias_shape = vec![1i64; shape.len()];
         bias_shape[shape.len() - 1] = bias_len as i64;
-        let dims: Vec<i64> = shape.iter().map(|d| *d as i64).collect();
+        let dims: Vec<i64> = shape.iter().map(|&extent| extent as i64).collect();
         let bias_t = tch_tensor_from_vec(&[bias_len], &bias).reshape(bias_shape);
         let bias_broadcast = bias_t.expand(dims.clone(), true);
         let expected_tensor = x_t + bias_broadcast;
@@ -378,7 +380,7 @@ fn run_linear_case<B: PortableBackend + 'static>(
     let x = random_vec(&mut rng, rows * in_features);
     let raw_w = random_vec(&mut rng, out_features * in_features);
     // The reference sees exactly the weight values gpt-rs stores.
-    let w = match weight_dtype {
+    let weight_values = match weight_dtype {
         DType::Bf16 => bf16_round(&raw_w),
         _ => raw_w,
     };
@@ -390,22 +392,23 @@ fn run_linear_case<B: PortableBackend + 'static>(
             x.clone()
         };
         let x_t = tch_tensor_from_vec(&[rows, in_features], &x_ref);
-        let w_t = tch_tensor_from_vec(&[out_features, in_features], &w);
+        let w_t = tch_tensor_from_vec(&[out_features, in_features], &weight_values);
         tensor_to_vec(&x_t.matmul(&w_t.transpose(0, 1)))
     });
 
     let actual = timed_gpt(|| {
         let x_d = device_tensor_from_data(backend, &[rows, in_features], &x);
-        let w = crate::tensor_as(&[out_features, in_features], &w, weight_dtype);
-        let mut layer = load_layer(backend, [("proj.weight".to_string(), w)], |p| {
+        let weight_host =
+            crate::tensor_as(&[out_features, in_features], &weight_values, weight_dtype);
+        let mut layer = load_layer(backend, [("proj.weight".to_string(), weight_host)], |p| {
             p.scoped("proj", Linear::new)
         })
         .unwrap();
         layer.input_dtype = bf16_inputs.then_some(DType::Bf16);
-        let y = layer.call(&x_d);
-        assert_eq!(y.shape().dims(), [rows, out_features]);
-        assert_eq!(y.dtype(), DType::F32);
-        to_host_vec(&y)
+        let output = layer.call(&x_d);
+        assert_eq!(output.shape().dims(), [rows, out_features]);
+        assert_eq!(output.dtype(), DType::F32);
+        to_host_vec(&output)
     });
 
     assert_close(&expected, &actual);

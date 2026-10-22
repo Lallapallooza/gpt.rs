@@ -121,11 +121,11 @@ fn yarn_tables_match_formula<B: PortableBackend + 'static>(
         .tables(&positions_tensor(backend, 0..seq_len));
 
     let (expected_cos, expected_sin) = timed_torch(|| {
-        let get_mscale = |scale: f64, mscale: f64| {
+        let get_mscale = |scale: f64, coefficient: f64| {
             if scale <= 1.0 {
                 1.0
             } else {
-                0.1 * mscale * scale.ln() + 1.0
+                0.1 * coefficient * scale.ln() + 1.0
             }
         };
         let attention_factor = match (mscale, mscale_all_dim) {
@@ -164,9 +164,9 @@ fn yarn_tables_match_formula<B: PortableBackend + 'static>(
 
         let positions = TchTensor::arange(seq_len as i64, (Kind::Float, Device::Cpu));
         let angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0);
-        let cos = angles.cos() * attention_factor;
-        let sin = angles.sin() * attention_factor;
-        (tensor_to_vec(&cos), tensor_to_vec(&sin))
+        let reference_cos = angles.cos() * attention_factor;
+        let reference_sin = angles.sin() * attention_factor;
+        (tensor_to_vec(&reference_cos), tensor_to_vec(&reference_sin))
     });
 
     assert_close(&expected_cos, &to_host_vec(&cos));

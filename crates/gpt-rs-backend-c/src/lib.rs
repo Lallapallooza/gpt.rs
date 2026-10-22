@@ -10,7 +10,6 @@ use std::time::Duration;
 use anyhow::{anyhow, ensure, Result};
 use gpt_rs::backend::hashing::FingerprintHasher;
 use gpt_rs::backend::{ParamStore, PortableBackend};
-use gpt_rs_ir::dialects::func::Func;
 use gpt_rs_ir::host::HostTensor;
 use gpt_rs_ir::ir::{Module, TensorType};
 use gpt_rs_ir::passes::Pipeline;
@@ -113,13 +112,10 @@ impl PortableBackend for CBackend {
     }
 
     fn compile(&self, module: &Arc<Module>, func: &str) -> Result<CompiledFunction> {
-        let inst = module
+        let function = module
             .func(func)
             .ok_or_else(|| anyhow!("the module has no function @{func}"))?;
-        let outputs = module
-            .op(inst)
-            .get::<Func>()
-            .expect("a function")
+        let outputs = function
             .results
             .iter()
             .map(|ty| {
@@ -136,7 +132,7 @@ impl PortableBackend for CBackend {
         Ok(CompiledFunction { module, outputs })
     }
 
-    fn run(&self, exe: &CompiledFunction, args: &[HostTensor]) -> Result<Vec<HostTensor>> {
+    fn run(&self, exe: &CompiledFunction, args: Vec<HostTensor>) -> Result<Vec<HostTensor>> {
         let module = &exe.module;
         let mut outputs = Vec::with_capacity(exe.outputs.len());
         {
@@ -158,7 +154,7 @@ impl PortableBackend for CBackend {
             dims
         };
         let mut input_views = Vec::with_capacity(args.len());
-        for tensor in args {
+        for tensor in &args {
             let data = tensor.to_le_bytes().as_ptr() as *mut c_void;
             input_views.push(ptir_tensor(tensor, next_dims(tensor.dims.len()), data)?);
         }

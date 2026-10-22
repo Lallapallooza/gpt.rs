@@ -111,7 +111,10 @@ pub(crate) fn steps(module: &Module, insts: &[Inst], results: &[Value]) -> Vec<S
         let kind = match fused.remove(&inst) {
             Some(kernel) => kernel.kind,
             None if covers.contains(&inst)
-                && !module.results(inst).iter().any(|v| needed.contains(v)) =>
+                && !module
+                    .results(inst)
+                    .iter()
+                    .any(|value| needed.contains(value)) =>
             {
                 continue;
             }
@@ -138,13 +141,13 @@ fn with_last_uses(module: &Module, kinds: Vec<StepKind>, results: &[Value]) -> V
     for value in results {
         last.remove(value);
     }
-    let mut last_uses: Vec<Vec<Value>> = vec![Vec::new(); kinds.len()];
+    let mut last_uses_by_step: Vec<Vec<Value>> = vec![Vec::new(); kinds.len()];
     for (value, index) in last {
-        last_uses[index].push(value);
+        last_uses_by_step[index].push(value);
     }
     kinds
         .into_iter()
-        .zip(last_uses)
+        .zip(last_uses_by_step)
         .map(|(kind, last_uses)| Step { kind, last_uses })
         .collect()
 }
@@ -182,16 +185,17 @@ fn conv2d(module: &Module, inst: Inst) -> Option<Fused> {
         && attrs.contract_rhs[..] == [0];
     let input = patches.input().id();
     let weight = dot.rhs().id();
-    let &[_, _, _, k] = f32_dims(module, patches.output().id())?.as_slice() else {
+    let &[_, _, _, patch_len] = f32_dims(module, patches.output().id())?.as_slice() else {
         return None;
     };
-    let &[k_w, c_out] = f32_dims(module, weight)?.as_slice() else {
+    let &[weight_patch_len, c_out] = f32_dims(module, weight)?.as_slice() else {
         return None;
     };
     let &[_, _, _, out_c] = f32_dims(module, dot.output().id())?.as_slice() else {
         return None;
     };
-    let shapes = k == k_w && c_out == out_c && f32_dims(module, input)?.len() == 4;
+    let shapes =
+        patch_len == weight_patch_len && c_out == out_c && f32_dims(module, input)?.len() == 4;
     (plain && shapes && conv_patches(patches.attrs())).then(|| Fused {
         kind: StepKind::Conv2d(Conv2d {
             input,
@@ -212,11 +216,11 @@ fn conv2d(module: &Module, inst: Inst) -> Option<Fused> {
 /// transpose and the reshape put back.
 fn depthwise_conv2d(module: &Module, inst: Inst) -> Option<Fused> {
     let reshape = module.op_as::<Reshape>(inst)?;
-    matched!(let transpose @ Transpose(dot @ DotGeneral(patches_reshape @ Reshape(patches @ ExtractPatches(input)), weight)) = reshape.input() else {
+    matched!(let transpose @ Transpose(dot @ DotGeneral(patches_reshape @ Reshape(patches @ ExtractPatches(patches_input)), dot_rhs)) = reshape.input() else {
         return None;
     });
-    let (input, weight) = (input.id(), weight.id());
-    let &[n, _, _, c] = f32_dims(module, input)?.as_slice() else {
+    let (input, weight) = (patches_input.id(), dot_rhs.id());
+    let &[batch, _, _, channels] = f32_dims(module, input)?.as_slice() else {
         return None;
     };
     let &[k_h, k_w] = patches.window.as_slice() else {
@@ -226,9 +230,10 @@ fn depthwise_conv2d(module: &Module, inst: Inst) -> Option<Fused> {
         return None;
     };
     let depthwise = conv_patches(patches.attrs())
-        && f32_dims(module, reshape.output().id())? == [n, out_h, out_w, c]
-        && f32_dims(module, patches_reshape.output().id())? == [n, out_h, out_w, k_h, k_w, c, 1]
-        && f32_dims(module, weight)? == [c, 1, 1, k_h, k_w]
+        && f32_dims(module, reshape.output().id())? == [batch, out_h, out_w, channels]
+        && f32_dims(module, patches_reshape.output().id())?
+            == [batch, out_h, out_w, k_h, k_w, channels, 1]
+        && f32_dims(module, weight)? == [channels, 1, 1, k_h, k_w]
         && dot.batch_lhs[..] == [5]
         && dot.batch_rhs[..] == [0]
         && dot.contract_lhs[..] == [3, 4, 6]
@@ -302,15 +307,15 @@ fn relu6(module: &Module, inst: Inst) -> Option<Fused> {
     })
 }
 
-/// Matches `add` as a bias add on the result of a convolution kernel: one f32 value per output
+/// Matches `inst` as a bias add on the result of a convolution kernel: one f32 value per output
 /// channel. Returns the kernel, the bias, and the broadcast that reads the bias. The kernel's
 /// result has no other reader.
 fn bias_add(
     module: &Module,
-    add: Inst,
+    inst: Inst,
     fused: &HashMap<Inst, Fused>,
 ) -> Option<(Inst, Value, Inst)> {
-    let add = module.op_as::<Add>(add)?;
+    let add = module.op_as::<Add>(inst)?;
     let (lhs, rhs) = (add.lhs().id(), add.rhs().id());
     let (conv, other) = [(lhs, rhs), (rhs, lhs)]
         .into_iter()

@@ -15,7 +15,7 @@ fn indices<B: PortableBackend + 'static>(tensor: &DeviceTensor<B>) -> Vec<i64> {
     host.as_si32()
         .unwrap()
         .iter()
-        .map(|&i| i64::from(i))
+        .map(|&index| i64::from(index))
         .collect()
 }
 
@@ -40,12 +40,12 @@ pub fn argmax_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
 
 pub fn top_k_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
     let mut rng = seeded_rng(0x5A02);
-    let (rows, cols, k) = (2, 50, 5);
+    let (rows, cols, top_k) = (2, 50, 5);
     let data = random_vec(&mut rng, rows * cols);
 
     let (expected_values, expected_indices) = timed_torch(|| {
         let x = tch_tensor_from_vec(&[rows, cols], &data);
-        let (values, indices) = x.topk(k as i64, -1, true, true);
+        let (values, indices) = x.topk(top_k as i64, -1, true, true);
         (
             tensor_to_vec(&values),
             Vec::<i64>::try_from(indices.flatten(0, -1)).unwrap(),
@@ -53,7 +53,7 @@ pub fn top_k_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
     });
     let (actual_values, actual_indices) = timed_gpt(|| {
         let x = device_tensor_from_data(backend, &[rows, cols], &data);
-        let (values, top) = x.top_k(k, -1);
+        let (values, top) = x.top_k(top_k, -1);
         (to_host_vec(&values), indices(&top))
     });
     assert_eq!(expected_values, actual_values);
@@ -77,8 +77,8 @@ pub fn sample_matches_torch_gumbel_max<B: PortableBackend + 'static>(backend: &A
         let expected = timed_torch(|| {
             let scaled = tch_tensor_from_vec(&[rows, cols], &data) / f64::from(temperature);
             let (candidates, columns) = match top_k {
-                Some(k) => {
-                    let (values, columns) = scaled.topk(k as i64, -1, true, true);
+                Some(count) => {
+                    let (values, columns) = scaled.topk(count as i64, -1, true, true);
                     (values, Some(columns))
                 }
                 None => (scaled, None),
@@ -86,7 +86,7 @@ pub fn sample_matches_torch_gumbel_max<B: PortableBackend + 'static>(backend: &A
             let gumbel = -(-tch_tensor_from_vec(&[rows, width], &noise).log()).log();
             let choice = (candidates + gumbel).argmax(-1, true);
             let token = match columns {
-                Some(columns) => columns.gather(-1, &choice, false),
+                Some(kept_columns) => kept_columns.gather(-1, &choice, false),
                 None => choice,
             };
             Vec::<i64>::try_from(token.flatten(0, -1)).unwrap()

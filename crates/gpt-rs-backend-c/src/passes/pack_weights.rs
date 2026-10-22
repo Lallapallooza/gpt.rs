@@ -4,12 +4,12 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
-use gpt_rs_ir::dialects::tensor::{DotGeneral, ExtractPatches, Reshape, Transpose};
-use gpt_rs_ir::ir::{DType, Matched, Module, Value, ValueDef, ValueRef};
+use gpt_rs_ir::dialects::tensor::{DotGeneral, DotGeneralOp, ExtractPatches, Reshape, Transpose};
+use gpt_rs_ir::ir::{DType, Value, ValueDef, ValueRef};
 use gpt_rs_ir::passes::{pass, run_patterns, Pass};
 use gpt_rs_ir::require;
 use gpt_rs_ir::rewrite::{
-    matched, pattern, Build, NoMatch, Pattern, PatternSet, Rewriter, Rewrites,
+    matched, pattern, Build, NoMatch, Pattern, PatternSet, Rewriter, Rewrites, Rewriting,
 };
 
 use crate::kernels::{LINEAR_PACK_MIN_ROWS, PANEL_N};
@@ -37,13 +37,13 @@ impl Pass for PackWeights {
         Rewrites::patterns(populate_pack_weights_patterns)
     }
 
-    fn run(&self, module: &mut Module) -> Result<bool> {
+    fn run(&self, module: &mut Rewriting) -> Result<bool> {
         run_patterns(module, self.rewrites(), &Self::PACKED)
     }
 }
 
 /// The extents of `value` when it is an f32 tensor with static extents.
-fn f32_dims(value: ValueRef<'_>) -> Option<Vec<usize>> {
+fn f32_dims(value: ValueRef) -> Option<Vec<usize>> {
     let ty = value.tensor_type();
     let dims = ty.static_dims().filter(|_| ty.dtype == DType::F32)?;
     Some(dims.to_vec())
@@ -65,11 +65,7 @@ struct PackGemmWeight;
 impl Pattern for PackGemmWeight {
     type Root = DotGeneral;
 
-    fn rewrite(
-        &self,
-        dot: Matched<'_, DotGeneral>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, dot: DotGeneralOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let (input, weight) = (dot.lhs(), dot.rhs());
         require!(let Some(input_dims) = f32_dims(input), "the input is not f32 with static extents");
         require!(let Some(output_dims) = f32_dims(dot.output()), "the result is not f32 with static extents");
@@ -132,7 +128,7 @@ impl Pattern for PackGemmWeight {
 
 /// Whether `weight` is known before the run and takes no more bytes than the parameters it is
 /// computed from. `outline-static` stores no other value.
-fn fits_parameters(weight: ValueRef<'_>) -> bool {
+fn fits_parameters(weight: ValueRef) -> bool {
     if !weight.known_before_run() {
         return false;
     }
@@ -174,11 +170,7 @@ struct GroupedConvWeight;
 impl Pattern for GroupedConvWeight {
     type Root = DotGeneral;
 
-    fn rewrite(
-        &self,
-        dot: Matched<'_, DotGeneral>,
-        rewriter: &mut Rewriter<'_>,
-    ) -> Result<(), NoMatch> {
+    fn rewrite(&self, dot: DotGeneralOp, rewriter: &mut Rewriter) -> Result<(), NoMatch> {
         let grouped = dot.batch_lhs[..] == [5]
             && dot.batch_rhs[..] == [0]
             && dot.contract_lhs[..] == [3, 4, 6]

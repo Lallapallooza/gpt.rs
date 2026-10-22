@@ -38,10 +38,20 @@ fn run_binary_case<B: PortableBackend + 'static>(
 }
 
 fn run_binary_special_values_case<B: PortableBackend + 'static>(backend: &Arc<B>, op: BinaryOp) {
-    let n = SPECIAL_VALUES.len();
-    let a_data: Vec<f32> = (0..n * n).map(|i| SPECIAL_VALUES[i / n]).collect();
-    let b_data: Vec<f32> = (0..n * n).map(|i| SPECIAL_VALUES[i % n]).collect();
-    check_binary(backend, &[n, n], &a_data, &b_data, op);
+    let special_count = SPECIAL_VALUES.len();
+    let a_data: Vec<f32> = (0..special_count * special_count)
+        .map(|index| SPECIAL_VALUES[index / special_count])
+        .collect();
+    let b_data: Vec<f32> = (0..special_count * special_count)
+        .map(|index| SPECIAL_VALUES[index % special_count])
+        .collect();
+    check_binary(
+        backend,
+        &[special_count, special_count],
+        &a_data,
+        &b_data,
+        op,
+    );
 }
 
 fn check_binary<B: PortableBackend + 'static>(
@@ -124,10 +134,10 @@ fn run_clamp_case<B: PortableBackend + 'static>(
     let len: usize = shape.iter().product();
 
     let base_data = random_vec(&mut rng, len);
-    let min_data: Vec<f32> = base_data.iter().map(|v| v - 0.5).collect();
-    let max_data: Vec<f32> = base_data.iter().map(|v| v + 0.5).collect();
-    let min_data = (!max_only).then_some(min_data.as_slice());
-    let max_data = (!min_only).then_some(max_data.as_slice());
+    let lower_bounds: Vec<f32> = base_data.iter().map(|value| value - 0.5).collect();
+    let upper_bounds: Vec<f32> = base_data.iter().map(|value| value + 0.5).collect();
+    let min_data = (!max_only).then_some(lower_bounds.as_slice());
+    let max_data = (!min_only).then_some(upper_bounds.as_slice());
     check_clamp(backend, shape, &base_data, min_data, max_data);
 }
 
@@ -140,11 +150,11 @@ fn check_clamp<B: PortableBackend + 'static>(
 ) {
     let expected = timed_torch(|| {
         let mut out = tch_tensor_from_vec(shape, base_data);
-        if let Some(min_data) = min_data {
-            out = out.maximum(&tch_tensor_from_vec(shape, min_data));
+        if let Some(lower_bounds) = min_data {
+            out = out.maximum(&tch_tensor_from_vec(shape, lower_bounds));
         }
-        if let Some(max_data) = max_data {
-            out = out.minimum(&tch_tensor_from_vec(shape, max_data));
+        if let Some(upper_bounds) = max_data {
+            out = out.minimum(&tch_tensor_from_vec(shape, upper_bounds));
         }
         tensor_to_vec(&out)
     });
@@ -208,10 +218,22 @@ pub fn min_matches_torch_special_values<B: PortableBackend + 'static>(backend: &
 }
 
 pub fn clamp_matches_torch_special_values<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    let n = SPECIAL_VALUES.len();
-    let len = n * n * n;
-    let base: Vec<f32> = (0..len).map(|i| SPECIAL_VALUES[i / (n * n)]).collect();
-    let min: Vec<f32> = (0..len).map(|i| SPECIAL_VALUES[i / n % n]).collect();
-    let max: Vec<f32> = (0..len).map(|i| SPECIAL_VALUES[i % n]).collect();
-    check_clamp(backend, &[n, n, n], &base, Some(&min), Some(&max));
+    let special_count = SPECIAL_VALUES.len();
+    let len = special_count * special_count * special_count;
+    let base: Vec<f32> = (0..len)
+        .map(|index| SPECIAL_VALUES[index / (special_count * special_count)])
+        .collect();
+    let min: Vec<f32> = (0..len)
+        .map(|index| SPECIAL_VALUES[index / special_count % special_count])
+        .collect();
+    let max: Vec<f32> = (0..len)
+        .map(|index| SPECIAL_VALUES[index % special_count])
+        .collect();
+    check_clamp(
+        backend,
+        &[special_count, special_count, special_count],
+        &base,
+        Some(&min),
+        Some(&max),
+    );
 }

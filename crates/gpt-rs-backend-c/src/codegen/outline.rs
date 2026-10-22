@@ -43,7 +43,7 @@ impl Outliner {
     /// variable to the next parameter.
     pub(super) fn rename(
         &self,
-        inst: &Instruction<'_>,
+        inst: &Instruction,
         value_infos: &HashMap<Value, ValueInfo>,
     ) -> Result<RenamedOperands> {
         let values = inst.operands.iter().chain(&inst.results).copied();

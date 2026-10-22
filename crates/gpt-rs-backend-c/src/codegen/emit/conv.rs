@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
-use gpt_rs_ir::dialects::tensor::{ExtractPatches, TensorOp};
+use gpt_rs_ir::dialects::tensor::{ExtractPatches, TensorOps};
 use gpt_rs_ir::ir::{DType, TensorType, Value};
 
 use super::super::profile::register_op_profile_unary;
@@ -15,10 +15,7 @@ use super::super::value_info::{
 use super::EmitContext;
 use crate::kernels::PANEL_N;
 
-pub(super) fn emit_instruction(
-    inst: &Instruction<'_>,
-    ctx: &mut EmitContext<'_>,
-) -> Result<Option<usize>> {
+pub(super) fn emit_instruction(inst: &Instruction, ctx: &mut EmitContext) -> Result<Option<usize>> {
     let EmitContext {
         module,
         value_infos,
@@ -30,7 +27,7 @@ pub(super) fn emit_instruction(
         return Ok(None);
     };
     let op_id = match op {
-        TensorOp::ExtractPatches(spec) => {
+        TensorOps::ExtractPatches(spec) => {
             let out_info = output_info(value_infos, inst.result())?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             ensure_dtype(input_dtype, DType::F32, "extract_patches input must be f32")?;

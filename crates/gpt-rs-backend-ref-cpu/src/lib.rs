@@ -50,9 +50,9 @@ impl PortableBackend for CpuPortableBackend {
         })
     }
 
-    fn run(&self, exe: &Function, args: &[HostTensor]) -> Result<Vec<HostTensor>> {
-        let args = args.iter().cloned().map(HostValue::Tensor).collect();
-        interp::run(&exe.module, &exe.name, args)?
+    fn run(&self, exe: &Function, args: Vec<HostTensor>) -> Result<Vec<HostTensor>> {
+        let values = args.into_iter().map(HostValue::Tensor).collect();
+        interp::run(&exe.module, &exe.name, values)?
             .into_iter()
             .map(|value| match value {
                 HostValue::Tensor(tensor) => Ok(tensor),

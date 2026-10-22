@@ -6,14 +6,6 @@ use tch::Tensor as TchTensor;
 
 use super::common::*;
 
-fn conv_params(stride: [usize; 2], padding: Padding2d) -> Conv2dParams {
-    Conv2dParams {
-        stride,
-        padding,
-        ..Conv2dParams::default()
-    }
-}
-
 fn tch_permute(tensor: &TchTensor, perm: &[i64]) -> TchTensor {
     tensor.permute(perm)
 }
@@ -21,9 +13,9 @@ fn tch_permute(tensor: &TchTensor, perm: &[i64]) -> TchTensor {
 #[allow(clippy::too_many_arguments)]
 fn run_conv2d_case<B: PortableBackend + 'static>(
     backend: &Arc<B>,
-    n: usize,
-    h: usize,
-    w: usize,
+    batch: usize,
+    height: usize,
+    width: usize,
     c_in: usize,
     c_out: usize,
     kernel: [usize; 2],
@@ -35,7 +27,7 @@ fn run_conv2d_case<B: PortableBackend + 'static>(
     seed: u64,
 ) {
     let mut rng = seeded_rng(seed);
-    let x_len = n * h * w * c_in;
+    let x_len = batch * height * width * c_in;
     let x_data = random_vec(&mut rng, x_len);
     let weight_len = c_out * (c_in / groups) * kernel[0] * kernel[1];
     let weight_data = random_vec(&mut rng, weight_len);
@@ -45,9 +37,9 @@ fn run_conv2d_case<B: PortableBackend + 'static>(
         let w_t = tch_tensor_from_vec(&[c_out, c_in / groups, kernel[0], kernel[1]], &weight_data);
         let bias_t = tch_tensor_from_vec(&[c_out], &bias_data);
 
-        let x_t = tch_tensor_from_vec(&[n, h, w, c_in], &x_data);
-        let x_t = tch_permute(&x_t, &[0, 3, 1, 2]);
-        let y_t = x_t.conv2d(
+        let x_nhwc = tch_tensor_from_vec(&[batch, height, width, c_in], &x_data);
+        let x_nchw = tch_permute(&x_nhwc, &[0, 3, 1, 2]);
+        let y_nchw = x_nchw.conv2d(
             &w_t,
             if bias { Some(&bias_t) } else { None },
             [stride[0] as i64, stride[1] as i64],
@@ -55,13 +47,13 @@ fn run_conv2d_case<B: PortableBackend + 'static>(
             [dilation[0] as i64, dilation[1] as i64],
             groups as i64,
         );
-        let y_t = tch_permute(&y_t, &[0, 2, 3, 1]);
-        tensor_to_vec(&y_t)
+        let y_nhwc = tch_permute(&y_nchw, &[0, 2, 3, 1]);
+        tensor_to_vec(&y_nhwc)
     });
 
     let actual = timed_gpt(|| {
-        let x = device_tensor_from_data(backend, &[n, h, w, c_in], &x_data);
-        let w = device_tensor_from_data(
+        let x = device_tensor_from_data(backend, &[batch, height, width, c_in], &x_data);
+        let weight = device_tensor_from_data(
             backend,
             &[c_out, c_in / groups, kernel[0], kernel[1]],
             &weight_data,
@@ -73,12 +65,12 @@ fn run_conv2d_case<B: PortableBackend + 'static>(
             padding,
             groups,
         };
-        let y = if bias {
-            functional::conv2d(&x, &w, Some(&bias_dev), params)
+        let output = if bias {
+            functional::conv2d(&x, &weight, Some(&bias_dev), params)
         } else {
-            functional::conv2d(&x, &w, None, params)
+            functional::conv2d(&x, &weight, None, params)
         };
-        to_host_vec(&y)
+        to_host_vec(&output)
     });
 
     assert_close(&expected, &actual);
@@ -87,577 +79,257 @@ fn run_conv2d_case<B: PortableBackend + 'static>(
 #[allow(clippy::too_many_arguments)]
 fn run_max_pool_case<B: PortableBackend + 'static>(
     backend: &Arc<B>,
-    n: usize,
-    h: usize,
-    w: usize,
-    c: usize,
+    batch: usize,
+    height: usize,
+    width: usize,
+    channels: usize,
     window: [usize; 2],
     stride: [usize; 2],
     padding: Padding2d,
     seed: u64,
 ) {
     let mut rng = seeded_rng(seed);
-    let x_data = random_vec(&mut rng, n * h * w * c);
-    check_max_pool(backend, [n, h, w, c], &x_data, window, stride, padding);
+    let x_data = random_vec(&mut rng, batch * height * width * channels);
+    check_max_pool(
+        backend,
+        [batch, height, width, channels],
+        &x_data,
+        window,
+        stride,
+        padding,
+    );
 }
 
 fn check_max_pool<B: PortableBackend + 'static>(
     backend: &Arc<B>,
-    [n, h, w, c]: [usize; 4],
+    shape: [usize; 4],
     x_data: &[f32],
     window: [usize; 2],
     stride: [usize; 2],
     padding: Padding2d,
 ) {
     let expected = timed_torch(|| {
-        let x_t = tch_tensor_from_vec(&[n, h, w, c], x_data);
-        let x_t = tch_permute(&x_t, &[0, 3, 1, 2]);
-        let y_t = x_t.max_pool2d(
+        let x_nhwc = tch_tensor_from_vec(&shape, x_data);
+        let x_nchw = tch_permute(&x_nhwc, &[0, 3, 1, 2]);
+        let y_nchw = x_nchw.max_pool2d(
             [window[0] as i64, window[1] as i64],
             [stride[0] as i64, stride[1] as i64],
             [padding.top as i64, padding.left as i64],
             [1, 1],
             false,
         );
-        let y_t = tch_permute(&y_t, &[0, 2, 3, 1]);
-        tensor_to_vec(&y_t)
+        let y_nhwc = tch_permute(&y_nchw, &[0, 2, 3, 1]);
+        tensor_to_vec(&y_nhwc)
     });
 
     let actual = timed_gpt(|| {
-        let x = device_tensor_from_data(backend, &[n, h, w, c], x_data);
-        let y = functional::max_pool2d(&x, window, stride, padding);
-        to_host_vec(&y)
+        let x = device_tensor_from_data(backend, &shape, x_data);
+        let output = functional::max_pool2d(&x, window, stride, padding);
+        to_host_vec(&output)
     });
 
     assert_close(&expected, &actual);
 }
 
 pub fn conv2d_nhwc_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    let mut rng = seeded_rng(101);
-    let (n, h, w, c_in, c_out) = (1usize, 7usize, 8usize, 3usize, 4usize);
-    let kernel = [3usize, 3usize];
-    let stride = [2usize, 2usize];
-    let padding = Padding2d {
-        top: 1,
-        bottom: 1,
-        left: 1,
-        right: 1,
-    };
-
-    let x_len = n * h * w * c_in;
-    let x_data = random_vec(&mut rng, x_len);
-    let weight_len = c_out * c_in * kernel[0] * kernel[1];
-    let weight_data = random_vec(&mut rng, weight_len);
-    let bias_data = random_vec(&mut rng, c_out);
-
-    let expected = timed_torch(|| {
-        let w_t = tch_tensor_from_vec(&[c_out, c_in, kernel[0], kernel[1]], &weight_data);
-        let b_t = tch_tensor_from_vec(&[c_out], &bias_data);
-
-        // Torch expects NCHW.
-        let x_t = tch_tensor_from_vec(&[n, h, w, c_in], &x_data);
-        let x_t = tch_permute(&x_t, &[0, 3, 1, 2]);
-        let y_t = x_t.conv2d(
-            &w_t,
-            Some(&b_t),
-            [stride[0] as i64, stride[1] as i64],
-            [padding.top as i64, padding.left as i64],
-            [1, 1],
-            1,
-        );
-        let y_t = tch_permute(&y_t, &[0, 2, 3, 1]);
-        tensor_to_vec(&y_t)
-    });
-
-    let actual = timed_gpt(|| {
-        let x = device_tensor_from_data(backend, &[n, h, w, c_in], &x_data);
-        let w =
-            device_tensor_from_data(backend, &[c_out, c_in, kernel[0], kernel[1]], &weight_data);
-        let bias = device_tensor_from_data(backend, &[c_out], &bias_data);
-
-        let params = conv_params(stride, padding);
-        let y = functional::conv2d(&x, &w, Some(&bias), params);
-        to_host_vec(&y)
-    });
-
-    assert_close(&expected, &actual);
+    run_conv2d_case(
+        backend,
+        1,
+        7,
+        8,
+        3,
+        4,
+        [3, 3],
+        [2, 2],
+        Padding2d::uniform(1),
+        [1, 1],
+        1,
+        true,
+        101,
+    );
 }
 
 pub fn conv2d_nhwc_kernel3_stride1_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
     // Covers the most common ResNet block conv: 3x3, stride 1, padding 1.
-    let mut rng = seeded_rng(106);
-    let (n, h, w, c_in, c_out) = (2usize, 6usize, 7usize, 5usize, 4usize);
-    let kernel = [3usize, 3usize];
-    let stride = [1usize, 1usize];
-    let padding = Padding2d {
-        top: 1,
-        bottom: 1,
-        left: 1,
-        right: 1,
-    };
-
-    let x_len = n * h * w * c_in;
-    let x_data = random_vec(&mut rng, x_len);
-    let weight_len = c_out * c_in * kernel[0] * kernel[1];
-    let weight_data = random_vec(&mut rng, weight_len);
-    let bias_data = random_vec(&mut rng, c_out);
-
-    let expected = timed_torch(|| {
-        let w_t = tch_tensor_from_vec(&[c_out, c_in, kernel[0], kernel[1]], &weight_data);
-        let b_t = tch_tensor_from_vec(&[c_out], &bias_data);
-
-        let x_t = tch_tensor_from_vec(&[n, h, w, c_in], &x_data);
-        let x_t = tch_permute(&x_t, &[0, 3, 1, 2]);
-        let y_t = x_t.conv2d(
-            &w_t,
-            Some(&b_t),
-            [stride[0] as i64, stride[1] as i64],
-            [padding.top as i64, padding.left as i64],
-            [1, 1],
-            1,
-        );
-        let y_t = tch_permute(&y_t, &[0, 2, 3, 1]);
-        tensor_to_vec(&y_t)
-    });
-
-    let actual = timed_gpt(|| {
-        let x = device_tensor_from_data(backend, &[n, h, w, c_in], &x_data);
-        let w =
-            device_tensor_from_data(backend, &[c_out, c_in, kernel[0], kernel[1]], &weight_data);
-        let bias = device_tensor_from_data(backend, &[c_out], &bias_data);
-
-        let params = conv_params(stride, padding);
-        let y = functional::conv2d(&x, &w, Some(&bias), params);
-        to_host_vec(&y)
-    });
-
-    assert_close(&expected, &actual);
+    run_conv2d_case(
+        backend,
+        2,
+        6,
+        7,
+        5,
+        4,
+        [3, 3],
+        [1, 1],
+        Padding2d::uniform(1),
+        [1, 1],
+        1,
+        true,
+        106,
+    );
 }
 
 pub fn conv2d_nhwc_kernel7_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    let mut rng = seeded_rng(102);
-    let (n, h, w, c_in, c_out) = (1usize, 9usize, 10usize, 3usize, 5usize);
-    let kernel = [7usize, 7usize];
-    let stride = [2usize, 2usize];
-    let padding = Padding2d {
-        top: 3,
-        bottom: 3,
-        left: 3,
-        right: 3,
-    };
-
-    let x_len = n * h * w * c_in;
-    let x_data = random_vec(&mut rng, x_len);
-    let weight_len = c_out * c_in * kernel[0] * kernel[1];
-    let weight_data = random_vec(&mut rng, weight_len);
-    let bias_data = random_vec(&mut rng, c_out);
-
-    let expected = timed_torch(|| {
-        let w_t = tch_tensor_from_vec(&[c_out, c_in, kernel[0], kernel[1]], &weight_data);
-        let b_t = tch_tensor_from_vec(&[c_out], &bias_data);
-
-        let x_t = tch_tensor_from_vec(&[n, h, w, c_in], &x_data);
-        let x_t = tch_permute(&x_t, &[0, 3, 1, 2]);
-        let y_t = x_t.conv2d(
-            &w_t,
-            Some(&b_t),
-            [stride[0] as i64, stride[1] as i64],
-            [padding.top as i64, padding.left as i64],
-            [1, 1],
-            1,
-        );
-        let y_t = tch_permute(&y_t, &[0, 2, 3, 1]);
-        tensor_to_vec(&y_t)
-    });
-
-    let actual = timed_gpt(|| {
-        let x = device_tensor_from_data(backend, &[n, h, w, c_in], &x_data);
-        let w =
-            device_tensor_from_data(backend, &[c_out, c_in, kernel[0], kernel[1]], &weight_data);
-        let bias = device_tensor_from_data(backend, &[c_out], &bias_data);
-
-        let params = conv_params(stride, padding);
-        let y = functional::conv2d(&x, &w, Some(&bias), params);
-        to_host_vec(&y)
-    });
-
-    assert_close(&expected, &actual);
+    run_conv2d_case(
+        backend,
+        1,
+        9,
+        10,
+        3,
+        5,
+        [7, 7],
+        [2, 2],
+        Padding2d::uniform(3),
+        [1, 1],
+        1,
+        true,
+        102,
+    );
 }
 
 pub fn conv2d_nhwc_kernel1_stride2_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    let mut rng = seeded_rng(104);
-    let (n, h, w, c_in, c_out) = (1usize, 5usize, 6usize, 8usize, 4usize);
-    let kernel = [1usize, 1usize];
-    let stride = [2usize, 2usize];
-    let padding = Padding2d::default();
-
-    let x_len = n * h * w * c_in;
-    let x_data = random_vec(&mut rng, x_len);
-    let weight_len = c_out * c_in * kernel[0] * kernel[1];
-    let weight_data = random_vec(&mut rng, weight_len);
-    let bias_data = random_vec(&mut rng, c_out);
-
-    let expected = timed_torch(|| {
-        let w_t = tch_tensor_from_vec(&[c_out, c_in, kernel[0], kernel[1]], &weight_data);
-        let b_t = tch_tensor_from_vec(&[c_out], &bias_data);
-
-        let x_t = tch_tensor_from_vec(&[n, h, w, c_in], &x_data);
-        let x_t = tch_permute(&x_t, &[0, 3, 1, 2]);
-        let y_t = x_t.conv2d(
-            &w_t,
-            Some(&b_t),
-            [stride[0] as i64, stride[1] as i64],
-            [0, 0],
-            [1, 1],
-            1,
-        );
-        let y_t = tch_permute(&y_t, &[0, 2, 3, 1]);
-        tensor_to_vec(&y_t)
-    });
-
-    let actual = timed_gpt(|| {
-        let x = device_tensor_from_data(backend, &[n, h, w, c_in], &x_data);
-        let w =
-            device_tensor_from_data(backend, &[c_out, c_in, kernel[0], kernel[1]], &weight_data);
-        let bias = device_tensor_from_data(backend, &[c_out], &bias_data);
-
-        let params = conv_params(stride, padding);
-        let y = functional::conv2d(&x, &w, Some(&bias), params);
-        to_host_vec(&y)
-    });
-
-    assert_close(&expected, &actual);
+    run_conv2d_case(
+        backend,
+        1,
+        5,
+        6,
+        8,
+        4,
+        [1, 1],
+        [2, 2],
+        Padding2d::default(),
+        [1, 1],
+        1,
+        true,
+        104,
+    );
 }
 
 pub fn conv2d_nhwc_kernel1_stride1_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    let mut rng = seeded_rng(105);
-    let (n, h, w, c_in, c_out) = (2usize, 5usize, 4usize, 6usize, 7usize);
-    let kernel = [1usize, 1usize];
-    let stride = [1usize, 1usize];
-    let padding = Padding2d::default();
-
-    let x_len = n * h * w * c_in;
-    let x_data = random_vec(&mut rng, x_len);
-    let weight_len = c_out * c_in * kernel[0] * kernel[1];
-    let weight_data = random_vec(&mut rng, weight_len);
-    let bias_data = random_vec(&mut rng, c_out);
-
-    let expected = timed_torch(|| {
-        let w_t = tch_tensor_from_vec(&[c_out, c_in, kernel[0], kernel[1]], &weight_data);
-        let b_t = tch_tensor_from_vec(&[c_out], &bias_data);
-
-        let x_t = tch_tensor_from_vec(&[n, h, w, c_in], &x_data);
-        let x_t = tch_permute(&x_t, &[0, 3, 1, 2]);
-        let y_t = x_t.conv2d(&w_t, Some(&b_t), [1, 1], [0, 0], [1, 1], 1);
-        let y_t = tch_permute(&y_t, &[0, 2, 3, 1]);
-        tensor_to_vec(&y_t)
-    });
-
-    let actual = timed_gpt(|| {
-        let x = device_tensor_from_data(backend, &[n, h, w, c_in], &x_data);
-        let w =
-            device_tensor_from_data(backend, &[c_out, c_in, kernel[0], kernel[1]], &weight_data);
-        let bias = device_tensor_from_data(backend, &[c_out], &bias_data);
-
-        let params = conv_params(stride, padding);
-        let y = functional::conv2d(&x, &w, Some(&bias), params);
-        to_host_vec(&y)
-    });
-
-    assert_close(&expected, &actual);
+    run_conv2d_case(
+        backend,
+        2,
+        5,
+        4,
+        6,
+        7,
+        [1, 1],
+        [1, 1],
+        Padding2d::default(),
+        [1, 1],
+        1,
+        true,
+        105,
+    );
 }
 
 pub fn conv2d_nhwc_kernel1_stride2_resnet_matches_torch<B: PortableBackend + 'static>(
     backend: &Arc<B>,
 ) {
-    let mut rng = seeded_rng(201);
-    let (n, h, w, c_in, c_out) = (1usize, 28usize, 28usize, 32usize, 64usize);
-    let kernel = [1usize, 1usize];
-    let stride = [2usize, 2usize];
-    let padding = Padding2d::default();
-
-    let x_len = n * h * w * c_in;
-    let x_data = random_vec(&mut rng, x_len);
-    let weight_len = c_out * c_in * kernel[0] * kernel[1];
-    let weight_data = random_vec(&mut rng, weight_len);
-    let bias_data = random_vec(&mut rng, c_out);
-
-    let expected = timed_torch(|| {
-        let w_t = tch_tensor_from_vec(&[c_out, c_in, kernel[0], kernel[1]], &weight_data);
-        let b_t = tch_tensor_from_vec(&[c_out], &bias_data);
-
-        let x_t = tch_tensor_from_vec(&[n, h, w, c_in], &x_data);
-        let x_t = tch_permute(&x_t, &[0, 3, 1, 2]);
-        let y_t = x_t.conv2d(
-            &w_t,
-            Some(&b_t),
-            [stride[0] as i64, stride[1] as i64],
-            [0, 0],
-            [1, 1],
-            1,
-        );
-        let y_t = tch_permute(&y_t, &[0, 2, 3, 1]);
-        tensor_to_vec(&y_t)
-    });
-
-    let actual = timed_gpt(|| {
-        let x = device_tensor_from_data(backend, &[n, h, w, c_in], &x_data);
-        let w =
-            device_tensor_from_data(backend, &[c_out, c_in, kernel[0], kernel[1]], &weight_data);
-        let bias = device_tensor_from_data(backend, &[c_out], &bias_data);
-
-        let params = conv_params(stride, padding);
-        let y = functional::conv2d(&x, &w, Some(&bias), params);
-        to_host_vec(&y)
-    });
-
-    assert_close(&expected, &actual);
+    run_conv2d_case(
+        backend,
+        1,
+        28,
+        28,
+        32,
+        64,
+        [1, 1],
+        [2, 2],
+        Padding2d::default(),
+        [1, 1],
+        1,
+        true,
+        201,
+    );
 }
 
 pub fn conv2d_nhwc_kernel3_stride1_resnet_matches_torch<B: PortableBackend + 'static>(
     backend: &Arc<B>,
 ) {
-    let mut rng = seeded_rng(202);
-    let (n, h, w, c_in, c_out) = (1usize, 28usize, 28usize, 32usize, 32usize);
-    let kernel = [3usize, 3usize];
-    let stride = [1usize, 1usize];
-    let padding = Padding2d {
-        top: 1,
-        bottom: 1,
-        left: 1,
-        right: 1,
-    };
-
-    let x_len = n * h * w * c_in;
-    let x_data = random_vec(&mut rng, x_len);
-    let weight_len = c_out * c_in * kernel[0] * kernel[1];
-    let weight_data = random_vec(&mut rng, weight_len);
-    let bias_data = random_vec(&mut rng, c_out);
-
-    let expected = timed_torch(|| {
-        let w_t = tch_tensor_from_vec(&[c_out, c_in, kernel[0], kernel[1]], &weight_data);
-        let b_t = tch_tensor_from_vec(&[c_out], &bias_data);
-
-        let x_t = tch_tensor_from_vec(&[n, h, w, c_in], &x_data);
-        let x_t = tch_permute(&x_t, &[0, 3, 1, 2]);
-        let y_t = x_t.conv2d(
-            &w_t,
-            Some(&b_t),
-            [stride[0] as i64, stride[1] as i64],
-            [padding.top as i64, padding.left as i64],
-            [1, 1],
-            1,
-        );
-        let y_t = tch_permute(&y_t, &[0, 2, 3, 1]);
-        tensor_to_vec(&y_t)
-    });
-
-    let actual = timed_gpt(|| {
-        let x = device_tensor_from_data(backend, &[n, h, w, c_in], &x_data);
-        let w =
-            device_tensor_from_data(backend, &[c_out, c_in, kernel[0], kernel[1]], &weight_data);
-        let bias = device_tensor_from_data(backend, &[c_out], &bias_data);
-
-        let params = conv_params(stride, padding);
-        let y = functional::conv2d(&x, &w, Some(&bias), params);
-        to_host_vec(&y)
-    });
-
-    assert_close(&expected, &actual);
+    run_conv2d_case(
+        backend,
+        1,
+        28,
+        28,
+        32,
+        32,
+        [3, 3],
+        [1, 1],
+        Padding2d::uniform(1),
+        [1, 1],
+        1,
+        true,
+        202,
+    );
 }
 
 pub fn conv2d_nhwc_kernel7_stride2_resnet_matches_torch<B: PortableBackend + 'static>(
     backend: &Arc<B>,
 ) {
-    let mut rng = seeded_rng(203);
-    let (n, h, w, c_in, c_out) = (1usize, 64usize, 64usize, 3usize, 32usize);
-    let kernel = [7usize, 7usize];
-    let stride = [2usize, 2usize];
-    let padding = Padding2d {
-        top: 3,
-        bottom: 3,
-        left: 3,
-        right: 3,
-    };
-
-    let x_len = n * h * w * c_in;
-    let x_data = random_vec(&mut rng, x_len);
-    let weight_len = c_out * c_in * kernel[0] * kernel[1];
-    let weight_data = random_vec(&mut rng, weight_len);
-    let bias_data = random_vec(&mut rng, c_out);
-
-    let expected = timed_torch(|| {
-        let w_t = tch_tensor_from_vec(&[c_out, c_in, kernel[0], kernel[1]], &weight_data);
-        let b_t = tch_tensor_from_vec(&[c_out], &bias_data);
-
-        let x_t = tch_tensor_from_vec(&[n, h, w, c_in], &x_data);
-        let x_t = tch_permute(&x_t, &[0, 3, 1, 2]);
-        let y_t = x_t.conv2d(
-            &w_t,
-            Some(&b_t),
-            [stride[0] as i64, stride[1] as i64],
-            [padding.top as i64, padding.left as i64],
-            [1, 1],
-            1,
-        );
-        let y_t = tch_permute(&y_t, &[0, 2, 3, 1]);
-        tensor_to_vec(&y_t)
-    });
-
-    let actual = timed_gpt(|| {
-        let x = device_tensor_from_data(backend, &[n, h, w, c_in], &x_data);
-        let w =
-            device_tensor_from_data(backend, &[c_out, c_in, kernel[0], kernel[1]], &weight_data);
-        let bias = device_tensor_from_data(backend, &[c_out], &bias_data);
-
-        let params = conv_params(stride, padding);
-        let y = functional::conv2d(&x, &w, Some(&bias), params);
-        to_host_vec(&y)
-    });
-
-    assert_close(&expected, &actual);
+    run_conv2d_case(
+        backend,
+        1,
+        64,
+        64,
+        3,
+        32,
+        [7, 7],
+        [2, 2],
+        Padding2d::uniform(3),
+        [1, 1],
+        1,
+        true,
+        203,
+    );
 }
 
 pub fn depthwise_conv2d_nhwc_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    let mut rng = seeded_rng(103);
-    let (n, h, w, c) = (1usize, 6usize, 5usize, 4usize);
-    let kernel = [3usize, 3usize];
-    let stride = [1usize, 1usize];
-    let padding = Padding2d {
-        top: 1,
-        bottom: 1,
-        left: 1,
-        right: 1,
-    };
-
-    let x_len = n * h * w * c;
-    let x_data = random_vec(&mut rng, x_len);
-    let weight_len = c * kernel[0] * kernel[1];
-    let weight_data = random_vec(&mut rng, weight_len);
-    let bias_data = random_vec(&mut rng, c);
-
-    let expected = timed_torch(|| {
-        let w_t = tch_tensor_from_vec(&[c, 1, kernel[0], kernel[1]], &weight_data);
-        let b_t = tch_tensor_from_vec(&[c], &bias_data);
-
-        let x_t = tch_tensor_from_vec(&[n, h, w, c], &x_data);
-        let x_t = tch_permute(&x_t, &[0, 3, 1, 2]);
-        let y_t = x_t.conv2d(
-            &w_t,
-            Some(&b_t),
-            [stride[0] as i64, stride[1] as i64],
-            [padding.top as i64, padding.left as i64],
-            [1, 1],
-            c as i64,
-        );
-        let y_t = tch_permute(&y_t, &[0, 2, 3, 1]);
-        tensor_to_vec(&y_t)
-    });
-
-    let actual = timed_gpt(|| {
-        let x = device_tensor_from_data(backend, &[n, h, w, c], &x_data);
-        let w = device_tensor_from_data(backend, &[c, 1, kernel[0], kernel[1]], &weight_data);
-        let bias = device_tensor_from_data(backend, &[c], &bias_data);
-
-        let params = Conv2dParams {
-            groups: c,
-            ..conv_params(stride, padding)
-        };
-        let y = functional::conv2d(&x, &w, Some(&bias), params);
-        to_host_vec(&y)
-    });
-
-    assert_close(&expected, &actual);
+    run_conv2d_case(
+        backend,
+        1,
+        6,
+        5,
+        4,
+        4,
+        [3, 3],
+        [1, 1],
+        Padding2d::uniform(1),
+        [1, 1],
+        4,
+        true,
+        103,
+    );
 }
 
 pub fn depthwise_conv2d_nhwc_stride2_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    let mut rng = seeded_rng(111);
-    let (n, h, w, c) = (1usize, 7usize, 6usize, 4usize);
-    let kernel = [3usize, 3usize];
-    let stride = [2usize, 2usize];
-    let padding = Padding2d {
-        top: 1,
-        bottom: 1,
-        left: 1,
-        right: 1,
-    };
-
-    let x_len = n * h * w * c;
-    let x_data = random_vec(&mut rng, x_len);
-    let weight_len = c * kernel[0] * kernel[1];
-    let weight_data = random_vec(&mut rng, weight_len);
-    let bias_data = random_vec(&mut rng, c);
-
-    let expected = timed_torch(|| {
-        let w_t = tch_tensor_from_vec(&[c, 1, kernel[0], kernel[1]], &weight_data);
-        let b_t = tch_tensor_from_vec(&[c], &bias_data);
-
-        let x_t = tch_tensor_from_vec(&[n, h, w, c], &x_data);
-        let x_t = tch_permute(&x_t, &[0, 3, 1, 2]);
-        let y_t = x_t.conv2d(
-            &w_t,
-            Some(&b_t),
-            [stride[0] as i64, stride[1] as i64],
-            [padding.top as i64, padding.left as i64],
-            [1, 1],
-            c as i64,
-        );
-        let y_t = tch_permute(&y_t, &[0, 2, 3, 1]);
-        tensor_to_vec(&y_t)
-    });
-
-    let actual = timed_gpt(|| {
-        let x = device_tensor_from_data(backend, &[n, h, w, c], &x_data);
-        let w = device_tensor_from_data(backend, &[c, 1, kernel[0], kernel[1]], &weight_data);
-        let bias = device_tensor_from_data(backend, &[c], &bias_data);
-
-        let params = Conv2dParams {
-            groups: c,
-            ..conv_params(stride, padding)
-        };
-        let y = functional::conv2d(&x, &w, Some(&bias), params);
-        to_host_vec(&y)
-    });
-
-    assert_close(&expected, &actual);
+    run_conv2d_case(
+        backend,
+        1,
+        7,
+        6,
+        4,
+        4,
+        [3, 3],
+        [2, 2],
+        Padding2d::uniform(1),
+        [1, 1],
+        4,
+        true,
+        111,
+    );
 }
 
 pub fn max_pool2d_nhwc_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
-    let mut rng = seeded_rng(107);
-    let (n, h, w, c) = (1usize, 7usize, 8usize, 3usize);
-    let x_len = n * h * w * c;
-    let x_data = random_vec(&mut rng, x_len);
-
-    let window = [3usize, 3usize];
-    let stride = [2usize, 2usize];
-    let padding = Padding2d {
-        top: 1,
-        bottom: 1,
-        left: 1,
-        right: 1,
-    };
-
-    let expected = timed_torch(|| {
-        let x_t = tch_tensor_from_vec(&[n, h, w, c], &x_data);
-        let x_t = tch_permute(&x_t, &[0, 3, 1, 2]);
-        let y_t = x_t.max_pool2d(
-            [window[0] as i64, window[1] as i64],
-            [stride[0] as i64, stride[1] as i64],
-            [padding.top as i64, padding.left as i64],
-            [1, 1],
-            false,
-        );
-        let y_t = tch_permute(&y_t, &[0, 2, 3, 1]);
-        tensor_to_vec(&y_t)
-    });
-
-    let actual = timed_gpt(|| {
-        let x = device_tensor_from_data(backend, &[n, h, w, c], &x_data);
-        let y = functional::max_pool2d(&x, window, stride, padding);
-        to_host_vec(&y)
-    });
-
-    assert_close(&expected, &actual);
+    run_max_pool_case(
+        backend,
+        1,
+        7,
+        8,
+        3,
+        [3, 3],
+        [2, 2],
+        Padding2d::uniform(1),
+        107,
+    );
 }
 
 pub fn relu6_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
@@ -673,10 +345,43 @@ pub fn relu6_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
 
     let actual = timed_gpt(|| {
         let x = device_tensor_from_data(backend, &shape, &x_data);
-        let y = functional::relu6(&x);
-        to_host_vec(&y)
+        let output = functional::relu6(&x);
+        to_host_vec(&output)
     });
 
+    assert_close(&expected, &actual);
+}
+
+/// Inputs across the kinks of the hard sigmoid at -3 and 3: random values in [-5, 5), the kinks
+/// themselves, 0, and -6.
+fn hard_activation_inputs(seed: u64) -> ([usize; 2], Vec<f32>) {
+    let mut rng = seeded_rng(seed);
+    let mut data = Vec::new();
+    for value in random_vec(&mut rng, 60) {
+        data.push(value * 5.0);
+    }
+    data.extend([-3.0, 3.0, 0.0, -6.0]);
+    ([4, 16], data)
+}
+
+pub fn hard_sigmoid_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    let (shape, x_data) = hard_activation_inputs(111);
+    let expected =
+        timed_torch(|| tensor_to_vec(&tch_tensor_from_vec(&shape, &x_data).hardsigmoid()));
+    let actual = timed_gpt(|| {
+        let x = device_tensor_from_data(backend, &shape, &x_data);
+        to_host_vec(&functional::hard_sigmoid(&x))
+    });
+    assert_close(&expected, &actual);
+}
+
+pub fn hard_swish_matches_torch<B: PortableBackend + 'static>(backend: &Arc<B>) {
+    let (shape, x_data) = hard_activation_inputs(112);
+    let expected = timed_torch(|| tensor_to_vec(&tch_tensor_from_vec(&shape, &x_data).hardswish()));
+    let actual = timed_gpt(|| {
+        let x = device_tensor_from_data(backend, &shape, &x_data);
+        to_host_vec(&functional::hard_swish(&x))
+    });
     assert_close(&expected, &actual);
 }
 
@@ -691,9 +396,9 @@ pub fn global_avg_pool2d_matches_torch<B: PortableBackend + 'static>(backend: &A
 
     let actual = timed_gpt(|| {
         let x = device_tensor_from_data(backend, &shape, &x_data);
-        let y = functional::global_avg_pool2d(&x);
-        assert_eq!(y.shape().dims(), [2, 6]);
-        to_host_vec(&y)
+        let output = functional::global_avg_pool2d(&x);
+        assert_eq!(output.shape().dims(), [2, 6]);
+        to_host_vec(&output)
     });
 
     assert_close(&expected, &actual);
@@ -985,8 +690,8 @@ pub fn relu6_edge_values_matches_torch<B: PortableBackend + 'static>(backend: &A
 
     let actual = timed_gpt(|| {
         let x = device_tensor_from_data(backend, &shape, &values);
-        let y = functional::relu6(&x);
-        to_host_vec(&y)
+        let output = functional::relu6(&x);
+        to_host_vec(&output)
     });
 
     assert_close(&expected, &actual);

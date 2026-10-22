@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use gpt_rs_ir::dialects::tensor::{DynamicSlice, TensorOp};
+use gpt_rs_ir::dialects::tensor::{DynamicSlice, TensorOps};
 use gpt_rs_ir::ir::{DType, TensorType};
 
 use super::super::profile::register_op_profile_generic;
@@ -13,10 +13,7 @@ use super::super::value_info::{
 };
 use super::EmitContext;
 
-pub(super) fn emit_instruction(
-    inst: &Instruction<'_>,
-    ctx: &mut EmitContext<'_>,
-) -> Result<Option<usize>> {
+pub(super) fn emit_instruction(inst: &Instruction, ctx: &mut EmitContext) -> Result<Option<usize>> {
     let EmitContext {
         module,
         value_infos,
@@ -28,7 +25,7 @@ pub(super) fn emit_instruction(
         return Ok(None);
     };
     let op_id = match op {
-        TensorOp::Take(_) => {
+        TensorOps::Take(_) => {
             let out_info = output_info(value_infos, inst.result())?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             let indices_dtype = operand_dtype(&inst.operands[1], value_infos)?;
@@ -53,7 +50,7 @@ pub(super) fn emit_instruction(
             )?;
             op_id
         }
-        TensorOp::DynamicSlice(spec) => {
+        TensorOps::DynamicSlice(spec) => {
             let out_info = output_info(value_infos, inst.result())?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             let start_dtype = operand_dtype(&inst.operands[1], value_infos)?;
@@ -78,7 +75,7 @@ pub(super) fn emit_instruction(
             )?;
             op_id
         }
-        TensorOp::DynamicUpdateSlice(_) => {
+        TensorOps::DynamicUpdateSlice(_) => {
             let out_info = output_info(value_infos, inst.result())?;
             let input_dtype = operand_dtype(&inst.operands[0], value_infos)?;
             let update_dtype = operand_dtype(&inst.operands[1], value_infos)?;

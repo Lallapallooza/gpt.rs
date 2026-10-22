@@ -4,61 +4,23 @@
 
 use std::sync::Arc;
 
-use gpt_rs::backend::{ParamStore, PortableBackend};
 use gpt_rs::module::Layer;
 use gpt_rs::nn::layers::Linear;
 use gpt_rs::ops::graph::context::with_default_arena;
 use gpt_rs::ops::graph::GraphArena;
 use gpt_rs::tensor::{DType, DeviceTensor, HostTensor};
 use gpt_rs_backend_c::{generate_c_module, CBackend};
+use gpt_rs_backend_tests::layers::load_layer;
 use gpt_rs_backend_tests::recording_backend::RecordingBackend;
-use gpt_rs_backend_tests::{load_layer, tensor_as};
+use gpt_rs_backend_tests::tensor_as;
 use gpt_rs_ir::ir::{Module, TensorType};
-use gpt_rs_ir::passes::Pipeline;
-
-/// Records the programs the graph arena runs, which it compiles with the C backend's pipeline.
-#[derive(Default)]
-struct RecordingCBackend(RecordingBackend);
-
-impl PortableBackend for RecordingCBackend {
-    type TensorHandle = ();
-    type Executable = usize;
-
-    fn backend_name(&self) -> &str {
-        "recording-c"
-    }
-
-    fn pipeline(&self) -> Pipeline {
-        CBackend::new().pipeline()
-    }
-
-    fn params(&self) -> &ParamStore<()> {
-        self.0.params()
-    }
-
-    fn compile(&self, module: &Arc<Module>, func: &str) -> anyhow::Result<usize> {
-        self.0.compile(module, func)
-    }
-
-    fn run(&self, exe: &usize, args: &[()]) -> anyhow::Result<Vec<()>> {
-        self.0.run(exe, args)
-    }
-
-    fn upload(&self, host: HostTensor) -> anyhow::Result<()> {
-        self.0.upload(host)
-    }
-
-    fn download(&self, tensor: &()) -> anyhow::Result<HostTensor> {
-        self.0.download(tensor)
-    }
-}
 
 /// Runs an `nn::Linear` whose `[3, 4]` f8e4m3 weight has a one-element scale of dtype `scale`,
 /// with inputs cast to `input` when it is set. Returns the module the graph arena compiled for it
 /// and the name of its function. A model runs its layers inside one default arena, so the test does
 /// too.
 fn optimized_fp8_linear(input: Option<DType>, scale: DType) -> (Arc<Module>, String) {
-    let backend = Arc::new(RecordingCBackend::default());
+    let backend = Arc::new(RecordingBackend::new(CBackend::new()));
     let weight = HostTensor::from_le_bytes(&TensorType::new(DType::F8E4M3, [3, 4]), &[0x38; 12]);
     let tensors = [
         ("weight".to_string(), weight.expect("f8e4m3 weight")),
@@ -75,7 +37,7 @@ fn optimized_fp8_linear(input: Option<DType>, scale: DType) -> (Arc<Module>, Str
         let out = layer.call(&x);
         out.materialize().expect("materialize linear");
     });
-    backend.0.recorded_or_panic()
+    backend.last_compiled()
 }
 
 /// The C program reads an FP8 weight and its scale as stored, as `docs/backends/c.md` documents:

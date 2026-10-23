@@ -257,11 +257,12 @@ pub fn chrome_trace_to_folded(trace_json: &str) -> Option<String> {
 
     let mut folded: BTreeMap<String, u64> = BTreeMap::new();
     for (_tid, mut events) in by_tid {
-        events.sort_by(|a, b| {
-            a.ts.cmp(&b.ts)
-                .then_with(|| b.dur.cmp(&a.dur))
-                .then_with(|| a.cat.cmp(&b.cat))
-                .then_with(|| a.name.cmp(&b.name))
+        events.sort_by(|left, right| {
+            left.ts
+                .cmp(&right.ts)
+                .then_with(|| right.dur.cmp(&left.dur))
+                .then_with(|| left.cat.cmp(&right.cat))
+                .then_with(|| left.name.cmp(&right.name))
         });
         let mut stack: Vec<(u64, String)> = Vec::new();
         for event in events {
@@ -364,10 +365,10 @@ pub fn chrome_trace_to_speedscope(trace_json: &str) -> Option<String> {
         }
         stacks.push((frames, weight));
     }
-    stacks.sort_by(|a, b| {
-        let a_key = a.0.join(";");
-        let b_key = b.0.join(";");
-        a_key.cmp(&b_key).then_with(|| a.1.cmp(&b.1))
+    stacks.sort_by(|left, right| {
+        let left_key = left.0.join(";");
+        let right_key = right.0.join(";");
+        left_key.cmp(&right_key).then_with(|| left.1.cmp(&right.1))
     });
 
     let mut frame_names = BTreeSet::new();

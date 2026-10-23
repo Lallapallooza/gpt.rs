@@ -27,13 +27,13 @@ Each category answers a different question:
 
 Filetests live under `filetests/` at the repository root:
 
-- `filetests/tensor/<topic>/*.ptir` and `filetests/tile/<topic>/*.ptir`, for the IR passes and the
-  text form;
+- `filetests/<dialect>/<topic>/*.ptir`, for the IR passes and the text form of each dialect:
+  `tensor`, `arith`, `tile`, `loop`, `isa` and `host`;
 - `filetests/backend/<backend>/*.ptir`, for the passes that a backend adds to its pipeline
   (`PortableBackend::pipeline()`).
 
 One runner, the `gpt-rs-filetests` crate, runs them, and its crate doc gives the format. `gpt-rs-ir`
-runs `filetests/tensor/` and `filetests/tile/` from its `tests/filetests.rs`. A backend crate with
+runs the directory of each dialect from its `tests/filetests.rs`. A backend crate with
 passes of its own runs its directory from its `tests/filetests.rs`, with each pass of its pipeline
 under its name and the whole pipeline as `default`.
 
@@ -71,7 +71,7 @@ It contains:
 - `src/torch_parity/`: numerical parity tests against Torch (via `tch`)
 - `src/lib.rs`: the `define_backend_tests!` macro that wires everything together
 
-Each backend crate (ref-cpu, faer, c) then contains a single test entrypoint:
+Each backend crate (ref-cpu, faer, c, x86) then contains a single test entrypoint:
 
 - `crates/<backend-crate>/tests/backend_suite.rs`
 

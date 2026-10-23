@@ -7,7 +7,7 @@ At a glance:
 - **Models** (`gpt_rs::model::*`) wire blocks together (GPT-2, ResNet, MobileNetV2, ...).
 - **Layers** (`gpt_rs::nn::layers::*`) own parameters and orchestration (`forward`, cache plumbing, shape checks).
 - **Functionals** (`gpt_rs::ops::functional::*`) are portable kernels that validate inputs and record PTIR ops.
-- **Backends** (`gpt_rs::backend::PortableBackend`) compile and run functions of the IR (faer, ref-cpu, c).
+- **Backends** (`gpt_rs::backend::PortableBackend`) compile and run functions of the IR (ref-cpu, faer, c, x86).
 - **Runtime** (`gpt_rs::runtime::load_model`) loads a Hugging Face model directory into a dynamic
   model handle.
 

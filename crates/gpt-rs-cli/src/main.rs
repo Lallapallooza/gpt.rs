@@ -1,4 +1,6 @@
 mod ir;
+mod perf;
+mod target;
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -16,7 +18,7 @@ use gpt_rs::profiling;
 use gpt_rs::runtime::{LoadOptions, LoadedModel, ModelHandle};
 use gpt_rs::tensor::HostTensor;
 use gpt_rs::tokenizer::{StreamDecoder, Tokenizer};
-use gpt_rs_ir::dialects::func::Func;
+use gpt_rs_backends::BackendOptions;
 use gpt_rs_ir::ir::Module;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -25,15 +27,21 @@ mod benchmark;
 
 use self::benchmark::compile_freeze::{self, CompileFreezeGate};
 
+/// The backend a command runs on: its name, and what it compiles for.
+struct Backend {
+    name: String,
+    options: BackendOptions,
+}
+
 /// Loads the model directory `checkpoint` onto the backend `backend`.
-fn load_checkpoint(backend: &str, checkpoint: &Path, load: &LoadArgs) -> Result<ModelHandle> {
+fn load_checkpoint(backend: &Backend, checkpoint: &Path, load: &LoadArgs) -> Result<ModelHandle> {
     let options = LoadOptions {
         runtime: ModelRuntimeConfig {
             matmul_input_dtype: load.matmul_input_dtype,
         },
         ..LoadOptions::default()
     };
-    gpt_rs_backends::load_model(backend, checkpoint, options)
+    gpt_rs_backends::load_model(&backend.name, &backend.options, checkpoint, options)
         .with_context(|| format!("failed to load checkpoint {}", checkpoint.display()))
 }
 
@@ -71,6 +79,23 @@ struct Args {
         help = "Backend to use (overrides $GPTRS_BACKEND) [default: faer]"
     )]
     backend: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "TARGET",
+        global = true,
+        help = "Target of a backend that compiles for one: a preset, host or a target file \
+                (overrides $GPTRS_TARGET) [default: host]"
+    )]
+    target: Option<String>,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Run 3x3 convolutions with stride 1 as Winograd's F(2x2, 3x3), which rounds \
+                differently (or $GPTRS_WINOGRAD=1) [default: off]"
+    )]
+    winograd: bool,
 
     #[arg(
         long,
@@ -174,6 +199,15 @@ enum Command {
 
     /// Print how the ops of two versions of a PTIR program and their cost differ.
     IrDiff(ir::IrDiffArgs),
+
+    /// Run a list of passes on a PTIR program and write the result.
+    IrOpt(ir::IrOptArgs),
+
+    /// Show, list or probe the targets a program compiles for.
+    Target(target::TargetArgs),
+
+    /// Time and profile the ops, layers and blocks of GPT-2, ResNet-18 and MobileNetV2.
+    Perf(perf::PerfArgs),
 }
 
 /// Checkpoint loading options shared by every command that loads a model.
@@ -225,7 +259,7 @@ struct CausalSession {
 }
 
 impl CausalArgs {
-    fn session(&self, backend: &str) -> Result<CausalSession> {
+    fn session(&self, backend: &Backend) -> Result<CausalSession> {
         let model = load_checkpoint(backend, &self.checkpoint, &self.load)?;
         model.causal_lm()?;
         let tokenizer = load_tokenizer(&self.checkpoint, self.tokenizer.as_deref())?;
@@ -240,7 +274,7 @@ impl CausalArgs {
             let seed = self.seed.unwrap_or_else(rand::random);
             let sampling = Sampling::random(self.temperature, seed);
             match self.top_k {
-                Some(k) => sampling.with_top_k(k),
+                Some(top_k) => sampling.with_top_k(top_k),
                 None => sampling,
             }
         };
@@ -434,15 +468,29 @@ fn standard_normal(len: usize, rng: &mut impl Rng) -> Vec<f32> {
     while values.len() < len {
         let u1: f32 = rng.gen::<f32>().max(f32::MIN_POSITIVE);
         let u2: f32 = rng.gen::<f32>();
-        let r = (-2.0 * u1.ln()).sqrt();
+        let radius = (-2.0 * u1.ln()).sqrt();
         let theta = 2.0 * std::f32::consts::PI * u2;
-        values.extend([r * theta.cos(), r * theta.sin()]);
+        values.extend([radius * theta.cos(), radius * theta.sin()]);
     }
     values.truncate(len);
     values
 }
 
+/// Puts OpenMP's threads one on each core, in order, where the generated kernels of the x86 and C
+/// backends run best, unless the environment places them already. OpenMP reads the setting when a
+/// kernel first runs, so it is set before any thread starts.
+fn place_openmp_threads() {
+    let chosen = ["OMP_PLACES", "OMP_PROC_BIND", "KMP_AFFINITY"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+    if !chosen {
+        std::env::set_var("OMP_PLACES", "cores");
+        std::env::set_var("OMP_PROC_BIND", "close");
+    }
+}
+
 fn main() -> Result<()> {
+    place_openmp_threads();
     let args = Args::parse();
     let artifact_config = ProfileArtifactConfig {
         out_dir: args.profile_out.clone(),
@@ -470,31 +518,48 @@ fn main() -> Result<()> {
         profiling::reset();
     }
 
-    let command = match args.command {
+    let mut options = BackendOptions::from_env();
+    if let Some(target) = args.target {
+        options.target = target;
+    }
+    options.winograd |= args.winograd;
+    let profile_consumed = match args.command {
         Command::Convert(convert) => return run_conversion(convert),
         Command::IrStats(stats) => return ir::run_stats(stats),
         Command::IrDiff(diff) => return ir::run_diff(diff),
-        command => command,
+        Command::IrOpt(opt) => return ir::run_opt(opt),
+        Command::Target(target) => return target::run(target),
+        // `perf` picks its backends from its own arguments. The profile prints after `perf`
+        // returns, as it does after a model command.
+        Command::Perf(perf) => {
+            perf::run(perf, &options)?;
+            false
+        }
+        command => {
+            let name = args
+                .backend
+                .or_else(|| env::var("GPTRS_BACKEND").ok())
+                .unwrap_or_else(|| gpt_rs_backends::DEFAULT.to_string());
+            let backend = Backend {
+                name: name.trim().to_string(),
+                options,
+            };
+            run(
+                &backend,
+                command,
+                profile_enabled,
+                args.profile_full,
+                &artifact_config,
+            )?
+        }
     };
 
-    let backend = args
-        .backend
-        .or_else(|| env::var("GPTRS_BACKEND").ok())
-        .unwrap_or_else(|| gpt_rs_backends::DEFAULT.to_string());
-    let profile_consumed = run(
-        backend.trim(),
-        command,
-        profile_enabled,
-        args.profile_full,
-        &artifact_config,
-    )?;
-
     if profile_enabled && !profile_consumed {
-        let options = profiling::ProfileFormatOptions {
+        let format_options = profiling::ProfileFormatOptions {
             profile_full: args.profile_full,
             ..profiling::ProfileFormatOptions::default()
         };
-        if let Some(snapshot) = profiling::take_snapshot(false, &options) {
+        if let Some(snapshot) = profiling::take_snapshot(false, &format_options) {
             eprintln!("{}", snapshot.formatted);
             write_profile_artifacts(&snapshot, &artifact_config)?;
         } else {
@@ -509,7 +574,7 @@ fn main() -> Result<()> {
 
 /// Runs `command` on the backend `backend`. Returns whether the command printed the profile.
 fn run(
-    backend: &str,
+    backend: &Backend,
     command: Command,
     profile: bool,
     profile_full: bool,
@@ -535,13 +600,18 @@ fn run(
             run_forward(backend, &args, profile)?;
             Ok(false)
         }
-        Command::Convert(_) | Command::IrStats(_) | Command::IrDiff(_) => {
+        Command::Convert(_)
+        | Command::IrStats(_)
+        | Command::IrDiff(_)
+        | Command::IrOpt(_)
+        | Command::Target(_)
+        | Command::Perf(_) => {
             unreachable!("main runs the commands that load no model")
         }
     }
 }
 
-fn run_generate(backend: &str, args: &GenerateArgs, profile: bool) -> Result<()> {
+fn run_generate(backend: &Backend, args: &GenerateArgs, profile: bool) -> Result<()> {
     ensure!(args.max_tokens > 0, "--max-tokens must be > 0");
     let session = args.causal.session(backend)?;
     let stop_tokens = if args.ignore_eos {
@@ -611,7 +681,7 @@ const STREAM_FLUSH_TOKENS: usize = 16;
 const STREAM_FLUSH_BYTES: usize = 4096;
 
 fn run_benchmark(
-    backend: &str,
+    backend: &Backend,
     args: &BenchmarkArgs,
     profile: bool,
     profile_full: bool,
@@ -619,149 +689,179 @@ fn run_benchmark(
 ) -> Result<bool> {
     ensure!(args.max_tokens > 0, "--max-tokens must be > 0");
     let session = args.causal.session(backend)?;
-    let prompt_tokens = &session.prompt_tokens;
-
     match args.mode {
         BenchmarkMode::Prefill => {
-            if profile {
-                profiling::reset();
-            }
-            let elapsed = {
-                let _scope = profile.then(|| profiling::backend_scope("benchmark.prefill_total"));
-                let t0 = Instant::now();
-                let _generator = session.generator(args.max_tokens)?;
-                t0.elapsed()
-            };
-            eprintln!(
-                "Benchmark prefill latency: prompt_tokens={} elapsed={:.2?}",
-                prompt_tokens.len(),
-                elapsed
-            );
-
-            if profile {
-                emit_profile_with_attribution(
-                    elapsed,
-                    1.0,
-                    Some("run"),
-                    "prefill",
-                    profile_full,
-                    artifact_config,
-                    None,
-                )?;
-                return Ok(true);
-            }
-            Ok(false)
+            benchmark_prefill(&session, args, profile, profile_full, artifact_config)
         }
         BenchmarkMode::FirstToken => {
-            if profile {
-                profiling::reset();
-            }
-            let (token, elapsed) = {
-                let _scope =
-                    profile.then(|| profiling::backend_scope("benchmark.first_token_total"));
-                let t0 = Instant::now();
-                let mut generator = session.generator(args.max_tokens)?;
-                let token = generator.step()?;
-                (token, t0.elapsed())
-            };
-            eprintln!(
-                "Benchmark first-token latency: prompt_tokens={} token={} elapsed={:.2?} ({:.2} tokens/sec)",
-                prompt_tokens.len(),
-                token,
-                elapsed,
-                1.0f64 / elapsed.as_secs_f64().max(1e-9)
-            );
-
-            if profile {
-                emit_profile_with_attribution(
-                    elapsed,
-                    1.0,
-                    Some("run"),
-                    "first-token",
-                    profile_full,
-                    artifact_config,
-                    None,
-                )?;
-                return Ok(true);
-            }
-            Ok(false)
+            benchmark_first_token(&session, args, profile, profile_full, artifact_config)
         }
         BenchmarkMode::DecodeSteady => {
-            ensure!(
-                args.max_tokens > 0,
-                "--max-tokens must be > 0 for decode-steady benchmark"
-            );
-            let warmup = args.warmup_tokens.min(args.max_tokens);
-            let measured_steps = args.max_tokens.saturating_sub(warmup);
-            ensure!(
-                measured_steps > 0,
-                "decode-steady requires at least one measured token; got max_tokens={} warmup_tokens={}",
-                args.max_tokens,
-                args.warmup_tokens
-            );
-
-            let mut generator = session.generator(args.max_tokens)?;
-
-            for _ in 0..warmup {
-                generator.step()?;
-            }
-
-            if profile {
-                profiling::reset();
-            }
-            let freeze_capture_token = args.compile_freeze_after.min(measured_steps);
-            let mut compile_baseline_ms = if profile && freeze_capture_token == 0 {
-                profiling::take_snapshot(false, &profiling::ProfileFormatOptions::default())
-                    .and_then(|snapshot| {
-                        compile_freeze::compile_ms_from_report_json(&snapshot.report_json)
-                    })
-            } else {
-                None
-            };
-            let elapsed = {
-                let _scope =
-                    profile.then(|| profiling::backend_scope("benchmark.decode_steady_total"));
-                let t0 = Instant::now();
-                for step in 0..measured_steps {
-                    generator.step()?;
-                    if profile && step + 1 == freeze_capture_token {
-                        let options = profiling::ProfileFormatOptions::default();
-                        compile_baseline_ms =
-                            profiling::take_snapshot(false, &options).and_then(|snapshot| {
-                                compile_freeze::compile_ms_from_report_json(&snapshot.report_json)
-                            });
-                    }
-                }
-                t0.elapsed()
-            };
-            let tps = (measured_steps as f64) / elapsed.as_secs_f64().max(1e-9);
-            eprintln!(
-                "Benchmark decode-steady: measured_tokens={} warmup_tokens={} elapsed={:.2?} ({:.2} tokens/sec)",
-                measured_steps,
-                warmup,
-                elapsed,
-                tps
-            );
-
-            if profile {
-                emit_profile_with_attribution(
-                    elapsed,
-                    measured_steps as f64,
-                    Some("token"),
-                    "decode-steady",
-                    profile_full,
-                    artifact_config,
-                    Some(CompileFreezeGate {
-                        measured_token_threshold: args.compile_freeze_after,
-                        strict: args.strict_compile_freeze,
-                        baseline_compile_ms: compile_baseline_ms,
-                    }),
-                )?;
-                return Ok(true);
-            }
-            Ok(false)
+            benchmark_decode_steady(&session, args, profile, profile_full, artifact_config)
         }
     }
+}
+
+/// Times the prefill of the prompt. Returns whether it printed the profile.
+fn benchmark_prefill(
+    session: &CausalSession,
+    args: &BenchmarkArgs,
+    profile: bool,
+    profile_full: bool,
+    artifact_config: &ProfileArtifactConfig,
+) -> Result<bool> {
+    if profile {
+        profiling::reset();
+    }
+    let elapsed = {
+        let _scope = profile.then(|| profiling::backend_scope("benchmark.prefill_total"));
+        let t0 = Instant::now();
+        let _generator = session.generator(args.max_tokens)?;
+        t0.elapsed()
+    };
+    eprintln!(
+        "Benchmark prefill latency: prompt_tokens={} elapsed={:.2?}",
+        session.prompt_tokens.len(),
+        elapsed
+    );
+
+    if profile {
+        emit_profile_with_attribution(
+            elapsed,
+            1.0,
+            Some("run"),
+            "prefill",
+            profile_full,
+            artifact_config,
+            None,
+        )?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Times the prefill and the first token it picks. Returns whether it printed the profile.
+fn benchmark_first_token(
+    session: &CausalSession,
+    args: &BenchmarkArgs,
+    profile: bool,
+    profile_full: bool,
+    artifact_config: &ProfileArtifactConfig,
+) -> Result<bool> {
+    if profile {
+        profiling::reset();
+    }
+    let (token, elapsed) = {
+        let _scope = profile.then(|| profiling::backend_scope("benchmark.first_token_total"));
+        let t0 = Instant::now();
+        let mut generator = session.generator(args.max_tokens)?;
+        let token = generator.step()?;
+        (token, t0.elapsed())
+    };
+    eprintln!(
+        "Benchmark first-token latency: prompt_tokens={} token={} elapsed={:.2?} ({:.2} tokens/sec)",
+        session.prompt_tokens.len(),
+        token,
+        elapsed,
+        1.0f64 / elapsed.as_secs_f64().max(1e-9)
+    );
+
+    if profile {
+        emit_profile_with_attribution(
+            elapsed,
+            1.0,
+            Some("run"),
+            "first-token",
+            profile_full,
+            artifact_config,
+            None,
+        )?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Times the decode steps after the warmup tokens. With the profile, it reports compile activity
+/// after `--compile-freeze-after` measured tokens. Returns whether it printed the profile.
+fn benchmark_decode_steady(
+    session: &CausalSession,
+    args: &BenchmarkArgs,
+    profile: bool,
+    profile_full: bool,
+    artifact_config: &ProfileArtifactConfig,
+) -> Result<bool> {
+    ensure!(
+        args.max_tokens > 0,
+        "--max-tokens must be > 0 for decode-steady benchmark"
+    );
+    let warmup = args.warmup_tokens.min(args.max_tokens);
+    let measured_steps = args.max_tokens.saturating_sub(warmup);
+    ensure!(
+        measured_steps > 0,
+        "decode-steady requires at least one measured token; got max_tokens={} warmup_tokens={}",
+        args.max_tokens,
+        args.warmup_tokens
+    );
+
+    let mut generator = session.generator(args.max_tokens)?;
+
+    for _ in 0..warmup {
+        generator.step()?;
+    }
+
+    if profile {
+        profiling::reset();
+    }
+    let freeze_capture_token = args.compile_freeze_after.min(measured_steps);
+    let mut compile_baseline_ms = if profile && freeze_capture_token == 0 {
+        profiled_compile_ms()
+    } else {
+        None
+    };
+    let elapsed = {
+        let _scope = profile.then(|| profiling::backend_scope("benchmark.decode_steady_total"));
+        let t0 = Instant::now();
+        for step in 0..measured_steps {
+            generator.step()?;
+            if profile && step + 1 == freeze_capture_token {
+                compile_baseline_ms = profiled_compile_ms();
+            }
+        }
+        t0.elapsed()
+    };
+    let tps = (measured_steps as f64) / elapsed.as_secs_f64().max(1e-9);
+    eprintln!(
+        "Benchmark decode-steady: measured_tokens={} warmup_tokens={} elapsed={:.2?} ({:.2} tokens/sec)",
+        measured_steps,
+        warmup,
+        elapsed,
+        tps
+    );
+
+    if profile {
+        emit_profile_with_attribution(
+            elapsed,
+            measured_steps as f64,
+            Some("token"),
+            "decode-steady",
+            profile_full,
+            artifact_config,
+            Some(CompileFreezeGate {
+                measured_token_threshold: args.compile_freeze_after,
+                strict: args.strict_compile_freeze,
+                baseline_compile_ms: compile_baseline_ms,
+            }),
+        )?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// The milliseconds of compilation the profiler has recorded so far.
+fn profiled_compile_ms() -> Option<f64> {
+    let options = profiling::ProfileFormatOptions::default();
+    profiling::take_snapshot(false, &options)
+        .and_then(|snapshot| compile_freeze::compile_ms_from_report_json(&snapshot.report_json))
 }
 
 fn emit_profile_with_attribution(
@@ -904,9 +1004,12 @@ fn measured_component_ms_from_report_json(report_json: &str) -> Option<f64> {
             "compilation",
             "compile_passes",
         ] {
-            if let Some(rows) = tables.get(key).and_then(|v| v.as_array()) {
+            if let Some(rows) = tables.get(key).and_then(serde_json::Value::as_array) {
                 for row in rows {
-                    total += row.get("excl_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    total += row
+                        .get("excl_ms")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0);
                 }
             }
         }
@@ -922,12 +1025,12 @@ fn run_conversion(args: ConvertArgs) -> Result<()> {
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let module = Module::from_text(&src).with_context(|| format!("{}", path.display()))?;
     gpt_rs_ir::ir::verify(&module).map_err(|err| anyhow!("{}: {err}", path.display()))?;
-    let run_time: Vec<String> = module
-        .funcs()
-        .into_iter()
-        .filter_map(|f| module.op(f).get::<Func>().filter(|f| !f.is_load_time()))
-        .map(|f| f.name.clone())
-        .collect();
+    let mut run_time = Vec::new();
+    for func in module.funcs() {
+        if !func.is_load_time() {
+            run_time.push(func.name.clone());
+        }
+    }
     let [func] = &run_time[..] else {
         bail!(
             "{}: convert takes one run-time function, found {}",
@@ -959,7 +1062,7 @@ fn c_source(_module: &Module, _func: &str) -> Result<String> {
     bail!("convert requires building gpt-rs-cli with --features conversion-c")
 }
 
-fn run_forward(backend: &str, args: &ForwardArgs, profile: bool) -> Result<()> {
+fn run_forward(backend: &Backend, args: &ForwardArgs, profile: bool) -> Result<()> {
     let model = load_checkpoint(backend, &args.checkpoint, &args.load)?;
 
     let is_text = args.prompt.is_some() || !args.tokens.is_empty();
@@ -985,7 +1088,7 @@ fn run_forward(backend: &str, args: &ForwardArgs, profile: bool) -> Result<()> {
         }
         None => args.tokens.clone(),
     };
-    let pixels = (!is_text)
+    let vision_input = (!is_text)
         .then(|| load_vision_input_tensor(&args.vision))
         .transpose()?;
 
@@ -993,7 +1096,7 @@ fn run_forward(backend: &str, args: &ForwardArgs, profile: bool) -> Result<()> {
         profiling::reset();
     }
     let t0 = Instant::now();
-    let host = match pixels {
+    let host = match vision_input {
         Some(pixels) => model.vision()?.forward(pixels)?,
         None => model.causal_lm()?.forward(&tokens)?,
     };
@@ -1011,10 +1114,10 @@ fn run_forward(backend: &str, args: &ForwardArgs, profile: bool) -> Result<()> {
         let logits = &host.as_f32().unwrap()[start..start + cols];
         let mut best = 0usize;
         let mut best_val = f32::NEG_INFINITY;
-        for (i, &v) in logits.iter().enumerate() {
-            if v > best_val {
-                best = i;
-                best_val = v;
+        for (index, &logit) in logits.iter().enumerate() {
+            if logit > best_val {
+                best = index;
+                best_val = logit;
             }
         }
         println!("top1={} logit={:.6}", best, best_val);

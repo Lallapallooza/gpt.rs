@@ -124,113 +124,11 @@ fn summarise_tables(stats: HashMap<ProfilerKey, Stat>) -> Option<ProfilerTables>
         }
     }
 
-    fn finalize_by_percent(rows: &mut [TableRow]) {
-        rows.sort_by(|a, b| {
-            b.percent
-                .partial_cmp(&a.percent)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-    }
-
-    fn finalize_by_calls(rows: &mut [TableRow]) {
-        rows.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.name.cmp(&b.name)));
-    }
-
-    fn to_rows(
-        items: Vec<(String, Option<String>, Stat)>,
-        category_total_ns: f64,
-        global_total_ns: f64,
-    ) -> Vec<TableRow> {
-        items
-            .into_iter()
-            .map(|(name, signature, stat)| {
-                let excl_ms = stat.exclusive_ns as f64 / 1_000_000.0;
-                let incl_ms = stat.inclusive_ns as f64 / 1_000_000.0;
-                let per_ms = if stat.calls > 0 {
-                    excl_ms / stat.calls as f64
-                } else {
-                    0.0
-                };
-                let percent = if category_total_ns > 0.0 {
-                    (stat.exclusive_ns as f64 / category_total_ns) * 100.0
-                } else {
-                    0.0
-                };
-                let percent_global = if global_total_ns > 0.0 {
-                    (stat.exclusive_ns as f64 / global_total_ns) * 100.0
-                } else {
-                    0.0
-                };
-                TableRow {
-                    name,
-                    signature,
-                    calls: stat.calls,
-                    per_ms,
-                    excl_ms,
-                    incl_ms,
-                    percent,
-                    percent_global,
-                    elements: stat.work.elements,
-                    bytes_read: stat.work.bytes_read,
-                    bytes_written: stat.work.bytes_written,
-                    flops: stat.work.flops,
-                    alloc_bytes: stat.work.alloc_bytes,
-                    alloc_count: stat.work.alloc_count,
-                }
-            })
-            .collect()
-    }
-
-    fn to_cache_rows(items: Vec<(String, Stat)>) -> Vec<TableRow> {
-        let total_calls: f64 = items.iter().map(|(_, stat)| stat.calls as f64).sum();
-        items
-            .into_iter()
-            .map(|(name, stat)| {
-                let percent = if total_calls > 0.0 {
-                    (stat.calls as f64 / total_calls) * 100.0
-                } else {
-                    0.0
-                };
-                TableRow {
-                    name,
-                    signature: None,
-                    calls: stat.calls,
-                    per_ms: 0.0,
-                    excl_ms: 0.0,
-                    incl_ms: 0.0,
-                    percent,
-                    percent_global: percent,
-                    elements: stat.work.elements,
-                    bytes_read: stat.work.bytes_read,
-                    bytes_written: stat.work.bytes_written,
-                    flops: stat.work.flops,
-                    alloc_bytes: stat.work.alloc_bytes,
-                    alloc_count: stat.work.alloc_count,
-                }
-            })
-            .collect()
-    }
-
-    let total_layers_ns: f64 = layers
-        .iter()
-        .map(|(_, _, stat)| stat.exclusive_ns as f64)
-        .sum();
-    let total_functionals_ns: f64 = functionals
-        .iter()
-        .map(|(_, _, stat)| stat.exclusive_ns as f64)
-        .sum();
-    let total_backend_ns: f64 = backend
-        .iter()
-        .map(|(_, _, stat)| stat.exclusive_ns as f64)
-        .sum();
-    let total_compilation_ns: f64 = compilation
-        .iter()
-        .map(|(_, _, stat)| stat.exclusive_ns as f64)
-        .sum();
-    let total_compile_passes_ns: f64 = compile_passes
-        .iter()
-        .map(|(_, _, stat)| stat.exclusive_ns as f64)
-        .sum();
+    let total_layers_ns = total_exclusive_ns(&layers);
+    let total_functionals_ns = total_exclusive_ns(&functionals);
+    let total_backend_ns = total_exclusive_ns(&backend);
+    let total_compilation_ns = total_exclusive_ns(&compilation);
+    let total_compile_passes_ns = total_exclusive_ns(&compile_passes);
     let global_total_ns = total_layers_ns
         + total_functionals_ns
         + total_backend_ns
@@ -254,6 +152,112 @@ fn summarise_tables(stats: HashMap<ProfilerKey, Stat>) -> Option<ProfilerTables>
     finalize_by_calls(&mut table.caches);
 
     Some(table)
+}
+
+/// The exclusive time of the scopes of one table, in nanoseconds.
+#[cfg(feature = "profiler")]
+fn total_exclusive_ns(items: &[(String, Option<String>, Stat)]) -> f64 {
+    items
+        .iter()
+        .map(|(_, _, stat)| stat.exclusive_ns as f64)
+        .sum()
+}
+
+#[cfg(feature = "profiler")]
+fn finalize_by_percent(rows: &mut [TableRow]) {
+    rows.sort_by(|left, right| {
+        right
+            .percent
+            .partial_cmp(&left.percent)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
+#[cfg(feature = "profiler")]
+fn finalize_by_calls(rows: &mut [TableRow]) {
+    rows.sort_by(|left, right| {
+        right
+            .calls
+            .cmp(&left.calls)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+}
+
+#[cfg(feature = "profiler")]
+fn to_rows(
+    items: Vec<(String, Option<String>, Stat)>,
+    category_total_ns: f64,
+    global_total_ns: f64,
+) -> Vec<TableRow> {
+    items
+        .into_iter()
+        .map(|(name, signature, stat)| {
+            let excl_ms = stat.exclusive_ns as f64 / 1_000_000.0;
+            let incl_ms = stat.inclusive_ns as f64 / 1_000_000.0;
+            let per_ms = if stat.calls > 0 {
+                excl_ms / stat.calls as f64
+            } else {
+                0.0
+            };
+            let percent = if category_total_ns > 0.0 {
+                (stat.exclusive_ns as f64 / category_total_ns) * 100.0
+            } else {
+                0.0
+            };
+            let percent_global = if global_total_ns > 0.0 {
+                (stat.exclusive_ns as f64 / global_total_ns) * 100.0
+            } else {
+                0.0
+            };
+            TableRow {
+                name,
+                signature,
+                calls: stat.calls,
+                per_ms,
+                excl_ms,
+                incl_ms,
+                percent,
+                percent_global,
+                elements: stat.work.elements,
+                bytes_read: stat.work.bytes_read,
+                bytes_written: stat.work.bytes_written,
+                flops: stat.work.flops,
+                alloc_bytes: stat.work.alloc_bytes,
+                alloc_count: stat.work.alloc_count,
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "profiler")]
+fn to_cache_rows(items: Vec<(String, Stat)>) -> Vec<TableRow> {
+    let total_calls: f64 = items.iter().map(|(_, stat)| stat.calls as f64).sum();
+    items
+        .into_iter()
+        .map(|(name, stat)| {
+            let percent = if total_calls > 0.0 {
+                (stat.calls as f64 / total_calls) * 100.0
+            } else {
+                0.0
+            };
+            TableRow {
+                name,
+                signature: None,
+                calls: stat.calls,
+                per_ms: 0.0,
+                excl_ms: 0.0,
+                incl_ms: 0.0,
+                percent,
+                percent_global: percent,
+                elements: stat.work.elements,
+                bytes_read: stat.work.bytes_read,
+                bytes_written: stat.work.bytes_written,
+                flops: stat.work.flops,
+                alloc_bytes: stat.work.alloc_bytes,
+                alloc_count: stat.work.alloc_count,
+            }
+        })
+        .collect()
 }
 
 #[cfg(feature = "profiler")]
@@ -303,6 +307,32 @@ fn positive_measured_units(options: &ProfileFormatOptions) -> Option<f64> {
 
 #[cfg(feature = "profiler")]
 fn format_execution_kpis(tables: &ProfilerTables, options: &ProfileFormatOptions) -> String {
+    let mut rows = Vec::new();
+    for (metric, value) in execution_kpi_rows(tables, options) {
+        rows.push((metric, vec![value]));
+    }
+    let widths = column_widths("metric", &["value"], &rows);
+
+    let mut output = String::new();
+    output.push_str("Execution KPIs\n");
+    output.push_str(&table_line(&[
+        format!("{:<width$}", "metric", width = widths[0]),
+        format!("{:<width$}", "value", width = widths[1]),
+    ]));
+    output.push_str(&separator_line(&widths));
+    for (metric, values) in &rows {
+        output.push_str(&row_line(metric, values, &widths));
+    }
+    output
+}
+
+/// The metrics of the execution KPI table and their values: the totals of `tables`, then the
+/// totals per measured unit when the options count units.
+#[cfg(feature = "profiler")]
+fn execution_kpi_rows(
+    tables: &ProfilerTables,
+    options: &ProfileFormatOptions,
+) -> Vec<(String, String)> {
     let total_layers_ms: f64 = tables.layers.iter().map(|row| row.excl_ms).sum();
     let total_functionals_ms: f64 = tables.functionals.iter().map(|row| row.excl_ms).sum();
     let total_backend_ms: f64 = tables.backend.iter().map(|row| row.excl_ms).sum();
@@ -317,39 +347,38 @@ fn format_execution_kpis(tables: &ProfilerTables, options: &ProfileFormatOptions
         + total_compile_passes_ms;
     let total_compile_ms = total_compilation_ms + total_compile_passes_ms;
     let unit_label = options.unit_label.as_deref().unwrap_or("unit");
-    let units = positive_measured_units(options);
 
-    let mut rows: Vec<(String, String)> = Vec::new();
-    rows.push((
-        "measured_ms.total".to_string(),
-        format!("{total_measured_ms:.3}"),
-    ));
-    rows.push((
-        "layers_ms.total".to_string(),
-        format!("{total_layers_ms:.3}"),
-    ));
-    rows.push((
-        "functionals_ms.total".to_string(),
-        format!("{total_functionals_ms:.3}"),
-    ));
-    rows.push((
-        "backend_ms.total".to_string(),
-        format!("{total_backend_ms:.3}"),
-    ));
-    rows.push((
-        "compile_ms.total".to_string(),
-        format!("{total_compile_ms:.3}"),
-    ));
-    rows.push((
-        "backend_calls.total".to_string(),
-        total_backend_calls.to_string(),
-    ));
-    rows.push((
-        "cache_events.total".to_string(),
-        total_cache_events.to_string(),
-    ));
-
-    if let Some(units) = units {
+    let mut rows = vec![
+        (
+            "measured_ms.total".to_string(),
+            format!("{total_measured_ms:.3}"),
+        ),
+        (
+            "layers_ms.total".to_string(),
+            format!("{total_layers_ms:.3}"),
+        ),
+        (
+            "functionals_ms.total".to_string(),
+            format!("{total_functionals_ms:.3}"),
+        ),
+        (
+            "backend_ms.total".to_string(),
+            format!("{total_backend_ms:.3}"),
+        ),
+        (
+            "compile_ms.total".to_string(),
+            format!("{total_compile_ms:.3}"),
+        ),
+        (
+            "backend_calls.total".to_string(),
+            total_backend_calls.to_string(),
+        ),
+        (
+            "cache_events.total".to_string(),
+            total_cache_events.to_string(),
+        ),
+    ];
+    if let Some(units) = positive_measured_units(options) {
         rows.push((
             format!("measured_ms/{unit_label}"),
             format!("{:.3}", total_measured_ms / units),
@@ -367,40 +396,157 @@ fn format_execution_kpis(tables: &ProfilerTables, options: &ProfileFormatOptions
             format!("{:.3}", (total_backend_calls as f64) / units),
         ));
     }
+    rows
+}
 
-    let metric_width = rows
-        .iter()
-        .map(|(metric, _)| metric.len())
-        .max()
-        .unwrap_or("metric".len())
-        .max("metric".len());
-    let value_width = rows
-        .iter()
-        .map(|(_, value)| value.len())
-        .max()
-        .unwrap_or("value".len())
-        .max("value".len());
+/// A table line of padded cells: `| a | b | c |`.
+#[cfg(feature = "profiler")]
+fn table_line(cells: &[String]) -> String {
+    format!("| {} |\n", cells.join(" | "))
+}
 
+/// The line under a table header, with columns of `widths`: `|---|---|`.
+#[cfg(feature = "profiler")]
+fn separator_line(widths: &[usize]) -> String {
+    let mut dashes = Vec::with_capacity(widths.len());
+    for &width in widths {
+        dashes.push("-".repeat(width));
+    }
+    format!("|-{}-|\n", dashes.join("-|-"))
+}
+
+/// The header line of a table: the name column left-aligned and the other headers centered, at
+/// `widths`.
+#[cfg(feature = "profiler")]
+fn header_line(column: &str, headers: &[&str], widths: &[usize]) -> String {
+    let mut padded = vec![format!("{column:<width$}", width = widths[0])];
+    for (header, &width) in headers.iter().zip(&widths[1..]) {
+        padded.push(format!("{header:^width$}"));
+    }
+    table_line(&padded)
+}
+
+/// The line of one row: its name left-aligned and its cells right-aligned, at `widths`.
+#[cfg(feature = "profiler")]
+fn row_line(name: &str, cells: &[String], widths: &[usize]) -> String {
+    let mut padded = vec![format!("{name:<width$}", width = widths[0])];
+    for (cell, &width) in cells.iter().zip(&widths[1..]) {
+        padded.push(format!("{cell:>width$}"));
+    }
+    table_line(&padded)
+}
+
+/// The widths of the columns of a table: the name column fits `column` and every name, and each
+/// other column its header and every cell under it.
+#[cfg(feature = "profiler")]
+fn column_widths(column: &str, headers: &[&str], rows: &[(String, Vec<String>)]) -> Vec<usize> {
+    let mut widths = vec![column.len()];
+    for header in headers {
+        widths.push(header.len());
+    }
+    for (name, cells) in rows {
+        widths[0] = widths[0].max(name.len());
+        for (width, cell) in widths[1..].iter_mut().zip(cells) {
+            *width = (*width).max(cell.len());
+        }
+    }
+    widths
+}
+
+/// A table under `label`: the header, its separator line, and one line per row of a name and its
+/// cells, or a `(no data)` line when there are no rows.
+#[cfg(feature = "profiler")]
+fn format_rows(
+    label: &str,
+    column: &str,
+    headers: &[&str],
+    rows: &[(String, Vec<String>)],
+) -> String {
+    let widths = column_widths(column, headers, rows);
     let mut output = String::new();
-    output.push_str("Execution KPIs\n");
-    output.push_str(&format!(
-        "| {metric} | {value} |\n",
-        metric = format_args!("{:<width$}", "metric", width = metric_width),
-        value = format_args!("{:<width$}", "value", width = value_width),
-    ));
-    output.push_str(&format!(
-        "|-{metric}-|-{value}-|\n",
-        metric = "-".repeat(metric_width),
-        value = "-".repeat(value_width),
-    ));
-    for (metric, value) in rows {
-        output.push_str(&format!(
-            "| {metric} | {value} |\n",
-            metric = format_args!("{:<width$}", metric, width = metric_width),
-            value = format_args!("{:>width$}", value, width = value_width),
-        ));
+    output.push_str(label);
+    output.push('\n');
+    output.push_str(&header_line(column, headers, &widths));
+    output.push_str(&separator_line(&widths));
+    if rows.is_empty() {
+        let dashes = vec!["-".to_string(); headers.len()];
+        output.push_str(&row_line("(no data)", &dashes, &widths));
+    }
+    for (name, cells) in rows {
+        output.push_str(&row_line(name, cells, &widths));
     }
     output
+}
+
+/// The headers of the timing columns after the name: calls, ms per call, self and total ms, calls
+/// and ms per unit when `units` is given, and the two percentages.
+#[cfg(feature = "profiler")]
+fn timing_headers(units: Option<f64>) -> Vec<&'static str> {
+    let per_unit: &[&'static str] = if units.is_some() {
+        &["calls/unit", "ms/unit"]
+    } else {
+        &[]
+    };
+    [
+        &["#", "ms/call", "self_ms", "total_ms"][..],
+        per_unit,
+        &["%tbl", "%all"],
+    ]
+    .concat()
+}
+
+/// The timing cells of `row`, under [`timing_headers`].
+#[cfg(feature = "profiler")]
+fn timing_cells(row: &TableRow, units: Option<f64>) -> Vec<String> {
+    let mut cells = vec![
+        row.calls.to_string(),
+        format!("{:.3}", row.per_ms),
+        format!("{:.3}", row.excl_ms),
+        format!("{:.3}", row.incl_ms),
+    ];
+    if let Some(unit_count) = units {
+        cells.push(format!("{:.3}", (row.calls as f64) / unit_count));
+        cells.push(format!("{:.3}", row.excl_ms / unit_count));
+    }
+    cells.push(format!("{:.2}", row.percent));
+    cells.push(format!("{:.2}", row.percent_global));
+    cells
+}
+
+/// The name of `row`, with its signature in brackets when it has one.
+#[cfg(feature = "profiler")]
+fn display_name(row: &TableRow) -> String {
+    match row.signature.as_ref() {
+        None => row.name.clone(),
+        Some(sig) => format!("{} [{sig}]", row.name),
+    }
+}
+
+/// A timing table: per row its calls, times and shares.
+#[cfg(feature = "profiler")]
+fn format_table(
+    label: &str,
+    column: &str,
+    rows: &[TableRow],
+    options: &ProfileFormatOptions,
+) -> String {
+    let units = positive_measured_units(options);
+    let mut cells = Vec::with_capacity(rows.len());
+    for row in rows {
+        cells.push((display_name(row), timing_cells(row, units)));
+    }
+    format_rows(label, column, &timing_headers(units), &cells)
+}
+
+/// The cache table: per cache event its count and its share of all events.
+#[cfg(feature = "profiler")]
+fn format_cache_table(label: &str, column: &str, rows: &[TableRow]) -> String {
+    let mut cells = Vec::with_capacity(rows.len());
+    for row in rows {
+        let counts = vec![row.calls.to_string(), format!("{:.2}", row.percent)];
+        cells.push((row.name.clone(), counts));
+    }
+    format_rows(label, column, &["#", "%"], &cells)
 }
 
 #[cfg(feature = "profiler")]
@@ -449,239 +595,6 @@ pub fn format_tables_with_options(
     tables: &ProfilerTables,
     options: &ProfileFormatOptions,
 ) -> String {
-    fn display_name_len(row: &TableRow) -> usize {
-        match row.signature.as_ref() {
-            None => row.name.len(),
-            Some(sig) => row.name.len().saturating_add(sig.len()).saturating_add(3),
-        }
-    }
-
-    fn display_name(row: &TableRow) -> String {
-        match row.signature.as_ref() {
-            None => row.name.clone(),
-            Some(sig) => format!("{} [{sig}]", row.name),
-        }
-    }
-
-    fn format_table(
-        label: &str,
-        column: &str,
-        rows: &[TableRow],
-        options: &ProfileFormatOptions,
-    ) -> String {
-        let mut output = String::new();
-        output.push_str(label);
-        output.push('\n');
-
-        let units = positive_measured_units(options);
-        let include_unit_columns = units.is_some();
-
-        let name_width = rows
-            .iter()
-            .map(display_name_len)
-            .max()
-            .unwrap_or(column.len())
-            .max(column.len());
-
-        let mut calls_width = "#".len();
-        let mut per_width = "ms/call".len();
-        let mut excl_width = "self_ms".len();
-        let mut incl_width = "total_ms".len();
-        let mut percent_width = "%tbl".len();
-        let mut global_percent_width = "%all".len();
-        let mut calls_per_unit_width = "calls/unit".len();
-        let mut ms_per_unit_width = "ms/unit".len();
-
-        for row in rows {
-            calls_width = calls_width.max(format!("{}", row.calls).len());
-            per_width = per_width.max(format!("{:.3}", row.per_ms).len());
-            excl_width = excl_width.max(format!("{:.3}", row.excl_ms).len());
-            incl_width = incl_width.max(format!("{:.3}", row.incl_ms).len());
-            percent_width = percent_width.max(format!("{:.2}", row.percent).len());
-            global_percent_width =
-                global_percent_width.max(format!("{:.2}", row.percent_global).len());
-            if let Some(units) = units {
-                calls_per_unit_width =
-                    calls_per_unit_width.max(format!("{:.3}", (row.calls as f64) / units).len());
-                ms_per_unit_width =
-                    ms_per_unit_width.max(format!("{:.3}", row.excl_ms / units).len());
-            }
-        }
-
-        if include_unit_columns {
-            output.push_str(&format!(
-                "| {column} | {calls} | {per} | {excl} | {incl} | {calls_unit} | {ms_unit} | {percent} | {global} |\n",
-                column = format_args!("{:<width$}", column, width = name_width),
-                calls = format_args!("{:^width$}", "#", width = calls_width),
-                per = format_args!("{:^width$}", "ms/call", width = per_width),
-                excl = format_args!("{:^width$}", "self_ms", width = excl_width),
-                incl = format_args!("{:^width$}", "total_ms", width = incl_width),
-                calls_unit = format_args!("{:^width$}", "calls/unit", width = calls_per_unit_width),
-                ms_unit = format_args!("{:^width$}", "ms/unit", width = ms_per_unit_width),
-                percent = format_args!("{:^width$}", "%tbl", width = percent_width),
-                global = format_args!("{:^width$}", "%all", width = global_percent_width),
-            ));
-            output.push_str(&format!(
-                "|-{name}-|-{calls}-|-{per}-|-{excl}-|-{incl}-|-{calls_unit}-|-{ms_unit}-|-{percent}-|-{global}-|\n",
-                name = "-".repeat(name_width),
-                calls = "-".repeat(calls_width),
-                per = "-".repeat(per_width),
-                excl = "-".repeat(excl_width),
-                incl = "-".repeat(incl_width),
-                calls_unit = "-".repeat(calls_per_unit_width),
-                ms_unit = "-".repeat(ms_per_unit_width),
-                percent = "-".repeat(percent_width),
-                global = "-".repeat(global_percent_width),
-            ));
-        } else {
-            output.push_str(&format!(
-                "| {column} | {calls} | {per} | {excl} | {incl} | {percent} | {global} |\n",
-                column = format_args!("{:<width$}", column, width = name_width),
-                calls = format_args!("{:^width$}", "#", width = calls_width),
-                per = format_args!("{:^width$}", "ms/call", width = per_width),
-                excl = format_args!("{:^width$}", "self_ms", width = excl_width),
-                incl = format_args!("{:^width$}", "total_ms", width = incl_width),
-                percent = format_args!("{:^width$}", "%tbl", width = percent_width),
-                global = format_args!("{:^width$}", "%all", width = global_percent_width),
-            ));
-            output.push_str(&format!(
-                "|-{name}-|-{calls}-|-{per}-|-{excl}-|-{incl}-|-{percent}-|-{global}-|\n",
-                name = "-".repeat(name_width),
-                calls = "-".repeat(calls_width),
-                per = "-".repeat(per_width),
-                excl = "-".repeat(excl_width),
-                incl = "-".repeat(incl_width),
-                percent = "-".repeat(percent_width),
-                global = "-".repeat(global_percent_width),
-            ));
-        }
-
-        if rows.is_empty() {
-            if include_unit_columns {
-                output.push_str(&format!(
-                    "| {value} | {calls} | {per} | {excl} | {incl} | {calls_unit} | {ms_unit} | {percent} | {global} |\n",
-                    value = format_args!("{:<width$}", "(no data)", width = name_width),
-                    calls = format_args!("{:>width$}", "-", width = calls_width),
-                    per = format_args!("{:>width$}", "-", width = per_width),
-                    excl = format_args!("{:>width$}", "-", width = excl_width),
-                    incl = format_args!("{:>width$}", "-", width = incl_width),
-                    calls_unit = format_args!("{:>width$}", "-", width = calls_per_unit_width),
-                    ms_unit = format_args!("{:>width$}", "-", width = ms_per_unit_width),
-                    percent = format_args!("{:>width$}", "-", width = percent_width),
-                    global = format_args!("{:>width$}", "-", width = global_percent_width),
-                ));
-            } else {
-                output.push_str(&format!(
-                    "| {value} | {calls} | {per} | {excl} | {incl} | {percent} | {global} |\n",
-                    value = format_args!("{:<width$}", "(no data)", width = name_width),
-                    calls = format_args!("{:>width$}", "-", width = calls_width),
-                    per = format_args!("{:>width$}", "-", width = per_width),
-                    excl = format_args!("{:>width$}", "-", width = excl_width),
-                    incl = format_args!("{:>width$}", "-", width = incl_width),
-                    percent = format_args!("{:>width$}", "-", width = percent_width),
-                    global = format_args!("{:>width$}", "-", width = global_percent_width),
-                ));
-            }
-            return output;
-        }
-
-        for row in rows {
-            let display_name = display_name(row);
-            let per = format!("{:.3}", row.per_ms);
-            let excl = format!("{:.3}", row.excl_ms);
-            let incl = format!("{:.3}", row.incl_ms);
-            let percent = format!("{:.2}", row.percent);
-            let global = format!("{:.2}", row.percent_global);
-            if let Some(units) = units {
-                let calls_unit = format!("{:.3}", (row.calls as f64) / units);
-                let ms_unit = format!("{:.3}", row.excl_ms / units);
-                output.push_str(&format!(
-                    "| {name} | {calls} | {per} | {excl} | {incl} | {calls_unit} | {ms_unit} | {percent} | {global} |\n",
-                    name = format_args!("{:<width$}", display_name, width = name_width),
-                    calls = format_args!("{:>width$}", row.calls, width = calls_width),
-                    per = format_args!("{:>width$}", per, width = per_width),
-                    excl = format_args!("{:>width$}", excl, width = excl_width),
-                    incl = format_args!("{:>width$}", incl, width = incl_width),
-                    calls_unit = format_args!("{:>width$}", calls_unit, width = calls_per_unit_width),
-                    ms_unit = format_args!("{:>width$}", ms_unit, width = ms_per_unit_width),
-                    percent = format_args!("{:>width$}", percent, width = percent_width),
-                    global = format_args!("{:>width$}", global, width = global_percent_width),
-                ));
-            } else {
-                output.push_str(&format!(
-                    "| {name} | {calls} | {per} | {excl} | {incl} | {percent} | {global} |\n",
-                    name = format_args!("{:<width$}", display_name, width = name_width),
-                    calls = format_args!("{:>width$}", row.calls, width = calls_width),
-                    per = format_args!("{:>width$}", per, width = per_width),
-                    excl = format_args!("{:>width$}", excl, width = excl_width),
-                    incl = format_args!("{:>width$}", incl, width = incl_width),
-                    percent = format_args!("{:>width$}", percent, width = percent_width),
-                    global = format_args!("{:>width$}", global, width = global_percent_width),
-                ));
-            }
-        }
-        output
-    }
-
-    fn format_cache_table(label: &str, column: &str, rows: &[TableRow]) -> String {
-        let mut output = String::new();
-        output.push_str(label);
-        output.push('\n');
-
-        let name_width = rows
-            .iter()
-            .map(|row| row.name.len())
-            .max()
-            .unwrap_or(column.len())
-            .max(column.len());
-
-        let mut calls_width = "#".len();
-        let mut percent_width = "%".len();
-        for row in rows {
-            calls_width = calls_width.max(format!("{}", row.calls).len());
-            percent_width = percent_width.max(format!("{:.2}", row.percent).len());
-        }
-
-        let header = format!(
-            "| {column} | {calls} | {percent} |\n",
-            column = format_args!("{:<width$}", column, width = name_width),
-            calls = format_args!("{:^width$}", "#", width = calls_width),
-            percent = format_args!("{:^width$}", "%", width = percent_width),
-        );
-        output.push_str(&header);
-        let separator = format!(
-            "|-{name}-|-{calls}-|-{percent}-|\n",
-            name = "-".repeat(name_width),
-            calls = "-".repeat(calls_width),
-            percent = "-".repeat(percent_width),
-        );
-        output.push_str(&separator);
-
-        if rows.is_empty() {
-            let empty_row = format!(
-                "| {value} | {calls} | {percent} |\n",
-                value = format_args!("{:<width$}", "(no data)", width = name_width),
-                calls = format_args!("{:>width$}", "-", width = calls_width),
-                percent = format_args!("{:>width$}", "-", width = percent_width),
-            );
-            output.push_str(&empty_row);
-            return output;
-        }
-
-        for row in rows {
-            let percent = format!("{:.2}", row.percent);
-            let line = format!(
-                "| {name} | {calls} | {percent} |\n",
-                name = format_args!("{:<width$}", row.name, width = name_width),
-                calls = format_args!("{:>width$}", row.calls, width = calls_width),
-                percent = format_args!("{:>width$}", percent, width = percent_width),
-            );
-            output.push_str(&line);
-        }
-
-        output
-    }
-
     let (backend_rows, backend_compact_suffix) =
         maybe_compact_backend_rows(&tables.backend, options);
     let backend_label = match backend_compact_suffix {
@@ -828,18 +741,18 @@ fn kpi_rows_for_report(
             (backend_calls as f64) / units,
         ));
     }
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
     rows
 }
 
 #[cfg(feature = "profiler")]
 fn section_rows_sorted(rows: &[TableRow]) -> Vec<TableRow> {
     let mut sorted = rows.to_vec();
-    sorted.sort_by(|a, b| {
-        a.name
-            .cmp(&b.name)
-            .then_with(|| a.signature.cmp(&b.signature))
-            .then_with(|| a.calls.cmp(&b.calls))
+    sorted.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.signature.cmp(&right.signature))
+            .then_with(|| left.calls.cmp(&right.calls))
     });
     sorted
 }
@@ -907,8 +820,8 @@ pub fn report_to_jsonl(report: &ProfilerReport, options: &ProfileFormatOptions) 
                     "total_ms": format!("{:.6}", row.incl_ms),
                     "pct_section": format!("{:.6}", row.percent),
                     "pct_global": format!("{:.6}", row.percent_global),
-                    "calls_per_unit": calls_per_unit.map(|v| format!("{v:.6}")),
-                    "ms_per_unit": ms_per_unit.map(|v| format!("{v:.6}")),
+                    "calls_per_unit": calls_per_unit.map(|value| format!("{value:.6}")),
+                    "ms_per_unit": ms_per_unit.map(|value| format!("{value:.6}")),
                 }));
             }
         }

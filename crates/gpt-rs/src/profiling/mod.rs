@@ -214,7 +214,7 @@ impl InternTable {
     fn resolve(&self, id: u32) -> &str {
         self.names
             .get(id as usize)
-            .map(|s| s.as_str())
+            .map(String::as_str)
             .unwrap_or("<unknown>")
     }
 
@@ -288,6 +288,19 @@ pub struct SuspendGuard {
     _private: (),
 }
 
+/// Whether the profiler collects scopes on this thread now: built with it, and not suspended.
+#[inline(always)]
+pub fn collecting() -> bool {
+    #[cfg(feature = "profiler")]
+    {
+        !profiler_suspended()
+    }
+    #[cfg(not(feature = "profiler"))]
+    {
+        false
+    }
+}
+
 #[inline(always)]
 pub fn suspend() -> SuspendGuard {
     #[cfg(feature = "profiler")]
@@ -334,8 +347,7 @@ impl Drop for SectionGuard {
             return;
         }
         SECTION_STACK.with(|stack| {
-            let mut stack = stack.borrow_mut();
-            let _ = stack.pop();
+            let _ = stack.borrow_mut().pop();
         });
     }
 }
@@ -425,8 +437,8 @@ impl Drop for ScopeGuard {
         let Some(expected) = self.key else {
             return;
         };
-        ACTIVE_GUARDS.with(|stack| {
-            let mut stack = stack.borrow_mut();
+        ACTIVE_GUARDS.with(|guards| {
+            let mut stack = guards.borrow_mut();
             let frame = stack.pop().expect("scope guard stack underflow");
             debug_assert!(frame.key == expected, "scope guard stack corrupted");
 
@@ -529,14 +541,14 @@ where
         if profiler_suspended() {
             return ScopeGuard { key: None };
         }
-        let meta = meta();
+        let scope_meta = meta();
         ScopeGuard::new_with_work(
             ProfilerKey::Backend {
                 section: current_section_id(),
                 name,
-                signature: meta.signature,
+                signature: scope_meta.signature,
             },
-            meta.work,
+            scope_meta.work,
         )
     }
     #[cfg(not(feature = "profiler"))]

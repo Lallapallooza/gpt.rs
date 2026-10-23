@@ -259,7 +259,7 @@ fn fits(ty: &Type, available: Option<usize>, params: &[&Type]) -> bool {
 /// The bytes that a value of type `ty` may take past the `available` bytes of the parameters
 /// `params` that it reads: less than one slice of its outermost axis, as a layout in panels pads
 /// its last panel. This holds for a value of the parameters' dtype whose slices each take no more
-/// bytes than the parameters. Any other value, such as one slice that holds them all, may take
+/// than the `available` bytes. Any other value, such as one slice that holds them all, may take
 /// none.
 fn panel_padding(ty: &Type, available: usize, params: &[&Type]) -> usize {
     let Some(tensor) = ty.as_tensor() else {

@@ -16,7 +16,7 @@
 //! - `parse`: the case fails to parse with an error that its `// ERROR: <message>` line matches
 //!   (see the ERROR rules below).
 //! - `verify`: the case parses and fails verification with an error that its
-//!   `// ERROR: <message>` line matches (see the ERROR rules below).
+//!   `// ERROR: <message>` line matches.
 //! - `pass <passes>`: runs a pass list such as `canonicalize {fuel = 10}, cse`, or `default`,
 //!   verifying after each pass. The output must parse, print
 //!   back unchanged and satisfy the case's CHECK lines, of which it needs at least one. The passes
@@ -25,8 +25,8 @@
 //!   has a `// NO-INTERP: <reason>` line.
 //!
 //!   A pass case with an `// ERROR: <message>` line instead fails in its passes with an error
-//!   that this line matches (see the ERROR rules below). One with a `// LOCATIONS: <reason>` line
-//!   prints its output with the location of each op, trails included, for its CHECK lines.
+//!   that this line matches. One with a `// LOCATIONS: <reason>` line prints its output with the
+//!   location of each op, trails included, for its CHECK lines.
 //!
 //!   The inputs start with the special values of [`Specials::All`]. When the function before the
 //!   passes cannot run on them, as when they are out-of-range indices, plain random values replace

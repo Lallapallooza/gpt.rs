@@ -17,13 +17,16 @@ Doc policy:
 - [code_map.md](code_map.md): where the functional/recording plumbing lives.
 
 ## Reference
-- [backends/README.md](backends/README.md): the backend interface, and how each backend executes PTIR (ref-cpu, faer, c).
+- [backends/README.md](backends/README.md): the backend interface, and how each backend executes PTIR (ref-cpu, faer, c, x86).
 - [ptir/tensor.md](ptir/tensor.md): the `tensor` dialect, the PTIR spec, generated from the code.
-- [ptir/arith.md](ptir/arith.md), [ptir/tile.md](ptir/tile.md), [ptir/loop.md](ptir/loop.md) and
-  [ptir/host.md](ptir/host.md): the scalar, tile, loop and host dialects, generated from the code.
+- [ptir/arith.md](ptir/arith.md), [ptir/tile.md](ptir/tile.md), [ptir/loop.md](ptir/loop.md),
+  [ptir/isa.md](ptir/isa.md) and [ptir/host.md](ptir/host.md): the scalar, tile, loop, vector and
+  host dialects, generated from the code.
 - [ops.md](ops.md): ops/recording/graph execution architecture (implementation-oriented).
 - [ptir/passes.md](ptir/passes.md): the passes and the pipeline of each backend, generated from
   the code.
 - [formats.md](formats.md): checkpoints (Hugging Face model directories) and safetensors tensor
   files.
 - [development.md](development.md): env vars and local development notes.
+- [perf.md](perf.md): timing and profiling the ops, layers and blocks of GPT-2, ResNet-18 and
+  MobileNetV2, down to the lines of generated C and of Rust.

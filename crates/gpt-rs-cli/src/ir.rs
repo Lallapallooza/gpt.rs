@@ -1,5 +1,6 @@
-//! `ir-stats` and `ir-diff`: what the functions of a PTIR program cost, op by op, and how two
-//! versions of a program differ, such as a dumped `program.ptir` before and after a change.
+//! `ir-stats`, `ir-diff` and `ir-opt`: what the functions of a PTIR program cost, op by op, how
+//! two versions of a program differ, such as a dumped `program.ptir` before and after a change,
+//! and a program after a list of passes.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -7,9 +8,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args as ClapArgs, ValueEnum};
+use gpt_rs_filetests::interp_differential;
 use gpt_rs_ir::analysis::{Cost, CostSummary};
-use gpt_rs_ir::dialects::func::Func;
 use gpt_rs_ir::ir::{Inst, Module};
+use gpt_rs_ir::text::TextOptions;
 
 /// How the tables group the ops.
 #[derive(Clone, Copy, ValueEnum)]
@@ -64,6 +66,58 @@ pub struct IrDiffArgs {
     /// How the table groups the ops.
     #[arg(long, value_enum, default_value = "op")]
     by: Grouping,
+}
+
+#[derive(ClapArgs)]
+pub struct IrOptArgs {
+    /// PTIR text module, such as a `program.ptir` that `--dump-dir` writes.
+    #[arg(long)]
+    ptir: PathBuf,
+
+    /// The passes to run, in order, as filetests name them:
+    /// `tensor-to-tile, seal-dispatches, tile-to-loop`.
+    #[arg(long)]
+    passes: String,
+
+    /// Where to write the module after the passes [default: standard output].
+    #[arg(long)]
+    out: Option<PathBuf>,
+
+    /// Also run each run-time function before and after the passes in the interpreter, as the
+    /// filetests do: on special values and random inputs of this seed, after the load-time
+    /// functions, comparing the results bit for bit.
+    #[arg(long)]
+    check: Option<u64>,
+
+    /// Print the location and the number of each op, as dumps do.
+    #[arg(long)]
+    locations: bool,
+}
+
+/// Runs a pass list on a module, verifying it after each pass, and writes the result.
+pub fn run_opt(args: IrOptArgs) -> Result<()> {
+    let text = fs::read_to_string(&args.ptir)
+        .with_context(|| format!("reading {}", args.ptir.display()))?;
+    let before = Module::from_text(&text)?;
+    let mut module = before.clone();
+    let pipeline = gpt_rs_ir::passes::parse(&args.passes)?;
+    pipeline.run(&mut module)?;
+    let out = module.print(TextOptions {
+        locations: args.locations,
+        numbers: args.locations,
+        ..TextOptions::default()
+    });
+    match &args.out {
+        Some(path) => {
+            fs::write(path, out).with_context(|| format!("writing {}", path.display()))?
+        }
+        None => print!("{out}"),
+    }
+    if let Some(seed) = args.check {
+        interp_differential(&before, &module, seed, None).map_err(|err| anyhow!(err))?;
+        eprintln!("every run-time function computes the same bits after the passes");
+    }
+    Ok(())
 }
 
 /// Prints the cost of each function of the module, in all and for its costliest ops.
@@ -150,33 +204,28 @@ fn summaries(path: &Path, load_time: bool, by: Grouping) -> Result<BTreeMap<Stri
     let module = Module::from_text(&src).with_context(|| format!("{}", path.display()))?;
     let mut functions = BTreeMap::new();
     for func in module.funcs() {
-        let op = module
-            .op(func)
-            .get::<Func>()
-            .ok_or_else(|| anyhow!("{}: a function is not a func.func", path.display()))?;
-        if op.is_load_time() && !load_time {
+        if func.is_load_time() && !load_time {
             continue;
         }
-        let body = module.regions(func)[0];
-        let summary = module.cost_summary(body, |inst| group(&module, inst, by));
-        functions.insert(op.name.clone(), summary);
+        let summary = module.cost_summary(func.body().id(), |inst| group(&module, inst, by));
+        functions.insert(func.name.clone(), summary);
     }
     Ok(functions)
 }
 
 /// The group of the op of `inst`.
 fn group(module: &Module, inst: Inst, by: Grouping) -> String {
-    let scope = || {
+    let location_scope = || {
         let location = module.location(inst)?;
         location.scope.as_deref().map(str::to_string)
     };
     match by {
         Grouping::Op => module.op(inst).name().into_owned(),
-        Grouping::Scope => match scope() {
+        Grouping::Scope => match location_scope() {
             Some(scope) => merged_indices(&scope),
             None => "(no location)".to_string(),
         },
-        Grouping::Layer => match scope() {
+        Grouping::Layer => match location_scope() {
             Some(scope) => up_to_index(&scope),
             None => "(no location)".to_string(),
         },
@@ -186,7 +235,7 @@ fn group(module: &Module, inst: Inst, by: Grouping) -> String {
 /// Whether a segment of a module path is an index into a list of layers, such as the `3` of
 /// `model.layers.3.mlp`.
 fn is_index(segment: &str) -> bool {
-    !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit())
+    !segment.is_empty() && segment.chars().all(|character| character.is_ascii_digit())
 }
 
 /// `scope` with each index segment as `*`.

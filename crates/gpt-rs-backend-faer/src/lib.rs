@@ -607,8 +607,8 @@ struct Im2colBlock {
 }
 
 /// Computes the output rows `row_start..row_end` of an im2col convolution into `out_slice`, a
-/// block of rows at a time. The block's patches fill this thread's scratch, and a matmul on the
-/// threads of `matmul_par` multiplies them by the weight. Then it adds the bias to the block's
+/// block of rows at a time. The block's patches fill this thread's scratch. A matmul on the threads
+/// of `matmul_par` multiplies them by the weight. Then the function adds the bias to the block's
 /// results.
 fn process_range(
     ctx: Conv2dIm2colContext,

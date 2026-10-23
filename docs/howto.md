@@ -113,7 +113,7 @@ impl ConvNormActivation {
   the sublayer. Run `Vec` elements and enum variants with `layer.call(args)` (`module::Layer`).
 - Call functionals with tensors only (`functional::gelu(&x)`). The tensors carry the backend.
 - Build layers only through their constructors and `nn::Params`, including in tests
-  (`gpt_rs_backend_tests::load_layer`).
+  (`gpt_rs_backend_tests::layers::load_layer`).
 - `forward` returns its output, not a `Result`: tensor math panics on inputs that do not fit. A
   forward that uploads inputs (token ids, positions) returns a `Result` for the upload.
 - Use the ops of `DeviceTensor` for math (`&x + &y`, `x.exp()`, ...) and `nn::Linear` for projections:
@@ -162,6 +162,7 @@ Start from an existing backend crate:
 
 - Reference interpreter: `crates/gpt-rs-backend-ref-cpu`
 - Optimized CPU: `crates/gpt-rs-backend-faer`
+- Compiled through `tile`, `loop` and `isa` to C: `crates/gpt-rs-backend-x86`
 
 Steps:
 

@@ -5,7 +5,8 @@ Rust-first **research project** for portable tensor programs (PTIR) and model ru
 PTIR lets you keep model math portable while backends compete on execution:
 - Layers call portable functionals (no open-coded kernels).
 - Functionals record PTIR ops into lazy graphs.
-- Backends execute PTIR and run recognized op sequences, such as a convolution, on their own kernels.
+- Backends execute PTIR: faer and C run recognized op sequences, such as a convolution, on their own
+  kernels, and x86 lowers each program through the `tile`, `loop` and `isa` dialects to C.
 - Parameters have stable `u128` ids, and weights load as views of the memory-mapped checkpoint.
 
 Warning: expect churn. APIs, formats, and model coverage change quickly.
@@ -64,9 +65,9 @@ Start here:
 - [docs/formats.md](docs/formats.md) (Hugging Face checkpoints + safetensors tensor files)
 
 Reference:
-- [docs/backends/README.md](docs/backends/README.md) (how each backend works: ref-cpu, faer, c)
+- [docs/backends/README.md](docs/backends/README.md) (how each backend works: ref-cpu, faer, c, x86)
 - [docs/ptir/tensor.md](docs/ptir/tensor.md) (the `tensor` dialect: the PTIR spec, generated from the code)
-- [docs/ptir/arith.md](docs/ptir/arith.md), [docs/ptir/tile.md](docs/ptir/tile.md), [docs/ptir/loop.md](docs/ptir/loop.md) and [docs/ptir/host.md](docs/ptir/host.md) (the scalar, tile, loop and host dialects, generated from the code)
+- [docs/ptir/arith.md](docs/ptir/arith.md), [docs/ptir/tile.md](docs/ptir/tile.md), [docs/ptir/loop.md](docs/ptir/loop.md), [docs/ptir/isa.md](docs/ptir/isa.md) and [docs/ptir/host.md](docs/ptir/host.md) (the scalar, tile, loop, vector and host dialects, generated from the code)
 - [docs/ptir/passes.md](docs/ptir/passes.md) (the passes and the pipeline of each backend)
 - [docs/ops.md](docs/ops.md) (PTIR recording/graphs/execution)
 - [docs/frontend.md](docs/frontend.md) (frontend layering)
@@ -120,7 +121,7 @@ Misc
 - `crates/gpt-rs-filetests`: the filetest runner.
 - `crates/gpt-rs-docs`: writes the IR reference pages, `docs/ptir/`, from the code.
 - `filetests/`: IR filetests (`cargo test -p gpt-rs-ir --test filetests`) and the C backend's (`cargo test -p gpt-rs-backend-c --test filetests`).
-- `crates/gpt-rs-backend-ref-cpu`, `crates/gpt-rs-backend-faer`, `crates/gpt-rs-backend-c`: the backends (reference interpreter, faer, generated C).
+- `crates/gpt-rs-backend-ref-cpu`, `crates/gpt-rs-backend-faer`, `crates/gpt-rs-backend-c`, `crates/gpt-rs-backend-x86`: the backends (reference interpreter, faer, generated C, C through the multi-level IR).
 - `crates/gpt-rs-backends`: maps a backend name to its type; the CLI and Python load models through it.
 - `crates/gpt-rs-backend-tests`: backend suite + Torch parity harness (via `tch` / libtorch).
 - `crates/gpt-rs-cli`: model runner CLI (`--help` lists its commands) with dump/profile hooks.
@@ -220,8 +221,8 @@ Torch parity tests live under `crates/gpt-rs-backend-tests/src/torch_parity/` an
 ## Status
 
 Forward inference for causal LMs (`gpt2`, `ministral3`, `qwen3_5_text`) and image classification
-models (`resnet`, `mobilenet_v2`) is implemented, with portable PTIR kernels and Torch baselines
-for correctness.
+models (`resnet`, `mobilenet_v2`, timm's `mobilenetv3_large_100`) is implemented, with portable
+PTIR kernels and Torch baselines for correctness.
 
 `DeviceTensor` exposes the elementwise ops and operators (with Torch-style broadcasting), and the
 functional layer the composite math (matmul, normalization, attention, conv/pool), all recorded as

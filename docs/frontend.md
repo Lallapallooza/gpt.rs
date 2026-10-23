@@ -68,9 +68,10 @@ can fail at run time: `to_host()`, `DeviceTensor::from_host`, checkpoint loading
 
 ### Faster implementations
 
-A functional has one implementation: its portable PTIR. Backends make it fast by recognizing the
-recorded ops when they compile them. For example, faer and C run the ops that `conv2d` records on
-their own convolution kernels. See [backends/README.md](backends/README.md).
+A functional has one implementation: its portable PTIR. Backends make it fast when they compile
+the recorded ops. faer and C recognize op sequences: they run the ops that `conv2d` records on
+their own convolution kernels. x86 lowers every op through `tile`, `loop` and `isa` to C. See
+[backends/README.md](backends/README.md).
 
 ## Backends
 
@@ -78,6 +79,7 @@ Backends implement `gpt_rs::backend::PortableBackend` ([backends/README.md](back
 
 - `gpt-rs-backend-faer` (optimized CPU backend)
 - `gpt-rs-backend-c` (generated C)
+- `gpt-rs-backend-x86` (C with AVX-512 intrinsics, through the multi-level IR)
 - `gpt-rs-backend-ref-cpu` (reference interpreter)
 
 Dumps and profiles need no backend wrapper: dumps come from a trace sink that the graph arena

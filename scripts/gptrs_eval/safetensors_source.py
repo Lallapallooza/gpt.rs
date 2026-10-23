@@ -24,9 +24,9 @@ def resolve_model_dir(model_id: str) -> Path:
 class SafetensorsSource:
     """Lazy tensor access over a safetensors checkpoint, sharded or not.
 
-    A weight that a compressed-tensors checkpoint stores packed (`weight_packed` with its scale, its
-    shape, and an optional zero point) reads under its module's `weight` name, decompressed by
-    compressed-tensors.
+    A compressed-tensors checkpoint can store a weight packed, as `weight_packed` with its scale,
+    its shape, and an optional zero point. Such a weight reads under its module's `weight` name,
+    decompressed by compressed-tensors.
     """
 
     def __init__(self, model_dir: Path) -> None:

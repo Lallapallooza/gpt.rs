@@ -13,10 +13,10 @@ The canonical loader is:
 - `gpt_rs::runtime::load_model(backend, model_dir) -> ModelHandle`
 
 `backend` is an `Arc` of a concrete backend type, and the handle runs the model on it without
-naming that type. `gpt_rs_backends::load_model(name, model_dir, options)` picks the backend by
-name instead: `ref-cpu` always, `faer` and `c` with the features of those names. The CLI and the
-Python bindings load through it; the CLI always has faer, and both enable C with their
-`conversion-c` feature.
+naming that type. `gpt_rs_backends::load_model(name, backend_options, model_dir, options)` picks the
+backend by name instead: `ref-cpu` always, `faer`, `c` and `x86` with the features of those names.
+The CLI and the Python bindings load through it. The CLI always has faer and x86, and both enable C
+with their `conversion-c` feature.
 
 The loader:
 
@@ -52,10 +52,13 @@ Models are exposed through a small dynamic trait, which does not name the backen
 
 - `LoadedModel`: `kind()` and the capabilities, trait methods that return `Option<...>`:
   - `as_causal_lm() -> Option<&dyn CausalLanguageModel>`: token sequences in, logits out.
-  - `as_vision() -> Option<&dyn VisionModel>`: NCHW pixels in, class logits out.
+  - `as_vision() -> Option<&dyn VisionModel>`: NCHW pixels in, class logits out. The forward is
+    traced: it records once for each shape of the pixels and runs that program on later calls
+    ([ops.md](ops.md#traced-entry-points)).
 
 `ModelHandle::causal_lm()` and `ModelHandle::vision()` return a capability or an error that names
-the model kind.
+the model kind. The decoder traces a causal model's decode steps the same way: the first records,
+and the later ones replay its program ([ops.md](ops.md#traced-entry-points)).
 
 `CausalLanguageModel::forward` returns logits `[T, vocab]` for every position. It computes them as
 a prefill into fresh caches. `CausalLanguageModel::decode` prefills a prompt and returns a `Decode`,
